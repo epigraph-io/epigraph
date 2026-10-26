@@ -3028,6 +3028,20 @@ async fn require_api_workflow_authority(
 /// the identity checked is the identity that writes. Run on the act's own
 /// transaction, before the act. Returns each workflow with its grant, for
 /// [`record_api_lineage_writes`].
+///
+/// # Accepted residual: the lineage split (operator ruling R-21)
+///
+/// The workflow set is read on the caller's RLS-bound transaction, so it holds
+/// only the workflows whose `executes` edge (and lineage member) the caller
+/// can see. A group-private workflow outside the caller's groups that executes
+/// the same lineage is therefore not in the set and is not authority-checked.
+/// Every claim of a lineage takes its parent's tenancy at `evolve_step` and an
+/// `executes` edge takes its step's, so this needs a lineage whose members were
+/// split across tenancies; the ruling ACCEPTS that residual rather than moving
+/// the read into a privileged (definer) frame. Stated on
+/// `WorkflowRepository::workflows_executing_step_lineage` and in the MCP
+/// `evolve_step` tool description, whose twin
+/// (`tools/evolve_step.rs::require_lineage_authority`) shares it.
 #[cfg(feature = "db")]
 async fn require_api_lineage_authority(
     conn: &mut sqlx::PgConnection,
