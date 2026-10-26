@@ -23,8 +23,8 @@ use sqlx::PgPool;
 #[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_worker_recall_as_epigraph_app_writes_exactly_one_audit_row(pool: PgPool) {
-    // Seed and resolve on the SUPERUSER pool: resolving on a downgraded,
-    // unstamped session yields an empty group set (viewer_fixture's warning).
+    // Seed on the SUPERUSER pool; the viewer is resolved below on the app
+    // pool, as the worker resolves it.
     let (principal, personal_group) =
         fixture::seed_agent_with_group(&pool, "engine-audit-app-role").await;
     // A semantic hit, as in production: the deterministic mock embeds the query
@@ -43,9 +43,6 @@ async fn a_worker_recall_as_epigraph_app_writes_exactly_one_audit_row(pool: PgPo
     );
     let seed = fixture::seed_public_claim(&pool, principal, "vorpaline synthesis seed").await;
     fixture::set_claim_embedding(&pool, seed, &pgvec).await;
-    let viewer = epigraph_db::Viewer::resolve(&pool, principal)
-        .await
-        .expect("resolve the synthesis principal");
 
     // The worker's shape: a ScopedPool on the application role, and the engine
     // reading on its UNSTAMPED inner pool.
@@ -64,6 +61,24 @@ async fn a_worker_recall_as_epigraph_app_writes_exactly_one_audit_row(pool: PgPo
     assert_eq!(
         role, "epigraph_app",
         "precondition: the engine pool is the app role"
+    );
+
+    // The worker resolves its viewer on its unstamped app-role pool too
+    // (episcience `jobs/worker.rs`: `Viewer::resolve(&self.resolve_pool, ..)`),
+    // and the audit write's liveness check reads that viewer's group set. A
+    // resolve that came back without the personal group would DROP every row
+    // with "audit skipped" — the original zero-rows symptom by another road —
+    // so resolve where the worker does and pin the group set first.
+    let viewer = epigraph_db::Viewer::resolve(app, principal)
+        .await
+        .expect("resolve the synthesis principal on the app pool");
+    assert!(
+        viewer
+            .group_bind()
+            .is_some_and(|groups| groups.contains(&personal_group)),
+        "precondition: an app-role resolve sees the principal's live personal group \
+         (epigraph_live_memberships is a definer); got {:?}",
+        viewer.group_bind()
     );
 
     let results =
@@ -108,5 +123,9 @@ async fn a_worker_recall_as_epigraph_app_writes_exactly_one_audit_row(pool: PgPo
     assert!(
         !logs_contain("engine recall audit log failed"),
         "the audit write must not have been refused"
+    );
+    assert!(
+        !logs_contain("engine recall audit skipped"),
+        "the audit write must not have been dropped for want of an owner"
     );
 }

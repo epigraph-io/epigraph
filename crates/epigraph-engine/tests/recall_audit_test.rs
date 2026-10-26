@@ -89,6 +89,7 @@ async fn a_bypass_recall_writes_an_agentless_audit_row(pool: PgPool) {
 /// personal group. Nothing can own its row, so nothing is written — and in
 /// particular the row is not widened to instance-wide, where every
 /// authenticated agent could read its query text.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_principal_without_a_personal_group_writes_no_audit_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -113,6 +114,17 @@ async fn a_principal_without_a_personal_group_writes_no_audit_row(pool: PgPool) 
         n, 0,
         "no owner => the row is dropped, never written agent-less or instance-wide"
     );
+
+    // The drop must be the DESIGNED one (no owner), not a write that failed
+    // for some other reason and happened to leave the count at zero.
+    assert!(
+        logs_contain("engine recall audit skipped rather than widened"),
+        "the row must be dropped as owner-less"
+    );
+    assert!(
+        !logs_contain("engine recall audit log failed"),
+        "no write was attempted, so none can have failed"
+    );
 }
 
 /// A principal whose personal membership is REVOKED cannot own a row either.
@@ -121,6 +133,7 @@ async fn a_principal_without_a_personal_group_writes_no_audit_row(pool: PgPool) 
 /// the membership is live, so "visible" alone would own the row by the group
 /// the principal lost. The second check, against the viewer's live group set,
 /// is what drops it.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revoked_personal_membership_writes_no_audit_row(pool: PgPool) {
     let (principal, group) = fixture::seed_agent_with_group(&pool, "engine-audit-revoked").await;
@@ -155,5 +168,16 @@ async fn a_revoked_personal_membership_writes_no_audit_row(pool: PgPool) {
     assert_eq!(
         n, 0,
         "a revoked principal's row must not be owned by the group it was revoked from"
+    );
+
+    // The drop must be the DESIGNED one (no owner), not a write that failed
+    // for some other reason and happened to leave the count at zero.
+    assert!(
+        logs_contain("engine recall audit skipped rather than widened"),
+        "the row must be dropped as owner-less"
+    );
+    assert!(
+        !logs_contain("engine recall audit log failed"),
+        "no write was attempted, so none can have failed"
     );
 }
