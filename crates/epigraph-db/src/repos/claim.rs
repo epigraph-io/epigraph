@@ -7858,22 +7858,10 @@ impl ClaimRepository {
                 reason: format!("evolve_step: cannot supersede a non-current step {parent_uuid}"),
             });
         }
-        let lineage_id = match existing_lineage {
-            Some(l) => l,
-            None => {
-                let new_lineage = Uuid::new_v4();
-                sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
-                    .bind(new_lineage)
-                    .bind(parent_uuid)
-                    .execute(&mut *tx)
-                    .await?;
-                new_lineage
-            }
-        };
-
         if edge_type == "supersedes" {
-            // Retire the predecessor BEFORE writing its successor, and refuse
-            // when the retire changed nothing (backlog d34f5096). Row security
+            // Retire the predecessor BEFORE any other write (the lineage
+            // back-fill, the successor, its edge), and refuse when the retire
+            // changed nothing (backlog d34f5096). Row security
             // that refuses an UPDATE through its USING clause does not raise:
             // the statement matches zero rows and reports success. The locked
             // read above already proved the parent visible and current, so a
@@ -7902,6 +7890,19 @@ impl ClaimRepository {
                 });
             }
         }
+
+        let lineage_id = match existing_lineage {
+            Some(l) => l,
+            None => {
+                let new_lineage = Uuid::new_v4();
+                sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+                    .bind(new_lineage)
+                    .bind(parent_uuid)
+                    .execute(&mut *tx)
+                    .await?;
+                new_lineage
+            }
+        };
 
         let new_uuid = Uuid::new_v4();
         let hash = ContentHasher::hash(new_content.as_bytes());

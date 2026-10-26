@@ -215,8 +215,8 @@ async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
 /// successor next to a predecessor that was still current: two live heads on
 /// a lineage that `supersedes` keeps linear. A `BEFORE UPDATE` trigger that
 /// skips only the predecessor's `is_current` change stands in for that policy
-/// deterministically (the lineage back-fill, which leaves `is_current` alone,
-/// still goes through), named to fire before every other `BEFORE UPDATE`
+/// deterministically (it would let the lineage back-fill, which leaves
+/// `is_current` alone, through), named to fire before every other `BEFORE UPDATE`
 /// trigger on `claims`. The caller's transaction is committed whatever the
 /// call left on it, so the assertions see what a caller that ignored the error
 /// would have persisted.
@@ -260,6 +260,10 @@ async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(p
             .await
             .unwrap();
     assert!(still_current, "the predecessor is untouched");
+    assert_eq!(
+        lineage, None,
+        "the refusal wrote nothing, not even the lineage back-fill"
+    );
     let heads: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM claims \
          WHERE (id = $1 OR step_lineage_id = $2) AND COALESCE(is_current, true)",
