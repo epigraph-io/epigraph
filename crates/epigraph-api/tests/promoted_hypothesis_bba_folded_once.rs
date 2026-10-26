@@ -471,7 +471,10 @@ async fn a_promoted_hypothesis_is_not_promoted_again(
         reqwest::StatusCode::CONFLICT,
         "a second promotion is refused: {status} {body}"
     );
-    assert!(body.contains("already promoted"), "{body}");
+    assert!(
+        body.contains("already promoted; nothing was written") && !body.contains("concurrent"),
+        "the gate's status check refuses a sequential re-promotion, not the race path: {body}"
+    );
     let after: Vec<(Uuid, serde_json::Value)> = rows(&pool, r.claim, r.rv_frame)
         .await
         .into_iter()
@@ -634,7 +637,10 @@ async fn a_promotion_racing_a_committed_promotion_is_refused(
         reqwest::StatusCode::CONFLICT,
         "a promotion that lost the race is refused: {status} {body}"
     );
-    assert!(body.contains("already promoted"), "{body}");
+    assert!(
+        body.contains("concurrent promotion"),
+        "the conditional status write refuses it (its 0-row path), not the gate: {body}"
+    );
     assert!(
         rows(&pool, r.claim, r.rv_frame).await.is_empty(),
         "the refused promotion writes no research_validity copy"
