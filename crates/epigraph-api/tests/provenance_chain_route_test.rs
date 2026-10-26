@@ -431,11 +431,7 @@ async fn a_claim_the_viewer_cannot_read_does_not_extend_the_walk(pool: PgPool) {
     );
     assert_eq!(
         body["cycles"],
-        serde_json::json!([[
-            root.to_string(),
-            secret.to_string(),
-            root.to_string()
-        ]]),
+        serde_json::json!([[root.to_string(), secret.to_string(), root.to_string()]]),
         "the owner, who can read every hop, still sees the loop, got {body}"
     );
 }
