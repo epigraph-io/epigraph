@@ -44,6 +44,7 @@ rerank = []
 
 [dev-dependencies]
 tokio = { workspace = true }
+epigraph-db = { workspace = true, features = ["test-support"] }  # ScopedPool::connect_downgraded_for_tests
 chrono = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
