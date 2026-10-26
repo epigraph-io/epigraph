@@ -1511,6 +1511,22 @@ async fn a_mark_unmark_round_trip_leaves_an_unfactored_canonical_edge_unfactored
         vec![sorted_pair(x, canonical)],
         "CALIBRATION: the mark minted the moved edge's factor into the empty slot"
     );
+    // The revert payload records exactly that slot, read here from the factor
+    // row the mark actually wrote, and the canonical edge it found unfactored.
+    let minted = factor_rows(&pool, e_d).await;
+    let [(factor_type, vars, ..)] = minted.as_slice() else {
+        panic!("CALIBRATION: one factor for the moved edge: {minted:?}");
+    };
+    assert_eq!(
+        repair.revert.minted_factor_slots,
+        vec![format!("{factor_type}:{},{}", vars[0], vars[1])],
+        "the record names the slot the mark minted"
+    );
+    assert_eq!(
+        repair.revert.slot_edges_without_factor,
+        vec![e_c],
+        "the record names the canonical edge the mark found unfactored in that slot"
+    );
     unmark(&pool, dup, &repair.revert).await;
     assert_eq!(
         factors_of_edge(&pool, e_d).await,
@@ -1542,5 +1558,53 @@ async fn a_mark_unmark_round_trip_leaves_an_unfactored_canonical_edge_unfactored
         factors_of_edge(&pool, e_c2).await,
         vec![sorted_pair(y, canonical2)],
         "a canonical edge created after the mark gets the slot the un-mark frees"
+    );
+}
+
+/// A revert record written before backlog 5272d890 (1) carries neither
+/// `minted_factor_slots` nor `slot_edges_without_factor`. It still parses
+/// (both default to empty), and its un-mark re-fills a freed slot from any
+/// canonical edge, as every un-mark did before the fields existed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_record_from_before_the_minted_slots_unmarks_as_before(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let x = fixture::seed_public_claim(&pool, a, "x").await;
+    let e_c = edge(&pool, x, canonical, "provides_evidence").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_c)
+        .execute(&pool)
+        .await
+        .expect("remove the canonical edge's factor");
+    let e_d = edge(&pool, x, dup, "supports").await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        repair.revert.slot_edges_without_factor,
+        vec![e_c],
+        "CALIBRATION: a record written now names the unfactored canonical edge"
+    );
+
+    let mut old = serde_json::to_value(&repair.revert).expect("serialize the record");
+    let fields = old.as_object_mut().expect("the record is an object");
+    assert!(
+        fields.remove("minted_factor_slots").is_some()
+            && fields.remove("slot_edges_without_factor").is_some(),
+        "CALIBRATION: both fields were serialized"
+    );
+    let old: epigraph_db::DedupRevert =
+        serde_json::from_value(old).expect("a record without the fields still parses");
+    assert!(old.minted_factor_slots.is_empty() && old.slot_edges_without_factor.is_empty());
+
+    unmark(&pool, dup, &old).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, dup)],
+        "CALIBRATION: the un-mark put the duplicate's factor back"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_c).await,
+        vec![sorted_pair(x, canonical)],
+        "with no record of the unfactored edge, the freed slot is re-filled from it, as before"
     );
 }
