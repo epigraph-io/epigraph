@@ -432,13 +432,17 @@ async fn decide(
     }
 
     let ttl = chrono::Duration::seconds(RUN_TOKEN_MAX_SECS);
+    // No owner: the token speaks for the principal, never for whoever owns
+    // the delegator client (the shape the admission sites were proved
+    // against).
+    let owner: Option<uuid::Uuid> = None;
     let (access_token, jti) = state
         .jwt_config
         .issue_access_token(
             client.id,
             scopes.clone(),
             "agent",
-            None,
+            owner,
             Some(principal),
             ttl,
             epigraph_auth::AccessTokenBinding {
