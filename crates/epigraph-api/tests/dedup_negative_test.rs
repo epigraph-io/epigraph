@@ -48,8 +48,9 @@ async fn dedup_nonexistent_dup_returns_404() {
 }
 
 /// Calling dedup against a claim that already has supersedes set → 409.
-/// ClaimRepository::mark_duplicate returns DbError::QueryFailed when
-/// the dup row already has supersedes != NULL → handler maps to ApiError::Conflict → 409.
+/// ClaimRepository::mark_duplicate returns DbError::Refused when
+/// the dup row already has supersedes != NULL → handler maps to ApiError::Conflict → 409
+/// (versioning::mark_duplicate's `QueryFailed | Refused` arm).
 #[tokio::test(flavor = "multi_thread")]
 async fn dedup_already_superseded_dup_returns_409() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -137,7 +138,7 @@ async fn dedup_self_dedup_returns_400() {
 
 /// Calling dedup onto a canonical that is no longer current → 409, and the
 /// duplicate is untouched: the act refuses to build a dedup chain onto a
-/// retired claim (it returns DbError::QueryFailed, which the handler maps to
+/// retired claim (it returns DbError::Refused, which the handler maps to
 /// ApiError::Conflict).
 #[tokio::test(flavor = "multi_thread")]
 async fn dedup_onto_retired_canonical_returns_409() {

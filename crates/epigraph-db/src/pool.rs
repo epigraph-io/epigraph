@@ -909,7 +909,7 @@ impl ScopedPool {
     ///
     /// # Errors
     /// `DbError::ConnectionFailed` if the pool cannot be established, or
-    /// `DbError::QueryFailed` for a `role` that is not a plain lower-case
+    /// `DbError::Refused` for a `role` that is not a plain lower-case
     /// identifier (it is spliced into a statement that takes no bind).
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
