@@ -1,18 +1,23 @@
-//! Backlog e2c22c7c (ruling R-25), MCP half: a designed database refusal an
-//! MCP caller can reach arrives with its refusal CODE, not as the generic
+//! Backlog e2c22c7c (ruling R-25), MCP half: a designed database refusal that
+//! migration 176 coded arrives with its refusal CODE, not as the generic
 //! "internal error; the detail is in the server log".
 //!
 //! PR #686's fail-closed `internal_error` sends a database message only when it
 //! opens with a schema refusal code; these refusals named none, so they were
-//! redacted. Three representatives, each raised for real by the database:
+//! redacted.
+//!
+//! WHAT CROSSES A TRANSPORT, AND WHAT ONLY PINS THE MAPPER:
 //!
 //! * AGK01 (55000), migration 148's `agents` guard, through the real
 //!   `ingest_document` tool: a document author whose derived key is registered
-//!   for a system agent that has rotated off it.
-//! * GRM05 (42501), migration 164's team-roster guard, on an application-role
-//!   roster write, through `internal_error` and `db_caller_error`.
-//! * PRV01 (42501), migration 081's sealing guard, on an application-role
-//!   `claim_encryption` row for a public claim, through the same two.
+//!   for a system agent that has rotated off it. Of 176's codes it is the one
+//!   a shipped MCP tool answered with the generic internal error before 176
+//!   (`propose_admin_act` already relayed AAR01-AAR12's 22023 text).
+//! * GRM05 (42501, migration 164's team-roster guard) and PRV01 (42501,
+//!   migration 081's sealing guard) are raised for real by the database on an
+//!   application-role write and passed to `internal_error` and
+//!   `db_caller_error`. These pin the MAPPERS only: no MCP tool writes a team
+//!   group's roster or a `claim_encryption` row, so no tool reaches either arm.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -73,6 +78,7 @@ fn assert_coded(e: &rmcp::model::ErrorData, code: &str, fragment: &str, what: &s
     );
 }
 
+/// TRANSPORT: the real `ingest_document` tool and the real database refusal.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_registered_author_key_reaches_ingest_document_as_agk01(pool: PgPool) {
     // The author's derived key K, held by a system agent that was registered
@@ -124,8 +130,9 @@ async fn a_registered_author_key_reaches_ingest_document_as_agk01(pool: PgPool) 
     assert_eq!(holders, 0, "nothing was written");
 }
 
+/// MAPPER pin (no MCP tool reaches GRM05; see the module doc).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_team_group_roster_write_reaches_mcp_as_grm05(pool: PgPool) {
+async fn mcp_mappers_pass_grm05_with_its_code(pool: PgPool) {
     let (admin, _) = fixture::seed_agent_with_group(&pool, "refusal-code admin").await;
     let (member, _) = fixture::seed_agent_with_group(&pool, "refusal-code member").await;
     let team = Uuid::new_v4();
@@ -166,8 +173,9 @@ async fn a_team_group_roster_write_reaches_mcp_as_grm05(pool: PgPool) {
     );
 }
 
+/// MAPPER pin (no MCP tool reaches PRV01; see the module doc).
 #[sqlx::test(migrations = "../../migrations")]
-async fn sealing_a_public_claim_reaches_mcp_as_prv01(pool: PgPool) {
+async fn mcp_mappers_pass_prv01_with_its_code(pool: PgPool) {
     let (author, group) = fixture::seed_agent_with_group(&pool, "refusal-code author").await;
     let claim = fixture::seed_public_claim(&pool, author, "refusal-code public claim").await;
 

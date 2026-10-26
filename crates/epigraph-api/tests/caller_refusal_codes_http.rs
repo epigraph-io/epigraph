@@ -1,24 +1,27 @@
 #![cfg(feature = "db")]
-//! Backlog e2c22c7c (ruling R-25), HTTP half: a designed database refusal an
-//! API caller can reach answers with its refusal CODE and a 4xx, not the
+//! Backlog e2c22c7c (ruling R-25), HTTP half: a designed database refusal
+//! that migration 176 coded answers with its refusal CODE and a 4xx, not the
 //! generic 500 "A database error occurred".
 //!
-//! Three representative refusals, each raised for real by the database on the
-//! write the API makes:
+//! WHAT CROSSES A TRANSPORT, AND WHAT ONLY PINS THE MAPPER:
 //!
 //! * AGK01 (55000), migration 148's guard on `agents`: `POST /api/v1/agents`
 //!   with a public key registered for a system agent that has since rotated
-//!   off it. Driven through the real router.
-//! * GRM05 (42501), migration 164's roster guard: an application-role write
-//!   to a team group's roster (`GroupMembershipRepository::add_member`, the
-//!   HTTP add-member write), mapped by `From<DbError> for ApiError`.
-//! * PRV01 (42501), migration 081's sealing guard: an application-role
-//!   `claim_encryption` row for a public claim
-//!   (`ClaimEncryptionRepository::insert_conn`, the HTTP claim create's
-//!   sealing write), mapped the same way.
-//!
-//! And the fail-closed edge: an UNCODED database refusal with the same
-//! SQLSTATE still answers the redacted 500.
+//!   off it. Driven through the real router. Of 176's codes it is the one a
+//!   shipped HTTP route answered with the redacted 500 before 176 (the
+//!   propose-admin-act route already relayed AAR01-AAR12's 22023 text; it now
+//!   carries the code too).
+//! * GRM05 (42501, migration 164's roster guard) and PRV01 (42501, migration
+//!   081's sealing guard) are raised for real by the database on an
+//!   application-role write and passed to `From<DbError> for ApiError`. These
+//!   pin the MAPPER only. No shipped route reaches either arm: the group
+//!   routes map their own errors, `add_member` needs a key epoch a verb-made
+//!   (keyless) team group never has, and on the application role
+//!   `remove_member`'s unstamped session cannot see a verb-made roster, so it
+//!   answers 403 "Not a member" before any write; the claim create seals only
+//!   a claim it has already declared non-public.
+//! * Fail closed: an uncoded database refusal with a SQLSTATE the coded arm
+//!   maps (42501) still answers the redacted 500.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -84,6 +87,7 @@ async fn seed_team_group(pool: &PgPool, admin: Uuid) -> Uuid {
     group
 }
 
+/// TRANSPORT: the real router, the real route, the real database refusal.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_registered_system_key_answers_409_with_agk01_over_http(pool: PgPool) {
     // A system agent registered under key K, then rotated off it: K stays
@@ -153,8 +157,10 @@ async fn a_registered_system_key_answers_409_with_agk01_over_http(pool: PgPool) 
     assert_eq!(holders, 0, "nothing was written");
 }
 
+/// MAPPER pin (no shipped route reaches GRM05; see the module doc): the real
+/// roster refusal of an application-role write, through `From<DbError>`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_team_group_roster_write_answers_403_with_grm05(pool: PgPool) {
+async fn api_mapper_answers_grm05_with_403(pool: PgPool) {
     let (admin, _) = fixture::seed_agent_with_group(&pool, "refusal-code admin").await;
     let (member, _) = fixture::seed_agent_with_group(&pool, "refusal-code member").await;
     let team = seed_team_group(&pool, admin).await;
@@ -184,8 +190,10 @@ async fn a_team_group_roster_write_answers_403_with_grm05(pool: PgPool) {
     );
 }
 
+/// MAPPER pin (no shipped route reaches PRV01; see the module doc): the real
+/// sealing refusal of an application-role write, through `From<DbError>`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn sealing_a_public_claim_answers_403_with_prv01(pool: PgPool) {
+async fn api_mapper_answers_prv01_with_403(pool: PgPool) {
     let (author, group) = fixture::seed_agent_with_group(&pool, "refusal-code author").await;
     let claim = fixture::seed_public_claim(&pool, author, "refusal-code public claim").await;
 
