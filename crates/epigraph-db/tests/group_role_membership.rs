@@ -2691,6 +2691,13 @@ async fn a_shared_successor_does_not_inherit_the_group_through_registration(pool
         (false, false),
         "a SHARED successor does not read or write the group through its copy"
     );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, fleet, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the shared successor, forged stamp (armed)",
+    );
     assert!(live_roles(&pool, fleet, group).await.is_empty());
     assert_eq!(
         resolves(&pool, control, group).await,
@@ -2874,6 +2881,15 @@ async fn a_same_folder_successor_keeps_the_group_until_it_runs_elsewhere(pool: P
         (true, true),
         "a same-folder successor reached by the attach-time follow"
     );
+    // `resolves` runs on the test's privileged session, where 161's snapshot
+    // policy admits every row (`epigraph_bypass()`). This write runs, armed,
+    // on an `epigraph_app` session: the claims-path writer scope asks the
+    // derivation, whose maintenance-owned frame must read the FORCEd
+    // `agent_prompt_snapshots` through `epigraph_definer_bypass()`.
+    arm(&pool).await;
+    write_honest(&pool, newest, group)
+        .await
+        .expect("a same-folder successor writes on an application session");
 
     // The registration copy: the newest identity's own next identity.
     let next_key = identity_key();
@@ -2888,6 +2904,9 @@ async fn a_same_folder_successor_keeps_the_group_until_it_runs_elsewhere(pool: P
         (true, true),
         "a same-folder successor through the registration copy"
     );
+    write_honest(&pool, next, group)
+        .await
+        .expect("the registration-copy successor writes on an application session");
 
     // The same identity then also runs in another folder: it is shared now.
     register_in(&pool, &next_key, None, "g-fleet").await;
@@ -2895,6 +2914,12 @@ async fn a_same_folder_successor_keeps_the_group_until_it_runs_elsewhere(pool: P
         resolves(&pool, next, group).await,
         (false, false),
         "a successor that now runs in a second folder"
+    );
+    assert_refused(
+        &write_forged(&pool, next, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the now-shared successor, forged stamp (armed)",
     );
     assert_eq!(
         resolves(&pool, newest, group).await,
