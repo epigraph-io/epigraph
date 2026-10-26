@@ -329,14 +329,74 @@ async fn a_run_token_cannot_read_a_group_its_agent_is_not_in_even_when_the_reque
     );
     let (status, body) = read_claim(&st, &token, claim_x, None).await;
     assert!(
-        status != StatusCode::OK && !body.to_string().contains("run token group x"),
-        "group X is not readable by the run token: {status} {body}"
+        status == StatusCode::NOT_FOUND && !body.to_string().contains("run token group x"),
+        "group X is not readable by the run token (an invisible claim is not found): \
+         {status} {body}"
     );
     let (status, body) = read_claim(&st, &token, claim_x, Some(group_x)).await;
     assert!(
         status == StatusCode::FORBIDDEN && !body.to_string().contains("run token group x"),
         "a group check naming X refuses the run token: {status} {body}"
     );
+
+    // CONTROL: the refusal above is the principal's MEMBERSHIP, resolved by
+    // the server on each request, and nothing else. Give the principal a
+    // reader membership of X and the SAME token (minted before it existed)
+    // reads claim X: the claim exists, and the token carries no group set of
+    // its own.
+    delegation::membership(&pool, group_x, d.principal, "reader").await;
+    let (status, body) = read_claim(&st, &token, claim_x, None).await;
+    assert!(
+        status == StatusCode::OK && body.to_string().contains("run token group x"),
+        "CONTROL: once the principal is a member of X, the same token reads claim X: \
+         {status} {body}"
+    );
+}
+
+/// A run token's scopes are bounded by what the DELEGATOR is granted, not
+/// only by the delegated ceiling: a delegator granted `claims:read` alone
+/// cannot mint `claims:write` (which is inside the ceiling) by asking for it,
+/// and a request naming only ungranted scopes is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_token_never_carries_a_scope_its_delegator_is_not_granted(pool: PgPool) {
+    let (d, client_id, key) = world(&pool, "run-token-granted").await;
+    assert!(
+        epigraph_auth::DELEGATED_SCOPE_CEILING.contains(&"claims:write"),
+        "PREMISE: claims:write is inside the ceiling, so only the grant can cut it"
+    );
+    arm_client(&pool, d.delegator_client, &["claims:read"]).await;
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+
+    let minted = mint(
+        &st,
+        &request(
+            &client_id,
+            &key,
+            json!({"scope": "claims:read claims:write"}),
+        ),
+    )
+    .await;
+    token_of("a request for a granted and an ungranted scope", &minted);
+    assert_eq!(
+        scopes_of(&minted.1),
+        ["claims:read"],
+        "only the granted scope is minted: {}",
+        minted.1
+    );
+
+    let refused = mint(
+        &st,
+        &request(&client_id, &key, json!({"scope": "claims:write"})),
+    )
+    .await;
+    assert_refused(
+        "a request for an ungranted scope only",
+        &refused,
+        "invalid_scope",
+    );
+    let rows = events(&pool, "oauth_run_token_refused").await;
+    assert_eq!(rows.len(), 1, "one refusal row: {rows:?}");
+    assert_eq!(rows[0].2["reason"], json!("no_scope"), "{rows:?}");
 }
 
 /// The minted token is the shape the admission sites were proved against.
@@ -767,5 +827,49 @@ async fn a_minted_run_token_reaches_a_tool_over_mcp_streamable_http(pool: PgPool
             && answer["result"]["isError"] != json!(true)
             && answer.to_string().contains(&claim.to_string()),
         "the minted run token reads the claim over MCP: {answer}"
+    );
+}
+
+/// The MCP twin of the group-X refusal: over the streamable-HTTP transport the
+/// containers will use, a MINTED run token does not read a group-private claim
+/// of a group its agent is not in, although the delegator and the operator
+/// both write that group.
+///
+/// The MCP read tools read on the server's unstamped pool today (see the test
+/// above), so the principal's own group is not readable over MCP either and
+/// there is no membership control on this transport; the public read is the
+/// calibration that `get_claim` answers claim content here. This test is the
+/// REGRESSION GUARD for the day the MCP pool is stamped: stamped from the
+/// delegator (`dlg`) or the client (`sub`) instead of the principal, it reads
+/// claim X and this goes red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_minted_run_token_cannot_read_a_group_its_agent_is_not_in_over_mcp(pool: PgPool) {
+    let (d, client_id, key) = world(&pool, "run-token-mcp-x").await;
+    let (outsider, group_x) = delegation::agent_with_group(&pool, "run-token-mcp-x-group").await;
+    delegation::membership(&pool, group_x, d.delegator, "writer").await;
+    delegation::membership(&pool, group_x, d.operator, "writer").await;
+    let claim_x =
+        fixture::seed_group_claim(&pool, outsider, group_x, "run token group x over mcp").await;
+    let public = fixture::seed_public_claim(&pool, d.operator, "run token public over mcp").await;
+
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+    let token = token_of(
+        "mint",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+    );
+    let url = mcp_listener(&pool, st.jwt_config.clone()).await;
+
+    let answer = mcp_get_claim(&url, &token, public).await;
+    assert!(
+        answer.get("error").is_none()
+            && answer["result"]["isError"] != json!(true)
+            && answer.to_string().contains("run token public over mcp"),
+        "CALIBRATION: get_claim answers claim content over MCP: {answer}"
+    );
+    let answer = mcp_get_claim(&url, &token, claim_x).await;
+    assert!(
+        (answer.get("error").is_some() || answer["result"]["isError"] == json!(true))
+            && !answer.to_string().contains("run token group x over mcp"),
+        "group X is not readable by the run token over MCP: {answer}"
     );
 }
