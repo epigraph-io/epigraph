@@ -1680,6 +1680,30 @@ impl AgentRepository {
         }))
     }
 
+    /// The agent whose identity public key is `public_key`, with its recorded
+    /// LLM model (`properties ->> 'llm_model'`), for the run-token grant: the
+    /// principal a delegator names. `None` when no agent has the key; this
+    /// never creates one.
+    ///
+    /// The model is DISPLAY state (the application role may rewrite the
+    /// agent's own `properties`); the grant uses it only to narrow which
+    /// identities it serves, never as authority, which is
+    /// [`Self::delegated_principal_pool`]'s.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn run_token_principal_pool(
+        pool: &PgPool,
+        public_key: &[u8; 32],
+    ) -> Result<Option<(Uuid, Option<String>)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, properties ->> 'llm_model' FROM public.agents WHERE public_key = $1",
+        )
+        .bind(public_key.as_slice())
+        .fetch_optional(pool)
+        .await?)
+    }
+
     /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that
     /// is not bound to a human operator while the database is ARMED (migration
     /// 122); return quietly otherwise (bound, unarmed, or this session's valve

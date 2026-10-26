@@ -6,6 +6,8 @@
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 //! - `urn:epigraph:grant:elevate`: a confirmed grant-mode elevation ticket, redeemed once
 //!   for a short, refreshless, elevated access token (elevation plan EL-5)
+//! - `urn:epigraph:grant:run-token`: a host delegator's short, refreshless, delegated token
+//!   for an operated LLM agent (`oauth::run_token`)
 
 // UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
 // the step that MINTS the principal; a Viewer cannot precede it.
@@ -72,6 +74,11 @@ pub struct TokenRequest {
     pub ticket_id: Option<String>,
     /// For the elevate grant: the redeem secret shown once with that ticket (hex).
     pub redeem_secret: Option<String>,
+    /// For the run-token grant: the principal's identity public key (64 hex).
+    pub agent_public_key: Option<String>,
+    /// For the run-token grant: free text naming the schedule or run (audit
+    /// only, at most 64 characters).
+    pub run_label: Option<String>,
 }
 
 /// The grant that redeems a confirmed grant-mode elevation ticket.
@@ -253,8 +260,10 @@ pub(crate) fn binds_refresh_family(client_type: &str) -> bool {
 /// refused here like any other. The registry IS read on the request path, for
 /// one kind of token only: a delegated run token's `dlg` delegator, through
 /// `AgentRepository::delegated_principal_pool` (the REST bearer middlewares
-/// and the MCP dispatch, on every request that carries one). No grant here
-/// mints such a token yet.
+/// and the MCP dispatch, on every request that carries one), and at mint by
+/// the run-token grant (`oauth::run_token`), which asks the same question
+/// before it issues one. This function stays the refusal for every other
+/// grant.
 ///
 /// # Errors
 /// `ApiError::Forbidden` naming the operator; `ApiError::InternalError` if the
@@ -342,6 +351,9 @@ pub async fn token_endpoint(
         "refresh_token" => handle_refresh_token(&state, &req).await,
         "authorization_code" => handle_authorization_code(&state, &req).await,
         ELEVATE_GRANT_TYPE => handle_elevate_grant(&state, &req).await,
+        crate::oauth::run_token::RUN_TOKEN_GRANT_TYPE => {
+            crate::oauth::run_token::handle_run_token_grant(&state, &req).await
+        }
         other => {
             // Look up an external provider by grant_type.
             if let Some(provider) = state.providers.by_grant_type(other) {

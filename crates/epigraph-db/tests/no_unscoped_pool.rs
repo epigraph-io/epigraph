@@ -544,6 +544,16 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          `oauth.` event about the client.",
     ),
     (
+        "oauth/run_token.rs",
+        1,
+        "Pre-authentication, as `oauth/token.rs`: the run-token grant MINTS a token for a \
+         principal, so no Viewer can precede it. Its one pool binding serves the delegator \
+         client's row (`oauth_clients`, which carries no RLS), the principal's identity-key \
+         lookup (`agents`, universally readable by policy), the delegation's liveness (one \
+         statement over app-executable SECURITY DEFINER reads that answer without a stamp) and \
+         the mint's audit row in `security_events`. None reads a tenancy-partitioned row.",
+    ),
+    (
         "oauth/token.rs",
         17,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
