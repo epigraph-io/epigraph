@@ -1433,6 +1433,32 @@ mod tests {
 
         // Trace inputs should reference all evidence
         assert_eq!(packets[0].reasoning_trace.inputs.len(), 2);
+
+        // Ruling R-34: the FIGURE evidence (its own sign site) carries a v1
+        // EVIDENCE signature over its content hash, which is no claim
+        // signature over that hash.
+        let fig = &packets[0].evidence[1];
+        let sig: [u8; 64] = hex::decode(fig.signature.as_ref().expect("figure is signed"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut hash = [0u8; 32];
+        hex::decode_to_slice(&fig.content_hash, &mut hash).unwrap();
+        let check = |kind| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &signer.public_key(),
+                kind,
+                &hash,
+                &sig,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            check(SignedEntity::Evidence),
+            Some(epigraph_crypto::SignatureScheme::V1),
+            "the figure evidence is not signed as v1 evidence"
+        );
+        assert_eq!(check(SignedEntity::Claim), None);
     }
 
     #[test]

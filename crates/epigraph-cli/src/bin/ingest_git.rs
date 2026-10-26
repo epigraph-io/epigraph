@@ -2996,6 +2996,31 @@ mod tests {
         assert_eq!(props["source"], "git-history");
         assert_eq!(props["node"], "repo");
         assert_eq!(props["repo"], "epigraph-io/epiclaw-host");
+
+        // Ruling R-34: the repo node's evidence carries a v1 EVIDENCE
+        // signature over its content hash, which is no claim signature.
+        let ev = &p.evidence[0];
+        let sig: [u8; 64] = hex::decode(ev.signature.as_ref().expect("evidence is signed"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut hash = [0u8; 32];
+        hex::decode_to_slice(&ev.content_hash, &mut hash).unwrap();
+        let check = |kind| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &signer.public_key(),
+                kind,
+                &hash,
+                &sig,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            check(SignedEntity::Evidence),
+            Some(epigraph_crypto::SignatureScheme::V1),
+            "the repo node's evidence is not signed as v1 evidence"
+        );
+        assert_eq!(check(SignedEntity::Claim), None);
     }
 
     // -------------------------------------------------------------------------
