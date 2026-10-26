@@ -1698,6 +1698,42 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **179**: public `role_binding_attached_agents`. A third mode for 165's
+  role bindings: the role HOLDER plus the agents ATTACHED to the role (166's
+  `role_agents`) only. Adds `group_role_bindings.attached_agents boolean NOT
+  NULL DEFAULT false` and the CHECK `group_role_bindings_one_agent_mode`
+  (never together with `include_agents`); existing bindings keep 165's
+  meaning, no backfill. Modes: `holder_only` (both false),
+  `registered_agents` (165's `include_agents`), `attached_agents`. In the
+  attached mode an agent is a member while it has a live, undetached
+  attachment to the BOUND role AND its own human (165's agent arm: acting
+  live link or live client allowance) holds a live assignment of the role;
+  an agent registered to the holder but not attached, and an agent attached
+  while another human holds the role, are not members (the same rule as
+  166's `ROL01`). Re-states `epigraph_role_derived_memberships` (165's body
+  plus the attached arm; the viewer set, the writer scope and the roster all
+  ask it, none is re-stated), `epigraph_group_role_bindings_guard_update`
+  (the mode joins the immutable tuple) and `epigraph_group_role_bindings_audit`
+  (the row names `attached_agents` and `agent_mode`). Adds mode-taking
+  overloads `epigraph_bind_group_role(text, uuid, text, text, text)` and
+  `epigraph_define_group_role(text, text, uuid, text, text, text)`
+  (maintenance only, not app-executable; unknown mode `22023`); 165's
+  boolean signatures are unchanged. Callers cast the mode argument
+  (`$4::text` / `$4::boolean`): a client caching statements by SQL text
+  otherwise reuses one overload's statement for the other. GRB01 is NOT
+  relaxed (an elevating or audit-reading role is bound in no mode). CLI:
+  `define-group-role` / `bind-group-role --agent-mode MODE`. Pinned by
+  `epigraph-db/tests/group_role_membership.rs` (the 179 section),
+  `schema_contract.rs::migration_179_attached_mode_definers_are_owned_and_granted`
+  and `::migration_179_attached_arm_survives_at_head`, and
+  `epigraph-cli/tests/operator_group_role.rs`. Undo in the file's header. A
+  precondition checks the md5 of the three 165 bodies it re-states and
+  RAISEs `55000` (changing nothing) over any other body; a LATER re-statement
+  of the derivation must start from 179's body (the head pin fails
+  otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
+  **Deploy order:** after 165 and 166; before any operator CLI call with
+  `--agent-mode attached_agents` (the other modes work without it).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
