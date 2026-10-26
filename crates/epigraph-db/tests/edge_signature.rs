@@ -122,6 +122,7 @@ async fn a_writer_signs_its_new_edge_and_it_verifies_as_v1(pool: PgPool) {
         "{check:?}"
     );
     assert_eq!(check.content_matches, Some(true), "{check:?}");
+    assert_eq!(check.key_kind, Some("unattested"), "{check:?}");
 }
 
 /// What the attestation binds. After signing, a properties patch and a
@@ -237,6 +238,105 @@ async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) 
         let check = verify(&pool, id).await;
         assert_eq!(check.signature_scheme, want, "{check:?}");
         assert_eq!(check.signature_valid, want.is_some(), "{check:?}");
+    }
+}
+
+/// The signer's key must be ADMITTED when the edge was created, by the rule
+/// the claim verifier uses (`key_window_admits`): an active or closed-window
+/// rotated key verifies; a revoked, pending, not-yet-valid or expired one does
+/// not, and a key whose `agent_keys` row refuses it does not come back in as
+/// the bare `agents.public_key` (security review of this module, finding 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_key_admitted_at_the_edges_creation_verifies_it(pool: PgPool) {
+    use chrono::{Duration, Utc};
+    let hour = Duration::hours(1);
+    let now = Utc::now();
+    // (label, status, valid_from, valid_until, key is also agents.public_key, verifies)
+    type Case = (
+        &'static str,
+        &'static str,
+        chrono::DateTime<Utc>,
+        Option<chrono::DateTime<Utc>>,
+        bool,
+        bool,
+    );
+    let cases: [Case; 7] = [
+        ("active", "active", now - hour, None, false, true),
+        (
+            "rotated-closed",
+            "rotated",
+            now - hour * 2,
+            Some(now + hour),
+            false,
+            true,
+        ),
+        ("revoked", "revoked", now - hour, None, false, false),
+        ("pending", "pending", now - hour, None, false, false),
+        ("not-yet-valid", "active", now + hour, None, false, false),
+        (
+            "expired-before",
+            "expired",
+            now - hour * 3,
+            Some(now - hour * 2),
+            false,
+            false,
+        ),
+        (
+            "revoked-agent-key",
+            "revoked",
+            now - hour,
+            None,
+            true,
+            false,
+        ),
+    ];
+    for (i, (label, status, from, until, as_agent_key, want)) in cases.into_iter().enumerate() {
+        let key = AgentSigner::from_bytes(&[0x90 + u8::try_from(i).unwrap(); 32]).expect("key");
+        let (w, _) = fixture::seed_agent_with_group(&pool, &format!("edge-key-{label}")).await;
+        if as_agent_key {
+            sqlx::query("UPDATE agents SET public_key = $2 WHERE id = $1")
+                .bind(w)
+                .bind(key.public_key().as_slice())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, valid_until) \
+             VALUES ($1, $2, 'signing', $3, $4, $5)",
+        )
+        .bind(w)
+        .bind(key.public_key().as_slice())
+        .bind(status)
+        .bind(from)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: seed agent key: {e}"));
+        let a = fixture::seed_public_claim(&pool, w, &format!("{label} A")).await;
+        let b = fixture::seed_public_claim(&pool, w, &format!("{label} B")).await;
+        let id =
+            EdgeRepository::create(&pool, a, "claim", b, "claim", "supports", None, None, None)
+                .await
+                .expect("edge");
+        let mut conn = pool.acquire().await.expect("acquire");
+        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &key, w)
+            .await
+            .expect("sign");
+        assert!(
+            matches!(out, EdgeSignOutcome::Signed { .. }),
+            "{label}: {out:?}"
+        );
+        drop(conn);
+
+        let check = verify(&pool, id).await;
+        assert_eq!(check.content_matches, Some(true), "{label}: {check:?}");
+        assert_eq!(check.signature_valid, want, "{label}: {check:?}");
+        assert_eq!(
+            check.key_kind,
+            want.then_some("signing"),
+            "{label}: {check:?}"
+        );
     }
 }
 

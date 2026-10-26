@@ -42,6 +42,45 @@ pub struct AgentKeyRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// How far before a key's `valid_from` a signed row may be dated and still be
+/// admitted by [`key_window_admits`].
+///
+/// A row's `created_at` and a key's `valid_from` come from different clocks
+/// (the writer's and the database's), so a writer a little behind the
+/// database dates its first rows before the window opens. Clock skew, not a
+/// security boundary; only the LOWER bound is relaxed, a window's END
+/// (rotation, the legacy cut-over) stays exact.
+pub const KEY_VALID_FROM_SKEW_SECS: i64 = 60;
+
+/// Whether an attested key with this `status` and window admits a signature
+/// on a row dated `at`: inside `[valid_from - KEY_VALID_FROM_SKEW_SECS,
+/// valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a recorded
+/// `valid_until` (a rotated key with an open window records no end, so it
+/// admits nothing). A REVOKED or PENDING key admits nothing: a revoked key is
+/// treated as compromised from the start. `status` is in the SQL spelling
+/// (`lower(btrim(..))`).
+///
+/// The ONE window rule: `epigraph-mcp`'s claim verifier and boot verdict and
+/// the edge verifier (`repos::edge_signature`) all call it, so they cannot
+/// disagree about a key.
+#[must_use]
+pub fn key_window_admits(
+    status: &str,
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
+    at: DateTime<Utc>,
+) -> bool {
+    let opens = valid_from - chrono::Duration::seconds(KEY_VALID_FROM_SKEW_SECS);
+    if at < opens || valid_until.is_some_and(|until| at >= until) {
+        return false;
+    }
+    match status {
+        "active" => true,
+        "rotated" | "expired" => valid_until.is_some(),
+        _ => false,
+    }
+}
+
 /// One ATTESTED key (`signing` or `identity-legacy`) of a claim's author or
 /// signer, as [`AgentKeyRepository::attested_keys_for_claim`] returns it.
 ///

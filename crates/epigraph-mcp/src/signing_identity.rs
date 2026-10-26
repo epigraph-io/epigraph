@@ -151,7 +151,8 @@ pub struct KeyBinding {
     pub signature_scheme: Option<epigraph_crypto::SignatureScheme>,
 }
 
-/// How far before a key's `valid_from` a claim may be dated and still bind.
+/// How far before a key's `valid_from` a claim may be dated and still bind:
+/// the shared window rule's skew ([`epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS`]).
 ///
 /// `claims.created_at` is stamped by the writer's clock (`Claim::new`) and
 /// `valid_from` by the database's (`now()` at registration), so a writer a
@@ -160,7 +161,7 @@ pub struct KeyBinding {
 /// the writer and is not covered by the signature, so the lower bound never
 /// stopped a determined backdater. Only the LOWER bound is relaxed; a window's
 /// END (rotation, the legacy cut-over) stays exact.
-pub const VALID_FROM_SKEW_SECS: i64 = 60;
+pub const VALID_FROM_SKEW_SECS: i64 = epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS;
 
 /// Whether an attested key row was valid at `at`: inside `[valid_from -
 /// VALID_FROM_SKEW_SECS, valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a
@@ -172,23 +173,16 @@ fn valid_at(row: &AttestedKeyRow, at: DateTime<Utc>) -> bool {
 }
 
 /// [`valid_at`] over the fields alone, shared with the boot verdict so the
-/// boot check and `verify_claim` cannot disagree about a window. `status` is
-/// in the SQL spelling (`lower(btrim(..))`).
+/// boot check and `verify_claim` cannot disagree about a window. It IS the
+/// repository's [`epigraph_db::repos::agent_key::key_window_admits`], which
+/// the edge verifier calls too.
 fn window_admits(
     status: &str,
     valid_from: DateTime<Utc>,
     valid_until: Option<DateTime<Utc>>,
     at: DateTime<Utc>,
 ) -> bool {
-    let opens = valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
-    if at < opens || valid_until.is_some_and(|until| at >= until) {
-        return false;
-    }
-    match status {
-        "active" => true,
-        "rotated" | "expired" => valid_until.is_some(),
-        _ => false,
-    }
+    epigraph_db::repos::agent_key::key_window_admits(status, valid_from, valid_until, at)
 }
 
 fn kind_of(row: &AttestedKeyRow) -> Option<&'static str> {

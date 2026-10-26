@@ -114,11 +114,16 @@ pub struct EdgeSignatureCheck {
     /// `edges.signature IS NOT NULL`.
     pub signed: bool,
     /// The stored signature verifies, as an EDGE signature, over the STORED
-    /// `content_hash` under the signer's `agents.public_key` or one of its
-    /// attested `agent_keys` (`signing`, `identity-legacy`).
+    /// `content_hash`, under a key of the signer that was admitted when the
+    /// edge was created (see `key_kind`).
     pub signature_valid: bool,
     /// Which message verified (`v1` / `legacy`); `None` when nothing does.
     pub signature_scheme: Option<SignatureScheme>,
+    /// The kind of key that verified: `signing` / `identity-legacy` (an
+    /// attested `agent_keys` row whose status and window admit the edge's
+    /// `created_at`) or `unattested` (the signer's `agents.public_key`, only
+    /// when no `agent_keys` row carries it). `None` when nothing verifies.
+    pub key_kind: Option<&'static str>,
     /// The row recomputes to its stored `content_hash`; `None` when no digest
     /// is stored (an unsigned edge, or a legacy signature with no digest).
     pub content_matches: Option<bool>,
@@ -240,35 +245,85 @@ impl EdgeSignatureRepository {
             None => None,
         };
 
-        let mut signature_scheme = None;
+        let created_at: DateTime<Utc> = row.get("created_at");
+        let mut verified: Option<(SignatureScheme, &'static str)> = None;
         if let (Some(sig), Some(h), Some(signer)) = (signature.as_deref(), stored_hash, signer_id) {
             if let Ok(sig) = <[u8; 64]>::try_from(sig) {
-                let keys: Vec<Vec<u8>> = sqlx::query_scalar(
-                    "SELECT public_key FROM agents WHERE id = $1 \
-                     UNION ALL \
-                     SELECT public_key FROM agent_keys WHERE agent_id = $1 \
-                        AND lower(btrim(key_type)) IN ('signing', 'identity-legacy')",
-                )
-                .bind(signer)
-                .fetch_all(&mut *conn)
-                .await?;
-                signature_scheme = keys.iter().find_map(|k| {
-                    <[u8; 32]>::try_from(k.as_slice()).ok().and_then(|k| {
-                        SignatureVerifier::verify_entity(&k, SignedEntity::Edge, &h, &sig)
-                            .ok()
-                            .flatten()
-                    })
+                let keys = Self::admitted_keys(conn, signer, created_at).await?;
+                verified = keys.iter().find_map(|(key, kind)| {
+                    SignatureVerifier::verify_entity(key, SignedEntity::Edge, &h, &sig)
+                        .ok()
+                        .flatten()
+                        .map(|scheme| (scheme, *kind))
                 });
             }
         }
-
         Ok(Some(EdgeSignatureCheck {
             signed: signature.is_some(),
-            signature_valid: signature_scheme.is_some(),
-            signature_scheme,
+            signature_valid: verified.is_some(),
+            signature_scheme: verified.map(|(scheme, _)| scheme),
+            key_kind: verified.map(|(_, kind)| kind),
             content_matches,
             signer_id,
         }))
+    }
+
+    /// The signer's keys that may verify a signature on a row dated `at`:
+    ///
+    /// * each attested `agent_keys` row (`signing`, `identity-legacy`) whose
+    ///   status and window admit `at` ([`crate::repos::agent_key::key_window_admits`],
+    ///   the rule the claim verifier uses), and
+    /// * the signer's `agents.public_key` ("unattested") only when NO
+    ///   `agent_keys` row of the signer carries those bytes: a key with a
+    ///   recorded lifecycle is governed by it, so a revoked, pending or
+    ///   out-of-window key cannot come back in as the bare agent key.
+    async fn admitted_keys(
+        conn: &mut sqlx::PgConnection,
+        signer: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<([u8; 32], &'static str)>, DbError> {
+        // (public_key, key_type, status, valid_from, valid_until)
+        type KeyRow = (
+            Vec<u8>,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        );
+        let rows: Vec<KeyRow> = sqlx::query_as(
+            "SELECT public_key, lower(btrim(key_type)), lower(btrim(status)), \
+                        valid_from, valid_until \
+                   FROM agent_keys WHERE agent_id = $1 ORDER BY created_at, id",
+        )
+        .bind(signer)
+        .fetch_all(&mut *conn)
+        .await?;
+        let agent_key: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+                .bind(signer)
+                .fetch_optional(&mut *conn)
+                .await?;
+
+        let mut out = Vec::new();
+        for (key, key_type, status, from, until) in &rows {
+            let kind = match key_type.as_str() {
+                "signing" => "signing",
+                "identity-legacy" => "identity-legacy",
+                _ => continue,
+            };
+            if crate::repos::agent_key::key_window_admits(status, *from, *until, at) {
+                if let Ok(k) = <[u8; 32]>::try_from(key.as_slice()) {
+                    out.push((k, kind));
+                }
+            }
+        }
+        if let Some(k) = agent_key
+            .filter(|k| !rows.iter().any(|(key, ..)| key == k))
+            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+        {
+            out.push((k, "unattested"));
+        }
+        Ok(out)
     }
 
     /// The unsigned-edge metric: how many of the edges `viewer` may read carry
