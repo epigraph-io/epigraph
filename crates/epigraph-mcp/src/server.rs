@@ -274,7 +274,7 @@ impl EpiGraphMcpFull {
         )
         .await
         .map_err(|e| {
-            crate::errors::internal_error(format!("could not re-check the admin grant: {e}"))
+            crate::errors::internal_error_logged("could not re-check the admin grant", e)
         })?;
         if !live {
             return Err(McpError::invalid_request(

@@ -93,7 +93,12 @@ async fn require_authority_over(
 ) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
     let Some(head) = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
         .await
-        .map_err(|e| internal_error(format!("{tool_name}: could not resolve the workflow: {e}")))?
+        .map_err(|e| {
+            crate::errors::internal_error_logged(
+                format!("{tool_name}: could not resolve the workflow"),
+                e,
+            )
+        })?
     else {
         return Ok(None);
     };
@@ -163,7 +168,9 @@ pub async fn add_step(
             "add_step",
         )
         .await
-        .map_err(|e| internal_error(format!("add_step: could not record authorship: {e}")))?;
+        .map_err(|e| {
+            crate::errors::internal_error_logged("add_step: could not record authorship", e)
+        })?;
     }
     // The arm that admitted the caller is recorded with the write: the admin
     // arm's audit row, or the provenance row of any other authenticated arm.
@@ -187,7 +194,7 @@ pub async fn add_step(
     }
     tx.commit()
         .await
-        .map_err(|e| internal_error(format!("add_step: could not commit: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("add_step: could not commit", e))?;
 
     // Post-commit and best-effort, deliberately outside the transaction: the
     // embed holds a network round trip to OpenAI, and CLAUDE.md's embedding
@@ -266,7 +273,7 @@ pub async fn delete_step(
     }
     tx.commit()
         .await
-        .map_err(|e| internal_error(format!("delete_step: could not commit: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("delete_step: could not commit", e))?;
     success_json(&DeleteStepResponse {
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,

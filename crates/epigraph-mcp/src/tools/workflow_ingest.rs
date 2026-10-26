@@ -207,7 +207,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         "workflow_ingest",
     )
     .await
-    .map_err(|e| internal_error(format!("workflow ingest: could not record authorship: {e}")))?;
+    .map_err(|e| {
+        crate::errors::internal_error_logged("workflow ingest: could not record authorship", e)
+    })?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));
@@ -264,9 +266,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         )
         .await?;
     }
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged("workflow ingest: could not commit", e)
+    })?;
 
     // The DS wiring runs in its OWN system-agent-stamped transaction, after the
     // ingest commit. `claim_frames` / `mass_functions` / the cached-belief
@@ -443,10 +445,9 @@ pub async fn do_ingest_workflow_via_pool(
         // Named `unstamped_tx`, not `tx`: `residual_unstamped_writes.rs`'s
         // executor-call register counts calls spelled `&mut tx` as STAMPED, and
         // this one is not.
-        let mut unstamped_tx = pool
-            .begin()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not begin: {e}")))?;
+        let mut unstamped_tx = pool.begin().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not begin", e)
+        })?;
         let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
             &mut unstamped_tx,
             &plan,
@@ -454,17 +455,15 @@ pub async fn do_ingest_workflow_via_pool(
         )
         .await
         .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
-        unstamped_tx
-            .commit()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+        unstamped_tx.commit().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not commit", e)
+        })?;
         result
     };
     {
-        let mut ds_conn = pool
-            .acquire()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not acquire: {e}")))?;
+        let mut ds_conn = pool.acquire().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not acquire", e)
+        })?;
         wire_ds_after_ingest(&mut ds_conn, viewer, &plan, &result).await;
     }
     Ok(IngestWorkflowResponse {
@@ -664,8 +663,9 @@ async fn improve_workflow_hierarchy_with_inserted(
     let new_generation = parent_max + 1;
 
     extraction.source.canonical_name = parent_canonical_name.to_string();
-    extraction.source.generation = u32::try_from(new_generation)
-        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.generation = u32::try_from(new_generation).map_err(|e| {
+        crate::errors::internal_error_logged("new_generation does not fit in u32", e)
+    })?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let (response, inserted) =
@@ -715,8 +715,9 @@ pub async fn improve_workflow_hierarchy_via_pool(
             })?;
     let new_generation = parent_max + 1;
     extraction.source.canonical_name = parent_canonical_name.to_string();
-    extraction.source.generation = u32::try_from(new_generation)
-        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.generation = u32::try_from(new_generation).map_err(|e| {
+        crate::errors::internal_error_logged("new_generation does not fit in u32", e)
+    })?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let response = do_ingest_workflow_via_pool(pool, viewer, &extraction).await?;
