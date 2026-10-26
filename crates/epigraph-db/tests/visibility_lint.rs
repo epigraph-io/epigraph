@@ -2422,7 +2422,7 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
-    // ── Batch B1 (ruling R-36): same-human owners.
+    // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
     (
         "agent.rs",
         "humans_of",
@@ -2430,6 +2430,21 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
          itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
          `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "derivation_scope.rs",
+        "claim_is_public",
+        "READ of one claim's `visibility = 'public'` (ruling R-22). Every row it can return true \
+         for is public, so a viewer predicate would admit it anyway; a claim the session cannot \
+         see reads false, which is the private answer the caller wants.",
+    ),
+    (
+        "derivation_scope.rs",
+        "public_derived",
+        "READ of which BBAs are derived from PUBLIC sources only (ruling R-22). Every table it \
+         reads (`mass_functions`, `evidence`, `edges`, `claims`) is constrained to \
+         `visibility = 'public'`, so it returns only ids every viewer may read; its \
+         viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
     ),
     (
         "admin_scope_enforcement.rs",

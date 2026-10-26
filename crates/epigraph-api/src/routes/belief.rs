@@ -285,21 +285,28 @@ struct ScopedBeliefWrite {
 
 /// A stored scoped belief (`ds_combined_beliefs`) of one scope: the scope's
 /// stored BBAs, as this handler always folded them (raw masses, no discount),
-/// folded by the engine's owner-aware rule (ruling R-36: sibling agents of one
-/// human are reduced cautiously, never multiplied). `None` when no row is left
-/// or the fold fails (best-effort, as before).
+/// restricted to the rows the claim's stored beliefs may be computed from
+/// (ruling R-22: a public claim's are its public-derived BBAs only), folded by
+/// the engine's owner-aware rule (ruling R-36: sibling agents of one human
+/// are reduced cautiously, never multiplied). `None` when no row is left or
+/// the fold fails (best-effort, as before).
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn scoped_belief_write(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
     ds_frame: &epigraph_ds::FrameOfDiscernment,
     h_idx: Option<i32>,
-    mut rows: Vec<epigraph_db::MassFunctionRow>,
+    rows: Vec<epigraph_db::MassFunctionRow>,
     conflict_threshold: f64,
     scope_type: &'static str,
     scope_id: Uuid,
 ) -> Option<ScopedBeliefWrite> {
+    let mut rows = epigraph_engine::derivation_scope::retain_for_cache(conn, claim_id, rows)
+        .await
+        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope rows: {e}"))
+        .ok()?;
     rows.sort_by_key(|r| r.id);
     let rows: Vec<(epigraph_db::MassFunctionRow, epigraph_ds::MassFunction)> = rows
         .into_iter()
@@ -2020,6 +2027,7 @@ pub async fn submit_evidence(
         if let Some(write) = scoped_belief_write(
             read,
             &viewer,
+            request.claim_id,
             &ds_frame,
             h_idx,
             perspective_rows,
@@ -2100,6 +2108,7 @@ pub async fn submit_evidence(
                     if let Some(write) = scoped_belief_write(
                         read,
                         &viewer,
+                        request.claim_id,
                         &ds_frame,
                         h_idx,
                         community_rows,
@@ -2757,13 +2766,15 @@ pub async fn get_pignistic(
     )
     .await?;
 
-    // The BBAs with their writers' owners, for the same-human rule (ruling
-    // R-36).
+    // Only the BBAs whose sources this viewer can read (ruling R-22), with
+    // their writers' owners for the same-human rule (ruling R-36).
     let mut rows: Vec<epigraph_db::MassFunctionRow> = all_rows
         .into_iter()
         .filter(|row| row.combination_method.as_deref() == Some("discount"))
         .collect();
     rows.sort_by_key(|r| r.id);
+    let rows =
+        epigraph_engine::derivation_scope::retain_for_viewer(&mut read, &viewer, rows).await?;
     let (rows, masses): (Vec<epigraph_db::MassFunctionRow>, Vec<MassFunction>) = rows
         .into_iter()
         .filter_map(|row| {

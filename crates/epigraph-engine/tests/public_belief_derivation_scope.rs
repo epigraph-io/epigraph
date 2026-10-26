@@ -1,0 +1,234 @@
+//! Ruling R-22 (backlog fef24216): a BBA derived from a NON-PUBLIC source never
+//! enters a PUBLIC claim's cached or served-to-everyone belief, and a member
+//! of the source's group still gets the full belief through its own reads.
+//!
+//! # What was wrong, measured at origin/main before this file
+//!
+//! A `mass_functions` row inherits its claim's tenancy, so every BBA on a
+//! public claim is public, whatever it was derived from. An edge-factor BBA
+//! written for a group-private edge from a group-private claim carries that
+//! claim's belief onto the public target, and every fold of the target
+//! (the cache recompute, the framed `get_belief` for ANY viewer) included it:
+//! a public reader's Bel/Pl moved with private evidence it cannot see. The
+//! same holds for a BBA citing an evidence row narrowed to a private group.
+//!
+//! # The oracle
+//!
+//! The public claim's belief from its public BBA alone (read before the
+//! private-derived BBA exists). After the private-derived BBA is written and
+//! the cache recomputed AS THE MEMBER, the cache and a public reader's framed
+//! read must still equal it exactly; the member's framed read must be higher
+//! (it folds both).
+//!
+//! On the `#[sqlx::test]` superuser pool the viewer predicates decide (row
+//! security is bypassed), which is what pins the derivation rule itself.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use epigraph_db::visibility::Viewer;
+use epigraph_db::PgPool;
+use epigraph_engine::belief_query;
+use epigraph_engine::edge_factor::{
+    auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief, EdgeFactorOutcome,
+};
+use uuid::Uuid;
+
+/// A claim whose stored interval is (bel, pl), so an edge from it wires a BBA.
+async fn with_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
+    sqlx::query("UPDATE claims SET belief = $2, plausibility = $3 WHERE id = $1")
+        .bind(claim)
+        .bind(bel)
+        .bind(pl)
+        .execute(pool)
+        .await
+        .expect("set the source interval");
+}
+
+async fn cached_betp(pool: &PgPool, claim: Uuid) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the cache")
+        .expect("the cache is filled")
+}
+
+async fn edge_visibility(pool: &PgPool, edge: Uuid) -> String {
+    sqlx::query_scalar("SELECT visibility::text FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(pool)
+        .await
+        .expect("edge")
+}
+
+async fn wire(pool: &PgPool, viewer: &Viewer, signer: Uuid, edge: Uuid, from: Uuid, to: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = auto_wire_ds_for_edge(&mut conn, viewer, edge, signer, from, to, "supports")
+        .await
+        .expect("wire the edge factor");
+    assert_eq!(
+        out,
+        EdgeFactorOutcome::Wired,
+        "PREMISE: the edge wires a BBA"
+    );
+}
+
+async fn framed_betp(pool: &PgPool, viewer: &Viewer, claim: Uuid, frame: Uuid) -> f64 {
+    belief_query::get_belief(pool, viewer, claim, Some(frame))
+        .await
+        .expect("framed get_belief")
+        .pignistic_prob
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_edge_factor_never_enters_a_public_claims_belief(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "r22-member").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "r22-author").await;
+    let member_viewer = Viewer::resolve(&pool, member).await.expect("member viewer");
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary_truth");
+
+    let target = fixture::seed_public_claim(&pool, author, "r22 public target").await;
+    let public_source = fixture::seed_public_claim(&pool, author, "r22 public source").await;
+    let private_source =
+        fixture::seed_group_claim(&pool, member, group, "r22 group-private source").await;
+    with_interval(&pool, public_source, 0.6, 0.8).await;
+    with_interval(&pool, private_source, 0.9, 0.95).await;
+
+    // The public BBA: a public edge from a public claim.
+    let public_edge = fixture::seed_edge(&pool, public_source, target).await;
+    assert_eq!(edge_visibility(&pool, public_edge).await, "public");
+    wire(&pool, &public, author, public_edge, public_source, target).await;
+    let public_only = cached_betp(&pool, target).await;
+    assert!(
+        (framed_betp(&pool, &public, target, frame).await - public_only).abs() < 1e-9,
+        "PREMISE: the framed read agrees with the cache"
+    );
+
+    // The private-derived BBA: the member's edge from its group's claim. The
+    // trigger makes the edge the group's; the BBA row is the PUBLIC target's.
+    let private_edge = fixture::seed_edge(&pool, private_source, target).await;
+    assert_ne!(
+        edge_visibility(&pool, private_edge).await,
+        "public",
+        "PREMISE: an edge from a group-private claim is not public"
+    );
+    wire(
+        &pool,
+        &member_viewer,
+        member,
+        private_edge,
+        private_source,
+        target,
+    )
+    .await;
+    // The member's recompute is the one that used to write the leak.
+    let mut conn = pool.acquire().await.expect("acquire");
+    recompute_claim_cached_belief(&mut conn, &member_viewer, target)
+        .await
+        .expect("recompute as the member");
+    drop(conn);
+
+    let cached = cached_betp(&pool, target).await;
+    assert!(
+        (cached - public_only).abs() < 1e-9,
+        "the public claim's cached belief moved with a group-private edge factor: \
+         {public_only} -> {cached}"
+    );
+    let public_read = framed_betp(&pool, &public, target, frame).await;
+    assert!(
+        (public_read - public_only).abs() < 1e-9,
+        "a public reader's framed belief folded a group-private edge factor: \
+         {public_only} -> {public_read}"
+    );
+    let member_read = framed_betp(&pool, &member_viewer, target, frame).await;
+    assert!(
+        member_read > public_only + 1e-3,
+        "the group member's own read must still fold both BBAs: {member_read} vs {public_only}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "r22-ev-member").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "r22-ev-author").await;
+    let member_viewer = Viewer::resolve(&pool, member).await.expect("member viewer");
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary_truth");
+    let target = fixture::seed_public_claim(&pool, author, "r22 evidence target").await;
+    let store = |agent: Uuid, evidence: Option<Uuid>, perspective: Option<Uuid>, t: f64| {
+        let pool = pool.clone();
+        async move {
+            epigraph_db::MassFunctionRepository::store_with_perspective(
+                &pool,
+                target,
+                frame,
+                Some(agent),
+                perspective,
+                &serde_json::json!({"0": t, "0,1": 1.0 - t}),
+                None,
+                Some("auto_wire"),
+                Some(1.0),
+                None,
+                "unknown",
+                evidence,
+            )
+            .await
+            .expect("store a BBA")
+        }
+    };
+
+    // The public BBA cites public evidence on the claim.
+    let public_ev = fixture::seed_evidence(&pool, target, "observation").await;
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, public_ev, Some(author))
+        .await
+        .expect("evidence perspective");
+    store(author, Some(public_ev), Some(public_ev), 0.6).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    recompute_claim_cached_belief(&mut conn, &public, target)
+        .await
+        .expect("recompute");
+    drop(conn);
+    let public_only = cached_betp(&pool, target).await;
+
+    // The second BBA cites evidence narrowed to the member's group (the shape
+    // `epigraph-operator hide-evidence` leaves: the BBA row stays public).
+    let hidden_ev = fixture::seed_evidence(&pool, target, "document").await;
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(hidden_ev)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("narrow the evidence to the group");
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, hidden_ev, Some(member))
+        .await
+        .expect("evidence perspective");
+    store(member, Some(hidden_ev), Some(hidden_ev), 0.8).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    recompute_claim_cached_belief(&mut conn, &member_viewer, target)
+        .await
+        .expect("recompute as the member");
+    drop(conn);
+
+    let cached = cached_betp(&pool, target).await;
+    assert!(
+        (cached - public_only).abs() < 1e-9,
+        "the public claim's cache folded a BBA citing group-private evidence: \
+         {public_only} -> {cached}"
+    );
+    let public_read = framed_betp(&pool, &public, target, frame).await;
+    assert!(
+        (public_read - public_only).abs() < 1e-9,
+        "a public reader folded a BBA citing group-private evidence: {public_read}"
+    );
+    let member_read = framed_betp(&pool, &member_viewer, target, frame).await;
+    assert!(
+        member_read > public_only + 1e-3,
+        "the group member's own read must still fold both BBAs: {member_read} vs {public_only}"
+    );
+}
