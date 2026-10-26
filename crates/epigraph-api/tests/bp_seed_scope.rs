@@ -7,12 +7,16 @@
 //!   diagnostic) serves BetP values to its caller, so a claim's seed folds only
 //!   the BBAs whose every source THAT caller can read; a run that writes
 //!   caches seeds each claim with the BBAs its cache may hold.
+//! * Ruling R-36 (backlog fe3ec493): the seed combine is a BBA-combining path,
+//!   so agreeing BBAs of two agents of one human never multiply there either.
 //!
 //! # What was wrong, measured before this file
 //!
 //! The read-only run seeded every visible BBA row, and a row on a public
 //! claim is public whatever it was derived from: a stranger's BP value moved
-//! with a BBA citing evidence narrowed to a group.
+//! with a BBA citing evidence narrowed to a group. Every seed was the
+//! pairwise `adaptive_combine` of all of a claim's rows, so sibling agents'
+//! rows multiplied.
 //!
 //! # The oracle
 //!
@@ -34,7 +38,9 @@ use epigraph_api::state::{ApiConfig, AppState, BpApply};
 use epigraph_db::visibility::Viewer;
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{scoped_pool, seed_agent_with_group, seed_evidence, seed_public_claim};
+use viewer_fixture::{
+    scoped_pool, seed_agent_with_group, seed_evidence, seed_human_operator, seed_public_claim,
+};
 
 async fn frame(pool: &PgPool, name: &str) -> Uuid {
     epigraph_db::FrameRepository::create(
@@ -199,4 +205,77 @@ async fn an_applying_cdst_run_seeds_a_public_claim_without_its_narrowed_bba(pool
         "BP apply seeded a public claim's cache from evidence narrowed to a group: \
          {public_only} -> {written} ({body})"
     );
+}
+
+async fn link(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("link the agent to its human");
+    assert!(out.link_live, "{out:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bp_seed_never_multiplies_two_agents_of_one_human(pool: PgPool) {
+    let frame = frame(&pool, "r36_bp_seed_frame").await;
+    let (human, _) = seed_human_operator(&pool, "r36-bp-human").await;
+    let (one, _) = seed_agent_with_group(&pool, "r36-bp-one").await;
+    let (two, _) = seed_agent_with_group(&pool, "r36-bp-two").await;
+    link(&pool, one, human).await;
+    link(&pool, two, human).await;
+    let (stranger, _) = seed_agent_with_group(&pool, "r36-bp-stranger").await;
+    let (author, _) = seed_agent_with_group(&pool, "r36-bp-author").await;
+
+    // Four isolated components: a seeded claim and an unseeded partner each.
+    let claim = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let c = seed_public_claim(&pool, author, label).await;
+            let p = seed_public_claim(&pool, author, &format!("{label} partner")).await;
+            factor(&pool, frame, c, p).await;
+            c
+        }
+    };
+    let siblings = claim("r36 bp siblings").await;
+    let stronger_alone = claim("r36 bp stronger sibling alone").await;
+    let different_owners = claim("r36 bp different owners").await;
+    let premultiplied = claim("r36 bp one row holding the product").await;
+
+    // The stronger sibling written first, so "the latest row wins" cannot
+    // pass for the rule.
+    bba(&pool, siblings, frame, two, None, 0.7).await;
+    bba(&pool, siblings, frame, one, None, 0.6).await;
+    bba(&pool, stronger_alone, frame, two, None, 0.7).await;
+    bba(&pool, different_owners, frame, two, None, 0.7).await;
+    bba(&pool, different_owners, frame, stranger, None, 0.6).await;
+    // Dempster's product of 0.7 and 0.6 on one hypothesis, as one row: what
+    // the seed of two independent agents' rows has always been.
+    bba(&pool, premultiplied, frame, author, None, 1.0 - 0.3 * 0.4).await;
+
+    let body = run(&pool, author, frame, false, false).await;
+    let (s, alone, d, product) = (
+        served(&body, siblings),
+        served(&body, stronger_alone),
+        served(&body, different_owners),
+        served(&body, premultiplied),
+    );
+    assert!(
+        (s - alone).abs() < 1e-9,
+        "two agents of one human multiplied in the BP seed: {s} vs the stronger alone {alone}"
+    );
+    assert!(
+        (d - product).abs() < 1e-9,
+        "agents of different owners must still seed as independent evidence, exactly as \
+         before: {d} vs {product}"
+    );
+    assert!(
+        d > alone + 1e-3,
+        "PREMISE: independent agents reinforce ({d} vs {alone})"
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(siblings)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 2, "history kept: both sibling rows stay stored");
 }

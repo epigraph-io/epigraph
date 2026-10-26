@@ -400,9 +400,9 @@ pub async fn bba_sources_for_rows(
 
 /// The inputs of the owner-aware fold, before its final Dempster step.
 struct OwnerPartition {
-    /// BBAs that fold as independent evidence: everything outside a sibling
-    /// group, already reduced by the same-source rule.
-    independent: Vec<MassFunction>,
+    /// Everything outside a sibling group, in row order, with its
+    /// same-source key (not yet reduced by the same-source rule).
+    rest: Vec<(Option<SourceKey>, MassFunction)>,
     /// One group per owner that at least two distinct agents speak for, in
     /// first-appearance order: per agent, that agent's own fold of its rows
     /// (same-source rule, then Dempster, normalised), and the largest
@@ -468,9 +468,59 @@ fn owner_partition(
     }
 
     Ok(OwnerPartition {
-        independent: same_source_slots(rest)?,
+        rest,
         sibling_groups,
     })
+}
+
+/// One sibling group reduced: its cautious reduction and the group's conflict
+/// (the larger of the reduction's and any member's own), or, when the rule is
+/// not defined on the group, its members unchanged (to fold as independent)
+/// and their largest own conflict, with a warning.
+fn reduce_sibling_group(
+    members: Vec<MassFunction>,
+    own_conflict: f64,
+) -> Result<(Vec<MassFunction>, f64), DsError> {
+    match cautious_reduce(&members)? {
+        Some((reduced, k)) => Ok((vec![reduced], k.max(own_conflict))),
+        None => {
+            // R-36 does not hold for this group: say so rather than
+            // aggregate silently.
+            tracing::warn!(
+                target: "belief.same_human",
+                siblings = members.len(),
+                hypotheses = members.first().map(|m| m.frame().hypothesis_count()),
+                "same-human sibling BBAs fold as independent: the cautious rule is not \
+                 defined on them (frame above the cautious limit, or total conflict)"
+            );
+            Ok((members, own_conflict))
+        }
+    }
+}
+
+/// The same-human rule (R-36) ALONE, for a combine of stored BBAs that is not
+/// [`combine_with_owner_dependence`] (the BP seed's pairwise adaptive
+/// combine): every BBA outside a sibling group is returned unchanged and in
+/// order, so a claim with no sibling agents combines exactly as before; each
+/// sibling group (per agent: same-source rule, then Dempster) is replaced by
+/// its cautious reduction, appended after them. The caller combines the
+/// result as independent evidence.
+///
+/// # Errors
+/// Propagates `DsError` from the per-agent folds or the cautious rule.
+pub fn reduce_same_owner_siblings(
+    items: Vec<(BbaSource, MassFunction)>,
+    conflict_threshold: f64,
+) -> Result<Vec<MassFunction>, DsError> {
+    let OwnerPartition {
+        rest,
+        sibling_groups,
+    } = owner_partition(items, conflict_threshold)?;
+    let mut out: Vec<MassFunction> = rest.into_iter().map(|(_, m)| m).collect();
+    for (members, own_conflict) in sibling_groups {
+        out.extend(reduce_sibling_group(members, own_conflict)?.0);
+    }
+    Ok(out)
 }
 
 /// [`combine_with_source_dependence`] with the same-human rule (R-36): the
@@ -495,30 +545,15 @@ pub fn combine_with_owner_dependence(
     conflict_threshold: f64,
 ) -> Result<(MassFunction, f64), DsError> {
     let OwnerPartition {
-        mut independent,
+        rest,
         sibling_groups,
     } = owner_partition(items, conflict_threshold)?;
+    let mut independent = same_source_slots(rest)?;
     let mut group_conflicts: Vec<f64> = Vec::new();
     for (members, own_conflict) in sibling_groups {
-        match cautious_reduce(&members)? {
-            Some((reduced, k)) => {
-                group_conflicts.push(k.max(own_conflict));
-                independent.push(reduced);
-            }
-            None => {
-                // R-36 does not hold for this group: say so rather than
-                // aggregate silently.
-                tracing::warn!(
-                    target: "belief.same_human",
-                    siblings = members.len(),
-                    hypotheses = members.first().map(|m| m.frame().hypothesis_count()),
-                    "same-human sibling BBAs fold as independent: the cautious rule is not \
-                     defined on them (frame above the cautious limit, or total conflict)"
-                );
-                group_conflicts.push(own_conflict);
-                independent.extend(members);
-            }
-        }
+        let (inputs, k) = reduce_sibling_group(members, own_conflict)?;
+        group_conflicts.push(k);
+        independent.extend(inputs);
     }
     let (combined, k) = dempster_across_items(independent, conflict_threshold)?;
     if group_conflicts.is_empty() {
@@ -1436,6 +1471,41 @@ mod tests {
             m_true(&c)
         );
         assert!(logs_contain("same-human sibling BBAs fold as independent"));
+    }
+
+    #[test]
+    fn reducing_siblings_alone_leaves_every_other_bba_as_given() {
+        // The BP seed combines the result itself, so a claim without sibling
+        // agents must get its rows back unchanged and in order.
+        let rows = vec![
+            (by(1, 9), support(0, 0.6, 1.0)),
+            (by(3, 7), support(1, 0.2, 1.0)),
+            (BbaSource::default(), support(0, 0.5, 1.0)),
+        ];
+        let expected: Vec<MassFunction> = rows.iter().map(|(_, m)| m.clone()).collect();
+        let out = reduce_same_owner_siblings(rows, 0.9).unwrap();
+        assert_eq!(out.len(), expected.len());
+        for (a, b) in out.iter().zip(&expected) {
+            assert_eq!(a.masses(), b.masses());
+        }
+        // Siblings of human 9 become one input, the stronger; the other
+        // owner's row stays as given, first.
+        let out = reduce_same_owner_siblings(
+            vec![
+                (by(1, 9), support(0, 0.6, 1.0)),
+                (by(3, 7), support(1, 0.2, 1.0)),
+                (by(2, 9), support(0, 0.7, 1.0)),
+            ],
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].masses(), support(1, 0.2, 1.0).masses());
+        assert!(
+            (m_true(&out[1]) - 0.7).abs() < 1e-9,
+            "got {}",
+            m_true(&out[1])
+        );
     }
 
     #[test]

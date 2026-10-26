@@ -728,7 +728,8 @@ async fn apply_bp_updates(
     Ok((written, skipped, skipped_compounds, skipped_less_readable))
 }
 
-/// The stored BBAs that seed a CDST BP run, admitted on one viewer-stamped
+/// The stored BBAs that seed a CDST BP run, with each row's source (writing
+/// agent, its owner, its same-source key), read on one viewer-stamped
 /// connection.
 ///
 /// Ruling R-22: a run that writes caches (`apply`) seeds each claim with the
@@ -744,7 +745,13 @@ async fn bp_seed_rows(
     viewer: &epigraph_db::visibility::Viewer,
     claim_ids: &[Uuid],
     apply: bool,
-) -> Result<Vec<epigraph_db::MassFunctionRow>, ApiError> {
+) -> Result<
+    Vec<(
+        epigraph_db::MassFunctionRow,
+        epigraph_engine::source_dependence::BbaSource,
+    )>,
+    ApiError,
+> {
     let rows =
         epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, viewer, claim_ids)
             .await
@@ -767,8 +774,10 @@ async fn bp_seed_rows(
     } else {
         epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, rows).await?
     };
+    let sources =
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows).await?;
     crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
-    Ok(rows)
+    Ok(rows.into_iter().zip(sources).collect())
 }
 
 /// The claims of a BP run whose connected component in the factor graph
@@ -967,8 +976,8 @@ pub async fn propagate_beliefs(
 
     // Only load mass functions when CDST might be used (skip for explicit
     // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
-    // (ruling R-22), for the coverage check too, so a BBA the caller may not
-    // see a fold of cannot flip the mode either.
+    // (rulings R-22 and R-36), for the coverage check too, so a BBA the
+    // caller may not see a fold of cannot flip the mode either.
     let (use_cdst, seed_rows) = match mode {
         "cdst" => (
             true,
@@ -982,7 +991,7 @@ pub async fn propagate_beliefs(
                 .await
                 .unwrap_or_default();
             let claims_with_mf: std::collections::HashSet<Uuid> =
-                rows.iter().map(|r| r.claim_id).collect();
+                rows.iter().map(|(r, _)| r.claim_id).collect();
             let use_cdst = !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len();
             (use_cdst, rows)
         }
@@ -990,21 +999,49 @@ pub async fn propagate_beliefs(
 
     if use_cdst {
         // Combine multiple mass functions per claim via adaptive combination
-        // (a claim may have evidence from multiple sources/agents)
-        let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
-        for row in &seed_rows {
+        // (a claim may have evidence from multiple sources/agents). Ruling
+        // R-36: agreeing BBAs of sibling agents of one human never multiply,
+        // so each claim's sibling groups are first reduced by the cautious
+        // rule (`reduce_same_owner_siblings`); a claim with no siblings
+        // combines exactly as before.
+        let mut per_claim: HashMap<
+            Uuid,
+            Vec<(
+                epigraph_engine::source_dependence::BbaSource,
+                epigraph_ds::MassFunction,
+            )>,
+        > = HashMap::new();
+        for (row, source) in seed_rows {
             if let Ok(mf) = epigraph_engine::cdst_bp::parse_mass_function_row(&row.masses) {
-                evidence
+                per_claim
                     .entry(row.claim_id)
-                    .and_modify(|existing| {
-                        if let Ok((combined, _)) =
-                            epigraph_ds::combination::adaptive_combine(existing, &mf, 0.3)
-                        {
-                            *existing = combined;
-                        }
-                    })
-                    .or_insert(mf);
+                    .or_default()
+                    .push((source, mf));
             }
+        }
+        let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
+        for (claim_id, items) in per_claim {
+            let fallback: Vec<epigraph_ds::MassFunction> =
+                items.iter().map(|(_, m)| m.clone()).collect();
+            let inputs = epigraph_engine::source_dependence::reduce_same_owner_siblings(items, 0.3)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        %claim_id,
+                        error = %e,
+                        "BP seed: same-human reduction failed; combining as independent"
+                    );
+                    fallback
+                });
+            let mut inputs = inputs.into_iter();
+            let Some(first) = inputs.next() else {
+                continue;
+            };
+            let seed = inputs.fold(first, |existing, mf| {
+                epigraph_ds::combination::adaptive_combine(&existing, &mf, 0.3)
+                    .map(|(combined, _)| combined)
+                    .unwrap_or(existing)
+            });
+            evidence.insert(claim_id, seed);
         }
 
         // Build initial beliefs: evidence where available, vacuous otherwise
