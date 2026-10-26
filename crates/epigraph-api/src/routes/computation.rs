@@ -604,14 +604,36 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// it is decided over the edges the caller can see, not structurally; see
 /// `compound_ids_among_sql` for the residual that leaves.
 ///
-/// Returns `(written, skipped_not_visible, skipped_compounds)`.
+/// # A public claim BP could have informed from a non-public one is SKIPPED
+///
+/// Ruling R-22: a public claim's cached belief is derived from public sources
+/// only. BP messages travel along factors, so a public claim's result can
+/// carry the belief of any claim in its connected component of the run's
+/// factor graph (`factor_variables`). A public claim whose component holds a
+/// claim that is not public (a group-private claim, or an id that is no
+/// visible claim at all) is skipped and counted in `skipped_non_public`.
+///
+/// Returns `(written, skipped_not_visible, skipped_compounds,
+/// skipped_non_public)`.
 #[cfg(feature = "db")]
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     updates: &[BpUpdate],
-) -> Result<(usize, usize, usize), ApiError> {
+    factor_variables: &[&[Uuid]],
+) -> Result<(usize, usize, usize, usize), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
+    let all_variables: Vec<Uuid> = factor_variables
+        .iter()
+        .flat_map(|v| v.iter().copied())
+        .collect();
+    let public =
+        epigraph_db::repos::derivation_scope::DerivationScopeRepository::public_claims_among(
+            &mut *tx,
+            &all_variables,
+        )
+        .await?;
+    let informed_by_non_public = public_claims_informed_by_non_public(factor_variables, &public);
     let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
     let visible: std::collections::HashSet<Uuid> =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM claims WHERE id = ANY($1)")
@@ -636,6 +658,7 @@ async fn apply_bp_updates(
     let mut written = 0_usize;
     let mut skipped = 0_usize;
     let mut skipped_compounds = 0_usize;
+    let mut skipped_non_public = 0_usize;
     for (claim_id, betp, interval) in updates {
         if !visible.contains(claim_id) {
             skipped += 1;
@@ -643,6 +666,10 @@ async fn apply_bp_updates(
         }
         if compounds.contains(claim_id) {
             skipped_compounds += 1;
+            continue;
+        }
+        if informed_by_non_public.contains(claim_id) {
+            skipped_non_public += 1;
             continue;
         }
         let result = match interval {
@@ -695,7 +722,60 @@ async fn apply_bp_updates(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the belief updates: {e}"),
     })?;
-    Ok((written, skipped, skipped_compounds))
+    Ok((written, skipped, skipped_compounds, skipped_non_public))
+}
+
+/// The public claims of a BP run whose connected component in the factor
+/// graph (`factor_variables`, one variable list per factor) holds a variable
+/// that is not in `public`.
+#[cfg(feature = "db")]
+fn public_claims_informed_by_non_public(
+    factor_variables: &[&[Uuid]],
+    public: &std::collections::HashSet<Uuid>,
+) -> std::collections::HashSet<Uuid> {
+    use std::collections::HashMap;
+    let mut index: HashMap<Uuid, usize> = HashMap::new();
+    let mut parent: Vec<usize> = Vec::new();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut cur = x;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    for vars in factor_variables {
+        let mut first: Option<usize> = None;
+        for v in vars.iter() {
+            let i = *index.entry(*v).or_insert_with(|| {
+                parent.push(parent.len());
+                parent.len() - 1
+            });
+            match first {
+                None => first = Some(i),
+                Some(f) => {
+                    let (a, b) = (find(&mut parent, f), find(&mut parent, i));
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut tainted_roots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (v, &i) in &index {
+        if !public.contains(v) {
+            tainted_roots.insert(find(&mut parent, i));
+        }
+    }
+    index
+        .iter()
+        .filter(|(v, &i)| public.contains(v) && tainted_roots.contains(&find(&mut parent, i)))
+        .map(|(v, _)| *v)
+        .collect()
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
@@ -819,6 +899,10 @@ pub async fn propagate_beliefs(
         })
         .collect();
 
+    // The run's factor graph, for apply's R-22 guard (`apply_bp_updates`).
+    let factor_variables: Vec<&[Uuid]> =
+        factors.iter().map(|f| f.variable_ids.as_slice()).collect();
+
     // -- CDST branch: decide mode, load mass functions if needed ---------------
     let mode = request.mode.as_deref().unwrap_or("auto");
 
@@ -851,6 +935,36 @@ pub async fn propagate_beliefs(
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to load mass functions: {e}"),
         })?;
+        // Ruling R-22: a run that writes caches seeds each PUBLIC claim with
+        // its public-derived BBAs only, as its own recompute folds them.
+        let mf_rows = if apply {
+            use epigraph_db::repos::derivation_scope::DerivationScopeRepository as Scope;
+            let mut scope_read = state.read_as(&viewer).await.map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "propagate_beliefs",
+                    "could not acquire a viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to acquire a scoped connection".to_string(),
+                }
+            })?;
+            let public = Scope::public_claims_among(&mut *scope_read, &all_var_ids).await?;
+            let of_public: Vec<Uuid> = mf_rows
+                .iter()
+                .filter(|r| public.contains(&r.claim_id))
+                .map(|r| r.id)
+                .collect();
+            let admissible = Scope::public_derived(&mut *scope_read, &of_public).await?;
+            crate::routes::finish_scoped_read(scope_read, "propagate_beliefs").await?;
+            mf_rows
+                .into_iter()
+                .filter(|r| !public.contains(&r.claim_id) || admissible.contains(&r.id))
+                .collect()
+        } else {
+            mf_rows
+        };
 
         // Combine multiple mass functions per claim via adaptive combination
         // (a claim may have evidence from multiple sources/agents)
@@ -920,7 +1034,8 @@ pub async fn propagate_beliefs(
         // its existing readers and is now always 0: a failed apply is an error
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
-        let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
+        let (mut written, mut skipped, mut skipped_compounds, mut skipped_non_public) =
+            (0_usize, 0_usize, 0_usize, 0_usize);
         if apply {
             let updates: Vec<BpUpdate> = result
                 .updated_betps
@@ -935,8 +1050,8 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
-            (written, skipped, skipped_compounds) =
-                apply_bp_updates(&state, &viewer, &updates).await?;
+            (written, skipped, skipped_compounds, skipped_non_public) =
+                apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -952,6 +1067,7 @@ pub async fn propagate_beliefs(
             "applied_count": written,
             "skipped_not_visible": skipped,
             "skipped_compounds": skipped_compounds,
+            "skipped_non_public": skipped_non_public,
             "apply_failures": apply_failures,
             "updated_beliefs": result.updated_betps.iter()
                 .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
@@ -962,14 +1078,16 @@ pub async fn propagate_beliefs(
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
-    let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
+    let (mut written, mut skipped, mut skipped_compounds, mut skipped_non_public) =
+        (0_usize, 0_usize, 0_usize, 0_usize);
     if apply && !result.updated_beliefs.is_empty() {
         let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
             .collect();
-        (written, skipped, skipped_compounds) = apply_bp_updates(&state, &viewer, &updates).await?;
+        (written, skipped, skipped_compounds, skipped_non_public) =
+            apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
     }
 
     let updated: Vec<serde_json::Value> = result
@@ -990,6 +1108,7 @@ pub async fn propagate_beliefs(
         "applied_count": written,
         "skipped_not_visible": skipped,
         "skipped_compounds": skipped_compounds,
+        "skipped_non_public": skipped_non_public,
         "updated_beliefs": updated,
     })))
 }

@@ -71,6 +71,27 @@ impl DerivationScopeRepository {
         Ok(public.unwrap_or(false))
     }
 
+    /// The ids among `ids` that are public claims. An id that is no claim, or
+    /// a claim this session cannot see, is not among them.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn public_claims_among<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<HashSet<Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let public: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT c.id FROM claims c WHERE c.id = ANY($1) AND c.visibility = 'public'",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await?;
+        Ok(public.into_iter().collect())
+    }
+
     /// Of the `mass_functions` rows `row_ids`, those whose every derivation
     /// source is PUBLIC: the row itself, the evidence it cites, and for an
     /// edge-factor row the edge and the edge's source claim. These, and only

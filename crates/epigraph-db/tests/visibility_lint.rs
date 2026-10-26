@@ -2440,6 +2440,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "derivation_scope.rs",
+        "public_claims_among",
+        "READ of which ids are PUBLIC claims (ruling R-22, BP apply guard). The WHERE requires \
+         `visibility = 'public'`, so it can only return rows every viewer may read.",
+    ),
+    (
+        "derivation_scope.rs",
         "public_derived",
         "READ of which BBAs are derived from PUBLIC sources only (ruling R-22). Every table it \
          reads (`mass_functions`, `evidence`, `edges`, `claims`) is constrained to \
