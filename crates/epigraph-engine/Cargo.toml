@@ -25,10 +25,6 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 epigraph-interfaces = { workspace = true }
-# Theme k-means helper (shared by the HTTP route and the scheduled job).
-linfa = { workspace = true }
-linfa-clustering = { workspace = true }
-ndarray = { workspace = true }
 sqlx = { workspace = true }
 # Creation-time (`since`) windows on the diverse-retrieval candidate pool.
 # Was dev-only until temporal recall put a `DateTime<Utc>` in a public

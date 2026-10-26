@@ -2501,10 +2501,10 @@ impl EpiGraphMcpFull {
         crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
-    // ── Themes (3 tools) ──
+    // ── Themes (2 read tools, and the retired `theme_cluster` refusal) ──
 
     #[tool(
-        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the k-means family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this instead of theme_cluster to answer \"what topics does this graph cover\"."
+        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
     )]
     async fn list_themes(
         &self,
@@ -2530,16 +2530,13 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536, wipe_first=false (additive: new themes are added alongside the existing set, and repeated runs under one label_prefix accumulate duplicate labels). `wipe_first=true` deletes EVERY existing theme, whatever its prefix, and clears every claim's theme assignment before rebuilding: it requires claims:admin and the canonical label_prefix \"auto\", and is refused otherwise with nothing written. To read the current themes use list_themes / get_theme, never this tool."
+        description = "RETIRED. Was server-side k-means theme clustering; that prototype is removed. Every call is refused with nothing written. Themes are maintained by the UMAP theme pipeline (scripts/maintain_themes.py, theme_pipeline.py grow); read them with list_themes / get_theme."
     )]
     async fn theme_cluster(
         &self,
-        Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
-        extensions: rmcp::model::Extensions,
+        Parameters(_params): Parameters<crate::tools::themes::RetiredThemeClusterParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::themes::theme_cluster(self, params, auth).await
+        Err(crate::tools::themes::theme_cluster_retired())
     }
 
     // ── RDF Triple Layer (3 tools) ──

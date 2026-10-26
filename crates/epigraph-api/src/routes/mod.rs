@@ -376,10 +376,6 @@ pub fn create_router_with_extensions(
             post(crud::create_theme_with_centroid),
         )
         .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
-        )
-        .route(
             "/api/v1/clusters/build-from-bridges",
             post(clusters::build_from_bridges),
         )
@@ -1284,10 +1280,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/themes/create-with-centroid",
             post(crud::create_theme_with_centroid),
-        )
-        .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
         )
         .route(
             "/api/v1/clusters/build-from-bridges",

@@ -131,7 +131,7 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 have an embedding; every claim with `is_current = false` should have
 `embedding = NULL` AND `embedding_3072 = NULL` (enforced by
 `chk_deprecated_no_embedding`, migrations 052 and 144). Semantic recall
-(`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
+(`recall()`, `recall_with_context()`, the UMAP theme pipeline, `find_workflow`'s
 semantic path) reads from `embedding`, so violations either hide live claims
 or surface stale ones.
 

@@ -1031,9 +1031,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim_theme.rs",
         "delete_all_conn",
         "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
-         caller-owned connection so `run_theme_kmeans` can wipe and rebuild in ONE transaction \
-         (batch H-a). A corpus-wide maintenance statement with no row to filter; the SQL is \
-         unchanged.",
+         caller-owned connection so the k-means rebuild could wipe and rebuild in ONE transaction \
+         (batch H-a; that caller is retired, backlog a0ed0180). A corpus-wide maintenance \
+         statement with no row to filter; the SQL is unchanged.",
     ),
     (
         "claim.rs",
