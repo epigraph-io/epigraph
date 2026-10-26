@@ -35,12 +35,16 @@
 //! # The rules
 //!
 //! * A new site (a new function, or one more site in a registered function) is
-//!   a failure until it is registered here. Sign it
-//!   (`sign_created_edge_conn` on the writer's connection, for an edge THIS act
-//!   created), register it [`Signed`], or register it [`Unsigned`] with the
-//!   reason it cannot sign.
-//! * A [`Signed`] entry's function must call `sign_created_edge_conn`, so a
-//!   signed writer cannot silently stop signing.
+//!   a failure until it is registered here. Sign it and register it
+//!   [`Signed`], or register it [`Unsigned`] with the reason it cannot sign.
+//!   A writer signs AT INSERT (ruling R-50: an `EdgeRepository::*_signed_conn`
+//!   twin called with the writer's `EdgeSigningKey`, which also signs a
+//!   world-owned structural edge no application session may UPDATE), or
+//!   after it (`sign_created_edge_conn` on the writer's connection, for an
+//!   edge THIS act created and the session may update).
+//! * A [`Signed`] entry's function must call `sign_created_edge_conn`, or a
+//!   signed twin and name its key ([`signs`]), so a signed writer cannot
+//!   silently stop signing.
 //! * A site that disappears must have its entry REMOVED (exact match both ways).
 //! * [`UNSIGNED_SITES_HIGH_WATER`] is the exact number of unsigned sites
 //!   (Rust and database). It should only go down: signing a writer lowers it
@@ -83,10 +87,34 @@ const CALLS: &[&str] = &[
     "EdgeRepository::create_if_absent_including_retracted_conn(",
     "EdgeRepository::create_symmetric_if_absent",
     "EdgeRepository::create_processed_by_stamp_if_absent_conn(",
+    // The INSERT-time signed twins (ruling R-50); the symmetric family's
+    // `_signed_conn` forms match the prefix above.
+    "EdgeRepository::create_signed_conn(",
+    "EdgeRepository::create_if_not_exists_signed_conn(",
+    "EdgeRepository::create_if_absent_including_retracted_signed_conn(",
+    "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(",
 ];
 
-/// The call a [`Signed`] writer's function must contain.
+/// The after-the-fact signing call: one way a [`Signed`] writer attests.
 const SIGN_CALL: &str = "sign_created_edge_conn";
+
+/// The INSERT-time way (ruling R-50): a signed twin called with a key the
+/// writer holds. A [`Signed`] function must name both a `_signed_conn`
+/// primitive and the key (`edge_signing_key()` / an `EdgeSigningKey`).
+const SIGNED_TWIN: &str = "_signed_conn(";
+const KEY_MARKERS: &[&str] = &["edge_signing_key", "EdgeSigningKey"];
+
+/// The attested INSERT itself (`edge_signature::insert_attested_conn`): it
+/// signs the edge message in the statement that writes the row.
+const SIGN_AT_INSERT: &str = "sign_entity(SignedEntity::Edge";
+
+/// Whether a function body attests the edges it creates, by any of the three
+/// ways above.
+fn signs(body: &str) -> bool {
+    body.contains(SIGN_CALL)
+        || body.contains(SIGN_AT_INSERT)
+        || (body.contains(SIGNED_TWIN) && KEY_MARKERS.iter().any(|k| body.contains(k)))
+}
 
 /// Why an unsigned site does not sign. Each is a measured property of the
 /// tree, not a preference.
@@ -99,7 +127,8 @@ const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no 
 const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
      analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
      signing caller must receive the edge id";
-const PRIMITIVE: &str = "the EdgeRepository insert primitive itself; writers sign after it";
+const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
+     writer signs by passing its key to the primitive's _signed_conn twin";
 const PENDING_SIGNER_ID_RULING: &str = "the MCP server holds a key, but stamping \
      edges.signer_id with the server's agent changes what backfill_factors::EDGE_QUERY reads \
      as an edge factor's agent (COALESCE(e.signer_id, src.agent_id)); awaiting an operator \
@@ -112,9 +141,6 @@ const NO_KEY_DB_FUNCTION: &str = "a database function (SECURITY DEFINER entry po
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// The function attests the edges it creates.
-    // No writer is registered Signed yet: wiring the MCP writers waits on the
-    // signer_id ruling named in PENDING_SIGNER_ID_RULING.
-    #[allow(dead_code)]
     Signed,
     /// The function does not sign, for the stated reason.
     Unsigned(&'static str),
@@ -431,21 +457,28 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_returning_conn",
+        "create_symmetric_if_absent_returning_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_oriented_conn",
+        "create_symmetric_if_absent_oriented_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "edge_row",
+        "create_symmetric_if_absent_row_signed_conn",
         1,
         Unsigned(PRIMITIVE),
+    ),
+    // The attested INSERT (ruling R-50): every signed twin's key path.
+    site(
+        "crates/epigraph-db/src/repos/edge_signature.rs",
+        "insert_attested_conn",
+        1,
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
@@ -937,9 +970,10 @@ fn check(
                         s.count
                     ));
                 }
-                if s.status == Signed && !body.contains(SIGN_CALL) {
+                if s.status == Signed && !signs(body) {
                     problems.push(format!(
-                        "{file}::{func} is registered Signed but no longer calls {SIGN_CALL}"
+                        "{file}::{func} is registered Signed but no longer calls {SIGN_CALL} \
+                         or a signed twin with its key"
                     ));
                 }
             }
@@ -1046,9 +1080,20 @@ fn the_register_rules_hold_on_a_synthetic_register() {
     assert_eq!(
         check(&measured, &register, &no_db, &[], 0),
         vec![format!(
-            "a.rs::stopped is registered Signed but no longer calls {SIGN_CALL}"
+            "a.rs::stopped is registered Signed but no longer calls {SIGN_CALL} or a signed \
+             twin with its key"
         )]
     );
+
+    // The INSERT-time way: a signed twin WITH the writer's key signs; the twin
+    // alone (a `None` key) does not.
+    let twin_keyed = "EdgeRepository::create_signed_conn(conn, server.edge_signing_key(), ..);\n";
+    let twin_bare = "EdgeRepository::create_signed_conn(conn, None, ..);\n";
+    assert!(signs(twin_keyed));
+    assert!(!signs(twin_bare));
+    assert!(signs(
+        "let s = key.signer.sign_entity(SignedEntity::Edge, &digest);\n"
+    ));
 
     let register = [
         site("a.rs", "signs", 1, Signed),

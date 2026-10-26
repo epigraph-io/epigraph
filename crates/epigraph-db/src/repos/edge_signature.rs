@@ -126,6 +126,179 @@ fn attestation_object(a: &EdgeAttestation) -> serde_json::Value {
     })
 }
 
+/// The key a writer attests the edges it INSERTS with (rulings R-49, R-50):
+/// its signer, and the agent whose registered key that signer's public key is
+/// (`edges.signer_id`). An MCP server passes its own signer agent, the API its
+/// own; neither is the edge's author (an edge's author record is its writer
+/// group since migration 120, and what it asserts is its source's author's).
+#[derive(Clone, Copy)]
+pub struct EdgeSigningKey<'a> {
+    pub signer: &'a AgentSigner,
+    pub signer_id: Uuid,
+}
+
+impl std::fmt::Debug for EdgeSigningKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The public half and the agent only; the signer holds a private key.
+        f.debug_struct("EdgeSigningKey")
+            .field("public_key", &hex::encode(self.signer.public_key()))
+            .field("signer_id", &self.signer_id)
+            .finish()
+    }
+}
+
+/// `t` at the microsecond, the precision `timestamptz` stores: a digest over
+/// a nanosecond `created_at` would not recompute from the stored row.
+#[must_use]
+pub fn to_stored_micros(t: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(t.timestamp_micros()).unwrap_or(t)
+}
+
+/// The `WHERE NOT EXISTS` an attested INSERT carries, if any: the symmetric
+/// dedup of the `create_symmetric_if_absent*` family (`(a, b)` and `(b, a)`
+/// with one relationship are one edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SymmetricGuard {
+    /// Unconditional INSERT.
+    None,
+    /// Skip when such an edge IN FORCE exists (the link tools, migration 120).
+    InForce,
+}
+
+/// A new edge's attestation, before its INSERT: a fresh `id` and the writer's
+/// `created_at` (at the microsecond), so the digest is computable before the
+/// row exists (ruling R-50).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn new_attestation(
+    source_id: Uuid,
+    source_type: &str,
+    target_id: Uuid,
+    target_type: &str,
+    relationship: &str,
+    properties: serde_json::Value,
+    valid_from: Option<DateTime<Utc>>,
+) -> EdgeAttestation {
+    EdgeAttestation {
+        id: Uuid::new_v4(),
+        source_id,
+        source_type: source_type.to_string(),
+        target_id,
+        target_type: target_type.to_string(),
+        relationship: relationship.to_string(),
+        properties,
+        valid_from: valid_from.map(to_stored_micros),
+        created_at: to_stored_micros(Utc::now()),
+    }
+}
+
+/// INSERT one edge ATTESTED AT INSERT (ruling R-50): `content_hash` = the
+/// attestation digest of `a`, `signature` = the v1 edge signature over it and
+/// `signer_id` = `key.signer_id`, in the same statement as the row.
+///
+/// This is how a world-owned structural verb-edge is signed at all: an
+/// application session may INSERT such an edge but not UPDATE it (migration
+/// 117), so [`EdgeSignatureRepository::sign_created_edge_conn`] returns
+/// `NotSignable` for it.
+///
+/// The digest the verifier recomputes is over the row AS STORED. The INSERT
+/// returns the stored attestation columns and they are recomputed; if they
+/// differ from what was signed (a JSONB normalisation of `properties`, a
+/// trigger that canonicalises a column), the INSERT is rolled back to its
+/// savepoint and made once more over the stored values, so the signature is
+/// over exactly what the database holds. A second mismatch is an error and
+/// nothing is written: a stored signature over a digest its row does not
+/// recompute to would read as tampering.
+///
+/// Returns `None` when `guard`'s dedup found an existing edge (nothing
+/// written). Runs inside a savepoint of `conn`'s transaction (a real
+/// transaction on a bare connection).
+///
+/// # Errors
+/// `DbError::QueryFailed` if a statement fails; `DbError::InvalidData` if the
+/// stored row twice failed to recompute to the signed digest.
+pub(crate) async fn insert_attested_conn(
+    conn: &mut sqlx::PgConnection,
+    key: EdgeSigningKey<'_>,
+    mut a: EdgeAttestation,
+    valid_to: Option<DateTime<Utc>>,
+    guard: SymmetricGuard,
+    on_conflict_do_nothing: bool,
+) -> Result<Option<crate::repos::edge::EdgeRow>, DbError> {
+    use sqlx::Acquire;
+    let guard_sql = match guard {
+        SymmetricGuard::None => String::new(),
+        SymmetricGuard::InForce => format!(
+            " WHERE NOT EXISTS (SELECT 1 FROM edges \
+                 WHERE ((source_id = $2 AND target_id = $4) \
+                     OR (source_id = $4 AND target_id = $2)) \
+                   AND relationship = $6 AND {})",
+            crate::repos::edge::EDGE_IN_FORCE_UNALIASED
+        ),
+    };
+    let conflict = if on_conflict_do_nothing {
+        " ON CONFLICT DO NOTHING"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            properties, valid_from, valid_to, created_at, content_hash, \
+                            signature, signer_id) \
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13{guard_sql}{conflict} \
+         RETURNING id, source_id, source_type::text AS source_type, target_id, \
+                   target_type::text AS target_type, relationship::text AS relationship, \
+                   properties, valid_from, valid_to, created_at"
+    );
+    for _attempt in 0..2 {
+        let digest = edge_attestation_digest(&a)?;
+        let signature = key.signer.sign_entity(SignedEntity::Edge, &digest);
+        let mut sp = conn.begin().await?;
+        let row = sqlx::query(&sql)
+            .bind(a.id)
+            .bind(a.source_id)
+            .bind(&a.source_type)
+            .bind(a.target_id)
+            .bind(&a.target_type)
+            .bind(&a.relationship)
+            .bind(sqlx::types::Json(&a.properties))
+            .bind(a.valid_from)
+            .bind(valid_to)
+            .bind(a.created_at)
+            .bind(digest.as_slice())
+            .bind(signature.as_slice())
+            .bind(key.signer_id)
+            .fetch_optional(&mut *sp)
+            .await?;
+        let Some(row) = row else {
+            sp.commit().await?;
+            return Ok(None);
+        };
+        let stored = attestation_of(&row);
+        if edge_attestation_digest(&stored)? == digest {
+            sp.commit().await?;
+            return Ok(Some(crate::repos::edge::EdgeRow {
+                id: stored.id,
+                source_id: stored.source_id,
+                source_type: stored.source_type,
+                target_id: stored.target_id,
+                target_type: stored.target_type,
+                relationship: stored.relationship,
+                properties: stored.properties,
+                valid_from: stored.valid_from,
+                valid_to: row.get("valid_to"),
+            }));
+        }
+        sp.rollback().await?;
+        a = stored;
+    }
+    Err(DbError::InvalidData {
+        reason: "the edge row the database stores does not recompute to the digest signed \
+                 over it; nothing was written"
+            .to_string(),
+    })
+}
+
 /// What [`EdgeSignatureRepository::sign_created_edge_conn`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeSignOutcome {
