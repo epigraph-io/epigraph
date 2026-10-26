@@ -18,9 +18,7 @@ mod fixture;
 use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::PgPool;
-use epigraph_engine::edge_factor::{
-    auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief, EdgeFactorOutcome,
-};
+use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
 use uuid::Uuid;
 
 async fn with_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
