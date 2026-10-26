@@ -31,8 +31,8 @@ service token of its own.
 ```
                       https://explorer.example.com
   browser ─────────────────────▶ Caddy (public edge)
-     │                             │
-     │   /explorer/*               │ handle_path /explorer*  (prefix stripped)
+     │                             │  its OWN site block: the Explorer gets
+     │   /*                        │  an origin to itself (Operator setup §5)
      │                             ▼
      │                   epigraph-explorer  127.0.0.1:8096
      │                     • askama pages + /bff JSON + /static (compiled in)
@@ -42,12 +42,12 @@ service token of its own.
      │                             │  /oauth/token, /oauth/revoke (no bearer)
      │                             │  EPIGRAPH_API_URL (loopback)
      │                             ▼
-     │   /oauth/authorize  epigraph-api  :8080   (systemd: epigraph-api.service)
+     │   /oauth/authorize  epigraph-api  :8080   (api.example.com, its own
      └─────────────────────▶   /api/v1/*  ── reads, filtered per viewer
         (top-level              /oauth/*   ── authorization server
          navigation, to                   │
          EPIGRAPH_OAUTH_BASE_URL)         │
-                                     ▼
+                                          ▼
                               Google OIDC (email allowlist)
 ```
 
@@ -99,7 +99,7 @@ code **2**.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com/explorer`. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
+| `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` | **required** | The absolute public URL including the base path, e.g. `https://explorer.example.com` on a dedicated origin (recommended — see Operator setup §5), or `https://api.example.com/explorer` on a shared one. A **root** base path with `Secure` cookies is what earns the `__Host-` cookie prefix. Every link, redirect, `og:url` and cookie `Path`, and the OAuth `redirect_uri` (`{this}/auth/callback`), are built from it. It must be `http(s)`. It may not contain a query, a fragment or credentials. Path segments are limited to letters, digits and `-` `_` `.` `~`. A trailing `/` is ignored. Its **first** segment may not be one of the Explorer's own top-level routes (`agent`, `auth`, `bff`, `claim`, `community`, `evidence`, `frame`, `health`, `neighborhood`, `search`, `static`, `theme`): the routes are mounted both under the base path and at the root, so such a base path would make two handlers claim the same URL. The process refuses to start (exit 2) and names the offending segment. |
 | `EPIGRAPH_API_URL` | `http://127.0.0.1:8080` | The `epigraph-api` origin, called server to server. This is the repo-standard variable name. |
 | `EPIGRAPH_EXPLORER_PORT` | `8096` | Port to bind, always on `127.0.0.1`. Must be 1–65535. |
 | `EPIGRAPH_OAUTH_BASE_URL` | same as `EPIGRAPH_API_URL` | The **browser-facing** origin of the API's OAuth server, and only that: the browser is sent to `{this}/oauth/authorize`. In production it is the API's public origin (e.g. `https://api.example.com`), never loopback. The Explorer itself never calls this origin — the server-to-server `/oauth/token` and `/oauth/revoke` calls go to `EPIGRAPH_API_URL` (the same process, over loopback), which keeps the authorization code, the refresh token and the client id off the public edge. |
@@ -123,7 +123,7 @@ Fixed limits, which are not configurable:
 Here is an example environment file for production (`/etc/epigraph/explorer.env`):
 
 ```sh
-EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com/explorer
+EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com
 EPIGRAPH_API_URL=http://127.0.0.1:8080
 EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
 EPIGRAPH_EXPLORER_CLIENT_ID=epigraph_explorer
@@ -226,7 +226,7 @@ INSERT INTO oauth_clients
     (client_id, client_name, client_type, allowed_scopes, granted_scopes, status, redirect_uris)
 VALUES
     ('epigraph_explorer', 'EpiGraph Explorer', 'human', '{}', '{}', 'active',
-     ARRAY['https://explorer.example.com/explorer/auth/callback'])
+     ARRAY['https://explorer.example.com/auth/callback'])
 RETURNING id, client_id, client_type, status, redirect_uris;
 ```
 
@@ -241,9 +241,10 @@ The row has to meet these constraints:
   rejects any other status with `invalid_client`.
 - **`redirect_uris`** is compared with a **plain string match**, with no
   normalisation. The entry must equal
-  `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL + "/auth/callback"` byte for byte,
-  including the `/explorer` prefix that Caddy strips. There is no trailing
-  slash.
+  `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL + "/auth/callback"` byte for byte. On a
+  dedicated origin that is `https://explorer.example.com/auth/callback`; on a
+  shared origin it must include the `/explorer` prefix that Caddy strips.
+  There is no trailing slash.
 - **No secret.** The Explorer is a public client using PKCE S256, and the
   authorization-code grant never checks a secret.
 - **Empty scopes are correct.** The scopes a token carries come from the
@@ -265,7 +266,7 @@ To move the Explorer to a new public URL, update the row:
 
 ```sql
 UPDATE oauth_clients
-   SET redirect_uris = ARRAY['https://explorer.example.com/explorer/auth/callback'],
+   SET redirect_uris = ARRAY['https://explorer.example.com/auth/callback'],
        updated_at = now()
  WHERE client_id = 'epigraph_explorer';
 ```
@@ -289,19 +290,34 @@ The API's authorization server signs people in **only through Google**, and
 - The allowlist is checked again when a token is refreshed, so removing an
   email cuts that user off within about an hour. That is the access-token
   lifetime.
-- On `main`, an empty allowlist lets **everyone** in (the API logs a
-  warning). Populate it before exposing the Explorer.
+- An **empty** allowlist (`allowed_emails` and `allowed_domains` both empty)
+  admits **nobody**: `provision_external_user_client` denies every identity,
+  on the existing-client branch as well as the new-provision one, unless the
+  operator has explicitly set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true` — and
+  `build_registry` then refuses to boot at all under a production
+  `EPIGRAPH_ENV`. This default is fail-closed and **inverts** what older
+  builds did, where an empty allowlist admitted everyone the IdP
+  authenticated; that is the behaviour this README used to describe. Populate
+  the allowlist before exposing the Explorer — on an empty one nobody can
+  sign in.
 - Restart `epigraph-api.service` after editing the file.
 
 ### 3. The consent page
 
 After Google, the API shows its own consent page, and the user must press
-**Allow** on every sign-in (consent is not stored). The page names the
-requesting client from `oauth_clients.client_name` (plan §2.7, landed in
-`fix(oauth): name the requesting client on the consent page`), so whatever you
-put in `client_name` above is what your users read there. Older API builds
-hard-code "Authorize Claude"; if that is what the page says, the API is behind
-this tree.
+**Allow** on every sign-in (consent is not stored). The page is labelled from
+the **class of the session's `redirect_uri`** — validated against the client's
+registration at `/oauth/authorize` — and **never** from
+`oauth_clients.client_name`, which anyone registering a client picks for
+themselves (`render_consent_page` in `crates/epigraph-api/src/oauth/authorize.rs`,
+landed as `security(oauth): label the consent page from the redirect class,
+never the client's self-declared name`). A hosted `claude.ai` /
+`claude.com` redirect reads "Authorize Claude"; a loopback redirect reads
+"Authorize an application on this computer" and shows that redirect's origin;
+anything else reads "Authorize an application". The only
+registrant-controlled string on the page is the user's own email. So
+`client_name` in the SQL above is for operator bookkeeping and audit rows,
+not for what users read.
 
 ### 4. Keep `/oauth/*` browser-reachable
 
@@ -358,17 +374,75 @@ docker run -d --name epigraph-explorer --network host \
     --env-file /etc/epigraph/explorer.env epigraph-explorer
 ```
 
-**Caddy.** Add [`Caddyfile.snippet`](Caddyfile.snippet)
-(`handle_path /explorer* { reverse_proxy 127.0.0.1:8096 }`) to the public site
-block, then reload Caddy. `handle_path` strips `/explorer`, which is why the
-public base URL has to carry it. Do not add `X-Frame-Options` for this path:
-the Explorer's CSP `frame-ancestors` controls framing.
+**Caddy — give the Explorer an origin of its own.** Add
+[`Caddyfile.snippet`](Caddyfile.snippet) to the VM Caddyfile as a **site
+block of its own**, alongside (not inside) the `epigraph-api` block, then
+reload Caddy:
+
+```caddy
+explorer.example.com {
+    reverse_proxy 127.0.0.1:8096
+}
+```
+
+That block goes with `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com`
+(no path, so the base path is the root) and an `oauth_clients` row whose
+`redirect_uris` contains exactly `https://explorer.example.com/auth/callback`.
+Do not add `X-Frame-Options` or a second CSP for this site: the Explorer's own
+CSP `frame-ancestors` controls framing.
+
+The browser's security boundary is the **origin** (scheme + host + port), not
+the path, and every mechanism the Explorer uses to separate itself from other
+apps is origin-scoped:
+
+- **Cookies.** `epx_session` is a bearer-equivalent credential and `epx_login`
+  binds a sign-in to a browser. A cookie `Path` is *not* a security boundary:
+  any page on the origin can set a cookie at any path, so a co-hosted app can
+  write both names. On a dedicated https origin the Explorer instead names
+  them `__Host-epx_session` and `__Host-epx_login`, which a browser accepts
+  only with `Secure`, `Path=/` and no `Domain` — unwritable from another host.
+  That naming switches on by itself when the cookies are `Secure` **and** the
+  base path is the root, and the process logs which pair is in use at startup.
+- **CSP `'self'`** in `default-src`, `script-src`, `connect-src` and
+  `form-action` means the origin. On a shared origin the policy admits every
+  script, fetch target and form action any co-hosted app serves.
+- **The `Origin` check** on `POST /auth/logout` and `POST /auth/redeem`
+  compares the public origin, so a co-hosted page passes it.
+- **`Referrer-Policy: same-origin`** sends the full URL of an Explorer page,
+  which can carry a claim id, to every other app on the origin.
+- **The embed handoff** `postMessage`s a single-use sign-in code with
+  `targetOrigin` set to the origin, so any page on it can receive the code.
+- **localStorage, sessionStorage, IndexedDB** and the service-worker scope
+  are all per-origin.
+
+**Do not deploy the Explorer under a wildcard-DNS parent domain that is not
+on the [Public Suffix List](https://publicsuffix.org/).** Cookies are not
+origin-scoped: under such a parent any sibling host can `Set-Cookie` with
+`Domain=<parent>`, and the victim's browser sends it here. The `__Host-`
+prefix is the defence, so a layout that forgoes it (a base path, or
+`EPIGRAPH_EXPLORER_INSECURE_COOKIES`) under a non-PSL wildcard parent is the
+combination to avoid.
+
+**A path on a shared origin is possible but not recommended.** If a second
+hostname and certificate are genuinely unavailable, the snippet's last
+section has `handle_path /explorer* { reverse_proxy 127.0.0.1:8096 }` for the
+API's site block, with `EPIGRAPH_EXPLORER_PUBLIC_BASE_URL` carrying the
+`/explorer` prefix (`handle_path` strips it and the Explorer cannot recover
+it from the request). The cost, plainly: **every app on that origin is inside
+the Explorer's trust boundary.** For each bullet above, a co-hosted
+app — including one somebody deploys there later — can do what that bullet
+describes: read or overwrite the session and binding cookies, be loaded as
+script by the Explorer's own CSP, POST to `/auth/logout` and `/auth/redeem`
+past the `Origin` check, and receive the `postMessage` sign-in handoff. A
+compromise of any app on the origin is a compromise of every Explorer
+session, and `__Host-` cookie names are unavailable because they require
+`Path=/`.
 
 ### 6. Smoke test
 
 ```sh
 curl -fsS http://127.0.0.1:8096/health          # {"status":"ok","version":"0.1.0"}
-curl -sI https://explorer.example.com/explorer/  # 303 → /explorer/auth/login?return_to=…
+curl -sI https://explorer.example.com/          # 303 → /auth/login?return_to=…
 ```
 
 Then sign in through the browser and open a claim.
