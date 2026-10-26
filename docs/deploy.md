@@ -2579,6 +2579,25 @@ narrowing `scope`) widened the chain to everything the client is granted.
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
 
+## Refresh-grant hardening — confidential clients authenticate on refresh
+
+1. **BREAKING — an agent or service refresh carries the client's credential.**
+   RFC 6749 section 6: a confidential client authenticates on the
+   `refresh_token` grant. An agent sends a fresh `client_assertion` (with
+   `client_assertion_type=urn:epigraph:ed25519`), a service sends its
+   `client_secret`, each checked exactly as the `client_credentials` grant
+   checks it (one shared check). A `client_id` on the request must be the
+   chain's own. A refresh that does not authenticate is refused (`400` for a
+   missing credential, `401` for a wrong one or a foreign `client_id`) and
+   changes nothing: the presented token is neither burned nor rotated, so the
+   client retries with its credential. Before this release possession of the
+   refresh token was enough, so a later secret rotation or key change would
+   not have cut a live chain. No in-tree consumer refreshes an agent or
+   service chain (the agents re-run `client_credentials`); an out-of-tree
+   consumer that does must add its credential before this binary ships, or
+   switch to re-running `client_credentials`. Human (connector) chains are
+   unchanged. Rollback: the previous API binary.
+
 ## A lineage stays in its owner group (migration 153) — deploy order and rollback
 
 Once the operator binding is armed, an application session may not leave a

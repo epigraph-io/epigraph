@@ -2,7 +2,7 @@
 //!
 //! Supports:
 //! - client_credentials with Ed25519 proof (agents) or client_secret (services)
-//! - refresh_token (all client types)
+//! - refresh_token (all client types; agents and services authenticate on it too)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 //! - `urn:epigraph:grant:elevate`: a confirmed grant-mode elevation ticket, redeemed once
 //!   for a short, refreshless, elevated access token (elevation plan EL-5)
@@ -512,6 +512,93 @@ fn verify_agent_assertion(
     Ok(())
 }
 
+/// Whether `client_type` is a CONFIDENTIAL client: one that holds a credential
+/// of its own (an agent's Ed25519 key, a service's secret) and so must present
+/// it on the `client_credentials` grant and on the refresh grant (RFC 6749
+/// section 6). Human clients are public: their chains come from a consent.
+#[cfg(feature = "db")]
+fn is_confidential_client(client_type: &str) -> bool {
+    matches!(client_type, "agent" | "service")
+}
+
+/// Verify the credential a confidential client presents on `req`: a fresh
+/// Ed25519 assertion under the agent's key (its `client_id` is the hex public
+/// key), or the service's secret, compared in constant time against the
+/// stored hash. The ONE credential check, shared by the `client_credentials`
+/// grant and the refresh grant, so a later secret rotation or key change cuts
+/// both.
+///
+/// # Errors
+/// `ApiError::BadRequest` for a missing or malformed credential,
+/// `ApiError::Unauthorized` for a wrong one, and `ApiError::Unauthorized` for
+/// a client that is not confidential (see [`is_confidential_client`]).
+#[cfg(feature = "db")]
+fn authenticate_confidential_client(
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    req: &TokenRequest,
+) -> Result<(), ApiError> {
+    match client.client_type.as_str() {
+        "agent" => {
+            let assertion_type =
+                req.client_assertion_type
+                    .as_deref()
+                    .ok_or(ApiError::BadRequest {
+                        message: "client_assertion_type required for agents".to_string(),
+                    })?;
+            if assertion_type != "urn:epigraph:ed25519" {
+                return Err(ApiError::BadRequest {
+                    message: "Agents must use urn:epigraph:ed25519 assertion type".to_string(),
+                });
+            }
+            let assertion = req
+                .client_assertion
+                .as_deref()
+                .ok_or(ApiError::BadRequest {
+                    message: "client_assertion required for agents".to_string(),
+                })?;
+            let assertion_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, assertion)
+                    .map_err(|_| ApiError::BadRequest {
+                        message: "Invalid base64 in client_assertion".to_string(),
+                    })?;
+            let pub_key_bytes =
+                hex::decode(&client.client_id).map_err(|_| ApiError::BadRequest {
+                    message: "client_id must be hex-encoded public key for agents".to_string(),
+                })?;
+            verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+        }
+        "service" => {
+            let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
+                message: "client_secret required for service clients".to_string(),
+            })?;
+            let secret_bytes = hex::decode(secret).map_err(|_| ApiError::BadRequest {
+                message: "client_secret must be hex-encoded".to_string(),
+            })?;
+            let hash = blake3::hash(&secret_bytes);
+            let stored_hash =
+                client
+                    .client_secret_hash
+                    .as_deref()
+                    .ok_or(ApiError::InternalError {
+                        message: "Service client has no stored secret hash".to_string(),
+                    })?;
+            let ct_eq: bool =
+                subtle::ConstantTimeEq::ct_eq(hash.as_bytes().as_slice(), stored_hash).into();
+            if !ct_eq {
+                return Err(ApiError::Unauthorized {
+                    reason: "Invalid client_secret".to_string(),
+                });
+            }
+        }
+        _ => {
+            return Err(ApiError::Unauthorized {
+                reason: "not a confidential client".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 async fn handle_client_credentials(
     state: &AppState,
@@ -538,65 +625,14 @@ async fn handle_client_credentials(
         });
     }
 
-    // Credential verification based on client type
-    match client.client_type.as_str() {
-        "agent" => {
-            let assertion_type =
-                req.client_assertion_type
-                    .as_deref()
-                    .ok_or(ApiError::BadRequest {
-                        message: "client_assertion_type required for agents".to_string(),
-                    })?;
-            if assertion_type != "urn:epigraph:ed25519" {
-                return Err(ApiError::BadRequest {
-                    message: "Agents must use urn:epigraph:ed25519 assertion type".to_string(),
-                });
-            }
-            let assertion = req
-                .client_assertion
-                .as_deref()
-                .ok_or(ApiError::BadRequest {
-                    message: "client_assertion required for agents".to_string(),
-                })?;
-            let assertion_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, assertion)
-                    .map_err(|_| ApiError::BadRequest {
-                        message: "Invalid base64 in client_assertion".to_string(),
-                    })?;
-            let pub_key_bytes = hex::decode(client_id_str).map_err(|_| ApiError::BadRequest {
-                message: "client_id must be hex-encoded public key for agents".to_string(),
-            })?;
-            verify_agent_assertion(&assertion_bytes, &pub_key_bytes, client_id_str)?;
-        }
-        "service" => {
-            let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
-                message: "client_secret required for service clients".to_string(),
-            })?;
-            let secret_bytes = hex::decode(secret).map_err(|_| ApiError::BadRequest {
-                message: "client_secret must be hex-encoded".to_string(),
-            })?;
-            let hash = blake3::hash(&secret_bytes);
-            let stored_hash =
-                client
-                    .client_secret_hash
-                    .as_deref()
-                    .ok_or(ApiError::InternalError {
-                        message: "Service client has no stored secret hash".to_string(),
-                    })?;
-            let ct_eq: bool =
-                subtle::ConstantTimeEq::ct_eq(hash.as_bytes().as_slice(), stored_hash).into();
-            if !ct_eq {
-                return Err(ApiError::Unauthorized {
-                    reason: "Invalid client_secret".to_string(),
-                });
-            }
-        }
-        _ => {
-            return Err(ApiError::BadRequest {
-                message: "client_credentials grant not supported for this client type".to_string(),
-            });
-        }
+    // Credential verification based on client type (the same check the
+    // refresh grant runs for these two types).
+    if !is_confidential_client(&client.client_type) {
+        return Err(ApiError::BadRequest {
+            message: "client_credentials grant not supported for this client type".to_string(),
+        });
     }
+    authenticate_confidential_client(&client, req)?;
 
     let ttl = match client.client_type.as_str() {
         "agent" => Duration::minutes(15),
@@ -783,6 +819,25 @@ async fn handle_refresh_token(
         .ok_or(ApiError::InternalError {
             message: "Client not found for refresh token".to_string(),
         })?;
+
+    // RFC 6749 section 6: a CONFIDENTIAL client (agent, service) authenticates
+    // on the refresh grant, with the same credential `client_credentials`
+    // verifies; possession of the refresh token alone is not enough. A
+    // `client_id` on the request must be the chain's own. Both run first, so a
+    // presenter that cannot authenticate changes nothing: no burn, no
+    // rotation, and the chain stays usable by its client. A public (human)
+    // chain has no credential to check, and its request's `client_id` names
+    // the connector app, not the chain's per-user client.
+    if is_confidential_client(&client.client_type) {
+        if req
+            .client_id
+            .as_deref()
+            .is_some_and(|presented| presented != client.client_id)
+        {
+            return Err(invalid_refresh());
+        }
+        authenticate_confidential_client(&client, req)?;
+    }
 
     if client.status != "active" {
         burn_refresh_token(state, stored.id).await?;

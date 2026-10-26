@@ -544,7 +544,16 @@ async fn a_client_credentials_refresh_never_widens_the_requested_scope(pool: PgP
     assert_eq!(body["scope"], "claims:read");
     let rt = body["refresh_token"].as_str().unwrap().to_string();
 
-    let (status, body) = post_token(app.clone(), refresh_grant(&rt)).await;
+    let (status, body) = post_token(
+        app.clone(),
+        serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": client_id,
+            "client_secret": hex::encode(secret),
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "refresh: {body}");
     assert_eq!(
         body["scope"], "claims:read",

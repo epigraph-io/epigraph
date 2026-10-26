@@ -450,3 +450,156 @@ async fn an_external_grant_chain_minted_armed_regains_the_admin_scope_after_a_di
         "the disarm is reversible for a chain minted while armed"
     );
 }
+
+// ── 0306711a: confidential clients authenticate on the refresh grant ─────────
+
+use ed25519_dalek::{Signer, SigningKey};
+
+/// An agent row for `key` with an ACTIVE agent client holding `claims:read`
+/// (and the owner client `agents_must_have_owner` requires). Returns the
+/// agent client's `client_id` (the hex public key).
+async fn agent_client(pool: &PgPool, key: &SigningKey) -> String {
+    let public_key = key.verifying_key().to_bytes();
+    let agent = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(agent)
+        .bind(public_key.to_vec())
+        .execute(pool)
+        .await
+        .expect("agent row");
+    let owner = client_row(
+        pool,
+        &format!("owner-{agent}"),
+        "human",
+        &v(&["claims:read"]),
+    )
+    .await;
+    let client_id = hex::encode(public_key);
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id, owner_id) \
+         VALUES ($1, 'a11-agent', 'agent', ARRAY['claims:read'], ARRAY['claims:read'], \
+                 'active', $2, $3)",
+    )
+    .bind(&client_id)
+    .bind(agent)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("agent client");
+    client_id
+}
+
+/// `timestamp(8B BE) || nonce(16B) || Ed25519(timestamp || nonce)`, base64.
+fn assertion(key: &SigningKey) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let mut msg = Vec::with_capacity(88);
+    msg.extend_from_slice(&ts.to_be_bytes());
+    msg.extend_from_slice(Uuid::new_v4().as_bytes());
+    let sig = key.sign(&msg);
+    msg.extend_from_slice(&sig.to_bytes());
+    base64::engine::general_purpose::STANDARD.encode(msg)
+}
+
+fn agent_grant(client_id: &str, key: &SigningKey) -> Value {
+    json!({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_assertion_type": "urn:epigraph:ed25519",
+        "client_assertion": assertion(key),
+    })
+}
+
+fn agent_refresh(token: &str, client_id: &str, key: &SigningKey) -> Value {
+    json!({
+        "grant_type": "refresh_token",
+        "refresh_token": token,
+        "client_id": client_id,
+        "client_assertion_type": "urn:epigraph:ed25519",
+        "client_assertion": assertion(key),
+    })
+}
+
+/// A service chain refreshes only with the service's own secret. Without it,
+/// with a wrong one, or under another client's id and secret, the refresh is
+/// refused and the presented token is left intact (it then refreshes with
+/// the right credential).
+///
+/// Catches: possession of the refresh token being the only authentication of
+/// a confidential client on the refresh grant (RFC 6749 section 6).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
+    let (client_id, secret) = service_client(&pool, &v(&["claims:read"])).await;
+    let (other_id, other_secret) = service_client(&pool, &v(&["claims:read"])).await;
+    let app = create_router(state(&pool).await);
+    let (status, body) = post_token(&app, service_grant(&client_id, &secret)).await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    let r0 = refresh_token_of(&body);
+
+    let wrong: [u8; 32] = rand::random();
+    for (what, req) in [
+        ("no credential", refresh_grant(&r0)),
+        (
+            "a wrong secret",
+            service_refresh(&r0, &client_id, &hex::encode(wrong)),
+        ),
+        (
+            "another client's id and secret",
+            service_refresh(&r0, &other_id, &other_secret),
+        ),
+    ] {
+        let (status, body) = post_token(&app, req).await;
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
+            "{what}: a service refresh must authenticate the service, got {status}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{what}: {body}");
+    }
+
+    let (status, body) = post_token(&app, service_refresh(&r0, &client_id, &secret)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused requests left the chain intact: {body}"
+    );
+}
+
+/// An agent chain refreshes only with a fresh assertion under the agent's own
+/// key; the refused requests leave the presented token intact.
+///
+/// Catches: the agent arm of the same defect.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_refresh_requires_an_assertion_under_the_agents_key(pool: PgPool) {
+    let key = SigningKey::from_bytes(&[0x5a; 32]);
+    let stranger = SigningKey::from_bytes(&[0x5b; 32]);
+    let client_id = agent_client(&pool, &key).await;
+    let app = create_router(state(&pool).await);
+    let (status, body) = post_token(&app, agent_grant(&client_id, &key)).await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    let r0 = refresh_token_of(&body);
+
+    for (what, req) in [
+        ("no assertion", refresh_grant(&r0)),
+        (
+            "an assertion under another key",
+            agent_refresh(&r0, &client_id, &stranger),
+        ),
+    ] {
+        let (status, body) = post_token(&app, req).await;
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
+            "{what}: an agent refresh must authenticate the agent, got {status}: {body}"
+        );
+        assert!(body.get("access_token").is_none(), "{what}: {body}");
+    }
+
+    let (status, body) = post_token(&app, agent_refresh(&r0, &client_id, &key)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused requests left the chain intact: {body}"
+    );
+}
