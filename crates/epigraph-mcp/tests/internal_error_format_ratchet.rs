@@ -10,10 +10,20 @@
 //! `internal_error_logged("ctx", e)`: the designed context goes to the caller
 //! and the error goes to the log.
 //!
-//! The scan drops `//` comments, is not fooled by a line break between
-//! `internal_error(` and `format!`, and skips rmcp's two-argument constructor
+//! The scan drops `//` and `/* */` comments (but not a `//` inside a string),
+//! is not fooled by a line break between `internal_error(` and `format!` or by
+//! a borrowed `&format!`, and skips rmcp's two-argument constructor
 //! (`McpError::internal_error(format!(..), None)`), which sends its message as
 //! written.
+//!
+//! Known limits: it sees the `format!` only as the call's own argument. A
+//! string built first (`let m = format!(..); internal_error(m)`) and
+//! `internal_error(e.to_string())` are not caught. The latter also erases the
+//! error's type, so `designed_refusal` cannot recognise a `DbError::Refused`
+//! routed through it (tools/workflows.rs and tools/step_ops.rs each have one;
+//! `.map_err(internal_error)` is the shape that keeps it).
+
+mod lint_text;
 
 use std::path::{Path, PathBuf};
 
@@ -52,16 +62,6 @@ enum Bound {
     AtMost,
 }
 
-fn strip_line_comments(text: &str) -> String {
-    text.lines()
-        .map(|l| match l.find("//") {
-            Some(i) => &l[..i],
-            None => l,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// The 1-based lines where `internal_error(` (the crate helper, not
 /// `McpError::internal_error` / `ErrorData::internal_error`) takes a
 /// `format!` as its first argument.
@@ -85,11 +85,22 @@ fn sites(text: &str) -> Vec<usize> {
         if before.ends_with("McpError::") || before.ends_with("ErrorData::") {
             continue;
         }
-        if text[from..].trim_start().starts_with("format!") {
+        let arg = text[from..].trim_start();
+        let arg = arg.strip_prefix('&').map_or(arg, str::trim_start);
+        if arg.starts_with("format!") {
             out.push(before.matches('\n').count() + 1);
         }
     }
     out
+}
+
+/// The source with `//` and `/* */` comments removed, string literals kept
+/// (`lint_text::strip_comments`), so a `//` inside a string (a URL) does not
+/// hide the rest of its line. It drops the byte after a `\` escape, so a line
+/// continuation inside a string can shift reported line numbers by one; the
+/// counts are unaffected.
+fn strip(text: &str) -> String {
+    lint_text::strip_comments(text)
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -123,7 +134,7 @@ fn no_internal_error_is_handed_a_formatted_string() {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let text = strip_line_comments(&std::fs::read_to_string(path).expect("read source"));
+        let text = strip(&std::fs::read_to_string(path).expect("read source"));
         let found = sites(&text);
         if let Some((_, allowed, _, _)) = ALLOWED.iter().find(|(f, _, _, _)| *f == rel) {
             allowed_seen.insert(rel.clone(), (found.len(), *allowed));
@@ -162,12 +173,21 @@ fn no_internal_error_is_handed_a_formatted_string() {
 #[test]
 fn the_scanner_tells_the_helper_from_the_rmcp_constructor() {
     let caught = "a.map_err(|e| internal_error(format!(\"x: {e}\")))?;\n\
-                  b.map_err(|e| {\n    crate::errors::internal_error(\n        format!(\"y: {e}\"),\n    )\n})?;";
-    assert_eq!(sites(caught), vec![1, 3]);
+                  b.map_err(|e| {\n    crate::errors::internal_error(\n        format!(\"y: {e}\"),\n    )\n})?;\n\
+                  c.map_err(|e| internal_error(&format!(\"w: {e}\")))?;\n\
+                  let u = \"https://h/p\"; d.map_err(|e| internal_error(format!(\"v: {e}\")))?;";
+    assert_eq!(sites(&strip(caught)), vec![1, 3, 7, 8]);
     let skipped = "McpError::internal_error(format!(\"t\"), None);\n\
                    McpError::internal_error(\n    format!(\"t\"),\n    None,\n);\n\
                    internal_error_logged(\"ctx\", e);\n\
                    .map_err(internal_error)?;\n\
                    log_internal_error(format!(\"z\"));";
-    assert!(sites(skipped).is_empty(), "{:?}", sites(skipped));
+    assert!(
+        sites(&strip(skipped)).is_empty(),
+        "{:?}",
+        sites(&strip(skipped))
+    );
+    let commented = "// a.map_err(|e| internal_error(format!(\"x: {e}\")))?;\n\
+                     /* internal_error(format!(\"y\")) */";
+    assert!(sites(&strip(commented)).is_empty());
 }
