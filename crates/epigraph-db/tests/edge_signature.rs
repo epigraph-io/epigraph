@@ -60,8 +60,9 @@ async fn verify(
     pool: &PgPool,
     edge: Uuid,
 ) -> epigraph_db::repos::edge_signature::EdgeSignatureCheck {
+    let viewer = fixture::public_viewer(pool).await;
     let mut conn = pool.acquire().await.expect("acquire");
-    EdgeSignatureRepository::verify_conn(&mut conn, edge)
+    EdgeSignatureRepository::verify_conn(&mut conn, &viewer, edge)
         .await
         .expect("verify")
         .expect("the edge is readable")
@@ -79,6 +80,7 @@ async fn a_writer_signs_its_new_edge_and_it_verifies_as_v1(pool: PgPool) {
 
     let p = pool.clone();
     let s = AgentSigner::from_bytes(&[0x71; 32]).expect("signer");
+    let w_viewer = Viewer::resolve(&pool, w).await.expect("W's viewer");
     let (edge, outcome) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, w).await;
         let (row, created) = EdgeRepository::create_if_not_exists_conn(
@@ -95,9 +97,10 @@ async fn a_writer_signs_its_new_edge_and_it_verifies_as_v1(pool: PgPool) {
         .await
         .expect("W writes the edge");
         assert!(created);
-        let outcome = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, row.id, &s, w)
-            .await
-            .expect("sign");
+        let outcome =
+            EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &w_viewer, row.id, &s, w)
+                .await
+                .expect("sign");
         (conn, (row.id, outcome))
     })
     .await;
@@ -133,6 +136,8 @@ async fn a_writer_signs_its_new_edge_and_it_verifies_as_v1(pool: PgPool) {
 async fn a_changed_edge_no_longer_matches_its_attestation_and_a_retraction_still_does(
     pool: PgPool,
 ) {
+    // The harness connection is a superuser; sign as the maintenance path does.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
     let signer = AgentSigner::from_bytes(&[0x72; 32]).expect("signer");
     let w = seed_signing_writer(&pool, "edge-signer-t", &signer).await;
     let a = fixture::seed_public_claim(&pool, w, "tamper A").await;
@@ -155,9 +160,10 @@ async fn a_changed_edge_no_longer_matches_its_attestation_and_a_retraction_still
         )
         .await
         .expect("edge");
-        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &signer, w)
-            .await
-            .expect("sign");
+        let out =
+            EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, id, &signer, w)
+                .await
+                .expect("sign");
         assert!(matches!(out, EdgeSignOutcome::Signed { .. }), "{out:?}");
         edges.push(id);
     }
@@ -203,6 +209,8 @@ async fn a_changed_edge_no_longer_matches_its_attestation_and_a_retraction_still
 /// edge-tagged one verifies as `v1`, and a bare-digest one as `legacy`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) {
+    // The harness connection is a superuser; sign as the maintenance path does.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
     let signer = AgentSigner::from_bytes(&[0x73; 32]).expect("signer");
     let w = seed_signing_writer(&pool, "edge-signer-x", &signer).await;
     let a = fixture::seed_public_claim(&pool, w, "cross A").await;
@@ -212,7 +220,7 @@ async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) 
         .expect("edge");
     let mut conn = pool.acquire().await.expect("acquire");
     let EdgeSignOutcome::Signed { digest } =
-        EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &signer, w)
+        EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, id, &signer, w)
             .await
             .expect("sign")
     else {
@@ -278,6 +286,8 @@ async fn a_legacy_signature_counts_only_over_the_rows_own_digest(pool: PgPool) {
 /// the bare `agents.public_key` (security review of this module, finding 1).
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_a_key_admitted_at_the_edges_creation_verifies_it(pool: PgPool) {
+    // The harness connection is a superuser; sign as the maintenance path does.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
     use chrono::{Duration, Utc};
     let hour = Duration::hours(1);
     let now = Utc::now();
@@ -350,7 +360,7 @@ async fn only_a_key_admitted_at_the_edges_creation_verifies_it(pool: PgPool) {
                 .await
                 .expect("edge");
         let mut conn = pool.acquire().await.expect("acquire");
-        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &key, w)
+        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, id, &key, w)
             .await
             .expect("sign");
         assert!(
@@ -383,7 +393,9 @@ async fn a_stranger_cannot_sign_and_a_signature_is_never_overwritten(pool: PgPoo
     let b = fixture::seed_public_claim(&pool, w, "owned B").await;
 
     let p = pool.clone();
-    let (z_try, w_first, w_again) =
+    let w_viewer = Viewer::resolve(&pool, w).await.expect("W's viewer");
+    let z_viewer = Viewer::resolve(&pool, z).await.expect("Z's viewer");
+    let (z_try, z_with_ws_viewer, w_first, w_again) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, w).await;
             let id = EdgeRepository::create(
@@ -392,20 +404,39 @@ async fn a_stranger_cannot_sign_and_a_signature_is_never_overwritten(pool: PgPoo
             .await
             .expect("W writes");
             stamp(&mut conn, &p, z).await;
-            let z_try = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &z_key, z)
-                .await
-                .expect("Z's attempt runs");
+            let z_try = EdgeSignatureRepository::sign_created_edge_conn(
+                &mut conn, &z_viewer, id, &z_key, z,
+            )
+            .await
+            .expect("Z's attempt runs");
+            // A caller that passes a viewer its session does not hold: the
+            // write predicate admits W's group, and row security on Z's
+            // stamped session still refuses (defence in depth).
+            let z_with_ws_viewer = EdgeSignatureRepository::sign_created_edge_conn(
+                &mut conn, &w_viewer, id, &z_key, z,
+            )
+            .await
+            .expect("Z's second attempt runs");
             stamp(&mut conn, &p, w).await;
-            let w_first = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &w_key, w)
-                .await
-                .expect("W signs");
-            let w_again = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, id, &w_key, w)
-                .await
-                .expect("W re-signs");
-            (conn, (z_try, w_first, w_again))
+            let w_first = EdgeSignatureRepository::sign_created_edge_conn(
+                &mut conn, &w_viewer, id, &w_key, w,
+            )
+            .await
+            .expect("W signs");
+            let w_again = EdgeSignatureRepository::sign_created_edge_conn(
+                &mut conn, &w_viewer, id, &w_key, w,
+            )
+            .await
+            .expect("W re-signs");
+            (conn, (z_try, z_with_ws_viewer, w_first, w_again))
         })
         .await;
 
+    assert_eq!(
+        z_with_ws_viewer,
+        EdgeSignOutcome::NotSignable,
+        "row security let a stranger's session attest W's edge"
+    );
     assert_eq!(
         z_try,
         EdgeSignOutcome::NotSignable,
@@ -421,6 +452,8 @@ async fn a_stranger_cannot_sign_and_a_signature_is_never_overwritten(pool: PgPoo
 /// The unsigned-edge metric counts what the rows say.
 #[sqlx::test(migrations = "../../migrations")]
 async fn coverage_counts_signed_and_unsigned_edges(pool: PgPool) {
+    // The harness connection is a superuser; sign as the maintenance path does.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
     let signer = AgentSigner::from_bytes(&[0x76; 32]).expect("signer");
     let w = seed_signing_writer(&pool, "edge-metric", &signer).await;
     let viewer = fixture::public_viewer(&pool).await;
@@ -438,7 +471,7 @@ async fn coverage_counts_signed_and_unsigned_edges(pool: PgPool) {
         .await
         .unwrap();
     let mut conn = pool.acquire().await.unwrap();
-    EdgeSignatureRepository::sign_created_edge_conn(&mut conn, signed, &signer, w)
+    EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, signed, &signer, w)
         .await
         .unwrap();
     drop(conn);

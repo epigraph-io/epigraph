@@ -42,6 +42,7 @@
 //! the database's `created_at` cannot make an honest signature fail to verify.
 
 use crate::errors::DbError;
+use crate::visibility::Viewer;
 use chrono::{DateTime, SecondsFormat, Utc};
 use epigraph_crypto::{
     AgentSigner, ContentHasher, SignatureScheme, SignatureVerifier, SignedEntity, HASH_SIZE,
@@ -162,6 +163,52 @@ fn attestation_of(row: &sqlx::postgres::PgRow) -> EdgeAttestation {
     }
 }
 
+/// `(public_key, key_type, status, valid_from, valid_until)` of one
+/// `agent_keys` row, type and status lower-cased.
+type KeyRow = (
+    Vec<u8>,
+    String,
+    String,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+);
+
+/// The signer's keys that may verify a signature on a row dated `at`:
+///
+/// * each attested `agent_keys` row (`signing`, `identity-legacy`) whose
+///   status and window admit `at` ([`crate::repos::agent_key::key_window_admits`],
+///   the rule the claim verifier uses), and
+/// * the signer's `agents.public_key` ("unattested") only when NO `agent_keys`
+///   row of the signer carries those bytes: a key with a recorded lifecycle is
+///   governed by it, so a revoked, pending or out-of-window key cannot come
+///   back in as the bare agent key.
+fn admitted_keys(
+    rows: &[KeyRow],
+    agent_key: Option<Vec<u8>>,
+    at: DateTime<Utc>,
+) -> Vec<([u8; 32], &'static str)> {
+    let mut out = Vec::new();
+    for (key, key_type, status, from, until) in rows {
+        let kind = match key_type.as_str() {
+            "signing" => "signing",
+            "identity-legacy" => "identity-legacy",
+            _ => continue,
+        };
+        if crate::repos::agent_key::key_window_admits(status, *from, *until, at) {
+            if let Ok(k) = <[u8; 32]>::try_from(key.as_slice()) {
+                out.push((k, kind));
+            }
+        }
+    }
+    if let Some(k) = agent_key
+        .filter(|k| !rows.iter().any(|(key, ..)| key == k))
+        .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+    {
+        out.push((k, "unattested"));
+    }
+    out
+}
+
 impl EdgeSignatureRepository {
     /// Sign an edge THIS session just created: compute the attestation digest
     /// from the stored row and write `content_hash`, the v1 edge signature and
@@ -171,9 +218,11 @@ impl EdgeSignatureRepository {
     /// Call it only for an edge the caller created in this act (`was_created`):
     /// on a dedup hit the row is another write's assertion, and signing it
     /// would attest something this signer did not write. The UPDATE refuses to
-    /// overwrite any existing signature or digest, and the row is locked with
-    /// `FOR UPDATE`, so a session that may not update the edge (migration 117's
-    /// owner-scoped policy) signs nothing.
+    /// overwrite any existing signature or digest. Both the `FOR UPDATE` lock
+    /// and the UPDATE carry `viewer`'s WRITE predicate (`{WRITABLE:e}`, bound
+    /// to its writable groups; nothing for a maintenance viewer), and row
+    /// security (migration 117's owner-scoped UPDATE policy) applies on top,
+    /// so a session that may not update the edge signs nothing.
     ///
     /// `signer_id` must be the agent whose registered key is `signer`'s public
     /// key, as for `ClaimRepository::create_strict_signed`.
@@ -182,16 +231,26 @@ impl EdgeSignatureRepository {
     /// Returns `DbError::QueryFailed` if a statement fails.
     pub async fn sign_created_edge_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
         edge_id: Uuid,
         signer: &AgentSigner,
         signer_id: Uuid,
     ) -> Result<EdgeSignOutcome, DbError> {
-        let sql = format!("SELECT {ATTESTATION_COLUMNS} FROM edges e WHERE e.id = $1 FOR UPDATE");
-        let Some(row) = sqlx::query(&sql)
-            .bind(edge_id)
-            .fetch_optional(&mut *conn)
-            .await?
-        else {
+        // Both statements carry the WRITE predicate (the viewer's writable
+        // groups; nothing for a maintenance/bypass viewer, where row security
+        // decides), so only a writer of the edge locks or attests it.
+        let lock_sql = viewer.splice_write(
+            &format!(
+                "SELECT {ATTESTATION_COLUMNS} FROM edges e \
+                  WHERE e.id = $1 /* {{WRITABLE:e}} */ FOR UPDATE"
+            ),
+            2,
+        );
+        let mut q = sqlx::query(&lock_sql).bind(edge_id);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let Some(row) = q.fetch_optional(&mut *conn).await? else {
             return Ok(EdgeSignOutcome::NotSignable);
         };
         let existing_sig: Option<Vec<u8>> = row.get("signature");
@@ -201,18 +260,21 @@ impl EdgeSignatureRepository {
         }
         let digest = edge_attestation_digest(&attestation_of(&row))?;
         let signature = signer.sign_entity(SignedEntity::Edge, &digest);
-        let updated = sqlx::query(
-            "UPDATE edges SET content_hash = $2, signature = $3, signer_id = $4 \
-              WHERE id = $1 AND signature IS NULL AND signer_id IS NULL \
-                AND content_hash IS NULL",
-        )
-        .bind(edge_id)
-        .bind(digest.as_slice())
-        .bind(signature.as_slice())
-        .bind(signer_id)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        let update_sql = viewer.splice_write(
+            "UPDATE edges AS e SET content_hash = $2, signature = $3, signer_id = $4 \
+              WHERE e.id = $1 AND e.signature IS NULL AND e.signer_id IS NULL \
+                AND e.content_hash IS NULL /* {WRITABLE:e} */",
+            5,
+        );
+        let mut q = sqlx::query(&update_sql)
+            .bind(edge_id)
+            .bind(digest.as_slice())
+            .bind(signature.as_slice())
+            .bind(signer_id);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let updated = q.execute(&mut *conn).await?.rows_affected();
         Ok(if updated == 1 {
             EdgeSignOutcome::Signed { digest }
         } else {
@@ -220,21 +282,28 @@ impl EdgeSignatureRepository {
         })
     }
 
-    /// Verify one edge's attestation, as the session can see it. `None` when
-    /// the session cannot read the edge.
+    /// Verify one edge's attestation. `None` when `viewer` cannot read the
+    /// edge (the EDGE read predicate).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if a statement fails.
     pub async fn verify_conn(
         conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
         edge_id: Uuid,
     ) -> Result<Option<EdgeSignatureCheck>, DbError> {
-        let sql = format!("SELECT {ATTESTATION_COLUMNS} FROM edges e WHERE e.id = $1");
-        let Some(row) = sqlx::query(&sql)
-            .bind(edge_id)
-            .fetch_optional(&mut *conn)
-            .await?
-        else {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT {ATTESTATION_COLUMNS} FROM edges e \
+                  WHERE e.id = $1 /* {{EDGE_VISIBILITY:e}} */"
+            ),
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(edge_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let Some(row) = q.fetch_optional(&mut *conn).await? else {
             return Ok(None);
         };
         let signature: Option<Vec<u8>> = row.get("signature");
@@ -252,7 +321,22 @@ impl EdgeSignatureRepository {
         let mut verified: Option<(SignatureScheme, &'static str)> = None;
         if let (Some(sig), Some(h), Some(signer)) = (signature.as_deref(), stored_hash, signer_id) {
             if let Ok(sig) = <[u8; 64]>::try_from(sig) {
-                let keys = Self::admitted_keys(conn, signer, created_at).await?;
+                // `agents` and `agent_keys` carry no tenancy columns: a key is
+                // public verification material, read unfiltered.
+                let rows: Vec<KeyRow> = sqlx::query_as(
+                    "SELECT public_key, lower(btrim(key_type)), lower(btrim(status)), \
+                            valid_from, valid_until \
+                       FROM agent_keys WHERE agent_id = $1 ORDER BY created_at, id",
+                )
+                .bind(signer)
+                .fetch_all(&mut *conn)
+                .await?;
+                let agent_key: Option<Vec<u8>> =
+                    sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+                        .bind(signer)
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                let keys = admitted_keys(&rows, agent_key, created_at);
                 verified = keys.iter().find_map(|(key, kind)| {
                     SignatureVerifier::verify_entity(key, SignedEntity::Edge, &h, &sig)
                         .ok()
@@ -279,64 +363,6 @@ impl EdgeSignatureRepository {
         }))
     }
 
-    /// The signer's keys that may verify a signature on a row dated `at`:
-    ///
-    /// * each attested `agent_keys` row (`signing`, `identity-legacy`) whose
-    ///   status and window admit `at` ([`crate::repos::agent_key::key_window_admits`],
-    ///   the rule the claim verifier uses), and
-    /// * the signer's `agents.public_key` ("unattested") only when NO
-    ///   `agent_keys` row of the signer carries those bytes: a key with a
-    ///   recorded lifecycle is governed by it, so a revoked, pending or
-    ///   out-of-window key cannot come back in as the bare agent key.
-    async fn admitted_keys(
-        conn: &mut sqlx::PgConnection,
-        signer: Uuid,
-        at: DateTime<Utc>,
-    ) -> Result<Vec<([u8; 32], &'static str)>, DbError> {
-        // (public_key, key_type, status, valid_from, valid_until)
-        type KeyRow = (
-            Vec<u8>,
-            String,
-            String,
-            DateTime<Utc>,
-            Option<DateTime<Utc>>,
-        );
-        let rows: Vec<KeyRow> = sqlx::query_as(
-            "SELECT public_key, lower(btrim(key_type)), lower(btrim(status)), \
-                        valid_from, valid_until \
-                   FROM agent_keys WHERE agent_id = $1 ORDER BY created_at, id",
-        )
-        .bind(signer)
-        .fetch_all(&mut *conn)
-        .await?;
-        let agent_key: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
-                .bind(signer)
-                .fetch_optional(&mut *conn)
-                .await?;
-
-        let mut out = Vec::new();
-        for (key, key_type, status, from, until) in &rows {
-            let kind = match key_type.as_str() {
-                "signing" => "signing",
-                "identity-legacy" => "identity-legacy",
-                _ => continue,
-            };
-            if crate::repos::agent_key::key_window_admits(status, *from, *until, at) {
-                if let Ok(k) = <[u8; 32]>::try_from(key.as_slice()) {
-                    out.push((k, kind));
-                }
-            }
-        }
-        if let Some(k) = agent_key
-            .filter(|k| !rows.iter().any(|(key, ..)| key == k))
-            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
-        {
-            out.push((k, "unattested"));
-        }
-        Ok(out)
-    }
-
     /// The unsigned-edge metric: how many of the edges `viewer` may read carry
     /// a signature, and how many do not.
     ///
@@ -348,7 +374,7 @@ impl EdgeSignatureRepository {
     /// Returns `DbError::QueryFailed` if the query fails.
     pub async fn coverage(
         pool: &sqlx::PgPool,
-        viewer: &crate::visibility::Viewer,
+        viewer: &Viewer,
     ) -> Result<EdgeSigningCoverage, DbError> {
         // `WHERE true` gives the marker a predicate to append ` AND (...)` to.
         let sql = viewer.splice(

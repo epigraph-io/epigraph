@@ -50,6 +50,8 @@ async fn detailed_stats_count_signed_and_unsigned_edges_for_the_caller(pool: PgP
     let w_viewer = Viewer::resolve(&pool, w).await.expect("viewer");
     let s_viewer = Viewer::resolve(&pool, stranger).await.expect("viewer");
     let server = build_test_server(pool.clone());
+    // The harness connection is a superuser; sign as the maintenance path does.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
 
     let (w_signed0, w_unsigned0) = stats(&server, &w_viewer).await;
     let (s_signed0, s_unsigned0) = stats(&server, &s_viewer).await;
@@ -62,7 +64,7 @@ async fn detailed_stats_count_signed_and_unsigned_edges_for_the_caller(pool: PgP
             .await
             .expect("edge");
     let mut conn = pool.acquire().await.expect("acquire");
-    EdgeSignatureRepository::sign_created_edge_conn(&mut conn, signed, &signer, w)
+    EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, signed, &signer, w)
         .await
         .expect("sign");
     drop(conn);
