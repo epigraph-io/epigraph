@@ -30,12 +30,20 @@
 //!
 //! 1. the key is registered in `agent_keys`: it must be an ACTIVE `signing`
 //!    key, inside its window now, of exactly one agent, and that agent signs
-//!    (the separate-signing-key shape the MCP server uses; rotation = register
-//!    the new key as the agent's active `signing` key, rotate the old row, and
-//!    point the variable at the new file; no code change);
+//!    (the separate-signing-key shape the MCP server uses);
 //! 2. otherwise the agent whose `agents.public_key` is the key;
 //! 3. otherwise a new agent is registered with that public key (as the MCP
 //!    server does for its own key), named [`SIGNER_DISPLAY_NAME`].
+//!
+//! Rotation needs no code change, but it is a maintenance act (`signing` rows
+//! are attested state, refused to the application role by migration 161).
+//! The OLD key must end up in `agent_keys` as a `rotated` row with
+//! `valid_until` set: a key that is only an `agents.public_key` (steps 2 and
+//! 3) is admitted by the verifier with no window while no row carries its
+//! bytes, so without that row a retired key keeps verifying. Then the new key
+//! is registered as the agent's active `signing` row and the variable points
+//! at its file. `docs/architecture/noun-claims-and-verb-edges.md` has the
+//! operator steps.
 //!
 //! The signer is never an edge's author: an edge's author is its source
 //! claim's (`backfill_factors::EDGE_QUERY`, the operator's edge-writer read).
