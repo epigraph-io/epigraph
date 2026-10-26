@@ -1752,7 +1752,11 @@ restart.
   repository change reverted. Slot: 181 is assigned to this batch (moved from
   179, which an open PR holds) and is free on `main` and in every open PR.
   **Deploy order:** with or after 172, and before (or with) the API binary
-  that calls it; the binary's member removal fails 42501 without it.
+  that calls it. Without 181 that binary's call raises 42883 (function does
+  not exist), so EVERY member removal is a 500, the creator's included. A
+  grant that no-opped (role absent when 181 ran) shows on that route as a 403
+  for every removal instead; `epigraph-tenancy-backfill verify` reports both
+  the owner and the grant, so run it after 181.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
