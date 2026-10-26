@@ -290,22 +290,36 @@ async fn frame_rows(pool: &PgPool, claim: Uuid) -> i64 {
         .expect("count claim_frames")
 }
 
-/// `upsert_cluster` and `assign_claim_to_frame` spent their viewer on the FRAME
-/// and never read the CLAIM they bind to it, so a `claims:admin` caller could
-/// bind a claim it cannot read. Their siblings in the same file
-/// (`reassign_claim`, and `forget_convention` in `conventions.rs`) already read
-/// their claim through the viewer first. Now these two do: an unreadable claim
-/// is 404 and no `claim_frames` row is written.
-#[tokio::test(flavor = "multi_thread")]
-async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_nothing() {
-    let (url, pool) = shared_pool().await;
-    let (addr, _shutdown) = common::spawn_app(&url).await;
+/// A `claims:admin` caller, an owner with a private group, and an http client.
+async fn frame_world(pool: &PgPool) -> (String, Uuid, Uuid) {
     let (token, _) = common::test_bearer_token_with_seeded_client(
-        &pool,
+        pool,
         &["claims:read", "claims:write", "claims:admin"],
     )
     .await;
-    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "a12-frame-owner").await;
+    let (owner, group) = viewer_fixture::seed_agent_with_group(pool, "a12-frame-owner").await;
+    (token, owner, group)
+}
+
+async fn seed_frame_target(pool: &PgPool, owner: Uuid, group: Uuid, readable: bool) -> Uuid {
+    let content = format!("a12 frame target {readable} {}", Uuid::new_v4());
+    if readable {
+        viewer_fixture::seed_public_claim(pool, owner, &content).await
+    } else {
+        viewer_fixture::seed_group_claim(pool, owner, group, &content).await
+    }
+}
+
+/// `assign_claim_to_frame` spent its viewer on the FRAME and never read the
+/// CLAIM it binds to it, so a `claims:admin` caller could bind a claim it cannot
+/// read. Its siblings (`reassign_claim`, and `forget_convention` in
+/// `conventions.rs`) already read their claim through the viewer first. Now it
+/// does: an unreadable claim is 404 and no `claim_frames` row is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn assigning_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_nothing() {
+    let (url, pool) = shared_pool().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, owner, group) = frame_world(&pool).await;
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['in','out']::text[]) RETURNING id",
     )
@@ -315,18 +329,8 @@ async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_not
     .expect("seed frame");
     let http = reqwest::Client::new();
 
-    for (visibility, readable) in [("public", true), ("group", false)] {
-        let content = format!("a12 frame target {visibility} {}", Uuid::new_v4());
-        let seed = || async {
-            if readable {
-                viewer_fixture::seed_public_claim(&pool, owner, &content).await
-            } else {
-                viewer_fixture::seed_group_claim(&pool, owner, group, &content).await
-            }
-        };
-
-        // ── assign-claim ──
-        let claim = seed().await;
+    for readable in [true, false] {
+        let claim = seed_frame_target(&pool, owner, group, readable).await;
         let status = http
             .post(format!("http://{addr}/api/v1/frames/{frame}/assign-claim"))
             .bearer_auth(&token)
@@ -340,7 +344,7 @@ async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_not
         if readable {
             assert_eq!(
                 status, 201,
-                "calibration ({visibility}): assign-claim must succeed"
+                "calibration: assign-claim on a public claim must succeed"
             );
             assert_eq!(rows, 1, "calibration: the binding must land");
         } else {
@@ -350,34 +354,63 @@ async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_not
             );
             assert_eq!(rows, 0, "a refused assign-claim must write no binding");
         }
+    }
+}
 
-        // ── clusters ──
-        let claim = seed().await;
+async fn cluster_frames(pool: &PgPool, label: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM frames WHERE name = $1")
+        .bind(format!("cluster:{label}"))
+        .fetch_one(pool)
+        .await
+        .expect("count cluster frames")
+}
+
+/// `upsert_cluster` has the same shape as `assign_claim_to_frame`, and its
+/// FIRST write is the find-or-create of the `cluster:<label>` frame. A refused
+/// upsert must write neither that frame nor the binding.
+#[tokio::test(flavor = "multi_thread")]
+async fn clustering_a_claim_the_caller_cannot_read_is_404_and_creates_nothing() {
+    let (url, pool) = shared_pool().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, owner, group) = frame_world(&pool).await;
+    let http = reqwest::Client::new();
+
+    for readable in [true, false] {
+        let claim = seed_frame_target(&pool, owner, group, readable).await;
+        let label = format!("a12-{}", Uuid::new_v4());
         let status = http
             .post(format!("http://{addr}/api/v1/clusters"))
             .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "claim_id": claim,
-                "cluster_label": format!("a12-{}", Uuid::new_v4()),
-            }))
+            .json(&serde_json::json!({"claim_id": claim, "cluster_label": label}))
             .send()
             .await
             .expect("clusters request")
             .status()
             .as_u16();
-        let rows = frame_rows(&pool, claim).await;
+        let (rows, frames) = (
+            frame_rows(&pool, claim).await,
+            cluster_frames(&pool, &label).await,
+        );
         if readable {
             assert_eq!(
                 status, 201,
-                "calibration ({visibility}): clusters must succeed"
+                "calibration: clustering a public claim must succeed"
             );
-            assert_eq!(rows, 1, "calibration: the cluster binding must land");
+            assert_eq!(
+                (rows, frames),
+                (1, 1),
+                "calibration: the cluster frame and the binding must land"
+            );
         } else {
             assert_eq!(
                 status, 404,
                 "clustering a claim the caller cannot read must be 404, got {status}"
             );
-            assert_eq!(rows, 0, "a refused cluster upsert must write no binding");
+            assert_eq!(
+                (rows, frames),
+                (0, 0),
+                "a refused cluster upsert must create no `cluster:<label>` frame and no binding"
+            );
         }
     }
 }
