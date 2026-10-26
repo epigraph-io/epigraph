@@ -219,6 +219,33 @@ fn assert_refused(what: &str, (status, body): &(StatusCode, Value), error: &str)
     );
 }
 
+/// A refused mint (as [`assert_refused`]) after which there are exactly `n`
+/// `oauth_run_token_refused` rows (so it added one), the newest naming
+/// `reason` (the check that refused it) and `principal` (`None` when the
+/// refusal came before the principal was looked up).
+async fn refused_because(
+    pool: &PgPool,
+    n: usize,
+    what: &str,
+    answer: &(StatusCode, Value),
+    error: &str,
+    reason: &str,
+    principal: Option<Uuid>,
+) {
+    assert_refused(what, answer, error);
+    let rows = events(pool, "oauth_run_token_refused").await;
+    assert_eq!(rows.len(), n, "{what}: one new refusal row: {rows:?}");
+    let (agent, ok, details) = rows.last().expect("the new refusal row");
+    assert_eq!(*ok, Some(false), "{what}: {details}");
+    assert_eq!(
+        details["reason"],
+        json!(reason),
+        "{what}: the refusing check: {details}"
+    );
+    assert_eq!(*agent, principal, "{what}: the row's agent: {details}");
+    assert_eq!(details["principal"], json!(principal), "{what}: {details}");
+}
+
 /// `GET /api/v1/claims/{claim}` (with `?group_id=` when given) under `token`.
 async fn read_claim(
     state: &AppState,
@@ -480,7 +507,8 @@ async fn the_grant_is_unsupported_while_run_tokens_are_off(pool: PgPool) {
 
 /// Every way the delegation is not live refuses the mint, before any token
 /// exists; an unknown identity is refused without creating an agent; each
-/// refusal is one audit row.
+/// refusal is ONE audit row naming the check that refused it, so a case
+/// refused by an earlier, unrelated check fails here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_mint_whose_delegation_is_not_live_is_refused(pool: PgPool) {
     let (d, client_id, key) = world(&pool, "run-token-refusals").await;
@@ -493,52 +521,79 @@ async fn a_mint_whose_delegation_is_not_live_is_refused(pool: PgPool) {
     // An identity key no agent has.
     let before = agent_count(&pool).await;
     let unknown = hex::encode([0x11u8; 32]);
-    assert_refused(
+    refused_because(
+        &pool,
+        1,
         "unknown identity",
         &mint(&st, &request(&client_id, &unknown, json!({}))).await,
         "invalid_grant",
-    );
+        "unknown_identity",
+        None,
+    )
+    .await;
     assert_eq!(agent_count(&pool).await, before, "no agent is created");
 
     // An LLM agent with no operator link.
     let (unlinked, _) = delegation::agent_with_group(&pool, "run-token-unlinked").await;
     let unlinked_key = identify(&pool, unlinked, MODEL).await;
-    assert_refused(
+    refused_because(
+        &pool,
+        2,
         "unlinked principal",
         &mint(&st, &request(&client_id, &unlinked_key, json!({}))).await,
         "invalid_grant",
-    );
+        "delegation_not_live",
+        Some(unlinked),
+    )
+    .await;
 
     // A principal linked to ANOTHER operator.
     let other = delegation::live_delegation(&pool, "run-token-other-operator").await;
     let other_key = identify(&pool, other.principal, MODEL).await;
-    assert_refused(
+    refused_because(
+        &pool,
+        3,
         "another operator's principal",
         &mint(&st, &request(&client_id, &other_key, json!({}))).await,
         "invalid_grant",
-    );
+        "delegation_not_live",
+        Some(other.principal),
+    )
+    .await;
 
     // A delegator that is not on the allowlist.
     let (c, _) =
         delegation::delegator(&pool, d.operator, d.operator_group, Some("writer"), false).await;
     let not_allowed = arm_client(&pool, c, DELEGATOR_GRANTED).await;
-    assert_refused(
+    refused_because(
+        &pool,
+        4,
         "a delegator not on the allowlist",
         &mint(&st, &request(&not_allowed, &key, json!({}))).await,
         "invalid_grant",
-    );
+        "delegation_not_live",
+        Some(d.principal),
+    )
+    .await;
 
     // An allowlisted delegator that holds no writer membership of G.
     let (c, _) = delegation::delegator(&pool, d.operator, d.operator_group, None, true).await;
     let no_membership = arm_client(&pool, c, DELEGATOR_GRANTED).await;
-    assert_refused(
+    refused_because(
+        &pool,
+        5,
         "a delegator without writer membership",
         &mint(&st, &request(&no_membership, &key, json!({}))).await,
         "invalid_grant",
-    );
+        "delegation_not_live",
+        Some(d.principal),
+    )
+    .await;
 
-    // The wrong secret.
-    assert_refused(
+    // The wrong secret (refused before the principal is looked up).
+    refused_because(
+        &pool,
+        6,
         "wrong secret",
         &mint(
             &st,
@@ -550,7 +605,10 @@ async fn a_mint_whose_delegation_is_not_live_is_refused(pool: PgPool) {
         )
         .await,
         "invalid_client",
-    );
+        "bad_secret",
+        None,
+    )
+    .await;
 
     // A human client cannot delegate.
     let human: String =
@@ -559,34 +617,50 @@ async fn a_mint_whose_delegation_is_not_live_is_refused(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("the operator's human client");
-    assert_refused(
+    refused_because(
+        &pool,
+        7,
         "a human client",
         &mint(&st, &request(&human, &key, json!({}))).await,
         "invalid_client",
-    );
+        "client_not_active_service",
+        None,
+    )
+    .await;
 
-    // A suspended delegator client.
+    // A suspended delegator client: the client lookup reads ACTIVE clients
+    // only (`OAuthClientRepository::get_by_client_id`), so it is refused as
+    // unknown, before the status check `decide` repeats.
     delegation::set_client_status(&pool, d.delegator_client, "suspended").await;
-    assert_refused(
+    refused_because(
+        &pool,
+        8,
         "a suspended delegator",
         &mint(&st, &request(&client_id, &key, json!({}))).await,
         "invalid_client",
-    );
+        "unknown_client",
+        None,
+    )
+    .await;
     delegation::set_client_status(&pool, d.delegator_client, "active").await;
 
     // A retired link.
     delegation::retire_link(&pool, d.principal).await;
-    assert_refused(
+    refused_because(
+        &pool,
+        9,
         "a retired link",
         &mint(&st, &request(&client_id, &key, json!({}))).await,
         "invalid_grant",
-    );
+        "delegation_not_live",
+        Some(d.principal),
+    )
+    .await;
 
     // Unknown identity, unlinked, other operator, not allowed, no membership,
     // wrong secret, human, suspended, retired: one row each.
     let refused = events(&pool, "oauth_run_token_refused").await;
     assert_eq!(refused.len(), 9, "one audit row per refusal: {refused:?}");
-    assert!(refused.iter().all(|(_, ok, _)| *ok == Some(false)));
 }
 
 /// The model list: a principal whose model is not listed is refused, and an
@@ -678,10 +752,72 @@ async fn a_mint_writes_one_audit_row_naming_the_token(pool: PgPool) {
         json!("schedule:test-run"),
         "{details}"
     );
+    assert_eq!(
+        details["operator_group"],
+        json!(d.operator_group),
+        "{details}"
+    );
+    assert_eq!(details["scopes"], json!(claims.scopes), "{details}");
     let text = details.to_string();
     assert!(!text.contains(&secret_hex()), "the secret is never audited");
     assert!(!text.contains(&token), "the token is never audited");
-    assert!("oauth_run_token_minted".len() < 50 && "oauth_run_token_refused".len() < 50);
+
+    // The run label's bound is inclusive: 64 characters mint (65 do not;
+    // `a_malformed_run_token_request_is_invalid_request`).
+    let label = "y".repeat(64);
+    token_of(
+        "a 64-character run label",
+        &mint(&st, &request(&client_id, &key, json!({"run_label": label}))).await,
+    );
+    let minted = events(&pool, "oauth_run_token_minted").await;
+    assert_eq!(minted.len(), 2, "{minted:?}");
+    assert_eq!(minted[1].2["run_label"], json!(label));
+}
+
+/// No token without its audit row: when the `oauth_run_token_minted` row
+/// cannot be written, the mint answers an error and no access token.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mint_whose_audit_row_cannot_be_written_returns_no_token(pool: PgPool) {
+    let (_d, client_id, key) = world(&pool, "run-token-audit-fails").await;
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+    token_of(
+        "CALIBRATION: the world mints while its row can be written",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+    );
+    // The harness pool is the superuser: make the mint's row fail to insert.
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_run_token_minted() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           IF NEW.event_type = 'oauth_run_token_minted' THEN \
+             RAISE EXCEPTION 'test: the audit row cannot be written'; \
+           END IF; RETURN NEW; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_run_token_minted BEFORE INSERT ON security_events \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_run_token_minted()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the refusing trigger");
+
+    let (status, body) = mint(&st, &request(&client_id, &key, json!({}))).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a mint whose row cannot land is an error: {body}"
+    );
+    assert!(
+        body.get("access_token").is_none() && !body.to_string().contains("eyJ"),
+        "no token is returned: {body}"
+    );
+    assert_eq!(
+        events(&pool, "oauth_run_token_minted").await.len(),
+        1,
+        "only the calibration mint's row exists"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
