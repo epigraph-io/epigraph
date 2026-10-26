@@ -95,6 +95,15 @@ async fn slot_masses(pool: &PgPool, row: Uuid) -> serde_json::Value {
         .expect("the assessment slot row")
 }
 
+async fn cached_betp(pool: &PgPool, claim: Uuid) -> f64 {
+    sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("cache")
+        .expect("assess filled the cache")
+}
+
 async fn link(pool: &PgPool, agent: Uuid, human: Uuid) {
     let mut conn = pool.acquire().await.expect("acquire");
     let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
@@ -117,6 +126,7 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
     let claim = seed_public_claim(&pool, author, "assess owner grouping: siblings").await;
     let first = assess(&state, &pool, one, claim).await;
     let single = first.pignistic_prob.expect("single-call BetP");
+    let cache_single = cached_betp(&pool, claim).await;
     let masses = slot_masses(&pool, first.mass_function_id).await;
 
     // The sibling restates the owner's assessment through another route.
@@ -128,10 +138,28 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
         "a sibling's identical row must not add up with the owner's slot: single-call \
          {single}, got {folded}"
     );
+    // The claim's cache is the engine's recompute (checked against the
+    // control below, which holds the same two rows from independent owners).
+    let cache_again = cached_betp(&pool, claim).await;
+    // The stored global scoped belief is this response's fold.
+    let global: Option<f64> = sqlx::query_scalar(
+        "SELECT pignistic_prob FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = 'global'",
+    )
+    .bind(claim)
+    .bind(again.frame_id)
+    .fetch_one(&pool)
+    .await
+    .expect("global scoped belief");
+    assert!(
+        global.is_some_and(|g| (g - folded).abs() < 1e-9),
+        "the stored global scoped belief must hold the response's fold: {global:?} vs {folded}"
+    );
 
     // Control: the same identical row by an agent of no human reinforces.
     let control = seed_public_claim(&pool, author, "assess owner grouping: control").await;
     let c_first = assess(&state, &pool, one, control).await;
+    let c_cache_single = cached_betp(&pool, control).await;
     let c_masses = slot_masses(&pool, c_first.mass_function_id).await;
     frames_row(
         &state,
@@ -147,5 +175,24 @@ async fn a_siblings_row_folds_cautiously_with_the_owners_assessment(pool: PgPool
     assert!(
         independent > single + 1e-3,
         "an independent owner's identical row must still reinforce: {independent} vs {single}"
+    );
+    // The cache path: the engine discounts each row by its own evidence type
+    // (the untyped slot more than the frames row), so the siblings' rows are
+    // not equal there and the cautious rule need not return either one; it
+    // must stay strictly below the independent fold of the SAME two rows.
+    let c_cache = cached_betp(&pool, control).await;
+    assert!(
+        c_cache > c_cache_single + 1e-3,
+        "PREMISE: an independent owner's row reinforces the cache: {c_cache} vs \
+         {c_cache_single}"
+    );
+    assert!(
+        (cache_single - c_cache_single).abs() < 1e-9,
+        "PREMISE: the two claims' slot-only caches are equal"
+    );
+    assert!(
+        cache_again < c_cache - 1e-3,
+        "the cache aggregated the sibling's row like an independent owner's: siblings \
+         {cache_again} vs independent {c_cache}"
     );
 }
