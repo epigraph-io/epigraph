@@ -2480,3 +2480,90 @@ async fn the_mode_verbs_keep_the_old_signatures_and_a_mode_never_changes(pool: P
         "POSITIVE CONTROL: a plain end still lands"
     );
 }
+
+// =====================================================================
+// Migration 179: which attachments count. The bound role and the
+// window's start.
+// =====================================================================
+
+/// THE BOUND ROLE. An agent of the holder attached to ANOTHER role (one its
+/// human also holds, bound to another group) is not a member of a group bound
+/// to ROLE in the attached mode. Positive controls: the holder reads ROLE's
+/// group, and the same agent reads the OTHER role's group, so the attachment
+/// is live and held, and only the role match leaves it out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_attached_to_another_role_is_not_admitted(pool: PgPool) {
+    const OTHER: &str = "role:another-team";
+    let (h, _) = human(&pool, "other-role-h").await;
+    let other_attached = operated(&pool, h, "other-role-attached").await;
+    let (group, _) = attached_group(&pool, "Synthetic Role Match Team", "writer").await;
+    let (owner2, _) = human(&pool, "other-role-owner2").await;
+    let other_group = team_group(&pool, "Synthetic Other Role Team", owner2).await;
+    define_mode(&pool, OTHER, other_group, "reader", ATTACHED_AGENTS)
+        .await
+        .expect("define the other role, attached agents only");
+    attach_to_role(&pool, OTHER, other_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    grant(&pool, OTHER, h, 0, None).await;
+
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder"
+    );
+    assert_eq!(
+        resolves(&pool, other_attached, other_group).await,
+        (true, false),
+        "POSITIVE CONTROL: the agent's attachment to the other role is live and held"
+    );
+    assert_eq!(
+        resolves(&pool, other_attached, group).await,
+        (false, false),
+        "an agent attached to ANOTHER role its human holds"
+    );
+    assert!(live_roles(&pool, other_attached, group).await.is_empty());
+}
+
+/// THE WINDOW'S START. An attachment whose window opens in an hour admits
+/// nothing now, while the role IS held by the agent's own human (positive
+/// control: the holder reads, and an agent of the same human attached now
+/// does).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attachment_that_has_not_started_admits_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "future-h").await;
+    let future = operated(&pool, h, "future-attached").await;
+    let now_attached = operated(&pool, h, "future-control").await;
+    let (group, _) = attached_group(&pool, "Synthetic Future Attach Team", "writer").await;
+    let role = ROLE.to_string();
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() + interval '1 hour', \
+                    NULL, 'role membership test future attach')",
+        )
+        .bind(&role)
+        .bind(future)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a future attachment");
+        (conn, ())
+    })
+    .await;
+    attach_to_role(&pool, ROLE, now_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder"
+    );
+    assert_eq!(
+        resolves(&pool, now_attached, group).await,
+        (true, true),
+        "POSITIVE CONTROL: an agent of the same human attached now"
+    );
+    assert_eq!(
+        resolves(&pool, future, group).await,
+        (false, false),
+        "an attachment whose window opens in an hour"
+    );
+}
