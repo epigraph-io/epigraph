@@ -489,12 +489,20 @@ jobs:
   # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
   # job does not provide yet, so that arm does not run in CI.
   #
+  # The database arms connect as the service container's superuser, so RLS is
+  # bypassed: they verify the scripts' logic against the migrated schema, not
+  # role or tenancy scoping (a script run as a non-superuser role seeing only
+  # part of the rows is outside what they can catch).
+  #
   # Advisory at first (continue-on-error, the `audit` precedent): promote it to
   # a hard gate once it has been stable on main.
   python:
     name: Python tests (advisory)
-    runs-on: ubuntu-latest
-    # Build ~15 min cold, the suites under a minute; 60 cuts off a hang.
+    # Pinned, not ubuntu-latest: tests/requirements-ci.txt pins wheels built
+    # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
+    # so a newer default image would turn the install into a source build.
+    runs-on: ubuntu-24.04
+    # A cold debug build of the two binaries plus the suites; 60 cuts off a hang.
     timeout-minutes: 60
     continue-on-error: true
     services:
@@ -521,6 +529,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          # Save only from main: PR runs restore main's entry but do not add
+          # their own, so this job's cache cannot churn the shared Actions cache
+          # budget the `test` job's (much larger) entry depends on.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build epigraph-migrate and ingest_git
         run: cargo build --locked -p epigraph-api --bin epigraph-migrate -p epigraph-cli --bin ingest_git
       - name: Install Python test dependencies
