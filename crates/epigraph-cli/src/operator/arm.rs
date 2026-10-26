@@ -18,12 +18,20 @@
 //! authors, so with an empty allowlist the report is exactly what it was
 //! before 149.
 //!
-//! LIMIT: `claims` records the AUTHOR and the owner group, not the writing
-//! principal, so the census sees writer scope only where the author was also
-//! the writer. A row authored by an allowlisted agent but written by another
-//! principal can be listed although it was admitted (conservative; the
-//! override exists), and a write BY an allowlisted agent under another author
-//! is invisible to both lists.
+//! WHO WROTE A CLAIM. A claim is attributed to its author (`claims.agent_id`),
+//! except a supersession's successor (backlog 73085534, ruling R-23): the
+//! successor inherits the RETIRED claim's author, so it is attributed to the
+//! agent that performed the act, which the act records as the successor's
+//! `AUTHORED` edge in its own transaction ([`CENSUS_WRITES`]). Counting the
+//! inherited author would list a long-quiet author as a live writer, and miss
+//! the agent that actually wrote.
+//!
+//! LIMIT: apart from that, `claims` records the AUTHOR and the owner group, not
+//! the writing principal, so the census sees writer scope only where the
+//! author was also the writer. A row authored by an allowlisted agent but
+//! written by another principal can be listed although it was admitted
+//! (conservative; the override exists), and a write BY an allowlisted agent
+//! under another author is invisible to both lists.
 //!
 //! A dry run (the default) prints the report and arms nothing.
 //!
@@ -94,7 +102,32 @@ pub async fn unregistered_system_roles(
     ))
 }
 
-/// The census: unbound agents that authored claims in the last `days` days.
+/// Every claim written in the last `$1` days, as `(writer, owner_group_id)`:
+/// the claim's author, except a supersession's successor, whose writer is the
+/// agent that performed the act (backlog 73085534, ruling R-23).
+///
+/// The act writes that agent's `AUTHORED` edge to the successor in the SAME
+/// transaction as the successor, so the edge's `created_at` equals the
+/// claim's (both are the transaction's `now()`). That equality is what picks
+/// the act's edge out: the supersede cascade (and the custodial verb) moves the
+/// retired claim's own `AUTHORED` edges onto the successor, and those carry
+/// the retired claim's older timestamp; an `AUTHORED` edge added later by any
+/// other write carries a later one. A successor with no such edge (one written
+/// before the act recorded it) keeps its author, as before.
+pub const CENSUS_WRITES: &str = "SELECT COALESCE(act.source_id, c.agent_id) AS writer, \
+            c.owner_group_id \
+       FROM claims c \
+       LEFT JOIN LATERAL ( \
+            SELECT e.source_id FROM edges e \
+             WHERE c.supersedes IS NOT NULL \
+               AND e.target_id = c.id AND e.target_type = 'claim' \
+               AND e.source_type = 'agent' AND e.relationship = 'AUTHORED' \
+               AND e.created_at = c.created_at \
+             ORDER BY e.id LIMIT 1) act ON true \
+      WHERE c.created_at > now() - make_interval(days => $1)";
+
+/// The census: unbound agents that wrote claims in the last `days` days
+/// (attributed as [`CENSUS_WRITES`] says).
 ///
 /// # Errors
 /// The read fails (e.g. migration 122 is not applied).
@@ -102,22 +135,21 @@ pub async fn unbound_recent_writers(
     conn: &mut PgConnection,
     days: i32,
 ) -> anyhow::Result<Vec<(Uuid, i64)>> {
-    Ok(sqlx::query_as(
-        "SELECT c.agent_id, count(*)::bigint \
-           FROM claims c \
-          WHERE c.created_at > now() - make_interval(days => $1) \
-          GROUP BY c.agent_id \
-         HAVING public.epigraph_author_binding(c.agent_id) IS NULL \
-          ORDER BY 2 DESC, 1",
-    )
+    Ok(sqlx::query_as(&format!(
+        "SELECT w.writer, count(*)::bigint \
+           FROM ({CENSUS_WRITES}) w \
+          GROUP BY w.writer \
+         HAVING public.epigraph_author_binding(w.writer) IS NULL \
+          ORDER BY 2 DESC, 1"
+    ))
     .bind(days)
     .fetch_all(&mut *conn)
     .await?)
 }
 
-/// The allowlist census (migration 149): allowlisted agents that authored
-/// claims in the last `days` days in a group their operator does not write,
-/// per group.
+/// The allowlist census (migration 149): allowlisted agents that wrote claims
+/// in the last `days` days (attributed as [`CENSUS_WRITES`] says) in a group
+/// their operator does not write, per group.
 ///
 /// # Errors
 /// The read fails (e.g. migration 149 is not applied, which leaves the label
@@ -126,16 +158,15 @@ pub async fn out_of_scope_allowlisted_writers(
     conn: &mut PgConnection,
     days: i32,
 ) -> anyhow::Result<Vec<(Uuid, Option<Uuid>, i64)>> {
-    Ok(sqlx::query_as(
-        "SELECT c.agent_id, c.owner_group_id, count(*)::bigint \
-           FROM claims c \
-          WHERE c.created_at > now() - make_interval(days => $1) \
-          GROUP BY c.agent_id, c.owner_group_id \
-         HAVING public.epigraph_author_binding(c.agent_id) = $2 \
+    Ok(sqlx::query_as(&format!(
+        "SELECT w.writer, w.owner_group_id, count(*)::bigint \
+           FROM ({CENSUS_WRITES}) w \
+          GROUP BY w.writer, w.owner_group_id \
+         HAVING public.epigraph_author_binding(w.writer) = $2 \
             AND NOT COALESCE(public.epigraph_operator_writes_group( \
-                      public.epigraph_human_of(c.agent_id, false), c.owner_group_id), false) \
-          ORDER BY 3 DESC, 1, 2",
-    )
+                      public.epigraph_human_of(w.writer, false), w.owner_group_id), false) \
+          ORDER BY 3 DESC, 1, 2"
+    ))
     .bind(days)
     .bind(epigraph_db::CLIENT_ALLOWLIST_BINDING)
     .fetch_all(&mut *conn)

@@ -316,6 +316,130 @@ async fn arm_arms_when_every_recent_writer_is_bound(pool: PgPool) {
         .expect("armed: the human still writes");
 }
 
+/// A `('public', group)` claim by `agent` written `age_days` ago together with
+/// its author's `AUTHORED` edge, in ONE transaction, as the submit paths write
+/// a claim (both rows carry that transaction's timestamp).
+async fn submitted_claim(pool: &PgPool, agent: Uuid, group: Uuid, age_days: i32) -> Uuid {
+    let id = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, \
+                 now() - make_interval(days => $6), now() - make_interval(days => $6))",
+    )
+    .bind(id)
+    .bind(format!("census probe {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(agent)
+    .bind(group)
+    .bind(age_days)
+    .execute(&mut *tx)
+    .await
+    .expect("seed claim");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, created_at) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{\"tool\": \"submit_claim\"}', \
+                 now() - make_interval(days => $3))",
+    )
+    .bind(agent)
+    .bind(id)
+    .bind(age_days)
+    .execute(&mut *tx)
+    .await
+    .expect("seed the author's AUTHORED edge");
+    tx.commit().await.expect("commit");
+    id
+}
+
+/// `actor` supersedes `old` (the act AND the edge migration, on this
+/// privileged pool), as the request paths and their cascade do. Returns the
+/// successor, after checking that the retired claim's own `AUTHORED` edge now
+/// sits on it too: the shape the census must see through.
+async fn supersede_as(pool: &PgPool, old: Uuid, author: Uuid, actor: Uuid) -> Uuid {
+    let (new, _) = epigraph_db::ClaimRepository::supersede(
+        pool,
+        epigraph_core::ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        epigraph_core::TruthValue::clamped(0.6),
+        "census probe",
+        epigraph_db::SupersedeActor::new(actor, "supersede_claim"),
+    )
+    .await
+    .expect("supersede");
+    let mut sources: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT source_id FROM edges WHERE relationship = 'AUTHORED' AND target_id = $1",
+    )
+    .bind(new)
+    .fetch_all(pool)
+    .await
+    .expect("AUTHORED edges");
+    sources.sort();
+    let mut want = vec![author, actor];
+    want.sort();
+    assert_eq!(
+        sources, want,
+        "calibration: the successor carries the actor's edge AND the author's migrated one"
+    );
+    new
+}
+
+/// Backlog 73085534 (ruling R-23): a supersession's successor is counted for
+/// the agent that PERFORMED it. A bound human authored the claim; an unbound
+/// agent superseded it. The successor inherits the human's author id (and the
+/// human's own `AUTHORED` edge, moved by the cascade), so attributing by
+/// author hid the unbound writer that arming would refuse.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_counts_the_agent_that_superseded_not_the_inherited_author(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "census-actor").await;
+    let old = submitted_claim(&pool, human, group, 0).await;
+    supersede_as(&pool, old, human, unbound).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t1"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout
+            .contains(&format!("UNBOUND\t{unbound}\t1 claim(s)")),
+        "the superseding agent is a live writer: {}",
+        dry.show()
+    );
+}
+
+/// The converse: an unbound author whose last claim is older than the window
+/// is NOT a live writer because a bound human superseded that claim today.
+/// Attributing the successor to its inherited author listed the quiet author
+/// and refused `--apply`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_count_an_inherited_author_as_a_live_writer(pool: PgPool) {
+    let (quiet, group) = fixture::seed_agent_with_group(&pool, "census-quiet-author").await;
+    let (human, _) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let old = submitted_claim(&pool, quiet, group, 60).await;
+    supersede_as(&pool, old, quiet, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(
+        !r.stdout.contains(&quiet.to_string()),
+        "the quiet author wrote nothing in the window: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        r.show()
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "nothing unbound wrote, so --apply arms");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // link-legacy-authors
 // ─────────────────────────────────────────────────────────────────────────────
