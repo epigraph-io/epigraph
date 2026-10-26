@@ -800,8 +800,9 @@ async fn recall_post_embed(
             .iter()
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match epigraph_engine::belief_query::get_perspective_belief_batch(
+        match epigraph_engine::belief_query::get_perspective_belief_batch_scoped(
             &server.pool,
+            server.scoped.as_ref(),
             viewer,
             &claim_ids,
             frame_id,
