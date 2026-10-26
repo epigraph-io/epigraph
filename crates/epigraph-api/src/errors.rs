@@ -895,17 +895,34 @@ mod tests {
     /// server log. Routes that know what a refusal means map it before this
     /// (`versioning::mark_duplicate`'s 409).
     #[cfg(feature = "db")]
-    #[test]
-    fn a_repo_refusal_keeps_the_redacted_500_it_answered_before() {
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_repo_refusal_keeps_the_redacted_500_it_answered_before() {
+        const ID: &str = "00000000-0000-0000-0000-00000000e0f0";
         let api = ApiError::from(DbError::Refused {
-            message: "consolidate: source 00000000-0000-0000-0000-00000000e0f0 is not current"
-                .to_string(),
+            message: format!("consolidate: source {ID} is not current"),
         });
         let ApiError::DatabaseError { .. } = &api else {
             panic!("a repo refusal keeps its 500: {api:?}");
         };
-        let response = api.into_response();
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let (status, body) = rendered(api).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.contains("a database error occurred"),
+            "the fixed database-error text: {body}"
+        );
+        assert!(
+            !body.contains(ID) && !body.contains("not current"),
+            "the refusal's text reached the HTTP body: {body}"
+        );
+        // The log line is the only server-side record of the refusal.
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| l.contains("the repository refused the request") && l.contains(ID))
+                .then_some(())
+                .ok_or_else(|| "no refusal warn line carries the refusal's text".to_string())
+        });
     }
 
     /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its
