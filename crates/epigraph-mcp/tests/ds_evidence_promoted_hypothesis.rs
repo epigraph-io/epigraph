@@ -422,3 +422,113 @@ async fn a_non_owners_update_on_a_promoted_world_hypothesis_lands_on_research_va
         .expect("truth");
     assert_eq!(truth_after, truth_before, "the claim row is not written");
 }
+
+/// The two refusals `promoted_hypothesis_filing_frame` makes, through
+/// `update_with_evidence`: a promoted hypothesis's evidence is filed on
+/// `research_validity`, so when that frame does not exist, or is not a
+/// two-hypothesis frame the binary evidence can address, the call is a CALLER
+/// error (invalid params) and nothing is written: no evidence row (it was
+/// inserted in the same transaction, which rolls back), no BBA, no frame
+/// binding and no truth write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_refuses_a_promoted_hypothesis_without_a_binary_research_validity(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    ensure_frame(&pool, "hypothesis_assessment").await;
+
+    async fn refused(
+        pool: &PgPool,
+        server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim: Uuid,
+        arm: &str,
+    ) {
+        let truth_before: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("truth");
+        let err = tools::claims::update_with_evidence(
+            server,
+            viewer,
+            epigraph_mcp::types::UpdateWithEvidenceParams {
+                canonical_name: None,
+                step_index: None,
+                claim_id: claim.to_string(),
+                evidence_type: "empirical".into(),
+                evidence_data: format!("r17 refused bench result {}", Uuid::new_v4()),
+                source_url: None,
+                supports: true,
+                strength: 0.8,
+                labels: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect_err("the evidence cannot be filed where the claim's readers look");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{arm}: a caller error, not an internal one: {err:?}"
+        );
+        assert!(
+            err.message.contains("research_validity"),
+            "{arm}: the reason names the frame: {}",
+            err.message
+        );
+        let evidence: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("evidence rows");
+        assert_eq!(evidence, 0, "{arm}: no evidence row");
+        assert!(
+            frames_with_bbas(pool, claim).await.is_empty(),
+            "{arm}: no BBA"
+        );
+        let bound: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(pool)
+                .await
+                .expect("claim_frames");
+        assert_eq!(bound, 0, "{arm}: no frame binding");
+        let truth_after: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("truth");
+        assert_eq!(truth_after, truth_before, "{arm}: no truth write");
+    }
+
+    // Arm 1: research_validity does not exist.
+    let absent: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM frames WHERE name = 'research_validity'")
+            .fetch_one(&pool)
+            .await
+            .expect("frames");
+    assert_eq!(absent, 0, "CALIBRATION: no research_validity frame yet");
+    let promoted = hypothesis(&pool, "promoted").await;
+    refused(&pool, &server, &viewer, promoted, "missing frame").await;
+
+    // Arm 2: research_validity has three hypotheses.
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('research_validity', \
+                ARRAY['valid','invalid','undetermined']::text[])",
+    )
+    .execute(&pool)
+    .await
+    .expect("a three-hypothesis research_validity frame");
+    let promoted = hypothesis(&pool, "promoted").await;
+    refused(&pool, &server, &viewer, promoted, "three-hypothesis frame").await;
+
+    // CALIBRATION: the same call on an unpromoted claim is accepted.
+    let active = hypothesis(&pool, "active").await;
+    update_with_evidence(&server, &viewer, active).await;
+    assert_eq!(
+        frames_of_evidence_bbas(&pool, active).await,
+        vec!["binary_truth".to_string()]
+    );
+}
