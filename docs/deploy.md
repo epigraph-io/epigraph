@@ -2490,8 +2490,10 @@ narrowing `scope`) widened the chain to everything the client is granted.
    refresh.
 3. **BREAKING — a refresh `scope` that names nothing issuable is refused.**
    A refresh request whose `scope` names none of the chain's issuable scopes
-   gets `400` with `invalid_scope`, and the presented refresh token is NOT
-   spent. Before this release `scope` was ignored on refresh. A `scope` that
+   gets `400` with the RFC 6749 section 5.2 body `{"error":"invalid_scope"}`,
+   and the presented refresh token is NOT spent. That includes a `scope` whose
+   every name the mint chokepoint strips (an admin-only scope while migration
+   128's switch is armed, or when the switch cannot be read). Before this release `scope` was ignored on refresh. A `scope` that
    names some issuable scopes narrows the access token to them (unknown names
    are dropped, as for `client_credentials`); the chain keeps its scopes.
 4. **DECISION — chains widened under 118 are not healed.** Migration 140

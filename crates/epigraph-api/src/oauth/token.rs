@@ -838,14 +838,15 @@ async fn handle_refresh_token(
     // scopes (narrowed to the grant by the rotation definer, migration 140).
     //
     // A `scope` that names nothing this token can issue is `invalid_scope`
-    // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
-    // empty-scope access token would rotate the chain and authorize nothing.
+    // (RFC 6749 section 5.2, in its `{"error":"invalid_scope"}` shape),
+    // answered BEFORE the chain is spent: a 200 with an empty-scope access
+    // token would rotate the chain and authorize nothing. "Nothing it can
+    // issue" is decided twice: against the stored and granted sets here, and
+    // again after the mint chokepoint below, which can strip what a request
+    // named (an admin-only scope while migration 128's switch is armed, or
+    // when the switch cannot be read).
     let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
-        .ok_or_else(|| ApiError::BadRequest {
-            message: "invalid_scope: the requested scope names none of the scopes \
-                          this refresh token was granted"
-                .into(),
-        })?;
+        .ok_or_else(refresh_invalid_scope)?;
     // Then through the mint chokepoint (never the elevation scope; the
     // admin-only scopes per migration 128's switch), which only ever removes.
     let effective_scopes = crate::oauth::scopes::grantable(
@@ -855,6 +856,9 @@ async fn handle_refresh_token(
         crate::oauth::scopes::MintGrant::RefreshToken,
     )
     .await;
+    if effective_scopes.is_empty() && names_a_scope(req.scope.as_deref()) {
+        return Err(refresh_invalid_scope());
+    }
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -1010,6 +1014,26 @@ fn refresh_scopes(
         return None;
     }
     Some(issued)
+}
+
+/// Whether a request's `scope` parameter names any scope (an absent or blank
+/// one means "as originally granted", RFC 6749 section 6).
+#[cfg(feature = "db")]
+fn names_a_scope(requested: Option<&str>) -> bool {
+    requested.is_some_and(|r| r.split_whitespace().next().is_some())
+}
+
+/// The refresh grant's refusal of a `scope` that names nothing the presented
+/// token can issue: RFC 6749 section 5.2's `invalid_scope`, in that section's
+/// body shape. The chain is left untouched.
+#[cfg(feature = "db")]
+fn refresh_invalid_scope() -> ApiError {
+    ApiError::OAuthGrantError {
+        error: "invalid_scope",
+        description: "the requested scope names none of the scopes this refresh token can \
+                      issue"
+            .to_string(),
+    }
 }
 
 /// One 401 for every refresh that cannot proceed (unknown, expired, revoked,

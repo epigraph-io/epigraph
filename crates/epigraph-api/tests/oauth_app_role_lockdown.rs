@@ -640,9 +640,9 @@ async fn a_refresh_scope_naming_nothing_issuable_is_refused_and_keeps_the_chain(
             StatusCode::BAD_REQUEST,
             "scope={nothing:?} names nothing this token can issue: {body}"
         );
-        assert!(
-            body.to_string().contains("invalid_scope"),
-            "the refusal is invalid_scope: {body}"
+        assert_eq!(
+            body["error"], "invalid_scope",
+            "the refusal is RFC 6749 section 5.2's invalid_scope, not a generic 400: {body}"
         );
         assert!(
             body.get("access_token").is_none(),
