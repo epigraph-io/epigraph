@@ -308,7 +308,7 @@ async fn try_record_as(
         .bind(child)
         .bind(parent)
         .bind(&group)
-        .bind("S5: registered parentless after the AID03 legacy-parent refusal")
+        .bind("registered parentless after the AID03 legacy-parent refusal")
         .fetch_one(&mut *conn)
         .await;
         (conn, r)
