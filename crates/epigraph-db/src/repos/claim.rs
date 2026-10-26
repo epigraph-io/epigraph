@@ -6282,11 +6282,8 @@ impl ClaimRepository {
                         entity: "Claim".to_string(),
                         id: old_uuid,
                     },
-                    Some(false) => DbError::QueryFailed {
-                        source: sqlx::Error::Protocol(format!(
-                            "Claim {} has already been superseded",
-                            old_uuid
-                        )),
+                    Some(false) => DbError::Refused {
+                        message: format!("Claim {} has already been superseded", old_uuid),
                     },
                     // Visible and current, yet the UPDATE matched no row: the
                     // session may read it but not retire it (an UPDATE policy
@@ -7679,13 +7676,13 @@ impl ClaimRepository {
             return Ok(vec![]);
         }
         if claim_ids.len() > Self::MAX_PAIRWISE_IDS {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::Refused {
+                message: format!(
                     "pairwise_cosine_distance: {} ids exceeds MAX_PAIRWISE_IDS={}; \
                      split the input into smaller batches",
                     claim_ids.len(),
                     Self::MAX_PAIRWISE_IDS,
-                )),
+                ),
             });
         }
 
@@ -8151,13 +8148,13 @@ impl ClaimRepository {
         .await?
         .unwrap_or(false);
         if foreign_private_canonical {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::Refused {
+                message: format!(
                     "FA04: canonical {canon_uuid} is not public and this session cannot write \
                      it; a dedup would move the duplicate's derived rows into its owner's \
                      group, and a non-owner may attach only to a PUBLIC claim; nothing was \
                      written"
-                )),
+                ),
             });
         }
         let false_binding: bool = sqlx::query_scalar(
@@ -8184,12 +8181,12 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
         if false_binding {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::Refused {
+                message: format!(
                     "FA07: duplicate {dup_uuid} is bound to binary_truth at a non-zero index, and \
                      canonical {canon_uuid} (which this session cannot write) has no binding: a \
                      dedup may not hand it one; nothing was written"
-                )),
+                ),
             });
         }
         tx.commit().await?;
@@ -8448,10 +8445,8 @@ impl ClaimRepository {
                 id: dup_uuid,
             });
         };
-        let not_marked = |why: &str| DbError::QueryFailed {
-            source: sqlx::Error::Protocol(format!(
-                "unmark_duplicate: claim {dup_uuid} {why}; nothing was written"
-            )),
+        let not_marked = |why: &str| DbError::Refused {
+            message: format!("unmark_duplicate: claim {dup_uuid} {why}; nothing was written"),
         };
         let canonical = match (supersedes, current) {
             (Some(c), false) => c,
@@ -10671,9 +10666,7 @@ impl ClaimRepository {
         acting_agent_id: Uuid,
     ) -> Result<ConsolidateResult, DbError> {
         use sqlx::Acquire;
-        let protocol = |m: String| DbError::QueryFailed {
-            source: sqlx::Error::Protocol(m),
-        };
+        let protocol = |m: String| DbError::Refused { message: m };
 
         if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
         {
@@ -11623,8 +11616,8 @@ async fn mark_duplicate_act(
     provenance: &DuplicateProvenance,
 ) -> Result<Uuid, DbError> {
     if dup_uuid == canon_uuid {
-        return Err(DbError::QueryFailed {
-            source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
+        return Err(DbError::Refused {
+            message: "mark_duplicate: dup == canonical".into(),
         });
     }
     // The canonical must exist and be CURRENT: a mark onto a retired claim
@@ -11648,11 +11641,11 @@ async fn mark_duplicate_act(
             })
         }
         Some(false) => {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::Refused {
+                message: format!(
                     "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
                      dedup chain onto a retired claim"
-                )),
+                ),
             })
         }
         Some(true) => {}
@@ -11671,10 +11664,8 @@ async fn mark_duplicate_act(
         });
     };
     if existing.is_some() {
-        return Err(DbError::QueryFailed {
-            source: sqlx::Error::Protocol(format!(
-                "Claim {dup_uuid} already superseded; refusing to overwrite"
-            )),
+        return Err(DbError::Refused {
+            message: format!("Claim {dup_uuid} already superseded; refusing to overwrite"),
         });
     }
     // Null both embedding columns in the same statement as is_current=false

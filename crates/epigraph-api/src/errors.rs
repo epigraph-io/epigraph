@@ -794,6 +794,16 @@ impl From<DbError> for ApiError {
                     message: "A database error occurred".to_string(),
                 }
             }
+            // A repo-authored refusal (backlog e0f0cb68). It answers the 500
+            // it answered as `QueryFailed { Protocol }` before the variant
+            // existed: which status each refusal deserves (400, 403, 409) is
+            // the route's to decide, and routes that know map it first.
+            DbError::Refused { message } => {
+                tracing::warn!(detail = %message, "the repository refused the request");
+                ApiError::DatabaseError {
+                    message: "A database error occurred".to_string(),
+                }
+            }
             // Fail-closed (elevation plan EL-8): an elevated read that could
             // not be recorded is withheld. A server-side failure, never the
             // caller's; the reason is logged, not sent.
@@ -877,6 +887,25 @@ mod tests {
             other => panic!("23514 must not be a DatabaseError: {other:?}"),
         }
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A repo-authored refusal (`DbError::Refused`, backlog e0f0cb68) keeps
+    /// the HTTP answer it had as `QueryFailed { Protocol }`: a 500 whose body
+    /// is the fixed database-error text, with the refusal's own words in the
+    /// server log. Routes that know what a refusal means map it before this
+    /// (`versioning::mark_duplicate`'s 409).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_repo_refusal_keeps_the_redacted_500_it_answered_before() {
+        let api = ApiError::from(DbError::Refused {
+            message: "consolidate: source 00000000-0000-0000-0000-00000000e0f0 is not current"
+                .to_string(),
+        });
+        let ApiError::DatabaseError { .. } = &api else {
+            panic!("a repo refusal keeps its 500: {api:?}");
+        };
+        let response = api.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its

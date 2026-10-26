@@ -686,8 +686,8 @@ fn plain_role_identifier(role: &str) -> Result<(), DbError> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
     {
-        return Err(DbError::QueryFailed {
-            source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+        return Err(DbError::Refused {
+            message: format!("not a plain role identifier: {role}"),
         });
     }
     Ok(())

@@ -98,6 +98,9 @@ async fn mark_duplicate_rejects_self(pool: PgPool) {
     .err()
     .unwrap();
     assert!(format!("{err:?}").contains("dup == canonical"), "{err:?}");
+    // A repo-authored refusal, so the MCP layer may send it as written
+    // (backlog e0f0cb68); never a `QueryFailed`, which it must redact.
+    assert!(matches!(err, DbError::Refused { .. }), "{err:?}");
 }
 
 async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
@@ -429,8 +432,7 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
         .await
         .expect_err("a mark onto a retired canonical is refused");
         assert!(
-            matches!(err, DbError::QueryFailed { .. })
-                && format!("{err:?}").contains("not current"),
+            matches!(err, DbError::Refused { .. }) && format!("{err:?}").contains("not current"),
             "{err:?}"
         );
         let (sup, current): (Option<Uuid>, bool) =

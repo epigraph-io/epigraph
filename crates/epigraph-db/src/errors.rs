@@ -155,6 +155,28 @@ pub enum DbError {
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
 
+    /// A refusal the repo layer AUTHORED: literal text and ids it wrote
+    /// itself, naming why the request is not carried out and, usually, that
+    /// nothing was written ("mark_duplicate: canonical ... is not current",
+    /// "consolidate: duplicate source ids", "FA07: ...").
+    ///
+    /// Its own variant so that a surface can send `message` to the caller as
+    /// written WITHOUT trusting a shape that other errors also take. These
+    /// refusals used to be built as `QueryFailed { source: sqlx::Error::Protocol
+    /// (msg) }`, and `From<sqlx::Error>` wraps ANY `Protocol` error into that
+    /// same shape (sqlx's own protocol errors, an engine stringification of
+    /// another error), so the MCP layer could not tell a designed refusal
+    /// from a server fault (backlog e0f0cb68). Never construct it from an
+    /// error's `Display`.
+    ///
+    /// The MCP layer sends `message` as written (`errors::designed_refusal`).
+    /// The HTTP layer keeps the 500 these refusals always answered (the same
+    /// redacted body as `QueryFailed`) and logs `message`; routes that know
+    /// what a refusal means map it themselves first (e.g. `mark_duplicate`'s
+    /// 409).
+    #[error("{message}")]
+    Refused { message: String },
+
     /// A write that row security let the session SEE but not CHANGE: the
     /// statement matched fewer rows than the session can read, so a row it had
     /// to change was left as it was. Maps to HTTP **403**.

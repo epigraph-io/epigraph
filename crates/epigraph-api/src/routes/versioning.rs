@@ -824,9 +824,11 @@ pub async fn mark_duplicate(
             entity: "Claim".into(),
             id: id.to_string(),
         },
-        epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
-            reason: "claim already superseded or invalid input".into(),
-        },
+        epigraph_db::DbError::QueryFailed { .. } | epigraph_db::DbError::Refused { .. } => {
+            ApiError::Conflict {
+                reason: "claim already superseded or invalid input".into(),
+            }
+        }
         other => ApiError::DatabaseError {
             message: other.to_string(),
         },
