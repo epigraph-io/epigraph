@@ -268,6 +268,7 @@ async fn create(
         &vacuous_masses,
         None,
         Some("prior"),
+        None,      // vacuous prior: not evidence, so no evidence type (bc06ec6f)
         "unknown", // vacuous prior; no evidence yet (issue #197)
         None,      // vacuous prior — no evidence row (issue #197 Phase 3)
     )
@@ -300,11 +301,17 @@ async fn status(
             .await
             .unwrap_or(0);
 
-    // Mass functions
-    let frame_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_optional(pool)
-            .await?;
+    // Mass functions: on `research_validity` once promoted, where the
+    // promotion moved them (backlog 090221d9).
+    let belief_frame = epigraph_engine::promotion::status_belief_frame(
+        properties
+            .get("hypothesis_status")
+            .and_then(serde_json::Value::as_str),
+    );
+    let frame_id: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(belief_frame)
+        .fetch_optional(pool)
+        .await?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
         let mass_rows =
@@ -469,18 +476,30 @@ async fn promote(
     let mut tx = pool.begin().await?;
 
     // Copy mass function
+    // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
+    // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
+    //
+    // The promotion MOVES the BBA: the source row is retired in the same
+    // transaction (backlog 846b808e), so the evidence is never read twice
+    // across the two binary frames.
     if let Some(latest) = mass_rows.last() {
-        sqlx::query(
-            r#"
-            INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, conflict_k, combination_method)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id) DO UPDATE
-            SET masses = EXCLUDED.masses, conflict_k = EXCLUDED.conflict_k, created_at = NOW()
-            "#,
+        epigraph_db::MassFunctionRepository::copy_to_frame(&mut *tx, latest, rv_frame.0).await?;
+        let retired = epigraph_db::ExperimentRepository::retire_promoted_hypothesis_bba(
+            &mut *tx,
+            viewer,
+            latest.id,
+            id,
+            hyp_frame.0,
         )
-        .bind(id).bind(rv_frame.0).bind(latest.source_agent_id)
-        .bind(&latest.masses).bind(latest.conflict_k).bind(latest.combination_method.as_deref())
-        .execute(&mut *tx).await?;
+        .await?;
+        if !retired {
+            return Err(format!(
+                "could not retire hypothesis_assessment BBA {} after copying it; \
+                 promotion rolled back",
+                latest.id
+            )
+            .into());
+        }
     }
 
     // Add to research_validity frame

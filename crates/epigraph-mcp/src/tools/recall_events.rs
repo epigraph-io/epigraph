@@ -3,7 +3,7 @@
 //! Read side of the recall audit log: "what did this agent retrieve, and
 //! which queries ever surfaced this claim?"
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 
 use crate::errors::{internal_error, invalid_params, McpError};
@@ -89,7 +89,7 @@ pub async fn get_recall_events(
         })
         .collect();
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&out).map_err(internal_error)?,
     )]))
 }

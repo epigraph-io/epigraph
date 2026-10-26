@@ -23,7 +23,8 @@
 //!
 //! * `EvidenceRepository::{get_by_id, get_by_claim, provided_for_claim_as_of,
 //!   detail_by_id, by_relationship_for_claim, list_filtered, count_filtered,
-//!   search_by_embedding}` and `GraphViewRepository::subgraph_evidence` —
+//!   search_by_embedding, source_urls_by_claim_ids}` and
+//!   `GraphViewRepository::subgraph_evidence` —
 //!   every HTTP route and MCP tool that returns evidence content reaches it
 //!   through one of these, with the request's `Viewer`
 //!   (`routes/crud.rs`, `routes/edges.rs`, `routes/rag.rs`, `routes/claims.rs`,
@@ -234,6 +235,14 @@ async fn probe(conn: &mut PgConnection, viewer: &Viewer, fx: &Fx) -> BTreeMap<&'
             .expect("search_by_embedding")
             .iter()
             .any(|r| r.id == h),
+    );
+    seen.insert(
+        "EvidenceRepository::source_urls_by_claim_ids",
+        EvidenceRepository::source_urls_by_claim_ids(&mut *conn, viewer, &[fx.claim])
+            .await
+            .expect("source_urls_by_claim_ids")
+            .get(&fx.claim)
+            .is_some_and(|v| v.iter().any(|u| u.contains(SENTINEL))),
     );
     seen.insert(
         "GraphViewRepository::subgraph_evidence",

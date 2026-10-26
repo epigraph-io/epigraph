@@ -150,17 +150,19 @@ pub async fn create_challenge(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
-    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to resolve system agent: {e}"),
-        })?;
+    // Passed through as-is: the resolver's armed-and-unregistered refusal is an
+    // `InternalErrorStatic` the caller must read (it names the registry and the
+    // remedy), and re-wrapping it as `InternalError` would redact it.
+    let sys_agent_id = crate::routes::workflows::get_or_create_system_agent(&state.db_pool).await?;
 
+    // No protocol IS "any": normalized once, so the content (and its dedup
+    // hash) and the stored `properties.protocol` say the same thing. The
+    // content format is unchanged byte for byte: existing challenges' hashes
+    // must keep matching the idempotent lookup below.
+    let protocol = req.protocol.as_deref().unwrap_or("any");
     let content = format!(
-        "Network access challenge: {}:{} ({})",
-        req.host,
-        req.port,
-        req.protocol.as_deref().unwrap_or("any")
+        "Network access challenge: {}:{} ({protocol})",
+        req.host, req.port
     );
     let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
@@ -183,10 +185,11 @@ pub async fn create_challenge(
     //
     // The existing row is FOUND, not inferred from a unique violation.
     // `uq_claims_content_hash_agent` (migration 013) is absent on the
-    // long-lived production database (migrations/README.md, "Known schema
-    // drift"), so a handler that relied on the constraint firing would 500 on
-    // a fresh database and silently mint a duplicate pending challenge on
-    // production. The lookup works with or without the constraint.
+    // long-lived production database and, since migration 150, on every
+    // database (migrations/README.md, "Known schema drift"), so a handler that
+    // relied on the constraint firing would silently mint a duplicate pending
+    // challenge (and 500 where a database still has it). The lookup works with
+    // or without the constraint.
     //
     // The transaction-scoped advisory lock serializes concurrent creates of
     // the same challenge, so two first requests racing each other cannot both
@@ -251,7 +254,7 @@ pub async fn create_challenge(
         .bind(serde_json::json!({
             "host": req.host,
             "port": req.port,
-            "protocol": req.protocol,
+            "protocol": protocol,
             "status": "pending",
         }))
         .bind(decl.visibility_bind())
@@ -299,11 +302,17 @@ pub async fn get_challenge(
         id: id.to_string(),
     })?;
 
+    // A challenge stored before the protocol was normalized at create time
+    // carries JSON null for "no protocol", which is "any" (its content says so).
+    let protocol = match properties.get("protocol") {
+        None | Some(serde_json::Value::Null) => serde_json::json!("any"),
+        Some(p) => p.clone(),
+    };
     Ok(Json(serde_json::json!({
         "id": id,
         "host": properties.get("host"),
         "port": properties.get("port"),
-        "protocol": properties.get("protocol"),
+        "protocol": protocol,
         "status": properties.get("status"),
     })))
 }
@@ -563,6 +572,7 @@ mod tests {
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+                delegated_by: None,
             }))
             .with_state(state)
     }
@@ -619,11 +629,20 @@ mod tests {
         .unwrap()
     }
 
-    /// The fresh-database shape: `uq_claims_content_hash_agent` is present, so
-    /// a second identical insert is a unique violation. Before the lookup the
-    /// repeat answered 500 `Failed to create challenge: ... duplicate key`.
+    /// The constraint-present shape: with `uq_claims_content_hash_agent` in
+    /// force a second identical insert is a unique violation, and before the
+    /// lookup the repeat answered 500 `Failed to create challenge: ... duplicate
+    /// key`. Migration 150 drops the constraint from every database, so this
+    /// arm re-adds it: a database migrated only to 013-149 still has it.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_challenge_repeat_returns_the_existing_challenge(pool: PgPool) {
+        sqlx::query(
+            "ALTER TABLE claims ADD CONSTRAINT uq_claims_content_hash_agent \
+             UNIQUE (content_hash, agent_id)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let body = serde_json::json!({ "host": "idem.example", "port": 8443, "protocol": "https" });
 
         let first = create_ok(test_state(pool.clone()), &body, "first").await;
@@ -650,12 +669,13 @@ mod tests {
     }
 
     /// The PRODUCTION shape: `migrations/README.md` records that the
-    /// long-lived database has no `uq_claims_content_hash_agent`. There the
-    /// repeat never errored — it silently inserted a second pending challenge.
-    /// A fix that only caught the unique violation would still do that.
+    /// long-lived database has no `uq_claims_content_hash_agent` (and from
+    /// migration 150 no database does). There the repeat never errored — it
+    /// silently inserted a second pending challenge. A fix that only caught the
+    /// unique violation would still do that.
     #[sqlx::test(migrations = "../../migrations")]
     async fn create_challenge_repeat_is_idempotent_without_the_unique_constraint(pool: PgPool) {
-        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
             .execute(&pool)
             .await
             .unwrap();
@@ -688,7 +708,7 @@ mod tests {
     async fn concurrent_first_creates_yield_one_challenge_without_the_unique_constraint(
         pool: PgPool,
     ) {
-        sqlx::query("ALTER TABLE claims DROP CONSTRAINT uq_claims_content_hash_agent")
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
             .execute(&pool)
             .await
             .unwrap();
@@ -784,6 +804,58 @@ mod tests {
             1,
             "a repeat must write nothing"
         );
+    }
+
+    /// GET one challenge through the policy router.
+    async fn get_challenge_body(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        let response = policy_router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/policy-challenges/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        parse_body(response).await
+    }
+
+    /// No protocol means "any": the content (and so the dedup hash) already
+    /// says `(any)`, so the stored and served protocol must say it too. Before,
+    /// `None` stored JSON null while hashing identically to `"any"`, so which
+    /// of the two requests arrived FIRST decided what GET answered for both.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_challenge_without_protocol_stores_any(pool: PgPool) {
+        let bare = serde_json::json!({ "host": "noproto.example", "port": 443 });
+        let first = create_ok(test_state(pool.clone()), &bare, "no-protocol").await;
+        let body = get_challenge_body(&pool, first).await;
+        assert_eq!(body["protocol"], "any", "{body}");
+
+        // Dedup is unchanged: an explicit "any" is the same challenge.
+        let explicit =
+            serde_json::json!({ "host": "noproto.example", "port": 443, "protocol": "any" });
+        let second = create_ok(test_state(pool.clone()), &explicit, "explicit-any").await;
+        assert_eq!(second, first, "None and \"any\" are one challenge");
+        assert_eq!(challenge_rows(&pool, &bare).await, 1, "and one row");
+
+        // A row stored before this fix (protocol JSON null) reads as "any" too.
+        let content = "Network access challenge: legacy.example:443 (any)";
+        let legacy: Uuid = sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, labels, properties) \
+             VALUES ($1, $2, $3, 0.5, ARRAY['policy','policy:challenge'], $4) RETURNING id",
+        )
+        .bind(content)
+        .bind(epigraph_crypto::ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(ensure_system_agent(&pool).await)
+        .bind(serde_json::json!({
+            "host": "legacy.example", "port": 443, "protocol": null, "status": "pending",
+        }))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let body = get_challenge_body(&pool, legacy).await;
+        assert_eq!(body["protocol"], "any", "a legacy null row: {body}");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

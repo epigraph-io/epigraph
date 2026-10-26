@@ -169,8 +169,25 @@ pub enum ApiError {
     #[error("Signature error: {reason}")]
     SignatureError { reason: String },
 
+    /// A server fault. `message` is the SERVER-SIDE detail: it is logged
+    /// (`tracing::error!`, target `api.internal_error`) and is never put in
+    /// the response, which carries [`INTERNAL_ERROR_BODY`] instead. Route sites
+    /// build this with the driver's error interpolated (`format!("...: {e}")`,
+    /// `e.to_string()`), so the body cannot be trusted to whatever the
+    /// constructor wrote (docs/tenancy/progress.json,
+    /// F-route-error-text-remainder). A 500 whose text the CALLER must read is
+    /// [`ApiError::InternalErrorStatic`].
     #[error("Internal error: {message}")]
     InternalError { message: String },
+
+    /// A server fault whose message is DESIGNED, caller-facing text: an
+    /// operator remedy or a fail-closed notice (e.g. "ELEVATED ACCESS NOT
+    /// RECORDED"). `&'static str` on purpose: the compiler, not a review
+    /// convention, keeps a driver error out of it. Answered 500 with error key
+    /// `InternalError` (the same contract as [`ApiError::InternalError`]) and
+    /// `message` verbatim.
+    #[error("Internal error: {message}")]
+    InternalErrorStatic { message: &'static str },
 
     #[error("Validation error on field '{field}': {reason}")]
     ValidationError { field: String, reason: String },
@@ -182,6 +199,8 @@ pub enum ApiError {
         actual: String,
     },
 
+    /// A database fault. Like [`ApiError::InternalError`], `message` is logged
+    /// and never sent; the response carries [`DATABASE_ERROR_BODY`].
     #[error("Database error: {message}")]
     DatabaseError { message: String },
 
@@ -337,6 +356,15 @@ impl ApiError {
 pub const PRIVATIZATION_LIFECYCLE_NOT_SERVED: &str =
     "privatization lifecycle unavailable under D9: see operator";
 
+/// The whole of what a 500 `InternalError` body says, whatever the variant
+/// carried. The carried message goes to the server log (target
+/// `api.internal_error`), not to the caller.
+pub const INTERNAL_ERROR_BODY: &str = "an internal error occurred; the detail is in the server log";
+
+/// The whole of what a 500 `DatabaseError` body says. See
+/// [`INTERNAL_ERROR_BODY`].
+pub const DATABASE_ERROR_BODY: &str = "a database error occurred; the detail is in the server log";
+
 /// JSON error response structure
 #[derive(Serialize)]
 struct ErrorResponse {
@@ -436,7 +464,18 @@ impl IntoResponse for ApiError {
                 "SignatureError",
                 Some(serde_json::json!({ "reason": reason })),
             ),
-            ApiError::InternalError { message } => (
+            // REDACTED (F-route-error-text-remainder): the carried message is
+            // the server's to read, so it is logged here, once, for every
+            // route, and the body is a fixed literal.
+            ApiError::InternalError { message } => {
+                tracing::error!(target: "api.internal_error", detail = %message, "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    Some(serde_json::json!({ "message": INTERNAL_ERROR_BODY })),
+                )
+            }
+            ApiError::InternalErrorStatic { message } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
                 Some(serde_json::json!({ "message": message })),
@@ -459,11 +498,14 @@ impl IntoResponse for ApiError {
                     "actual": actual
                 })),
             ),
-            ApiError::DatabaseError { message } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                Some(serde_json::json!({ "message": message })),
-            ),
+            ApiError::DatabaseError { message } => {
+                tracing::error!(target: "api.internal_error", detail = %message, "database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DatabaseError",
+                    Some(serde_json::json!({ "message": DATABASE_ERROR_BODY })),
+                )
+            }
             ApiError::ServiceUnavailable { service } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ServiceUnavailable",
@@ -533,9 +575,16 @@ impl IntoResponse for ApiError {
                 | ApiError::SignatureError { .. }
         );
 
+        // `Display` renders the carried message, so the redacted variants'
+        // top-level `message` is built from the literal, not from `self`.
+        let message = match &self {
+            ApiError::InternalError { .. } => format!("Internal error: {INTERNAL_ERROR_BODY}"),
+            ApiError::DatabaseError { .. } => format!("Database error: {DATABASE_ERROR_BODY}"),
+            other => other.to_string(),
+        };
         let body = ErrorResponse {
             error: error_type.to_string(),
-            message: self.to_string(),
+            message,
             details,
         };
 
@@ -670,6 +719,19 @@ impl From<DbError> for ApiError {
                         .to_string(),
                 }
             }
+            // Migration 166 (ROL01): a role's agent wrote while no human holds
+            // the role, or while its linked human is not the holder. The agent
+            // and role stay in the log.
+            DbError::RoleHolderRequired { message } => {
+                tracing::warn!(detail = %message, "role-attached agent without its live holder");
+                ApiError::Forbidden {
+                    reason: "ROL01: the writing or named agent is attached to a role that no \
+                             human holds now, or whose holder is not the agent's linked human; a \
+                             role's agents write only while a human holds the role, and only for \
+                             that holder. Nothing was written."
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -737,8 +799,8 @@ impl From<DbError> for ApiError {
             // caller's; the reason is logged, not sent.
             DbError::ElevatedAccessUnrecorded { reason } => {
                 tracing::error!(target: "elevation", reason = %reason, "elevated access not recorded");
-                ApiError::InternalError {
-                    message: "ELEVATED ACCESS NOT RECORDED: the response is withheld".to_string(),
+                ApiError::InternalErrorStatic {
+                    message: "ELEVATED ACCESS NOT RECORDED: the response is withheld",
                 }
             }
             DbError::MigrationFailed { source } => {
@@ -851,6 +913,29 @@ mod tests {
         }
     }
 
+    /// Migration 166's ROL01 is a DENIAL (403) carrying its code; the
+    /// database's text (agent and role) stays in the log. Mutation caught: the
+    /// arm removed (it falls to the fault arm).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_role_agent_without_its_holder_is_forbidden_with_the_code() {
+        let api = ApiError::from(DbError::RoleHolderRequired {
+            message: "ROL01: agent 00000000-0000-0000-0000-00000000abcd is attached to role r"
+                .to_string(),
+        });
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.starts_with("ROL01"), "the code: {reason}");
+                assert!(
+                    !reason.contains("00000000-0000-0000-0000-00000000abcd"),
+                    "the database text must stay server-side: {reason}"
+                );
+            }
+            other => panic!("ROL01 must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
     /// An elevated request asking to write is a 403 denial naming the remedy,
     /// not a 500. Mutation caught: the arm removed (it falls to the fault arm).
     #[test]
@@ -931,6 +1016,91 @@ mod tests {
         };
         let response = error.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The status and the whole body of `error`'s response, body as text.
+    async fn rendered(error: ApiError) -> (StatusCode, String) {
+        use http_body_util::BodyExt;
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("an in-memory body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A route builds `InternalError` / `DatabaseError` with the driver's
+    /// error interpolated (`format!("...: {e}")`, `e.to_string()`): hundreds
+    /// of sites under `routes/` (`docs/tenancy/progress.json`,
+    /// F-route-error-text-remainder). The response must not carry that text,
+    /// in either the top-level `message` or `details`, whatever the
+    /// constructor put in the variant.
+    #[tokio::test]
+    async fn internal_error_body_never_carries_the_constructed_message() {
+        let driver = "relation \"claims\" does not exist";
+        for error in [
+            ApiError::InternalError {
+                message: format!("query failed: {driver}"),
+            },
+            ApiError::DatabaseError {
+                message: format!("Failed to look up existing challenge: {driver}"),
+            },
+        ] {
+            let kind = if matches!(error, ApiError::InternalError { .. }) {
+                "InternalError"
+            } else {
+                "DatabaseError"
+            };
+            let (status, body) = rendered(error).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            for leaked in [
+                "relation",
+                "claims",
+                "does not exist",
+                "query failed",
+                "look up",
+            ] {
+                assert!(
+                    !body.contains(leaked),
+                    "{kind}: the 500 body carries the constructed message ({leaked:?}): {body}"
+                );
+            }
+            // The machine key is unchanged: a client still learns WHICH kind
+            // of server fault it hit, only not the driver's words.
+            let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+            assert_eq!(v["error"], kind, "{body}");
+            assert!(
+                v["message"].as_str().is_some_and(|m| !m.is_empty()),
+                "{kind}: the body still says something: {body}"
+            );
+        }
+    }
+
+    /// The designed-text variant is NOT redacted: its `&'static str` is the
+    /// whole point of it (an operator remedy, a fail-closed notice), and the
+    /// error key is the same `InternalError` contract.
+    #[tokio::test]
+    async fn internal_error_static_body_carries_its_literal() {
+        let (status, body) = rendered(ApiError::InternalErrorStatic {
+            message: "ELEVATED ACCESS NOT RECORDED: the response is withheld",
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+        assert_eq!(v["error"], "InternalError", "{body}");
+        assert_eq!(
+            v["details"]["message"], "ELEVATED ACCESS NOT RECORDED: the response is withheld",
+            "{body}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("ELEVATED ACCESS NOT RECORDED")),
+            "{body}"
+        );
     }
 
     // ---- RFC 6750 / RFC 9728 challenge -----------------------------------

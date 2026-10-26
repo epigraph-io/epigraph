@@ -253,10 +253,13 @@ atoms; the `theme_cluster` MCP tool in
 (re)builds them from the live corpus by running k-means over
 paragraph embeddings, with elbow-penalised search over
 `k_min..=k_max` when `k` is not pinned. The default `limit` is 500
-(VM OOMs at ~2000 embeddings, per `feedback_memory_limits.md`),
-and `wipe_first=true` is the safe default because `claim_themes`
-has no `UNIQUE(label)` constraint and additive runs silently
-duplicate `auto-00, auto-01, …` rows.
+(VM OOMs at ~2000 embeddings, per `feedback_memory_limits.md`).
+`wipe_first` defaults to `false`: a run is additive, and because
+`claim_themes` has no `UNIQUE(label)` constraint, repeated additive
+runs under one `label_prefix` duplicate `auto-00, auto-01, …` rows.
+`wipe_first=true` is destructive: it deletes EVERY theme (whatever its
+prefix) and clears every `claims.theme_id`, so it needs `claims:admin`
+and is admitted only with the canonical `label_prefix` `"auto"`.
 
 Rule of thumb:
 
@@ -286,7 +289,7 @@ EpiGraph stores documents as a tree, not a flat bag of sentences. Each ingested 
   atom atom atom                          (level 3)
 ```
 
-**Paragraphs are the primary search target.** The `recall_with_context` MCP tool runs vector kNN over level-2 paragraphs first, then *batches in* the structural context for each hit: the paragraph's atoms (level 3), its sibling paragraphs in the same section (level 2), its corroborating edges, and its neighbor paragraphs. The level-2-only filter is explicit in the SQL (see `(properties->>'level')::int = 2` throughout [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs)). Searching at atom level is too noisy — atoms strip away their surrounding context and the kNN catches spurious near-matches. Searching at paper level is too coarse — a 50-page document averages out into a single embedding that does not retrieve well. Paragraphs are the unit of meaning that recall is tuned for.
+**Every embedded claim is a search candidate; the hierarchy is context.** The `recall_with_context` MCP tool runs vector kNN over every claim that carries an embedding — paragraphs, atoms, sections, workflow steps, and claims written on their own with `submit_claim` or `memorize` — then *batches in* the structural context for each hit: its parent paper and section, its atoms (level 3), its sibling paragraphs in the same section (level 2), its corroborating and epistemic edges, and its neighbor paragraphs. Parentage is an enrichment attribute, not an eligibility filter: a hit with no paper attribution comes back without a `paper` key and with `section: null`, rather than being dropped. The hierarchy lists (atoms, siblings, neighbor paragraphs) are filled only for paragraph hits; corroborating and epistemic edges come from the hit's own edges whatever its level (backlog `a1d89aab`, drain U082). Paragraphs are still the unit of meaning the hierarchy is built around — an atom on its own strips away its surrounding context, and a 50-page document averages out into a single embedding that does not retrieve well — which is why the tree's context travels with every hit that has one. Earlier versions searched level-2 paragraphs only; an exactly matching standalone claim then lost to weaker paragraphs because it was never a candidate.
 
 This shape exists only because ingestion *creates* it that way. The
 single canonical ingest path is **Tier 1 hierarchical extraction**:
@@ -303,21 +306,25 @@ historical failure modes are worth knowing about:
   embeddings in the primary embedding column (user-memory
   `feedback_tier1_ingestion_only.md`).
 - **Flat extraction without the level-2 paragraph layer.** Without
-  paragraphs, `recall_with_context` has nothing to search at the
-  right granularity — atom-level results lose context and
-  paper-level results lose precision. The tree must exist before
-  search works.
+  paragraphs, `recall_with_context` still finds the flat claims, but
+  it has no paragraph-granularity hits and no structure to batch in
+  around them — atom-level results lose context and paper-level
+  results lose precision. The tree must exist for recall to return
+  context.
 
 The dimensionality choice is the only thing recall is willing to
 negotiate at query time: it auto-detects 1536 vs 3072 dimensions
-from how the paragraph rows are populated (see
-`paragraph_3072_population` and `detect_centroid_dim` in
-`recall.rs`), defaulting to 3072 when ≥50% of paragraphs carry the
-larger embedding.
+from how the embedded claims it searches are populated (see
+`embedded_3072_population` and `detect_centroid_dim` in
+`recall.rs`), defaulting to 3072 when ≥50% of the embedded claims
+carry the larger embedding. The write paths embed at 1536 only
+(`epigraph-cli reembed` writes the 3072 column), so measuring
+paragraphs alone would switch to 3072 and hide every claim that was
+never re-embedded.
 
 Every `recall_with_context` response also carries a `corpus_scope` summary — `claims_total`, `paragraph_total`, `paper_total`, `themes_total` — so callers can tell how big the corpus was at query time. That number changes as ingest runs, and the LLM consuming the result needs to know whether it just searched 200 paragraphs or 200,000 before deciding how much faith to place in "we found nothing relevant".
 
-A single recall hit, abbreviated, looks like this — note the structural batches around each paragraph:
+A single recall hit for an ingested paragraph, abbreviated, looks like this — note the structural batches around it (a hit with no parent paper omits `paper` and has `section: null`; a hit that is not a paragraph gets empty atom, sibling and neighbor-paragraph lists):
 
 ```json
 {
@@ -335,7 +342,7 @@ A single recall hit, abbreviated, looks like this — note the structural batche
 
 Each batched list also carries a `_total` and `_truncated` field (e.g., `atoms_total`, `atoms_truncated`) so the caller can tell when the structural fan-out was clipped. The `truth_value` field on `RecallHit` is a legacy scalar carried for back-compat; treat `pignistic_prob` from `get_belief` (§3) as the authoritative belief signal for ranking.
 
-**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the paragraph-primary kNN logic and the full `RecallHit` shape; user-memory `feedback_tier1_ingestion_only.md` for the single-canonical-ingest-path rule; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
+**See also:** [`crates/epigraph-mcp/src/tools/recall.rs`](../../crates/epigraph-mcp/src/tools/recall.rs) for the whole-corpus kNN logic and the full `RecallHit` shape; user-memory `feedback_tier1_ingestion_only.md` for the single-canonical-ingest-path rule; the `extract-claims` skill (`.claude/skills/extract-claims/`) for the hierarchical extraction protocol the LLM follows.
 
 ---
 

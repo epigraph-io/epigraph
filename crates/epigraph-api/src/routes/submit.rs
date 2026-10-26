@@ -376,6 +376,33 @@ impl ErrorResponse {
     }
 }
 
+/// The response for a refused packet.
+///
+/// A 5xx body is REDACTED, as `ApiError`'s are (F-route-error-text-remainder):
+/// this handler builds its own `ErrorResponse`s, many with the driver's error
+/// interpolated into `message` or `details`, so the message and details are
+/// LOGGED (target `api.internal_error`) and the body keeps only the error key
+/// and a fixed literal. A 4xx body is the caller's to read and is sent as built.
+fn error_response(status: StatusCode, error: ErrorResponse) -> Response {
+    if !status.is_server_error() {
+        return (status, Json(error)).into_response();
+    }
+    tracing::error!(
+        target: "api.internal_error",
+        route = "submit/packet",
+        kind = %error.error,
+        detail = %error.message,
+        details = ?error.details,
+        "packet submission failed"
+    );
+    let message = if error.error == "DatabaseError" {
+        crate::errors::DATABASE_ERROR_BODY
+    } else {
+        crate::errors::INTERNAL_ERROR_BODY
+    };
+    (status, Json(ErrorResponse::new(error.error, message))).into_response()
+}
+
 // =============================================================================
 // VALIDATION
 // =============================================================================
@@ -1296,12 +1323,11 @@ async fn persist_packet(
         // 4. Insert reasoning trace (with claim_id)
         let trace_uuid: Uuid = trace_id.into();
         let methodology = convert_methodology(packet.reasoning_trace.methodology);
-        let methodology_str = match methodology {
-            Methodology::Deductive | Methodology::FormalProof => "deductive",
-            Methodology::Inductive => "inductive",
-            Methodology::Abductive | Methodology::Heuristic => "abductive",
-            _ => "statistical",
-        };
+        // The one enum -> reasoning_type mapping, shared with the repo layer
+        // rather than copied here. The packet's `MethodologySubmission` has no
+        // observation variant, so this transport cannot say "observational".
+        let methodology_str =
+            epigraph_db::ReasoningTraceRepository::reasoning_type_for(methodology);
 
         // Convert evidence IDs for trace inputs
         let domain_evidence_ids: Vec<EvidenceId> = evidence_ids.to_vec();
@@ -1461,7 +1487,9 @@ async fn persist_packet(
             evidence_uuid,
             content_hash_bytes.as_slice(),
             evidence_type_str,
-            None::<String>,
+            // A Document's URL, so the column REST `claim_provenance` and
+            // `get_evidence` read is not always NULL (backlog 43ab8c73).
+            epigraph_db::EvidenceRepository::source_url_of(&evidence_type_domain),
             evidence_submission.raw_content.as_deref(),
             claim_uuid,
             signature_bytes.as_deref(),
@@ -1651,7 +1679,7 @@ pub async fn submit_packet(
 
     // 2. Validate the packet
     if let Err((status, error)) = validate_packet(&packet, &state).await {
-        return (status, Json(error)).into_response();
+        return error_response(status, error);
     }
 
     // 3. Calculate truth value from evidence (NOT from reputation - BAD ACTOR TEST)
@@ -1726,7 +1754,7 @@ pub async fn submit_packet(
                     response_evidence_ids,
                 )
             }
-            Err((status, error)) => return (status, Json(error)).into_response(),
+            Err((status, error)) => return error_response(status, error),
         }
     };
     // Without the db feature there is no persistence step; the response simply
@@ -2421,6 +2449,7 @@ mod signature_verification_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
     use super::*;

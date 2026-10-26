@@ -29,7 +29,7 @@ use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassF
 // `use` and so external integration tests can import via the MCP crate.
 pub use epigraph_engine::edge_factor::{
     auto_wire_ds_for_edge, auto_wire_edge_if_epistemic, effective_source_strength,
-    EdgeFactorOutcome,
+    effective_source_strength_profiled, EdgeFactorOutcome,
 };
 
 /// Probability value in [0.0, 1.0]. Currently f64 for codebase consistency.
@@ -75,7 +75,23 @@ pub struct BatchDsEntry {
 /// Canonical binary frame name.
 const BINARY_FRAME_NAME: &str = "binary_truth";
 /// Hypotheses for the canonical binary frame.
+// belief-profile: allow-literal (array length of a fixed hypothesis list)
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
+
+/// `mass_functions.combination_method` of the BBA [`auto_wire_ds_update`] seeds
+/// from a claim's `truth_value` (backlog fc55465b).
+pub const TRUTH_VALUE_SEED_METHOD: &str = "truth_value_seed";
+
+/// The range a `truth_value` is capped to before it is seeded: the served
+/// belief profile's `construction.truth_seed_min` / `truth_seed_max`
+/// (defaults 0.005 / 0.995), so the seed's committed mass stays within the cap
+/// `build_bba_on_index` puts on evidence. An uncapped t = 1.0 (or 0.0) would
+/// seed a categorical BBA, and under Dempster's rule a categorical BBA absorbs
+/// every later one: the claim could never be moved by evidence again.
+fn seed_truth_bounds() -> (f64, f64) {
+    let c = &epigraph_engine::belief_profile::BeliefProfile::served().construction;
+    (c.truth_seed_min, c.truth_seed_max)
+}
 
 /// Get-or-create the canonical `binary_truth` frame.
 ///
@@ -198,8 +214,9 @@ fn build_binary_bba(
     build_bba_on_index(frame, confidence, weight, idx)
 }
 
-/// Simple-support BBA placing `m({idx}) = (confidence*weight).clamp(0.01, 0.99)`
-/// with the remainder on Θ — [`build_binary_bba`] generalized to any hypothesis
+/// Simple-support BBA placing `m({idx}) = confidence*weight`, clamped to the
+/// served belief profile's `construction.simple_support_mass_min` /
+/// `simple_support_mass_max` (defaults 0.01 / 0.99), with the remainder on Θ — [`build_binary_bba`] generalized to any hypothesis
 /// index on any frame (issue #222).
 ///
 /// Same mass SHAPE as the binary case, just aimed at the declared label instead
@@ -211,7 +228,11 @@ fn build_bba_on_index(
     weight: f64,
     idx: usize,
 ) -> Result<MassFunction, String> {
-    let mass = (confidence * weight).clamp(0.01, 0.99);
+    let bounds = &epigraph_engine::belief_profile::BeliefProfile::served().construction;
+    let mass = (confidence * weight).clamp(
+        bounds.simple_support_mass_min,
+        bounds.simple_support_mass_max,
+    );
     MassFunction::simple(frame.clone(), BTreeSet::from([idx]), mass)
         .map_err(|e| format!("build BBA: {e}"))
 }
@@ -305,6 +326,13 @@ pub struct DsAutoInput<'a> {
     pub supports: bool,
     /// Evidence classification tag, when the caller has one.
     pub evidence_type: Option<&'a str>,
+    /// The evidence row this BBA came from, when the caller wrote one in the
+    /// same transaction. Stored as `mass_functions.evidence_id`, it is what
+    /// gives the BBA a source identity
+    /// (`epigraph_engine::source_dependence::SourceKey`), so a later
+    /// re-observation of the same `source_url` by the same agent is folded as
+    /// a repeat rather than as independent corroboration (backlog 4c42c0bf).
+    pub evidence_id: Option<Uuid>,
 }
 
 /// The future an [`optional_read_under_savepoint`] read returns: it borrows the
@@ -364,6 +392,56 @@ where
     }
 }
 
+/// The frame's `belief_profile` override object (`frames.properties`), read
+/// under a savepoint for the same reason as [`optional_read_under_savepoint`]:
+/// it is optional, and a failure must not abort the caller's transaction.
+async fn frame_profile_overrides(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+) -> Result<Option<serde_json::Value>, String> {
+    let what = "belief_profile";
+    let mut sp = conn
+        .begin()
+        .await
+        .map_err(|e| format!("{what}: could not open a savepoint: {e}"))?;
+    match FrameRepository::get_by_id(&mut *sp, viewer, frame_id).await {
+        Ok(row) => {
+            sp.commit()
+                .await
+                .map_err(|e| format!("{what}: could not release the savepoint: {e}"))?;
+            Ok(row.and_then(|f| {
+                epigraph_engine::belief_profile::overrides_in(&f.properties).cloned()
+            }))
+        }
+        Err(e) => {
+            tracing::warn!(read = what, error = %e, "optional read failed; treated as absent");
+            sp.rollback()
+                .await
+                .map_err(|e| format!("{what}: could not roll back to the savepoint: {e}"))?;
+            Ok(None)
+        }
+    }
+}
+
+/// The belief profile a DS write folds under: the served profile with this
+/// frame's tier, exactly what `edge_factor::compute_combined_belief` resolves,
+/// so the cached value this write leaves is the value a recompute reproduces.
+fn resolve_frame_profile(
+    frame_overrides: Option<&serde_json::Value>,
+    per_frame_intra: Option<f64>,
+    per_frame_evidence_weights: Option<&std::collections::HashMap<String, f64>>,
+) -> epigraph_engine::belief_profile::BeliefProfile {
+    epigraph_engine::belief_profile::BeliefProfile::served().resolve(
+        epigraph_engine::belief_profile::FrameTier {
+            overrides: frame_overrides,
+            intra_evidence_locality_factor: per_frame_intra,
+            evidence_type_weights: per_frame_evidence_weights,
+        },
+        epigraph_engine::belief_profile::PerspectiveTier::default(),
+    )
+}
+
 /// Auto-wire DS for a **new** claim.
 ///
 /// Creates a BBA, assigns the claim to the binary frame, computes Bel/Pl/BetP,
@@ -380,6 +458,7 @@ pub async fn auto_wire_ds_for_claim(
         weight,
         supports,
         evidence_type,
+        evidence_id,
     } = input;
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
@@ -392,6 +471,9 @@ pub async fn auto_wire_ds_for_claim(
     FrameRepository::assign_claim(&mut *conn, claim_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
+
+    // The canonical key, not the caller's spelling or DB-vocab tag (bc06ec6f).
+    let evidence_type = epigraph_engine::calibration::canonical_evidence_type(evidence_type);
 
     // Store BBA (perspective_id=NULL for auto-wired). source_strength is the
     // evidence-type reliability weight (used as Shafer's reliability discount
@@ -407,10 +489,13 @@ pub async fn auto_wire_ds_for_claim(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(weight),  // source_strength = evidence-type reliability
-        evidence_type, // evidence_type
-        "unknown",     // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
-        None, // no evidence row in scope on the new-claim initial-write path (issue #197 Phase 3)
+        Some(weight),             // source_strength = evidence-type reliability
+        evidence_type.as_deref(), // evidence_type (canonical key)
+        "unknown", // ds_auto single-evidence path; locality lives on edge_factor (issue #197)
+        // The creation's evidence row, when the caller wrote one (issue #197
+        // Phase 3). perspective_id stays NULL: this is the claim's one
+        // creation BBA, not a per-evidence row.
+        evidence_id,
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
@@ -434,11 +519,7 @@ pub async fn auto_wire_ds_for_claim(
     // this also shifts the new-claim persisted truth_value from a confidence-based
     // value to the evidence-type-discounted BetP — a deliberate, correctness-positive
     // change in persisted truth, not only in cached BetP.
-    let calibration = epigraph_engine::calibration::CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| {
-            epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
-        });
-    // Both optional: a failure means "no per-frame override", and each runs under
+    // All optional: a failure means "no per-frame override", and each runs under
     // its own savepoint because this function runs inside the submission's
     // transaction (see `optional_read_under_savepoint`).
     let per_frame_intra =
@@ -463,12 +544,13 @@ pub async fn auto_wire_ds_for_claim(
     let row = all_rows
         .first()
         .ok_or_else(|| "no BBA row after store_with_perspective".to_string())?;
-    let reliability = effective_source_strength(
-        row,
+    let frame_overrides = frame_profile_overrides(&mut *conn, viewer, frame_id).await?;
+    let profile = resolve_frame_profile(
+        frame_overrides.as_ref(),
         per_frame_intra,
         per_frame_evidence_weights.as_ref(),
-        &calibration,
     );
+    let reliability = effective_source_strength_profiled(row, &profile);
     let mf = parse_stored_bba(&frame, &row.masses)?;
     let discounted =
         combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
@@ -510,6 +592,29 @@ pub async fn auto_wire_ds_for_claim(
 /// `evidence_id` is passed as `perspective_id` so that each evidence submission
 /// gets its own BBA row rather than upsert-overwriting the previous one on the
 /// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
+///
+/// # The claim's scalar prior (backlog fc55465b)
+///
+/// A claim whose `truth_value` came from a path that wrote no BBA (ingest-time
+/// `calculate_initial_truth`, REST create) has nothing for the new evidence to
+/// combine with, and its `pignistic_prob` cache is NULL. Two guards keep the
+/// first update from discarding that prior:
+///
+/// - **Seed** (`seed_truth_prior = true`, and the claim has NO BBA on any
+///   two-hypothesis frame): before the evidence BBA is stored, the claim gets a
+///   [`TRUTH_VALUE_SEED_METHOD`] row built by
+///   [`MassFunction::from_pignistic_prior`], whose BetP is exactly the
+///   `truth_value` (capped to the profile's truth-seed bounds), so the seed alone moves
+///   nothing. It is attributed to the claim's author (the authored scalar is
+///   the author's opinion), stored undiscounted (`source_strength = 1.0`,
+///   `evidence_type = NULL`: `effective_source_strength`'s exempt arm), with no
+///   perspective and no evidence row. It is written at most once: afterwards
+///   the claim has BBAs. A caller that seeds must pass an `evidence_id`, or its
+///   own evidence BBA would upsert over a seed it authored.
+/// - **Clamp prior**: the supports=true monotonicity clamp reads
+///   `COALESCE(pignistic_prob, truth_value)`, so a caller that does not seed
+///   (a non-owner attaching to a public claim, `backfill_factors`) still has a
+///   prior to clamp to.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_ds_update(
     conn: &mut sqlx::PgConnection,
@@ -521,6 +626,7 @@ pub async fn auto_wire_ds_update(
     supports: bool,
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
+    seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
@@ -544,6 +650,79 @@ pub async fn auto_wire_ds_update(
             .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
     }
 
+    // The canonical key: callers pass a DB-vocab tag of the evidence row they
+    // wrote or linked (`observation`, `reference`, ...) or a caller-cased
+    // canonical key; both resolve through the calibration alias map (bc06ec6f).
+    let evidence_type_str =
+        epigraph_engine::calibration::canonical_evidence_type(evidence_type_str);
+
+    // The claim's scalar prior, read ONCE, before anything below writes: the
+    // cached `pignistic_prob` (the clamp's prior), the authored `truth_value`
+    // (the seed, and the clamp's prior when the cache is NULL), and the author
+    // (the seed's source). PR-09: a per-id read over a caller-supplied uuid, so
+    // it is filtered rather than exempted; an invisible claim reads as "no
+    // prior", the same answer a nonexistent one gives.
+    let claim_prior: Option<(Option<f64>, f64, Uuid)> = {
+        let sql = viewer.splice(
+            "SELECT c.pignistic_prob, c.truth_value, c.agent_id FROM claims c \
+                 WHERE c.id = $1 /* {VISIBILITY:c} */",
+            // belief-profile: allow-literal (the SQL bind slot the visibility splice uses)
+            2,
+        );
+        // Owned, so the boxed read borrows only the savepoint's connection.
+        let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
+        optional_read_under_savepoint(&mut *conn, "claim prior", move |c| {
+            Box::pin(async move {
+                let mut q = sqlx::query_as::<_, (Option<f64>, f64, Uuid)>(&sql).bind(claim_id);
+                if let Some(g) = group {
+                    q = q.bind(g);
+                }
+                q.fetch_optional(c).await
+            })
+        })
+        .await?
+    };
+
+    // The truth_value seed (see the doc comment). Decided on BBA PRESENCE over
+    // every two-hypothesis frame, not on `pignistic_prob IS NULL`: a claim can
+    // carry a cache from another frame (`assess_claim`, an other-frame
+    // recompute) and no binary BBA, and a claim whose BBAs sit on a legacy
+    // binary frame already has its prior in the combine below.
+    if seed_truth_prior {
+        if let Some((_, truth, author)) = claim_prior {
+            let existing =
+                MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
+                    .await
+                    .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
+            let (seed_min, seed_max) = seed_truth_bounds();
+            let t = truth.clamp(seed_min, seed_max);
+            let seed = if existing.is_empty() {
+                MassFunction::from_pignistic_prior(frame.clone(), 0, t)
+                    .map_err(|e| format!("truth_value seed: {e}"))?
+            } else {
+                None
+            };
+            if let Some(seed) = seed {
+                MassFunctionRepository::store_with_perspective(
+                    &mut *conn,
+                    claim_id,
+                    frame_id,
+                    Some(author), // the authored scalar is the author's opinion
+                    None,         // no perspective
+                    &mass_to_json(&seed)?,
+                    None,
+                    Some(TRUTH_VALUE_SEED_METHOD),
+                    Some(1.0), // exempt reliability: read undiscounted, so BetP stays t
+                    None,      // no evidence_type (the exempt arm keys on its absence)
+                    "unknown",
+                    None, // no evidence row produced it
+                )
+                .await
+                .map_err(|e| format!("store truth_value seed: {e}"))?;
+            }
+        }
+    }
+
     // Store BBA — use evidence_id as perspective_id so each evidence submission
     // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
     // source_strength = evidence-type reliability weight (used for Shafer
@@ -558,9 +737,9 @@ pub async fn auto_wire_ds_update(
         &masses_json,
         None,
         Some("auto_wire"),
-        Some(weight),      // source_strength = evidence-type reliability
-        evidence_type_str, // evidence_type
-        "unknown",         // ds_auto evidence path; locality not derived here (issue #197)
+        Some(weight),                 // source_strength = evidence-type reliability
+        evidence_type_str.as_deref(), // evidence_type (canonical key)
+        "unknown",   // ds_auto evidence path; locality not derived here (issue #197)
         evidence_id, // Phase 3: the FK to the evidence row that produced this BBA (issue #197)
     )
     .await
@@ -582,17 +761,11 @@ pub async fn auto_wire_ds_update(
             .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
 
     // Phase 2 (issue #197): the combine path no longer trusts the
-    // stored `source_strength` as the authority. The Phase 2 helper
-    // derives reliability dynamically from (`evidence_type`,
-    // `locality_tag`, per-frame factor, calibration). Calibration I/O
-    // failure falls back to the synthetic config (intra 0.3, every
-    // evidence_type → 0.5 unknown) which mirrors the pre-Phase-2
-    // hardcodes. See effective_source_strength docs in
-    // `epigraph_engine::edge_factor` for the full fallback chain.
-    let calibration = epigraph_engine::calibration::CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| {
-            epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
-        });
+    // stored `source_strength` as the authority. Reliability is derived
+    // dynamically from (`evidence_type`, `locality_tag`) under the belief
+    // profile the recompute path resolves: the served profile (calibration,
+    // or its load-failure fallback) with this frame's overrides. See
+    // `epigraph_engine::edge_factor::effective_source_strength_profiled`.
     let per_frame_intra =
         optional_read_under_savepoint(&mut *conn, "intra_evidence_locality_factor", |c| {
             Box::pin(FrameRepository::get_intra_evidence_locality_factor(
@@ -614,70 +787,55 @@ pub async fn auto_wire_ds_update(
         })
         .await?;
 
-    // Read current pignistic_prob for monotonicity clamp.  Supporting evidence
-    // must never lower BetP: high-conflict K between legacy mixed-format BBAs
-    // (m({0})>0 AND m({1})>0) and a new pure-support BBA can push mass to
-    // missing via Inagaki redistribution and reduce pignistic_prob even when
-    // supports=true.  We bound the result from below by the pre-addition value.
-    let prior_betp: Option<f64> = {
-        // PR-09: a per-id belief oracle over a caller-supplied uuid, so it
-        // is filtered rather than exempted. `unwrap_or(None)` already
-        // treats "no row" as "no prior", so an invisible claim degrades to
-        // the same answer a nonexistent one gives — no new failure mode.
-        let sql = viewer.splice(
-            "SELECT c.pignistic_prob FROM claims c \
-                 WHERE c.id = $1 /* {VISIBILITY:c} */",
-            2,
-        );
-        // Owned, so the boxed read borrows only the savepoint's connection.
-        let group: Option<Vec<Uuid>> = viewer.group_bind().map(<[Uuid]>::to_vec);
-        optional_read_under_savepoint(&mut *conn, "prior pignistic_prob", move |c| {
-            Box::pin(async move {
-                let mut q = sqlx::query_scalar::<_, Option<f64>>(&sql).bind(claim_id);
-                if let Some(g) = group {
-                    q = q.bind(g);
-                }
-                q.fetch_optional(c).await
-            })
-        })
-        .await?
-        .flatten()
-    };
+    // The monotonicity clamp's prior. Supporting evidence must never lower
+    // BetP: high-conflict K between legacy mixed-format BBAs (m({0})>0 AND
+    // m({1})>0) and a new pure-support BBA can reduce pignistic_prob even when
+    // supports=true, so the result is bounded from below by the pre-addition
+    // value: the cached `pignistic_prob`, or the authored `truth_value` when the
+    // claim has no cache (backlog fc55465b: with no fallback the clamp never
+    // fired on exactly the claims whose prior was otherwise discarded).
+    let prior_betp: Option<f64> = claim_prior.map(|(cached, truth, _)| cached.unwrap_or(truth));
 
-    let combined = if all_rows.len() <= 1 {
-        // Single BBA — still apply discount
-        let r = all_rows
-            .first()
-            .expect("len <= 1 with non-empty check: store_with_perspective wrote one");
-        let reliability = effective_source_strength(
-            r,
-            per_frame_intra,
-            per_frame_evidence_weights.as_ref(),
-            &calibration,
-        );
-        let mf = parse_stored_bba(&frame, &r.masses)?;
-        combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?
-    } else {
-        // Multiple BBAs — discount each via the helper, then combine.
-        let mut mass_fns = Vec::with_capacity(all_rows.len());
-        for row in &all_rows {
-            let mf = parse_stored_bba(&frame, &row.masses)?;
-            let reliability = effective_source_strength(
-                row,
-                per_frame_intra,
-                per_frame_evidence_weights.as_ref(),
-                &calibration,
-            );
-            let discounted =
-                combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-            mass_fns.push(discounted);
-        }
-        let (combined, _reports) = combination::combine_multiple(&mass_fns, 0.9)
-            .map_err(|e| format!("combine_multiple: {e}"))?;
-        combined
-    };
+    // The second value is the conflict the fold SAW. Since U025 every
+    // `combine_multiple` step is Dempster, which normalises conflict out of
+    // the combined mass, so the multi-BBA arm reads it from the per-step
+    // reports (`aggregate_conflict`), exactly as the recompute path
+    // (`edge_factor::compute_combined_belief`) does; otherwise this write and
+    // the next recompute would disagree on `claims.mass_on_empty`.
+    //
+    // Discount each BBA via the helper, then combine through the SAME
+    // function the recompute path uses (`edge_factor::compute_combined_belief`):
+    // BBAs from one agent re-reading one `source_url` are folded cautiously into
+    // one before the Dempster fold, so a re-worded re-observation of an
+    // unchanged source no longer counts as corroboration (backlog 4c42c0bf).
+    // Rows with no source identity fold exactly as before.
+    let source_keys =
+        epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+            .await
+            .map_err(|e| format!("evidence source_url read: {e}"))?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    let frame_overrides = frame_profile_overrides(&mut *conn, viewer, frame_id).await?;
+    let profile = resolve_frame_profile(
+        frame_overrides.as_ref(),
+        per_frame_intra,
+        per_frame_evidence_weights.as_ref(),
+    );
+    for (row, key) in all_rows.iter().zip(source_keys) {
+        let mf = parse_stored_bba(&frame, &row.masses)?;
+        let reliability = effective_source_strength_profiled(row, &profile);
+        let discounted =
+            combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        items.push((key, discounted));
+    }
+    let (combined, fold_conflict) =
+        epigraph_engine::source_dependence::combine_with_source_dependence(
+            items,
+            profile.combination.conflict_threshold,
+        )
+        .map_err(|e| format!("combine_multiple: {e}"))?;
 
-    let (bel, pl, mut betp, conflict, missing) = compute_measures(&combined);
+    let (bel, pl, mut betp, _, missing) = compute_measures(&combined);
+    let conflict = fold_conflict;
 
     // Monotonicity clamp: supports=true evidence must not lower pignistic_prob.
     //
@@ -857,6 +1015,10 @@ async fn wire_single_batch_entry(
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
 
+    // Ingest normalizes its tags already; canonicalize anyway so no batch
+    // caller can store a non-canonical spelling (bc06ec6f).
+    let evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(entry.evidence_type.as_deref());
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
         entry.claim_id,
@@ -867,9 +1029,9 @@ async fn wire_single_batch_entry(
         None,
         Some("auto_wire"),
         Some(entry.weight), // source_strength = methodology weight (legacy fallback when evidence_type is None)
-        entry.evidence_type.as_deref(), // evidence_type → effective_source_strength / frame function
-        "unknown",                      // batch ds_auto path; no per-entry locality (issue #197)
-        None, // batch path predates per-claim evidence rows (issue #197 Phase 3)
+        evidence_type.as_deref(), // evidence_type → effective_source_strength / frame function
+        "unknown",          // batch ds_auto path; no per-entry locality (issue #197)
+        None,               // batch path predates per-claim evidence rows (issue #197 Phase 3)
     )
     .await
     .map_err(|e| format!("store BBA: {e}"))?;

@@ -138,6 +138,7 @@ fn http_auth(agent_id: Option<Uuid>) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -610,6 +611,7 @@ async fn a_revoked_link_grants_nothing(pool: PgPool) {
 ///   answer it did not get), so the failure is real.
 /// * The same supersede from an UNDECLARED signer is still allowed (its
 ///   pre-107 warn-and-allow), rather than turned into an internal error.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_undeclared_stdio_signer_keeps_its_pre_107_arm_when_the_operator_lookup_fails(
     pool: PgPool,
@@ -627,9 +629,15 @@ async fn an_undeclared_stdio_signer_keeps_its_pre_107_arm_when_the_operator_look
     let err = supersede(&declared, &pool, c, None)
         .await
         .expect_err("CALIBRATION: a declared signer's operator lookup must fail here");
+    // The failed lookup is the recorded cause, in the server log; the caller
+    // gets a fixed message without the database's text (backlog 49863d2c).
     assert!(
-        err.contains("epigraph_operator_of_author"),
+        logs_contain("epigraph_operator_of_author(uuid) does not exist"),
         "CALIBRATION: the refusal must be the failed lookup: {err}"
+    );
+    assert!(
+        !err.contains("epigraph_operator_of_author"),
+        "the database's error text must not reach the caller: {err}"
     );
     assert!(is_current(&pool, c).await);
 

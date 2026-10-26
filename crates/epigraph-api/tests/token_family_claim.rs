@@ -122,6 +122,7 @@ fn a_token_with_fam_and_elv_decodes_under_the_previous_claims_struct() {
     let binding = AccessTokenBinding {
         family_id: Some(fam),
         elevation_id: Some(elv),
+        delegated_by: None,
     };
     let (token, jti) = cfg
         .issue_access_token(
@@ -244,6 +245,7 @@ fn fam_and_elv_reach_the_auth_context() {
             AccessTokenBinding {
                 family_id: Some(fam),
                 elevation_id: Some(elv),
+                delegated_by: None,
             },
         )
         .expect("mint");

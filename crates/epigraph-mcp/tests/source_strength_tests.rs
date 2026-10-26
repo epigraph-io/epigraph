@@ -82,6 +82,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         true, // supports
         Some("testimony"),
         Some(evidence_id),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");
@@ -106,7 +107,8 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
         (stored_strength - confidence).abs() > 0.01,
         "source_strength must NOT equal confidence ({confidence}); confidence is encoded in BBA shape"
     );
-    assert_eq!(stored.1.as_deref(), Some("testimony"));
+    // The DB-vocab tag `testimony` is stored as its canonical key (bc06ec6f).
+    assert_eq!(stored.1.as_deref(), Some("testimonial"));
     // Phase 3 (issue #197): auto_wire_ds_update must pipe its evidence_id
     // parameter through to mass_functions.evidence_id as the FK to the
     // evidence row that produced this BBA. Without this, the linking
@@ -161,6 +163,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true, // supports
         Some("empirical"),
         Some(ev_a),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("first update");
@@ -175,6 +178,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true,
         Some("empirical"),
         Some(ev_b),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("second update");
@@ -228,6 +232,7 @@ async fn auto_wire_ds_update_recalibration_flows_through_combine() {
         true,
         Some("empirical"),
         Some(ev_c),
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("third update");

@@ -187,7 +187,7 @@ pub async fn request_viewer(
     if auth.is_none() {
         return Viewer::resolve(&server.pool, principal)
             .await
-            .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None));
+            .map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e));
     }
     // HTTP: an OPERATED principal gets no viewer. Operated agents are
     // stdio-only (migration 107); token issuance refuses them, but a token
@@ -197,12 +197,37 @@ pub async fn request_viewer(
     // while the agent's writer row in the operator's group is live. Checked
     // concurrently with the resolve, so it adds a round trip of work but no
     // latency.
-    let (viewer, actor) = tokio::join!(
+    //
+    // A DELEGATED run token (`dlg`) is the one carve-out, and only while its
+    // delegation is live NOW ([`live_delegation`]). A token carrying `dlg`
+    // whose delegation is not live is refused whatever the principal's link
+    // state: an unlinked principal is never delegated to.
+    let (viewer, actor, delegation) = tokio::join!(
         resolve_http(server, auth, principal),
         epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, principal),
+        live_delegation(server, auth, principal),
     );
+    let delegated = match (auth.and_then(|a| a.delegated_by), delegation?) {
+        (None, _) => false,
+        (Some(_), Some(_)) => true,
+        (Some(delegator), None) => {
+            tracing::warn!(
+                target: "auth.delegation.rejected",
+                reason = "delegation_not_live",
+                principal = %principal,
+                delegator = %delegator,
+                "MCP viewer refused: a delegated run token whose delegation is not live"
+            );
+            return Err(delegation_not_live(principal, delegator));
+        }
+    };
     match actor {
         Ok(None) => {}
+        // A live delegation names this operated principal's own operator. The
+        // viewer is the principal's own membership set, exactly as on stdio;
+        // what it may WRITE is bounded by the database's operator-scope rule
+        // (migration 122, `OPL02`) to groups its operator writes.
+        Ok(Some(_)) if delegated => {}
         Ok(Some(link)) => {
             return Err(McpError::invalid_request(
                 format!(
@@ -214,11 +239,199 @@ pub async fn request_viewer(
             ))
         }
         Err(e) => {
-            return Err(McpError::internal_error(
-                format!("could not check whether agent {principal} is operated: {e}"),
-                None,
+            return Err(crate::errors::internal_error_logged(
+                format!("could not check whether agent {principal} is operated"),
+                e,
             ))
         }
     }
-    viewer.map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+    viewer.map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e))
+}
+
+/// The refusal of a delegated run token whose delegation is not live: one
+/// wording at dispatch and at the viewer.
+fn delegation_not_live(principal: uuid::Uuid, delegator: uuid::Uuid) -> McpError {
+    McpError::invalid_request(
+        format!(
+            "this token was delegated to agent {principal} by agent {delegator}, and that \
+             delegation is not live: delegated run tokens are refused, or the delegator's \
+             allowance, client, or writer membership, or the agent's operator link, has ended"
+        ),
+        None,
+    )
+}
+
+/// One delegation the dispatch found live for the tool call in flight
+/// ([`admit_delegated_call`]); see [`ADMITTED`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdmittedDelegation {
+    delegator: uuid::Uuid,
+    principal: uuid::Uuid,
+    live: epigraph_db::DelegationLive,
+}
+
+tokio::task_local! {
+    /// The delegation `call_tool` found live for the tool call it is running
+    /// (set only by [`with_admitted_delegation`], around that one call), so a
+    /// tool's [`request_viewer`] and the ownership gate reuse the dispatch's
+    /// one read instead of repeating it. Private to this module: nothing
+    /// outside can claim a delegation was checked. A tool that resolves its
+    /// viewer outside the call's task sees no value and reads again; the
+    /// fallback only ever READS, it never admits unchecked.
+    static ADMITTED: AdmittedDelegation;
+}
+
+/// Run `call` (one tool call) with `admitted` visible to [`live_delegation`].
+pub(crate) async fn with_admitted_delegation<F: std::future::Future>(
+    admitted: Option<AdmittedDelegation>,
+    call: F,
+) -> F::Output {
+    match admitted {
+        Some(a) => ADMITTED.scope(a, call).await,
+        None => call.await,
+    }
+}
+
+/// THE per-call check of a DELEGATED run token on the MCP HTTP transport, run
+/// by `call_tool` FIRST, before any gate, lineage write or tool: a tool that
+/// never resolves a viewer is covered exactly like one that does. `Ok(None)`
+/// for a context without `dlg` (and on stdio, which has no context), with no
+/// read.
+///
+/// # Errors
+/// INVALID_REQUEST (logged, never with the token) when the token carries a
+/// scope outside `epigraph_auth::DELEGATED_SCOPE_CEILING` (checked first, no
+/// read), when the delegation is not live, or when it names no principal; an internal error with a fixed
+/// message when the check cannot answer (fails closed).
+pub(crate) async fn admit_delegated_call(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    tool: &str,
+) -> Result<Option<AdmittedDelegation>, McpError> {
+    let Some(auth) = auth else {
+        return Ok(None);
+    };
+    let Some(delegator) = auth.delegated_by else {
+        return Ok(None);
+    };
+    let outside = epigraph_auth::outside_delegated_ceiling(&auth.scopes);
+    if !outside.is_empty() {
+        tracing::warn!(
+            target: "auth.delegation.rejected",
+            reason = "scope_outside_ceiling",
+            tool = %tool,
+            principal = ?auth.agent_id,
+            delegator = %delegator,
+            jti = %auth.jti,
+            scopes = ?outside,
+            "MCP call refused: a delegated run token carrying scopes outside the delegated ceiling"
+        );
+        return Err(McpError::invalid_request(
+            format!(
+                "a delegated run token may carry only the delegated scope ceiling ({}); this one \
+                 also carries {}",
+                epigraph_auth::DELEGATED_SCOPE_CEILING.join(" "),
+                outside.join(" ")
+            ),
+            None,
+        ));
+    }
+    let Some(principal) = auth.agent_id else {
+        tracing::warn!(
+            target: "auth.delegation.rejected",
+            reason = "no_principal",
+            tool = %tool,
+            delegator = %delegator,
+            jti = %auth.jti,
+            "MCP call refused: a delegated run token that names no principal"
+        );
+        return Err(McpError::invalid_request(
+            format!(
+                "this token was delegated by agent {delegator} but names no principal; that \
+                 delegation is not live"
+            ),
+            None,
+        ));
+    };
+    match read_delegation(server, delegator, principal).await? {
+        Some(live) => Ok(Some(AdmittedDelegation {
+            delegator,
+            principal,
+            live,
+        })),
+        None => {
+            tracing::warn!(
+                target: "auth.delegation.rejected",
+                reason = "delegation_not_live",
+                tool = %tool,
+                principal = %principal,
+                delegator = %delegator,
+                jti = %auth.jti,
+                "MCP call refused: a delegated run token whose delegation is not live"
+            );
+            Err(delegation_not_live(principal, delegator))
+        }
+    }
+}
+
+/// The live delegation of `auth`'s `dlg` claim to `principal`. `None` when the
+/// token carries no `dlg`, and when its delegation is not live.
+///
+/// Inside a tool call the dispatch already checked ([`ADMITTED`] holds this
+/// very delegator and principal) it reuses that answer; anywhere else it asks
+/// THE shared per-request check (`AgentRepository::delegated_principal_pool`,
+/// with this listener's `EPIGRAPH_RUN_TOKENS` switch: `None` without a read
+/// while it is off).
+///
+/// Read by [`request_viewer`] and by the ownership gate's actor arm
+/// (`tools::claims::require_owner_or_admin`), so both sites admit a delegated
+/// token on the same answer.
+///
+/// # Errors
+/// An MCP internal error with a fixed message when the check cannot answer;
+/// callers refuse.
+pub(crate) async fn live_delegation(
+    server: &EpiGraphMcpFull,
+    auth: Option<&epigraph_auth::AuthContext>,
+    principal: uuid::Uuid,
+) -> Result<Option<epigraph_db::DelegationLive>, McpError> {
+    let Some(delegator) = auth.and_then(|a| a.delegated_by) else {
+        return Ok(None);
+    };
+    if let Ok(a) = ADMITTED.try_with(|a| *a) {
+        if a.delegator == delegator && a.principal == principal {
+            return Ok(Some(a.live));
+        }
+    }
+    read_delegation(server, delegator, principal).await
+}
+
+/// The one read: `AgentRepository::delegated_principal_pool` on this
+/// listener's pool and switch. The database error is logged here and never
+/// sent to the client.
+async fn read_delegation(
+    server: &EpiGraphMcpFull,
+    delegator: uuid::Uuid,
+    principal: uuid::Uuid,
+) -> Result<Option<epigraph_db::DelegationLive>, McpError> {
+    epigraph_db::AgentRepository::delegated_principal_pool(
+        &server.pool,
+        server.run_tokens,
+        delegator,
+        principal,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            reason = "delegation_check_unavailable",
+            principal = %principal,
+            delegator = %delegator,
+            error = %e,
+            "the delegated run token check failed"
+        );
+        McpError::internal_error(
+            "could not check whether this token's delegation is live".to_string(),
+            None,
+        )
+    })
 }

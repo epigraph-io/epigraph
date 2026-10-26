@@ -161,6 +161,51 @@ impl ExperimentRepository {
         let row: (i64,) = q.fetch_one(executor).await?;
         Ok(row.0)
     }
+
+    /// Retire the `hypothesis_assessment` BBA a promotion has just copied onto
+    /// `research_validity`, so the promotion MOVES the evidence rather than
+    /// duplicating it (backlog 846b808e).
+    ///
+    /// Both frames are 2-hypothesis frames, so a copy left beside its source
+    /// was read twice by `MassFunctionRepository::get_for_claim_binary_frames`
+    /// and, when the row carries no `evidence_id` (the `error_derived` BBA),
+    /// folded twice as independent evidence.
+    ///
+    /// The row is named by id AND by the claim and frame it must sit on, so a
+    /// stray id cannot delete a row anywhere else, and the statement carries
+    /// the caller's write predicate: a scoped viewer retires only a row in its
+    /// writable set; a maintenance viewer renders no predicate. Returns whether
+    /// the row went. Callers run it in the promotion's transaction and treat
+    /// `false` as a refusal of the whole promotion, so a promotion never leaves
+    /// two copies.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the statement fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn retire_promoted_hypothesis_bba<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        mass_function_id: Uuid,
+        hypothesis_id: Uuid,
+        hypothesis_frame_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice_write(
+            "DELETE FROM mass_functions AS mf \
+              WHERE mf.id = $1 AND mf.claim_id = $2 AND mf.frame_id = $3 \
+                /* {WRITABLE:mf} */",
+            4,
+        );
+        let mut q = sqlx::query(&sql)
+            .bind(mass_function_id)
+            .bind(hypothesis_id)
+            .bind(hypothesis_frame_id);
+        // Conditional: a maintenance viewer renders no predicate, so the
+        // statement has no `$4` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.execute(executor).await?.rows_affected() == 1)
+    }
 }
 
 pub struct ExperimentResultRepository;

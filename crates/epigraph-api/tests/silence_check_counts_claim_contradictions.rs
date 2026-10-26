@@ -472,6 +472,7 @@ async fn a_contradiction_counts_when_only_its_target_is_in_the_frame(
 async fn silence_events(frame: Uuid, claim: Uuid) -> usize {
     let filter = epigraph_api::routes::events::EventFilter {
         since: None,
+        after_id: None,
         event_type: Some("silence.suspicious".to_string()),
         limit: Some(1000),
         offset: None,

@@ -421,6 +421,50 @@ the mechanical requirement is (1)-(3) above, not a particular release count.
 `docs/runbooks/084-undo.sql` recreates the EMPTY SHAPE only; read it before
 applying 084 to anything you cannot rebuild.
 
+### 1e. `POST /api/v1/claims/batch` now persists its claims
+
+Each item goes through the same code as `POST /api/v1/claims`, on its own
+transaction. Before this change the route returned ids that named no row.
+
+- An item may carry any `POST /api/v1/claims` field. An item without
+  `agent_id` is authored by the caller. `truth_value` is still accepted as
+  `initial_truth`, but giving both is refused.
+- `if_not_exists: true` makes re-running a batch safe: matched items return
+  the existing id with `was_created: false` and are counted in the new
+  `existing` field.
+- A matched item writes nothing. Its `AUTHORED`, `HAS_TRACE` (`trace_id`)
+  and `DERIVED_FROM` (`evidence_id`) edges and its "create" provenance row
+  are written only for a claim the call created. This also changes
+  `POST /api/v1/claims` with `if_not_exists: true`, which used to write those
+  edges onto whatever claim it matched, including another agent's. A client
+  that relied on a re-run attaching new evidence to an existing claim must
+  link it with `POST /api/v1/edges`.
+- Each failed item's result carries `status` (the code the single route would
+  return, e.g. 400 or 409) next to `error`.
+- The request now needs an authenticated agent with `claims:write`, the same
+  as the single route.
+- Still no `ClaimSubmitted` event, the same as `POST /api/v1/claims`.
+- Once operator binding is armed (migration 122), the database checks each
+  item as it checks a single claim. An item naming an author the caller may
+  not write as, and any item from an unbound caller, is refused in its own
+  slot with 403 (`OPL01`/`OPL02`), and the other items are unaffected.
+- A public item is always owned by the token agent's personal group.
+  `group_id` does not change that: it is ignored unless `privacy_tier` is
+  `fully_private`, which also needs `encrypted_content` and
+  `encryption_epoch` and a caller that is a member of the group. That is the
+  only way to choose an item's owner group. So under an armed binding an
+  allowlisted service client's public items are refused with `OPL02`, because
+  its personal group is not a group its operator writes, and sending
+  `group_id` on a public item does not avoid it. Without an armed binding, a
+  public item sent with `group_id` lands in the caller's personal group, not
+  in the named one. Fleet agents can't call this route over HTTP, because
+  their token mint is refused.
+- A batch embeds its items one after another, so a large public batch can
+  take tens of seconds. The rate limiter counts the request, not its items.
+
+Clients that relied on the old behaviour see real rows, and the response ids
+now name them.
+
 #### One route needs more than a token
 
 | Route | Was | Now | Failure if you get it wrong |
@@ -692,6 +736,8 @@ What that means for callers:
   JSON-RPC `-32600` with `data.status = "moved"` for `recompute_beliefs`
   (-> `recompute_claim_belief`), `backfill_embeddings` (-> `embed_backfill`)
   and `sweep_semantic_duplicates` (-> the `sweep_semantic_duplicates` CLI).
+  `embed_backfill` also fills NULL `workflows.goal_embedding` (the workflow
+  write paths embed the goal best-effort), so one schedule covers both columns.
 * **No job runs in the server.** It builds no job pool and no maintenance pool,
   starts no job runner and no stale-job reaper. The queue is drained by
   `drain_jobs`.
@@ -824,9 +870,14 @@ run on an unprivileged role once policies land reads a subset and exits 0 with
 no warning. The refusal that protects you is at the API and CLI boundary only.
 
 **Deploy surfaces that need the variable** (each currently takes the WARN
-fallback): `decompose_claims` (a bind-mounted host binary, not baked into the
-image), the binaries layered into `epigraph-agent:latest`, `epiclaw.env`, the
-decomposition-cycle schedule, and foreman.
+fallback): the binaries layered into `epigraph-agent:latest`, `epiclaw.env`,
+and foreman. `decompose_claims` (a bind-mounted host binary, not baked into the
+image) needs it only on its maintenance path. A scheduled decomposition-cycle
+run in an agent container should pass `--as-agent <agent id>` (the agent its API
+token acts as); it then runs on the application login in `DATABASE_URL`
+through row-level security and needs no maintenance DSN. This takes effect only
+once the deployed binary has the flag and the schedule's command passes it. See
+the binary's module doc, "Running as an agent".
 
 **Known prerequisite, NOT shipped by PR-15.** `epigraph_maintenance` is NOLOGIN
 and `epigraph_admin` is not a member of it, so today no non-superuser role both
@@ -1653,7 +1704,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 `epigraph-operator` (the role verbs and `custodial-supersede`),
 `epigraph-api` (privatization records a custodial act and reads the
 assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
-one). Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
+one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first.
+Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
 ended after 123), drops 123's triggers, re-applies 083's and 122's function
@@ -2447,28 +2499,237 @@ narrowing `scope`) widened the chain to everything the client is granted.
    client's whole grant, and every rotation re-caps its expiry at now() plus
    the client type's TTL (human 30 days, service 90 days, agent 24 hours) with
    no family-age cap, so a connector that refreshes at least once per TTL keeps
-   the widened scopes indefinitely. Decide, per client, after step 1:
-   * **Revoke** the client's live chains, forcing a fresh consent (humans
-     re-authorize the connector; services run a new `client_credentials`
-     grant): `SELECT public.epigraph_refresh_token_revoke_client('<oauth_clients.id>');`
-     on the maintenance DSN (it returns the number of tokens revoked). The candidates are `human` clients (any connector consented
-     with a narrowed scope) and `client_credentials` clients that request a
-     narrowing `scope`. Read-only census of what each live chain now stores
-     against the grant (maintenance DSN):
+   the widened scopes indefinitely.
+
+   **What a revoke stops, and what it does not.** Revoking a chain (either
+   function below) stops its NEXT refresh, and ends any elevation session on
+   that family at once (migration 125's `refresh_tokens_end_elevations`
+   trigger). Access tokens the chain already issued stay valid until they
+   expire, at most 1 hour for a `human` or `service` client and 15 minutes for
+   an `agent` one, because the bearer check consults only the per-`jti`
+   access-token denylist (migration 141), never the refresh family. To cut a
+   known access token off sooner, revoke it by value at `POST /oauth/revoke`.
+
+   Decide, per chain, after step 1. Every query below is read-only and runs on
+   the maintenance DSN. A family's root is its first token: its row has
+   `family_id` NULL and its `id` is the family id, and every successor a
+   rotation inserts carries `family_id` = that id. A live row with `family_id`
+   NULL has never been rotated, so 118 cannot have widened it.
+   * **Rootless chains: lead with these.** A chain whose root row is no
+     longer there (most chains that were rotated under 118 are in this shape)
+     does not record what its consent granted. The only census is a
+     HEURISTIC against the client's grant as it stands now:
      ```sql
-     SELECT c.id, c.client_id, c.client_type, t.scopes, c.granted_scopes,
+     SELECT t.id AS live_token_id, c.id AS client, c.client_id, c.client_type,
+            t.scopes, c.granted_scopes,
             t.scopes @> c.granted_scopes AS holds_whole_grant
        FROM refresh_tokens t JOIN oauth_clients c ON c.id = t.client_id
       WHERE t.revoked_at IS NULL AND t.expires_at > now()
+        AND t.family_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM refresh_tokens r WHERE r.id = t.family_id)
       ORDER BY c.client_type, c.client_id;
      ```
-     `holds_whole_grant` is true for a chain whose last 118 rotation stored
-     the grant as it stands now, and equally for a consent that genuinely asked
-     for everything; the stored row does not record which, so the decision is
-     the operator's.
+     `holds_whole_grant` errs both ways. It is true for a chain whose last
+     118 rotation stored the grant as it stands now, but equally for a
+     consent that genuinely asked for everything, and for a client whose
+     grant is empty (every array contains `{}`). It is false for a chain that
+     WAS widened under 118 when the client's grant has grown since (a scope
+     added after that rotation). The stored rows cannot tell these apart, so
+     the decision is the operator's.
+   * **Chains that still have their root.** The root's scopes are what the
+     consent granted, so a live successor holding a scope its root does not
+     was widened:
+     ```sql
+     SELECT t.id AS live_token_id, c.id AS client, c.client_id, c.client_type,
+            r.scopes AS consented, t.scopes AS live
+       FROM refresh_tokens t
+       JOIN refresh_tokens r ON r.id = t.family_id
+       JOIN oauth_clients c ON c.id = t.client_id
+      WHERE t.revoked_at IS NULL AND t.expires_at > now()
+        AND NOT (t.scopes <@ r.scopes)
+      ORDER BY c.client_type, c.client_id;
+     ```
+   * **Revoke one chain** (both cases): a family has exactly one live row, so
+     revoking that row ends the chain, and only that one connector must be
+     re-authorized (a human re-authorizes it; a service runs a new
+     `client_credentials` grant):
+     `SELECT public.epigraph_refresh_token_revoke('<live_token_id>', 'revoked');`
+     It returns true when it revoked the row, false when the row was already
+     revoked.
+   * **Revoke a whole client** (the coarse option):
+     `SELECT public.epigraph_refresh_token_revoke_client('<oauth_clients.id>');`
+     returns the number of tokens revoked. Mind the blast radius: a human's
+     connectors all refresh on that human's ONE per-user client, so this logs
+     the human out of EVERY connector, and the same trigger ends every
+     elevation session on those families.
    * **Accept** the widening for chains whose consumer is trusted with the
      whole grant, and record that decision.
 
    Rollback: re-run 118's `CREATE OR REPLACE FUNCTION
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
+
+## A lineage stays in its owner group (migration 153) — deploy order and rollback
+
+Once the operator binding is armed, an application session may not leave a
+CURRENT claim naming `supersedes` in a different owner group than that
+predecessor: at the insert, at a re-open, or when `supersedes` is first set on
+a claim that stays current. Refused `OPL02` (never relieved by the
+`operator_link_enforcement` valve). Privileged sessions, the supersede act
+(which inherits the predecessor's group), retired rows (the dedup and
+consolidate acts) and an unarmed database are unchanged. The rule and its
+reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
+
+1. **Preconditions.** Migration 123 applied. No binary change is needed: the
+   refusal is `OPL02`, which every surface already maps.
+2. **Migrate 153** (`epigraph-migrate`, migration DSN): one `CREATE OR
+   REPLACE` of the claims binding trigger function. It changes no write on an
+   unarmed database, and it may apply before or after any lower-numbered
+   migration that does not re-body that function (sqlx applies every
+   embedded, unapplied migration in version order).
+3. **Before arming, census the dangling successors** 153 does not revisit
+   (read-only):
+
+   ```sql
+   SELECT (p.owner_group_id = '00000000-0000-0000-0000-000000000000') AS world_pred,
+          (s.owner_group_id IS DISTINCT FROM p.owner_group_id) AS cross_group,
+          count(*)
+     FROM claims s JOIN claims p ON p.id = s.supersedes
+    WHERE COALESCE(s.is_current, true) AND COALESCE(p.is_current, true)
+      AND s.id <> p.id
+    GROUP BY 1, 2;
+   ```
+
+   What blocks is ANOTHER CURRENT successor of a CURRENT predecessor, in any
+   group: 123's inherited-author rule needs "no other current successor", and
+   that rule is the only one that admits a supersede restating a claim under
+   its unbound or retired-linked author, the custodial supersede of a corpus
+   claim included (refused `OPL01` otherwise). So the `world_pred` rows are
+   custodial edits that would be refused once armed; revise or retire each
+   such successor on the maintenance DSN first. The other rows include benign
+   pairs (a same-author first `supersedes` within one group needs no inherited
+   rule). A current successor of an already-retired predecessor blocks
+   nothing. The `cross_group` rows are the shape 153 now refuses; migration
+   153's header carries that subset's count alone.
+4. **Before arming, confirm the world group has no live writer.** 153
+   compares groups only, so a writer of the world group could still attach a
+   current successor to a corpus claim in that group, with the same effect.
+   The world group has no memberships by design, but nothing enforces it.
+   Expect 0 rows:
+
+   ```sql
+   SELECT agent_id, role FROM group_memberships
+    WHERE group_id = '00000000-0000-0000-0000-000000000000'
+      AND revoked_at IS NULL AND role IN ('writer', 'admin');
+   ```
+
+   A row is a stop for arming until it is revoked or ruled on.
+
+**Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
+transaction: it restores 123's body of the function and re-asserts its owner.
+Run it before `123-undo.sql`.
+
+## `epigraph-operator restrict-claims` — the audited admin privatization act (no migration)
+
+Moves listed PUBLIC claims, and every row that follows them (evidence,
+reasoning traces, BBAs, versions, challenges, frame assignments, fragments,
+and every edge with the claim as an endpoint, other writers' rows included),
+into a target group with `visibility = 'group'`. Reversed exactly by
+`reown-reverse`. Runs on the maintenance DSN like the other operator verbs, and
+like `reown-claims` it needs a SUPERUSER DSN (its readability probe switches
+the session to the application role). Module doc:
+`crates/epigraph-cli/src/operator/restrict.rs`.
+
+```bash
+# dry run: plan, held claims with reasons, per-table counts, a sample, ENFORCED/UNENFORCED
+epigraph-operator restrict-claims --claims-file ids.txt --target-group <group> \
+    --operator <person> --manifest-out restrict-1.jsonl
+# apply: repeat the dry run's eligible count back
+epigraph-operator restrict-claims ... --manifest-out restrict-1.jsonl --apply \
+    --confirm-count <N> --ruling "<decision>" --reason "<why>" [--accept-unenforced]
+# undo (several manifests: pass them all; applied newest first)
+epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
+```
+
+- **Eligible**: public and world-owned (`--allow-non-world-owner` admits other
+  public owners). The target must be an existing `active` group, not world or
+  seed, administered by `--operator`. A claim whose move would make another
+  group's row readable to the target's members (e.g. an edge declared
+  `('group', H)`) is HELD, not widened. Pinned evidence is left as it is.
+- **Enforcement**: the run detects legacy permissive read policies (and row
+  security disabled) on every table it touches. `--apply` refuses while any
+  exist unless `--accept-unenforced`; the report and the audit row then say
+  UNENFORCED, because an application session can still read the moved rows.
+- **Manifest**: the header before the first batch, each batch's prior tuples
+  (owner, visibility, co-owner, `writer_owned`) fsynced before its write. Never
+  overwritten: a resumed run takes a new path; moved claims count as done.
+  `--max-batches` bounds one run.
+- **Audit**: one `security_events` row per applied run
+  (`privatization.cli_restrict`) and per reversed manifest
+  (`privatization.cli_restrict_reverse`), attributed to `--operator`, written
+  in the first batch transaction that changes anything; it carries the ruling,
+  reason, target, planned counts, the operator login and process, the SHA-256
+  of the id file and of the manifest header (the whole manifest on reverse),
+  and ENFORCED/UNENFORCED.
+- **Reverse** restores every recorded row and edge to its own recorded tuple,
+  never to a meet recomputed from its endpoints (an edge declared group between
+  public claims stays group). An edge whose other moved endpoint is held keeps
+  its narrow meet until that endpoint is reversed. The declassification
+  interlock is armed transaction-locally around the one claims UPDATE, for
+  claims recorded as originally public only.
+- **Nodes stay; links narrow.** The claim's own dependent rows (evidence,
+  traces, BBAs, beliefs, versions, challenges, triples, revocations) and its
+  LINK rows (edges, cluster / frame / neighbourhood assignments, entity
+  mentions, provenance links) narrow. A node at the other end (another claim
+  or its evidence, a frame, a cluster, an entity) is never written. A harvester
+  fragment narrows only if every claim it is the provenance of is restricted
+  into the target; otherwise it keeps its tuple. The classification is
+  `restrict::TABLE_ROLES`; an unclassified table is refused.
+- **Edges with an evidence endpoint** (claim->evidence, evidence->evidence)
+  are not re-met by the tenancy trigger, so the tool narrows them itself: an
+  edge is no more visible than its least visible endpoint. Each takes the meet
+  of its endpoints (the same tuple a claim-endpoint edge gets) unless it is
+  already at least as narrow; each is recorded and restored like every other
+  edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
+- **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
+  reverse.
+
+## `backfill_evidence_type` — legacy BBA typing (no migration, operator-gated)
+
+Backlog bc06ec6f. #573 made every BBA write path store the canonical
+`mass_functions.evidence_type`; rows written before it stay NULL, so
+`effective_source_strength` uses their stored `source_strength` (or 0.5) instead
+of `[evidence_type_weights]`, and the perspective lens never sees them. This
+binary types the rows whose stored provenance determines their type and leaves
+every other row NULL, counted per writer (`combination_method`) and reason.
+Rules and reasons: `crates/epigraph-cli/src/evidence_type_backfill.rs`.
+
+- **Authority**: `MAINTENANCE_DATABASE_URL` must be set (the fallback to
+  `DATABASE_URL` is refused) and its login must bypass row security.
+- **`--calibration <path>` is required** and must be the `calibration.toml` the
+  API and MCP servers load; the report echoes it. A file that does not load, or
+  has no `[evidence_type_weights]`, is refused.
+- **Dry run by default.** `--apply` writes `evidence_type` only, only on rows
+  still untyped, one transaction per `--batch` (default 1000). A re-run writes
+  nothing on rows already typed. On a live database it also decides the rows
+  written untyped since by the same rules, so it can type some (e.g. a REST
+  input sent without a type on a claim that declares one): run the re-apply
+  right after the apply and expect `written` near 0, any rows it does write
+  being ones created after the first apply started. `--max-batches N` bounds a
+  run; pass the report's `last_id` as `--after` to continue.
+- **Never typed**: cached combination rows (the predicate the combine-input
+  readers exclude), unlabelled agent-less rows sharing their (claim, frame)
+  with another BBA, `error_derived` / `prior` / `truth_value_seed`, rows whose
+  masses already carry their weight (`masses_already_weighted`: agent-less,
+  perspective-less `discount` inputs, and lone unlabelled agent-less rows on
+  `research_validity` / `paper_validity_*`), other rows labelled with a
+  combination-rule name in any case (`combination_labelled_input`), test and
+  backlog rows, propagated BBAs, linked `observation` / `testimony` /
+  `computation` / `document` tags, declared aliases, rows with a deciding
+  methodology.
+- **Counted, not applied: `openstax_agent_name_only`.** OpenStax extractor rows
+  have only their agent's name to go on. Typing them `logical` would move them
+  from 0.3 to 0.85; that needs its own operator decision.
+- **Beliefs**: typing changes the weight each typed row contributes (the
+  calibrated weight of its type, times the locality factor) and nothing else.
+  Cached beliefs are NOT recomputed: run the belief recompute after an apply.

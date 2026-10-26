@@ -28,7 +28,7 @@ use epigraph_ingest::document::structure::{
 use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -91,6 +91,7 @@ fn structured_doc_to_extraction(doc: StructuredDoc, source: DocumentSource) -> D
         sections,
         relationships: Vec::new(),
         source_text: Some(doc.source_text),
+        labels: Vec::new(),
     }
 }
 
@@ -175,6 +176,11 @@ pub async fn ingest_document(
 
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    // The label set is validated before ANY write, here in the handler: the walk
+    // runs detached, so a refusal there would reach only the server log after
+    // the caller was told `queued` and after `ensure_paper_node` wrote the
+    // `papers` row. The core re-derives (and re-checks) the same set.
+    ingest_claim_labels(&extraction, &doi)?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -209,6 +215,9 @@ pub async fn ingest_document(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document", auth).await?;
+    if params.wait.unwrap_or(false) {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
@@ -247,10 +256,13 @@ pub async fn ingest_document(
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
-/// but the COMMON refusal — this server's agent has no live writable
-/// membership of its PERSONAL group (which owns every row the walk writes), or
-/// the process was built without a `ScopedPool` — is knowable before the task
-/// starts. This opens exactly the transaction the task will open, from the same
+/// but the COMMON refusals are knowable before the task starts: the author
+/// cannot write the group that owns every row the walk writes (its own
+/// personal group, or its operator's when it is operator-linked and acting;
+/// see `owner_decl`), the author is bound to no human operator once operator
+/// binding is armed (`OPL01`), a linked agent whose link is not acting would
+/// fall back to a group its operator does not write (`OPL02`), or the process
+/// was built without a `ScopedPool`. This opens exactly the transaction the task will open, from the same
 /// author, runs the same owner-group check ([`IngestTx::owner_decl`]), and
 /// drops it: so that refusal is returned to the caller as an error with nothing
 /// written, instead of a `queued` over a task that cannot write.
@@ -275,8 +287,10 @@ async fn preflight_write_authority(
     let mut tx = begin_ingest_tx(server, author, tool_name).await?;
     // The OWNER group, not merely "some writable group": the same read-only
     // check the walk itself makes (`IngestTx::owner_decl`), so an author whose
-    // personal membership is revoked or read-only is refused HERE, to the
-    // caller, instead of being told `queued` over a task that writes nothing.
+    // owner-group membership is revoked or read-only, an unbound author once
+    // armed (OPL01), and a linked agent whose link is not acting (OPL02) are
+    // refused HERE, to the caller, instead of being told `queued` over a task
+    // that writes nothing.
     tx.owner_decl(agent_id, tool_name).await?;
     // Nothing was written on it; dropping it rolls back.
     drop(tx);
@@ -294,9 +308,12 @@ pub async fn ingest_document_inline(
     params: IngestDocumentInlineParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    let wait = params.wait.unwrap_or(false);
     let extraction = params.extraction;
     let doi = resolve_doi(&extraction);
     let title = extraction.source.title.clone();
+    // Before any write, for the reason given in `ingest_document` above.
+    ingest_claim_labels(&extraction, &doi)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -310,6 +327,9 @@ pub async fn ingest_document_inline(
     })?;
 
     preflight_write_authority(server, &viewer, "ingest_document_inline", auth).await?;
+    if wait {
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi).await;
+    }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
@@ -331,6 +351,43 @@ pub async fn ingest_document_inline(
         }
     });
     success_json(&queued_response(&doi, &title, paper_id))
+}
+
+/// The `wait: true` arm of the two detached ingest handlers: run the walk IN
+/// the request and hand its result, or its error, to the caller.
+///
+/// Detached, a walk that fails past [`preflight_write_authority`] (a constraint
+/// on one of the document's rows, a refused trace, a malformed axis) reaches
+/// only the server log, and the caller, already told `queued`, can infer it
+/// only from `query_paper`'s claim_count staying 0 (backlog b1924b39). Waiting
+/// is what `ingest_document_spine` already does.
+///
+/// Called AFTER the same `refuse_elevated` / `detach_scoped` / preflight the
+/// detached arm runs, so both modes author under exactly the same authority.
+/// It skips `ensure_paper_node`: `do_ingest_document` gets-or-creates the row
+/// itself, after its verbatim and axis guards, so a guard refusal here leaves
+/// no `papers` row at all. A failure later in the walk can still leave that
+/// row (it is written on the pool, outside the walk's transaction), and the
+/// error says so.
+async fn ingest_in_request(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    extraction: &DocumentExtraction,
+    auth: Option<&epigraph_auth::AuthContext>,
+    doi: &str,
+) -> Result<CallToolResult, McpError> {
+    do_ingest_document(server, viewer, extraction, auth)
+        .await
+        .map_err(|e| McpError {
+            code: e.code,
+            message: std::borrow::Cow::from(format!(
+                "{}. The ingest walk is one transaction, so no claims or edges were written \
+                 for document_key {doi:?}; its papers row may exist with 0 claims. Fix the \
+                 cause and retry: a retry is safe and converges on existing nodes.",
+                e.message
+            )),
+            data: e.data,
+        })
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -395,10 +452,7 @@ pub async fn paper_already_ingested(
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
-    let Some(prior) = PaperRepository::find_by_doi(pool, doi)
-        .await
-        .map_err(internal_error)?
-    else {
+    let Some(prior) = find_paper_by_document_key(pool, doi).await? else {
         return Ok(None);
     };
     if PaperRepository::has_processed_by_edge(pool, viewer, prior.id, pipeline_version)
@@ -461,9 +515,7 @@ pub async fn check_already_ingested(
             (exact, paper_id, matched)
         }
         None => {
-            let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
-                .await
-                .map_err(internal_error)?;
+            let paper = find_paper_by_document_key(&server.pool, &params.doi).await?;
             let matched = match &paper {
                 Some(p) => PaperRepository::processed_by_pipelines_in_family(
                     &server.pool,
@@ -509,9 +561,10 @@ pub async fn ingest_document_spine(
 /// `DocumentExtraction` without round-tripping through the file-path validation
 /// in `ingest_document`.
 #[allow(clippy::too_many_lines)]
-/// Add this document's `doi:` label to a claim the walk RESOLVED TO rather than
-/// created — returning `false`, with nothing changed, when that claim belongs to
-/// a group the ingesting agent cannot write.
+/// Add this document's labels (`doi:<doi>` and the caller's `labels`, see
+/// [`ingest_claim_labels`]) to a claim the walk RESOLVED TO rather than
+/// created — returning `false`, with nothing changed, when that claim belongs
+/// to a group the ingesting agent cannot write.
 ///
 /// # Why a refusal here is skipped rather than propagated
 ///
@@ -537,11 +590,11 @@ pub async fn ingest_document_spine(
 async fn label_resolved_claim(
     conn: &mut sqlx::PgConnection,
     claim_id: Uuid,
-    label: &str,
+    labels: &[String],
 ) -> Result<bool, McpError> {
     use sqlx::Acquire;
     let mut sp = conn.begin().await.map_err(internal_error)?;
-    match ClaimRepository::update_labels_conn(&mut sp, claim_id, &[label.to_string()], &[]).await {
+    match ClaimRepository::update_labels_conn(&mut sp, claim_id, labels, &[]).await {
         Ok(_) => {
             sp.commit().await.map_err(internal_error)?;
             Ok(true)
@@ -551,14 +604,71 @@ async fn label_resolved_claim(
             tracing::warn!(
                 target: "tenancy.scoped_write",
                 claim_id = %claim_id,
-                label = label,
+                labels = ?labels,
                 "ingest resolved to an existing claim owned by a group this agent cannot write; \
-                 its document label was NOT added (the paper still asserts it)"
+                 its document labels were NOT added (the paper still asserts it)"
             );
             Ok(false)
         }
         Err(e) => Err(internal_error(e)),
     }
+}
+
+/// The labels this ingest may merge onto a claim it RESOLVED TO: the full set
+/// ([`ingest_claim_labels`]) when the ingesting agent authored that claim, and
+/// only `doi:<doi>` (its first entry) otherwise.
+///
+/// # Why the caller's labels stop at another author's row
+///
+/// The resolved branch is reached by content, not by ownership: an atom
+/// converges onto ANY row with its `content_hash` (`ClaimRepository::create_conn`
+/// has no author filter), and a document-scoped node onto any row with its
+/// (title, path, text) id. The only check on the label write is RLS, and under
+/// D1 a writer of a TEAM group passes it on a colleague's claim owned by that
+/// team. `doi:<doi>` is safe there — its fixed prefix can never spell a
+/// workflow label. Caller vocabulary is not: `labels: ["resolved"]` on an atom
+/// restating a colleague's backlog item retired it with no `Resolves <id>:`
+/// trail, past [`crate::tools::claims`]'s retirement gate and the HTTP
+/// whole-mutation `require_owner_or_admin` bar on `update_labels`. MEASURED on
+/// `epigraph_app` (`tests/ingest_caller_labels_foreign_claim.rs`).
+///
+/// Author equality is deliberately narrower than `require_owner_or_admin`: an
+/// agent linked to the author's operator, or an admin, gets `doi:` only here
+/// and relabels through `update_labels`, which asks those questions. Fail
+/// closed: an author this walk cannot read (`None`) is treated as foreign.
+///
+/// With no caller labels the set is just `[doi:<doi>]` and no read is made, so
+/// the default ingest's behaviour and cost are unchanged.
+async fn labels_for_resolved_claim<'l>(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    known_author: Option<Uuid>,
+    agent_id: Uuid,
+    claim_labels: &'l [String],
+) -> Result<&'l [String], McpError> {
+    if claim_labels.len() <= 1 {
+        return Ok(claim_labels);
+    }
+    let author = match known_author {
+        Some(author) => Some(author),
+        None => ClaimRepository::get_agent_id(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(internal_error)?,
+    };
+    if author == Some(agent_id) {
+        return Ok(claim_labels);
+    }
+    tracing::warn!(
+        target: "tenancy.scoped_write",
+        claim_id = %claim_id,
+        author = ?author,
+        ingesting_agent = %agent_id,
+        withheld = ?&claim_labels[1..],
+        "ingest resolved to a claim another agent authored; the caller's labels were NOT \
+         added to it (only the document's doi: label is)"
+    );
+    Ok(&claim_labels[..1])
 }
 
 /// The write transaction a document ingest runs in.
@@ -601,11 +711,30 @@ impl IngestTx<'_> {
         }
     }
 
-    /// The tenancy declaration every row of this ingest is owned under: the
-    /// ingesting agent's PERSONAL group — proved live and writable on THIS
-    /// transaction, never minted.
+    /// The tenancy declaration every row of this ingest is owned under — the
+    /// same owner rule `submit_claim` / `memorize` apply
+    /// (`ClaimRepository::default_decl_for_author`), resolved without ever
+    /// minting:
     ///
-    /// # Why not `ClaimRepository::default_decl_for_author`
+    /// * an operator-linked agent that is ACTING for its operator (migration
+    ///   107's `epigraph_operator_actor`): the OPERATOR's personal group;
+    /// * any other author: its OWN personal group, proved live and writable on
+    ///   THIS transaction.
+    ///
+    /// # Why the operator branch comes first
+    ///
+    /// Once operator binding is armed (migration 122), the claims trigger
+    /// refuses a linked agent's claim owned by a group its operator does not
+    /// write (`OPL02`). A linked agent's own personal group is such a group.
+    /// This arm used to read ONLY that group, so a linked agent that still
+    /// held a live membership there passed the synchronous preflight, was
+    /// told `queued`, and then lost the whole detached walk to `OPL02` on the
+    /// first claim INSERT, where only the server log saw it. A linked agent
+    /// with no personal group of its own was refused outright. The operator
+    /// branch is what `default_decl_for_author` has done since migration 107;
+    /// this arm predated it and was never re-pointed.
+    ///
+    /// # Why not call `ClaimRepository::default_decl_for_author`
     ///
     /// That helper resolves through `ensure_personal_group`, which on migration
     /// 077's body revived a revoked admin membership (`ON CONFLICT … DO UPDATE
@@ -614,7 +743,8 @@ impl IngestTx<'_> {
     /// transaction stamped from the author, "not visible" already means "no
     /// LIVE membership", and a read-only check can refuse with the
     /// operator-facing reason without spending the function's RAISE on an
-    /// ingest transaction.
+    /// ingest transaction. So it mirrors that helper's ORDER with reads and
+    /// refusals only.
     ///
     /// `begin_author_stamped_tx` only proves the author has SOME writable
     /// group, and "some writable group is not the same question"
@@ -624,13 +754,38 @@ impl IngestTx<'_> {
     /// group, `ingest_document_inline` twice — `personal:admin(revoked)` became
     /// `personal:admin(live)` and +3 / +4 claims committed under it.
     ///
-    /// So on the Stamped arm this is a pure read plus a refusal:
-    /// * [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
-    ///   — `None` means no live membership; refuse.
-    /// * [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
-    ///   — `group = ANY(epigraph_writable_groups())` on the same transaction,
-    ///   the exact question migration 077's `WITH CHECK` will ask of every row;
-    ///   a live `reader` membership fails it; refuse.
+    /// So on the Stamped arm this is, in order, the claims trigger's own
+    /// questions asked before anything is written:
+    /// 1. [`epigraph_db::AgentRepository::require_bound_author`] — an author
+    ///    bound to no registered human operator is refused by name (`OPL01`)
+    ///    once armed; quiet when unarmed. Asked FIRST and of every author,
+    ///    because an acting link (step 2) does not read the human registry: a
+    ///    link whose operator was de-registered still acts, and still does not
+    ///    bind.
+    /// 2. [`epigraph_db::AgentRepository::operator_actor`] (a definer read) —
+    ///    `Some` gives the operator's personal group. An acting link means the
+    ///    agent AND the operator hold live writer/admin rows there, so the
+    ///    trigger's writer-scope check passes and the stamp carries the group.
+    /// 3. Otherwise [`epigraph_db::GroupMembershipRepository::visible_personal_group_conn`]
+    ///    — `None` means no live membership; refuse (`OPL02`, by name, when
+    ///    the agent is live-linked: its link is not acting and it has no group
+    ///    it may write).
+    /// 4. [`epigraph_db::AgentRepository::require_writer_authority`] with the
+    ///    author as the writer — the trigger's writer-scope question on the
+    ///    resolved group. A live link that is NOT acting (the operator revoked
+    ///    the agent's row in its group, or no longer holds the group itself)
+    ///    falls back to the agent's own personal group, which its operator
+    ///    does not write: `OPL02`. So does an author bound only through the
+    ///    client allowlist (migration 149), whose own personal group is not
+    ///    one its human writes. Quiet for an unlinked agent and when unarmed.
+    /// 5. [`epigraph_db::GroupMembershipRepository::session_can_write_group_conn`]
+    ///    — `group = ANY(epigraph_writable_groups())` on the same transaction,
+    ///    the exact question migration 077's `WITH CHECK` will ask of every row;
+    ///    a live `reader` membership fails it; refuse.
+    ///
+    /// Every refusal here reaches the caller synchronously, because
+    /// [`preflight_write_authority`] runs this same check before the detached
+    /// walk is spawned and before the `papers` row is written.
     ///
     /// The Privileged arm (the operator CLI on `MaintenancePool`, BYPASSRLS)
     /// calls `default_decl_for_author`: there is no stamp to reason about. Since
@@ -658,29 +813,82 @@ impl IngestTx<'_> {
                 author = %agent_id,
                 "{why}"
             );
-            internal_error(format!("{tool_name}: {why}"))
+            crate::errors::internal_error_text(format!("{tool_name}: {why}"))
         };
-        let Some(group) =
-            epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
-                .await
-                .map_err(internal_error)?
-        else {
-            return Err(refuse(format!(
-                "the ingesting agent ({agent_id}) holds no LIVE membership of its personal group, \
-                 which owns every row this ingest would write. Refusing: if the membership was \
-                 revoked, restoring it is an operator decision, and nothing on this path will \
-                 restore it. Nothing was written"
-            )));
+        // 1. The claims trigger's first question, asked of EVERY author: is it
+        //    bound to a registered human operator? OPL01 by name once armed.
+        //    Unconditional, because an acting link (107) does not read the
+        //    human registry: a link whose operator was de-registered still
+        //    "acts", and only this check sees that it no longer binds.
+        epigraph_db::AgentRepository::require_bound_author(tx, agent_id)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+        // 2. Operator-linked and ACTING: the operator's personal group.
+        let group = if let Some(link) = epigraph_db::AgentRepository::operator_actor(tx, agent_id)
+            .await
+            .map_err(crate::errors::db_caller_error)?
+        {
+            link.operator_group_id
+        } else {
+            // 3. The author's own personal group, a pure read.
+            let Some(own) =
+                epigraph_db::GroupMembershipRepository::visible_personal_group_conn(tx, agent_id)
+                    .await
+                    .map_err(internal_error)?
+            else {
+                // A live-linked agent whose link is not acting has no group
+                // it may write: say that (OPL02), not "restore your personal
+                // membership", which would not help.
+                let binding = epigraph_db::AgentRepository::author_binding(tx, agent_id)
+                    .await
+                    .map_err(crate::errors::db_caller_error)?;
+                if binding.as_deref() == Some(epigraph_db::LIVE_LINK_BINDING) {
+                    let why = format!(
+                        "the ingesting agent ({agent_id}) is operator-linked, but its link is not \
+                         acting (its membership in its operator's personal group was revoked, or \
+                         the operator no longer holds that group), and it has no personal group \
+                         of its own; a linked agent writes only where its operator writes. \
+                         Nothing was written"
+                    );
+                    tracing::error!(
+                        target: "tenancy.scoped_write",
+                        tool = tool_name,
+                        author = %agent_id,
+                        "{why}"
+                    );
+                    return Err(crate::errors::db_caller_error(
+                        epigraph_db::DbError::OperatorScopeRefused { message: why },
+                    ));
+                }
+                return Err(refuse(format!(
+                    "the ingesting agent ({agent_id}) holds no LIVE membership of its personal \
+                     group, which owns every row this ingest would write. Refusing: if the \
+                     membership was revoked, restoring it is an operator decision, and nothing on \
+                     this path will restore it. Nothing was written"
+                )));
+            };
+            own
         };
+        // 4. The trigger's own writer-scope question on the resolved group
+        //    (bound writer, writer scope, attribution; the author IS the
+        //    writer here). OPL02 by name for a live link that is not acting
+        //    (its fallback is a group its operator does not write), an author
+        //    bound only through the client allowlist (149: its own group is
+        //    not one its human writes), and a retired link under the valve.
+        epigraph_db::AgentRepository::require_writer_authority(tx, agent_id, Some(agent_id), group)
+            .await
+            .map_err(crate::errors::db_caller_error)?;
+        // 5. The stamp must carry the owner group (077's WITH CHECK).
         let writable =
             epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, group)
                 .await
                 .map_err(|e| internal_error(format!("{tool_name}: writable-group check: {e}")))?;
         if !writable {
             return Err(refuse(format!(
-                "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of its \
-                 personal group ({group}), which owns every row this ingest would write, so \
-                 every INSERT would be refused. Nothing was written"
+                "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of the \
+                 group that owns every row this ingest would write ({group}: its own personal \
+                 group, or its operator's when it is operator-linked), so every INSERT would be \
+                 refused. Nothing was written"
             )));
         }
         Ok(epigraph_core::TenancyDecl::public(group))
@@ -765,17 +973,16 @@ pub async fn do_ingest_document(
     let pipeline_version = effective_pipeline_version(extraction);
     // Attached to every claim this paper asserts so `query_claims_by_label`
     // and `recompute_beliefs(labels=[...])` can address a paper's full claim
-    // set (backlog c9d12a95: neither could ever find it before this label
-    // existed).
-    let paper_label = format!("doi:{doi}");
+    // set (backlog c9d12a95: neither could ever find it before the `doi:`
+    // label existed), followed by the caller's own `extraction.labels`
+    // (backlog b6b5ac28: they were silently dropped before).
     // Validated ONCE, here, before the paper node or any claim is written.
-    // `doi` comes from the extraction's source metadata, and the per-claim
-    // `update_labels` call that applies this label runs INSIDE the plan walk —
-    // so a `$` in the DOI would fail the ingest partway through, with the paper
-    // row and some claims already landed. Refusing up front keeps the "reject
-    // and write nothing" contract the rest of this branch establishes.
-    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
-        .map_err(db_caller_error)?;
+    // `doi` and the caller labels come from the extraction, and the per-claim
+    // `update_labels` call that applies them runs INSIDE the plan walk — so a
+    // `$` in either would fail the ingest partway through, with the paper row
+    // and some claims already landed. Refusing up front keeps the "reject and
+    // write nothing" contract the rest of this branch establishes.
+    let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
     // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
@@ -794,8 +1001,9 @@ pub async fn do_ingest_document(
 
     // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
-    // Every claim below is authored by the write identity and owned by that
-    // agent's personal group (`decl`), so that agent's viewer is the one
+    // Every claim below is authored by the write identity and owned by `decl`
+    // (that agent's personal group, or its operator's when it is
+    // operator-linked; see `IngestTx::owner_decl`), so that agent's viewer is the one
     // migration 077's `WITH CHECK` asks about — the sibling-tool identity, which
     // here IS the row's author (contrast the workflow executor, which authors as
     // its own system agent).
@@ -826,9 +1034,10 @@ pub async fn do_ingest_document(
     let mut author_agent_map: HashMap<usize, Uuid> = HashMap::new();
     // Defensive backstop (backlog a55aac45): hierarchical extraction sometimes
     // drops `source.authors` (empty array), so a paper would be recorded with no
-    // real authors. When the structured list is empty, fall back to parsing the
-    // author byline out of the raw `source_text` body (Tier 1 only; Tier 2 has
-    // no `source_text` and silently no-ops). The parser is conservative and
+    // real authors. When the structured list has no real author (empty or
+    // placeholder-only), fall back to parsing the author byline out of the raw
+    // `source_text` body (Tier 1 only; Tier 2 has no `source_text` and silently
+    // no-ops). The parser is conservative and
     // returns empty when unsure — it never fabricates a placeholder author, so
     // the empty-fallback case preserves the pre-existing behavior exactly.
     //
@@ -841,11 +1050,26 @@ pub async fn do_ingest_document(
         epigraph_ingest::document::schema::SourceType::Paper
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
-    let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+    // "No real author" covers an empty list AND a list of only placeholder
+    // names ("Authors Not Specified", "Unknown", ...): either way the byline
+    // backstop gets its chance (backlog a55aac45, arXiv:2606.16707).
+    //
+    // Index alignment with the planner's `author_placeholder` edges (keyed by
+    // `author_index` into `author_agent_map`):
+    // - structured list in use: the planner and the loop below skip the SAME
+    //   original indices (`AuthorEntry::is_placeholder`), so every planned
+    //   `asserts` edge maps to a real author's agent;
+    // - byline fallback in use: every structured entry was a placeholder, so the
+    //   planner emitted NO `author_placeholder` edges; the fallback's indices are
+    //   never looked up for `asserts`, and byline authors get `authored → paper`
+    //   only — the same as the empty-list fallback.
+    let has_real_author = extraction
         .source
         .authors
-        .is_empty()
+        .iter()
+        .any(|a| !a.is_placeholder());
+    let parsed_fallback;
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if !has_real_author
         && byline_eligible
     {
         parsed_fallback = extraction
@@ -856,13 +1080,13 @@ pub async fn do_ingest_document(
         if parsed_fallback.is_empty() {
             tracing::warn!(
                 paper = %paper_title,
-                "ingest_document: source.authors empty and no byline recovered from body; paper will have no author agents"
+                "ingest_document: source.authors empty or placeholder-only and no byline recovered from body; paper will have no author agents"
             );
         } else {
             tracing::info!(
                 paper = %paper_title,
                 count = parsed_fallback.len(),
-                "ingest_document: source.authors empty; recovered authors from body byline fallback"
+                "ingest_document: source.authors empty or placeholder-only; recovered authors from body byline fallback"
             );
         }
         &parsed_fallback
@@ -882,7 +1106,17 @@ pub async fn do_ingest_document(
             .map_err(internal_error)?
     };
     for (idx, author) in authors.iter().enumerate() {
-        if author.name.is_empty() {
+        // Empty or placeholder name: no agent, no `authored` edge. Same original
+        // `idx` the planner skipped, so `author_agent_map` stays aligned.
+        if author.is_placeholder() {
+            if !author.name.trim().is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    name = %author.name,
+                    author_index = idx,
+                    "ingest_document: dropping placeholder author name"
+                );
+            }
             continue;
         }
         let (_did, pub_key_bytes) =
@@ -927,6 +1161,9 @@ pub async fn do_ingest_document(
             "paper",
             "authored",
             Some(serde_json::json!({
+                // The ORIGINAL extraction index: it can have gaps where a
+                // placeholder author was dropped ([Unknown, Alice] gives Alice
+                // position 1 and no edge position 0).
                 "position": idx,
                 "role": author.roles.first().map_or("author", String::as_str),
                 "affiliations": author.affiliations,
@@ -955,6 +1192,7 @@ pub async fn do_ingest_document(
     let mut embed_queue: Vec<(Uuid, String)> = Vec::new();
     let mut dedup_count = 0_usize;
     let mut converged_unlabelled = 0_usize;
+    let mut caller_labels_withheld = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
     // Tenancy declaration (PR-16), hoisted above the loop -- see
@@ -988,7 +1226,7 @@ pub async fn do_ingest_document(
         claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+        let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
             &claim,
             planned,
@@ -1001,18 +1239,24 @@ pub async fn do_ingest_document(
         // shared across papers (convergence) picks up every paper's label —
         // when this author may write it; see `label_resolved_claim`.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &paper_label).await? {
+            let labels = labels_for_resolved_claim(
+                &mut tx,
+                viewer,
+                persisted_id,
+                known_author,
+                agent_id,
+                &claim_labels,
+            )
+            .await?;
+            if !label_resolved_claim(&mut tx, persisted_id, labels).await? {
                 converged_unlabelled += 1;
+            } else if labels.len() < claim_labels.len() {
+                caller_labels_withheld += 1;
             }
         } else {
-            ClaimRepository::update_labels_conn(
-                &mut tx,
-                persisted_id,
-                std::slice::from_ref(&paper_label),
-                &[],
-            )
-            .await
-            .map_err(internal_error)?;
+            ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
+                .await
+                .map_err(internal_error)?;
         }
         if resolved_to_existing {
             let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
@@ -1307,6 +1551,7 @@ pub async fn do_ingest_document(
         claims_ds_wired,
         ds_frame_id,
         converged_claims_unlabelled: converged_unlabelled,
+        converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })
 }
@@ -1353,17 +1598,13 @@ fn doi_to_slug(doi: &str) -> String {
 /// URN prefix for a synthesized (non-DOI) document identity key.
 const SYNTHETIC_KEY_PREFIX: &str = "urn:epigraph:doc:";
 
-/// Values callers pass to mean "this document has no DOI". Treated as ABSENT,
-/// not as an identity: keying on them collapsed every DOI-less document onto a
-/// single shared `papers` row (issue #356 — one node had accrued 1244 claims
-/// from at least four unrelated sources, with their author lists unioned).
-const DOI_PLACEHOLDERS: [&str; 8] = ["unknown", "n/a", "na", "none", "null", "nil", "-", "tbd"];
-
-/// True when `s` is empty/whitespace or one of the [`DOI_PLACEHOLDERS`].
-fn is_placeholder_id(s: &str) -> bool {
-    let t = s.trim();
-    t.is_empty() || DOI_PLACEHOLDERS.contains(&t.to_ascii_lowercase().as_str())
-}
+// Values callers pass to mean "this document has no DOI" are treated as
+// ABSENT, not as an identity: keying on them collapsed every DOI-less document
+// onto a single shared `papers` row (issue #356 — one node had accrued 1244
+// claims from at least four unrelated sources, with their author lists
+// unioned). The list lives in epigraph-core so the belief engine's source key
+// rejects exactly the same values.
+use epigraph_core::domain::evidence::is_placeholder_id;
 
 /// Legible-but-bounded slug for the human-readable half of a synthetic key:
 /// lowercased, non-alphanumerics collapsed to single `-`, capped at 48 bytes on
@@ -1441,15 +1682,71 @@ fn is_synthetic_key(key: &str) -> bool {
     key.starts_with(SYNTHETIC_KEY_PREFIX)
 }
 
+/// The full label set one ingest call applies to every claim it writes or
+/// resolves to: `doi:<doi>` first, then the caller's `extraction.labels`
+/// (deduplicated, order-preserving). With no caller labels this is exactly
+/// `[doi:<doi>]`, the set the writer applied before caller labels existed.
+/// `doi:<doi>` is always entry 0: [`labels_for_resolved_claim`] keeps only that
+/// entry for a resolved row another agent authored.
+///
+/// Validated HERE so every entry point fails closed before any write: the two
+/// detached handlers call it before `ensure_paper_node` writes the `papers`
+/// row (a refusal inside the spawned walk would reach only the server log,
+/// after the caller was told `queued`), and both cores call it again before
+/// their first write, for the callers that reach a core directly (the spine
+/// handler, the operator `ingest_document` CLI).
+fn ingest_claim_labels(
+    extraction: &DocumentExtraction,
+    doi: &str,
+) -> Result<Vec<String>, McpError> {
+    let mut labels = vec![format!("doi:{doi}")];
+    for label in &extraction.labels {
+        if !labels.contains(label) {
+            labels.push(label.clone());
+        }
+    }
+    epigraph_db::reject_unexpanded_labels(&labels).map_err(db_caller_error)?;
+    Ok(labels)
+}
+
+// The document-key normalizer is shared with the REST paper routes
+// (`epigraph-api` `routes/papers.rs`), so both transports key `papers.doi`
+// identically (backlog 90756d26). See `epigraph_db::repos::paper`.
+pub(crate) use epigraph_db::repos::paper::canonical_document_key;
+
+/// Find the `papers` row a caller-supplied document key names, trying each of
+/// [`epigraph_db::repos::paper::document_key_spellings`] in order: the
+/// [`canonical_document_key`] first, then the key as given (trimmed), then,
+/// for a bare DOI, each legacy resolver-prefix spelling of it. A row written
+/// under a resolver-URL spelling before keys were canonicalized is thus found
+/// by that spelling AND by the bare DOI, which is what the monitor's dedup
+/// probe asks with.
+pub(crate) async fn find_paper_by_document_key(
+    pool: &sqlx::PgPool,
+    raw: &str,
+) -> Result<Option<epigraph_db::PaperRow>, McpError> {
+    for spelling in epigraph_db::repos::paper::document_key_spellings(raw) {
+        if let Some(row) = PaperRepository::find_by_doi(pool, &spelling)
+            .await
+            .map_err(internal_error)?
+        {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
 /// Priority: real DOI → arXiv id parsed from `uri` → `uri` → synthesized key.
+/// A DOI given as a resolver URL or `doi:` (in `doi` or in `uri`) is keyed on
+/// the bare DOI ([`canonical_document_key`]).
 /// Placeholder DOIs/URIs (`"unknown"`, `"n/a"`, empty, …) are treated as absent
 /// so they fall through to synthesis instead of becoming a shared bucket.
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
         if !is_placeholder_id(d) {
-            return d.trim().to_string();
+            return canonical_document_key(d);
         }
         tracing::warn!(
             doi = %d,
@@ -1463,7 +1760,7 @@ fn resolve_doi(extraction: &DocumentExtraction) -> String {
             if let Some(arxiv) = find_arxiv_id(uri) {
                 return format!("10.48550/arXiv.{arxiv}");
             }
-            return uri.trim().to_string();
+            return canonical_document_key(uri);
         }
     }
     synthetic_document_key(&extraction.source)
@@ -1502,9 +1799,14 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 
 /// Persist one planned claim, routing on the identity class the PLANNER chose.
 ///
-/// Returns `(persisted_id, resolved_to_existing)`. `resolved_to_existing` means
-/// the row was already there with its provenance (trace + evidence) written, so
-/// the caller must only wire the `asserts` edge and must NOT clobber it.
+/// Returns `(persisted_id, resolved_to_existing, known_author)`.
+/// `resolved_to_existing` means the row was already there with its provenance
+/// (trace + evidence) written, so the caller must only wire the `asserts` edge
+/// and must NOT clobber it. `known_author` is the row's author when this call
+/// already knows it without another read: the ingesting agent for a row it
+/// created, the existing row's author for an atom. It is `None` for a
+/// document-scoped node the walk resolved to (`ON CONFLICT (id) DO NOTHING`
+/// returns nothing about the existing row); see [`labels_for_resolved_claim`].
 ///
 /// Two classes, per `epigraph_ingest::common::ids`:
 ///
@@ -1531,8 +1833,9 @@ async fn persist_planned_claim(
     planned: &PlannedClaim,
     agent_id: Uuid,
     truth: TruthValue,
-    // Tenancy declaration (PR-16): the ingesting agent's own personal group,
-    // resolved ONCE by the caller above its loop. It was resolved here per
+    // Tenancy declaration (PR-16): the owner group `IngestTx::owner_decl`
+    // resolves (the ingesting agent's own personal group, or its operator's
+    // when it is operator-linked), resolved ONCE by the caller above its loop. It was resolved here per
     // planned claim until review: an N-claim document then performed N
     // `pool.acquire()` calls and N identical `SELECT id FROM groups WHERE
     // did_key = ...` round trips for the same agent.
@@ -1540,7 +1843,7 @@ async fn persist_planned_claim(
     // the identical lookup, with a comment saying exactly that; the two
     // siblings now agree.
     decl: epigraph_core::TenancyDecl,
-) -> Result<(Uuid, bool), McpError> {
+) -> Result<(Uuid, bool, Option<Uuid>), McpError> {
     if planned.id_is_document_scoped() {
         let was_new = ClaimRepository::create_with_id_if_absent_conn(
             &mut *conn,
@@ -1560,7 +1863,7 @@ async fn persist_planned_claim(
         // and the trace write below leaves the node without trace/evidence, and
         // the retry takes the reuse branch. The old `already_had_trace` probe
         // covered that; closing it again would cost a SELECT per claim.
-        return Ok((planned.id, !was_new));
+        return Ok((planned.id, !was_new, was_new.then_some(agent_id)));
     }
 
     // Atom: `create` dedupes on content_hash and returns the existing row.
@@ -1588,6 +1891,7 @@ async fn persist_planned_claim(
     Ok((
         persisted_id,
         persisted_id != planned.id || persisted.trace_id.is_some() || persisted_author != agent_id,
+        Some(persisted_author),
     ))
 }
 
@@ -1647,12 +1951,12 @@ pub async fn do_ingest_document_spine(
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
     let pipeline_version = effective_pipeline_version(extraction);
-    // See do_ingest_document: attached to every claim so label-based lookup
-    // (recompute_beliefs, query_claims_by_label) can find this paper's set,
-    // and validated here for the same reason — before the first write.
-    let paper_label = format!("doi:{doi}");
-    epigraph_db::reject_unexpanded_labels(std::slice::from_ref(&paper_label))
-        .map_err(db_caller_error)?;
+    // See do_ingest_document: `doi:<doi>` plus the caller's labels, attached to
+    // every claim so label-based lookup (recompute_beliefs,
+    // query_claims_by_label) can find this paper's set, and validated here for
+    // the same reason — before the first write. This is the spine handler's
+    // only label check: it calls this core synchronously.
+    let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
     // Atom planned IDs — skip these claims and any edges referencing them.
     let atom_planned_ids: HashSet<Uuid> = plan
@@ -1702,7 +2006,7 @@ pub async fn do_ingest_document_spine(
     // Same defensive backstop as `do_ingest_document` (backlog a55aac45): the
     // spine path is the recommended two-phase entry and shares the empty-authors
     // failure mode, so recover the byline from `source_text` when the structured
-    // author list is absent. Gated on Paper/Textbook source_type (see the
+    // author list has no real author (empty or placeholder-only). Gated on Paper/Textbook source_type (see the
     // `do_ingest_document` rationale). Conservative parser; empty ⇒ pre-existing
     // behavior.
     let byline_eligible = matches!(
@@ -1710,11 +2014,26 @@ pub async fn do_ingest_document_spine(
         epigraph_ingest::document::schema::SourceType::Paper
             | epigraph_ingest::document::schema::SourceType::Textbook
     );
-    let parsed_fallback;
-    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if extraction
+    // "No real author" covers an empty list AND a list of only placeholder
+    // names ("Authors Not Specified", "Unknown", ...): either way the byline
+    // backstop gets its chance (backlog a55aac45, arXiv:2606.16707).
+    //
+    // Index alignment with the planner's `author_placeholder` edges (keyed by
+    // `author_index` into `author_agent_map`):
+    // - structured list in use: the planner and the loop below skip the SAME
+    //   original indices (`AuthorEntry::is_placeholder`), so every planned
+    //   `asserts` edge maps to a real author's agent;
+    // - byline fallback in use: every structured entry was a placeholder, so the
+    //   planner emitted NO `author_placeholder` edges; the fallback's indices are
+    //   never looked up for `asserts`, and byline authors get `authored → paper`
+    //   only — the same as the empty-list fallback.
+    let has_real_author = extraction
         .source
         .authors
-        .is_empty()
+        .iter()
+        .any(|a| !a.is_placeholder());
+    let parsed_fallback;
+    let authors: &[epigraph_ingest::common::schema::AuthorEntry] = if !has_real_author
         && byline_eligible
     {
         parsed_fallback = extraction
@@ -1725,13 +2044,13 @@ pub async fn do_ingest_document_spine(
         if parsed_fallback.is_empty() {
             tracing::warn!(
                 paper = %paper_title,
-                "ingest_document_spine: source.authors empty and no byline recovered from body; paper will have no author agents"
+                "ingest_document_spine: source.authors empty or placeholder-only and no byline recovered from body; paper will have no author agents"
             );
         } else {
             tracing::info!(
                 paper = %paper_title,
                 count = parsed_fallback.len(),
-                "ingest_document_spine: source.authors empty; recovered authors from body byline fallback"
+                "ingest_document_spine: source.authors empty or placeholder-only; recovered authors from body byline fallback"
             );
         }
         &parsed_fallback
@@ -1751,7 +2070,17 @@ pub async fn do_ingest_document_spine(
             .map_err(internal_error)?
     };
     for (idx, author) in authors.iter().enumerate() {
-        if author.name.is_empty() {
+        // Empty or placeholder name: no agent, no `authored` edge. Same original
+        // `idx` the planner skipped, so `author_agent_map` stays aligned.
+        if author.is_placeholder() {
+            if !author.name.trim().is_empty() {
+                tracing::warn!(
+                    paper = %paper_title,
+                    name = %author.name,
+                    author_index = idx,
+                    "ingest_document_spine: dropping placeholder author name"
+                );
+            }
             continue;
         }
         let (_did, pub_key_bytes) =
@@ -1797,6 +2126,9 @@ pub async fn do_ingest_document_spine(
             "paper",
             "authored",
             Some(serde_json::json!({
+                // The ORIGINAL extraction index: it can have gaps where a
+                // placeholder author was dropped ([Unknown, Alice] gives Alice
+                // position 1 and no edge position 0).
                 "position": idx,
                 "role": author.roles.first().map_or("author", String::as_str),
                 "affiliations": author.affiliations,
@@ -1825,6 +2157,7 @@ pub async fn do_ingest_document_spine(
     let mut para_new_count = 0_usize;
     let mut para_dedup_count = 0_usize;
     let mut converged_unlabelled = 0_usize;
+    let mut caller_labels_withheld = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
     // Hoisted, as above, and through the same never-minting helper.
@@ -1849,7 +2182,7 @@ pub async fn do_ingest_document_spine(
         claim.content_hash = planned.content_hash;
         claim.signature = Some(server.signer.sign(&claim.content_hash));
 
-        let (persisted_id, resolved_to_existing) = persist_planned_claim(
+        let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
             &claim,
             planned,
@@ -1863,18 +2196,24 @@ pub async fn do_ingest_document_spine(
         // first); its label is skipped and disclosed, not allowed to abort the
         // spine. A node this walk CREATED is the author's own and must label.
         if resolved_to_existing {
-            if !label_resolved_claim(&mut tx, persisted_id, &paper_label).await? {
+            let labels = labels_for_resolved_claim(
+                &mut tx,
+                viewer,
+                persisted_id,
+                known_author,
+                agent_id,
+                &claim_labels,
+            )
+            .await?;
+            if !label_resolved_claim(&mut tx, persisted_id, labels).await? {
                 converged_unlabelled += 1;
+            } else if labels.len() < claim_labels.len() {
+                caller_labels_withheld += 1;
             }
         } else {
-            ClaimRepository::update_labels_conn(
-                &mut tx,
-                persisted_id,
-                std::slice::from_ref(&paper_label),
-                &[],
-            )
-            .await
-            .map_err(internal_error)?;
+            ClaimRepository::update_labels_conn(&mut tx, persisted_id, &claim_labels, &[])
+                .await
+                .map_err(internal_error)?;
         }
 
         if resolved_to_existing {
@@ -2060,6 +2399,7 @@ pub async fn do_ingest_document_spine(
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,
+        converged_claims_caller_labels_withheld: caller_labels_withheld,
         already_ingested: para_new_count == 0 && para_dedup_count > 0,
     })
 }
@@ -2209,6 +2549,7 @@ mod tests {
             sections: Vec::new(),
             relationships: Vec::new(),
             source_text: None,
+            labels: Vec::new(),
         }
     }
 
@@ -2219,6 +2560,68 @@ mod tests {
         let key = resolve_doi(&extraction_of(s));
         assert_eq!(key, "10.1000/xyz123");
         assert!(!is_synthetic_key(&key));
+    }
+
+    fn key_for_doi(doi: &str) -> String {
+        let mut s = src("A paper");
+        s.doi = Some(doi.to_string());
+        resolve_doi(&extraction_of(s))
+    }
+
+    fn key_for_uri(uri: &str) -> String {
+        let mut s = src("A paper");
+        s.uri = Some(uri.to_string());
+        resolve_doi(&extraction_of(s))
+    }
+
+    /// A resolver-URL or `doi:` spelling of a DOI keys the SAME `papers` row as
+    /// the bare DOI. Observed: `https://doi.org/10.1021/acsnano.9b05650` was
+    /// stored verbatim, so a `query_paper` on the bare DOI found nothing and
+    /// the same DOI could exist under two keys.
+    #[test]
+    fn resolve_doi_strips_doi_org_url_prefix() {
+        let bare = "10.1021/acsnano.9b05650";
+        for spelled in [
+            "https://doi.org/10.1021/acsnano.9b05650",
+            "http://doi.org/10.1021/acsnano.9b05650",
+            "https://dx.doi.org/10.1021/acsnano.9b05650",
+            "http://dx.doi.org/10.1021/acsnano.9b05650",
+            "HTTPS://DOI.ORG/10.1021/acsnano.9b05650",
+            "doi:10.1021/acsnano.9b05650",
+            "DOI: 10.1021/acsnano.9b05650",
+            "  https://doi.org/10.1021/acsnano.9b05650  ",
+        ] {
+            assert_eq!(key_for_doi(spelled), bare, "source.doi = {spelled:?}");
+            assert_eq!(key_for_uri(spelled), bare, "source.uri = {spelled:?}");
+        }
+        // The suffix's case is part of the stored key: it is NOT lowercased
+        // (that would re-key existing rows and their `doi:` labels).
+        assert_eq!(
+            key_for_doi("https://doi.org/10.1103/PhysRevLett.116.061102"),
+            "10.1103/PhysRevLett.116.061102"
+        );
+        // A doi.org link to an arXiv DOI converges with the arXiv-uri key.
+        assert_eq!(
+            key_for_uri("https://doi.org/10.48550/arXiv.2606.04990"),
+            key_for_uri("https://arxiv.org/abs/2606.04990"),
+        );
+    }
+
+    /// Only a prefix in front of a DOI-shaped remainder is stripped; anything
+    /// else keeps the verbatim key it always had.
+    #[test]
+    fn resolve_doi_leaves_non_doi_keys_verbatim() {
+        for verbatim in [
+            "https://doi.org/about",
+            "https://doi.org/10.1021",
+            "https://doi.org/10.12/short-registrant",
+            "https://example.com/report/10.1021/x",
+            "https://example.org/eln/entry-42",
+        ] {
+            assert_eq!(key_for_uri(verbatim), verbatim, "source.uri = {verbatim:?}");
+            assert_eq!(key_for_doi(verbatim), verbatim, "source.doi = {verbatim:?}");
+        }
+        assert_eq!(key_for_doi("10.1000/xyz123"), "10.1000/xyz123");
     }
 
     #[test]

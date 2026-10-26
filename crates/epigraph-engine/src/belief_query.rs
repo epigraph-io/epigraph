@@ -16,10 +16,11 @@ use epigraph_db::{
 use epigraph_ds::{combination, FocalElement, FrameOfDiscernment, MassFunction};
 use thiserror::Error;
 
-use crate::calibration::CalibrationConfig;
-use crate::edge_factor::{
-    effective_source_strength, effective_source_strength_with_perspective, PerspectiveReliability,
+use crate::belief_profile::{
+    overrides_in, BeliefProfile, FrameTier, PerspectiveTier, ProfileIdentity, DEFAULT_PROFILE_NAME,
 };
+use crate::edge_factor::{effective_source_strength_profiled, PerspectiveReliability};
+use epigraph_db::FrameRow;
 use uuid::Uuid;
 
 /// Errors from the library-level `get_belief` function.
@@ -76,6 +77,7 @@ impl BeliefInterval {
         Self {
             belief: 0.0,
             plausibility: 1.0,
+            // belief-profile: allow-literal (the uniform 1/n BetP of a frame with no evidence)
             pignistic_prob: 1.0 / hypothesis_count as f64,
             mass_on_conflict: 0.0,
             mass_on_missing: 0.0,
@@ -141,12 +143,14 @@ pub async fn get_belief(
         }
 
         // Discount each BBA by its calibrated reliability (evidence-type weight
-        // × locality, via `effective_source_strength`) before combining, so the
+        // × locality, via the resolved belief profile) before combining, so the
         // framed read agrees with the cached `claims.pignistic_prob` that the
-        // recompute path writes. `perspective = None` → global calibration.
-        let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, None)
-            .await?
-            .expect("all_bbas is non-empty so combination yields Some");
+        // recompute path writes. No perspective → the served profile with this
+        // frame's overrides, exactly what the recompute resolves.
+        let (combined, fold_conflict) =
+            recompute_framed_belief(pool, viewer, &frame_row, &frame, &all_bbas, None)
+                .await?
+                .expect("all_bbas is non-empty so combination yields Some");
 
         let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
         let bel = epigraph_ds::measures::belief(&combined, &target);
@@ -157,7 +161,7 @@ pub async fn get_belief(
             belief: bel,
             plausibility: pl,
             pignistic_prob: betp,
-            mass_on_conflict: combined.mass_of_conflict(),
+            mass_on_conflict: fold_conflict,
             mass_on_missing: combined.mass_of_missing(),
             framed: true,
             source: "recomputed".to_string(),
@@ -193,7 +197,9 @@ pub async fn get_belief(
             // fall back to belief rather than to truth_value, which is the scalar this
             // whole read path exists to stop conflating with the DS state.
             pignistic_prob: cols.pignistic_prob.unwrap_or(belief),
+            // belief-profile: allow-literal (a NULL cached mass is no mass)
             mass_on_conflict: cols.mass_on_empty.unwrap_or(0.0),
+            // belief-profile: allow-literal (a NULL cached mass is no mass)
             mass_on_missing: cols.mass_on_missing.unwrap_or(0.0),
             framed: false,
             source: "cached".to_string(),
@@ -267,67 +273,225 @@ pub async fn get_perspective_belief(
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
-    // The perspective's frame-function config: source-reliability (evidence
-    // type) + locality-reliability (pathway). Absent/empty → no opinion → the
-    // computation reduces to the global `get_belief`.
-    let perspective = PerspectiveRepository::get_by_id(pool, viewer, perspective_id)
-        .await?
-        .map(|p| PerspectiveReliability {
-            source_reliability: p.source_reliability().unwrap_or_default(),
-            locality_reliability: p.locality_reliability().unwrap_or_default(),
-        })
-        .unwrap_or_default();
-
-    let combined = recompute_framed_belief(pool, frame_id, &frame, &all_bbas, Some(&perspective))
-        .await?
-        .expect("all_bbas is non-empty so combination yields Some");
+    // The perspective's frame-function config: its `belief_profile` override
+    // object, source-reliability (evidence type) and locality-reliability
+    // (pathway). Absent/empty → no opinion → the computation reduces to the
+    // global `get_belief`.
+    let (combined, fold_conflict) = recompute_framed_belief(
+        pool,
+        viewer,
+        &frame_row,
+        &frame,
+        &all_bbas,
+        Some(perspective_id),
+    )
+    .await?
+    .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     Ok(BeliefInterval {
         belief: epigraph_ds::measures::belief(&combined, &target),
         plausibility: epigraph_ds::measures::plausibility(&combined, &target),
         pignistic_prob: epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index),
-        mass_on_conflict: combined.mass_of_conflict(),
+        mass_on_conflict: fold_conflict,
         mass_on_missing: combined.mass_of_missing(),
         framed: true,
         source: "recomputed_perspective".to_string(),
     })
 }
 
-/// The per-frame reliability inputs a framed-belief combination needs, resolved
-/// ONCE per `(frame)` and reused across every claim on a page.
+/// The lens a framed-belief combination runs under: one resolved
+/// [`BeliefProfile`], resolved ONCE per `(frame, perspective)` and reused
+/// across every claim on a page.
 ///
-/// Hoisting these out of the per-claim combine is what eliminates the lensed
-/// recall N+1: the perspective row, the two per-frame override lookups, and the
-/// calibration config are frame/perspective-scoped, not claim-scoped, so a
-/// 20-hit page previously re-resolved all four 20 times. [`FramedBeliefContext`]
-/// captures them so the batch path resolves them once (see
-/// [`get_perspective_belief_batch`]) and the pure combine
-/// ([`combine_framed_bbas`]) touches the DB zero more times.
-struct FramedBeliefContext {
-    calibration: CalibrationConfig,
-    per_frame_intra: Option<f64>,
-    per_frame_weights: Option<std::collections::HashMap<String, f64>>,
+/// The profile carries every parameter the fold reads (the served profile,
+/// then the frame tier, then the perspective tier; see
+/// [`crate::belief_profile`]). Hoisting the resolution out of the per-claim
+/// combine is what eliminates the lensed recall N+1: the perspective row, the
+/// per-frame override lookups and the calibration are frame/perspective-scoped,
+/// not claim-scoped. [`get_perspective_belief_batch`] resolves the context
+/// once and the pure combine ([`combine_framed_bbas`]) touches the DB zero
+/// more times.
+///
+/// It is also the lens context of the atom fold
+/// ([`crate::atom_items::atom_axiom_rows`], SPEC §3.3 "Lens context"): there
+/// the global profile and the perspective tier apply, while each row's frame
+/// tier comes from that row's own frame, because the atom fold reads several
+/// frames at once. That is what [`Self::profile_for_frame`] resolves: the
+/// context's base profile, the row frame's tier, then this context's
+/// perspective tier, in one resolution, so the tier order (perspective over
+/// frame over global) holds per row. The context's own frame tier (from
+/// [`Self::resolve`]) is not read there. A context built by [`Self::new`],
+/// [`Self::global`] or [`Self::for_perspective`] carries no frame tier.
+#[derive(Debug, Clone)]
+pub struct FramedBeliefContext {
+    /// The global profile, before any frame or perspective tier: what
+    /// [`Self::profile_for_frame`] resolves a row's frame tier over.
+    base: BeliefProfile,
+    /// The perspective tier's reliability maps (`None`: no lens).
     perspective: Option<PerspectiveReliability>,
+    /// The perspective tier's `belief_profile` override object.
+    perspective_overrides: Option<serde_json::Value>,
+    /// The resolved profile: `base`, then this context's frame tier (if any),
+    /// then the perspective tier.
+    profile: BeliefProfile,
+    /// The named global profile the lens was resolved over (provenance; not
+    /// part of the hash).
+    name: &'static str,
 }
 
 impl FramedBeliefContext {
-    /// Resolve the frame-scoped reliability inputs from the DB exactly once.
+    /// A lens context with no frame tier: the global profile of
+    /// `calibration` ([`BeliefProfile::from_calibration`]), and the querying
+    /// perspective's reliability overrides when there is a lens (`None` is
+    /// the global, no-lens read).
+    #[must_use]
+    pub fn new(
+        calibration: crate::calibration::CalibrationConfig,
+        perspective: Option<PerspectiveReliability>,
+    ) -> Self {
+        Self::over(
+            BeliefProfile::from_calibration(&calibration),
+            FrameTier::default(),
+            perspective,
+            None,
+        )
+    }
+
+    /// A context over an already-resolved profile, resolved over the default
+    /// named profile ([`DEFAULT_PROFILE_NAME`], the only one served today).
+    /// It carries no tier inputs of its own: [`Self::profile_for_frame`]
+    /// resolves a frame tier over `profile` itself.
+    #[must_use]
+    pub fn from_profile(profile: BeliefProfile) -> Self {
+        Self {
+            base: profile.clone(),
+            perspective: None,
+            perspective_overrides: None,
+            profile,
+            name: DEFAULT_PROFILE_NAME,
+        }
+    }
+
+    /// The global (no-lens) context over the served profile
+    /// ([`BeliefProfile::served`]: the workspace calibration, falling back to
+    /// the built-in calibration when `calibration.toml` cannot be loaded,
+    /// exactly as the cache recompute does).
+    #[must_use]
+    pub fn global() -> Self {
+        Self::from_profile(BeliefProfile::served().clone())
+    }
+
+    /// The lens context of `perspective_id` with no frame tier: the served
+    /// profile (as [`Self::global`]) under the perspective's tier (its
+    /// reliability maps and its `belief_profile` override object), resolved
+    /// exactly as [`get_perspective_belief`] resolves them (an unknown or
+    /// empty perspective is no opinion). `None` is the global context.
     ///
-    /// Per-frame loads are best-effort: a DB error there falls back to global
-    /// calibration (`.ok().flatten()`) rather than failing the read — matching
-    /// the pre-refactor `recompute_framed_belief` semantics exactly. When
-    /// `perspective_id` is `Some`, the perspective row is resolved and an
-    /// unknown/empty perspective reduces to no opinion (`unwrap_or_default`),
-    /// so a lensed read over an un-configured observer equals the global read.
+    /// This is the context a compound read under a lens passes to
+    /// [`crate::compound_belief::derive_compound_belief_batch`], so a compound
+    /// under lens P is derived from its leaves under lens P (SPEC §3.3).
+    ///
+    /// # Errors
+    /// `Db` if the perspective read fails.
+    pub async fn for_perspective(
+        pool: &PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Self, BeliefQueryError> {
+        let Some(pid) = perspective_id else {
+            return Ok(Self::global());
+        };
+        let (perspective, perspective_overrides) =
+            perspective_tier_inputs(pool, viewer, pid).await?;
+        Ok(Self::over(
+            BeliefProfile::served().clone(),
+            FrameTier::default(),
+            Some(perspective),
+            perspective_overrides,
+        ))
+    }
+
+    /// `base` resolved under `frame`, then the perspective tier; the
+    /// perspective tier inputs are kept for [`Self::profile_for_frame`].
+    fn over(
+        base: BeliefProfile,
+        frame: FrameTier<'_>,
+        perspective: Option<PerspectiveReliability>,
+        perspective_overrides: Option<serde_json::Value>,
+    ) -> Self {
+        let profile = base.resolve(
+            frame,
+            PerspectiveTier {
+                overrides: perspective_overrides.as_ref(),
+                reliability: perspective.as_ref(),
+            },
+        );
+        Self {
+            base,
+            perspective,
+            perspective_overrides,
+            profile,
+            name: DEFAULT_PROFILE_NAME,
+        }
+    }
+
+    /// The profile a row of the frame whose tier is `frame` folds under in
+    /// this lens: the context's base profile, then `frame`, then this
+    /// context's perspective tier (one [`BeliefProfile::resolve`], so a
+    /// perspective's named weight still displaces the frame's dedicated
+    /// weight). The context's own frame tier, if any, is not applied.
+    #[must_use]
+    pub fn profile_for_frame(&self, frame: FrameTier<'_>) -> BeliefProfile {
+        self.base.resolve(
+            frame,
+            PerspectiveTier {
+                overrides: self.perspective_overrides.as_ref(),
+                reliability: self.perspective.as_ref(),
+            },
+        )
+    }
+
+    /// The read's profile identity `{name, hash}`: what `BeliefView.profile`
+    /// reports (SPEC §3.5).
+    #[must_use]
+    pub fn profile_identity(&self) -> ProfileIdentity {
+        ProfileIdentity {
+            name: self.name.to_string(),
+            hash: self.profile_hash(),
+        }
+    }
+
+    /// The resolved profile every fold under this context reads.
+    #[must_use]
+    pub fn profile(&self) -> &BeliefProfile {
+        &self.profile
+    }
+
+    /// BLAKE3 hash of the resolved profile (see
+    /// [`BeliefProfile::profile_hash`]): what a belief read under this
+    /// context reports as its profile identity.
+    #[must_use]
+    pub fn profile_hash(&self) -> String {
+        self.profile.profile_hash()
+    }
+
+    /// Resolve the lens from the DB exactly once.
+    ///
+    /// Per-frame loads are best-effort: a DB error there falls back to the
+    /// tier below (`.ok().flatten()`) rather than failing the read, matching
+    /// the recompute path. The frame's generic override object comes from the
+    /// `frame_row` the caller already holds. When `perspective_id` is `Some`,
+    /// the perspective row is resolved and an unknown perspective reduces to
+    /// no opinion, so a lensed read over an un-configured observer equals the
+    /// global read.
     async fn resolve(
         pool: &PgPool,
         viewer: &epigraph_db::visibility::Viewer,
-        frame_id: Uuid,
+        frame_row: &FrameRow,
         perspective_id: Option<Uuid>,
     ) -> Result<Self, BeliefQueryError> {
-        let calibration = CalibrationConfig::from_workspace_root()
-            .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+        let frame_id = frame_row.id;
         let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
             .await
             .ok()
@@ -337,86 +501,116 @@ impl FramedBeliefContext {
                 .await
                 .ok()
                 .flatten();
-        let perspective = match perspective_id {
-            Some(pid) => Some(
-                PerspectiveRepository::get_by_id(pool, viewer, pid)
-                    .await?
-                    .map(|p| PerspectiveReliability {
-                        source_reliability: p.source_reliability().unwrap_or_default(),
-                        locality_reliability: p.locality_reliability().unwrap_or_default(),
-                    })
-                    .unwrap_or_default(),
-            ),
-            None => None,
+        let (perspective, perspective_overrides) = match perspective_id {
+            Some(pid) => {
+                let (p, o) = perspective_tier_inputs(pool, viewer, pid).await?;
+                (Some(p), o)
+            }
+            None => (None, None),
         };
-        Ok(Self {
-            calibration,
-            per_frame_intra,
-            per_frame_weights,
+        Ok(Self::over(
+            BeliefProfile::served().clone(),
+            FrameTier {
+                overrides: overrides_in(&frame_row.properties),
+                intra_evidence_locality_factor: per_frame_intra,
+                evidence_type_weights: per_frame_weights.as_ref(),
+            },
             perspective,
-        })
+            perspective_overrides,
+        ))
     }
+}
+
+/// The perspective tier's inputs from its row: the reliability maps and the
+/// `belief_profile` override object. An unknown perspective is no opinion
+/// (empty maps, no object), so a lensed read over an un-configured observer
+/// equals the global read.
+async fn perspective_tier_inputs(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    perspective_id: Uuid,
+) -> Result<(PerspectiveReliability, Option<serde_json::Value>), BeliefQueryError> {
+    Ok(
+        match PerspectiveRepository::get_by_id(pool, viewer, perspective_id).await? {
+            Some(p) => (
+                PerspectiveReliability {
+                    source_reliability: p.source_reliability().unwrap_or_default(),
+                    locality_reliability: p.locality_reliability().unwrap_or_default(),
+                },
+                p.properties.as_ref().and_then(overrides_in).cloned(),
+            ),
+            None => (PerspectiveReliability::default(), None),
+        },
+    )
 }
 
 /// Combine a claim's stored BBAs into one mass function — the pure (no-DB) core
 /// shared by the single-claim and batch framed-belief paths.
 ///
-/// Each BBA is discounted by its effective reliability (the
-/// `effective_source_strength` tier chain: per-frame override → global
-/// calibration → stored `source_strength`, with locality applied; the
-/// perspective overrides sit at the top when present) before the SAME adaptive
-/// combination rule the recompute/write path uses (`combine_multiple`). All
-/// reliability inputs arrive pre-resolved in `ctx`, so this function issues no
-/// queries — the caller resolves `ctx` once and calls this per claim.
+/// Each BBA is discounted by its effective reliability under the context's
+/// profile ([`effective_source_strength_profiled`]: perspective → per-frame →
+/// profile tables → stored `source_strength` → unknown-type weight, with
+/// locality applied) before the SAME combination the recompute/write path
+/// uses ([`crate::source_dependence::combine_with_source_dependence`], with
+/// the profile's conflict threshold). The rows' source keys arrive in
+/// `source_keys` (one per row, from
+/// [`crate::source_dependence::source_keys_for_rows`]), so this function
+/// issues no queries.
 ///
 /// Returns `Ok(None)` only when `rows` is empty.
-fn combine_framed_bbas(
+///
+/// # Errors
+/// `ParseMasses` on a malformed stored BBA; `Ds` when discounting or the fold
+/// fails.
+pub fn combine_framed_bbas(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
+    source_keys: Vec<Option<crate::source_dependence::SourceKey>>,
     ctx: &FramedBeliefContext,
-) -> Result<Option<MassFunction>, BeliefQueryError> {
+) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
+    debug_assert_eq!(rows.len(), source_keys.len(), "one source key per row");
 
-    let mut mass_fns: Vec<MassFunction> = Vec::with_capacity(rows.len());
-    for row in rows {
+    let mut items = Vec::with_capacity(rows.len());
+    for (row, key) in rows.iter().zip(source_keys) {
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
-        let alpha = match ctx.perspective.as_ref() {
-            Some(p) => effective_source_strength_with_perspective(
-                row,
-                ctx.per_frame_intra,
-                ctx.per_frame_weights.as_ref(),
-                &ctx.calibration,
-                p,
-            ),
-            None => effective_source_strength(
-                row,
-                ctx.per_frame_intra,
-                ctx.per_frame_weights.as_ref(),
-                &ctx.calibration,
-            ),
-        };
-        mass_fns.push(combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?);
+        let alpha = effective_source_strength_profiled(row, &ctx.profile);
+        items.push((
+            key,
+            combination::discount(&mf, alpha).map_err(BeliefQueryError::Ds)?,
+        ));
     }
 
-    // Combine via the SAME adaptive rule the recompute/write path uses
-    // (`combine_multiple`: canonical sort + per-step Dempster/Conjunctive/
-    // Yager/Inagaki selection by conflict). Matching it — not a plain Dempster
-    // fold — is what makes this compute-on-read result reproduce the recompute
-    // path's combination for the same discounted BBAs.
-    let (combined, _reports) =
-        combination::combine_multiple(&mass_fns, 0.9).map_err(BeliefQueryError::Ds)?;
-    Ok(Some(combined))
+    // Combine via the SAME function the recompute/write path uses: same-source
+    // repeats (one agent re-reading one `source_url`) are folded cautiously
+    // into one, then everything is Dempster-folded (`combine_multiple`). Using
+    // that one function is what makes this compute-on-read result reproduce
+    // the cached value for the same stored BBAs (backlog 4c42c0bf); a plain
+    // `combine_multiple` here served the inflated same-source value while the
+    // cache held the honest one.
+    //
+    // The conflict is reported the same way the recompute caches it
+    // (`edge_factor::compute_combined_belief` -> `claims.mass_on_empty`): the
+    // fold's `aggregate_conflict`, because Dempster normalises it out of the
+    // combined mass. A single BBA is not folded; its own empty-set mass is
+    // the conflict.
+    let (combined, conflict) = crate::source_dependence::combine_with_source_dependence(
+        items,
+        ctx.profile.combination.conflict_threshold,
+    )
+    .map_err(BeliefQueryError::Ds)?;
+    Ok(Some((combined, conflict)))
 }
 
 /// Recompute the combined mass function for a framed claim, discounting each
 /// stored BBA by its effective reliability before Dempster combination.
 ///
 /// This is the single-claim path both `get_belief` (perspective = `None`) and
-/// `get_perspective_belief` use. It resolves the frame-scoped reliability
-/// context ([`FramedBeliefContext::resolve`]) once, then delegates the actual
+/// `get_perspective_belief` use. It resolves the lens
+/// ([`FramedBeliefContext::resolve`]) once, then delegates the actual
 /// combination to the pure [`combine_framed_bbas`]. The batch path
 /// ([`get_perspective_belief_batch`]) resolves the SAME context once and reuses
 /// it across a whole page — that is the N+1 fix; both paths share
@@ -425,37 +619,18 @@ fn combine_framed_bbas(
 /// Returns `Ok(None)` only when `rows` is empty.
 async fn recompute_framed_belief(
     pool: &PgPool,
-    frame_id: Uuid,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_row: &FrameRow,
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
-    perspective: Option<&PerspectiveReliability>,
-) -> Result<Option<MassFunction>, BeliefQueryError> {
+    perspective_id: Option<Uuid>,
+) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
         return Ok(None);
     }
-
-    // Preserve the pre-refactor semantics: this path is only reached with an
-    // already-resolved `PerspectiveReliability` (or `None`), so build the
-    // context from the per-frame/calibration loads plus the passed reliability
-    // rather than re-resolving the perspective row.
-    let calibration = CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
-    let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(pool, frame_id)
-        .await
-        .ok()
-        .flatten();
-    let per_frame_weights = FrameRepository::get_per_frame_evidence_type_weights(pool, frame_id)
-        .await
-        .ok()
-        .flatten();
-    let ctx = FramedBeliefContext {
-        calibration,
-        per_frame_intra,
-        per_frame_weights,
-        perspective: perspective.cloned(),
-    };
-
-    combine_framed_bbas(frame, rows, &ctx)
+    let ctx = FramedBeliefContext::resolve(pool, viewer, frame_row, perspective_id).await?;
+    let source_keys = crate::source_dependence::source_keys_for_rows(pool, viewer, rows).await?;
+    combine_framed_bbas(frame, rows, source_keys, &ctx)
 }
 
 /// Batch sibling of [`get_perspective_belief`]: compute the lensed belief for a
@@ -494,7 +669,7 @@ pub async fn get_perspective_belief_batch(
 
     // Resolve perspective + per-frame overrides + calibration ONCE per page.
     // This is the hoist that removes the N+1.
-    let ctx = FramedBeliefContext::resolve(pool, viewer, frame_id, Some(perspective_id)).await?;
+    let ctx = FramedBeliefContext::resolve(pool, viewer, &frame_row, Some(perspective_id)).await?;
 
     let mut out = Vec::with_capacity(claim_ids.len());
     for &claim_id in claim_ids {
@@ -531,7 +706,11 @@ async fn perspective_belief_for_claim(
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }
 
-    let combined = combine_framed_bbas(frame, &all_bbas, ctx)?
+    // Claim-scoped like the BBA fetch above (one query, skipped when no row
+    // can carry a source key), so the page-level hoist is unchanged.
+    let source_keys =
+        crate::source_dependence::source_keys_for_rows(pool, viewer, &all_bbas).await?;
+    let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, source_keys, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
@@ -539,7 +718,7 @@ async fn perspective_belief_for_claim(
         belief: epigraph_ds::measures::belief(&combined, &target),
         plausibility: epigraph_ds::measures::plausibility(&combined, &target),
         pignistic_prob: epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index),
-        mass_on_conflict: combined.mass_of_conflict(),
+        mass_on_conflict: fold_conflict,
         mass_on_missing: combined.mass_of_missing(),
         framed: true,
         source: "recomputed_perspective".to_string(),
@@ -547,7 +726,69 @@ async fn perspective_belief_for_claim(
 }
 
 // The frame-function reliability composition (perspective × per-frame ×
-// calibration, at both the evidence-type and locality tiers) is unit-tested at
-// its source in `edge_factor::tests` (effective_source_strength_with_perspective).
+// profile, at both the evidence-type and locality tiers) is unit-tested at
+// its source (`effective_source_strength_unit`, `belief_profile_golden`).
 // The full DB chain — get_perspective_belief vs get_belief over stored BBAs —
 // is covered by the `perspective_frame_function` sqlx integration test.
+
+/// The `shadow` view of one claim under `mode` (SPEC §7.1): `None` in
+/// [`CompoundBeliefMode::Legacy`](crate::belief_view::CompoundBeliefMode),
+/// which issues no query at all. In `Shadow`, the claim's
+/// [`BeliefView`](crate::belief_view::BeliefView) under the global lens: a
+/// compound's derived value (R-DEP over the viewer's visible leaves, with its
+/// `not_all` valuation), or an atom's or standalone's AEF value. A procedural
+/// or rule claim, or a claim the viewer cannot see, has none.
+///
+/// The shadow never changes or fails the served read: a computation error is
+/// logged and the view omitted. It is always the `binary_truth` value under
+/// the global lens, whatever frame or lens the served read used.
+///
+/// **Known gap, carried from the atom reader** (`atom_axiom`'s module doc):
+/// on an application session row security can hide a compound's whole
+/// decomposition from a viewer; the role read then finds no compound, so that
+/// compound's own rows fold as an atom's and its frozen cache can be read as a
+/// `Legacy` leaf. The derivation is exact on a connection that bypasses row
+/// security. Per-request reads close this before any mode serves derived
+/// values (the read-dispatch PR fails closed or reads roles with definer
+/// rights); the shadow, off by default, is diagnostic only until then.
+pub async fn shadow_belief(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    mode: crate::belief_view::CompoundBeliefMode,
+) -> Option<crate::belief_view::BeliefView> {
+    if mode != crate::belief_view::CompoundBeliefMode::Shadow {
+        return None;
+    }
+    match shadow_view(pool, viewer, claim_id).await {
+        Ok(view) => view,
+        Err(error) => {
+            tracing::warn!(claim = %claim_id, %error, "shadow belief omitted");
+            None
+        }
+    }
+}
+
+/// [`shadow_belief`]'s computation: the compound derivation first, then the
+/// atom view.
+async fn shadow_view(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<Option<crate::belief_view::BeliefView>, String> {
+    let mut conn = pool.acquire().await.map_err(|e| format!("acquire: {e}"))?;
+    let ctx = FramedBeliefContext::global();
+    let ids = [claim_id];
+    if let Some(view) =
+        crate::compound_belief::derive_compound_belief_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id)
+    {
+        return Ok(Some(view));
+    }
+    Ok(
+        crate::compound_belief::atom_belief_view_batch(&mut conn, viewer, &ids, &ctx)
+            .await?
+            .remove(&claim_id),
+    )
+}

@@ -4,7 +4,7 @@
 //! the server never invokes an LLM, matching `epigraph-ingest-executor`'s
 //! division of labour (agent-side synthesis, server-side storage).
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
@@ -36,6 +36,10 @@ pub async fn consolidate_claims(
     params: ConsolidateClaimsParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // The merged claim is a claim like any other: the same content cap as
+    // `submit_claim` and its HTTP twins, checked before anything is resolved,
+    // embedded or written (backlog b76e284b).
+    crate::tools::claims::check_claim_content_length(&params.merged_content)?;
     let acting = server.write_identity(auth, viewer).await?;
     let acting_agent_id = acting.agent_id();
 
@@ -196,7 +200,7 @@ pub async fn consolidate_claims(
         cascade,
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))
 }

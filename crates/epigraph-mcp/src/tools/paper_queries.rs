@@ -7,10 +7,11 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::*;
 
 use epigraph_crypto::ContentHasher;
+use epigraph_db::repos::claim::LabelCursor;
 use epigraph_db::{ClaimRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -120,9 +121,10 @@ pub async fn query_paper(
         .clamp(1, MAX_PAPER_CLAIM_LIMIT);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let paper = PaperRepository::find_by_doi(&server.pool, &params.doi)
-        .await
-        .map_err(internal_error)?;
+    // Canonical key first (a `https://doi.org/` spelling finds the bare-DOI
+    // row), then the key as given; see `find_paper_by_document_key`.
+    let paper =
+        crate::tools::ingestion::find_paper_by_document_key(&server.pool, &params.doi).await?;
 
     let Some(paper) = paper else {
         return success_json(&PaperResponse {
@@ -329,6 +331,28 @@ pub async fn query_claims_by_label(
             data: None,
         });
     }
+    // `after` present (even "") selects the keyset response shape; absent
+    // keeps the legacy bare array (backlog 6f072833).
+    let keyset = params.after.is_some();
+    let after = match params.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(LabelCursor::decode(token).ok_or(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Borrowed(
+                "malformed `after` cursor; pass back the previous response's next_cursor unchanged",
+            ),
+            data: None,
+        })?),
+    };
+    if after.is_some() && offset > 0 {
+        return Err(McpError {
+            code: rmcp::model::ErrorCode::INVALID_PARAMS,
+            message: std::borrow::Cow::Borrowed(
+                "`after` and a non-zero `offset` cannot be combined; page with `after` alone",
+            ),
+            data: None,
+        });
+    }
 
     let rows = ClaimRepository::list_by_labels(
         &server.pool,
@@ -340,26 +364,60 @@ pub async fn query_claims_by_label(
             min_truth,
             limit,
             offset,
+            after,
         },
     )
     .await
     .map_err(internal_error)?;
+    let next_cursor = LabelCursor::next_page(&rows, limit).map(|c| c.encode());
 
-    let mut results: Vec<ClaimResponse> = Vec::with_capacity(rows.len());
+    // Opt-in only: without the flag no evidence query runs and the response
+    // carries no `source_urls` key (backlog 43ab8c73).
+    let mut source_urls = if params.include_source_urls {
+        let ids: Vec<uuid::Uuid> = rows.iter().map(|(c, _)| c.id.as_uuid()).collect();
+        Some(
+            EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &ids)
+                .await
+                .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
+
+    let mut results: Vec<ClaimWithSources> = Vec::with_capacity(rows.len());
     for (c, labels) in rows {
-        results.push(ClaimResponse {
-            id: c.id.as_uuid().to_string(),
-            content: c.content.clone(),
-            truth_value: c.truth_value.value(),
-            agent_id: c.agent_id.as_uuid().to_string(),
-            content_hash: ContentHasher::to_hex(&c.content_hash),
-            created_at: c.created_at.to_rfc3339(),
-            labels,
-            is_current: c.is_current,
-            supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
-            belief_score: None,
+        let id = c.id.as_uuid();
+        results.push(ClaimWithSources {
+            claim: ClaimResponse {
+                id: id.to_string(),
+                content: c.content.clone(),
+                truth_value: c.truth_value.value(),
+                agent_id: c.agent_id.as_uuid().to_string(),
+                content_hash: ContentHasher::to_hex(&c.content_hash),
+                created_at: c.created_at.to_rfc3339(),
+                labels,
+                is_current: c.is_current,
+                supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
+                belief_score: None,
+            },
+            source_urls: source_urls
+                .as_mut()
+                .map(|m| m.remove(&id).unwrap_or_default()),
         });
     }
 
+    if keyset {
+        /// The `after`-mode response: a page plus the cursor of the next one
+        /// (`null` once the set is exhausted).
+        #[derive(serde::Serialize)]
+        struct KeysetPage {
+            claims: Vec<ClaimWithSources>,
+            next_cursor: Option<String>,
+        }
+        return success_json(&KeysetPage {
+            claims: results,
+            next_cursor,
+        });
+    }
     success_json(&results)
 }

@@ -27,7 +27,7 @@ use axum::Router;
 use epigraph_mcp::federation::config::ExtensionConfig;
 use epigraph_mcp::federation::{FederationRegistry, SharedFederation};
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ListToolsResult, ServerCapabilities,
+    CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult, ServerCapabilities,
     ServerInfo, Tool,
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -58,10 +58,7 @@ struct StubServer {
 
 impl ServerHandler for StubServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn list_tools(
@@ -89,7 +86,7 @@ impl ServerHandler for StubServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Echo the tool name so the gateway test can confirm the DOWNSTREAM
         // (un-prefixed) name arrived, proving prefix stripping on the proxy path.
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "stub handled `{}`",
             request.name
         ))]))

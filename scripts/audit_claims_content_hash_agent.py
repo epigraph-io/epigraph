@@ -28,20 +28,25 @@ when) the table is already clean enough to accept it.
       UNIQUE (content_hash, agent_id)
     Blocked by every duplicate group, including ones that are just supersession
     history (one is_current row plus N superseded ancestors).
+    REJECTED (backlog 00f1a517, 2026-10-12): migration 150 drops this
+    constraint everywhere, and migrations/README.md says "Do not re-add the
+    full constraint". Its numbers are reported for the record only.
 
   Option B — partial, floated in
     docs/superpowers/specs/2026-06-03-plan-2.5-server-side-ingestion-idempotency.md:181:
       UNIQUE (content_hash, agent_id) WHERE is_current
-    Permits supersession history, blocks only genuinely-live duplicates. Note
-    this is a weaker invariant than 013 and diverges from what CI enforces.
+    Permits supersession history, blocks only genuinely-live duplicates. A
+    weaker invariant than 013's; from migration 150 no database (CI included)
+    carries any constraint on the pair, so this is the one to restore.
 
 Usage:
     python3 scripts/audit_claims_content_hash_agent.py
     DATABASE_URL=postgres://... python3 scripts/audit_claims_content_hash_agent.py
     python3 scripts/audit_claims_content_hash_agent.py --json
 
-    # Only succeeds if zero blocking rows; never deletes:
-    python3 scripts/audit_claims_content_hash_agent.py --apply-constraint full
+    # Only succeeds if zero blocking rows; never deletes. `partial` (option B)
+    # is the sanctioned future target; `full` (option A) is rejected, see
+    # migrations/README.md "Do not re-add the full constraint":
     python3 scripts/audit_claims_content_hash_agent.py --apply-constraint partial
 
 Read-only by default. `--apply-constraint` needs DDL rights on `claims`.
@@ -246,12 +251,13 @@ def render(r: dict) -> str:
 
     add("")
     if a["excess_rows"] == 0:
-        add("Next step: table is clean for Option A — rerun with")
-        add("  --apply-constraint full")
+        add("Next step: table is clean for both shapes. Option A is rejected")
+        add("  (migration 150, migrations/README.md); restore Option B with")
+        add("  --apply-constraint partial")
     elif b["excess_rows"] == 0:
         add("Next step: Option A still blocked, but Option B is satisfiable now:")
         add("  --apply-constraint partial")
-        add("  (weaker than 013; confirm the divergence from CI is acceptable)")
+        add("  (weaker than 013; the sanctioned target, backlog 00f1a517)")
     else:
         add("Next step: neither shape is satisfiable without reconciling duplicates.")
         add("  Reconcile first (owner decision), then rerun this script.")
@@ -315,7 +321,9 @@ def main() -> int:
     ap.add_argument(
         "--apply-constraint",
         choices=("full", "partial"),
-        help="add the constraint; refuses unless zero rows violate it",
+        help="add the constraint; refuses unless zero rows violate it. "
+        "'partial' is the sanctioned target; 'full' is rejected (migration 150, "
+        "migrations/README.md)",
     )
     args = ap.parse_args()
 

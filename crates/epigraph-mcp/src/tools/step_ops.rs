@@ -2,7 +2,7 @@
 //! [`epigraph_ingest_executor::workflow_steps`]; this module is a thin
 //! parameter/response shim for the MCP tool surface.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,9 +16,12 @@ pub struct AddStepParams {
     /// Step text to append/insert.
     pub step_text: String,
     /// 0-indexed insertion slot in the `step_follows` chain. `None` (or
-    /// out-of-range) appends. It does not change plan order: find_workflow,
-    /// find_workflow_hierarchical and the outcome tools list an added step after
-    /// all originally planned steps.
+    /// out-of-range) appends. An append to a plan whose every `executes` edge
+    /// the workflow-ingest stamp can read is public is indexed one past the
+    /// largest `plan_index` it can read. Every other add (an insert, or an
+    /// append to a plan with a non-public `executes` edge or with no integer
+    /// `plan_index`) is left unindexed (`plan_index: null` in the response),
+    /// and plan order lists it after every indexed step.
     #[serde(default)]
     pub position: Option<u32>,
 }
@@ -28,6 +31,8 @@ pub struct AddStepResponse {
     pub workflow_id: Uuid,
     pub step_claim_id: Uuid,
     pub step_index: u32,
+    /// The step's `plan_index`, or `null` when the step was left unindexed.
+    pub plan_index: Option<u32>,
     pub step_lineage_id: Uuid,
     pub already_present: bool,
 }
@@ -48,7 +53,7 @@ pub struct DeleteStepResponse {
 }
 
 fn success_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -147,14 +152,29 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
-        crate::tools::workflow_authority::audit_admin_workflow_write(
+    // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
+    // over HTTP, this server's pinned agent on stdio) AUTHORED the step claim
+    // this call created; the claim itself stays the system agent's.
+    if r.claim_created {
+        epigraph_ingest_executor::record_caller_authorship(
+            &mut tx,
+            caller.agent_id(),
+            &[r.step_claim_id],
+            "add_step",
+        )
+        .await
+        .map_err(|e| internal_error(format!("add_step: could not record authorship: {e}")))?;
+    }
+    // The arm that admitted the caller is recorded with the write: the admin
+    // arm's audit row, or the provenance row of any other authenticated arm.
+    if let Some((head, grant)) = authority {
+        crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             caller,
             "add_step",
             head,
-            grant.owner,
+            grant,
             serde_json::json!({
                 "canonical_name": params.canonical_name,
                 "step_claim_id": r.step_claim_id,
@@ -185,6 +205,7 @@ pub async fn add_step(
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,
         step_index: r.step_index,
+        plan_index: r.plan_index,
         step_lineage_id: r.step_lineage_id,
         already_present: r.already_present,
     })
@@ -224,14 +245,16 @@ pub async fn delete_step(
     let r = epigraph_ingest_executor::delete_step(&mut tx, &params.canonical_name, lineage)
         .await
         .map_err(map_step_err)?;
-    if let Some((head, grant)) = authority.filter(|(_, g)| g.admin) {
-        crate::tools::workflow_authority::audit_admin_workflow_write(
+    // The arm that admitted the caller is recorded with the write: the admin
+    // arm's audit row, or the provenance row of any other authenticated arm.
+    if let Some((head, grant)) = authority {
+        crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
             auth,
             caller,
             "delete_step",
             head,
-            grant.owner,
+            grant,
             serde_json::json!({
                 "canonical_name": params.canonical_name,
                 "step_claim_id": r.step_claim_id,

@@ -341,6 +341,7 @@ mod tests {
             sections,
             relationships: Vec::new(),
             source_text: None,
+            labels: Vec::new(),
         }
     }
 

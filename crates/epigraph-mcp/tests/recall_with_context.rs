@@ -23,7 +23,7 @@ mod viewerfx;
 #[rustfmt::skip]
 use epigraph_mcp::tools::recall::{
     EdgeDirection,
-    __test_only::{assemble_neighbor_paragraphs, fetch_batched_context, paragraph_3072_population},
+    __test_only::{assemble_neighbor_paragraphs, embedded_3072_population, fetch_batched_context},
     NeighborPath,
 };
 use sqlx::PgPool;
@@ -662,12 +662,12 @@ async fn explicit_3072_with_no_population_returns_invalid_params(pool: PgPool) {
     let _fx = fixture::build(&pool).await;
 
     // Sanity: helper reports 0.0 for the unpopulated 3072 column.
-    let frac = paragraph_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
+    let frac = embedded_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
         .await
-        .expect("paragraph_3072_population helper");
+        .expect("embedded_3072_population helper");
     assert_eq!(
         frac, 0.0,
-        "fixture should leave embedding_3072 unpopulated on level=2 paragraphs"
+        "fixture should leave embedding_3072 unpopulated on every embedded claim"
     );
 
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
@@ -966,6 +966,13 @@ mod diverse_fixture {
         drift_bucket: usize,
         drift: f32,
     ) -> String {
+        vec_to_pgvec(&drift_vec(bucket, value, drift_bucket, drift))
+    }
+
+    /// The raw vector behind `cluster_pgvec_with_drift`, shared with
+    /// `cluster_pgvec_with_drift_and_query_share` so the drift layout lives
+    /// in one place.
+    fn drift_vec(bucket: usize, value: f32, drift_bucket: usize, drift: f32) -> Vec<f32> {
         let mut v = vec![0.0f32; DIM];
         let start = bucket * STRIDE;
         let end = start + STRIDE;
@@ -976,6 +983,41 @@ mod diverse_fixture {
         let dend = dstart + STRIDE;
         for slot in v.iter_mut().take(dend).skip(dstart) {
             *slot = drift;
+        }
+        v
+    }
+
+    /// `cluster_pgvec_with_drift(bucket, value, drift_bucket, drift)` plus a
+    /// constant `query_share` in bucket 0 (the query bucket in these tests).
+    ///
+    /// For a "far" cluster that must stay further from the query than the
+    /// near rows, yet NOT be exactly orthogonal to them. When two clusters are
+    /// exactly orthogonal, every cross-cluster distance ties at cosine
+    /// distance 1.0 (similarity 0), and the HNSW index built on insert can
+    /// leave the near cluster unreachable from the graph's entry point. An
+    /// index scan then returns only far rows, even at `hnsw.ef_search = 1000`
+    /// with iterative scan. The shared bucket-0 component removes that exact
+    /// tie. This is a measured result, not a guarantee: the unreachable-graph
+    /// failure went from about 3% of fresh builds to 0 in 2750 (a 95% upper
+    /// bound of about 0.11% per build).
+    ///
+    /// Precondition: `bucket` and `drift_bucket` are not 0. Bucket 0 is the
+    /// query-share slot and is written last, so it would silently overwrite
+    /// either of them.
+    pub fn cluster_pgvec_with_drift_and_query_share(
+        bucket: usize,
+        value: f32,
+        drift_bucket: usize,
+        drift: f32,
+        query_share: f32,
+    ) -> String {
+        debug_assert!(
+            bucket != 0 && drift_bucket != 0,
+            "bucket 0 is the query-share slot; got bucket={bucket}, drift_bucket={drift_bucket}"
+        );
+        let mut v = drift_vec(bucket, value, drift_bucket, drift);
+        for slot in v.iter_mut().take(STRIDE) {
+            *slot = query_share;
         }
         vec_to_pgvec(&v)
     }
@@ -1211,7 +1253,8 @@ async fn diverse_mode_falls_back_to_flat_when_themes_empty(pool: PgPool) {
 }
 
 /// Test: diverse=false leaves the existing flat-ANN ordering unchanged.
-/// Compares against `ClaimRepository::search_by_embedding` directly.
+/// Compares against `ClaimRepository::search_by_embedding_since` in the
+/// whole-corpus scope (drain U082) — the exact call the flat path makes.
 #[sqlx::test(migrations = "../../migrations")]
 async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let viewer = viewerfx::public_viewer(&pool).await;
@@ -1224,8 +1267,11 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let query_pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
     let mut paragraph_ids = Vec::new();
     for i in 0..5 {
-        // Slight reduction in value moves the cosine score down monotonically.
-        let para_vec = diverse_fixture::cluster_pgvec(0, 1.0 - (i as f32) * 0.05);
+        // Direction drift, not magnitude, so every paragraph has its own
+        // cosine and the order is fully determined (scaling `cluster_pgvec`
+        // leaves the cosine unchanged, and an all-tie page's order is just
+        // the plan's).
+        let para_vec = diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.1 * i as f32);
         let id = diverse_fixture::seed_paragraph(
             &pool,
             agent,
@@ -1241,17 +1287,23 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     // Reference: direct call to the same repo function recall_with_context
     // uses in diverse=false mode. If diverse=false matches this ordering
     // verbatim, the diverse-routing change preserves the flat path.
-    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding(
+    let direct_hits = epigraph_db::ClaimRepository::search_by_embedding_since(
         &pool,
         &viewer,
         &query_pgvec,
         1536,
         10,
         None,
+        None,
+        epigraph_db::EmbeddingSeedScope::AllClaims,
     )
     .await
     .expect("direct flat ANN");
     let direct_order: Vec<Uuid> = direct_hits.iter().map(|h| h.claim_id).collect();
+    assert_eq!(
+        direct_order, paragraph_ids,
+        "calibration: the drifted fixture ranks the paragraphs in seed order"
+    );
 
     let server = build_test_server(pool.clone());
     let params = diverse_params(/*diverse=*/ false, None, None, 10);
@@ -1263,7 +1315,8 @@ async fn diverse_false_matches_existing_flat_ordering(pool: PgPool) {
     let recall_order: Vec<Uuid> = resp.results.iter().map(|r| r.paragraph_id).collect();
     assert_eq!(
         recall_order, direct_order,
-        "diverse=false ordering must match direct ClaimRepository::search_by_embedding ordering"
+        "diverse=false ordering must match direct ClaimRepository::search_by_embedding_since \
+         (AllClaims) ordering"
     );
 }
 
@@ -1661,6 +1714,318 @@ async fn recall_with_context_annotates_contested_paragraph(pool: PgPool) {
     );
 }
 
+// ============================================================================
+// Epistemic-edge neighbours at the TOOL-RESPONSE boundary (backlog 922a1e54)
+// ============================================================================
+//
+// `fetch_batched_context` has filled `epistemic_edges_by_paragraph` since #462,
+// and the ctx-level tests further down pin that. But the hit-assembly loop never
+// read the map, so no caller ever saw a single supports / refutes / specializes
+// neighbour — and the ctx tests stayed green throughout. These assert on the
+// serialized response a caller actually receives.
+
+/// A claim inserted for its role as an epistemic-edge endpoint: public (the
+/// insert trigger stamps tenancy from the default visibility), current, no
+/// embedding — so it is never itself a recall hit.
+async fn seed_neighbour_claim(pool: &PgPool, agent: Uuid, content: &str, truth: f64) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ($1, sha256($1::bytea), $2, $3, true) RETURNING id",
+    )
+    .bind(content)
+    .bind(truth)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("seed epistemic neighbour claim")
+}
+
+async fn seed_claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+         VALUES ($1, $2, 'claim', 'claim', $3)",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("seed epistemic edge");
+}
+
+/// Run `recall_with_context` end to end and return the raw JSON row for
+/// `paragraph`. Raw `serde_json::Value`, not a typed struct: the defect is a
+/// MISSING key, and a typed struct with `#[serde(default)]` would mask it.
+async fn recall_row_for(
+    pool: &PgPool,
+    params: epigraph_mcp::tools::recall::RecallWithContextParams,
+    pgvec: &str,
+    paragraph: Uuid,
+) -> serde_json::Value {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+    let viewer = viewerfx::public_viewer(pool).await;
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, pgvec)
+        .await
+        .expect("recall_with_context ok");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse JSON");
+    json["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .find(|r| r["paragraph_id"] == paragraph.to_string())
+        .cloned()
+        .unwrap_or_else(|| panic!("paragraph {paragraph} not returned by recall_with_context"))
+}
+
+fn epistemic_edges_of(row: &serde_json::Value) -> Vec<serde_json::Value> {
+    let edges = row.get("epistemic_edges");
+    assert!(
+        edges.is_some(),
+        "recall_with_context fetched epistemic edges but dropped them before RecallHit \
+         (backlog 922a1e54); hit keys were: {:?}",
+        row.as_object()
+            .map(|o| o.keys().cloned().collect::<Vec<_>>())
+    );
+    edges
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("epistemic_edges must be a JSON array")
+}
+
+fn has_edge(edges: &[serde_json::Value], claim: Uuid, relationship: &str, direction: &str) -> bool {
+    edges.iter().any(|e| {
+        e["claim_id"] == claim.to_string()
+            && e["relationship"] == relationship
+            && e["direction"] == direction
+    })
+}
+
+/// The hit itself must carry its epistemic neighbours, with direction: an
+/// INCOMING `refutes` is "is refuted by", the opposite credibility signal from
+/// an outgoing one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_hit_carries_epistemic_edges(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-edges", "Epistemic edges").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para = diverse_fixture::seed_paragraph(&pool, agent, paper, "epi para", &pgvec, None).await;
+
+    let refuter = seed_neighbour_claim(&pool, agent, "a refutation of epi para", 0.9).await;
+    let supported = seed_neighbour_claim(&pool, agent, "a claim epi para supports", 0.6).await;
+    seed_claim_edge(&pool, refuter, para, "refutes").await; // incoming, from para's view
+    seed_claim_edge(&pool, para, supported, "supports").await; // outgoing
+                                                               // A second hit in the same cluster with NO epistemic edges at all.
+    let bare =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "bare para", &pgvec, None).await;
+
+    let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    assert!(
+        has_edge(&edges, refuter, "refutes", "incoming"),
+        "the refuter is the edge SOURCE, so the hit must report it as an incoming \
+         `refutes` (\"is refuted by\"); got {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, supported, "supports", "outgoing"),
+        "the hit is the edge SOURCE of `supports`, so it must be reported outgoing; got {edges:?}"
+    );
+    let refuter_entry = edges
+        .iter()
+        .find(|e| e["claim_id"] == refuter.to_string())
+        .expect("refuter entry");
+    assert_eq!(refuter_entry["content"], "a refutation of epi para");
+    assert_eq!(refuter_entry["truth_value"], serde_json::json!(0.9));
+    assert_eq!(
+        edges.len(),
+        2,
+        "exactly the two seeded epistemic neighbours"
+    );
+    assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(false));
+
+    // Stable shape (scope OQ2): a hit with no visible epistemic neighbours still
+    // CARRIES the three keys, so an empty list reads "none visible" rather than
+    // "not computed". `skip_serializing_if = "Vec::is_empty"` would drop them.
+    let bare_row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, bare).await;
+    let bare_obj = bare_row.as_object().expect("hit is a JSON object");
+    for key in [
+        "epistemic_edges",
+        "epistemic_edges_total",
+        "epistemic_edges_truncated",
+    ] {
+        assert!(
+            bare_obj.contains_key(key),
+            "a hit with no epistemic neighbours must still carry `{key}` (always \
+             serialized, like `corroborates`); hit keys were: {:?}",
+            bare_obj.keys().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(bare_row["epistemic_edges"], serde_json::json!([]));
+    assert_eq!(bare_row["epistemic_edges_total"], serde_json::json!(0));
+    assert_eq!(
+        bare_row["epistemic_edges_truncated"],
+        serde_json::json!(false)
+    );
+}
+
+/// A claim's scope caveats travel with it (backlog 99582af7, design note 3): a
+/// `qualifies` edge ("A bounds the conditions under which B applies") is
+/// returned among the hit's epistemic neighbours, with direction, so a caller
+/// reading the hit also reads where it does NOT hold. Both directions are
+/// seeded: incoming = "is qualified by", outgoing = "qualifies".
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_hit_carries_its_qualifies_caveats(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-qualifies", "Scope caveats").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "anchor hub para", &pgvec, None).await;
+
+    let caveat = seed_neighbour_claim(&pool, agent, "holds only in 1 M monovalent NaCl", 0.9).await;
+    let bounded = seed_neighbour_claim(&pool, agent, "a claim the hub para bounds", 0.7).await;
+    seed_claim_edge(&pool, caveat, para, "qualifies").await; // incoming
+    seed_claim_edge(&pool, para, bounded, "qualifies").await; // outgoing
+
+    let row = recall_row_for(&pool, diverse_params(false, None, None, 10), &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    assert!(
+        has_edge(&edges, caveat, "qualifies", "incoming"),
+        "the caveat is the edge SOURCE, so the hit must carry it as an incoming \
+         `qualifies` (\"is qualified by\"); got {edges:?}"
+    );
+    assert!(
+        has_edge(&edges, bounded, "qualifies", "outgoing"),
+        "the hit is the SOURCE of the second `qualifies`, so it must be reported \
+         outgoing; got {edges:?}"
+    );
+    assert_eq!(row["epistemic_edges_total"], serde_json::json!(2));
+
+    // The contract a caller reads names the relation too.
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let limit_doc = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "recall_with_context")
+        .expect("recall_with_context is registered")["inputSchema"]["properties"]
+        ["epistemic_limit"]["description"]
+        .as_str()
+        .expect("epistemic_limit has a description")
+        .to_string();
+    assert!(
+        limit_doc.contains("elaborates / cites / qualifies"),
+        "recall_with_context's epistemic_limit must list qualifies among the carried \
+         relationships; got: {limit_doc}"
+    );
+}
+
+/// `epistemic_limit` caps PER RELATIONSHIP, keeps the strongest neighbour of
+/// each, and `epistemic_edges_total` / `_truncated` report what the cap hid.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_epistemic_edges_cap_per_relationship(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/epi-cap", "Epistemic cap").await;
+    let pgvec = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "capped para", &pgvec, None).await;
+
+    let strong = seed_neighbour_claim(&pool, agent, "strong support", 0.9).await;
+    let middling = seed_neighbour_claim(&pool, agent, "middling support", 0.5).await;
+    let weak = seed_neighbour_claim(&pool, agent, "weak support", 0.3).await;
+    let refuter = seed_neighbour_claim(&pool, agent, "lone refutation", 0.4).await;
+    for s in [middling, weak, strong] {
+        seed_claim_edge(&pool, s, para, "supports").await;
+    }
+    seed_claim_edge(&pool, refuter, para, "refutes").await;
+
+    let mut params = diverse_params(false, None, None, 10);
+    params.epistemic_limit = Some(1);
+    let row = recall_row_for(&pool, params, &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+
+    let supports: Vec<_> = edges
+        .iter()
+        .filter(|e| e["relationship"] == "supports")
+        .collect();
+    assert_eq!(
+        supports.len(),
+        1,
+        "epistemic_limit=1 caps EACH relationship at one; got {edges:?}"
+    );
+    assert_eq!(
+        supports[0]["claim_id"],
+        serde_json::json!(strong.to_string()),
+        "the cap must keep the highest-truth neighbour of the relationship"
+    );
+    assert!(
+        has_edge(&edges, refuter, "refutes", "incoming"),
+        "a cap on `supports` must not starve `refutes` — the limit is per relationship; \
+         got {edges:?}"
+    );
+    assert_eq!(edges.len(), 2);
+    assert_eq!(
+        row["epistemic_edges_total"],
+        serde_json::json!(4),
+        "total counts every visible epistemic neighbour, not the returned page"
+    );
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(true));
+
+    // epistemic_limit=0 is raised to 1. The total is carried on the returned
+    // rows, so a literal cap of 0 returned no rows and reported `total: 0,
+    // truncated: false` for a hit with four visible neighbours.
+    let mut params = diverse_params(false, None, None, 10);
+    params.epistemic_limit = Some(0);
+    let row = recall_row_for(&pool, params, &pgvec, para).await;
+    let edges = epistemic_edges_of(&row);
+    assert_eq!(
+        row["epistemic_edges_total"],
+        serde_json::json!(4),
+        "epistemic_limit=0 must not hide the total; got row {row}"
+    );
+    assert_eq!(row["epistemic_edges_truncated"], serde_json::json!(true));
+    assert_eq!(
+        edges.len(),
+        2,
+        "epistemic_limit=0 is floored to 1 per relationship; got {edges:?}"
+    );
+}
+
+/// The tool description is the only place a caller learns the field exists.
+/// No DB: the description is static router metadata.
+#[test]
+fn recall_with_context_description_advertises_epistemic_edges() {
+    let tools = epigraph_mcp::EpiGraphMcpFull::all_tools_json();
+    let description = tools
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "recall_with_context")
+        .and_then(|t| t["description"].as_str())
+        .expect("recall_with_context is registered with a description")
+        .to_string();
+    for needle in [
+        "epistemic-edge neighbours",
+        "supports / refutes / contradicts / specializes / elaborates / cites",
+        "direction incoming|outgoing",
+        "epistemic_limit",
+        "epistemic_edges_total",
+    ] {
+        assert!(
+            description.contains(needle),
+            "recall_with_context description must advertise the epistemic-edge payload \
+             ({needle:?} missing); got: {description}"
+        );
+    }
+}
+
 /// F5 (backlog 8cbffa0e): `recall_with_context` must write its OWN audit row,
 /// tagged with its own tool name. The plain `recall` path logging is not
 /// evidence that this surface does — they are separate handlers.
@@ -1939,6 +2304,466 @@ async fn epistemic_edges_respect_the_viewer_boundary(pool: PgPool) {
     );
 }
 
+/// Run `fetch_batched_context` for one paragraph under `viewer` and return
+/// `(neighbours, total)`. The total is asserted alongside the neighbours: a
+/// hidden row that still counts toward `epistemic_edges_total` discloses its
+/// existence through the count and the truncation flag.
+async fn ctx_edges_for(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    paragraph: Uuid,
+) -> (
+    Vec<epigraph_mcp::tools::recall::EpistemicEdgeNeighbor>,
+    Option<usize>,
+) {
+    let ctx = fetch_batched_context(pool, viewer, &[paragraph], 8, 4, 4)
+        .await
+        .expect("fetch_batched_context");
+    (
+        ctx.epistemic_edges_by_paragraph
+            .get(&paragraph)
+            .cloned()
+            .unwrap_or_default(),
+        ctx.epistemic_edges_total_by_paragraph
+            .get(&paragraph)
+            .copied(),
+    )
+}
+
+/// Edge tenancy, distinct from `epistemic_edges_respect_the_viewer_boundary`
+/// (which covers a private NEIGHBOUR CLAIM): here both endpoints are public and
+/// only the EDGE is group-private. Migration 070's trigger honours exactly that
+/// declaration, so such edges exist; `ClaimRepository::dispute_batch` filters on
+/// the edge's own tenancy columns and query 7b must too, or wiring 7b onto the
+/// hit discloses another group's private assertion that two public claims are
+/// related.
+///
+/// Query 7b repeats the edge predicate in BOTH arms of its `UNION ALL`
+/// (outgoing and incoming), so the test seeds one private edge in each
+/// direction: dropping the predicate from a single arm must red this test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_a_group_private_edge_between_public_claims(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+    let (member, other_group) =
+        viewerfx::seed_agent_with_group(&pool, "epistemic-private-edge").await;
+
+    // Positive control: a public claim on an ordinary (trigger-stamped public) edge.
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "public refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    // A public claim reached ONLY through a group-private `supports` edge.
+    let behind_private_edge = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        behind_private_edge,
+        "public claim linked by a private edge",
+        2,
+        None,
+    )
+    .await;
+    // OUTGOING from para's view (para --supports--> behind_private_edge).
+    viewerfx::seed_edge_owned_by(&pool, para, behind_private_edge, "group", other_group).await;
+
+    // The mirror: a public claim reaching para ONLY through a group-private
+    // INCOMING `supports` edge (behind_private_incoming --supports--> para).
+    let behind_private_incoming = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        behind_private_incoming,
+        "public claim linked to the paragraph by a private incoming edge",
+        2,
+        None,
+    )
+    .await;
+    viewerfx::seed_edge_owned_by(&pool, behind_private_incoming, para, "group", other_group).await;
+
+    let public = viewerfx::public_viewer(&pool).await;
+    let (edges, total) = ctx_edges_for(&pool, &public, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the public-edge neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == behind_private_edge),
+        "a public viewer received a neighbour reachable only through another group's \
+         private OUTGOING edge: {edges:?}. Query 7b's outgoing arm checks the neighbour \
+         claim's visibility but not the edge's own tenancy columns."
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == behind_private_incoming),
+        "a public viewer received a neighbour reachable only through another group's \
+         private INCOMING edge: {edges:?}. Query 7b's incoming arm checks the neighbour \
+         claim's visibility but not the edge's own tenancy columns."
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "neither private edge may count toward the public viewer's total"
+    );
+
+    // Calibration: a member of the edge's group DOES see it, so the predicate
+    // filters on tenancy rather than dropping group edges outright.
+    let insider = epigraph_db::visibility::Viewer::resolve(&pool, member)
+        .await
+        .expect("resolve group member");
+    let (edges, total) = ctx_edges_for(&pool, &insider, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_edge
+            && e.relationship == "supports"
+            && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a member of the edge's owning group must see the private outgoing edge; got {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_incoming
+            && e.relationship == "supports"
+            && matches!(e.direction, EdgeDirection::Incoming)),
+        "a member of the edge's owning group must see the private incoming edge; got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
+
+    // Calibration: a BYPASS (system / maintenance) viewer is in no group, yet the
+    // `$4::bool OR` disjunct must still admit both private edges, as it does in
+    // `dispute_batch` and 7b's sibling queries.
+    let (_scoped, system) = viewerfx::bypass(&pool).await;
+    let (edges, total) = ctx_edges_for(&pool, &system, para).await;
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == behind_private_edge
+                && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a bypass viewer must see the group-private OUTGOING edge (query 7b's outgoing \
+         arm lost its `$4::bool OR` bypass disjunct); got {edges:?}"
+    );
+    assert!(
+        edges.iter().any(|e| e.claim_id == behind_private_incoming
+            && matches!(e.direction, EdgeDirection::Incoming)),
+        "a bypass viewer must see the group-private INCOMING edge (query 7b's incoming \
+         arm lost its `$4::bool OR` bypass disjunct); got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
+}
+
+/// The co-owner half of the edge-tenancy predicate. A CO-OWNED edge (owner
+/// `GA`, co-owner `GB`, migration 072) is visible only to a viewer in BOTH
+/// groups — `dispute_batch`'s `(e.co_owner_group_id IS NULL OR
+/// e.co_owner_group_id = ANY(groups))`. A viewer in the owner group alone must
+/// not see it. One co-owned edge per `UNION ALL` arm, so the clause cannot be
+/// dropped from either arm unnoticed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_require_both_groups_for_a_co_owned_edge(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+    let (owner_only, group_a) = viewerfx::seed_agent_with_group(&pool, "epi-co-owner-a").await;
+    let (in_both, group_b) = viewerfx::seed_agent_with_group(&pool, "epi-co-owner-b").await;
+    // `in_both` already belongs to group_b; add it to group_a as well.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(group_a)
+    .bind(in_both)
+    .execute(&pool)
+    .await
+    .expect("add in_both to group_a");
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "public refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    let co_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        co_out,
+        "co-owned outgoing target",
+        2,
+        None,
+    )
+    .await;
+    let co_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        co_in,
+        "co-owned incoming source",
+        2,
+        None,
+    )
+    .await;
+    for (source, target) in [(para, co_out), (co_in, para)] {
+        let edge = viewerfx::seed_edge_owned_by(&pool, source, target, "group", group_a).await;
+        sqlx::query("UPDATE edges SET co_owner_group_id = $2 WHERE id = $1")
+            .bind(edge)
+            .bind(group_b)
+            .execute(&pool)
+            .await
+            .expect("co-own edge with group_b");
+    }
+
+    let owner_viewer = epigraph_db::visibility::Viewer::resolve(&pool, owner_only)
+        .await
+        .expect("resolve owner-group-only viewer");
+    let (edges, total) = ctx_edges_for(&pool, &owner_viewer, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the public-edge neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == co_out),
+        "a viewer in the owner group ONLY received a co-owned OUTGOING edge: {edges:?}. \
+         Query 7b's outgoing arm is missing the co_owner_group_id clause."
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == co_in),
+        "a viewer in the owner group ONLY received a co-owned INCOMING edge: {edges:?}. \
+         Query 7b's incoming arm is missing the co_owner_group_id clause."
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "co-owned edges the viewer cannot see must not count toward its total"
+    );
+
+    // Calibration: a viewer in BOTH groups sees both co-owned edges.
+    let both_viewer = epigraph_db::visibility::Viewer::resolve(&pool, in_both)
+        .await
+        .expect("resolve two-group viewer");
+    let (edges, total) = ctx_edges_for(&pool, &both_viewer, para).await;
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == co_out && matches!(e.direction, EdgeDirection::Outgoing)),
+        "a viewer in both owner and co-owner groups must see the co-owned outgoing edge; \
+         got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == co_in && matches!(e.direction, EdgeDirection::Incoming)),
+        "a viewer in both owner and co-owner groups must see the co-owned incoming edge; \
+         got {edges:?}"
+    );
+    assert_eq!(total, Some(3));
+}
+
+/// Set `valid_to` on the single `source --relationship--> target` edge to
+/// `now() + offset` (a Postgres interval literal, e.g. `'-1 second'`).
+async fn set_edge_valid_to(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+    offset: &str,
+) {
+    let updated = sqlx::query(
+        "UPDATE edges SET valid_to = now() + $4::interval
+         WHERE source_id = $1 AND target_id = $2 AND relationship = $3",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .bind(offset)
+    .execute(pool)
+    .await
+    .expect("set edge valid_to");
+    assert_eq!(
+        updated.rows_affected(),
+        1,
+        "fixture: exactly one {source} --{relationship}--> {target} edge"
+    );
+}
+
+/// An edge retracted by `delete_edge` (`valid_to` set) is no longer in force
+/// (`EdgeRepository`'s `EDGE_IN_FORCE`); presenting it as a live `supports` would
+/// report an argument its author withdrew.
+///
+/// Query 7b repeats the in-force predicate in BOTH arms of its `UNION ALL`, so
+/// a retracted edge is seeded in each direction. And because the predicate is
+/// `EDGE_IN_FORCE` (`valid_to IS NULL OR valid_to > now()`), not a bare
+/// `valid_to IS NULL`, an edge whose retraction is only SCHEDULED (future
+/// `valid_to`) is still live and must be returned and counted — again in each
+/// direction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_retracted_edges(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "live refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    // Retracted, INCOMING (withdrawn_in --supports--> para). Retracted the way
+    // `EdgeRepository::retract_by_id` does, backdated a second so
+    // `valid_to > now()` cannot hold at read time.
+    let withdrawn_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        withdrawn_in,
+        "withdrawn support",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        withdrawn_in,
+        "claim",
+        para,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, withdrawn_in, para, "supports", "-1 second").await;
+
+    // Retracted, OUTGOING (para --supports--> withdrawn_out).
+    let withdrawn_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        withdrawn_out,
+        "withdrawn supported",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        para,
+        "claim",
+        withdrawn_out,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, para, withdrawn_out, "supports", "-1 second").await;
+
+    // Retraction SCHEDULED an hour out, one edge in each direction: still in force.
+    let scheduled_in = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        scheduled_in,
+        "expiring support",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        scheduled_in,
+        "claim",
+        para,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, scheduled_in, para, "supports", "1 hour").await;
+
+    let scheduled_out = Uuid::new_v4();
+    fixture::insert_claim(
+        &pool,
+        fx.agent_id,
+        scheduled_out,
+        "expiring supported",
+        2,
+        None,
+    )
+    .await;
+    fixture::insert_edge(
+        &pool,
+        para,
+        "claim",
+        scheduled_out,
+        "claim",
+        "supports",
+        None,
+    )
+    .await;
+    set_edge_valid_to(&pool, para, scheduled_out, "supports", "1 hour").await;
+
+    let (edges, total) = ctx_edges_for(&pool, &viewerfx::public_viewer(&pool).await, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the in-force edge must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == withdrawn_in),
+        "a retracted (valid_to in the past) INCOMING edge was reported as a live \
+         epistemic neighbour: {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == withdrawn_out),
+        "a retracted (valid_to in the past) OUTGOING edge was reported as a live \
+         epistemic neighbour: {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == scheduled_in && matches!(e.direction, EdgeDirection::Incoming)),
+        "an INCOMING edge whose retraction is scheduled in the future (valid_to > now()) \
+         is still in force and must be returned; got {edges:?}"
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.claim_id == scheduled_out && matches!(e.direction, EdgeDirection::Outgoing)),
+        "an OUTGOING edge whose retraction is scheduled in the future (valid_to > now()) \
+         is still in force and must be returned; got {edges:?}"
+    );
+    assert_eq!(
+        total,
+        Some(3),
+        "the total counts the live edge and the two scheduled-retraction edges, and \
+         neither retracted edge"
+    );
+}
+
+/// A superseded neighbour (`is_current = false`) is not live argument;
+/// `dispute_batch` already joins `src.is_current` for the same page.
+#[sqlx::test(migrations = "../../migrations")]
+async fn epistemic_edges_omit_superseded_neighbours(pool: PgPool) {
+    let fx = fixture::build(&pool).await;
+    let para = fx.paragraphs[0];
+
+    let control = Uuid::new_v4();
+    fixture::insert_claim(&pool, fx.agent_id, control, "current refutation", 2, None).await;
+    fixture::insert_edge(&pool, control, "claim", para, "claim", "refutes", None).await;
+
+    let superseded: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current)
+         VALUES ('superseded refutation', sha256('superseded refutation'::bytea), 0.9, $1, false)
+         RETURNING id",
+    )
+    .bind(fx.agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("seed superseded neighbour");
+    fixture::insert_edge(&pool, superseded, "claim", para, "claim", "refutes", None).await;
+
+    let (edges, total) = ctx_edges_for(&pool, &viewerfx::public_viewer(&pool).await, para).await;
+    assert!(
+        edges.iter().any(|e| e.claim_id == control),
+        "positive control: the current neighbour must be returned; got {edges:?}"
+    );
+    assert!(
+        !edges.iter().any(|e| e.claim_id == superseded),
+        "a superseded (is_current = false) neighbour was reported as live argument: {edges:?}"
+    );
+    assert_eq!(
+        total,
+        Some(1),
+        "a superseded neighbour must not count toward the total"
+    );
+}
+
 // ============================================================================
 // Theme-coverage guard (diverse mode must not route a query through a theme
 // set that does not cover the query's neighbourhood)
@@ -2070,7 +2895,7 @@ async fn diverse_mode_falls_back_when_tiny_theme_set_does_not_cover_query(pool: 
 }
 
 /// The guard must be PER-QUERY, not corpus-wide: here most of the corpus is
-/// unthemed (a large orthogonal cluster), but the query's own neighbourhood is
+/// unthemed (a large cluster far from the query), but the query's own neighbourhood is
 /// almost entirely themed. Diverse selection must still run — observable
 /// because diverse candidates come only from themes, so the single UNTHEMED
 /// paragraph that is the query's nearest neighbour must NOT be returned (flat
@@ -2119,16 +2944,37 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
     }
 
     // A large unthemed cluster far from the query, so corpus-wide coverage is
-    // well under half. A corpus-ratio guard would (wrongly) disable diverse
-    // mode here; a per-query guard must not.
+    // well under half (60/211). A corpus-ratio guard would (wrongly) disable
+    // diverse mode here; a per-query guard must not.
+    //
+    // The far cluster is deliberately NOT orthogonal to the query region: each
+    // far row carries a 0.5 share in the query's bucket 0. Its cosine to the
+    // query is at most 0.5/sqrt(1.25) ≈ 0.447, below the least similar themed
+    // row's 1/sqrt(1 + 0.64²) ≈ 0.842, so the themed rows stay the nearest
+    // ones. With exactly orthogonal clusters, about 3% of freshly built HNSW
+    // graphs left the near cluster unreachable from the entry point. The
+    // guard's probe then saw 40 far rows (0 covered), the request fell back
+    // to flat retrieval, and that index scan also returned far rows.
+    let mut far = std::collections::HashSet::new();
     for i in 0..150 {
-        let v = diverse_fixture::cluster_pgvec_with_drift(6, 1.0, 7, (i as f32) * 0.01);
-        diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None).await;
+        let v = diverse_fixture::cluster_pgvec_with_drift_and_query_share(
+            6,
+            1.0,
+            7,
+            (i as f32) * 0.01,
+            0.5,
+        );
+        far.insert(
+            diverse_fixture::seed_paragraph(&pool, agent, paper, &format!("far-{i}"), &v, None)
+                .await,
+        );
     }
     // Keep the ANN indexes here (unlike the coverage-bug arm) and give the
     // planner statistics, so the guard's probe and the candidate query run
-    // under the plans a populated database would choose. The outcome does not
-    // depend on which plan is picked: the themed rows are the nearest ones.
+    // under the plans a populated database would choose. An index scan is
+    // approximate, so the result does not depend on the plan only as far as
+    // the HNSW graph reaches the query region. With the shared bucket-0
+    // component above, that failed in 0 of 2750 fresh builds (about 3% before).
     sqlx::query("VACUUM ANALYZE claims")
         .execute(&pool)
         .await
@@ -2152,9 +2998,13 @@ async fn diverse_mode_still_selects_from_themes_when_query_neighbourhood_is_cove
          are themed only — the unthemed nearest neighbour appearing means the request fell \
          back to flat retrieval"
     );
+    let far_returned = returned.intersection(&far).count();
     assert!(
         returned.is_subset(&themed),
-        "every diverse pick must come from the covering theme; got {returned:?}"
+        "every diverse pick must come from the covering theme; got {returned:?}. \
+         {far_returned} of them are far-cluster rows: a non-zero count means the HNSW \
+         index scan never reached the query region (a fixture-geometry problem, see the \
+         far-cluster comment above), not a per-query guard regression"
     );
 }
 
@@ -2466,4 +3316,405 @@ async fn diverse_mode_falls_back_under_index_backed_plans(pool: PgPool) {
     );
     let flat_top_5: std::collections::HashSet<Uuid> = relevant[..5].iter().copied().collect();
     assert_eq!(returned, flat_top_5, "the fallback returns the flat top-5");
+}
+
+// ============================================================================
+// Whole-corpus seeding (drain U082, backlog a1d89aab; operator ruling
+// 2026-10-14). `recall_with_context` seeds on EVERY embedded claim the viewer
+// can see, not only on level-2 paragraphs with a paper attribution. Paper and
+// section parentage are enrichment attributes: a parentless hit omits `paper`
+// (and carries `section: null`, as any section-less hit always did) instead of
+// being dropped.
+// ============================================================================
+
+/// An embedded claim that is NOT an `ingest_document` paragraph: no paper
+/// `asserts` edge, and `properties` as given (`{}` for a `submit_claim` /
+/// `memorize` claim, `{"level": 2, "kind": "workflow_step"}` for a workflow
+/// step). Public, current.
+async fn seed_parentless_claim(
+    pool: &PgPool,
+    agent: Uuid,
+    content: &str,
+    properties: &str,
+    embedding_pgvec: &str,
+    theme_id: Option<Uuid>,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, \
+                             properties, embedding, theme_id) \
+         VALUES ($1, sha256($1::bytea), 0.7, $2, true, $3::jsonb, $4::vector, $5) \
+         RETURNING id",
+    )
+    .bind(content)
+    .bind(agent)
+    .bind(properties)
+    .bind(embedding_pgvec)
+    .bind(theme_id)
+    .fetch_one(pool)
+    .await
+    .expect("seed parentless claim")
+}
+
+/// The full `results` array as raw JSON. Raw `serde_json::Value`, not a typed
+/// struct: one assertion is about a key being ABSENT, which a typed struct
+/// with `Option` + `#[serde(default)]` cannot distinguish from `null`.
+async fn recall_results_json(
+    pool: &PgPool,
+    params: epigraph_mcp::tools::recall::RecallWithContextParams,
+    pgvec: &str,
+) -> Vec<serde_json::Value> {
+    use epigraph_mcp::tools::recall::__test_only::recall_with_context_with_pgvec;
+    let viewer = viewerfx::public_viewer(pool).await;
+    let server = build_test_server(pool.clone());
+    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, pgvec)
+        .await
+        .expect("recall_with_context ok");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text content");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("parse JSON");
+    json["results"].as_array().expect("results array").clone()
+}
+
+fn result_ids(results: &[serde_json::Value]) -> Vec<String> {
+    results
+        .iter()
+        .map(|r| r["paragraph_id"].as_str().unwrap_or("<no id>").to_string())
+        .collect()
+}
+
+/// The backlog's own regression test (a1d89aab): a parentless claim that is
+/// the BEST semantic match is returned AHEAD of a weaker, paper-attributed
+/// paragraph — and it is returned without a `paper` key rather than with a
+/// fabricated one.
+///
+/// Pre-fix the parentless claim is never a candidate (the flat kNN is
+/// `level = 2` only, and the assembly loop drops any hit without paper meta),
+/// so the page is `[paragraph]` and the first assertion fails on the ids.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_returns_a_parentless_best_match_ahead_of_a_weaker_paragraph(
+    pool: PgPool,
+) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/parentless", "Parentless test").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    // Exact match (cosine 1.0), no level, no paper: a submit_claim claim.
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "EpiGraph is installed correctly.",
+        "{}",
+        &query,
+        None,
+    )
+    .await;
+    // Weaker match (cosine ~0.894). Direction drift, not magnitude: scaling
+    // `cluster_pgvec` leaves the cosine unchanged.
+    let para = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a real paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(false, None, None, /*limit=*/ 2),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![parentless.to_string(), para.to_string()],
+        "the parentless exact match must be a candidate and rank first; a level-2/paper-only \
+         seed never considers it"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless hit omits `paper` (never null, never fabricated); got {}",
+        results[0]
+    );
+    assert!(
+        results[0]["section"].is_null() && results[0].get("section").is_some(),
+        "a parentless hit carries `section: null` (the key set of a section-less hit is \
+         unchanged); got {}",
+        results[0]
+    );
+    assert_eq!(
+        results[1]["paper"]["doi"], "10.1/parentless",
+        "a paper paragraph still carries its paper attribution"
+    );
+}
+
+/// A level-2 claim with NO paper attribution — a workflow step, which
+/// `crates/epigraph-ingest/src/workflow/builder.rs` writes as
+/// `{"level": 2, "kind": "workflow_step"}` with only author `asserts` edges —
+/// is a hit in its own right.
+///
+/// The fixture carries that author edge in the shape `ingest_workflow`
+/// persists it (`crates/epigraph-mcp/src/tools/ingestion.rs` resolves the
+/// planner's `author_placeholder` source to the author's agent: `source_type =
+/// 'agent'`, `relationship = 'asserts'`), so the "omits `paper`" assertion
+/// covers the production edge shape: an `asserts` edge that is not from a
+/// paper must not produce paper meta.
+///
+/// Pre-fix it is the worst case of the old filter pair: the level-2 kNN
+/// spends the page's only slot (`limit = 1`) on it, and the assembly loop then
+/// drops it for having no paper, so the page comes back EMPTY.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_returns_a_level_2_claim_without_paper_attribution(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/wfstep", "Workflow step test").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let step = seed_parentless_claim(
+        &pool,
+        agent,
+        "workflow step: install the toolchain",
+        r#"{"level": 2, "kind": "workflow_step"}"#,
+        &query,
+        None,
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES (gen_random_uuid(), $1, 'agent', $2, 'claim', 'asserts', \
+                 '{\"role\": \"author\", \"source\": \"workflow_attribution\"}'::jsonb)",
+    )
+    .bind(agent)
+    .bind(step)
+    .execute(&pool)
+    .await
+    .expect("seed the workflow step's author asserts edge");
+    diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a weaker paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(false, None, None, /*limit=*/ 1),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![step.to_string()],
+        "limit=1 must return the best match, the unattributed workflow step"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "an unattributed hit omits `paper`; got {}",
+        results[0]
+    );
+}
+
+/// The diverse surface seeds on the whole corpus too: a parentless claim
+/// inside the selected theme is a candidate for `diverse_select`.
+///
+/// Four of the five rows sit in the one theme, so the theme-coverage guard
+/// passes (4/5 probed rows reachable; 3/4 if the probe were paragraph-only)
+/// and the DIVERSE path serves the page. The fifth row is an UNTHEMED
+/// paragraph nearer the query than any themed paragraph: the flat fallback
+/// would put it second, the diverse path cannot return it. Its absence is
+/// what proves the diverse path served the page, so a regression that always
+/// falls back cannot pass here. That is also what makes this test independent
+/// of the flat-path tests above: with the diverse candidate query still
+/// restricted to paragraphs, the parentless claim is absent here even when
+/// the flat path is fixed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_diverse_returns_a_parentless_claim_in_a_theme(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/div-parentless", "Diverse").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+    let theme = diverse_fixture::seed_theme_with_centroid(&pool, "only-theme", &query).await;
+
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "a memorized note that matches exactly",
+        "{}",
+        &query,
+        Some(theme),
+    )
+    .await;
+    let mut paragraphs = Vec::new();
+    for i in 0..3 {
+        paragraphs.push(
+            diverse_fixture::seed_paragraph(
+                &pool,
+                agent,
+                paper,
+                &format!("themed paragraph {i}"),
+                &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.3 + 0.1 * i as f32),
+                Some(theme),
+            )
+            .await,
+        );
+    }
+    let unthemed = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "an unthemed paragraph nearer than every themed one",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.05),
+        None,
+    )
+    .await;
+
+    // alpha = 0.0: pure relevance, so the exact match must be selected.
+    let results = recall_results_json(
+        &pool,
+        diverse_params(true, Some(5), Some(0.0), /*limit=*/ 3),
+        &query,
+    )
+    .await;
+
+    let ids = result_ids(&results);
+    assert_eq!(
+        ids.len(),
+        3,
+        "the diverse page must fill its budget; got {ids:?}"
+    );
+    assert_eq!(
+        ids[0],
+        parentless.to_string(),
+        "the parentless exact match must be a diverse candidate and rank first; got {ids:?}"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless diverse hit omits `paper`; got {}",
+        results[0]
+    );
+    assert!(
+        !ids.contains(&unthemed.to_string()),
+        "the unthemed paragraph is the flat path's second hit; its presence means the \
+         page came from the flat fallback, not the diverse path. Got {ids:?}"
+    );
+}
+
+/// The diverse path's flat FALLBACK seeds on the whole corpus too. With no
+/// themes at all the diverse pipeline selects nothing and
+/// `recall_with_context_post_embed` falls back to
+/// `search_by_embedding_since` (the `kNN fallback` call site), a separate
+/// call from the `diverse=false` path, with its own scope argument.
+///
+/// Pre-fix (or with that one argument at `EmbeddingSeedScope::Paragraphs`)
+/// the parentless exact match is never a candidate and the page is
+/// `[paragraph]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_with_context_diverse_fallback_returns_a_parentless_best_match(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/fallback-parentless", "Fallback").await;
+    let query = diverse_fixture::cluster_pgvec(0, 1.0);
+
+    let parentless = seed_parentless_claim(
+        &pool,
+        agent,
+        "a memorized note, no themes anywhere",
+        "{}",
+        &query,
+        None,
+    )
+    .await;
+    let para = diverse_fixture::seed_paragraph(
+        &pool,
+        agent,
+        paper,
+        "a weaker paper paragraph",
+        &diverse_fixture::cluster_pgvec_with_drift(0, 1.0, 1, 0.5),
+        None,
+    )
+    .await;
+    let themes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claim_themes")
+        .fetch_one(&pool)
+        .await
+        .expect("count themes");
+    assert_eq!(
+        themes, 0,
+        "calibration: no themes, so diverse must fall back"
+    );
+
+    let results = recall_results_json(
+        &pool,
+        diverse_params(true, Some(5), Some(0.0), /*limit=*/ 2),
+        &query,
+    )
+    .await;
+
+    assert_eq!(
+        result_ids(&results),
+        vec![parentless.to_string(), para.to_string()],
+        "the diverse fallback must seed on every embedded claim: the parentless exact \
+         match first, then the weaker paragraph"
+    );
+    assert!(
+        results[0].get("paper").is_none(),
+        "a parentless fallback hit omits `paper`; got {}",
+        results[0]
+    );
+}
+
+/// `centroid_dim` auto-detect measures the population the seed searches: every
+/// embedded claim, not only level-2 paragraphs.
+///
+/// One paragraph re-embedded at 3072 (both columns) beside two `submit_claim`
+/// style claims that, like every MCP write path, carry only the 1536-d vector.
+/// Paragraph-only, the fraction is 1/1 and auto-detect would pick 3072 — where
+/// the two parentless claims have no vector, so they could never be returned.
+/// Whole-corpus, it is 1/3 and auto-detect stays on 1536, where all three are
+/// candidates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn centroid_auto_detect_counts_every_embedded_claim_not_just_paragraphs(pool: PgPool) {
+    let agent = diverse_fixture::seed_agent(&pool).await;
+    let paper = diverse_fixture::seed_paper(&pool, "10.1/detect", "Detect test").await;
+    let v1536 = diverse_fixture::cluster_pgvec(0, 1.0);
+    let para =
+        diverse_fixture::seed_paragraph(&pool, agent, paper, "re-embedded para", &v1536, None)
+            .await;
+    let v3072 = format!("[{}]", vec!["0.5"; 3072].join(","));
+    sqlx::query("UPDATE claims SET embedding_3072 = $2::vector WHERE id = $1")
+        .bind(para)
+        .bind(&v3072)
+        .execute(&pool)
+        .await
+        .expect("set embedding_3072 on the paragraph");
+    for content in ["memorized note one", "memorized note two"] {
+        seed_parentless_claim(&pool, agent, content, "{}", &v1536, None).await;
+    }
+
+    let frac = embedded_3072_population(&pool, &viewerfx::public_viewer(&pool).await)
+        .await
+        .expect("embedded_3072_population");
+    assert!(
+        (frac - 1.0 / 3.0).abs() < 1e-9,
+        "1 of the 3 embedded claims carries a 3072-d vector; a paragraph-only \
+         denominator reports 1.0 and auto-selects 3072, hiding both parentless claims. \
+         Got {frac}"
+    );
+
+    // The decision the caller sees (`centroid_dim_used`), not just its input:
+    // a threshold change or a call site reading the wrong helper flips this.
+    use epigraph_mcp::tools::recall::__test_only::detect_centroid_dim;
+    let dim = detect_centroid_dim(&pool, &viewerfx::public_viewer(&pool).await)
+        .await
+        .expect("detect_centroid_dim");
+    assert_eq!(
+        dim, 1536,
+        "auto-detect must stay on 1536, where the two parentless claims have vectors"
+    );
 }

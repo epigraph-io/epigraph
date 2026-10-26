@@ -26,10 +26,15 @@ pub const EPISTEMIC_RELATIONSHIPS: &[&str] = &[
     "refutes",
 ];
 
-/// The subset of [`EPISTEMIC_RELATIONSHIPS`] that WEAKENS its target's belief.
+/// The subset of [`EPISTEMIC_RELATIONSHIPS`] with NEGATIVE polarity: they
+/// transmit the source's belief AGAINST the target.
 ///
-/// Every other member of that list strengthens the target; these two are the
-/// only ones that subtract. The distinction is not cosmetic — it decides what
+/// Every other member of that list transmits it toward the target; these two
+/// are the only ones that argue against it. (For a positive edge polarity is
+/// not a guarantee of direction: it also carries the source's disbelief and
+/// open-world mass, so it can lower the target's belief. These two are mutual
+/// exclusion: only the source's belief transfers, as disbelief in the target,
+/// so they never put mass on the target being true; drain U075.) The distinction is not cosmetic — it decides what
 /// may be re-pointed when a claim is replaced. A `refutes`/`contradicts` edge
 /// is an assertion about a *specific pair of contents* ("this text refutes
 /// THAT text"), so re-pointing either endpoint at a different text silently
@@ -487,6 +492,27 @@ impl EdgeRepository {
         .bind(id)
         .fetch_one(executor)
         .await?)
+    }
+
+    /// The group an edge INSERTed on this connection now would record as its
+    /// writer: `public.epigraph_writer_group()` (migration 114), the function
+    /// migration 120's trigger stamps `writer_group_id` from. `None` means the
+    /// edge would land with no writer group.
+    ///
+    /// Run it on a connection stamped exactly like the write (the same
+    /// viewer, `ScopedPool::begin_as`). It reads only the session's own
+    /// identity, so it discloses nothing the session could not already see.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn session_writer_group<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT public.epigraph_writer_group()")
+                .fetch_one(executor)
+                .await?,
+        )
     }
 
     /// The one dedup probe + INSERT behind [`Self::create_if_not_exists_conn`]
@@ -1339,6 +1365,77 @@ impl EdgeRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_one(executor).await?)
+    }
+
+    /// The claim-to-claim edges `viewer` can read, as
+    /// `(source_id, target_id, relationship, properties)`: the edge set
+    /// `POST /api/v1/reasoning/analyze` reasons over when its caller supplies
+    /// none.
+    ///
+    /// With `among = Some(ids)` only edges whose source AND target are both in
+    /// `ids` are returned. With `None`, every readable claim-to-claim edge.
+    /// `limit = None` is `LIMIT NULL`, i.e. no cap.
+    ///
+    /// Filtered by the co-owner-aware edge predicate
+    /// (`Viewer::edge_predicate_fragment`) AND by the claim predicate on both
+    /// endpoints, so a derived result can name only claims the viewer can
+    /// read. The edge predicate alone is not enough: it trusts the edge's own
+    /// stamp, and an edge stamped wider than one of its endpoints (a legacy
+    /// row, a stamp forced past migration 070's trigger) would otherwise carry
+    /// a hidden claim's id into the analysis (backlog 2e44a404).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, among))]
+    pub async fn claim_edges_for_reasoning<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        among: Option<&[Uuid]>,
+        limit: Option<i64>,
+    ) -> Result<Vec<(Uuid, Uuid, String, serde_json::Value)>, DbError> {
+        // Two statements, not one `$1::uuid[] IS NULL OR ...` disjunction: a
+        // cached prepared statement can settle on a generic plan, which cannot
+        // use an index through that disjunction, and the id-scoped arm would
+        // then scan every edge. Each statement carries its own predicate.
+        let sql = match among {
+            Some(_) => viewer.splice(
+                "SELECT e.source_id, e.target_id, e.relationship, e.properties \
+                   FROM edges e \
+                   JOIN claims cs ON cs.id = e.source_id \
+                   JOIN claims ct ON ct.id = e.target_id \
+                  WHERE e.source_type = 'claim' \
+                    AND e.target_type = 'claim' \
+                    AND e.source_id = ANY($1) \
+                    AND e.target_id = ANY($1) \
+                    /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:cs} */ /* {VISIBILITY:ct} */ \
+                  LIMIT $2",
+                3,
+            ),
+            None => viewer.splice(
+                "SELECT e.source_id, e.target_id, e.relationship, e.properties \
+                   FROM edges e \
+                   JOIN claims cs ON cs.id = e.source_id \
+                   JOIN claims ct ON ct.id = e.target_id \
+                  WHERE e.source_type = 'claim' \
+                    AND e.target_type = 'claim' \
+                    /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:cs} */ /* {VISIBILITY:ct} */ \
+                  LIMIT $1",
+                2,
+            ),
+        };
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, String, Json<serde_json::Value>)>(&sql);
+        if let Some(ids) = among {
+            q = q.bind(ids);
+        }
+        q = q.bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(s, t, r, Json(p))| (s, t, r, p))
+            .collect())
     }
 
     /// The edge-keyed BBA cleanup every application act that withdraws an edge

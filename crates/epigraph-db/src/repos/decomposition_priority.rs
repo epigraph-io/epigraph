@@ -62,6 +62,10 @@ pub struct DecomposeCandidate {
     pub content_hash: Vec<u8>,
     pub labels: Vec<String>,
     pub created_at: DateTime<Utc>,
+    /// `claims.visibility` (`public` / `group`). Selection reads under a
+    /// bypass viewer, so the caller must refuse a non-public candidate itself
+    /// (`epigraph_cli::decompose::check_publicly_decomposable`).
+    pub visibility: String,
     /// In-force contradicts/refutes edges from a current claim that target
     /// this claim. Zero outside the conflict ordering.
     pub conflict_edges: i64,
@@ -141,6 +145,7 @@ impl DecompositionPriorityRepository {
             .splice(
                 r#"
                 SELECT c.id, c.agent_id, c.content, c.content_hash, c.labels, c.created_at,
+                       c.visibility,
                        0::bigint AS conflict_edges,
                        NULL::timestamptz AS newest_conflict_at
                 FROM claims c
@@ -205,6 +210,7 @@ impl DecompositionPriorityRepository {
                     GROUP BY e.target_id
                 )
                 SELECT c.id, c.agent_id, c.content, c.content_hash, c.labels, c.created_at,
+                       c.visibility,
                        k.n AS conflict_edges, k.newest AS newest_conflict_at
                 FROM claims c
                 JOIN conflict k ON k.target_id = c.id
@@ -254,6 +260,7 @@ impl DecompositionPriorityRepository {
         let sql = viewer.splice(
             r#"
                 SELECT c.id, c.agent_id, c.content, c.content_hash, c.labels, c.created_at,
+                       c.visibility,
                        0::bigint AS conflict_edges,
                        NULL::timestamptz AS newest_conflict_at
                 FROM unnest($1::uuid[]) WITH ORDINALITY AS want(id, ord)

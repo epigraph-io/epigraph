@@ -708,6 +708,7 @@ fn token(
         epigraph_auth::AccessTokenBinding {
             family_id: Some(family),
             elevation_id: elv,
+            delegated_by: None,
         },
     )
     .expect("mint")
@@ -738,7 +739,8 @@ async fn a_role_end_is_proposed_confirmed_and_executed_end_to_end(pool: PgPool) 
     // A bootstrap grant by P: no custodian holds a passkey yet.
     let assignment: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let a = sqlx::query_scalar(
-            "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'test')",
+            "SELECT public.epigraph_grant_role('role:auditor', $1, \
+                    now() - interval '30 seconds', NULL, $2, 'test')",
         )
         .bind(x)
         .bind(p)
@@ -1000,7 +1002,8 @@ async fn enrolled_custodian(
         let (x, _) = fixture::seed_human_operator(pool, &format!("auditor {i}")).await;
         *a = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
             let a = sqlx::query_scalar(
-                "SELECT public.epigraph_grant_role('role:auditor', $1, NULL, NULL, $2, 'test')",
+                "SELECT public.epigraph_grant_role('role:auditor', $1, \
+                    now() - interval '30 seconds', NULL, $2, 'test')",
             )
             .bind(x)
             .bind(p)

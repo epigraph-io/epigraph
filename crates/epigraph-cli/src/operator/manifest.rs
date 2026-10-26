@@ -90,6 +90,11 @@ pub struct Record {
     /// With `after`: a NEIGHBOUR claim's state — a claim this batch did not
     /// move that shares a row with one it did (see the module doc).
     pub neighbour: bool,
+    /// `Some(..)` only on a row of a table that carries migration 114's
+    /// `writer_owned` flag, and only in a `restrict-claims` manifest: a
+    /// narrowing clears the flag (the row follows the claim), so its reversal
+    /// must put the recorded value back. `None` (absent) everywhere else.
+    pub writer_owned: Option<bool>,
 }
 
 impl Record {
@@ -113,6 +118,9 @@ impl Record {
         }
         if self.neighbour {
             v["neighbour"] = json!(true);
+        }
+        if let Some(w) = self.writer_owned {
+            v["writer_owned"] = json!(w);
         }
         v
     }
@@ -147,6 +155,11 @@ impl Record {
             hidden: v.get("hidden").and_then(Value::as_bool).unwrap_or(false),
             after: v.get("after").and_then(Value::as_bool).unwrap_or(false),
             neighbour: v.get("neighbour").and_then(Value::as_bool).unwrap_or(false),
+            writer_owned: match v.get("writer_owned") {
+                None => None,
+                Some(Value::Bool(b)) => Some(*b),
+                Some(other) => bail!("writer_owned is {other}"),
+            },
         })
     }
 
@@ -355,6 +368,7 @@ mod tests {
             hidden: false,
             after: false,
             neighbour: false,
+            writer_owned: None,
         };
         let j = edge.to_json();
         assert!(j.get("co_owner_group_id").is_some_and(Value::is_null));
@@ -367,7 +381,15 @@ mod tests {
         };
         let j = ev.to_json();
         assert!(j.get("co_owner_group_id").is_none());
+        assert!(j.get("writer_owned").is_none());
         assert_eq!(Record::from_json(&j).unwrap(), ev);
+        let wo = Record {
+            writer_owned: Some(true),
+            ..ev
+        };
+        let j = wo.to_json();
+        assert_eq!(j.get("writer_owned"), Some(&json!(true)));
+        assert_eq!(Record::from_json(&j).unwrap(), wo);
     }
 
     #[test]
@@ -386,6 +408,7 @@ mod tests {
             hidden: false,
             after: false,
             neighbour: false,
+            writer_owned: None,
         };
         assert_eq!(w.append(&[r.clone(), r.clone()]).unwrap(), 1);
         assert_eq!(w.append(&[r]).unwrap(), 0);

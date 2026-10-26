@@ -30,6 +30,7 @@
 //! so the 403 in the test above it can only be the scope.
 
 mod common;
+mod viewer_fixture;
 
 async fn spawn() -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -261,6 +262,190 @@ async fn add_member_no_token_returns_401() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401, "got {}", resp.status());
+}
+
+/// A community shaped like migration 068's legacy projection: a `communities`
+/// row, its `groups` row of kind `community` and epoch 0, and NO membership of
+/// any kind (no `community_members`, no `group_memberships`).
+async fn memberless_legacy_community(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let community: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
+            .bind(format!("legacy-community-{}", uuid::Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("seed community");
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_at) \
+         SELECT c.id, c.name, 'did:epigraph:community:' || c.id::text, ''::bytea, \
+                'community', c.created_at \
+           FROM communities c WHERE c.id = $1",
+    )
+    .bind(community)
+    .execute(pool)
+    .await
+    .expect("project the community onto a memberless group, as 068 did");
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, wrapped_key, status) \
+         VALUES ($1, 0, NULL, 'active')",
+    )
+    .bind(community)
+    .execute(pool)
+    .await
+    .expect("project the community's epoch 0");
+    community
+}
+
+/// Backlog 7cdea6f1 (migration 159), through the handler the defect was
+/// reported on (`POST /api/v1/communities/:id/members`), on the APPLICATION
+/// ROLE. A `groups:admin` principal that is NOT a member must not become the
+/// first member of a legacy community nobody has ever joined. Before 159 the
+/// repo rule treated such a group as open, so this caller got 204, became a
+/// live member, and could then admit anyone.
+///
+/// Why the handler is called directly, and not through `common::spawn_app`:
+/// that harness serves requests on the superuser test DSN, a MAINTENANCE
+/// session (`epigraph_bypass()` reads `session_user`), for which 159 keeps the
+/// bootstrap open by design; through it this call answers 204 on 159 as well
+/// (measured). A deployed request process never holds a maintenance DSN
+/// (`epigraph_db::pool`), so both pools here are downgraded to `epigraph_app`,
+/// as `claim_routes_bind_the_caller.rs` does.
+///
+/// The scope is present, so the 403 is the membership rule; the positive
+/// control at the end shows the community was visible and the perspective
+/// found. The effect is checked, not the status alone: no `community_members`
+/// row, no `group_memberships` row, no `MEMBER_OF` edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn add_member_cannot_claim_a_memberless_legacy_community(pool: sqlx::PgPool) {
+    use axum::extract::{Path, State};
+    use axum::response::IntoResponse;
+    use epigraph_api::middleware::bearer::{RequireScopeGroupsAdmin, ViewerExtractor};
+    use epigraph_api::routes::community::{add_member, AddMemberRequest};
+
+    let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "x14-http-joiner").await;
+    let community = memberless_legacy_community(&pool).await;
+    let perspective: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(format!("legacy-joiner-{}", uuid::Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the joiner's perspective");
+    let state = app_role_state(&pool).await;
+
+    let call = |state: epigraph_api::state::AppState, viewer: epigraph_db::Viewer| {
+        add_member(
+            RequireScopeGroupsAdmin(groups_admin(agent)),
+            ViewerExtractor(viewer),
+            State(state),
+            Path(community),
+            axum::Json(AddMemberRequest {
+                perspective_id: perspective,
+            }),
+        )
+    };
+
+    let viewer = epigraph_db::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let status = call(state.clone(), viewer).await.into_response().status();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::FORBIDDEN,
+        "a non-member holding `groups:admin` must not bootstrap a never-populated \
+         community group"
+    );
+    let listed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM community_members WHERE community_id = $1 AND perspective_id = $2",
+    )
+    .bind(community)
+    .bind(perspective)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(listed, 0, "no community_members row may be written");
+    let memberships: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_memberships WHERE group_id = $1")
+            .bind(community)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(memberships, 0, "the group must stay never-populated");
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+           AND relationship = 'MEMBER_OF'",
+    )
+    .bind(perspective)
+    .bind(community)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(edges, 0, "no MEMBER_OF edge may be materialised");
+
+    // POSITIVE CONTROL: once a maintenance session (the superuser fixture
+    // pool) seeds the same agent as a live member, the same caller, community
+    // and perspective succeed on the same application-role state.
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(community)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("operator seeds the first member");
+    let viewer = epigraph_db::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let status = call(state, viewer).await.into_response().status();
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NO_CONTENT,
+        "once the operator has seeded it as a member, the same call must succeed"
+    );
+}
+
+/// Both pools of the state on the application role (see the test above).
+async fn app_role_state(pool: &sqlx::PgPool) -> epigraph_api::state::AppState {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: the test is vacuous"
+    );
+    let url = viewer_fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let raw = viewer_fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut state =
+        epigraph_api::state::AppState::with_db(raw, epigraph_api::state::ApiConfig::default());
+    state.scoped = Some(scoped);
+    state
+}
+
+/// A `groups:admin` token for `agent`, as the bearer middleware would inject it.
+fn groups_admin(agent: uuid::Uuid) -> epigraph_api::middleware::bearer::AuthContext {
+    epigraph_api::middleware::bearer::AuthContext {
+        client_id: uuid::Uuid::new_v4(),
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Agent,
+        scopes: vec!["groups:admin".to_string(), "claims:read".to_string()],
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }
 }
 
 // ===========================================================================

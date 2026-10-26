@@ -1270,13 +1270,15 @@ async fn graph_query_stranger_token_spoofed_owner_omits_the_private_node() {
     // key `seed_probe_claim_with_agent` wrote.
     //
     // This used to be `MATCH (n:claim) RETURN * LIMIT 1000` — match everything,
-    // and trust the seeded row to be inside the window. `graph_query.rs` emits
-    // `SELECT id FROM claims <where> LIMIT <n>` with **no ORDER BY**, so which
-    // 1000 rows come back is whatever the plan yields; once the shared test
-    // database passed ~2500 claims the freshly-seeded row started falling
+    // and trust the seeded row to be inside the window. `graph_query.rs` then
+    // emitted `SELECT id FROM claims <where> LIMIT <n>` with no ORDER BY, so
+    // which 1000 rows came back was whatever the plan yielded; once the shared
+    // test database passed ~2500 claims the freshly-seeded row started falling
     // outside it and the test failed with "seeded claim not present", i.e. a
-    // false failure that says nothing about redaction. A one-row match makes
-    // the assertion about redaction and nothing else.
+    // false failure that says nothing about redaction. The window is now
+    // `ORDER BY created_at DESC, id`, but concurrent writers to the shared
+    // database can still push the row out of a match-everything window. A
+    // one-row match makes the assertion about redaction and nothing else.
     let query = format!("MATCH (n:claim) WHERE n.probe = '{probe}' RETURN *");
     let body = serde_json::json!({
         "query": query,

@@ -21,6 +21,8 @@ pub mod admin_acts;
 #[cfg(feature = "db")]
 pub mod agent_keys;
 #[cfg(feature = "db")]
+pub mod agent_prompt_history;
+#[cfg(feature = "db")]
 pub mod agents;
 pub mod analyze;
 #[cfg(feature = "db")]
@@ -240,8 +242,9 @@ use axum::{
 ///   Allow button bound to a single-use ticket. Rendered inside another
 ///   origin's frame, a signed-in user can be walked onto it (clickjacking).
 ///   The legacy header covers browsers without CSP level 2.
-/// * `Cache-Control: no-store`: that ticket, and every token response (RFC 6749
-///   section 5.1 requires it there), must not be stored by any cache.
+/// * `Cache-Control: no-store` and `Pragma: no-cache`: that ticket, and every
+///   token response, must not be stored by any cache. RFC 6749 section 5.1
+///   requires both on a token response (`Pragma` for HTTP/1.0 caches).
 /// * `Referrer-Policy: no-referrer`: these URLs carry codes and state.
 ///
 /// Inserted, not appended, so a handler cannot weaken them.
@@ -254,6 +257,7 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
     h.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
@@ -395,6 +399,10 @@ pub fn create_router_with_extensions(
             post(versioning::supersede_claim),
         )
         .route("/api/v1/claims/:id/dedup", post(versioning::mark_duplicate))
+        .route(
+            "/api/v1/claims/:id/undedup",
+            post(versioning::unmark_duplicate),
+        )
         .route(
             "/api/v1/claims/:id/revoke-signature",
             post(revoke_signature::revoke_claim_signature),
@@ -748,7 +756,7 @@ pub fn create_router_with_extensions(
     // already registered above (`/api/v1/claims/:id` is the clearest case).
     // ------------------------------------------------------------------
     let protected = protected
-        .route("/claims", get(claims::list_claims))
+        .route("/claims", get(claims::list_claims_route))
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
@@ -761,13 +769,27 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/agents/:id/claims", get(agents::agent_claims))
         .route("/api/v1/agents/:id/keys", get(agent_keys::list_agent_keys))
+        // The agent's prompt snapshots and lineage (design D4): its operator
+        // and admins only, decided by migration 161's definer on the caller's
+        // stamped connection; anyone else gets the 404 an absent agent gets.
+        // There is no registration route: that is the host's act (D3).
+        .route(
+            "/api/v1/agents/:id/prompt-history",
+            get(agent_prompt_history::get_prompt_history),
+        )
+        // One file named in that history, for the same callers, served only
+        // when a snapshot the caller may read names it.
+        .route(
+            "/api/v1/agents/:id/prompt-history/blobs/:hash",
+            get(agent_prompt_history::get_prompt_history_blob),
+        )
         .route(
             "/api/v1/agents/:id/timeline",
             get(timeline::get_agent_timeline),
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
         .route("/api/v1/search/semantic", post(search::semantic_search))
-        .route("/api/v1/claims", get(claims_query::list_claims_query))
+        .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",
             get(claims::find_claims_needing_embeddings),
@@ -927,6 +949,10 @@ pub fn create_router_with_extensions(
             get(workflows::find_workflow_hierarchical),
         )
         .route("/api/v1/workflows/:id", get(workflows::get_workflow))
+        .route(
+            "/api/v1/workflows/:id/plan",
+            get(workflows::get_workflow_plan),
+        )
         .route(
             "/api/v1/policies/network",
             get(policies::list_network_policies),

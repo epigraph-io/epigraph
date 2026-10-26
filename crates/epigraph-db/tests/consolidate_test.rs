@@ -412,8 +412,11 @@ async fn already_superseded_source_is_refused(pool: PgPool) {
     );
 }
 
-/// A repeated identical merge returns the existing claim instead of tripping
-/// uq_claims_content_hash_agent — a retried merge is idempotent, not fatal.
+/// A repeated identical merge returns the existing claim instead of minting a
+/// second row for one (content_hash, agent_id) — a retried merge is
+/// idempotent, not fatal. (Before migration 150 a second row would have
+/// tripped uq_claims_content_hash_agent; from 150 nothing in the database
+/// stops it, so this arm is the guard.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn identical_repeat_merge_returns_existing(pool: PgPool) {
     let agent = seed_agent(&pool).await;

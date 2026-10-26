@@ -378,7 +378,11 @@ fn grant_args(role: &str, holder: Uuid, valid_to: Option<&str>, reason: &str) ->
 }
 
 /// `epigraph_grant_role` (seven-parameter, act-taking form) on a maintenance
-/// session; the new assignment id.
+/// session; the new assignment id. An UNCONFIRMED grant (no act) is
+/// back-dated 30 s (CUS02 admits a minute), because its holder may grant next
+/// and CUS03 re-reads the grantor's liveness at `now()` with no tolerance (a
+/// backward wall-clock step would refuse it); a grant on an act keeps the
+/// definer's default, which `grant_args` states as a null `valid_from`.
 async fn grant_on(
     pool: &PgPool,
     role: &str,
@@ -395,7 +399,9 @@ async fn grant_on(
     );
     fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let r = sqlx::query_scalar::<_, Uuid>(
-            "SELECT public.epigraph_grant_role($1, $2, NULL, $3::timestamptz, $4, $5, $6)",
+            "SELECT public.epigraph_grant_role($1, $2, \
+                    CASE WHEN $6::uuid IS NULL THEN now() - interval '30 seconds' END, \
+                    $3::timestamptz, $4, $5, $6)",
         )
         .bind(&role)
         .bind(holder)

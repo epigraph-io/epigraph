@@ -26,11 +26,13 @@
 //! Its act, the flip to `stale`, is administrative too: migration 118's
 //! `match_candidates_stale_guard` refuses it on a non-privileged session. So
 //! [`apply_match_retire`] runs the flip AND the cascade in one transaction on
-//! the maintenance connection, with the applied row naming the caller. Without
-//! a maintenance connection nothing about the candidate changes: the request
-//! path records the whole retirement as deferred ([`record_deferral`], whose
-//! definer records the candidate's status at that moment), and the replay
-//! carries it out only while the candidate still has that status.
+//! the maintenance connection, with the applied row naming the caller, then
+//! re-derives the belief of the pair's endpoints like the other causes do
+//! (when the retirement withdrew anything). Without a maintenance connection
+//! nothing about the candidate changes: the request path records the whole
+//! retirement as deferred ([`record_deferral`], whose definer records the
+//! candidate's status at that moment), and the replay carries it out only
+//! while the candidate still has that status.
 //!
 //! # The audit trail
 //!
@@ -77,7 +79,9 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use epigraph_db::repos::admin_cascade::{self as audit, EVENT_APPLIED, EVENT_BELIEF, EVENT_FAILED};
+use epigraph_db::repos::admin_cascade::{
+    self as audit, EVENT_APPLIED, EVENT_APPLIED_IDS, EVENT_BELIEF, EVENT_BELIEF_IDS, EVENT_FAILED,
+};
 use epigraph_db::repos::match_candidate::RetirementOutcome;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ClaimRepository, DbError, MatchCandidateRepo};
@@ -107,12 +111,19 @@ pub enum CascadeCause {
     Dedup,
     /// Two or more claims were consolidated into one merged claim.
     Consolidate,
-    /// A promoted match candidate was retired.
+    /// A promoted match candidate was retired: its matcher edge retracted, its
+    /// derived factors, bp_messages and edge-keyed BBAs removed, and both
+    /// endpoints' belief re-derived from the BBAs that survive.
     MatchRetire,
     /// An edge's owner retracted or deleted it (migration 120): every OTHER
     /// writer's edge-keyed BBA on it is removed administratively and the
     /// affected beliefs re-derived.
     EdgeRetract,
+    /// A marked duplicate was un-marked: the dedup's repair reversed from its
+    /// revert record, and both claims' belief re-derived. Never deferred
+    /// (migration 117's deferral definer does not accept it), so an un-mark
+    /// runs only where the maintenance connection is held.
+    Undedup,
 }
 
 impl CascadeCause {
@@ -125,6 +136,7 @@ impl CascadeCause {
             Self::Consolidate => "consolidate",
             Self::MatchRetire => "match_retire",
             Self::EdgeRetract => "edge_retract",
+            Self::Undedup => "undedup",
         }
     }
 
@@ -137,6 +149,7 @@ impl CascadeCause {
             "consolidate" => Some(Self::Consolidate),
             "match_retire" => Some(Self::MatchRetire),
             "edge_retract" => Some(Self::EdgeRetract),
+            "undedup" => Some(Self::Undedup),
             _ => None,
         }
     }
@@ -519,25 +532,36 @@ pub async fn retirement_for_caller(
     out
 }
 
+/// The `details.reason_code` of every [`EVENT_FAILED`] row.
+pub const FAILED_REASON_CODE: &str = "repair_failed";
+
 /// Record a repair that failed (and rolled back), on the maintenance
-/// connection, and build the caller's status: the reason it gets is generic,
-/// the audit row carries the error.
+/// connection, and build the caller's status: the reason it gets is generic.
+///
+/// The audit row carries a static reason ([`FAILED_REASON_CODE`] and the step
+/// that failed), never the error: the row names the triggering agent, who can
+/// read it, and the error is a driver error that can spell SQL, a constraint
+/// or another writer's row (backlog 9d6f21c5). The error goes to the server
+/// log. `step` is `&'static str` so only a literal can reach the row.
 async fn failed(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
-    step: &str,
+    step: &'static str,
     e: impl std::fmt::Display,
 ) -> CascadeStatus {
-    let reason = format!("{step} failed on the maintenance connection: {e}");
+    let reason = format!("{step} failed on the maintenance connection");
     tracing::warn!(
         target: "tenancy.admin_cascade",
         cause = trigger.cause.as_str(),
         subject = %trigger.subject_id,
+        error = %e,
         "{reason}"
     );
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("failed");
-    details["reason"] = serde_json::Value::String(reason);
+    details["reason_code"] = serde_json::json!(FAILED_REASON_CODE);
+    details["reason"] =
+        serde_json::Value::String(format!("{reason}; the detail is in the server log"));
     let (audit_event_id, audit_error) =
         match audit::record(&mut *admin, EVENT_FAILED, trigger.agent_id, false, &details).await {
             Ok(id) => (Some(id), None),
@@ -572,20 +596,51 @@ async fn failed(
 /// the error text (the transaction rolled back; nothing of the repair or the
 /// row committed).
 macro_rules! repair_with_audit {
-    ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr) => {{
+    ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr) => {
+        repair_with_audit!($admin, $trigger, |$tx| $repair, |$out| $touched, record: None)
+    };
+    ($admin:expr, $trigger:expr, |$tx:ident| $repair:expr, |$out:ident| $touched:expr,
+     record: $record:expr) => {{
         let res: Result<_, String> = async {
             let mut $tx = sqlx::Acquire::begin(&mut *$admin)
                 .await
                 .map_err(|e| e.to_string())?;
             let $out = $repair.await.map_err(|e| e.to_string())?;
+            let touched: serde_json::Value = $touched;
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
-            details["touched"] = $touched;
+            // The applied row names the triggering principal, who can read it
+            // (`security_events_read`): it carries COUNTS. The ids the repair
+            // moved -- other writers' edges among them -- go to an agent-less
+            // companion row in the same transaction, when there are any.
+            let counts = counts_only(&touched);
+            let has_ids = counts != touched;
+            details["touched"] = counts;
+            let record: Option<serde_json::Value> = $record;
             let id = audit::record(&mut *$tx, EVENT_APPLIED, $trigger.agent_id, true, &details)
                 .await
                 .map_err(|e| format!("the audit row could not be written: {e}"))?;
+            if has_ids {
+                let ids = serde_json::json!({
+                    "cause": $trigger.cause.as_str(),
+                    "applied_event_id": id,
+                    "subject_id": $trigger.subject_id,
+                    "touched": &touched,
+                });
+                audit::record(&mut *$tx, EVENT_APPLIED_IDS, None, true, &ids)
+                    .await
+                    .map_err(|e| format!("the applied ids row could not be written: {e}"))?;
+            }
+            // The revert record names other writers' rows: its own row, which
+            // the triggering principal cannot read (`audit::record_dedup_revert`),
+            // committed with the applied row it belongs to.
+            if let Some(record) = record {
+                audit::record_dedup_revert(&mut *$tx, id, $trigger.subject_id, &record)
+                    .await
+                    .map_err(|e| format!("the revert record could not be written: {e}"))?;
+            }
             $tx.commit().await.map_err(|e| e.to_string())?;
-            Ok(($out, id, details["touched"].clone()))
+            Ok(($out, id, touched))
         }
         .await;
         res
@@ -596,6 +651,11 @@ macro_rules! repair_with_audit {
 type BeliefAudit = (Option<Uuid>, Option<String>);
 
 /// Write the belief re-derivation's row after the applied repair (best-effort).
+///
+/// The row names the triggering principal, who can read it
+/// (`security_events_read`), so it carries [`belief_counts`]; the claim ids
+/// and error texts go to an agent-less [`EVENT_BELIEF_IDS`] row, committed
+/// with it in one transaction.
 async fn record_belief(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
@@ -604,22 +664,42 @@ async fn record_belief(
 ) -> BeliefAudit {
     let mut details = trigger.audit_details();
     details["applied_event_id"] = serde_json::json!(applied_event_id);
-    details["belief"] = serde_json::json!({
+    details["belief"] = belief_counts(report);
+    let full = serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
         "errors": report.errors,
     });
-    match audit::record(
-        &mut *admin,
-        EVENT_BELIEF,
-        trigger.agent_id,
-        report.errors.is_empty(),
-        &details,
-    )
-    .await
-    {
+    let written: Result<Uuid, String> = async {
+        let mut tx = sqlx::Acquire::begin(&mut *admin)
+            .await
+            .map_err(|e| e.to_string())?;
+        let id = audit::record(
+            &mut *tx,
+            EVENT_BELIEF,
+            trigger.agent_id,
+            report.errors.is_empty(),
+            &details,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let ids = serde_json::json!({
+            "cause": trigger.cause.as_str(),
+            "applied_event_id": applied_event_id,
+            "belief_event_id": id,
+            "subject_id": trigger.subject_id,
+            "belief": full,
+        });
+        audit::record(&mut *tx, EVENT_BELIEF_IDS, None, true, &ids)
+            .await
+            .map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+    .await;
+    match written {
         Ok(id) => (Some(id), None),
         Err(e) => {
             tracing::error!(
@@ -741,7 +821,10 @@ pub async fn apply_after_dedup(
             "bbas_moved": r.moved_bbas,
             "duplicate_copies_dropped": r.dropped_duplicate_copies,
             "false_bindings_not_copied": r.skipped_false_bindings,
-        })
+            "bbas_pooled": r.pooled_bbas.len(),
+            "bbas_kept_on_duplicate": r.kept_on_duplicate.len(),
+        }),
+        record: serde_json::to_value(&r.revert).ok()
     );
     let (repair, applied_id, touched) = match repaired {
         Ok(r) => r,
@@ -756,6 +839,249 @@ pub async fn apply_after_dedup(
     let belief = record_belief(admin, trigger, applied_id, &report).await;
     let status = applied(applied_id, &touched, Some((&report, belief)));
     (status, report_for_caller(admin, caller, &report).await)
+}
+
+/// What [`apply_unmark`] did, the caller's copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnmarkOutcome {
+    /// The canonical the claim had been marked a duplicate of.
+    pub canonical_id: Uuid,
+    /// The canonical the duplicate was restored against: `canonical_id`, or
+    /// the claim that replaced it since (supersession or consolidation,
+    /// followed to the current one; operator ruling R-11).
+    pub current_canonical_id: Uuid,
+    /// The administrative cascade's status (`touched` holds counts only).
+    pub cascade: CascadeStatus,
+}
+
+/// Why an un-mark changed nothing (its transaction rolled back).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnmarkRefusal {
+    /// The act refused: not a dedup-marked duplicate, or not writable.
+    Act(String),
+    /// No applied repair record and no open cascade for this mark, and it is
+    /// not a legacy mark the operator backfill gave its identity edge: there is
+    /// nothing to reverse it from.
+    NoRecord,
+    /// Any other failure of the reversal or its audit row.
+    Failed(String),
+}
+
+impl std::fmt::Display for UnmarkRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Act(e) => write!(f, "{e}"),
+            Self::NoRecord => f.write_str(
+                "there is no record of this dedup's repair (it was repaired before revert \
+                 records existed, or not through the administrative cascade), so it cannot \
+                 be reversed exactly; nothing was changed",
+            ),
+            Self::Failed(e) => write!(f, "the un-mark failed and nothing was changed: {e}"),
+        }
+    }
+}
+
+/// Un-mark a duplicate, administratively and atomically: in ONE transaction
+/// on the maintenance connection, the un-mark's act
+/// ([`ClaimRepository::unmark_duplicate_act_conn`]), the reversal of the
+/// dedup's repair from the revert record its applied audit row kept
+/// ([`ClaimRepository::reverse_marked_duplicate_conn`]), the retirement of any
+/// still-open cascade of that mark, and an applied `undedup` audit row naming
+/// the caller. Then the belief of both claims (and every far-end claim whose
+/// BBAs moved) is re-derived, with the DUPLICATE's interval refreshed first
+/// ([`cascade_after_dedup`] over [`epigraph_db::DedupReversal::as_repair`]).
+///
+/// The act runs here, not on the caller's stamped transaction, so that the
+/// act and the reversal cannot be split: an un-mark cannot be deferred
+/// (migration 117's deferral definer has no such cause), and a committed act
+/// whose reversal failed would leave a current claim with its edges and BBAs
+/// still on the canonical. The request paths therefore establish the caller's
+/// write authority FIRST, by running the same act on the caller's stamped
+/// transaction and rolling it back.
+///
+/// A canonical superseded or consolidated since the mark is followed to the
+/// current one, and the duplicate is restored against it (operator ruling
+/// R-11): the reversal takes each repaired row back from wherever along that
+/// chain it now is.
+///
+/// # Errors
+/// [`UnmarkRefusal`]: nothing was changed. `expected_canonical` is the
+/// canonical the caller's authority was checked against; a duplicate marked
+/// onto any other is refused as [`UnmarkRefusal::Act`].
+pub async fn apply_unmark(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    dup_id: Uuid,
+    expected_canonical: Uuid,
+) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
+    apply_unmark_authorized(
+        admin,
+        admin_viewer,
+        caller,
+        trigger,
+        dup_id,
+        expected_canonical,
+        None,
+    )
+    .await
+}
+
+/// [`apply_unmark`] for a request path that checked the caller's authority
+/// over every claim of the canonical's chain
+/// ([`ClaimRepository::unmark_chain_conn`], read on the caller's own
+/// transaction): `authorized_chain` is that chain, and an act that resolves
+/// any other (the canonical was replaced again since) is refused as
+/// [`UnmarkRefusal::Act`], as a different canonical is.
+///
+/// # Errors
+/// As [`apply_unmark`].
+pub async fn apply_unmark_authorized(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    dup_id: Uuid,
+    expected_canonical: Uuid,
+    authorized_chain: Option<&[Uuid]>,
+) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
+    use epigraph_core::ClaimId;
+    let mut tx = sqlx::Acquire::begin(&mut *admin)
+        .await
+        .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
+    // The act re-reads the canonical's chain and refuses one other than
+    // `authorized_chain` (the canonical was replaced again since the caller
+    // was checked) without naming what it read under the admin viewer.
+    let unmarked = ClaimRepository::unmark_duplicate_act_authorized_conn(
+        &mut tx,
+        admin_viewer,
+        ClaimId::from_uuid(dup_id),
+        authorized_chain,
+    )
+    .await
+    .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
+    let canonical_id = unmarked.canonical;
+    // The act locked the duplicate's row; the mark it found must be the one
+    // the caller was authorized against (read earlier, on its own transaction).
+    if canonical_id != expected_canonical {
+        return Err(UnmarkRefusal::Act(format!(
+            "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
+             {expected_canonical}, which the caller's authority was checked against; \
+             nothing was changed"
+        )));
+    }
+    let current_canonical_id = unmarked.current_canonical();
+    let failed = |e: String| UnmarkRefusal::Failed(e);
+    let record = audit::dedup_revert_record(&mut *tx, dup_id, unmarked.identity_edge)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let open = audit::open_dedup_cascades(&mut *tx, dup_id)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    let (reversed_event_id, reversal) = match record {
+        Some((event_id, json)) => {
+            let rec: epigraph_db::DedupRevert =
+                serde_json::from_value(json).map_err(|e| failed(format!("revert record: {e}")))?;
+            let reversal = ClaimRepository::reverse_marked_duplicate_conn(
+                &mut tx,
+                ClaimId::from_uuid(dup_id),
+                &unmarked.chain,
+                &rec,
+            )
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+            (Some(event_id), reversal)
+        }
+        // A legacy `fuzzy_dedup_claims` mark whose identity edge the operator
+        // backfill reconstructed is an ordinary dedup record (operator ruling
+        // R-7). Its raw-SQL repair kept no record, so the reversal has nothing
+        // to put back; it still runs, with the empty record, so the duplicate's
+        // own edges get their BP factors back as on every un-mark.
+        None if unmarked.legacy_backfill => {
+            let rec = epigraph_db::DedupRevert {
+                identity_edge: Some(unmarked.identity_edge),
+                ..Default::default()
+            };
+            let reversal = ClaimRepository::reverse_marked_duplicate_conn(
+                &mut tx,
+                ClaimId::from_uuid(dup_id),
+                &unmarked.chain,
+                &rec,
+            )
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+            (None, reversal)
+        }
+        // The mark's repair never ran (its cascade is still deferred or
+        // failed): there is nothing to put back, only the cascade to retire.
+        None if !open.is_empty() => (
+            None,
+            epigraph_db::DedupReversal {
+                stale_claims: vec![dup_id, current_canonical_id],
+                ..Default::default()
+            },
+        ),
+        None => return Err(UnmarkRefusal::NoRecord),
+    };
+    for event_id in &open {
+        audit::retire_pending(
+            &mut *tx,
+            *event_id,
+            "unmark_duplicate",
+            "the duplicate was un-marked before this cascade was applied",
+        )
+        .await
+        .map_err(|e| failed(e.to_string()))?;
+    }
+    // Counts only: this row names the caller (`agent_id`), who may read it,
+    // and the reversal's ids are other writers' rows.
+    let mut touched = serde_json::json!({
+        "edges_resourced_back": reversal.resourced_back.len(),
+        "edges_retargeted_back": reversal.retargeted_back.len(),
+        "edges_unretracted": reversal.unretracted_edges.len(),
+        "bbas_returned": reversal.returned_bbas.len(),
+        "bbas_restored": reversal.restored_bbas.len(),
+        "frames_unbound": reversal.unbound_frames.len(),
+        "cached_rows_cleared": reversal.cleared_cached_rows,
+        "drifted": reversal.drifted.len(),
+        "cascades_retired": open.len(),
+    });
+    let legacy_mark = reversed_event_id.is_none() && unmarked.legacy_backfill;
+    if legacy_mark {
+        // Said, not left to read as an exact reversal: the legacy script moved
+        // or deleted the duplicate's rows and recorded none of it.
+        touched["legacy_mark"] = serde_json::json!(true);
+    }
+    let mut details = trigger.audit_details();
+    details["outcome"] = serde_json::json!("applied");
+    if legacy_mark {
+        details["legacy_mark"] = serde_json::json!(true);
+    }
+    if current_canonical_id != canonical_id {
+        // Restored against the canonical's current replacement (R-11).
+        details["canonical_chain"] = serde_json::json!(unmarked.chain);
+    }
+    details["identity_edge"] = serde_json::json!(unmarked.identity_edge);
+    details["reversed_event_id"] = serde_json::json!(reversed_event_id);
+    details["touched"] = touched.clone();
+    let applied_id = audit::record(&mut *tx, EVENT_APPLIED, trigger.agent_id, true, &details)
+        .await
+        .map_err(|e| failed(format!("the audit row could not be written: {e}")))?;
+    tx.commit().await.map_err(|e| failed(e.to_string()))?;
+
+    let report =
+        cascade_after_dedup(&mut *admin, admin_viewer, dup_id, &reversal.as_repair()).await;
+    let belief = record_belief(admin, trigger, applied_id, &report).await;
+    let cascade = applied(applied_id, &touched, Some((&report, belief)));
+    Ok((
+        UnmarkOutcome {
+            canonical_id,
+            current_canonical_id,
+            cascade,
+        },
+        report_for_caller(admin, caller, &report).await,
+    ))
 }
 
 /// The consolidation cascade: migrate the retired sources' live edges onto
@@ -791,14 +1117,33 @@ pub async fn apply_after_consolidate(
 /// ([`MatchCandidateRepo::retire_conn`]), and write its audit row, in ONE
 /// transaction. `trigger.candidate_status`, when set, is the status the
 /// retirement was requested against, and a candidate decided again since is
-/// refused (the status is `failed` and nothing changed). The returned outcome
-/// is filtered to `caller`.
+/// refused (the status is `failed` and nothing changed).
+///
+/// Then, when the retirement withdrew anything (an edge, a factor or an
+/// edge-keyed BBA), the belief of both endpoints is re-derived from the
+/// `mass_functions` that survive, like every other cascade that removes belief
+/// inputs ([`crate::retraction_cascade::cascade_after_edge_withdrawal`]: each
+/// endpoint is recomputed on `binary_truth`, or has its cache cleared when no
+/// BBA on any frame backs it), and the re-derivation writes its own
+/// [`EVENT_BELIEF`] row. This is the only operation that repairs a
+/// `pignistic_prob` a past `POST /api/v1/bp/propagate` with
+/// `apply_updates: true` biased through the retired factor: a later propagate
+/// builds its variables from the surviving `factors` only, so an endpoint whose
+/// only factor was the matcher edge is no longer a variable at all, and scalar
+/// BP seeds its priors from the stored (biased) value. A retirement that
+/// withdrew nothing (a candidate never promoted, or retired already) changed no
+/// belief input, and re-deriving would only rewrite caches it never fed.
+///
+/// `admin` / `admin_viewer` / `caller` as for [`apply_after_supersede`]: the
+/// re-derivation runs with the bypass viewer, and the returned outcome and
+/// belief report are filtered to `caller`.
 pub async fn apply_match_retire(
     admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
     caller: &Viewer,
     trigger: &CascadeTrigger,
     candidate_id: Uuid,
-) -> (CascadeStatus, Option<RetirementOutcome>) {
+) -> (CascadeStatus, Option<RetirementOutcome>, CascadeReport) {
     let expected = trigger.candidate_status.clone();
     let repaired = repair_with_audit!(
         admin,
@@ -819,17 +1164,38 @@ pub async fn apply_match_retire(
             "affected_claims": o.affected_claims,
         })
     );
-    match repaired {
-        Ok((outcome, applied_id, touched)) => {
-            let status = applied(applied_id, &touched, None);
-            let outcome = retirement_for_caller(admin, caller, &outcome).await;
-            (status, Some(outcome))
+    let (outcome, applied_id, touched) = match repaired {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                failed(admin, trigger, "the match-candidate retirement", e).await,
+                None,
+                CascadeReport::default(),
+            )
         }
-        Err(e) => (
-            failed(admin, trigger, "the match-candidate retirement", e).await,
-            None,
-        ),
-    }
+    };
+    let withdrew = outcome.edges_retracted + outcome.factors_deleted + outcome.bbas_invalidated > 0;
+    let (status, report) = if withdrew {
+        // Over the UNFILTERED endpoints, with the bypass viewer: the caller's
+        // view filters what it is told, never what is repaired.
+        let report = crate::retraction_cascade::cascade_after_edge_withdrawal(
+            &mut *admin,
+            admin_viewer,
+            &outcome.affected_claims,
+            outcome.bbas_invalidated,
+        )
+        .await;
+        let belief = record_belief(admin, trigger, applied_id, &report).await;
+        let status = applied(applied_id, &touched, Some((&report, belief)));
+        (status, report_for_caller(admin, caller, &report).await)
+    } else {
+        (
+            applied(applied_id, &touched, None),
+            CascadeReport::default(),
+        )
+    };
+    let outcome = retirement_for_caller(admin, caller, &outcome).await;
+    (status, Some(outcome), report)
 }
 
 /// The `edge_retract` cascade (migration 120), on the maintenance connection:
@@ -1096,14 +1462,14 @@ pub async fn replay_deferred(
             }
             (CascadeCause::Consolidate, _) => apply_after_consolidate(admin, &trigger).await,
             (CascadeCause::MatchRetire, _) => {
-                apply_match_retire(admin, admin_viewer, &trigger, subject)
+                apply_match_retire(admin, admin_viewer, admin_viewer, &trigger, subject)
                     .await
                     .0
             }
             (CascadeCause::EdgeRetract, _) => {
                 apply_after_edge_retract(admin, admin_viewer, &trigger, None).await
             }
-            (CascadeCause::Supersede | CascadeCause::Dedup, None) => {
+            (CascadeCause::Undedup, _) | (CascadeCause::Supersede | CascadeCause::Dedup, None) => {
                 report.unreadable += 1;
                 report.items.push(ReplayItem {
                     deferred_event_id: event_id,
@@ -1111,7 +1477,11 @@ pub async fn replay_deferred(
                     subject_id: Some(subject),
                     status: CascadeStatus {
                         status: CascadeState::Deferred,
-                        reason: Some("the deferral row names no object claim".to_string()),
+                        reason: Some(if trigger.cause == CascadeCause::Undedup {
+                            "an un-mark is never deferred; this row cannot be replayed".to_string()
+                        } else {
+                            "the deferral row names no object claim".to_string()
+                        }),
                         audit_event_id: Some(event_id),
                         ..CascadeStatus::default()
                     },
@@ -1205,6 +1575,8 @@ mod tests {
             CascadeCause::Dedup,
             CascadeCause::Consolidate,
             CascadeCause::MatchRetire,
+            CascadeCause::EdgeRetract,
+            CascadeCause::Undedup,
         ] {
             assert_eq!(CascadeCause::parse(c.as_str()), Some(c));
         }

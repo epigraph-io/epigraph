@@ -17,13 +17,17 @@
 //! (the cores behind MCP `ingest_document`, `ingest_document_inline` and
 //! `ingest_document_spine`) and then asks `verify_claim` about what landed.
 //!
-//! Deliberately does NOT use `tests/common`: that helper DROPs
-//! `uq_claims_content_hash_agent`, and the seed-scoped digest exists precisely
-//! to satisfy that constraint — keeping it in force is part of what makes these
-//! fixtures realistic.
+//! Keeps `uq_claims_content_hash_agent` IN FORCE: the seed-scoped digest
+//! exists precisely to satisfy that constraint, so keeping it is part of what
+//! makes these fixtures realistic. Migration 150 drops it from every database
+//! (backlog 00f1a517), so [`make_server`] re-adds it on the private
+//! `#[sqlx::test]` database with `tests/common::add_unique_constraint`, which
+//! asserts it is present.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+
+mod common;
 
 use epigraph_crypto::AgentSigner;
 use epigraph_ingest::schema::DocumentExtraction;
@@ -49,7 +53,10 @@ const ATOM: &str = "Tip functionalization occurred under ultra-high vacuum.";
 /// superuser, so the stamp is inert here — what this buys is that the fixture
 /// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
 /// refusal.
+///
+/// Re-adds `uq_claims_content_hash_agent` first (see the module doc).
 async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
+    common::add_unique_constraint(&pool).await;
     let scoped = fixture::scoped_pool(&pool).await;
     let signer = AgentSigner::generate();
     let embedder = McpEmbedder::new(pool.clone(), None).with_scoped_pool(scoped.clone());

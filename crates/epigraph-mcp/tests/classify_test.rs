@@ -13,7 +13,7 @@ use epigraph_crypto::AgentSigner;
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::types::{GetClaimParams, RecomputeBeliefsParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -59,6 +59,7 @@ async fn wire(pool: &PgPool, claim: Uuid, agent: Uuid, confidence: f64, supports
         supports,
         None,
         None,
+        false, // seed_truth_prior: direct calls exercise the combine alone
     )
     .await
     .expect("auto_wire_ds_update");
@@ -166,8 +167,8 @@ async fn get_claim_exposes_classification(pool: PgPool) {
     )
     .await
     .expect("get_claim");
-    let text = match out.content.first().cloned().expect("content").raw {
-        RawContent::Text(t) => t.text,
+    let text = match out.content.first().cloned().expect("content") {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text, got {other:?}"),
     };
     let j: serde_json::Value = serde_json::from_str(&text).expect("json");

@@ -505,10 +505,10 @@ async fn get_provenance_bounds_total_output_when_evidence_dense(pool: PgPool) {
 /// against a `max_depth` of 5, and 3 nodes is far under 50 — so the bundle must
 /// report `truncated: false`.
 ///
-/// This has to be a SEPARATE fixture rather than another arm of the test above:
-/// passing `max_depth: Some(1)` to shrink that lineage would make
-/// `max_depth_reached == max_depth`, which `get_lineage` infers as truncation,
-/// so the widened-caps arm there cannot serve as the negative case.
+/// This has to be a SEPARATE fixture rather than another arm of the test above,
+/// whose lineage is built to exceed the default caps. The exact-depth edge of
+/// the flag (a lineage ending AT `max_depth` is not truncated) is pinned by
+/// `get_provenance_truncated_is_exact_at_max_depth`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_provenance_reports_untruncated_when_the_lineage_fits(pool: PgPool) {
     let agent = seed_agent(&pool).await;
@@ -818,12 +818,15 @@ async fn seed_claim(pool: &PgPool, agent_id: Uuid, content: &str) -> Uuid {
     id
 }
 
-/// `ancestor -> descendant`, the direction `get_lineage`'s recursive CTE walks
-/// (`e.source_id = c.id AND e.target_id = l.id`).
+/// `ancestor --supports--> descendant`: `supports` is a derivation
+/// relationship `get_lineage` walks over the INCOMING edge, so `ancestor` is
+/// reached from `descendant`. (Not a verb edge like `DERIVED_FROM`, whose
+/// place in the lineage walk is an open ruling, not something this fixture
+/// should depend on.)
 async fn seed_claim_edge(pool: &PgPool, ancestor: Uuid, descendant: Uuid) {
     sqlx::query(
         "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
-         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'DERIVED_FROM')",
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'supports')",
     )
     .bind(ancestor)
     .bind(descendant)
@@ -904,4 +907,66 @@ async fn seed_asserts_edge(pool: &PgPool, paper: Uuid, claim: Uuid) {
     .execute(pool)
     .await
     .expect("seed asserts edge");
+}
+
+/// `get_provenance`'s bundle-level `truncated` is exact at `max_depth`: a
+/// lineage whose furthest ancestor sits EXACTLY at `max_depth` is complete, and
+/// one with an ancestor beyond it is cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_provenance_truncated_is_exact_at_max_depth(pool: PgPool) {
+    const CUT: i32 = 2;
+    let agent = seed_agent(&pool).await;
+    // c0 -> c1 -> c2 -> c3: from c2 the ancestry ends at exactly CUT; from c3
+    // one ancestor (c0) lies past it.
+    let mut chain = Vec::new();
+    for i in 0..=(CUT + 1) {
+        let c = seed_claim(&pool, agent, &format!("depth chain {i}")).await;
+        if let Some(prev) = chain.last() {
+            seed_claim_edge(&pool, *prev, c).await;
+        }
+        chain.push(c);
+    }
+
+    let server = build_test_server(pool.clone());
+    let viewer = fixture::public_viewer(&pool).await;
+    let bundle_for = |target: Uuid| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            let result = get_provenance(
+                server,
+                viewer,
+                GetProvenanceParams {
+                    claim_id: target.to_string(),
+                    max_depth: Some(CUT),
+                    max_nodes: None,
+                    max_content_chars: None,
+                    max_output_chars: None,
+                },
+            )
+            .await
+            .expect("get_provenance");
+            serde_json::from_str::<Value>(&raw_text(&result)).expect("bundle is JSON")
+        }
+    };
+
+    let complete = bundle_for(chain[CUT as usize]).await;
+    assert_eq!(
+        complete["claim_node_count"],
+        Value::from(CUT + 1),
+        "{complete}"
+    );
+    assert_eq!(
+        complete["truncated"],
+        Value::Bool(false),
+        "an ancestry ending exactly at max_depth is complete: {complete}"
+    );
+
+    let cut = bundle_for(chain[CUT as usize + 1]).await;
+    assert_eq!(cut["claim_node_count"], Value::from(CUT + 1), "{cut}");
+    assert_eq!(
+        cut["truncated"],
+        Value::Bool(true),
+        "an ancestor lies past max_depth, so the bundle must say it was cut: {cut}"
+    );
 }

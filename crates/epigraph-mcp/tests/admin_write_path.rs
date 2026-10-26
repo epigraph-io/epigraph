@@ -74,6 +74,7 @@ async fn admin(pool: &PgPool, grant: bool) -> Admin {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         },
         viewer: Viewer::resolve(pool, agent).await.expect("admin viewer"),
     }

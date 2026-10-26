@@ -17,6 +17,10 @@
 //! * `hide-evidence` — hide and PIN selected evidence rows on the operator's
 //!   claims (Amendment 2; migration 110's `evidence_visibility_pins` keeps
 //!   them hidden), under the guards and manifest `hide`'s module doc lists.
+//! * `restrict-claims` — move listed PUBLIC claims, and every row that follows
+//!   them, into a target group with `visibility = 'group'` (the audited admin
+//!   privatization act; see [`restrict`]). `reown-reverse` reverses its
+//!   manifest exactly.
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!
@@ -81,6 +85,29 @@
 //!   own trigger. Armed, every mint strips them and every path that hands
 //!   scopes out refuses them; an admin act then needs an elevation.
 //!
+//! And a graph cleanup (drain U048; see [`delete_frames`]):
+//!
+//! * `delete-frames` — remove an explicit list of test or probe `frames` rows
+//!   with the companion test-claim rows that cascade from them, refusing every
+//!   frame a real claim's BBA, a factor, a child frame, a cached belief or an
+//!   edge still depends on. Audited (`operator.frames_deleted`).
+//!
+//! And keyless team groups (migration 164; see [`team_group`]):
+//!
+//! * `create-group --kind team --name N --admin <person>` — a group with no
+//!   key material whose admin is a registered human operator. Audited
+//!   (`group.team_created`).
+//! * `group-member add|remove|set-role` — change its roster: an operated agent
+//!   is a member only where its operator writes, the last live admin stays,
+//!   and a removal is a revoke. Each act audited (`group.member_*`).
+//!
+//! And an OAuth cleanup (backlog d3cdd376; see [`dcr_sweep`]):
+//!
+//! * `sweep-dcr-clients` — revoke the dynamically registered (RFC 7591)
+//!   clients that never completed an authorization and are older than a floor
+//!   (default 24 h), one `oauth.dcr_client_swept` audit row each;
+//!   `list-dcr-clients` — the read-only census behind it.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -116,7 +143,10 @@ pub mod binding_client;
 pub mod client_scope;
 pub mod confirmations;
 pub mod custodian;
+pub mod dcr_sweep;
+pub mod delete_frames;
 pub mod elevation;
+pub mod group_role;
 pub mod hide;
 pub mod human;
 pub mod legacy;
@@ -125,9 +155,11 @@ pub mod manifest;
 pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
+pub mod restrict;
 pub mod reverse;
 pub mod system_agent;
 pub mod tables;
+pub mod team_group;
 
 use anyhow::{anyhow, bail, Context};
 use sqlx::PgConnection;

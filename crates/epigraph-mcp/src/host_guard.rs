@@ -2,13 +2,13 @@
 //!
 //! ## Why this exists
 //!
-//! The workspace pins `rmcp = "0.15"` (Cargo.lock resolves 0.15.0). That
-//! version's [`StreamableHttpServerConfig`] has exactly four fields
-//! (`sse_keep_alive`, `sse_retry`, `stateful_mode`, `cancellation_token`) — no
-//! `allowed_hosts` / `allowed_origins` knob — and the crate source contains no
-//! Host- or Origin-validation code anywhere. rmcp added that guard internally
-//! in 1.4.0 (CVE-2026-42559 class); until this workspace takes that major bump
-//! the transport ships with **no** rebinding defense.
+//! This guard predates the rmcp bump: rmcp 0.15 validated neither `Host` nor
+//! `Origin`. rmcp added a Host check of its own in 1.4.0 (CVE-2026-42559), and
+//! the workspace is now on 2.x, but this layer stays the authoritative one: it
+//! runs OUTSIDE auth (rmcp's check runs inside the service, after it), it
+//! normalizes trailing DNS dots, and it checks `Origin` against the same list.
+//! [`streamable_http_server_config`] feeds rmcp's check the same allowlist, so
+//! the two layers enforce one policy.
 //!
 //! Without it, a browser on the same host as the listener can be pointed at a
 //! hostile page whose DNS rebinds to `127.0.0.1:<mcp port>`. The browser then
@@ -50,6 +50,7 @@ use http::{
     header::{HOST, ORIGIN},
     StatusCode,
 };
+use rmcp::transport::streamable_http_server::StreamableHttpServerConfig;
 
 /// Authorities always permitted, regardless of `--listen` / `--allowed-host`.
 ///
@@ -154,6 +155,23 @@ impl HostAllowlist {
             .is_some_and(|authority| self.allows_host(authority))
     }
 
+    /// The allowlist in the form rmcp's `allowed_hosts` takes: each hostname,
+    /// plus its fully-qualified `name.` spelling. rmcp matches a port-less entry
+    /// against any port, as this allowlist does, but it does not strip a
+    /// trailing DNS dot, so without the dotted twin a `Host: localhost.` that
+    /// this guard serves would be refused inside the service. IPv6 literals get
+    /// no dotted twin (a dot is not part of any address spelling).
+    #[must_use]
+    pub fn rmcp_allowed_hosts(&self) -> Vec<String> {
+        self.allowed
+            .iter()
+            .flat_map(|h| {
+                let dotted = (!h.contains(':')).then(|| format!("{h}."));
+                std::iter::once(h.clone()).chain(dotted)
+            })
+            .collect()
+    }
+
     /// Comma-separated rendering for the startup log, so an operator debugging
     /// a 403 can see what the process actually accepts.
     #[must_use]
@@ -163,6 +181,41 @@ impl HostAllowlist {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// The rmcp [`StreamableHttpServerConfig`] for an MCP HTTP listener.
+///
+/// `tcp_allowlist` is the TCP listener's [`HostAllowlist`] (the one
+/// [`host_guard_middleware`] enforces), or `None` for a unix-socket listener.
+/// Callers reach it through [`crate::http_listener::mcp_http_listener`], which
+/// `main.rs` and the HTTP Host tests both call, so those tests serve the config
+/// `main.rs` builds for the same `--listen` / `--allowed-host` values.
+///
+/// rmcp (>= 1.4) validates `Host` inside the service too, and its default
+/// `allowed_hosts` is loopback only. Left at that default, a reverse-proxied
+/// request whose public `Host` the outer guard allowlists would still be
+/// refused one layer in. So:
+///
+/// - **TCP**: rmcp gets the same allowlist ([`HostAllowlist::rmcp_allowed_hosts`]),
+///   making its check a second copy of the guard's rather than a different
+///   policy. The guard stays the outermost, authoritative layer (it runs before
+///   auth, and also covers the trailing-dot and Origin cases).
+/// - **Unix socket**: rmcp's Host check is disabled, matching the absent guard
+///   layer: a unix socket has no DNS-rebinding surface.
+///
+/// rmcp's own `allowed_origins` stays empty (its "not checked" setting):
+/// [`host_guard_middleware`] already refuses any `Origin` outside the
+/// allowlist, and rmcp's form needs scheme-qualified entries the allowlist
+/// does not hold.
+#[must_use]
+pub fn streamable_http_server_config(
+    tcp_allowlist: Option<&HostAllowlist>,
+) -> StreamableHttpServerConfig {
+    let config = StreamableHttpServerConfig::default();
+    match tcp_allowlist {
+        Some(allowlist) => config.with_allowed_hosts(allowlist.rmcp_allowed_hosts()),
+        None => config.disable_allowed_hosts(),
     }
 }
 

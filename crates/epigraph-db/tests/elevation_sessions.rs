@@ -1282,12 +1282,20 @@ async fn the_live_assignment_must_be_the_stored_one(pool: PgPool) {
     let sid = elevated(&pool, &h).await;
     let q = holder(&pool, "grantor", 2).await;
     // Since 130 the grantor Q holds a passkey, so the grant rides a confirmed
-    // `role.grant` act (the fixture's stand-in).
+    // `role.grant` act (the fixture's stand-in). Back-dated like the fixture's
+    // grants (its liveness is read below), so the act states the same
+    // canonical `valid_from` the 130 guard recomputes from the row.
+    let from: String =
+        sqlx::query_scalar("SELECT public.epigraph_canonical_timestamp(now() - $1::interval)")
+            .bind(fixture::FIXTURE_GRANT_BACKDATE)
+            .fetch_one(&pool)
+            .await
+            .expect("the back-dated valid_from");
     let act = fixture::confirmed_act(
         &pool,
         "role.grant",
         &format!(
-            "{{\"role\": \"{CUSTODIAN}\", \"holder\": \"{}\", \"valid_from\": null, \
+            "{{\"role\": \"{CUSTODIAN}\", \"holder\": \"{}\", \"valid_from\": \"{from}\", \
              \"valid_to\": null, \"reason\": \"a second assignment\"}}",
             h.person
         ),
@@ -1295,12 +1303,14 @@ async fn the_live_assignment_must_be_the_stored_one(pool: PgPool) {
     )
     .await;
     sqlx::query(
-        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'a second assignment', $4)",
+        "SELECT public.epigraph_grant_role($1, $2, $5::timestamptz, NULL, $3, \
+                                          'a second assignment', $4)",
     )
     .bind(CUSTODIAN)
     .bind(h.person)
     .bind(q.person)
     .bind(act)
+    .bind(&from)
     .execute(&pool)
     .await
     .expect("a second assignment");
@@ -2027,7 +2037,10 @@ async fn no_session_is_live_until_132_opens_the_gate(pool: PgPool) {
     let secret = [b'g'; 32];
     let t = ticket(&pool, &g, "grant", Some(&secret)).await;
     let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
-    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+    assert_eq!(
+        r.0, "confirmed",
+        "CALIBRATION: the grant ceremony confirms: {r:?}"
+    );
 
     let reads_b = || {
         let pool = pool.clone();
@@ -2273,7 +2286,10 @@ async fn a_privileged_login_is_never_elevated(pool: PgPool) {
     let secret = [b'p'; 32];
     let t = ticket(&pool, &g, "grant", Some(&secret)).await;
     let r = confirm(&pool, t, &g.cred, 0, false).await.expect("confirm");
-    assert_eq!(r.0, "confirmed", "CALIBRATION: the grant ceremony confirms");
+    assert_eq!(
+        r.0, "confirmed",
+        "CALIBRATION: the grant ceremony confirms: {r:?}"
+    );
     for login in [None, Some("epigraph_maintenance"), Some(BYPASSRLS_PROBE)] {
         let status = redeem_as_login(&pool, login, t, &secret, g.client).await;
         assert_eq!(
@@ -3001,4 +3017,164 @@ fn every_125_object_is_registered() {
             "079-undo.sql lacks {table}"
         );
     }
+}
+
+// =====================================================================
+// FIXTURE CONTRACT: a backward wall-clock step between a fixture's grant
+// and the grantee's first use.
+//
+// Every liveness read compares a STORED `valid_from` with the `now()` /
+// `clock_timestamp()` of a LATER transaction
+// (`epigraph_live_role_assignment`, `ra.valid_from <= p_at`), with no
+// tolerance. On a host whose wall clock steps BACKWARD (a time-sync daemon
+// correcting a fast clock, a VM resuming), a step that lands between the
+// grant and the next read makes a grant stamped with the definer's
+// `now()` default "not yet live" for up to the size of the step: ELV02 on
+// the ticket, `no_live_assignment` on the confirm, CUS03 on a grant it
+// makes. The product is human-paced and retries heal it; a fixture that
+// uses its grantee milliseconds later is not.
+//
+// For a lower bound, "every later clock read is D earlier" is the same as
+// "the stored `valid_from` is D later", so these tests inject the step by
+// moving the stored `valid_from` forward by 5 s (above any step a build
+// host has been seen to make) as the harness superuser with triggers off.
+// The injection does not depend on the host's clock, so the result is the
+// same on every host.
+// =====================================================================
+
+/// Simulate the wall clock stepping BACK by `secs` right after
+/// `assignment` was granted: move its stored `valid_from` forward, with
+/// triggers off (the append-only guard would refuse the write), as
+/// `viewer_fixture::confirmed_act` stands rows in.
+async fn clock_steps_back_after_grant(pool: &PgPool, assignment: Uuid, secs: i32) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let n = sqlx::query(
+        "UPDATE role_assignments SET valid_from = valid_from + make_interval(secs => $2) \
+          WHERE id = $1",
+    )
+    .bind(assignment)
+    .bind(secs)
+    .execute(&mut *conn)
+    .await
+    .expect("move valid_from forward");
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    assert_eq!(n.rows_affected(), 1, "PREMISE: the assignment exists");
+}
+
+/// The injection bites: a custodian granted with the definer's own
+/// `now()` default, then a 5 s backward step, is refused its ticket with
+/// ELV02. This is the positive control for the two fixture tests below
+/// (it does not go through the fixture, so it holds before and after the
+/// fixture leaves a margin).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backward_clock_step_refuses_a_grant_stamped_now(pool: PgPool) {
+    let (person, client) = human(&pool, "step-control").await;
+    let assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, NULL, 'clock step control')",
+    )
+    .bind(CUSTODIAN)
+    .bind(person)
+    .fetch_one(&pool)
+    .await
+    .expect("PREMISE: the first custodian is granted at bootstrap");
+    let _key = passkey(&pool, person, 1).await;
+    let (fam, _) = family(&pool, client).await;
+    // Anchored on the READ, not the grant: a grant stamped `now()` with the
+    // step landing just before the ticket, however long the setup above took
+    // on a loaded host (shifting the stored value by 5 s would leave this
+    // control green only while setup stays under 5 s).
+    without_triggers(
+        &pool,
+        "UPDATE role_assignments SET valid_from = clock_timestamp() + interval '5 seconds' \
+          WHERE id = $1",
+        assignment,
+    )
+    .await;
+    let r = create_ticket(&pool, Some(person), client, fam, "connector", None).await;
+    let err = r.expect_err("CALIBRATION: a grant stamped now() is not live across a 5 s step");
+    assert!(
+        err.to_string().contains("ELV02"),
+        "the refusal is ELV02 (no live elevating assignment): {err}"
+    );
+}
+
+/// `fixture::make_custodian` (no act: the first custodian) leaves its
+/// grantee live across a backward clock step: the ticket and the confirm
+/// right after the fixture's grant succeed.
+///
+/// Verified to fail: the fixture granted with the definer's `now()`
+/// default -> ELV02 on the ticket.
+#[sqlx::test(migrations = "../../migrations")]
+async fn make_custodian_survives_a_backward_clock_step(pool: PgPool) {
+    let h = holder(&pool, "step-fixture", 1).await;
+    clock_steps_back_after_grant(&pool, h.assignment, 5).await;
+    let r = create_ticket(&pool, Some(h.person), h.client, h.family, "connector", None).await;
+    assert!(
+        r.is_ok(),
+        "a ticket right after the fixture's grant, across a 5 s backward step: {r:?}"
+    );
+    let secret = [b'p'; 32];
+    let t = ticket(&pool, &h, "grant", Some(&secret)).await;
+    clock_steps_back_after_grant(&pool, h.assignment, 5).await;
+    let c = confirm(&pool, t, &h.cred, 0, false).await.expect("confirm");
+    assert_eq!(
+        c.0, "confirmed",
+        "the grant ceremony confirms across a second step: {c:?}"
+    );
+}
+
+/// The same contract on the fixture's ACT path: a second custodian granted
+/// by a grantor holding a passkey rides a confirmed `role.grant` act, whose
+/// args must state the grant's `valid_from` exactly (the 130 guard
+/// recomputes them from the row and compares digests, ELV09).
+///
+/// Verified to fail: the fixture granted with the definer's `now()`
+/// default -> ELV02 on the ticket.
+#[sqlx::test(migrations = "../../migrations")]
+async fn make_custodian_on_an_act_survives_a_backward_clock_step(pool: PgPool) {
+    let _grantor = holder(&pool, "step-grantor", 1).await;
+    let (person, client) = human(&pool, "step-act-holder").await;
+    let assignment = fixture::make_custodian(&pool, person).await;
+    let on_act: bool =
+        sqlx::query_scalar("SELECT grant_act_id IS NOT NULL FROM role_assignments WHERE id = $1")
+            .bind(assignment)
+            .fetch_one(&pool)
+            .await
+            .expect("the assignment");
+    assert!(
+        on_act,
+        "CALIBRATION: the fixture granted on a confirmed act"
+    );
+    let key = passkey(&pool, person, 2).await;
+    let (fam, token_hash) = family(&pool, client).await;
+    let h = Holder {
+        person,
+        client,
+        assignment,
+        passkey: key,
+        cred: credential(2),
+        family: fam,
+        token_hash,
+    };
+    clock_steps_back_after_grant(&pool, h.assignment, 5).await;
+    let r = create_ticket(&pool, Some(h.person), h.client, h.family, "connector", None).await;
+    assert!(
+        r.is_ok(),
+        "a ticket right after the fixture's act-path grant, across a 5 s step: {r:?}"
+    );
+    let secret = [b'q'; 32];
+    let t = ticket(&pool, &h, "grant", Some(&secret)).await;
+    clock_steps_back_after_grant(&pool, h.assignment, 5).await;
+    let c = confirm(&pool, t, &h.cred, 0, false).await.expect("confirm");
+    assert_eq!(
+        c.0, "confirmed",
+        "the grant ceremony confirms across a second step: {c:?}"
+    );
 }

@@ -376,12 +376,12 @@ async fn test_batch_update_truth_values_nonexistent_claims(pool: PgPool) {
     assert_eq!(updated.truth_value.value(), 0.9);
 }
 
-/// Test: Batch update uses CASE WHEN for efficiency
+/// Test: Batch update assigns each claim its own value
 ///
 /// **Evidence**: Different values for different claims in single query
 /// **Reasoning**: Single round-trip to database for all updates
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
+async fn test_batch_update_truth_values_assigns_each_claim_its_own_value(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let agent = make_agent(Some("Batch Test Agent"));
     let agent = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -419,6 +419,154 @@ async fn test_batch_update_truth_values_uses_case_when(pool: PgPool) {
 
         assert_eq!(claim.truth_value.value(), expected_truth.value());
     }
+}
+
+/// Test: Batch update of more items than Postgres's bind-parameter limit
+///
+/// **Evidence**: the statement used to be built with two `$N` placeholders per
+/// item (`CASE id WHEN $1 THEN $2 …` plus `WHERE id IN ($1, $3, …)`), so its
+/// text varied with batch size and any batch above 32767 items exceeded the
+/// 65535-bind limit of the wire protocol: the call failed before reaching the
+/// database.
+/// **Reasoning**: one static `unnest($1::uuid[], $2::float8[])` statement binds
+/// two arrays whatever the batch size. The batch is mostly ids that name no
+/// row (skipped by the join, as for a small batch) so the test exercises the
+/// statement's size limit without paying for 33k per-row UPDATE triggers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_update_truth_values_handles_more_than_bind_limit(pool: PgPool) {
+    const N: usize = 33_000;
+    const REAL: i64 = 64;
+    let agent: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'bind-limit', 'system') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let real: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         SELECT 'bind-limit claim ' || i, sha256(('bind-limit claim ' || i)::bytea), 0.5, $1 \
+           FROM generate_series(1, $2) AS i \
+         RETURNING id",
+    )
+    .bind(agent)
+    .bind(REAL)
+    .fetch_all(&pool)
+    .await
+    .expect("seed claims");
+    assert_eq!(real.len() as i64, REAL);
+
+    // Real ids spread through the batch, with the first at index 0 and the
+    // last at index N - 1, so both ends of the arrays carry a real row.
+    let tv = |v: f64| TruthValue::new(v).unwrap();
+    let mut updates: Vec<(ClaimId, TruthValue)> = (0..N)
+        .map(|_| (ClaimId::from_uuid(uuid::Uuid::new_v4()), tv(0.9)))
+        .collect();
+    let stride = (N - 1) / (real.len() - 1);
+    for (k, id) in real.iter().enumerate() {
+        let pos = if k + 1 == real.len() {
+            N - 1
+        } else {
+            k * stride
+        };
+        let value = if k % 2 == 0 { 0.25 } else { 0.75 };
+        updates[pos] = (ClaimId::from_uuid(*id), tv(value));
+    }
+    assert_eq!(updates.len(), N);
+
+    let affected = ClaimRepository::batch_update_truth_values(&pool, &updates)
+        .await
+        .expect("a batch above the bind-parameter limit must succeed");
+    assert_eq!(
+        affected as i64, REAL,
+        "every existing claim in the batch is updated"
+    );
+
+    let (low, high): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE truth_value = 0.25), \
+                count(*) FILTER (WHERE truth_value = 0.75) \
+           FROM claims WHERE agent_id = $1",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (low, high),
+        (REAL / 2, REAL / 2),
+        "each claim got its own value"
+    );
+    let first: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(real[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first, 0.25, "the real id at index 0");
+    let last: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(real[real.len() - 1])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(last, 0.75, "the real id at index N - 1");
+}
+
+/// Test: an id listed twice is updated once, with its FIRST value
+///
+/// **Evidence**: the previous `CASE id WHEN $1 THEN $2 …` form resolved a
+/// repeated id to its first matching arm; `UPDATE … FROM unnest(…)` joining one
+/// row to two source rows applies an unspecified one of them.
+/// **Reasoning**: the input is deduplicated first-wins before the statement,
+/// so the contract survives the change of statement shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_update_truth_values_keeps_the_first_value_of_a_repeated_id(pool: PgPool) {
+    let agent: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), 'repeated-id', 'system') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed agent");
+    let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+         SELECT 'repeated-id claim ' || i, sha256(('repeated-id claim ' || i)::bytea), 0.5, $1 \
+           FROM generate_series(1, 2) AS i \
+         RETURNING id",
+    )
+    .bind(agent)
+    .fetch_all(&pool)
+    .await
+    .expect("seed claims");
+    let (a, b) = (ids[0], ids[1]);
+    let tv = |v: f64| TruthValue::new(v).unwrap();
+    // `a` first with 0.2, then 32 more times with 0.8: a last-wins pick, or
+    // an arbitrary one among 33 source rows, lands on 0.8.
+    let mut updates = vec![
+        (ClaimId::from_uuid(a), tv(0.2)),
+        (ClaimId::from_uuid(b), tv(0.6)),
+    ];
+    for _ in 0..32 {
+        updates.push((ClaimId::from_uuid(a), tv(0.8)));
+    }
+
+    let affected = ClaimRepository::batch_update_truth_values(&pool, &updates)
+        .await
+        .expect("batch update");
+    assert_eq!(
+        affected, 2,
+        "two distinct existing claims are updated, once each"
+    );
+    let read = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, f64>("SELECT truth_value FROM claims WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(read(a).await, 0.2, "a repeated id keeps its FIRST value");
+    assert_eq!(read(b).await, 0.6);
 }
 
 // ============================================================================
@@ -721,5 +869,78 @@ async fn test_batch_insert_performance(pool: PgPool) {
     assert!(
         batch_duration < individual_duration * 3,
         "Batch insert should not be significantly slower than individual inserts"
+    );
+}
+
+/// Test: Both evidence writers store a Document's URL in `evidence.source_url`,
+/// and neither copies a Testimony's free-text `source` there.
+///
+/// **Evidence**: backlog 43ab8c73 — `create` and `batch_create` both bound
+/// NULL to the column, so REST `get_evidence` / `claim_provenance` (which read
+/// it) never saw a URL.
+/// **Reasoning**: `create` has production callers (REST POST evidence,
+/// conventions) and `batch_create` is the bulk path; a Testimony's `source` is
+/// a name as often as a link, so only the Document arm may populate the column.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_evidence_writers_store_a_document_url_and_no_testimony_source(pool: PgPool) {
+    let agent = make_agent(Some("Evidence URL Agent"));
+    let agent = AgentRepository::create(&pool, &agent).await.unwrap();
+    let claim = create_test_claim_entity(agent.id, "Claim whose evidence has links", 0.7);
+    ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+        .await
+        .expect("Create claim should succeed");
+
+    let with_type = |content: &str, evidence_type: EvidenceType| -> Evidence {
+        let mut e = create_test_evidence_entity(agent.id, claim.id, content);
+        e.evidence_type = evidence_type;
+        e
+    };
+    let document = |url: &str| EvidenceType::Document {
+        source_url: Some(url.to_string()),
+        mime_type: "text/plain".to_string(),
+        checksum: None,
+    };
+    let created = with_type("one by create", document("https://example.org/u036/create"));
+    let batched = with_type("one by batch", document("https://example.org/u036/batch"));
+    let testimony = with_type(
+        "a named witness",
+        EvidenceType::Testimony {
+            source: "Dr. X".to_string(),
+            testified_at: chrono::Utc::now(),
+            verification: None,
+        },
+    );
+
+    EvidenceRepository::create(&pool, &created)
+        .await
+        .expect("create should succeed");
+    EvidenceRepository::batch_create(&pool, &[batched.clone(), testimony.clone()])
+        .await
+        .expect("batch create should succeed");
+
+    let column = |id: epigraph_core::EvidenceId| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT source_url FROM evidence WHERE id = $1")
+                .bind(uuid::Uuid::from(id))
+                .fetch_one(&pool)
+                .await
+                .expect("read evidence.source_url")
+        }
+    };
+    assert_eq!(
+        column(created.id).await.as_deref(),
+        Some("https://example.org/u036/create"),
+        "EvidenceRepository::create must store a Document's URL in the column"
+    );
+    assert_eq!(
+        column(batched.id).await.as_deref(),
+        Some("https://example.org/u036/batch"),
+        "EvidenceRepository::batch_create must store a Document's URL in the column"
+    );
+    assert_eq!(
+        column(testimony.id).await,
+        None,
+        "a Testimony's free-text source must never be copied into the URL column"
     );
 }

@@ -27,8 +27,9 @@ BACKLOG — raw SQL used here because the API surface is incomplete:
     + `ClaimThemeRepository::set_centroid_3072` + a properties merge).
   * The drop-auto path (DELETE FROM claim_themes WHERE label LIKE 'auto-%')
     has no API equivalent. POST /api/v1/themes/build-from-corpus has a
-    `wipe_first` parameter that drops all themes for a given label_prefix,
-    but it also re-runs k-means; we just want the delete. Need
+    `wipe_first` parameter, but it drops EVERY theme (whatever its prefix;
+    admitted only with label_prefix "auto") and also re-runs k-means; we
+    just want the prefix-scoped delete. Need
     DELETE /api/v1/themes/by-label-prefix or similar.
   * Bulk theme_id assignment (UPDATE claims SET theme_id = ...) goes
     through the same path the existing POST /api/v1/themes/reassign uses

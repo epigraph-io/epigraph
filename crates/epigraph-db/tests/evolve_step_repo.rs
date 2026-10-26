@@ -204,3 +204,397 @@ async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
         "expected non-current-step error message, got: {msg}"
     );
 }
+
+// ── evolve_step(supersedes) and the supersede edge cascade (backlog 8d3b4527) ──
+//
+// evolve_step(supersedes) retires a step and writes its successor, but the
+// retired step kept every structural edge: on prod the live head of workflow
+// f00fa5e9's D3 step held one edge (`supersedes`) while its decomposition
+// parent, its children and its `continues_argument` predecessor all still
+// pointed at the retired version. The fix records the supersession in
+// `claims.supersedes`, so the Supersede admin cascade
+// (`migrate_superseded_edges_conn`, and its deferred replay) accepts the pair,
+// and that migration leaves a step lineage's `executes` edge (the workflow's
+// frozen step) and its agents' `asserts` / `AUTHORED` edges where they are.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+async fn seed_workflow(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal) VALUES ($1, $2, 'evolve-step test')",
+    )
+    .bind(id)
+    .bind(format!("evolve-step-{id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn seed_typed_edge(
+    pool: &PgPool,
+    source: Uuid,
+    source_type: &str,
+    target: Uuid,
+    target_type: &str,
+    relationship: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(target_type)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("seed {relationship} edge: {e}"));
+    id
+}
+
+/// `(source_id, target_id)` of edge `id`.
+async fn ends(pool: &PgPool, id: Uuid) -> (Uuid, Uuid) {
+    sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The Supersede admin cascade's edge migration, on the maintenance role (the
+/// connection `epigraph_engine::admin_cascade` and the deferred replay run it on).
+async fn migrate_as_maintenance(
+    pool: &PgPool,
+    old: Uuid,
+    new: Uuid,
+) -> Result<epigraph_db::SupersedeEdgeMigration, epigraph_db::DbError> {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new).await;
+        (conn, r)
+    })
+    .await
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_cascade_carries_structural_edges_but_not_executes(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let other_agent = seed_agent(&pool).await;
+    let step = seed_claim(&pool, agent, "D3: measure the yield", 0.7).await;
+    let parent = seed_claim(&pool, agent, "the D-arm of the plan", 0.7).await;
+    let child1 = seed_claim(&pool, agent, "D3.1 prepare", 0.7).await;
+    let child2 = seed_claim(&pool, agent, "D3.2 run", 0.7).await;
+    let prior = seed_claim(&pool, agent, "the preceding paragraph", 0.7).await;
+    let supporter = seed_claim(&pool, agent, "a supporting observation", 0.7).await;
+    let refuter = seed_claim(&pool, agent, "a refuting observation", 0.7).await;
+    let workflow = seed_workflow(&pool).await;
+
+    let decomposed_from =
+        seed_typed_edge(&pool, parent, "claim", step, "claim", "decomposes_to").await;
+    let to_child1 = seed_typed_edge(&pool, step, "claim", child1, "claim", "decomposes_to").await;
+    let to_child2 = seed_typed_edge(&pool, step, "claim", child2, "claim", "decomposes_to").await;
+    let continued =
+        seed_typed_edge(&pool, prior, "claim", step, "claim", "continues_argument").await;
+    let supported = seed_typed_edge(&pool, supporter, "claim", step, "claim", "supports").await;
+    let refuted = seed_typed_edge(&pool, refuter, "claim", step, "claim", "refutes").await;
+    let executes = seed_typed_edge(&pool, workflow, "workflow", step, "claim", "executes").await;
+    let asserted = seed_typed_edge(&pool, other_agent, "agent", step, "claim", "asserts").await;
+    let authored = seed_typed_edge(&pool, other_agent, "agent", step, "claim", "AUTHORED").await;
+    // A NON-agent `asserts` (a claim or paper asserting the step, the shape
+    // migration 041 reads) is not authorship by an agent: it follows the head.
+    let asserter = seed_claim(&pool, agent, "a claim that asserts the step", 0.7).await;
+    let claim_asserted = seed_typed_edge(&pool, asserter, "claim", step, "claim", "asserts").await;
+
+    let evolved = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(step),
+        "D3: measure the yield, in triplicate",
+        "supersedes",
+        Some("tighter protocol"),
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(supersedes)");
+    let head = evolved.new_claim_id;
+
+    migrate_as_maintenance(&pool, step, head)
+        .await
+        .expect("the Supersede cascade must accept an evolve_step(supersedes) pair");
+
+    // Structural and strengthening edges follow the live head.
+    assert_eq!(
+        ends(&pool, decomposed_from).await,
+        (parent, head),
+        "parent -decomposes_to-> head"
+    );
+    assert_eq!(
+        ends(&pool, to_child1).await,
+        (head, child1),
+        "head -decomposes_to-> child1"
+    );
+    assert_eq!(
+        ends(&pool, to_child2).await,
+        (head, child2),
+        "head -decomposes_to-> child2"
+    );
+    assert_eq!(
+        ends(&pool, continued).await,
+        (prior, head),
+        "prior -continues_argument-> head"
+    );
+    assert_eq!(
+        ends(&pool, supported).await,
+        (supporter, head),
+        "supporter -supports-> head"
+    );
+    // The workflow's `executes` edge stays on the frozen original step: heads
+    // are resolved through the lineage (WorkflowRepository::ResolvedStep).
+    assert_eq!(
+        ends(&pool, executes).await,
+        (workflow, step),
+        "executes stays on the frozen step"
+    );
+    // Weakening edges stay on the content they were filed against (#398).
+    assert_eq!(ends(&pool, refuted).await, (refuter, step), "refutes stays");
+    // The successor is written by evolve_step's CALLER, so another agent's
+    // assertion of the old content does not become an assertion of the new.
+    assert_eq!(
+        ends(&pool, asserted).await,
+        (other_agent, step),
+        "agent asserts stays"
+    );
+    assert_eq!(
+        ends(&pool, authored).await,
+        (other_agent, step),
+        "agent AUTHORED stays"
+    );
+    assert_eq!(
+        ends(&pool, claim_asserted).await,
+        (asserter, head),
+        "a non-agent asserts follows the head (the carve-out is agents' only)"
+    );
+}
+
+/// The carve-out is a STEP-LINEAGE rule, derived from the rows: a plain
+/// supersede of a claim that happens to carry a `step_lineage_id` writes a
+/// successor outside that lineage, so its `executes` and agent edges move as
+/// every supersession's do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let other_agent = seed_agent(&pool).await;
+    let step = seed_claim(&pool, agent, "a step with a lineage", 0.7).await;
+    sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+        .bind(Uuid::new_v4())
+        .bind(step)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let workflow = seed_workflow(&pool).await;
+    let executes = seed_typed_edge(&pool, workflow, "workflow", step, "claim", "executes").await;
+    let asserted = seed_typed_edge(&pool, other_agent, "agent", step, "claim", "asserts").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let (new_id, _) = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(step),
+        "a plain restatement",
+        epigraph_core::TruthValue::clamped(0.6),
+        "restated",
+    )
+    .await
+    .expect("supersede act");
+    tx.commit().await.unwrap();
+
+    migrate_as_maintenance(&pool, step, new_id)
+        .await
+        .expect("the Supersede cascade");
+    assert_eq!(
+        ends(&pool, executes).await,
+        (workflow, new_id),
+        "executes follows a plain supersede"
+    );
+    assert_eq!(
+        ends(&pool, asserted).await,
+        (other_agent, new_id),
+        "asserts follows a plain supersede"
+    );
+}
+
+/// `revises` is a parallel branch: both heads stay current and nothing is
+/// superseded, so the column stays NULL and the cascade refuses the pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_revises_records_no_supersession(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let parent = seed_claim(&pool, agent, "parent", 0.7).await;
+    let r = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        "branch",
+        "revises",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .unwrap();
+    let sup: Option<Uuid> = sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+        .bind(r.new_claim_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sup, None, "a revises branch records no supersession");
+    let e = migrate_as_maintenance(&pool, parent, r.new_claim_id)
+        .await
+        .expect_err("a revises branch is not a supersession to migrate");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
+}
+
+/// `revises` is lineage-internal history, like `supersedes`: `R -revises-> S`
+/// records that R branched from S. A later step-lineage supersession of
+/// EITHER end must leave it where it is. Carried onto S's successor it would
+/// say R branched from a version that did not exist when R was written; carried
+/// onto R's successor it would say that successor branched from S directly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_cascade_leaves_revises_history_in_place(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let s = seed_claim(&pool, agent, "S: the original step", 0.7).await;
+
+    // R branches from S; both stay current.
+    let branch = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(s),
+        "R: a concurrent branch of S",
+        "revises",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(revises)");
+    let r = branch.new_claim_id;
+    let revises_edge = branch.edge_id;
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "seeded R -revises-> S"
+    );
+
+    // Incoming side: S is superseded by N within the lineage.
+    let n = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(s),
+        "N: S, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(S, supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, s, n)
+        .await
+        .expect("the Supersede cascade for (S, N)");
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "R -revises-> S stays on S when S is superseded (incoming)"
+    );
+
+    // Outgoing side: R is superseded by R2 within the lineage.
+    let r2 = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(r),
+        "R2: R, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(R, supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, r, r2)
+        .await
+        .expect("the Supersede cascade for (R, R2)");
+    assert_eq!(
+        ends(&pool, revises_edge).await,
+        (r, s),
+        "R -revises-> S stays on R when R is superseded (outgoing)"
+    );
+}
+
+/// A workflow's chain edges (`step_follows` between steps, `phase_follows`
+/// between phases) link the FROZEN claims its `executes` edges name, and
+/// `workflow_steps::ordered_steps` walks them inside that id set. A
+/// step-lineage supersession leaves them, in both directions, on the retired
+/// claim; the decomposition edge beside them still follows the head, so this
+/// arm is not satisfied by a cascade that moved nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_cascade_leaves_the_step_and_phase_chains_in_place(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let step = seed_claim(&pool, agent, "S: the middle step", 0.7).await;
+    let prev = seed_claim(&pool, agent, "the step before", 0.7).await;
+    let next = seed_claim(&pool, agent, "the step after", 0.7).await;
+    let prev_phase = seed_claim(&pool, agent, "a phase before", 0.7).await;
+    let next_phase = seed_claim(&pool, agent, "a phase after", 0.7).await;
+    let parent = seed_claim(&pool, agent, "the phase S decomposes", 0.7).await;
+
+    let step_in = seed_typed_edge(&pool, prev, "claim", step, "claim", "step_follows").await;
+    let step_out = seed_typed_edge(&pool, step, "claim", next, "claim", "step_follows").await;
+    let phase_in =
+        seed_typed_edge(&pool, prev_phase, "claim", step, "claim", "phase_follows").await;
+    let phase_out =
+        seed_typed_edge(&pool, step, "claim", next_phase, "claim", "phase_follows").await;
+    let decomposed_from =
+        seed_typed_edge(&pool, parent, "claim", step, "claim", "decomposes_to").await;
+
+    let head = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(step),
+        "S: the middle step, refined",
+        "supersedes",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("evolve_step(supersedes)")
+    .new_claim_id;
+    migrate_as_maintenance(&pool, step, head)
+        .await
+        .expect("the Supersede cascade");
+
+    assert_eq!(
+        ends(&pool, decomposed_from).await,
+        (parent, head),
+        "control: decomposes_to follows the head"
+    );
+    assert_eq!(
+        ends(&pool, step_in).await,
+        (prev, step),
+        "prev -step_follows-> S stays on S"
+    );
+    assert_eq!(
+        ends(&pool, step_out).await,
+        (step, next),
+        "S -step_follows-> next stays on S"
+    );
+    assert_eq!(
+        ends(&pool, phase_in).await,
+        (prev_phase, step),
+        "phase_follows (incoming) stays"
+    );
+    assert_eq!(
+        ends(&pool, phase_out).await,
+        (step, next_phase),
+        "phase_follows (outgoing) stays"
+    );
+}

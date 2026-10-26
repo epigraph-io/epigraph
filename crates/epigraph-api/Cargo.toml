@@ -95,7 +95,7 @@ opentelemetry-otlp = { version = "0.27", optional = true }
 tracing-opentelemetry = { version = "0.28", optional = true }
 futures = "0.3"  # For try_join_all in concurrent workflow resolution
 nom = "8.0.0"
-jsonwebtoken = "9"        # JWT creation and validation
+jsonwebtoken = { workspace = true }  # JWT creation and validation
 rand = { workspace = true }  # Token generation, nonce generation
 blake3 = { workspace = true }  # Content hashing for refresh tokens
 ed25519-dalek = { workspace = true }  # Ed25519 agent assertion verification
@@ -257,3 +257,9 @@ path = "tests/integration/skip_embed_host_telemetry.rs"
 [[test]]
 name = "idempotency_2p5_tests"
 path = "tests/integration/idempotency_2p5_tests.rs"
+
+# Builds an MCP server beside the router; `epigraph-mcp` is a `db` dependency.
+[[test]]
+name = "belief_modes_surfaces_agree"
+path = "tests/belief_modes_surfaces_agree.rs"
+required-features = ["db"]

@@ -2008,7 +2008,10 @@ fn read_repo(rel: &str) -> String {
 async fn the_149_rollback_returns_the_catalog_and_records_the_dropped_allowances(pool: PgPool) {
     migrate(&pool, &up_to_below(149)).await;
     let before = catalog(&pool).await;
-    migrate(&pool, &MIGRATOR).await;
+    // Up to 149 INCLUSIVE, not head: the undo reverses 149 alone, so a later
+    // migration's catalog change (150 drops `uq_claims_content_hash_agent`)
+    // must not be charged to it.
+    migrate(&pool, &up_to_below(150)).await;
     assert_ne!(
         catalog(&pool).await,
         before,

@@ -1,9 +1,18 @@
 #[cfg(feature = "db")]
+pub mod backfill_factors;
+#[cfg(feature = "db")]
+pub mod belief_cache;
+pub mod belief_mode_check;
+#[cfg(feature = "db")]
 pub mod bootstrap;
 #[cfg(feature = "db")]
 pub mod bridge;
 pub mod decompose;
+#[cfg(feature = "db")]
+pub mod embed_backfill;
 pub mod enrichment;
+#[cfg(feature = "db")]
+pub mod evidence_type_backfill;
 #[cfg(feature = "genai")]
 pub mod matching_client;
 #[cfg(feature = "db")]
@@ -15,6 +24,8 @@ pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;
 pub mod retarget;
+#[cfg(feature = "db")]
+pub mod shadow_report;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;

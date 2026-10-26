@@ -13,7 +13,7 @@ use epigraph_mcp::types::{
     RetireMatchCandidateParams,
 };
 use epigraph_mcp::{embed::McpEmbedder, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::types::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -184,8 +184,8 @@ async fn edge_relationships(pool: &PgPool, a: Uuid, b: Uuid) -> Vec<String> {
 
 fn result_text(out: rmcp::model::CallToolResult) -> String {
     let first = out.content.first().cloned().expect("first content");
-    match first.raw {
-        RawContent::Text(t) => t.text,
+    match first {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text content, got {other:?}"),
     }
 }
@@ -677,6 +677,50 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
     assert_eq!(
         applied_counts["previous_status"], "promoted",
         "{applied_counts}"
+    );
+    // The applied row is attributed to the triggering principal, who can read
+    // it: it carries COUNTS for the id lists, never the ids themselves.
+    let matcher_edge: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE properties->>'source' = 'cross_source_matcher' \
+           AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("the matcher edge");
+    assert_eq!(applied_counts["edges_retracted"], 1, "{applied_counts}");
+    assert!(
+        applied_counts["affected_claims"].is_u64(),
+        "affected_claims must be a count on the applied row: {applied_counts}"
+    );
+    let applied_text = applied_counts.to_string();
+    for id in [matcher_edge, a, b] {
+        assert!(
+            !applied_text.contains(&id.to_string()),
+            "the trigger-readable applied row must name no edge or claim id ({id}): {applied_counts}"
+        );
+    }
+    // The ids go to the agent-less companion row of the same replay.
+    let ids_touched: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' AND agent_id IS NULL \
+            AND details->>'subject_id' = $1::text",
+    )
+    .bind(cand)
+    .fetch_one(&pool)
+    .await
+    .expect("the replay's applied-ids companion row");
+    assert_eq!(
+        ids_touched["edges_retracted"],
+        serde_json::json!([matcher_edge]),
+        "{ids_touched}"
+    );
+    let affected: Vec<Uuid> = serde_json::from_value(ids_touched["affected_claims"].clone())
+        .expect("affected_claims is an id list on the companion row");
+    assert!(
+        !affected.is_empty() && affected.iter().all(|c| *c == a || *c == b),
+        "the companion row names the claims the retirement touched: {ids_touched}"
     );
     let status: String = sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1")
         .bind(cand)
@@ -1615,4 +1659,170 @@ async fn a_promote_racing_a_verdict_rescore_is_refused(pool: PgPool) {
         edge_relationships(&pool, a, b).await.is_empty(),
         "no edge may be written from a verdict the row no longer carries"
     );
+}
+
+/// A stale BP-written value, far from any value the BBA below derives.
+const POISONED_BETP: f64 = 0.93;
+
+async fn betp_of(pool: &PgPool, claim: Uuid) -> Option<f64> {
+    sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read pignistic_prob")
+}
+
+/// Give `claim` one BBA on the engine's own `binary_truth` frame, keyed on no
+/// edge (so the retirement leaves it in place), derive its cache through the
+/// engine's own entry point, then overwrite the cache as a past
+/// `bp/propagate {"apply_updates": true}` would. Returns the derived value.
+async fn seed_surviving_bba_then_poison(pool: &PgPool, claim: Uuid, source_agent: Uuid) -> f64 {
+    let scoped = fixture::scoped_pool(pool)
+        .await
+        .with_maintenance_pool(pool.clone());
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, viewer) = session.split();
+    let frame = epigraph_engine::edge_factor::ensure_binary_frame(&mut *conn, viewer)
+        .await
+        .expect("the engine's binary frame");
+    sqlx::query(
+        "INSERT INTO mass_functions \
+           (claim_id, frame_id, source_agent_id, perspective_id, masses, source_strength, \
+            evidence_type) \
+         VALUES ($1, $2, $3, NULL, $4, 1.0, 'empirical')",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(source_agent)
+    .bind(serde_json::json!({"0": 0.6, "1": 0.1, "0,1": 0.3}))
+    .execute(&mut *conn)
+    .await
+    .expect("seed a surviving BBA");
+    assert!(
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut *conn, viewer, claim)
+            .await
+            .expect("derive the claim's belief from its BBA"),
+        "CALIBRATION: the BBA is on a frame the recompute reads"
+    );
+    let d = betp_of(pool, claim)
+        .await
+        .expect("CALIBRATION: the recompute wrote pignistic_prob");
+    assert!(
+        (d - POISONED_BETP).abs() > 0.1,
+        "CALIBRATION: the derived value ({d}) must be distinguishable from the poison"
+    );
+    sqlx::query("UPDATE claims SET pignistic_prob = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(POISONED_BETP)
+        .execute(pool)
+        .await
+        .expect("simulate a BP-written value");
+    d
+}
+
+/// U043 on the MCP tool's APPLIED arm (a server with a maintenance pool; the
+/// D9 deferral arm is covered above and by the API replay test): the retirement
+/// re-derives both endpoints from their surviving BBAs, audits it, and reports
+/// it as `belief_cascade` filtered to the CALLER. One endpoint is a claim the
+/// caller cannot see: it is repaired all the same and never named back. This
+/// pins the `session.split()` wiring here, where `admin_viewer` and `viewer`
+/// are both `&Viewer` and would swap without a compile error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retire_with_an_admin_connection_rederives_endpoints_and_reports_only_visible_ones(
+    pool: PgPool,
+) {
+    let maintenance = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(maintenance);
+    let server = build_server_with(pool.clone(), false, scoped);
+    let agent = insert_agent(&pool).await;
+    let a = insert_claim(&pool, agent).await;
+    let b = insert_claim(&pool, agent).await;
+    let cand = insert_candidate(&pool, a, b, 0.95, "pending").await;
+    let caller = fixture::public_viewer(&pool).await;
+    tools::matching::decide_match_candidate(
+        &server,
+        &caller,
+        DecideMatchCandidateParams {
+            candidate_id: cand.to_string(),
+            verdict: "promote".into(),
+        },
+        None,
+    )
+    .await
+    .expect("promote");
+
+    let d_a = seed_surviving_bba_then_poison(&pool, a, agent).await;
+    let d_b = seed_surviving_bba_then_poison(&pool, b, agent).await;
+    // b moves into a team group the caller is not in.
+    let group: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ('u043 hidden endpoint', 'did:test:u043mcp:' || gen_random_uuid(), \
+                 decode(repeat('ab', 32), 'hex'), 'team') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("seed a group");
+    sqlx::query("UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(b)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("privatize b");
+    let visible = epigraph_db::ClaimRepository::visible_claim_ids(&pool, &caller, &[a, b])
+        .await
+        .expect("visibility probe");
+    assert!(
+        visible.contains(&a) && !visible.contains(&b),
+        "CALIBRATION: the caller sees a and not b: {visible:?}"
+    );
+
+    let out = tools::matching::retire_match_candidate(
+        &server,
+        &caller,
+        RetireMatchCandidateParams {
+            candidate_id: cand.to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("retire");
+    let body: serde_json::Value = serde_json::from_str(&result_text(out)).expect("json body");
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert!(
+        body["cascade"]["belief_audit_event_id"].is_string(),
+        "the re-derivation names its audit row: {body}"
+    );
+
+    for (claim, d) in [(a, d_a), (b, d_b)] {
+        let after = betp_of(&pool, claim)
+            .await
+            .expect("a BBA backs both endpoints");
+        assert!(
+            (after - d).abs() < 1e-9,
+            "the retirement must re-derive endpoint {claim} whether or not the caller sees it: \
+             expected {d}, found {after}: {body}"
+        );
+    }
+    assert_eq!(
+        body["belief_cascade"]["recomputed"],
+        serde_json::json!([a]),
+        "the caller is told about the endpoint it sees, and only that one: {body}"
+    );
+    let b_text = b.to_string();
+    for key in ["targets", "recomputed", "unbacked", "errors"] {
+        let named = body["belief_cascade"][key]
+            .as_array()
+            .unwrap_or_else(|| panic!("belief_cascade.{key} is a list: {body}"))
+            .iter()
+            .any(|v| v.as_str().is_some_and(|s| s.contains(&b_text)));
+        assert!(
+            !named,
+            "belief_cascade.{key} must not name the hidden endpoint {b}: {body}"
+        );
+    }
 }

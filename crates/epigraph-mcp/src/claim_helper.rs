@@ -7,7 +7,7 @@ use epigraph_db::{ClaimRepository, EdgeRepository};
 use serde_json::json;
 use sqlx::{Acquire, PgConnection};
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error, internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
 
 /// The two things every author-stamped write needs and neither can be faked:
@@ -54,7 +54,7 @@ async fn author_write_authority<'p>(
              trace, evidence and AUTHORED edge to a 42501. Construct the server with \
              EpiGraphMcpFull::with_scoped_pool."
         );
-        internal_error(format!(
+        internal_error_text(format!(
             "{tool_name}: this MCP server was not built from a ScopedPool, so the write \
              path cannot stamp a connection with the author's tenancy context. Nothing was \
              written. Construct the server with EpiGraphMcpFull::with_scoped_pool."
@@ -71,8 +71,8 @@ async fn author_write_authority<'p>(
                 error = %e,
                 "could not resolve the author's viewer"
             );
-            internal_error(format!(
-                "{tool_name}: could not resolve the author's viewer: {e}"
+            internal_error_text(format!(
+                "{tool_name}: could not resolve the author's viewer"
             ))
         })?;
 
@@ -87,7 +87,7 @@ async fn author_write_authority<'p>(
              `admin`/`writer` membership in a group the submission's rows would be owned by. \
              Nothing was written."
         );
-        return Err(internal_error(format!(
+        return Err(internal_error_text(format!(
             "{tool_name}: the author ({author_agent_id}) has no live writable group membership, \
              so no connection can be stamped with write authority for the rows this submission \
              would own. Nothing was written."
@@ -209,8 +209,8 @@ pub async fn begin_author_stamped_tx<'p>(
             error = %e,
             "could not begin an author-stamped transaction"
         );
-        internal_error(format!(
-            "{tool_name}: could not begin an author-stamped transaction: {e}"
+        internal_error_text(format!(
+            "{tool_name}: could not begin an author-stamped transaction"
         ))
     })
 }
@@ -253,9 +253,10 @@ pub async fn begin_author_stamped_tx<'p>(
 /// forward-only because `workflows` recorded no owner before, is
 /// `tools::workflow_authority`'s: a workflow created since H-b records its
 /// submitter, and only the submitter, its operator, or `claims:admin` may change
-/// it; a workflow with no record is platform corpus, mutable only through the
-/// audited `claims:admin` path (U005). The system-agent stamp is unchanged for
-/// the rows these writes make.
+/// it; a workflow with no record is platform corpus, mutable only through the audited `claims:admin` path
+/// (U005). The system-agent stamp is unchanged for the rows these writes make;
+/// the caller is recorded in a `security_events` provenance row on the same
+/// transaction (`tools::workflow_authority::record_workflow_write`).
 ///
 /// # The CALLER is bound before anything is written (migration 122)
 ///
@@ -289,7 +290,7 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
              walking the plan on the unstamped pool, where a cleanly-migrated schema refuses the \
              first claim INSERT and leaves the workflows row behind."
         );
-        internal_error(format!(
+        internal_error_text(format!(
             "{tool_name}: this MCP server was not built from a ScopedPool, so the workflow \
              ingest path cannot stamp a connection with the ingest system agent's tenancy \
              context. Nothing was written. Construct the server with \
@@ -307,10 +308,19 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
                 "write refused: could not establish the workflow-ingest-system agent's write \
                  authority. Nothing was written."
             );
-            internal_error(format!(
-                "{tool_name}: could not establish the workflow-ingest-system agent's write \
-                 authority: {e}. Nothing was written."
-            ))
+            // Migration 148's refusal is the operator's remedy, with no driver
+            // error in it; every other failure here stays in the log above.
+            if matches!(
+                e,
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { .. }
+            ) {
+                internal_error_text(format!("{tool_name}: {e}"))
+            } else {
+                internal_error_text(format!(
+                    "{tool_name}: could not establish the workflow-ingest-system agent's write \
+                     authority. Nothing was written."
+                ))
+            }
         })?;
 
     let mut tx = scoped.begin_as(&authority.viewer).await.map_err(|e| {
@@ -321,8 +331,8 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
             error = %e,
             "could not begin a system-agent-stamped transaction"
         );
-        internal_error(format!(
-            "{tool_name}: could not begin a system-agent-stamped transaction: {e}"
+        internal_error_text(format!(
+            "{tool_name}: could not begin a system-agent-stamped transaction"
         ))
     })?;
 
@@ -343,8 +353,8 @@ pub async fn begin_system_ingest_stamped_tx<'p>(
         if e.is_write_authority_refusal() {
             crate::errors::db_caller_error(e)
         } else {
-            internal_error(format!(
-                "{tool_name}: could not check the caller's authority: {e}"
+            internal_error_text(format!(
+                "{tool_name}: could not check the caller's authority"
             ))
         }
     })?;
@@ -418,8 +428,8 @@ pub async fn wire_ds_for_new_claim_in_tx(
             "ds auto-wire failed inside the submission transaction: {e}. Rolling back the \
              whole submission; nothing was written"
         );
-        internal_error(format!(
-            "{tool_name}: the claim's Dempster-Shafer belief could not be wired ({e}). The \
+        internal_error_text(format!(
+            "{tool_name}: the claim's Dempster-Shafer belief could not be wired. The \
              submission was rolled back and nothing was written; retrying is safe."
         ))
     })?;
@@ -433,10 +443,13 @@ pub async fn wire_ds_for_new_claim_in_tx(
         )
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: the truth value derived from the claim's belief could not be \
-                 stored ({e}). The submission was rolled back and nothing was written."
-            ))
+            internal_error_logged(
+                format!(
+                    "{tool_name}: the truth value derived from the claim's belief could not \
+                     be stored. The submission was rolled back and nothing was written."
+                ),
+                e,
+            )
         })?;
     }
 

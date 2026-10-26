@@ -50,8 +50,9 @@
 //! `SessionGucMode::Transaction` a `ScopedRead` IS a transaction, so on a
 //! pooler deployment that is one open transaction and one pinned pool slot per
 //! in-flight search. This is the class `F-PR26-lineage-holds-one-connection-for-n-round-trips`
-//! owns (`routes/lineage.rs::get_lineage`); that entry stays open and this shard
-//! does not discharge it. `rolling_success_rate` and `find_lineage_root` are
+//! described (`routes/lineage.rs::get_lineage`). That entry is now closed by the
+//! lineage walk's own projection, which does not touch this handler: its
+//! footprint above is unchanged. `rolling_success_rate` and `find_lineage_root` are
 //! both batchable over `r.claim_id`, which would collapse the ~100 to 2, but
 //! that is a separable change with its own acceptance.
 //!
@@ -136,6 +137,10 @@ pub struct StoreWorkflowRequest {
     pub prerequisites: Option<Vec<String>>,
     pub expected_outcome: Option<String>,
     pub confidence: Option<f64>,
+    /// Stored on the workflows row as `metadata.tags` (trimmed, empties
+    /// dropped, de-duplicated) on the first store only: a re-store of the
+    /// same goal is a no-op that keeps the original tags. Not added as claim
+    /// labels.
     pub tags: Option<Vec<String>>,
 }
 
@@ -157,6 +162,10 @@ pub struct ListWorkflowsQuery {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ReportOutcomeRequest {
+    /// `true` only if the workflow's goal or expected outcome was achieved:
+    /// every gate and check passed. A run that ran every step but a gate or
+    /// check failed is `success=false`; record what the steps did in
+    /// `outcome_details` / `step_executions` instead.
     pub success: bool,
     pub outcome_details: String,
     pub quality: Option<f64>,
@@ -189,7 +198,10 @@ pub struct HierarchicalSearchQuery {
     #[serde(default)]
     pub resolve_to_latest: bool,
     /// Minimum `truth_value` to surface. Defaults to 0.3 so rows
-    /// deprecated via `deprecate_workflow` (truth=0.05) drop out.
+    /// deprecated via `deprecate_workflow` (truth=0.05) drop out. Exception:
+    /// with `resolve_to_latest=true` the lineage head of each matched
+    /// `canonical_name` is always returned, flagged `lineage_head_deprecated`
+    /// when its truth is below `min_truth`.
     pub min_truth: Option<f64>,
 }
 
@@ -197,6 +209,8 @@ pub struct HierarchicalSearchQuery {
 #[derive(Debug, Deserialize)]
 pub struct RecordBehavioralExecutionRequest {
     pub goal_text: String,
+    /// `true` only if the run's goal or expected outcome was achieved: every
+    /// gate and check passed. Running every step is not success.
     pub success: bool,
     pub step_beliefs: serde_json::Value,
     pub tool_pattern: Vec<String>,
@@ -228,6 +242,18 @@ pub struct HierarchicalWorkflowResult {
     pub truth_value: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_steps: Option<Vec<ResolvedStepResult>>,
+    /// `resolve_to_latest` only: this row is its lineage's head, the highest
+    /// `generation` of its `canonical_name` (what `improve_workflow_hierarchy`
+    /// builds on). The head of every matched lineage is always returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_lineage_head: Option<bool>,
+    /// `resolve_to_latest` only: the head's generation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_generation: Option<i32>,
+    /// `resolve_to_latest` only: the head's `truth_value` is below
+    /// `min_truth` (deprecated). It is returned anyway, so this says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_head_deprecated: Option<bool>,
 }
 
 /// Per-step resolution result within [`HierarchicalWorkflowResult`].
@@ -247,6 +273,9 @@ pub struct LineageHeadResult {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `false` for a head retired without a `supersedes` edge: it is still the
+    /// lineage's head, but `evolve_step` refuses to supersede it.
+    pub is_current: bool,
 }
 
 // ── Handlers ──
@@ -336,6 +365,8 @@ pub async fn store_workflow(
         epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
             .await
             .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         None,
@@ -355,25 +386,8 @@ pub async fn store_workflow(
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     if let Some(embedder) = state.embedding_service() {
         let wf_id = result.workflow_id;
-        for (claim_id, content) in &result.inserted {
-            match embedder.generate(content).await {
-                Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
-                }
-            }
-        }
+        embed_inserted_workflow_claims(&state, embedder.as_ref(), "workflows", &result.inserted)
+            .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&request.goal).await {
             Ok(qvec) => {
@@ -753,6 +767,82 @@ pub async fn get_workflow(
     })))
 }
 
+/// GET /api/v1/workflows/:id/plan - The frozen plan of one workflow
+/// generation, read as the caller (`claims:read`).
+///
+/// Every `executes` target of THIS `workflow_id`, at every level, in the order
+/// the edges' `plan_index` values give, with content, stored hash, the
+/// seed-aware `content_hash_ok`, tenancy, truth, `is_current` and
+/// `heads_diverged`; the `workflows` row's name, generation, goal, parent,
+/// truth and recorded submitter; integrity counts (`hidden_count`,
+/// `unindexed_edges`, `plan_index_gaps`, `duplicate_plan_indices`,
+/// `retracted_edges`); and a `wfd1` `digest_echo` only when every count is
+/// zero. Lineage heads are never read as content: an `evolve_step` shows as
+/// `heads_diverged`, not as a different plan.
+///
+/// `plan_index` is a mutable edge property (a writer of the plan's group can
+/// rewrite or retract an `executes` edge), so the read reports the order as
+/// stored and never repairs it. A caller that pins a plan compares its own
+/// digest; the echo is informational.
+///
+/// 404 when the row does not exist and when the caller can see none of its
+/// `executes` edges (a non-member of a group-private plan); see
+/// `epigraph_ingest_executor::workflow_plan::frozen_plan` for why that is not a
+/// 200 with a count.
+///
+/// The `workflows` row and every edge and claim are read on ONE connection
+/// stamped with the caller's viewer, so the in-query predicates and the
+/// session's tenancy GUCs agree under forced RLS.
+#[cfg(feature = "db")]
+pub async fn get_workflow_plan(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
+    State(state): State<AppState>,
+    Path(workflow_id): Path<Uuid>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<epigraph_ingest::workflow::frozen_plan::FrozenPlan>, ApiError> {
+    // `else return Unauthorized`, not `if let Some(..)`: the conditional form
+    // is a fail-open scope site (see `routes/crud.rs::list_evidence`).
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_workflow_plan",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let plan =
+        epigraph_ingest_executor::workflow_plan::frozen_plan(&mut read, &viewer, workflow_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "tenancy.scoped_read",
+                    error = %e,
+                    handler = "get_workflow_plan",
+                    "frozen plan read failed on the viewer-stamped connection"
+                );
+                ApiError::InternalError {
+                    message: "Failed to read the workflow plan".to_string(),
+                }
+            })?;
+    read.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("Failed to close the scoped read: {e}"),
+    })?;
+    plan.map(Json).ok_or(ApiError::NotFound {
+        entity: "workflow plan".to_string(),
+        id: workflow_id.to_string(),
+    })
+}
+
 /// POST /api/v1/workflows/:id/outcome - Report execution outcome.
 ///
 /// The truth update, the usage counters and the behavioral-execution row are
@@ -1042,6 +1132,14 @@ pub async fn report_outcome(
 /// Returns workflows whose `goal` or `canonical_name` matches `q` (ILIKE),
 /// ordered newest first. Limit defaults to 10, max 50.
 ///
+/// With `resolve_to_latest=true` the lineage head (highest `generation`) of
+/// every matched `canonical_name` is always returned, even when its goal does
+/// not match `q`, it has no goal embedding, or its truth is below `min_truth`;
+/// each entry carries `is_lineage_head`, `lineage_head_generation` and
+/// `lineage_head_deprecated`. The result can then exceed `limit` by one head
+/// per matched lineage. A live head leads its lineage group; a deprecated head
+/// (truth below `min_truth`) sorts after the live rows of its group.
+///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -1136,18 +1234,33 @@ pub async fn find_workflow_hierarchical(
         })?;
     }
 
+    // With `resolve_to_latest` both searches add the head of every matched
+    // canonical_name, so the highest generation per group in `rows` IS the
+    // lineage head (`lineage_heads_in`).
+    let heads = params
+        .resolve_to_latest
+        .then(|| epigraph_db::repos::workflow::lineage_heads_in(&rows));
     let mut workflows: Vec<HierarchicalWorkflowResult> = rows
         .into_iter()
-        .map(|r| HierarchicalWorkflowResult {
-            workflow_id: r.id,
-            canonical_name: r.canonical_name,
-            generation: r.generation,
-            goal: r.goal,
-            parent_id: r.parent_id,
-            metadata: r.metadata,
-            created_at: r.created_at,
-            truth_value: r.truth_value,
-            resolved_steps: None,
+        .map(|r| {
+            let lineage = heads
+                .as_ref()
+                .and_then(|h| h.get(&r.canonical_name))
+                .copied();
+            HierarchicalWorkflowResult {
+                is_lineage_head: lineage.map(|(id, _, _)| id == r.id),
+                lineage_head_generation: lineage.map(|(_, generation, _)| generation),
+                lineage_head_deprecated: lineage.map(|(_, _, truth)| truth < min_truth),
+                workflow_id: r.id,
+                canonical_name: r.canonical_name,
+                generation: r.generation,
+                goal: r.goal,
+                parent_id: r.parent_id,
+                metadata: r.metadata,
+                created_at: r.created_at,
+                truth_value: r.truth_value,
+                resolved_steps: None,
+            }
         })
         .collect();
 
@@ -1182,6 +1295,7 @@ pub async fn find_workflow_hierarchical(
                                 content: h.content,
                                 truth_value: h.truth_value,
                                 created_at: h.created_at,
+                                is_current: h.is_current,
                             })
                             .collect(),
                         pending_resolution: s.pending_resolution,
@@ -1204,10 +1318,42 @@ pub async fn find_workflow_hierarchical(
 ///
 /// Updates `workflows.metadata` counters (use_count, success_count, failure_count,
 /// avg_variance) and writes per-step `behavioral_executions` rows with
-/// `step_claim_id` populated for each step in `step_executions`.
+/// `step_claim_id` populated for each step in `step_executions`, all on one
+/// transaction: a refused step row is a 500 and nothing is written. An
+/// out-of-range `quality` is a 400. A non-blank `goal_text` is embedded
+/// (best-effort) onto every step row so the report feeds behavioral affinity.
+/// NOT idempotent: a retried report counts twice.
 ///
-/// Returns 404 if the id does not correspond to a `workflows` row. Use
+/// Returns 404 if the id does not correspond to a `workflows` row, or if the
+/// caller can read none of the workflow's `executes` edges (the two are not
+/// told apart, and nothing is written). Use
 /// `POST /api/v1/workflows/:id/outcome` for flat-JSON workflows.
+///
+/// # Authority
+///
+/// Requires `claims:write`, as the MCP twin does (`scope_map.rs`); a request
+/// with no `AuthContext` is 401, never a skipped check. The route used to take
+/// no `AuthContext` at all, so any authenticated bearer, a read-only client
+/// included, could move a workflow's counters.
+///
+/// # Step attribution runs through the CALLER's viewer
+///
+/// The whole report runs on one transaction stamped with the caller's viewer
+/// ([`AppState::write_as`]). `workflows` and `behavioral_executions` have no
+/// row security, so that changes nothing about the two writes; it changes the
+/// reads of `claims` and `edges`. On the plain transaction this used to run
+/// on, row security admitted only public rows, so a group's own member got
+/// every row of a group-private workflow written with a NULL `step_claim_id`,
+/// silently. A caller that reads NONE of the plan's `executes` edges
+/// (`WorkflowRepository::viewer_reads_any_executes_edge`) is refused with the
+/// missing-id 404 before anything is written: `workflows` has no row security,
+/// so without that check any `claims:write` holder could move the counters of
+/// a workflow it cannot read. A reader of the plan resolves its steps, and any
+/// `step_index` that matches no step the caller can read is listed in
+/// `unresolved_step_indices` with a `warning` (out of range and not visible are
+/// deliberately not told apart). Shared with MCP:
+/// `WorkflowRepository::plan_step_claim_ids` and
+/// `epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning`.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1216,35 +1362,110 @@ pub async fn find_workflow_hierarchical(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 404),
+        (status = 400, description = "quality outside [0, 1]"),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write"),
+        (status = 404, description = "no such workflow, or the caller reads none of its plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
     tag = "workflows"
 )]
 pub async fn report_hierarchical_outcome(
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // 1. Confirm this is a hierarchical workflow root
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "report_hierarchical_outcome requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
+    // 0. Validate before touching the database (U033). `behavioral_executions`
+    //    carries CHECK (quality BETWEEN 0 AND 1); an out-of-range value used to
+    //    move the counters and then have every step row silently refused.
+    if let Some(q) = request.quality {
+        if !(q.is_finite() && (0.0..=1.0).contains(&q)) {
+            return Err(ApiError::BadRequest {
+                message: format!("`quality` must be a finite number in [0, 1]; got {q}"),
+            });
+        }
+    }
+
+    // Embed the goal for affinity matching, best-effort and BEFORE the
+    // transaction so embedder latency stays out of the row lock. Blank goals and
+    // the "hierarchical" placeholder are not goals. Mirrors the MCP tool's
+    // `do_report_hierarchical_outcome_with_embedder`.
+    let goal_text = request
+        .goal_text
+        .clone()
+        .unwrap_or_else(|| String::from("hierarchical"));
+    let goal_to_embed = request
+        .goal_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty() && *g != "hierarchical");
+    let goal_embedding_pgvec = match (goal_to_embed, state.embedding_service()) {
+        (Some(goal), Some(embedder)) => match embedder.generate(goal).await {
+            Ok(vec) => Some(format!(
+                "[{}]",
+                vec.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+            Err(e) => {
+                tracing::warn!(workflow_id = %workflow_id, "hierarchical goal embedding failed: {e}");
+                None
+            }
+        },
+        _ => None,
+    };
+
+    // ONE transaction for the counters and every step row (U033): a refused row
+    // fails the report and rolls the counters back. Stamped with the caller's
+    // viewer so the step lookup (step 4) reads what the CALLER may read; the
+    // two writes are to tables with no row security.
+    let mut tx = state
+        .write_as(&viewer, "report_hierarchical_outcome")
+        .await?;
+
+    // 1. Confirm this is a hierarchical workflow root, and lock its row so two
+    //    concurrent reports cannot both read `use_count = n` and write `n + 1`.
     let row: Option<(serde_json::Value,)> =
-        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1")
+        sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
-            .fetch_optional(&state.db_pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("workflows lookup failed: {e}"),
             })?;
+    let not_found = || ApiError::NotFound {
+        entity: "hierarchical workflow".into(),
+        id: workflow_id.to_string(),
+    };
     let mut metadata = match row {
         Some((m,)) => m,
-        None => {
-            return Err(ApiError::NotFound {
-                entity: "hierarchical workflow".into(),
-                id: workflow_id.to_string(),
-            });
-        }
+        None => return Err(not_found()),
     };
+    // A caller that reads none of the plan's `executes` edges cannot read this
+    // workflow (`workflows` has no row security; its plan does): 404 exactly
+    // like a missing id, before any write. Shared with MCP.
+    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
+        &mut tx,
+        &viewer,
+        workflow_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("workflow visibility check failed: {e}"),
+    })? {
+        return Err(not_found());
+    }
 
     // 2. Compute deltas
     let success = request.success;
@@ -1291,53 +1512,36 @@ pub async fn report_hierarchical_outcome(
     sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
         .bind(&metadata)
         .bind(workflow_id)
-        .execute(&state.db_pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("metadata update failed: {e}"),
         })?;
 
     // 4. Resolve step_index → step_claim_id via the workflow's executes edges,
-    //    restricted to level=2 (steps), in PLAN order: the `plan_index` ordinal
-    //    the ingest executor records on each edge, with `e.created_at` only as
-    //    the fallback for edges that predate it. `created_at` alone stopped
-    //    being a usable proxy when the executor began writing a plan in ONE
-    //    transaction — `NOW()` is transaction-start time, every edge ties, and
-    //    the tiebreak `c.id` is a content-derived UUID. Same key as
-    //    `epigraph_mcp::tools::workflow_hierarchical` and
-    //    `WorkflowRepository::resolve_steps_to_heads`, so step N is one step on
-    //    both transports.
-    let step_claim_rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT c.id \
-         FROM edges e \
-         JOIN claims c ON c.id = e.target_id \
-         WHERE e.source_id = $1 AND e.relationship = 'executes' AND (c.properties->>'level')::int = 2 \
-         ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
-                       THEN (e.properties->>'plan_index')::int \
-                       ELSE 2147483647 END, \
-                  e.created_at ASC, c.id ASC",
-    )
-    .bind(workflow_id)
-    .fetch_all(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("step lookup failed: {e}"),
-    })?;
-    let step_claim_ids: Vec<Uuid> = step_claim_rows.into_iter().map(|(id,)| id).collect();
+    //    restricted to level=2 (steps), in PLAN order, through the caller's
+    //    viewer on this stamped transaction. The order key (the `plan_index`
+    //    ordinal; `e.created_at` only for edges that predate it) lives in the
+    //    repository, shared with the MCP tool, so step N is one step on both
+    //    transports.
+    let step_claim_ids =
+        epigraph_db::WorkflowRepository::plan_step_claim_ids(&mut tx, &viewer, workflow_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("step lookup failed: {e}"),
+            })?;
 
-    // 5. Write per-step behavioral_executions rows. Capture timestamp once so
-    //    rows from a single outcome report group cleanly downstream.
+    // 5. Write per-step behavioral_executions rows on the same transaction; a
+    //    refused row returns 500 and rolls back everything above. Capture the
+    //    timestamp once so rows from a single outcome report group cleanly
+    //    downstream (and count as ONE report in `behavioral_affinity_hierarchical`).
     let report_ts = chrono::Utc::now();
+    let mut unresolved: Vec<usize> = Vec::new();
     if let Some(ref step_execs) = request.step_executions {
         for step_exec in step_execs {
             let step_claim_id = step_claim_ids.get(step_exec.step_index).copied();
-            if step_claim_id.is_none() && !step_claim_ids.is_empty() {
-                tracing::warn!(
-                    workflow_id = %workflow_id,
-                    step_index = step_exec.step_index,
-                    known_steps = step_claim_ids.len(),
-                    "step_index out of range; behavioral_executions row will have NULL step_claim_id"
-                );
+            if step_claim_id.is_none() {
+                unresolved.push(step_exec.step_index);
             }
             let step_beliefs = serde_json::json!({
                 "deviated": step_exec.deviated,
@@ -1346,10 +1550,7 @@ pub async fn report_hierarchical_outcome(
             let row = epigraph_db::BehavioralExecutionRow {
                 id: Uuid::new_v4(),
                 workflow_id,
-                goal_text: request
-                    .goal_text
-                    .clone()
-                    .unwrap_or_else(|| String::from("hierarchical")),
+                goal_text: goal_text.clone(),
                 success,
                 step_beliefs,
                 tool_pattern: vec![step_exec.planned.clone()],
@@ -1360,21 +1561,48 @@ pub async fn report_hierarchical_outcome(
                 step_claim_id,
                 run_label: None,
             };
-            if let Err(e) =
-                epigraph_db::BehavioralExecutionRepository::create(&state.db_pool, row, None).await
-            {
-                tracing::warn!(workflow_id = %workflow_id, "behavioral_executions write failed: {e}");
-            }
+            epigraph_db::BehavioralExecutionRepository::create(
+                &mut *tx,
+                row,
+                goal_embedding_pgvec.as_deref(),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("behavioral_executions write failed: {e}"),
+            })?;
         }
     }
 
-    Ok(Json(serde_json::json!({
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("outcome commit failed: {e}"),
+    })?;
+
+    let warning = epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(&unresolved);
+    if warning.is_some() {
+        // Every unattributed row is logged, the all-invisible case included;
+        // the old guard (`!step_claim_ids.is_empty()`) kept that case silent.
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            principal = ?viewer.principal(),
+            unresolved_step_indices = ?unresolved,
+            "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
+             (step_index out of range, or the step is not visible to the reporter)"
+        );
+    }
+
+    let mut response = serde_json::json!({
         "workflow_id": workflow_id,
         "use_count": use_count,
         "success_count": success_count,
         "failure_count": failure_count,
         "variance": variance,
-    })))
+        // The rows written with a NULL step_claim_id, in request order.
+        "unresolved_step_indices": unresolved,
+    });
+    if let Some(w) = warning {
+        response["warning"] = serde_json::Value::String(w);
+    }
+    Ok(Json(response))
 }
 
 /// POST /api/v1/workflows/steps/:id/evolve — atomically evolve a step claim.
@@ -1395,8 +1623,49 @@ pub struct EvolveStepResponse {
     pub step_lineage_id: uuid::Uuid,
     pub edge_type: String,
     pub edge_id: uuid::Uuid,
+    /// `supersedes` only: the Supersede admin cascade (migration 117) that
+    /// carries the retired step's edges onto the new one, as
+    /// `POST /api/v1/claims/:id/supersede` reports it (`applied`, `deferred`
+    /// or `failed`, with its `security_events` row id). Absent for `revises`,
+    /// which supersedes nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub cascade: Option<epigraph_engine::admin_cascade::CascadeStatus>,
+    /// `supersedes` only: what the downstream belief cascade repaired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub belief_cascade: Option<epigraph_engine::retraction_cascade::CascadeReport>,
 }
 
+/// POST /api/v1/workflows/steps/{id}/evolve - Evolve a versioned step.
+///
+/// Creates a new claim in the step's lineage that `supersedes` (linear
+/// refinement; the parent is retired) or `revises` (a concurrent branch; both
+/// stay current) the parent. With `supersedes` the new claim records
+/// `supersedes = parent` and the administrative Supersede cascade (as
+/// `POST /api/v1/claims/{id}/supersede` runs it) carries the retired step's
+/// edges onto it, reported in `cascade` (`applied`; `deferred` to the replay
+/// timer when no maintenance connection is configured; or `failed`, and
+/// replayable) and `belief_cascade`. The workflow's `executes` edge, its step
+/// chain (`step_follows` / `phase_follows`), the lineage's `revises` history
+/// and other agents' `asserts` / `AUTHORED` stay on the retired step.
+/// `revises` retires nothing and runs no cascade.
+///
+/// Authority: when any workflow executes the parent's step lineage (the
+/// parent or any claim sharing its `step_lineage_id`, retracted `executes`
+/// edges included), the caller needs workflow authority over EVERY such
+/// workflow, as `add_step` / `delete_step` need over theirs: its recorded
+/// submitter, the submitter's operator, or the audited `claims:admin` path (a
+/// workflow with no recorded submitter admits only that path). Anyone else is
+/// refused 403 with nothing written. Each admitted write records one
+/// `workflows.caller_write` (or `workflows.admin_write`) row per workflow. A
+/// claim no workflow executes is unaffected.
+///
+/// Refusals write nothing: 400 for a `level` other than 2 or 3, blank
+/// `content` or an `edge_type` other than `supersedes` / `revises`; 404 for a
+/// parent that does not exist or that the caller cannot see; 409 for
+/// `supersedes` on a parent that is no longer current (`revises` may still
+/// branch from it).
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1407,7 +1676,9 @@ pub struct EvolveStepResponse {
         (status = 200, body = EvolveStepResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = [])),
     tag = "workflows"
@@ -1434,6 +1705,20 @@ pub async fn evolve_step(
             message: "parent_id in path and body must match".into(),
         });
     }
+    // The request checks MCP `evolve_step` makes before any write, with its
+    // wording (backlog 769989ae): without them a bad level was written as is
+    // and blank content reached the claims CHECK as a 500.
+    let level = req.level.unwrap_or(2);
+    if level != 2 && level != 3 {
+        return Err(ApiError::BadRequest {
+            message: format!("level must be 2 or 3 (got {level})"),
+        });
+    }
+    if req.content.trim().is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "content must not be empty".into(),
+        });
+    }
     // The step claim is AUTHORED by, and written on a transaction STAMPED
     // with, the authenticated caller: the viewer's principal (the token's
     // `agent_id`). NOT `owner_id` / `client_id`: those are `oauth_clients.id`
@@ -1445,8 +1730,11 @@ pub async fn evolve_step(
             reason: "evolve_step requires an authenticated principal".into(),
         });
     };
-    let level = req.level.unwrap_or(2);
     let mut tx = state.begin_claim_write(&viewer, "evolve_step").await?;
+    // Workflow authority over every workflow executing the parent's
+    // step lineage, checked for the SAME principal the step is authored as,
+    // on the act's own transaction and before it, so a refusal writes nothing.
+    let grants = require_api_lineage_authority(&mut tx, &auth, agent, parent_id).await?;
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(parent_id),
@@ -1462,20 +1750,92 @@ pub async fn evolve_step(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        // The repo's refusals are the caller's to act on (backlog 769989ae):
+        // `InvalidData` (an edge_type outside the vocabulary) is a 400 and
+        // `Conflict` (superseding a non-current step) a 409, as
+        // `From<DbError>` maps them everywhere else. These are the only two
+        // refusals `evolve_step_conn` raises besides `NotFound`. Its other
+        // `InvalidData`, a parent whose stored visibility is outside the
+        // vocabulary, is a data fault but also reads as a 400: the column is
+        // NOT NULL with a CHECK, so it is unreachable unless that constraint
+        // is dropped out of band.
+        e @ (epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::Conflict { .. }) => {
+            ApiError::from(e)
+        }
         e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {
             message: other.to_string(),
         },
     })?;
+    record_api_lineage_writes(
+        &mut tx,
+        &auth,
+        agent,
+        &grants,
+        serde_json::json!({
+            "parent_claim_id": parent_id,
+            "claim_id": result.new_claim_id,
+            "step_lineage_id": result.step_lineage_id,
+            "edge_type": result.edge_type,
+            "level": level,
+        }),
+    )
+    .await?;
+    // A `supersedes` step is a supersession (`claims.supersedes` names the
+    // parent), so it runs `versioning::supersede_claim`'s administrative
+    // cascade (backlog 8d3b4527): the act above moved no edge, and the retired
+    // step's decomposition, argument and support edges belong to other
+    // writers. `migrate_superseded_edges`' step-lineage rule leaves the
+    // workflow's `executes` and its `step_follows` / `phase_follows` chain,
+    // the lineage's `revises` history and agents' authorship edges on the
+    // retired step.
+    // The maintenance session is acquired BEFORE the act commits; without one
+    // the deferral commits with the act, under the caller's stamp.
+    let supersession = if result.edge_type == "supersedes" {
+        let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+            epigraph_engine::admin_cascade::CascadeCause::Supersede,
+            Some(agent),
+            Some(crate::routes::versioning::oauth_principal(&auth)),
+            parent_id,
+            Some(result.new_claim_id),
+        );
+        let (session, deferred) =
+            crate::routes::versioning::admin_session_or_deferral(&state, &mut tx, &trigger).await?;
+        Some((trigger, session, deferred))
+    } else {
+        None
+    };
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("evolve_step: commit failed: {e}"),
     })?;
+
+    // Best-effort, as in `supersede_claim`: the act has committed, so a
+    // cascade failure is reported in `cascade`, never as an error.
+    let (cascade, belief_cascade) = match supersession {
+        Some((trigger, Some(mut session), _)) => {
+            let (conn, admin_viewer) = session.split();
+            let (c, b) = epigraph_engine::admin_cascade::apply_after_supersede(
+                conn,
+                admin_viewer,
+                &viewer,
+                &trigger,
+                parent_id,
+                result.new_claim_id,
+            )
+            .await;
+            (Some(c), Some(b))
+        }
+        Some((_, None, status)) => (Some(status), Some(Default::default())),
+        None => (None, None),
+    };
 
     Ok(Json(EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_type: result.edge_type,
         edge_id: result.edge_id,
+        cascade,
+        belief_cascade,
     }))
 }
 
@@ -1729,13 +2089,49 @@ pub async fn record_behavioral_execution(
     })))
 }
 
+/// The body of `POST /api/v1/workflows/ingest`: a `WorkflowExtraction`, with
+/// two optional keys beside its own.
+///
+/// * `tenancy`: `{"visibility": "group", "owner_group_id": G}` declares
+///   `('group', G)` for every claim the ingest creates (absent: public).
+/// * `embed`: `false` embeds nothing (default `true`).
+#[cfg(feature = "db")]
+#[derive(Debug, Deserialize)]
+pub struct IngestWorkflowRequest {
+    #[serde(flatten)]
+    pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+    #[serde(default)]
+    pub embed: Option<bool>,
+}
+
 /// POST /api/v1/workflows/ingest - Ingest a hierarchical `WorkflowExtraction`.
 ///
 /// Parses a `WorkflowExtraction` JSON body, persists the claim hierarchy
 /// (thesis → phases → steps → operation atoms), writes `workflow —executes→ claim`
 /// edges, resolves author-placeholder edges, and returns a summary. Idempotent:
 /// if the workflow row already has `executes` edges, returns `already_ingested: true`
-/// without touching the DB further.
+/// without touching the DB further. `executes_edges` then counts only the
+/// existing plan's edges the caller can read.
+///
+/// # A declared tenancy
+///
+/// With `tenancy` (see [`IngestWorkflowRequest`]) every claim the ingest
+/// creates is `('group', G)`. The REQUEST's principal itself must hold a live
+/// writer or admin membership of G (checked on its own viewer before any
+/// transaction, so a refusal writes nothing; its operator's membership does
+/// not count), and so must the workflow-ingest system agent (checked by the
+/// executor on the stamped transaction). Both refusals are 403. The response
+/// then carries `reused_items`: every planned claim the call did not create
+/// whose tenancy is not `('group', G)`, with its tenancy (`null` when the
+/// caller cannot read it, which only a re-ingest can report). Nothing
+/// re-tenants a reused claim, and a plan that reuses a claim private to a group
+/// the caller does not write is refused (403) before any edge is written.
+///
+/// The `workflows` row itself has no row security: its `canonical_name`,
+/// `goal`, `metadata` and (unless `embed` is `false`) `goal_embedding` stay
+/// instance-readable whatever the tenancy, so a caller must keep them neutral.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1743,6 +2139,7 @@ pub async fn record_behavioral_execution(
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1752,8 +2149,25 @@ pub async fn ingest_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Json(mut extraction): Json<epigraph_ingest::workflow::WorkflowExtraction>,
+    Json(request): Json<IngestWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let IngestWorkflowRequest {
+        mut extraction,
+        tenancy,
+        embed,
+    } = request;
+    let declared_group = tenancy.map(|t| t.owner_group_id);
+    // The caller's OWN membership of a declared group, before anything is
+    // begun (`require_caller_writes_group`). A viewer with no principal names
+    // no caller and is refused.
+    if let Some(group) = declared_group {
+        let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
+            reason: "workflow ingest: a declared tenancy needs an authenticated agent principal"
+                .to_string(),
+        })?;
+        epigraph_ingest_executor::require_caller_writes_group(&viewer, caller, group)
+            .map_err(workflow_ingest_error)?;
+    }
     // H3 (batch H-b): the submitter key is this route's to write, never the
     // caller's; see `workflow_ingest_submitter`.
     if let Some(obj) = extraction.source.metadata.as_object_mut() {
@@ -1764,10 +2178,17 @@ pub async fn ingest_workflow(
         begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
     let auth = auth_ctx.as_ref().map(|a| &a.0);
     let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
-    let result =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
-            .await
-            .map_err(workflow_ingest_error)?;
+    let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+        &mut tx,
+        &plan,
+        &extraction,
+        &viewer,
+        declared_group,
+    )
+    .await
+    .map_err(workflow_ingest_error)?;
+    let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
         auth,
@@ -1785,27 +2206,21 @@ pub async fn ingest_workflow(
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
-    if let Some(embedder) = state.embedding_service() {
+    // `embed: false` (OD-6) sends no text to the embedder at all.
+    let embedder = if embed.unwrap_or(true) {
+        state.embedding_service()
+    } else {
+        None
+    };
+    if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
-        for (claim_id, content) in &result.inserted {
-            match embedder.generate(content).await {
-                Ok(embedding) => {
-                    let pgvector_str = format_embedding(&embedding);
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(*claim_id)
-                            .execute(&state.db_pool)
-                            .await
-                    {
-                        tracing::warn!(claim_id = %claim_id, error = %e, "Failed to store embedding for ingested workflow claim");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(claim_id = %claim_id, error = %e, "Failed to generate embedding for ingested workflow claim");
-                }
-            }
-        }
+        embed_inserted_workflow_claims(
+            &state,
+            embedder.as_ref(),
+            "workflows/ingest",
+            &result.inserted,
+        )
+        .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
@@ -1825,7 +2240,7 @@ pub async fn ingest_workflow(
         }
     }
 
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "workflow_id": result.workflow_id,
         "canonical_name": result.canonical_name,
         "generation": result.generation,
@@ -1834,7 +2249,21 @@ pub async fn ingest_workflow(
         "executes_edges": result.executes_edges_created,
         "relationships_created": result.relationship_edges_created,
         "already_ingested": result.already_ingested,
-    })))
+    });
+    if declared_group.is_some() {
+        body["reused_items"] = result
+            .reused_items
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "claim_id": r.claim_id,
+                    "visibility": r.visibility,
+                    "owner_group_id": r.owner_group_id,
+                })
+            })
+            .collect();
+    }
+    Ok(Json(body))
 }
 
 // ── Internal helpers ──
@@ -1920,11 +2349,16 @@ pub(crate) async fn begin_system_ingest_stamped_tx<'s>(
                 "write refused: could not establish the workflow-ingest-system agent's write \
                  authority. Nothing was written."
             );
-            ApiError::InternalError {
-                message: format!(
-                    "{route}: could not establish the workflow-ingest-system agent's write \
-                     authority: {e}. Nothing was written."
-                ),
+            match e {
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                    system_agent_unregistered(role)
+                }
+                e => ApiError::InternalError {
+                    message: format!(
+                        "{route}: could not establish the workflow-ingest-system agent's write \
+                         authority: {e}. Nothing was written."
+                    ),
+                },
             }
         })?;
 
@@ -1971,9 +2405,150 @@ pub(crate) async fn get_or_create_system_agent(pool: &sqlx::PgPool) -> Result<Uu
     })?;
     epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
         .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
+        .map_err(|e| match e {
+            epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+                system_agent_unregistered(role)
+            }
+            other => ApiError::InternalError {
+                message: other.to_string(),
+            },
         })
+}
+
+/// The armed-and-unregistered refusal (migration 148), as a 500 the CALLER
+/// can read: its text is the operator's remedy, not a driver error, so it is
+/// [`ApiError::InternalErrorStatic`] and survives the 500 body redaction that
+/// every other `InternalError` gets. One literal per
+/// [`epigraph_db::SystemAgentRole`]; `role` is that enum's `as_str()`.
+#[cfg(feature = "db")]
+pub(crate) fn system_agent_unregistered(role: &'static str) -> ApiError {
+    ApiError::InternalErrorStatic {
+        message: if role == epigraph_db::SystemAgentRole::WorkflowIngest.as_str() {
+            "the workflow-ingest system agent is not registered in system_agents and this \
+             database is armed (migration 122): workflow ingest is refused until a maintenance \
+             session registers it (epigraph-operator register-system-agent --role \
+             workflow-ingest --agent <id> --reason <text> --apply). Nothing was written"
+        } else {
+            "a system agent is not registered in system_agents and this database is armed \
+             (migration 122): the request is refused until a maintenance session registers it \
+             (epigraph-operator register-system-agent). Nothing was written"
+        },
+    }
+}
+
+/// Embed the claims a workflow ingest just committed. This runs post-commit and
+/// best-effort, on a transaction stamped from the **workflow-ingest system
+/// agent's** viewer: the same authority [`begin_system_ingest_stamped_tx`] wrote
+/// the claims with.
+///
+/// # Why not `state.db_pool`
+///
+/// The claims are authored by the system agent and owned by its personal
+/// group. An `UPDATE claims SET embedding` on the unstamped pool carries no
+/// viewer, so row security on `claims` refuses it. Before this helper existed,
+/// both `store_workflow` and `ingest_workflow` did exactly that and only
+/// WARN-logged the refusal. The route answered 200 and every claim it had
+/// written was left without a vector (backlog 5ce88457), invisible to dense
+/// recall against CLAUDE.md's "Embedding policy". The CALLER's viewer is wrong
+/// too: the `{WRITABLE:c}` splice in `store_embedding_if_unsealed` would render
+/// the caller's groups, and no system-owned row satisfies them.
+///
+/// No caller re-binding is needed. Migration 122's claims trigger fires on
+/// `UPDATE OF agent_id, supersedes, is_current`, not on `embedding`.
+///
+/// # Shape
+///
+/// * Every vector is generated FIRST, with no connection held, so a provider
+///   round trip never holds a transaction open. This is the rule
+///   `epigraph-mcp`'s `claim_helper::embed_claim_author_stamped` states.
+/// * Then ONE stamped transaction stores them all through
+///   [`epigraph_db::ClaimRepository::store_embedding_if_unsealed`]. That call
+///   takes the row lock, re-checks seal and `is_current`, and runs in its own
+///   savepoint, so one refused row does not abort the rest.
+/// * Every failure is logged and swallowed. The claims are already committed,
+///   and the embedding policy forbids a failed embed from unwinding them. A
+///   missing `ScopedPool` or system authority is logged at ERROR on
+///   `tenancy.scoped_write`. There is never a fallback to `state.db_pool`.
+#[cfg(feature = "db")]
+async fn embed_inserted_workflow_claims(
+    state: &AppState,
+    embedder: &dyn epigraph_embeddings::EmbeddingService,
+    route: &'static str,
+    inserted: &[(Uuid, String)],
+) {
+    if inserted.is_empty() {
+        return;
+    }
+
+    let mut vectors: Vec<(Uuid, String)> = Vec::with_capacity(inserted.len());
+    for (claim_id, content) in inserted {
+        match embedder.generate(content).await {
+            Ok(embedding) => vectors.push((*claim_id, format_embedding(&embedding))),
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to generate embedding for ingested workflow claim");
+            }
+        }
+    }
+    if vectors.is_empty() {
+        return;
+    }
+
+    let Some(scoped) = state.scoped.as_ref() else {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            claims = vectors.len(),
+            "workflow claim embeddings not stored: this process was not built from a \
+             ScopedPool, so no connection can be stamped with the ingest system agent's \
+             authority. The claims are stored but carry no vector."
+        );
+        return;
+    };
+    let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                route = route,
+                claims = vectors.len(),
+                error = %e,
+                "workflow claim embeddings not stored: could not establish the \
+                 workflow-ingest-system agent's write authority. The claims are stored but \
+                 carry no vector."
+            );
+            return;
+        }
+    };
+    let mut tx = match scoped.begin_as(&authority.viewer).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(route = route, claims = vectors.len(), error = %e, "workflow claim embeddings not stored: could not begin a system-agent-stamped transaction");
+            return;
+        }
+    };
+
+    let mut stored = 0usize;
+    for (claim_id, pgvec) in &vectors {
+        match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+            &mut tx,
+            &authority.viewer,
+            *claim_id,
+            pgvec,
+        )
+        .await
+        {
+            Ok(true) => stored += 1,
+            Ok(false) => {
+                tracing::warn!(claim_id = %claim_id, route = route, "workflow claim embedding matched no row (claim missing, sealed, superseded, or not writable by the system agent)");
+            }
+            Err(e) => {
+                tracing::warn!(claim_id = %claim_id, route = route, error = %e, "Failed to store embedding for ingested workflow claim");
+            }
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(route = route, claims = stored, error = %e, "workflow claim embeddings could not commit; the claims are stored but carry no vector");
+    }
 }
 
 #[cfg(feature = "db")]
@@ -2103,7 +2678,9 @@ pub struct DeleteStepRequest {
 /// Map a workflow-ingest executor error. Migration 105's personal-group
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
-/// detail logged and kept out of the body. Everything else stays a 500.
+/// detail logged and kept out of the body. A content-less generation
+/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
+/// the caller's payload errors: 400. Everything else stays a 500.
 ///
 /// On these routes `system_agent_write_authority` refuses a revoked system
 /// agent first, with its own `AgentCreation` error (#498's 500, unchanged), so
@@ -2115,6 +2692,28 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
             if db.is_write_authority_refusal() =>
         {
             ApiError::from(db)
+        }
+        // U032: a content-less generation is the caller's payload error: 400,
+        // not a 500 that invites the retry loop that minted the stubs.
+        e @ epigraph_ingest_executor::IngestExecutorError::EmptyGeneration { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // Blank claim content in the payload (thesis, phase, step or
+        // operation), refused by the executor's pre-flight: 400 naming the
+        // field.
+        e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // A declared group the caller, or the system agent, does not write.
+        e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
+            reason: format!("workflow ingest: {e}"),
+        },
+        epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
+            system_agent_unregistered(role)
         }
         other => ApiError::InternalError {
             message: format!("workflow ingest: {other}"),
@@ -2150,6 +2749,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
         {
             ApiError::from(db)
         }
+        E::Executor(epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered {
+            role,
+        }) => system_agent_unregistered(role),
         E::Db(e) => ApiError::InternalError {
             message: format!("db: {e}"),
         },
@@ -2162,15 +2764,37 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
     }
 }
 
+/// Which arm of [`workflow_authority`] admitted the caller (the MCP twin's
+/// `WorkflowArm`, without its stdio arm: every route here is authenticated or
+/// names its caller through the viewer).
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiWorkflowArm {
+    /// The caller is the recorded submitter.
+    Submitter,
+    /// The caller is the operator of the submitter (#503).
+    Operator,
+    /// The AUDITED admin arm.
+    Admin,
+}
+
 /// What [`workflow_authority`] admitted (batch H-b, H3).
 #[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug)]
 struct ApiWorkflowGrant {
     /// The recorded submitter, if any.
     owner: Option<Uuid>,
-    /// Admitted only through the audited admin arm: the write must then record
-    /// [`audit_api_admin_workflow_write`] on its own transaction.
-    admin: bool,
+    /// The arm that admitted the caller. The admin arm's write must record
+    /// [`audit_api_admin_workflow_write`] on its own transaction; every other
+    /// arm's write records [`record_api_caller_workflow_write`].
+    arm: ApiWorkflowArm,
+}
+
+#[cfg(feature = "db")]
+impl ApiWorkflowGrant {
+    fn is_admin(&self) -> bool {
+        matches!(self.arm, ApiWorkflowArm::Admin)
+    }
 }
 
 /// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
@@ -2207,7 +2831,7 @@ async fn workflow_authority(
         if api_admin_arm(conn, auth, caller, &subject).await? {
             return Ok(ApiWorkflowGrant {
                 owner: None,
-                admin: true,
+                arm: ApiWorkflowArm::Admin,
             });
         }
         return Err(ApiError::Forbidden {
@@ -2217,12 +2841,12 @@ async fn workflow_authority(
             ),
         });
     };
-    let allowed = ApiWorkflowGrant {
+    let allowed = |arm| ApiWorkflowGrant {
         owner: Some(owner),
-        admin: false,
+        arm,
     };
     if caller == Some(owner) {
-        return Ok(allowed);
+        return Ok(allowed(ApiWorkflowArm::Submitter));
     }
     if let Some(caller) = caller {
         // On the request's own transaction, not the raw pool (`no_unscoped_pool`).
@@ -2232,15 +2856,12 @@ async fn workflow_authority(
                 message: format!("could not read the submitter's operator: {e}"),
             })?;
         if op.is_some_and(|l| l.operator_id == caller) {
-            return Ok(allowed);
+            return Ok(allowed(ApiWorkflowArm::Operator));
         }
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     if api_admin_arm(conn, auth, caller, &subject).await? {
-        return Ok(ApiWorkflowGrant {
-            owner: Some(owner),
-            admin: true,
-        });
+        return Ok(allowed(ApiWorkflowArm::Admin));
     }
     Err(ApiError::Forbidden {
         reason: format!(
@@ -2249,6 +2870,48 @@ async fn workflow_authority(
              written."
         ),
     })
+}
+
+/// The PROVENANCE of a write admitted through the submitter or operator arm
+/// (the MCP twin's `record_caller_workflow_write`, the same
+/// `workflows.caller_write` row and fields), on the write's own transaction.
+/// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
+/// The token fields are null on a route that carries no token
+/// (`store_workflow`, which names its caller through the viewer).
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+async fn record_api_caller_workflow_write(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    acting: Uuid,
+    action: &str,
+    workflow_id: Uuid,
+    grant: ApiWorkflowGrant,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    let (arm, operator) = match grant.arm {
+        ApiWorkflowArm::Admin => return Ok(()),
+        ApiWorkflowArm::Submitter => ("submitter", None),
+        ApiWorkflowArm::Operator => ("operator", Some(acting)),
+    };
+    let record = serde_json::json!({
+        "action": action,
+        "workflow_id": workflow_id,
+        "submitter": grant.owner,
+        "arm": arm,
+        "acting_agent": acting,
+        "operator": operator,
+        "client_id": auth.map(|a| a.client_id),
+        "token_jti": auth.map(|a| a.jti),
+        "write": details,
+    });
+    epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!(
+                "{action}: could not record the write's provenance: {e}. Nothing was written."
+            ),
+        })
 }
 
 /// The AUDITED admin arm of [`workflow_authority`], shared by a submitted
@@ -2351,6 +3014,108 @@ async fn require_api_workflow_authority(
     Ok(Some((head, grant)))
 }
 
+/// Lineage-wide authority (the MCP twin is
+/// `tools/evolve_step.rs::require_lineage_authority`):
+/// [`workflow_authority`] for `caller` over EVERY workflow that executes the
+/// step lineage of `parent`
+/// (`WorkflowRepository::workflows_executing_step_lineage`: the parent and
+/// every claim sharing its `step_lineage_id`, retracted `executes` edges
+/// included). A step two workflows execute needs authority over both; the
+/// head an earlier evolve left unexecuted is still gated through its lineage;
+/// a lineage no workflow executes returns no grant and is unaffected.
+///
+/// `caller` must be the principal the step is authored as (the viewer's), so
+/// the identity checked is the identity that writes. Run on the act's own
+/// transaction, before the act. Returns each workflow with its grant, for
+/// [`record_api_lineage_writes`].
+#[cfg(feature = "db")]
+async fn require_api_lineage_authority(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    caller: Uuid,
+    parent: Uuid,
+) -> Result<Vec<(Uuid, ApiWorkflowGrant)>, ApiError> {
+    let workflows =
+        epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut *conn, parent)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!(
+                    "evolve_step: could not read the workflows executing the step's lineage: {e}"
+                ),
+            })?;
+    let mut grants = Vec::with_capacity(workflows.len());
+    for workflow in workflows {
+        let grant = workflow_authority(&mut *conn, Some(auth), Some(caller), workflow).await?;
+        grants.push((workflow, grant));
+    }
+    Ok(grants)
+}
+
+/// Record an admitted `evolve_step` once per workflow
+/// [`require_api_lineage_authority`] checked, on the act's own transaction:
+/// [`audit_api_admin_workflow_write`] for the audited admin arm,
+/// [`record_api_caller_workflow_write`] for the submitter and operator arms.
+/// The rows are attributed to the session principal, here the caller itself,
+/// whose stamp the step claim is written on.
+#[cfg(feature = "db")]
+async fn record_api_lineage_writes(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    caller: Uuid,
+    grants: &[(Uuid, ApiWorkflowGrant)],
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    for (workflow, grant) in grants {
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut *conn,
+                auth,
+                caller,
+                "evolve_step",
+                *workflow,
+                grant.owner,
+                details.clone(),
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut *conn,
+                Some(auth),
+                caller,
+                "evolve_step",
+                *workflow,
+                *grant,
+                details.clone(),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// AUTHORSHIP (operator rulings, 2026-10-13; the MCP twin's
+/// `epigraph_ingest_executor::record_caller_authorship` call): one `AUTHORED`
+/// edge from the acting principal to each claim this request CREATED, on its
+/// own (system-stamped) transaction. The claims stay the system agent's. A
+/// request with no principal records nothing (it names no agent).
+#[cfg(feature = "db")]
+async fn record_api_authorship(
+    conn: &mut sqlx::PgConnection,
+    acting: Option<Uuid>,
+    created: &[Uuid],
+    route: &str,
+) -> Result<(), ApiError> {
+    let Some(acting) = acting else {
+        return Ok(());
+    };
+    epigraph_ingest_executor::record_caller_authorship(conn, acting, created, route)
+        .await
+        .map(|_| ())
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{route}: could not record authorship: {e}. Nothing was written."),
+        })
+}
+
 /// What an ingest records, decided BEFORE the plan walk on the same
 /// transaction (see [`workflow_ingest_submitter`]).
 #[cfg(feature = "db")]
@@ -2361,6 +3126,9 @@ struct ApiIngestDecision {
     submitter: Option<Uuid>,
     /// Admitted through the audited admin arm over an existing lineage.
     admin: bool,
+    /// Every anchor checked and the grant that admitted the caller over it,
+    /// for the provenance rows.
+    grants: Vec<(Uuid, ApiWorkflowGrant)>,
     /// The anchors checked, for the audit row.
     anchors: epigraph_db::repos::workflow::IngestAnchors,
 }
@@ -2395,6 +3163,7 @@ async fn workflow_ingest_submitter(
     let creating = anchors.existing.is_none();
     let mut inherited: Option<Option<Uuid>> = None;
     let mut admin = false;
+    let mut grants = Vec::with_capacity(2);
     if creating {
         let mut checked: Vec<Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -2406,14 +3175,16 @@ async fn workflow_ingest_submitter(
             }
             checked.push(anchor);
             let grant = workflow_authority(conn, auth, caller, anchor).await?;
-            admin |= grant.admin;
+            admin |= grant.is_admin();
             inherited.get_or_insert(grant.owner);
+            grants.push((anchor, grant));
         }
     }
     Ok(ApiIngestDecision {
         creating,
         submitter: inherited.unwrap_or(caller),
         admin,
+        grants,
         anchors,
     })
 }
@@ -2436,6 +3207,30 @@ async fn record_workflow_submitter(
                 .map_err(|e| ApiError::InternalError {
                     message: format!("workflow ingest: could not record the submitter: {e}"),
                 })?;
+        }
+    }
+    // The provenance of the authority exercised over each existing anchor
+    // through a non-admin arm (the MCP twin's per-anchor rows).
+    if let Some(acting) = viewer.principal() {
+        for (anchor, grant) in &decision.grants {
+            record_api_caller_workflow_write(
+                conn,
+                auth,
+                acting,
+                "workflow_ingest",
+                *anchor,
+                *grant,
+                serde_json::json!({
+                    "created_workflow_id": workflow_id,
+                    "canonical_name": extraction.source.canonical_name,
+                    "generation": extraction.source.generation,
+                    "parent_canonical_name": extraction.source.parent_canonical_name,
+                    "lineage_head_before": decision.anchors.lineage_head,
+                    "linked_parent": decision.anchors.linked_parent,
+                    "recorded_submitter": decision.submitter,
+                }),
+            )
+            .await?;
         }
     }
     if decision.admin {
@@ -2483,24 +3278,40 @@ pub async fn add_step(
     )
     .await
     .map_err(map_step_err)?;
-    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
-    {
-        audit_api_admin_workflow_write(
-            &mut tx,
-            &auth,
-            admin,
-            "add_step",
-            head,
-            grant.owner,
-            serde_json::json!({
-                "canonical_name": req.canonical_name,
-                "step_claim_id": r.step_claim_id,
-                "step_lineage_id": r.step_lineage_id,
-                "step_index": r.step_index,
-                "already_present": r.already_present,
-            }),
-        )
-        .await?;
+    if r.claim_created {
+        record_api_authorship(&mut tx, auth.agent_id, &[r.step_claim_id], "add_step").await?;
+    }
+    if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
+        let details = serde_json::json!({
+            "canonical_name": req.canonical_name,
+            "step_claim_id": r.step_claim_id,
+            "step_lineage_id": r.step_lineage_id,
+            "step_index": r.step_index,
+            "already_present": r.already_present,
+        });
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut tx,
+                &auth,
+                acting,
+                "add_step",
+                head,
+                grant.owner,
+                details,
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut tx,
+                Some(&auth),
+                acting,
+                "add_step",
+                head,
+                grant,
+                details,
+            )
+            .await?;
+        }
     }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("add_step: could not commit: {e}"),
@@ -2510,6 +3321,7 @@ pub async fn add_step(
         "workflow_id": r.workflow_id,
         "step_claim_id": r.step_claim_id,
         "step_index": r.step_index,
+        "plan_index": r.plan_index,
         "step_lineage_id": r.step_lineage_id,
         "already_present": r.already_present,
     })))
@@ -2534,23 +3346,36 @@ pub async fn delete_step(
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
             .await
             .map_err(map_step_err)?;
-    if let (Some((head, grant)), Some(admin)) = (authority.filter(|(_, g)| g.admin), auth.agent_id)
-    {
-        audit_api_admin_workflow_write(
-            &mut tx,
-            &auth,
-            admin,
-            "delete_step",
-            head,
-            grant.owner,
-            serde_json::json!({
-                "canonical_name": req.canonical_name,
-                "step_claim_id": r.step_claim_id,
-                "step_lineage_id": r.step_lineage_id,
-                "truth_value_after": r.truth_value,
-            }),
-        )
-        .await?;
+    if let (Some((head, grant)), Some(acting)) = (authority, auth.agent_id) {
+        let details = serde_json::json!({
+            "canonical_name": req.canonical_name,
+            "step_claim_id": r.step_claim_id,
+            "step_lineage_id": r.step_lineage_id,
+            "truth_value_after": r.truth_value,
+        });
+        if grant.is_admin() {
+            audit_api_admin_workflow_write(
+                &mut tx,
+                &auth,
+                acting,
+                "delete_step",
+                head,
+                grant.owner,
+                details,
+            )
+            .await?;
+        } else {
+            record_api_caller_workflow_write(
+                &mut tx,
+                Some(&auth),
+                acting,
+                "delete_step",
+                head,
+                grant,
+                details,
+            )
+            .await?;
+        }
     }
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("delete_step: could not commit: {e}"),
@@ -2575,6 +3400,168 @@ mod tests {
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
+
+    /// Backlog 563165f2 (HTTP twin of the MCP `success` definition): the
+    /// OpenAPI schema of the outcome body both outcome routes take must say
+    /// that `success` means the goal was achieved, not that the steps ran.
+    #[test]
+    fn report_outcome_success_is_defined_as_goal_achieved() {
+        let schema =
+            serde_json::to_value(<ReportOutcomeRequest as utoipa::PartialSchema>::schema())
+                .expect("schema serializes");
+        let d = schema["properties"]["success"]["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`success` carries a description: {schema}"));
+        for needle in [
+            "goal or expected outcome was achieved",
+            "every gate and check passed",
+            "ran every step but a gate or",
+        ] {
+            assert!(
+                d.contains(needle),
+                "`success` must say {needle:?}; got: {d}"
+            );
+        }
+    }
+
+    /// U032: a step-less new generation (or an empty plan) is the caller's
+    /// payload error — 400 with the executor's reason, not a 500 that invites
+    /// a retry (the retry loop is what minted the empty generations).
+    #[test]
+    fn an_empty_generation_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::EmptyGeneration {
+                canonical_name: "weekly-capability-audit".to_string(),
+                generation: 3,
+                level2: 0,
+                claims: 1,
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("empty workflow generation")
+                    && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// The executor's pre-flight refusal of blank claim content in the
+    /// caller's payload is a 400 carrying the field path, not a 500 that
+    /// invites a retry of a payload that can never succeed.
+    #[test]
+    fn blank_claim_content_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::InvalidContent {
+                path: "phases[0].steps[0].operations[0]".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.starts_with("workflow ingest: ")
+                    && message.contains("blank claim content at phases[0].steps[0].operations[0]"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Render an `ApiError` the way a route answers it: status and JSON body.
+    async fn rendered(e: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = axum::response::IntoResponse::into_response(e);
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("an in-memory body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON error body"),
+        )
+    }
+
+    /// The armed-and-unregistered refusal (migration 148) is the operator's
+    /// remedy, so it is answered verbatim through the 500 redaction on both
+    /// executor mapping sites, while any other executor 500 keeps its detail
+    /// out of the body.
+    #[tokio::test]
+    async fn the_unregistered_system_agent_remedy_survives_the_500_redaction() {
+        let role = epigraph_db::SystemAgentRole::WorkflowIngest.as_str();
+        let unregistered =
+            || epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role };
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(unregistered()),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    unregistered(),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert_eq!(body["error"], "InternalError", "{site}: {body}");
+            let text = body.to_string();
+            assert!(
+                text.contains("not registered in system_agents")
+                    && text.contains("register-system-agent --role workflow-ingest"),
+                "{site}: the remedy reaches the caller: {body}"
+            );
+        }
+
+        for (site, e) in [
+            (
+                "workflow_ingest_error",
+                workflow_ingest_error(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                ),
+            ),
+            (
+                "map_step_err",
+                map_step_err(epigraph_ingest_executor::StepOpError::Executor(
+                    epigraph_ingest_executor::IngestExecutorError::AgentCreation(
+                        "secret-detail-3e91".to_string(),
+                    ),
+                )),
+            ),
+        ] {
+            let (status, body) = rendered(e).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{site}: {body}");
+            assert!(
+                !body.to_string().contains("secret-detail-3e91"),
+                "{site}: any other executor 500 is redacted: {body}"
+            );
+        }
+    }
+
+    /// `system_agent_unregistered` hand-copies the executor's `Display` text
+    /// (the variant needs a `&'static str`). Pin the copy to the source for
+    /// every registered role, so an edit to the executor's remedy (CLI flags,
+    /// migration number), or a new role landing on the generic fallback,
+    /// fails here instead of drifting from what HTTP callers read.
+    #[test]
+    fn the_unregistered_system_agent_literal_matches_the_executor_text() {
+        for role in epigraph_db::SystemAgentRole::ALL {
+            let role = role.as_str();
+            let ApiError::InternalErrorStatic { message } = system_agent_unregistered(role) else {
+                panic!("{role}: expected InternalErrorStatic");
+            };
+            assert_eq!(
+                message,
+                epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role }
+                    .to_string(),
+                "{role}: the HTTP literal drifted from the executor's error text"
+            );
+        }
+    }
 
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
@@ -2706,7 +3693,25 @@ mod tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
+    }
+
+    /// [`test_auth`] whose principal is a registered `agents` row, for a caller
+    /// whose write succeeds: the `AUTHORED` edge it gets from every claim it
+    /// creates is refused by `edges_validate_refs` for an agent that does not
+    /// exist (in production a token's agent always does).
+    async fn registered_auth(pool: &PgPool) -> crate::middleware::bearer::AuthContext {
+        let auth = test_auth();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'test caller')",
+        )
+        .bind(auth.agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        auth
     }
 
     /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
@@ -2725,9 +3730,10 @@ mod tests {
     async fn test_router(pool: sqlx::PgPool) -> axum::Router {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
+        let auth = registered_auth(&pool).await;
         axum::Router::new()
             .route("/api/v1/workflows/ingest", post(ingest_workflow))
-            .layer(axum::Extension(test_auth()))
+            .layer(axum::Extension(auth))
             .with_state(state)
     }
 
@@ -2845,6 +3851,53 @@ mod tests {
         assert!(body["canonical_name"].as_str().is_some());
     }
 
+    /// Through the route: a payload whose only step has a blank `compound` is
+    /// answered 400 naming the field, and no `workflows` row is written.
+    /// Positive control: the same payload with its content intact is a 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_workflow_http_refuses_blank_step_content_as_400(pool: PgPool) {
+        let post = |app: axum::Router, payload: serde_json::Value| async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/workflows/ingest")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let count = |pool: PgPool, name: &'static str| async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let app = test_router(pool.clone()).await;
+
+        let mut blank = ingest_payload("http-blank-step-content");
+        blank["phases"][0]["steps"][0]["compound"] = serde_json::json!("   ");
+        let (status, text) = post(app.clone(), blank).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(
+            text.contains("blank claim content at phases[0].steps[0]"),
+            "the 400 names the field: {text}"
+        );
+        assert_eq!(count(pool.clone(), "http-blank-step-content").await, 0);
+
+        let (status, text) = post(app, ingest_payload("http-intact-step-content")).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert_eq!(count(pool, "http-intact-step-content").await, 1);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_workflow_http_returns_workflow_id(pool: PgPool) {
         let app = test_router(pool).await;
@@ -2892,10 +3945,12 @@ mod tests {
         )
         .await
         .unwrap();
+        attach_public_thesis(&pool, workflow_id).await;
 
-        // Build a minimal axum app with just the outcome route.
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        // Build a minimal axum app with just the outcome route, on a state
+        // that can stamp the report's transaction (the route refuses to run
+        // unstamped).
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
@@ -2917,6 +3972,7 @@ mod tests {
                     ))
                     .method("POST")
                     .header("content-type", "application/json")
+                    .extension(outcome_reporter())
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -2934,10 +3990,393 @@ mod tests {
         assert_eq!(metadata["success_count"], 1);
     }
 
+    /// Give a bare test root the one thing the outcome route requires of a
+    /// workflow besides its row: a plan claim the reporter can read. One public
+    /// level-0 (thesis) claim at `plan_index` 0, so no `step_index` resolves
+    /// and the row counts these tests assert are unchanged.
+    async fn attach_public_thesis(pool: &PgPool, workflow_id: uuid::Uuid) {
+        // Inserted with its level rather than updated afterwards: the
+        // route-layer write ratchet (`tests/viewer_route_table_lint.rs`) counts
+        // an `UPDATE` of `claims` anywhere in this file.
+        let content = format!("outcome test thesis {workflow_id}");
+        let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
+        let thesis = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO claims (content, content_hash, agent_id, truth_value, properties) \
+             VALUES ($1, $2, $3, 0.5, jsonb_build_object('level', 0)) RETURNING id",
+        )
+        .bind(&content)
+        .bind(content_hash.as_slice())
+        .bind(ensure_system_agent(pool).await)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', 0))",
+        )
+        .bind(workflow_id)
+        .bind(thesis)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The caller every outcome-route test reports as: an agent token holding
+    /// `claims:write`, the scope the route requires. Its principal belongs to
+    /// no group; the superuser test pool filters nothing, so these tests pin
+    /// the counters / atomicity / embedding contract, not visibility (that is
+    /// `tests/hierarchical_outcome_route_authority.rs`, on the app role).
+    fn outcome_reporter() -> crate::middleware::bearer::AuthContext {
+        let agent = uuid::Uuid::new_v4();
+        crate::middleware::bearer::AuthContext {
+            client_id: uuid::Uuid::new_v4(),
+            agent_id: Some(agent),
+            owner_id: Some(agent),
+            client_type: crate::middleware::ClientType::Agent,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        }
+    }
+
+    /// A bare hierarchical root plus the outcome route alone (U033 fixtures).
+    async fn outcome_fixture(pool: &PgPool, canonical_name: &str) -> (axum::Router, uuid::Uuid) {
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome atomicity.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
+        let state = scoped_test_state(pool).await;
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn post_outcome(
+        app: axum::Router,
+        workflow_id: uuid::Uuid,
+        body: serde_json::Value,
+    ) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                ))
+                .method("POST")
+                .header("content-type", "application/json")
+                .extension(outcome_reporter())
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    fn two_step_body(quality: Option<f64>) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "outcome_details": "ok",
+            "quality": quality,
+            "step_executions": [
+                {"step_index": 0, "planned": "Step A", "actual": "done", "deviated": false},
+                {"step_index": 1, "planned": "Step B", "actual": "done", "deviated": false}
+            ]
+        })
+    }
+
+    async fn outcome_counters_and_rows(
+        pool: &PgPool,
+        workflow_id: uuid::Uuid,
+    ) -> (serde_json::Value, i64) {
+        let metadata: serde_json::Value =
+            sqlx::query_scalar("SELECT metadata FROM workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+                .bind(workflow_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (metadata, rows)
+    }
+
+    /// U033 / I229, HTTP twin: a step row the database refuses fails the
+    /// whole report (5xx) and moves nothing. Real DB failure injection: a
+    /// BEFORE INSERT trigger refusing only the second step. Before U033 the
+    /// counters autocommitted first, step A landed, step B was logged and
+    /// skipped, and the handler answered 200.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_is_all_or_nothing_when_a_step_row_fails(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-atomic-http").await;
+        // A SEQUENCE counts the step-row INSERTs the trigger saw: `nextval` is
+        // not transactional, so the count survives the rollback and ties the
+        // 500 to step B's refusal (the 500 body is redacted, so the error
+        // text can no longer do that).
+        sqlx::query("CREATE SEQUENCE u033_http_attempts")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE FUNCTION u033_http_fail() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN PERFORM nextval('u033_http_attempts'); \
+             IF NEW.tool_pattern[1] = 'Step B' THEN RAISE EXCEPTION 'u033 injected'; END IF; \
+             RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER u033_http_fail BEFORE INSERT ON behavioral_executions \
+             FOR EACH ROW EXECUTE FUNCTION u033_http_fail()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/workflows/hierarchical/{workflow_id}/outcome"
+                    ))
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .extension(outcome_reporter())
+                    .body(Body::from(two_step_body(None).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Tie the 500 to the injected refusal of step B, so an unrelated
+        // early error (begin, lookup) cannot satisfy this test: the trigger
+        // saw BOTH step rows, and step B's always raises.
+        let attempts: i64 = sqlx::query_scalar("SELECT last_value FROM u033_http_attempts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            attempts, 2,
+            "the 500 must come from step B's refused row, after step A's INSERT ran"
+        );
+        // And the 500 body does not carry the database's error text
+        // (F-route-error-text-remainder).
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("u033 injected"),
+            "the 500 body must not carry the database's error text: {body}"
+        );
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "counters must not move when a step row fails: {metadata}"
+        );
+        assert_eq!(rows, 0, "step A must roll back with step B");
+    }
+
+    /// U033 / I229, HTTP twin: an out-of-range `quality` is a 400 with no side
+    /// effects, not a 200 whose step rows the CHECK silently refused.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_rejects_out_of_range_quality(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-quality-http").await;
+        for bad in [1.5_f64, -0.1] {
+            let status = post_outcome(app.clone(), workflow_id, two_step_body(Some(bad))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "quality {bad}");
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert!(
+            metadata.get("use_count").is_none(),
+            "a refused report must not move counters: {metadata}"
+        );
+        assert_eq!(rows, 0, "a refused report must write no step rows");
+
+        // Positive control: the boundary value lands, both rows included.
+        let status = post_outcome(app, workflow_id, two_step_body(Some(1.0))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 1);
+        assert_eq!(rows, 2);
+    }
+
+    /// U033 / I229, HTTP twin of the MCP row-lock test: the route's counter
+    /// read takes `FOR UPDATE`, so a report arriving while another
+    /// transaction holds the `workflows` row waits and then increments the
+    /// committed value. The holder writes `use_count = 5` and keeps its lock
+    /// until the report is observed blocked in `pg_stat_activity`. Without
+    /// the lock the route reads the stale row, blocks only at its UPDATE, and
+    /// then overwrites the 5 with 1.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_waits_for_a_held_counter_row(pool: PgPool) {
+        let (app, workflow_id) = outcome_fixture(&pool, "outcome-row-lock-http").await;
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE workflows \
+             SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{use_count}', '5') \
+             WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+        let report = tokio::spawn(post_outcome(app, workflow_id, two_step_body(None)));
+
+        // Sync point: the report is blocked on the held row. Bounded by
+        // iterations, not wall time.
+        let mut blocked = false;
+        for _ in 0..1000 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            blocked,
+            "the report never blocked on the held workflows row"
+        );
+
+        holder.commit().await.unwrap();
+        assert_eq!(report.await.expect("join"), StatusCode::OK);
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(
+            metadata["use_count"], 6,
+            "the report must increment the committed 5, not overwrite it: {metadata}"
+        );
+        assert_eq!(rows, 2);
+    }
+
+    /// `outcome_fixture` with a deterministic `MockProvider` as the embedding
+    /// service: the OpenAI boundary is the only thing stood in for.
+    async fn embedding_outcome_fixture(
+        pool: &PgPool,
+        canonical_name: &str,
+    ) -> (axum::Router, uuid::Uuid) {
+        use epigraph_embeddings::{EmbeddingConfig, MockProvider};
+        let workflow_id = uuid::Uuid::new_v4();
+        epigraph_db::WorkflowRepository::insert_root(
+            pool,
+            workflow_id,
+            canonical_name,
+            0,
+            "Test workflow for outcome goal embedding.",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        attach_public_thesis(pool, workflow_id).await;
+        let state = scoped_test_state(pool)
+            .await
+            .with_embedding_service(std::sync::Arc::new(MockProvider::new(
+                EmbeddingConfig::openai(1536),
+            )));
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/workflows/hierarchical/:id/outcome",
+                axum::routing::post(report_hierarchical_outcome),
+            )
+            .with_state(state);
+        (app, workflow_id)
+    }
+
+    async fn embedded_rows(pool: &PgPool, workflow_id: uuid::Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM behavioral_executions \
+             WHERE workflow_id = $1 AND goal_embedding IS NOT NULL",
+        )
+        .bind(workflow_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// U033 / I229 part (4), HTTP twin: a real `goal_text` is embedded once
+    /// and written on every step row, so the report feeds
+    /// `behavioral_affinity_hierarchical`. Before U033 the route passed `None`
+    /// and every row's `goal_embedding` was NULL.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_embeds_a_real_goal_on_every_step_row(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-embed-http").await;
+        let mut body = two_step_body(None);
+        body["goal_text"] = serde_json::json!("Deploy with zero downtime");
+        let status = post_outcome(app, workflow_id, body).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(rows, 2, "both step rows land");
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            2,
+            "every step row carries the goal embedding"
+        );
+    }
+
+    /// The other half of the route's goal filter: the `"hierarchical"`
+    /// placeholder, blank text and an absent goal are not goals, and embedding
+    /// them would make every such report "similar" to every other. The
+    /// embedding service is configured, so a 0 here is the filter and nothing
+    /// else (the positive twin above shows the same fixture does embed).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn report_hierarchical_outcome_does_not_embed_a_placeholder_or_blank_goal(pool: PgPool) {
+        let (app, workflow_id) = embedding_outcome_fixture(&pool, "outcome-no-embed-http").await;
+        for goal in [
+            Some(serde_json::json!("hierarchical")),
+            Some(serde_json::json!("   ")),
+            None,
+        ] {
+            let mut body = two_step_body(None);
+            if let Some(g) = goal {
+                body["goal_text"] = g;
+            }
+            let status = post_outcome(app.clone(), workflow_id, body).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let (metadata, rows) = outcome_counters_and_rows(&pool, workflow_id).await;
+        assert_eq!(metadata["use_count"], 3, "all three reports landed");
+        assert_eq!(rows, 6);
+        assert_eq!(
+            embedded_rows(&pool, workflow_id).await,
+            0,
+            "no placeholder, blank or absent goal is embedded"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn report_hierarchical_outcome_404s_on_unknown_id(pool: PgPool) {
-        use crate::state::{ApiConfig, AppState};
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        let state = scoped_test_state(&pool).await;
         let app = axum::Router::new()
             .route(
                 "/api/v1/workflows/hierarchical/:id/outcome",
@@ -2954,6 +4393,7 @@ mod tests {
                     .uri(format!("/api/v1/workflows/hierarchical/{unknown}/outcome"))
                     .method("POST")
                     .header("content-type", "application/json")
+                    .extension(outcome_reporter())
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -3124,7 +4564,7 @@ mod tests {
     async fn workflow_steps_refuse_a_caller_who_did_not_submit_the_workflow(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3203,7 +4643,7 @@ mod tests {
     async fn workflow_lineage_and_admin_arm_are_checked_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let owner = test_auth();
+        let owner = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3332,7 +4772,7 @@ mod tests {
     async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
-        let ingester = test_auth();
+        let ingester = registered_auth(&pool).await;
         let stranger = test_auth();
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
@@ -3553,5 +4993,250 @@ mod tests {
             vec![Some("null".to_string())],
             "one audit row, \"submitter\": null"
         );
+    }
+
+    /// An agent row, and (when `client_type` is given) an ACTIVE OAuth client
+    /// of that type for it; returns `(agent, client)`.
+    async fn seed_bound_agent(pool: &PgPool, label: &str, client_type: &str) -> (Uuid, Uuid) {
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name) \
+             VALUES (decode(md5(random()::text) || md5(random()::text), 'hex'), $1) RETURNING id",
+        )
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let client: Uuid = sqlx::query_scalar(
+            "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                        status, agent_id, legal_entity_name, legal_contact_email) \
+             VALUES ($1, $2, $3, ARRAY['claims:write'], 'active', $4, \
+                     'Fixture Org', 'fixture@example.invalid') RETURNING id",
+        )
+        .bind(format!("{label}-{agent}"))
+        .bind(label)
+        .bind(client_type)
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (agent, client)
+    }
+
+    /// A registered human operator (migration 122 section 1c).
+    async fn seed_human_operator(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
+        let (agent, client) = seed_bound_agent(pool, label, "human").await;
+        sqlx::query(
+            "INSERT INTO human_operators (agent_id, client_id, reason) VALUES ($1, $2, 'test')",
+        )
+        .bind(agent)
+        .bind(client)
+        .execute(pool)
+        .await
+        .unwrap();
+        (agent, client)
+    }
+
+    /// The agent of a service client ALLOWLISTED for `operator` (migration
+    /// 149, arm (c)), through the real maintenance definer.
+    async fn seed_allowlisted_agent(pool: &PgPool, operator: Uuid, label: &str) -> (Uuid, Uuid) {
+        use sqlx::Executor;
+        let (agent, client) = seed_bound_agent(pool, label, "service").await;
+        let mut conn = pool.acquire().await.unwrap();
+        conn.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+            .await
+            .unwrap();
+        let binding: Option<String> = sqlx::query_scalar(
+            "SELECT effective_binding \
+               FROM public.epigraph_allow_author_binding_client($1, $2, 'test')",
+        )
+        .bind(client)
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        conn.execute("RESET SESSION AUTHORIZATION").await.unwrap();
+        assert_eq!(
+            binding.as_deref(),
+            Some(epigraph_db::CLIENT_ALLOWLIST_BINDING),
+            "calibration: {label} is allowlisted"
+        );
+        (agent, client)
+    }
+
+    /// The operator ruling over HTTP (2026-10-13; the MCP twin is
+    /// `epigraph-mcp/tests/workflow_write_provenance.rs`): on a workflow whose
+    /// recorded submitter is the human H, an agent bound to H (an allowlisted
+    /// client of H, the shape a host's shared credential takes) is REFUSED 403
+    /// with nothing written and no provenance row; H itself is admitted (the
+    /// submitter arm) with one `workflows.caller_write` row naming it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_bound_agent_is_refused_and_the_submitting_human_admitted_over_http(pool: PgPool) {
+        use axum::routing::post;
+        let state = scoped_test_state(&pool).await;
+        let router_as = |auth: crate::middleware::bearer::AuthContext| {
+            axum::Router::new()
+                .route("/api/v1/workflows/ingest", post(ingest_workflow))
+                .route("/api/v1/workflows/steps", post(add_step))
+                .layer(axum::Extension(auth))
+                .with_state(state.clone())
+        };
+        let post_json = |uri: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let as_agent = |agent: Uuid, client: Uuid| {
+            let mut a = test_auth();
+            a.client_id = client;
+            a.owner_id = Some(client);
+            a.agent_id = Some(agent);
+            a
+        };
+        let (h, h_client) = seed_human_operator(&pool, "h3-la-human").await;
+        let (agent, client) = seed_allowlisted_agent(&pool, h, "h3-la-agent").await;
+        let authored_sql = "SELECT source_id FROM edges \
+                            WHERE relationship = 'AUTHORED' AND source_type = 'agent' \
+                              AND target_type = 'claim' AND target_id = $1";
+        let authored_total = "SELECT count(*) FROM edges WHERE relationship = 'AUTHORED'";
+
+        let ingester = registered_auth(&pool).await;
+        let resp = router_as(ingester.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/ingest",
+                ingest_payload("h3-http-linked"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wf: Uuid = sqlx::query_scalar(
+            "UPDATE workflows \
+                SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($1::text)) \
+              WHERE canonical_name = 'h3-http-linked' RETURNING id",
+        )
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Authorship of what the ingest created: one AUTHORED edge from the
+        // ingesting principal per executed claim (all new in this database).
+        let executed: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'executes'",
+        )
+        .bind(wf)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!executed.is_empty());
+        for c in &executed {
+            let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+                .bind(c)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(sources, vec![ingester.agent_id.unwrap()], "claim {c}");
+        }
+        let authored_before: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let executes_sql = "SELECT count(*) FROM edges e JOIN workflows w ON w.id = e.source_id \
+                            WHERE w.canonical_name = 'h3-http-linked' AND e.relationship = 'executes'";
+        let provenance_sql = "SELECT agent_id, details FROM security_events \
+                              WHERE event_type = 'workflows.caller_write' \
+                                AND details->>'workflow_id' = $1::text";
+        let before: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let resp = router_as(as_agent(agent, client))
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's agent's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an agent bound to the submitting human is not admitted over HTTP"
+        );
+        let mid: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mid, before, "nothing written");
+        let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
+            .bind(wf)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "no provenance for a refusal: {rows:?}");
+        let authored_mid: i64 = sqlx::query_scalar(authored_total)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            authored_mid, authored_before,
+            "no AUTHORED edge for a refusal"
+        );
+
+        let auth = as_agent(h, h_client);
+        let resp = router_as(auth.clone())
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-linked", "step_text": "H's own step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the submitting human");
+        let step = parse_body(resp).await["step_claim_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let after: i64 = sqlx::query_scalar(executes_sql)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before + 1);
+        let stamp: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1::uuid")
+            .bind(&step)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(stamp, h, "the system agent still authors the step");
+        let sources: Vec<Uuid> = sqlx::query_scalar(authored_sql)
+            .bind(Uuid::parse_str(&step).unwrap())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sources,
+            vec![h],
+            "one AUTHORED edge from the acting principal"
+        );
+        let rows: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(provenance_sql)
+            .bind(wf)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (row_agent, d) = &rows[0];
+        assert_eq!(
+            *row_agent,
+            Some(stamp),
+            "attributed to the session's system stamp"
+        );
+        assert_eq!(d["action"], "add_step");
+        assert_eq!(d["submitter"], h.to_string());
+        assert_eq!(d["arm"], "submitter");
+        assert_eq!(d["acting_agent"], h.to_string());
+        assert_eq!(d["operator"], serde_json::Value::Null);
+        assert_eq!(d["client_id"], h_client.to_string());
+        assert_eq!(d["token_jti"], auth.jti.to_string());
+        assert_eq!(d["write"]["step_claim_id"], step.as_str());
     }
 }

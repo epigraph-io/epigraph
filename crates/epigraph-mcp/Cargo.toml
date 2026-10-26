@@ -12,7 +12,7 @@ repository.workspace = true
 epigraph-auth = { workspace = true }
 # Needed to classify JWT rejection reasons for logging; `epigraph-auth`
 # already surfaces `jsonwebtoken::errors::Error` from `validate_token`.
-jsonwebtoken = "9"
+jsonwebtoken = { workspace = true }
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
 epigraph-db = { workspace = true }
@@ -30,6 +30,16 @@ epigraph-authz = { workspace = true }  # Fail-closed write gate for the declassi
 epigraph-embeddings = { workspace = true }
 epigraph-ingest = { workspace = true }
 epigraph-ingest-executor = { workspace = true }
+
+# `O_NOFOLLOW | O_NONBLOCK` for the label-dedup profile file open (a symlink
+# or a FIFO at the profile path must be refused, never followed or waited on).
+# Already in the lock through tokio; no new crate.
+libc = "0.2"
+
+# Wipes the separate-signing-key mode's private key (its hex and its decoded
+# bytes) when they are dropped. Already in the lock through ed25519-dalek; no
+# new crate.
+zeroize = "1"
 
 # MCP protocol (no sqlx dep — coexists with workspace sqlx 0.7)
 rmcp = { workspace = true }
@@ -85,6 +95,11 @@ epigraph-ingest = { workspace = true }
 reqwest = { workspace = true }
 blake3 = { workspace = true }
 tower = "0.5"
+# `tokio::time::pause` for the session keep-alive tests
+# (`tests/mcp_session_keep_alive.rs`), which wait out minutes of virtual time.
+tokio = { workspace = true, features = ["test-util"] }
+# `StreamExt::next` over rmcp's session stream in the same test file.
+futures = { workspace = true }
 # `no-env-filter` is REQUIRED for integration tests in tests/* to capture
 # events emitted from src/ (different crate target). Without it, the macro's
 # default env filter scopes capture to the test crate only.

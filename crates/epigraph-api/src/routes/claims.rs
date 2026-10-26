@@ -68,11 +68,12 @@
 //!
 //! `viewer_route_table_lint.rs::TEST_ONLY_INLINE_READS` still carries
 //! `("claims.rs", 3)` and `ROUTE_LAYER_WRITES` `("claims.rs", 4)`; no inline
-//! statement was relocated by this shard. Two open entries brush this file and
-//! are neither discharged nor worsened by an executor swap —
-//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`) and
-//! `F-get-by-id-conn-duplicates-get-by-id`. Analysis held outside this
-//! repository.
+//! statement was relocated by this shard. One open entry brushes this file and
+//! is neither discharged nor worsened by an executor swap —
+//! `F-PR28-claims-list-projection` (`ClaimRepository::list`/`list_conn`).
+//! Analysis held outside this repository. A second,
+//! `F-get-by-id-conn-duplicates-get-by-id`, is closed: `get_by_id_conn` now
+//! delegates to `get_by_id`, so the reads below that use it run one SQL text.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -165,6 +166,36 @@ pub struct CreateClaimRequest {
     /// See docs/architecture/noun-claims-and-verb-edges.md.
     #[serde(default)]
     pub if_not_exists: bool,
+    /// When set, record a derivation evidence row on the created (or
+    /// deduplicated) claim: a `document` row carrying the named parent's text,
+    /// with `properties.derived_from_claim` and `properties.method`. It is
+    /// provenance only — no mass function, no truth change (backlog 3590a2d8).
+    /// Written in the same transaction as the claim. The parent must be a
+    /// current, PUBLIC claim the caller can see; otherwise the whole request is
+    /// refused with 400 and nothing is written. Public tier only.
+    #[serde(default)]
+    pub derived_from: Option<DerivedFrom>,
+}
+
+/// The parent a claim was derived from, for [`CreateClaimRequest::derived_from`].
+#[derive(Deserialize, Debug, Clone)]
+pub struct DerivedFrom {
+    /// The parent claim whose text the new claim was derived from.
+    pub claim_id: Uuid,
+    /// The derivation that produced the claim (e.g. `decompose_claims`):
+    /// 1-64 characters of `[a-z_]`, otherwise the request is refused with 400.
+    pub method: String,
+}
+
+/// Longest accepted [`DerivedFrom::method`].
+#[cfg(feature = "db")]
+const DERIVATION_METHOD_MAX_LEN: usize = 64;
+
+/// A [`DerivedFrom::method`] is a short machine name: 1-64 bytes of `[a-z_]`.
+#[cfg(feature = "db")]
+fn is_derivation_method_name(method: &str) -> bool {
+    (1..=DERIVATION_METHOD_MAX_LEN).contains(&method.len())
+        && method.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// Claim response structure
@@ -390,16 +421,49 @@ pub async fn create_claim(
     State(state): State<AppState>,
     // Still `Option<Extension<..>>` rather than a required extractor: PR-07
     // replaces the whole `Option<AuthContext>` idiom with `ViewerExtractor`
-    // across all 39 sites at once. Until then the handler rejects `None`
-    // explicitly below rather than falling open, which is the behavioural half
-    // of that change without the mechanical half.
+    // across all 39 sites at once. Until then `create_claim_core` rejects
+    // `None` explicitly rather than falling open.
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateClaimRequest>,
 ) -> Result<Json<ClaimResponse>, ApiError> {
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    create_claim_core(
+        &state,
+        &viewer,
+        auth_ctx.as_ref().map(|axum::Extension(a)| a),
+        request,
+    )
+    .await
+    .map(Json)
+}
+
+/// The body of `POST /api/v1/claims`, shared with `POST /api/v1/claims/batch`
+/// (one call per item) so the two cannot drift. Opens and commits its own
+/// transaction.
+#[cfg(feature = "db")]
+pub(crate) async fn create_claim_core(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth_ctx: Option<&crate::middleware::bearer::AuthContext>,
+    request: CreateClaimRequest,
+) -> Result<ClaimResponse, ApiError> {
+    // Bind the caller FIRST, then check its scope unconditionally.
+    //
+    // This is the prescribed shape from `tests/viewer_route_table_lint.rs`
+    // (`let Some(..) = auth_ctx else { return Err(Unauthorized) }`), not the
+    // `if let Some(..) = auth_ctx { check_scopes(..) }` idiom it registers as
+    // fail-open. The move out of `create_claim` respelled that idiom over
+    // `Option<&AuthContext>`, a spelling the lint's needles do not match, so
+    // the site dropped out of its registers without being fixed; hoisting the
+    // guard is what actually retires it. `None` is unreachable over HTTP
+    // (`ViewerExtractor` and the bearer middleware 401 first), so the only
+    // observable change is for a direct caller: `None` is now refused before
+    // the privacy and content validation below rather than after it.
+    let Some(ctx) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required to create a claim".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(ctx, &["claims:write"])?;
 
     // Validate privacy fields first (needed to know if content check applies)
     let privacy_tier = validate_privacy_fields(&request)?;
@@ -417,6 +481,30 @@ pub async fn create_claim(
             return Err(ApiError::ValidationError {
                 field: "if_not_exists".to_string(),
                 reason: "if_not_exists=true is incompatible with the content_hash override; new ingestion paths should compute hashes server-side".to_string(),
+            });
+        }
+    }
+
+    // Derivation evidence copies the parent's text into an evidence row that
+    // inherits THIS claim's tenancy; only a public claim has a coherent
+    // answer for that, and the encrypted tiers have their own evidence path.
+    if let Some(ref d) = request.derived_from {
+        if privacy_tier != "public" {
+            return Err(ApiError::ValidationError {
+                field: "derived_from".to_string(),
+                reason: "derived_from is only supported for privacy_tier=public".to_string(),
+            });
+        }
+        // `method` lands verbatim in a public evidence row every viewer reads
+        // through lineage/provenance, so it is a short machine name
+        // (`decompose_claims`), never free text.
+        if !is_derivation_method_name(&d.method) {
+            return Err(ApiError::ValidationError {
+                field: "derived_from.method".to_string(),
+                reason: format!(
+                    "derived_from.method must be 1-{DERIVATION_METHOD_MAX_LEN} characters \
+                     of [a-z_]"
+                ),
             });
         }
     }
@@ -448,12 +536,7 @@ pub async fn create_claim(
 
         // SECURITY: Use ONLY authenticated identity for membership check, never request body
         // Prefer agent_id, fall back to client_id (sub) for human clients
-        let caller_agent_id = auth_ctx
-            .as_ref()
-            .and_then(|axum::Extension(ctx)| ctx.agent_id.or(Some(ctx.client_id)))
-            .ok_or_else(|| ApiError::Forbidden {
-                reason: "Authentication required to create encrypted claims".to_string(),
-            })?;
+        let caller_agent_id = ctx.agent_id.unwrap_or(ctx.client_id);
 
         // Verify caller is a member of the group
         let is_member =
@@ -528,12 +611,8 @@ pub async fn create_claim(
     // Every arm now resolves to 401. That is the right code rather than 403 or
     // 500 in all three cases: no credential, a credential with no principal,
     // and a credential naming a principal that does not exist are all "re-mint
-    // your token", which is what RFC 6750 `invalid_token` means.
-    let Some(axum::Extension(ctx)) = &auth_ctx else {
-        return Err(ApiError::Unauthorized {
-            reason: "authentication required to create a claim".to_string(),
-        });
-    };
+    // your token", which is what RFC 6750 `invalid_token` means. (The
+    // no-credential arm is the guard at the top of this function.)
     let Some(author_agent_id) = ctx.agent_id else {
         return Err(ApiError::Unauthorized {
             reason: "token carries no agent_id; re-authenticate to obtain a \
@@ -606,7 +685,7 @@ pub async fn create_claim(
     // caller must be bound and may name only an author of its own human. On
     // the raw pool the trigger saw no principal at all (and, once armed, now
     // refuses the write outright rather than checking the body's author).
-    let mut tx = state.begin_claim_write(&viewer, "create_claim").await?;
+    let mut tx = state.begin_claim_write(viewer, "create_claim").await?;
 
     // ── Tenancy declaration (PR-16) ──
     //
@@ -675,16 +754,16 @@ pub async fn create_claim(
 
     // Persist claim — branch on if_not_exists per noun-claims-and-verb-edges S1.
     let (created_claim, was_created) = if request.if_not_exists {
-        ClaimRepository::create_or_get(&mut tx, &viewer, &claim, decl).await?
+        ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl).await?
     } else {
-        // The (content_hash, agent_id) UNIQUE constraint that create_strict's
-        // 409-on-duplicate contract relied on was dropped (migration 107), so
-        // create_strict now silently INSERTs duplicates — 20+ identical claims
-        // accumulated this way (bug c11c1295). Re-assert the contract at the app
-        // layer: refuse a duplicate up front with the same 409 the constraint
-        // would have produced. (Restoring the DB constraint requires de-duping
-        // existing rows first and is a separate migration; adding it here would
-        // brick API boot on the existing duplicates.)
+        // create_strict's 409-on-duplicate contract relied on the
+        // (content_hash, agent_id) UNIQUE constraint migration 013 added. It is
+        // absent on the long-lived database (dropped out-of-band; 20+ identical
+        // claims accumulated, bug c11c1295) and migration 150 drops it
+        // everywhere (backlog 00f1a517), so create_strict silently INSERTs
+        // duplicates. The contract is re-asserted here at the app layer:
+        // lock_content_hash_agent, then a find, refusing a duplicate up front
+        // with the same 409 the constraint would have produced.
         let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
         let agent_uuid: Uuid = claim.agent_id.into();
         let dup_conflict = || {
@@ -692,9 +771,17 @@ pub async fn create_claim(
             reason: "claim already exists for this (content_hash, agent_id); use if_not_exists=true to retrieve it".to_string(),
         }
         };
+        // The check is serialized, not just made: without the constraint two
+        // concurrent requests both miss the find and both insert. The
+        // transaction-scoped lock (the same key `create_or_get` takes, so the
+        // two branches serialize against each other too) is held on `tx` until
+        // this handler commits, so a racer's find runs after this row is
+        // visible and answers 409 (backlog 00f1a517).
+        ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
+            .await?;
         if ClaimRepository::find_by_content_hash_and_agent(
             &mut tx,
-            &viewer,
+            viewer,
             content_hash.as_slice(),
             agent_uuid,
         )
@@ -705,29 +792,32 @@ pub async fn create_claim(
         }
         match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
-            // Belt-and-suspenders: if the UNIQUE constraint is ever restored, or
-            // a concurrent writer wins the race between the check above and this
-            // INSERT, still surface 409 rather than a generic 500.
+            // Belt-and-suspenders: if a unique constraint on the pair is ever
+            // restored and a writer that bypassed the lock wins between the
+            // check above and this INSERT, still surface 409 rather than a
+            // generic 500.
             Err(epigraph_db::DbError::DuplicateKey { .. }) => return Err(dup_conflict()),
             Err(e) => return Err(e.into()),
         }
     };
     let claim_uuid = Uuid::from(created_claim.id);
 
-    // Apply optional content_hash override and properties only when we inserted
-    // a new row. Mutating an existing canonical noun-claim from a different
-    // caller's request would bypass ownership/authorisation checks and can
-    // clobber metadata that another agent set previously. See
+    // Verify the optional content_hash and apply optional properties only when
+    // we inserted a new row. Mutating an existing canonical noun-claim from a
+    // different caller's request would bypass ownership/authorisation checks
+    // and can clobber metadata that another agent set previously. See
     // docs/architecture/noun-claims-and-verb-edges.md §"if_not_exists semantics".
-    if was_created && (request.content_hash.is_some() || request.properties.is_some()) {
-        let content_hash_bytes: Option<Vec<u8>> = if let Some(ref hex_hash) = request.content_hash {
+    if was_created {
+        // `content_hash` is VERIFY-ONLY: it must equal the server-computed
+        // BLAKE3(content) and is never written (the row already carries that
+        // digest). A freshly-created claim can never already be a
+        // compound/parent in a decomposes_to edge at insert time, so this
+        // handler always operates on a non-compound claim.
+        if let Some(ref hex_hash) = request.content_hash {
             let decoded = hex::decode(hex_hash).map_err(|_| ApiError::ValidationError {
                 field: "content_hash".to_string(),
                 reason: "content_hash must be valid hex (64 chars for BLAKE3)".to_string(),
             })?;
-            // A freshly-created claim can never already be a compound/parent in a
-            // decomposes_to edge at insert time, so this handler always operates
-            // on a non-compound claim: the override must equal BLAKE3(content).
             let expected_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
             if decoded.as_slice() != expected_hash.as_slice() {
                 return Err(ApiError::ValidationError {
@@ -735,41 +825,24 @@ pub async fn create_claim(
                     reason: "content_hash override does not match BLAKE3(content); for non-compound claims the override must equal the server-computed hash of the claim content".to_string(),
                 });
             }
-            // Verified equal to the server-computed hash — a no-op for the
-            // UPDATE's COALESCE below either way, so just skip setting it.
-            None
-        } else {
-            None
-        };
+        }
 
-        sqlx::query(
-            "UPDATE claims SET content_hash = COALESCE($1, content_hash), properties = COALESCE($2, properties) WHERE id = $3"
-        )
-        .bind(content_hash_bytes.as_deref())
-        .bind(&request.properties)
-        .bind(claim_uuid)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| match e {
-            // Post-107: the override sets a content_hash already used by another
-            // row of the same agent. Spec §API surface (line 116) specifies this
-            // surfaces as 409 Conflict from the UPDATE on the
-            // if_not_exists: false path. Pre-107 this branch is unreachable.
-            sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
-                ApiError::Conflict {
-                    reason: "content_hash override collides with an existing claim for this agent".to_string(),
-                }
-            }
-            other => ApiError::DatabaseError {
-                message: format!("Failed to set content_hash/properties: {other}"),
-            },
-        })?;
+        if let Some(ref properties) = request.properties {
+            sqlx::query("UPDATE claims SET properties = $1 WHERE id = $2")
+                .bind(properties)
+                .bind(claim_uuid)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to set properties: {e}"),
+                })?;
+        }
     }
 
     // Apply optional labels within the same transaction.
     //
-    // Guarded on `was_created` for the same reason the content_hash/properties
-    // write above is: on an `if_not_exists` dedup hit this handler returns a row
+    // Guarded on `was_created` for the same reason the properties write above
+    // is: on an `if_not_exists` dedup hit this handler returns a row
     // it did not create, and a caller-supplied label array must not rewrite that
     // row's labels. `policies.rs` uses `'policy:active' = ANY(labels)` as an
     // UPDATE predicate, so an unguarded write here silently detaches a policy
@@ -784,6 +857,34 @@ pub async fn create_claim(
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to set labels: {e}"),
             })?;
+    }
+
+    // Derivation provenance (U041 option A), on BOTH arms: a dedup hit is a
+    // re-applied plan line or a second parent stating the same atom, and each
+    // still deserves its row. In the claim's own stamped transaction, so a
+    // refused parent rolls the claim back with it and the evidence can never
+    // exist without the claim (nor the claim, on this request, without it).
+    if let Some(ref d) = request.derived_from {
+        match epigraph_db::EvidenceRepository::record_derivation_conn(
+            &mut tx, viewer, claim_uuid, d.claim_id, &d.method,
+        )
+        .await?
+        {
+            epigraph_db::DerivationEvidence::ParentUnavailable => {
+                // One answer for absent, retired, invisible and non-public:
+                // the caller must not learn which.
+                return Err(ApiError::ValidationError {
+                    field: "derived_from.claim_id".to_string(),
+                    reason: format!(
+                        "derived_from.claim_id {} does not name a current public claim",
+                        d.claim_id
+                    ),
+                });
+            }
+            epigraph_db::DerivationEvidence::Recorded(_)
+            | epigraph_db::DerivationEvidence::AlreadyPresent
+            | epigraph_db::DerivationEvidence::SelfReference => {}
+        }
     }
 
     let mut encryption_response = (None, None, None, None);
@@ -888,48 +989,63 @@ pub async fn create_claim(
         }
     }
 
-    // Materialize edges (best-effort, after commit)
-    let _ = epigraph_db::EdgeRepository::create(
-        &state.db_pool,
-        request.agent_id,
-        "agent",
-        claim_uuid,
-        "claim",
-        "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    if let Some(trace_uuid) = request.trace_id {
+    // Materialize edges (best-effort, after commit) — ONLY for a row this call
+    // created.
+    //
+    // On an `if_not_exists` dedup hit `created_claim` is a row someone else
+    // may own: `create_or_get` matches on `(content_hash, agent_id)`, and
+    // `agent_id` is the request BODY's (see the note on `claim` above), so any
+    // caller can name another agent's public claim. These statements run on
+    // the raw, unstamped pool after the commit, so migration 122's trigger
+    // never sees them (no claims INSERT happens) and the edges land public and
+    // world-owned, which migration 120 makes administrative: neither the
+    // caller nor the claim's owner can retract them.
+    // Unguarded, a dedup hit let a caller hang `AUTHORED`, `HAS_TRACE` and
+    // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
+    // and for the same reason, as the labels and properties writes above.
+    if was_created {
         let _ = epigraph_db::EdgeRepository::create(
             &state.db_pool,
+            request.agent_id,
+            "agent",
             claim_uuid,
             "claim",
-            trace_uuid,
-            "trace",
-            "HAS_TRACE",
+            "AUTHORED",
             None,
             None,
             None,
         )
         .await;
-    }
 
-    if let Some(evidence_id) = request.evidence_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            &state.db_pool,
-            claim_uuid,
-            "claim",
-            evidence_id,
-            "evidence",
-            "DERIVED_FROM",
-            None,
-            None,
-            None,
-        )
-        .await;
+        if let Some(trace_uuid) = request.trace_id {
+            let _ = epigraph_db::EdgeRepository::create(
+                &state.db_pool,
+                claim_uuid,
+                "claim",
+                trace_uuid,
+                "trace",
+                "HAS_TRACE",
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        if let Some(evidence_id) = request.evidence_id {
+            let _ = epigraph_db::EdgeRepository::create(
+                &state.db_pool,
+                claim_uuid,
+                "claim",
+                evidence_id,
+                "evidence",
+                "DERIVED_FROM",
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
     }
 
     let mut response: ClaimResponse = created_claim.into();
@@ -940,8 +1056,11 @@ pub async fn create_claim(
     response.labels = request.labels;
     response.was_created = was_created;
 
-    // Record provenance chain of custody when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
+    // Record provenance chain of custody. Unconditional on the caller (`ctx`
+    // is bound by the guard at the top of this function), but only for a row
+    // this call created: the action recorded is "create", and on an
+    // `if_not_exists` dedup hit nothing was.
+    if was_created {
         // Content hash for provenance: BLAKE3 of claim content
         let content_hash = blake3::hash(request.content.as_bytes());
         // Provenance signature placeholder (agent did not sign this request body via Ed25519)
@@ -949,7 +1068,7 @@ pub async fn create_claim(
 
         if let Err(e) = crate::middleware::provenance::record_provenance(
             &state.db_pool,
-            auth,
+            ctx,
             "claim",
             claim_uuid,
             "create",
@@ -967,7 +1086,7 @@ pub async fn create_claim(
         }
     }
 
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Create a new claim (placeholder - no database)
@@ -1349,6 +1468,90 @@ pub async fn list_claims(
         limit: pagination.limit,
         offset: pagination.offset,
     }))
+}
+
+/// Query keys `GET /claims` receives but has no predicate for.
+///
+/// [`PaginationParams`] carries no `deny_unknown_fields`, so each of these
+/// used to be dropped in silence: `?created_after=2999-…` answered the
+/// unfiltered newest-first page with the whole visible corpus as `total`, an
+/// answer that looks filtered and is not. They are the
+/// filters the two endpoints that DO honour them accept, so a caller sending
+/// one plainly meant it. Every other key stays accepted: a blanket
+/// `deny_unknown_fields` would break callers that send harmless extras, and
+/// `agent_id` is accepted-and-ignored for wire compatibility.
+#[cfg(feature = "db")]
+const LEGACY_LIST_UNHONORED_FILTERS: &[&str] = &[
+    "label",
+    "labels",
+    "tags",
+    "exclude_labels",
+    "created_after",
+    "created_before",
+    "date",
+    "truth_min",
+    "truth_max",
+    "is_current",
+    "exclude_agent_id",
+    "sort_by",
+    "sort_order",
+    "content_contains",
+    "methodology",
+    "evidence_type",
+];
+
+/// Refuse the first query key in `unhonored` with a 400 naming it, rather than
+/// let a listing handler drop a filter it cannot apply and answer as if it had.
+///
+/// Reads the raw query string, so it sees keys the typed `Query<…>` struct has
+/// no field for (which is exactly the set it exists to catch).
+#[cfg(feature = "db")]
+pub(crate) fn refuse_unhonored_filters(
+    raw_query: Option<&str>,
+    unhonored: &[&str],
+    hint: &str,
+) -> Result<(), ApiError> {
+    let Some(raw) = raw_query else {
+        return Ok(());
+    };
+    for (key, _) in url::form_urlencoded::parse(raw.as_bytes()) {
+        // `labels[]=x` and `Label=x` are the same intent as `labels=x`; serde
+        // drops them just as silently, so they are refused the same way.
+        let key = key.strip_suffix("[]").unwrap_or(&key).to_ascii_lowercase();
+        if let Some(name) = unhonored.iter().find(|name| **name == key) {
+            return Err(ApiError::ValidationError {
+                field: (*name).to_string(),
+                reason: format!(
+                    "`{name}` is not a filter this endpoint applies, so it would be \
+                     silently ignored. {hint}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The handler `GET /claims` is routed to: [`list_claims`] behind a refusal of
+/// the filters it cannot honour ([`LEGACY_LIST_UNHONORED_FILTERS`]).
+///
+/// A wrapper rather than an extra extractor on `list_claims` itself so that
+/// handler's signature, which tests call directly, is unchanged.
+#[cfg(feature = "db")]
+pub async fn list_claims_route(
+    viewer: crate::middleware::bearer::ViewerExtractor,
+    state: State<AppState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    params: Query<PaginationParams>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+) -> Result<Json<PaginatedResponse<ClaimResponse>>, ApiError> {
+    refuse_unhonored_filters(
+        raw_query.as_deref(),
+        LEGACY_LIST_UNHONORED_FILTERS,
+        "GET /claims applies only limit, offset, search and group_id. Use GET \
+         /api/v1/claims for time, truth, currency, author and sort filters, or GET \
+         /api/v1/claims/by-labels for label filters.",
+    )?;
+    list_claims(viewer, state, params, auth_ctx).await
 }
 
 /// List claims with pagination (placeholder - no database)
@@ -2331,11 +2534,22 @@ pub struct ClaimsByLabelsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     /// Skip the first N matching claims (default 0; negative values clamped to 0).
-    /// Combine with `limit` to page through large result sets — claims are
-    /// ordered by `created_at DESC`.
+    /// Kept for compatibility; prefer `after`. Claims are ordered by
+    /// `(created_at DESC, id DESC)`.
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Opaque keyset cursor: the `X-Next-Cursor` response header of the
+    /// previous page, passed back unchanged. Returns the claims strictly after
+    /// that page's last row, so a page boundary does not drift under
+    /// concurrent writes. Empty = first page. Cannot be combined with a
+    /// non-zero `offset`.
+    #[serde(default)]
+    pub after: Option<String>,
 }
+
+/// Response header of `GET /api/v1/claims/by-labels` carrying the opaque
+/// next-page cursor: present only on a full page, passed back as `after`.
+pub const NEXT_CURSOR_HEADER: &str = "x-next-cursor";
 
 /// Response row for `GET /api/v1/claims/by-labels`.
 ///
@@ -2365,12 +2579,20 @@ pub struct ClaimByLabelsResponse {
 /// caller, and as of this shard the read runs on a viewer-stamped connection,
 /// so the rows returned are the caller's own visible set rather than "public
 /// claim metadata". The scripts named above authenticate.
+///
+/// # Paging
+/// A full page (as many rows as the clamped `limit`) carries the
+/// [`NEXT_CURSOR_HEADER`] response header; pass it back as `after` for the next
+/// page. No header means the set is exhausted. The body stays a bare JSON
+/// array, so a client that ignores the header is unaffected, and `offset`
+/// still works (it re-reads skipped rows and drifts under writes).
 #[cfg(feature = "db")]
 pub async fn list_by_labels(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Query(q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
+) -> Result<(axum::http::HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
+    use epigraph_db::repos::claim::LabelCursor;
     let labels: Vec<String> = q
         .labels
         .split(',')
@@ -2398,6 +2620,23 @@ pub async fn list_by_labels(
         .unwrap_or(DEFAULT_PAGE_LIMIT)
         .clamp(MIN_PAGE_LIMIT, MAX_PAGE_LIMIT);
     let offset = q.offset.unwrap_or(0).max(0);
+    let after = match q.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(
+            LabelCursor::decode(token).ok_or_else(|| ApiError::BadRequest {
+                message: format!(
+                    "malformed `after` cursor; pass back the {NEXT_CURSOR_HEADER} header of the \
+                 previous page unchanged"
+                ),
+            })?,
+        ),
+    };
+    if after.is_some() && offset > 0 {
+        return Err(ApiError::BadRequest {
+            message: "`after` and a non-zero `offset` cannot be combined; page with `after` alone"
+                .into(),
+        });
+    }
 
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -2421,6 +2660,7 @@ pub async fn list_by_labels(
             min_truth,
             limit,
             offset,
+            after,
         },
     )
     .await
@@ -2428,7 +2668,17 @@ pub async fn list_by_labels(
         message: e.to_string(),
     })?;
 
-    Ok(Json(
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(next) = LabelCursor::next_page(&rows, limit) {
+        let value = axum::http::HeaderValue::from_str(&next.encode()).map_err(|e| {
+            ApiError::InternalError {
+                message: format!("next cursor is not a header value: {e}"),
+            }
+        })?;
+        headers.insert(NEXT_CURSOR_HEADER, value);
+    }
+
+    let body = Json(
         rows.into_iter()
             .map(|(c, claim_labels)| ClaimByLabelsResponse {
                 id: c.id.as_uuid(),
@@ -2441,16 +2691,17 @@ pub async fn list_by_labels(
                 supersedes: c.supersedes.map(|s| s.as_uuid()),
             })
             .collect(),
-    ))
+    );
+    Ok((headers, body))
 }
 
-/// Stub for non-db builds — returns an empty list.
+/// Stub for non-db builds — returns an empty list (and so no cursor).
 #[cfg(not(feature = "db"))]
 pub async fn list_by_labels(
     State(_state): State<AppState>,
     Query(_q): Query<ClaimsByLabelsQuery>,
-) -> Result<Json<Vec<ClaimByLabelsResponse>>, ApiError> {
-    Ok(Json(vec![]))
+) -> Result<(axum::http::HeaderMap, Json<Vec<ClaimByLabelsResponse>>), ApiError> {
+    Ok((axum::http::HeaderMap::new(), Json(vec![])))
 }
 
 #[cfg(test)]
@@ -2754,6 +3005,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 
@@ -3159,6 +3411,7 @@ mod db_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         };
 
         let state = AppState::with_db(
@@ -3309,5 +3562,175 @@ mod db_tests {
         .await
         .unwrap();
         assert_eq!(count, 0, "no provenance row committed");
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // TEST 13: create_claim_core's own scope check, called directly
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Pins the scope check at the TOP of `create_claim_core`, independent of
+    /// the `create_claim` HTTP handler that wraps it.
+    ///
+    /// `tests/create_claim_missing_scope_403.rs` proves the same refusal over
+    /// HTTP, but that alone cannot distinguish "the check lives in
+    /// `create_claim_core`" from "the check moved into the `create_claim`
+    /// handler" — every HTTP request still goes through the handler either
+    /// way. This test calls `create_claim_core` directly, bypassing
+    /// `create_claim` entirely, so it fails if the check is hoisted out of
+    /// the core and left only in the handler (every other caller of the core,
+    /// including a future batch-item path, would then write unchecked).
+    #[tokio::test]
+    async fn test_create_claim_core_missing_scope_403() {
+        let pool = test_pool_or_skip!();
+        let client_id = Uuid::new_v4();
+
+        // No `oauth_clients` row and no `AgentRepository::ensure_for_client`
+        // call needed: `create_claim_core`'s scope check is the FIRST
+        // statement in the function body, before any FK-checked write or
+        // agent/personal-group provisioning, so this principal never needs
+        // to exist as a real agent for the refusal to be observable. Using
+        // `ensure_for_client` here would also add an unregistered call site
+        // to `crates/epigraph-db/tests/personal_group_mint_ratchet.rs`'s
+        // scan, which requires every call site that can reach the
+        // personal-group mint to be registered with a justification.
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, client_id)
+            .await
+            .expect("resolve viewer");
+
+        // Auth is present but lacks claims:write, exactly like
+        // `test_patch_missing_scope_403` above.
+        let auth = AuthContext {
+            client_id,
+            agent_id: Some(client_id),
+            owner_id: Some(client_id),
+            client_type: ClientType::Service,
+            scopes: vec!["claims:read".to_string()],
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        };
+
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        );
+
+        let content = format!("create_claim_core direct scope probe {}", Uuid::new_v4());
+        let request = CreateClaimRequest {
+            content: content.clone(),
+            agent_id: client_id,
+            trace_id: None,
+            initial_truth: None,
+            content_hash: None,
+            properties: None,
+            evidence_id: None,
+            privacy_tier: None,
+            group_id: None,
+            encrypted_content: None,
+            encryption_epoch: None,
+            labels: vec![],
+            if_not_exists: false,
+            derived_from: None,
+        };
+
+        let result = create_claim_core(&state, &viewer, Some(&auth), request).await;
+        match result {
+            Err(ApiError::Forbidden { reason }) => {
+                assert!(
+                    reason.contains("claims:write"),
+                    "the refusal must name the missing scope: {reason}"
+                );
+            }
+            other => panic!(
+                "expected Err(ApiError::Forbidden {{ .. }}) naming claims:write, got {other:?}"
+            ),
+        }
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content = $1")
+            .bind(&content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no row may land when create_claim_core's own scope check refuses the call"
+        );
+    }
+    // ────────────────────────────────────────────────────────────────────────
+    // TEST 14: create_claim_core refuses a missing caller before anything else
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Pins the `let Some(ctx) = auth_ctx else { return Err(Unauthorized) }`
+    /// guard at the TOP of `create_claim_core`.
+    ///
+    /// `None` is unreachable over HTTP — `ViewerExtractor` and the bearer
+    /// middleware answer 401 before `create_claim` runs — so only a direct
+    /// call can reach this arm, and every other caller of the core (the batch
+    /// route, one call per item) depends on it holding.
+    ///
+    /// Two requests, because one cannot tell the guard's POSITION:
+    ///
+    /// * a valid public request — the refusal must be `Unauthorized`, not a
+    ///   scope 403 or a write;
+    /// * an EMPTY-content request — with the guard anywhere below the content
+    ///   check this would be a 400 `ValidationError`, so `Unauthorized` here
+    ///   is what proves the caller is bound before any validation runs.
+    ///
+    /// No row count is asserted: the guard is the function's first statement,
+    /// so there is no write it could follow, and a `SELECT .. FROM claims
+    /// WHERE content = ..` read-back would add a second scalar read to this
+    /// module's `TEST_ONLY_INLINE_READS` register in
+    /// `tests/viewer_route_table_lint.rs` for no extra evidence.
+    #[tokio::test]
+    async fn test_create_claim_core_without_auth_ctx_is_401() {
+        let pool = test_pool_or_skip!();
+        let principal = Uuid::new_v4();
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, principal)
+            .await
+            .expect("resolve viewer");
+        let state = AppState::with_db(
+            pool.clone(),
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        );
+
+        for (what, content) in [
+            (
+                "a valid public request",
+                format!("create_claim_core no-auth probe {}", Uuid::new_v4()),
+            ),
+            ("an empty-content request", String::new()),
+        ] {
+            let request = CreateClaimRequest {
+                content,
+                agent_id: principal,
+                trace_id: None,
+                initial_truth: None,
+                content_hash: None,
+                properties: None,
+                evidence_id: None,
+                privacy_tier: None,
+                group_id: None,
+                encrypted_content: None,
+                encryption_epoch: None,
+                labels: vec![],
+                if_not_exists: false,
+                derived_from: None,
+            };
+            let result = create_claim_core(&state, &viewer, None, request).await;
+            assert!(
+                matches!(result, Err(ApiError::Unauthorized { .. })),
+                "{what}: a call with no AuthContext must be refused Unauthorized \
+                 before any validation or write, got {result:?}"
+            );
+        }
     }
 }

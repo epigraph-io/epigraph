@@ -831,10 +831,67 @@ const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-
 /// The sentinel `evidence.raw_content` carries once its claim is sealed.
 ///
 /// Not id-suffixed, and it does not need to be: `evidence` has no generated
-/// tsvector, no uniqueness constraint over its content and no content hash, so
-/// the three reasons the claim sentinel carries an id do not apply. One fixed
-/// token is the smaller side channel.
-const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+/// tsvector and its `content_hash` is left as the ORIGINAL body's digest (it is
+/// not recomputed from the sentinel), so the reasons the claim sentinel carries
+/// an id do not apply. One fixed token is the smaller side channel.
+///
+/// `pub(crate)` for `EvidenceRepository::update_raw_content`, which refuses to
+/// rewrite a row holding it.
+pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+
+/// The key under which a seal manifest carries an evidence row's
+/// `evidence.source_url` inside that row's `properties`.
+///
+/// `source_url` is plaintext the seal must not leave behind (backlog
+/// 43ab8c73 made writers populate it; before that every writer bound NULL), and
+/// `evidence_encryption` has no ciphertext column of its own for it. Folding
+/// the URL into the properties payload the client already encrypts puts it in
+/// the ciphertext with no wire or schema change: the seal then NULLs the
+/// column, and unseal splits the key back out of the restored properties into
+/// the column. A client that treats `properties` as an opaque JSON value (the
+/// CLI does) round-trips it without knowing the key exists.
+///
+/// The leading `$` is a spelling no `EvidenceType` serialization emits, so the
+/// key cannot collide with a real property.
+pub const SEALED_EVIDENCE_SOURCE_URL_KEY: &str = "$sealed_source_url";
+
+/// `properties` as the seal manifest serves it for one evidence row: the row's
+/// own properties, plus its `source_url` under
+/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`] when the column holds one.
+///
+/// A non-object `properties` (the schema does not forbid one) is served
+/// unchanged and the URL is not folded, because there is no key to put it
+/// under; the seal still NULLs the column. Every writer in this codebase
+/// stores an object.
+#[must_use]
+pub fn seal_manifest_evidence_properties(
+    properties: &serde_json::Value,
+    source_url: Option<&str>,
+) -> serde_json::Value {
+    let mut out = properties.clone();
+    if let (Some(url), Some(map)) = (source_url, out.as_object_mut()) {
+        map.insert(
+            SEALED_EVIDENCE_SOURCE_URL_KEY.to_string(),
+            serde_json::Value::String(url.to_string()),
+        );
+    }
+    out
+}
+
+/// The inverse of [`seal_manifest_evidence_properties`]: the restored
+/// properties with [`SEALED_EVIDENCE_SOURCE_URL_KEY`] removed, and the URL it
+/// carried, if any.
+#[must_use]
+pub fn split_unsealed_evidence_properties(
+    properties: &serde_json::Value,
+) -> (serde_json::Value, Option<String>) {
+    let mut out = properties.clone();
+    let url = out
+        .as_object_mut()
+        .and_then(|map| map.remove(SEALED_EVIDENCE_SOURCE_URL_KEY))
+        .and_then(|v| v.as_str().map(str::to_string));
+    (out, url)
+}
 
 /// `privacy_tier` on every encryption row.
 ///
@@ -867,6 +924,18 @@ pub const SEAL_DELETE_TABLES: &[&str] = &[
     "challenges",
     "experiment_triples",
 ];
+
+/// The [`SEAL_DELETE_TABLES`] whose WRITER-OWNED rows a seal KEEPS.
+///
+/// Operator ruling R-5 (2026-10-25): an OUTSIDER's challenge (migration 168,
+/// `challenges.writer_owned = true`) is not a derived extraction of the
+/// claim's plaintext but the outsider's own objection, owned by the
+/// outsider's group, so sealing the claim keeps it rather than deleting it.
+/// It stays hidden from every session that cannot read the claim by 168's
+/// `challenges_claim_readable` policy (and the repo's in-query claim
+/// predicate). An insider's (inherited) challenge is still deleted, so
+/// `challenges` stays in [`SEAL_DELETE_TABLES`].
+pub const SEAL_KEEPS_WRITER_OWNED: &[&str] = &["challenges"];
 
 /// One claim's plaintext trusted computing base, as the seal manifest serves it.
 ///
@@ -3007,9 +3076,18 @@ impl PrivatizationRepository {
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
 
-        let evidence = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, serde_json::Value)>(
+        let evidence = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Uuid,
+                Option<String>,
+                serde_json::Value,
+                Option<String>,
+            ),
+        >(
             r"
-            SELECT e.claim_id, e.id, e.raw_content, e.properties
+            SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url
               FROM public.evidence e
              WHERE e.claim_id = ANY($1)
              ORDER BY e.claim_id, e.id
@@ -3038,11 +3116,18 @@ impl PrivatizationRepository {
                 evidence: evidence
                     .iter()
                     .filter(|(cid, ..)| *cid == claim_id)
-                    .map(|(_, id, raw_content, properties)| SealManifestEvidence {
-                        id: *id,
-                        raw_content: raw_content.clone(),
-                        properties: properties.clone(),
-                    })
+                    .map(
+                        |(_, id, raw_content, properties, source_url)| SealManifestEvidence {
+                            id: *id,
+                            raw_content: raw_content.clone(),
+                            // The column is plaintext the seal NULLs, so it
+                            // travels inside the encrypted properties.
+                            properties: seal_manifest_evidence_properties(
+                                properties,
+                                source_url.as_deref(),
+                            ),
+                        },
+                    )
                     .collect(),
             })
             .collect())
@@ -3134,7 +3219,8 @@ impl PrivatizationRepository {
     ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
     ///    this table omits and the applied schema requires.
     /// 7. The derived-extraction DELETEs, over
-    ///    [`SEAL_DELETE_TABLES`].
+    ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
+    ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
     /// 8. `harvester_fragments`, through the provenance join. Not recoverable
     ///    on unseal, which the preview states.
     ///
@@ -3295,7 +3381,8 @@ impl PrivatizationRepository {
                    SET raw_content = $2,
                        embedding = NULL,
                        embedding_3072 = NULL,
-                       properties = '{}'::jsonb
+                       properties = '{}'::jsonb,
+                       source_url = NULL
                  WHERE e.id = ANY($1)
                 ",
             )
@@ -3306,10 +3393,16 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 7. The derived extractions. Deleted, not encrypted.
+        // 7. The derived extractions. Deleted, not encrypted. EXCEPT an
+        //    outsider's challenge (ruling R-5): see [`SEAL_KEEPS_WRITER_OWNED`].
         for table in SEAL_DELETE_TABLES {
+            let keep = if SEAL_KEEPS_WRITER_OWNED.contains(table) {
+                " AND NOT writer_owned"
+            } else {
+                ""
+            };
             sqlx::query(&format!(
-                "DELETE FROM public.{table} WHERE claim_id = ANY($1)"
+                "DELETE FROM public.{table} WHERE claim_id = ANY($1){keep}"
             ))
             .bind(&sealed)
             .execute(&mut *conn)
@@ -3653,12 +3746,18 @@ impl PrivatizationRepository {
         let mut evidence_parents: Vec<Uuid> = Vec::new();
         let mut evidence_contents: Vec<Option<String>> = Vec::new();
         let mut evidence_props: Vec<serde_json::Value> = Vec::new();
+        let mut evidence_urls: Vec<Option<String>> = Vec::new();
         for item in items.iter().filter(|i| restored.contains(&i.claim_id)) {
             for e in &item.evidence {
                 evidence_ids.push(e.id);
                 evidence_parents.push(item.claim_id);
                 evidence_contents.push(e.raw_content.clone());
-                evidence_props.push(e.properties.clone());
+                // The seal folded `evidence.source_url` into the encrypted
+                // properties; split it back out into the column. COALESCE keeps
+                // the column of a row sealed before the fold existed.
+                let (properties, source_url) = split_unsealed_evidence_properties(&e.properties);
+                evidence_props.push(properties);
+                evidence_urls.push(source_url);
             }
         }
         if !evidence_ids.is_empty() {
@@ -3666,9 +3765,10 @@ impl PrivatizationRepository {
                 r"
                 UPDATE public.evidence e
                    SET raw_content = t.raw_content,
-                       properties = t.properties
-                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[])
-                    AS t(evidence_id, claim_id, raw_content, properties)
+                       properties = t.properties,
+                       source_url = COALESCE(t.source_url, e.source_url)
+                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[])
+                    AS t(evidence_id, claim_id, raw_content, properties, source_url)
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
                 ",
             )
@@ -3676,6 +3776,7 @@ impl PrivatizationRepository {
             .bind(&evidence_parents)
             .bind(&evidence_contents)
             .bind(&evidence_props)
+            .bind(&evidence_urls)
             .execute(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;

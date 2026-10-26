@@ -225,14 +225,11 @@ Return 3-8 claims."#,
             // Compute content_hash via BLAKE3 (matches all other claims in the DB)
             let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
 
-            // Check for duplicates
-            let exists: Option<(i64,)> =
-                sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
-                    .bind(content_hash.as_slice())
-                    .fetch_optional(&pool)
-                    .await?;
-
-            if exists.is_some() {
+            // Cheap pre-check, before the embedding call: content that is
+            // already in the graph is skipped without paying for an embedding.
+            // `insert_unless_hash_exists` repeats the find, so this check is an
+            // optimization, not the dedup.
+            if content_hash_exists(&pool, content_hash.as_slice()).await? {
                 tracing::info!(
                     "Duplicate claim skipped: {}",
                     &content[..content.len().min(60)]
@@ -274,29 +271,31 @@ Return 3-8 claims."#,
             );
 
             // Insert claim
-            let claim_id: (Uuid,) = sqlx::query_as(
-                r#"
-                INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
-                VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
-                RETURNING id
-                "#,
-            )
-            .bind(content)
-            .bind(content_hash.as_slice())
-            .bind(tv)
-            .bind(args.agent_id)
-            .bind(serde_json::json!({
-                "source": "web_search",
-                "doi": doi,
-                "journal": journal,
-                "year": year,
-                "protocol_parameters": claim.get("protocol_parameters"),
-            }))
-            .bind(&embedding_str)
-            .bind(decl.visibility_bind())
-            .bind(decl.owner_group_bind())
-            .fetch_one(&pool)
-            .await?;
+            let new_claim = WebSearchClaim {
+                content,
+                truth_value: tv,
+                properties: serde_json::json!({
+                    "source": "web_search",
+                    "doi": doi,
+                    "journal": journal,
+                    "year": year,
+                    "protocol_parameters": claim.get("protocol_parameters"),
+                }),
+                embedding: &embedding_str,
+            };
+            let claim_id = {
+                let mut conn = pool.acquire().await?;
+                insert_unless_hash_exists(&mut conn, args.agent_id, decl, &new_claim)
+                    .await
+                    .map_err(|e| e as Box<dyn std::error::Error>)?
+            };
+            let Some(claim_id) = claim_id else {
+                tracing::info!(
+                    "Duplicate claim skipped: {}",
+                    &content[..content.len().min(60)]
+                );
+                continue;
+            };
 
             // Create SUPPORTS edge from claim to hypothesis
             sqlx::query(
@@ -306,7 +305,7 @@ Return 3-8 claims."#,
                 ON CONFLICT DO NOTHING
                 "#,
             )
-            .bind(claim_id.0)
+            .bind(claim_id)
             .bind(args.hypothesis_id)
             .execute(&pool)
             .await
@@ -316,7 +315,7 @@ Return 3-8 claims."#,
             sqlx::query(
                 "UPDATE methods SET source_claim_ids = source_claim_ids || ARRAY[$1] WHERE id = $2",
             )
-            .bind(claim_id.0)
+            .bind(claim_id)
             .bind(method_id)
             .execute(&pool)
             .await
@@ -344,4 +343,435 @@ Return 3-8 claims."#,
     }
 
     Ok(all_filled)
+}
+
+/// One web-search result to persist as a claim.
+struct WebSearchClaim<'a> {
+    content: &'a str,
+    truth_value: f64,
+    properties: serde_json::Value,
+    /// pgvector text literal, `[x,y,...]`.
+    embedding: &'a str,
+}
+
+/// Whether any claim (by any author) has this `content_hash`. The ONE
+/// existence probe of this binary: the run loop's unlocked pre-check and
+/// [`insert_unless_hash_exists`]'s check under the dedup lock both call it.
+/// `SELECT 1` is an INT4, so it decodes as `i32`; decoding it as anything
+/// wider failed every time a match existed and aborted the run.
+async fn content_hash_exists<'e, E>(exec: E, content_hash: &[u8]) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM claims WHERE content_hash = $1")
+        .bind(content_hash)
+        .fetch_optional(exec)
+        .await?;
+    Ok(exists.is_some())
+}
+
+/// Insert `claim` authored by `agent_id`, unless a claim with its
+/// `content_hash` already exists. Returns the new row's id, or `None` when the
+/// content was already present.
+///
+/// **Concurrency:** the find and the INSERT run in one scope (a real `BEGIN`
+/// on a bare connection, a SAVEPOINT in a caller's transaction) under
+/// `ClaimRepository::lock_content_hash_agent` for the pair the INSERT writes,
+/// the lock the repository's find-then-insert writers take (backlog
+/// 00f1a517). Two concurrent runs over the same content by one author, or a
+/// run racing a repository create of that pair, therefore yield one row. One
+/// lock per short transaction: nothing else is held while it waits. The find
+/// stays content-hash-only (any author), as before.
+async fn insert_unless_hash_exists(
+    conn: &mut sqlx::PgConnection,
+    agent_id: Uuid,
+    decl: epigraph_core::TenancyDecl,
+    claim: &WebSearchClaim<'_>,
+) -> Result<Option<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+    use sqlx::Acquire;
+
+    let content_hash = epigraph_crypto::ContentHasher::hash(claim.content.as_bytes());
+
+    // Dropped without commit on any error path below, which rolls the scope
+    // (and the lock, when it is a real transaction) back.
+    let mut scope = conn.begin().await?;
+
+    // Taken before the find: without it, a concurrent writer's uncommitted
+    // row is invisible to the find and both insert.
+    epigraph_db::ClaimRepository::lock_content_hash_agent(
+        &mut scope,
+        content_hash.as_slice(),
+        agent_id,
+    )
+    .await?;
+
+    if content_hash_exists(&mut *scope, content_hash.as_slice()).await? {
+        scope.commit().await?;
+        return Ok(None);
+    }
+
+    let (id,): (Uuid,) = sqlx::query_as(
+        r#"
+        INSERT INTO claims (content, content_hash, truth_value, agent_id, labels, properties, embedding, visibility, owner_group_id)
+        VALUES ($1, $2, $3, $4, ARRAY['experimental', 'web_search'], $5, $6::vector, $7, $8)
+        RETURNING id
+        "#,
+    )
+    .bind(claim.content)
+    .bind(content_hash.as_slice())
+    .bind(claim.truth_value)
+    .bind(agent_id)
+    .bind(&claim.properties)
+    .bind(claim.embedding)
+    .bind(decl.visibility_bind())
+    .bind(decl.owner_group_bind())
+    .fetch_one(&mut *scope)
+    .await?;
+    scope.commit().await?;
+    Ok(Some(id))
+}
+
+/// Concurrency cover for [`insert_unless_hash_exists`] (backlog 00f1a517):
+/// two writers of one `(content_hash, agent_id)` must yield one row.
+///
+/// Held-open shape, as in `epigraph-db`'s `claim_repo_helpers` race arms:
+/// caller 1 writes inside a transaction it keeps OPEN, so its row exists but is
+/// invisible to every other snapshot. Caller 2 then writes the same content by
+/// the same author on its own connection (the binary's shape). No sleep decides
+/// the outcome: the arm waits until caller 2 either finished (nothing made it
+/// wait, so its find missed caller 1's row and it inserted a second one) or is
+/// blocked on a two-key advisory lock, and panics if neither happens.
+#[cfg(test)]
+mod dedup_race_tests {
+    use super::{content_hash_exists, insert_unless_hash_exists, WebSearchClaim};
+    use epigraph_core::{AgentId, Claim, TenancyDecl, TruthValue};
+    use epigraph_crypto::ContentHasher;
+    use epigraph_db::ClaimRepository;
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// Who holds the pair first, in the open transaction.
+    #[derive(Debug, Clone, Copy)]
+    enum First {
+        /// Another run of this binary.
+        MethodSearch,
+        /// The repository's legacy content-hash create (`ingest_document`
+        /// atoms, the conventions routes). Proves the binary takes the SAME
+        /// key as the repository writers, not merely some lock.
+        RepositoryCreateConn,
+    }
+
+    async fn seed_author(pool: &PgPool) -> (Uuid, TenancyDecl) {
+        // The production shape: no unique constraint on the pair (migration
+        // 150). Explicit, so the arm cannot pass on a constraint.
+        sqlx::query("ALTER TABLE claims DROP CONSTRAINT IF EXISTS uq_claims_content_hash_agent")
+            .execute(pool)
+            .await
+            .expect("drop the pair constraint");
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, created_at, updated_at) \
+             VALUES ($1, sha256($1::text::bytea), NOW(), NOW())",
+        )
+        .bind(agent_id)
+        .execute(pool)
+        .await
+        .expect("insert the author");
+        // Mint the author's personal group NOW, committed: left to the racers,
+        // caller 2 would wait on caller 1's uncommitted group upsert (a row
+        // lock, not the dedup lock).
+        let mut conn = pool.acquire().await.expect("acquire for the group mint");
+        let decl = ClaimRepository::default_decl_for_author(&mut conn, agent_id)
+            .await
+            .expect("mint the author's personal group");
+        (agent_id, decl)
+    }
+
+    fn embedding_literal() -> String {
+        format!("[{}]", vec!["0.1"; 1536].join(","))
+    }
+
+    async fn settle_on_the_dedup_lock<T>(pool: &PgPool, task: &tokio::task::JoinHandle<T>) -> bool {
+        for _ in 0..600 {
+            if task.is_finished() {
+                return false;
+            }
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks \
+                  WHERE locktype = 'advisory' AND objsubid = 2 AND NOT granted \
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!(
+            "caller 2 neither finished nor blocked on a dedup lock while caller 1's transaction \
+             was open; it is waiting on something else, so the arm cannot tell serialized from not"
+        );
+    }
+
+    async fn race_held_open(pool: &PgPool, first: First) {
+        let (agent_id, decl) = seed_author(pool).await;
+        let content = format!("method_search held-open after {first:?} {}", Uuid::new_v4());
+        let embedding = embedding_literal();
+
+        let mut tx_1 = pool.begin().await.expect("begin caller 1's transaction");
+        let r1: Uuid = match first {
+            First::MethodSearch => {
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "source": "web_search" }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut tx_1, agent_id, decl, &claim)
+                    .await
+                    .expect("caller 1 insert")
+                    .expect("caller 1 is the first write of the pair")
+            }
+            First::RepositoryCreateConn => {
+                let claim = Claim::new(
+                    content.clone(),
+                    AgentId::from_uuid(agent_id),
+                    [0u8; 32],
+                    TruthValue::new(0.5).unwrap(),
+                );
+                ClaimRepository::create_conn(&mut tx_1, &claim, decl)
+                    .await
+                    .expect("caller 1 create_conn")
+                    .id
+                    .into()
+            }
+        };
+
+        let caller_2 = {
+            let pool = pool.clone();
+            let content = content.clone();
+            let embedding = embedding.clone();
+            tokio::spawn(async move {
+                let mut conn = pool.acquire().await.expect("acquire caller 2's connection");
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "source": "web_search" }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                    .await
+                    .expect("caller 2 insert")
+            })
+        };
+        let blocked = settle_on_the_dedup_lock(pool, &caller_2).await;
+
+        tx_1.commit().await.expect("commit caller 1's transaction");
+        let r2 = caller_2.await.expect("caller 2 must not panic");
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2",
+        )
+        .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .expect("count rows for the pair");
+        assert_eq!(
+            rows, 1,
+            "method_search racing an open {first:?} of one (content_hash, agent_id) left {rows} \
+             rows: its find could not see caller 1's uncommitted row and nothing made it wait. \
+             Caller 1 wrote {r1}, caller 2 answered {r2:?}"
+        );
+        assert!(
+            blocked,
+            "caller 2 finished while caller 1's transaction was open: nothing made it wait"
+        );
+        assert_eq!(
+            r2, None,
+            "caller 2 ran after caller 1 committed, so it must skip the existing content"
+        );
+    }
+
+    /// A run over content that is already in the graph skips it, at BOTH
+    /// places a run checks: the run loop's unlocked pre-check
+    /// (`content_hash_exists` on the pool, before the embedding call) and
+    /// `insert_unless_hash_exists`. Both go through the one probe,
+    /// `content_hash_exists`, whose `SELECT 1` is an INT4: decoding it as
+    /// anything wider failed every time a match existed, so a known result
+    /// aborted the run instead of being skipped.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_second_run_over_known_content_skips_it(pool: PgPool) {
+        let (agent_id, decl) = seed_author(&pool).await;
+        let content = format!("method_search sequential {}", Uuid::new_v4());
+        let hash = ContentHasher::hash(content.as_bytes());
+        let embedding = embedding_literal();
+        let claim = WebSearchClaim {
+            content: &content,
+            truth_value: 0.8,
+            properties: serde_json::json!({ "source": "web_search" }),
+            embedding: &embedding,
+        };
+        assert!(
+            !content_hash_exists(&pool, hash.as_slice())
+                .await
+                .expect("the run loop's pre-check over new content"),
+            "new content is not reported as known"
+        );
+        let mut conn = pool.acquire().await.expect("acquire");
+        let first = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+            .await
+            .expect("first run");
+        assert!(first.is_some(), "the first run inserts the new content");
+        assert!(
+            content_hash_exists(&pool, hash.as_slice())
+                .await
+                .expect("the run loop's pre-check over known content must not error"),
+            "the run loop's pre-check reports the committed content as known"
+        );
+        let second = insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+            .await
+            .expect("a second run over known content must not error");
+        assert_eq!(second, None, "the second run skips the known content");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE content_hash = $1")
+            .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("count rows");
+        assert_eq!(rows, 1);
+    }
+
+    const RACE_BARRIER_KEY: i64 = 424_243;
+
+    /// Two runs of the binary, BOTH on bare connections (its real shape), with
+    /// caller 1 parked inside its INSERT by a `BEFORE INSERT` trigger that
+    /// takes a session advisory lock the test holds. A transaction-scoped lock
+    /// taken in autocommit is released at the end of its own statement, so an
+    /// implementation that locks without opening a scope passes the held-open
+    /// arms (caller 1 runs in a transaction there) and still mints a duplicate
+    /// here. No sleep decides the outcome: the handshakes are read from
+    /// `pg_locks`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn two_bare_connection_runs_serialize_across_the_insert(pool: PgPool) {
+        let (agent_id, decl) = seed_author(&pool).await;
+        let content = format!("method_search bare race {}", Uuid::new_v4());
+        let embedding = embedding_literal();
+
+        // Fires only for caller 1's row, which carries the marker property.
+        sqlx::query(
+            &"CREATE OR REPLACE FUNCTION zz_ms_race_barrier() RETURNS trigger
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                  PERFORM pg_advisory_lock(KEY);
+                  PERFORM pg_advisory_unlock(KEY);
+                  RETURN NEW;
+              END $$"
+                .replace("KEY", &RACE_BARRIER_KEY.to_string()),
+        )
+        .execute(&pool)
+        .await
+        .expect("create the barrier function");
+        sqlx::query(
+            "CREATE TRIGGER zz_ms_race_barrier BEFORE INSERT ON claims FOR EACH ROW \
+             WHEN (NEW.properties->>'race_barrier' = 'hold') \
+             EXECUTE FUNCTION zz_ms_race_barrier()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install the barrier trigger");
+
+        let mut holder = pool.acquire().await.expect("acquire the barrier holder");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(RACE_BARRIER_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("take the barrier");
+
+        let spawn_run = |marker: &'static str| {
+            let pool = pool.clone();
+            let content = content.clone();
+            let embedding = embedding.clone();
+            tokio::spawn(async move {
+                let mut conn = pool.acquire().await.expect("acquire a racer connection");
+                let claim = WebSearchClaim {
+                    content: &content,
+                    truth_value: 0.8,
+                    properties: serde_json::json!({ "race_barrier": marker }),
+                    embedding: &embedding,
+                };
+                insert_unless_hash_exists(&mut conn, agent_id, decl, &claim)
+                    .await
+                    .expect("racer insert")
+            })
+        };
+
+        let caller_1 = spawn_run("hold");
+        // Caller 1 is parked inside its INSERT.
+        let mut parked = false;
+        for _ in 0..600 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_locks \
+                  WHERE locktype = 'advisory' AND objid = $1::bigint AND NOT granted \
+                  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .bind(RACE_BARRIER_KEY)
+            .fetch_one(&pool)
+            .await
+            .expect("read pg_locks");
+            if waiting > 0 {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            parked,
+            "caller 1 never reached the barrier trigger, so this arm would prove nothing"
+        );
+
+        let caller_2 = spawn_run("go");
+        let blocked = settle_on_the_dedup_lock(&pool, &caller_2).await;
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(RACE_BARRIER_KEY)
+            .execute(&mut *holder)
+            .await
+            .expect("release the barrier");
+        drop(holder);
+
+        let r1 = caller_1.await.expect("caller 1 must not panic");
+        let r2 = caller_2.await.expect("caller 2 must not panic");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM claims WHERE content_hash = $1 AND agent_id = $2",
+        )
+        .bind(ContentHasher::hash(content.as_bytes()).as_slice())
+        .bind(agent_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows for the pair");
+        assert_eq!(
+            rows, 1,
+            "two bare-connection runs of one (content_hash, agent_id) left {rows} rows: caller \
+             2's find ran while caller 1's INSERT was in flight. Outcomes: {r1:?}, {r2:?}"
+        );
+        assert!(
+            blocked,
+            "caller 2 finished while caller 1 was parked in its INSERT"
+        );
+        assert!(r1.is_some() && r2.is_none(), "outcomes: {r1:?}, {r2:?}");
+    }
+
+    /// Two runs of the binary over the same search result.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn two_runs_of_one_content_by_one_author_insert_one_row(pool: PgPool) {
+        race_held_open(&pool, First::MethodSearch).await;
+    }
+
+    /// The binary waits on the lock the repository's writers hold.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn waits_on_the_repository_writers_dedup_lock(pool: PgPool) {
+        race_held_open(&pool, First::RepositoryCreateConn).await;
+    }
 }

@@ -100,6 +100,7 @@ fn human(agent: Uuid, scopes: &[&str]) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 

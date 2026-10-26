@@ -118,6 +118,9 @@ const CLOSED: &[&str] = &[
     // Migration 149: an authority table (which client's agent writes for which
     // human), written only through maintenance definers.
     "author_binding_clients",
+    // Migration 165: an authority table (which role confers which group),
+    // written only by maintenance definers or a guarded maintenance statement.
+    "group_role_bindings",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
@@ -150,6 +153,9 @@ const NO_WRITE: &[&str] = &[
     "authorizers",
     "entity_merge_candidates",
     "experiment_entities",
+    // Migration 165: written only through maintenance definers; the
+    // application role holds SELECT only (and row security shows it nothing).
+    "group_role_bindings",
     "harvester_audit_reports",
     "harvester_enriched_concepts",
     "harvester_sources",
@@ -1351,12 +1357,16 @@ async fn an_agent_key_never_leaves_revoked(pool: PgPool) {
     let app = app_pool(&pool, 2).await;
     let now = chrono::Utc::now();
     let pk: Vec<u8> = Uuid::new_v4().as_bytes().repeat(2);
+    // An `encryption` key: since 161 a `signing` or `identity-legacy` key is
+    // attested state the application role can neither store nor move
+    // (`agent_identity_lineage.rs::an_application_session_can_neither_bind_nor_move_an_attested_key`).
+    // The transitions pinned here are 118's, for every key type.
     let key = AgentKeyRepository::store(
         &app,
         Uuid::new_v4(),
         epigraph_core::AgentId::from_uuid(agent),
         &pk,
-        "signing",
+        "encryption",
         "active",
         now,
         None,

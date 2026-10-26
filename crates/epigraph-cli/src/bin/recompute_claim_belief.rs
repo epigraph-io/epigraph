@@ -14,12 +14,14 @@
 //! leaving the bulk of an affected backfill population stale. This binary
 //! invokes the canonical per-claim, per-frame recompute directly.
 //!
-//! Frame handling: for each input claim, looks up every distinct
-//! `frame_id` in `mass_functions` and recomputes per-frame via
-//! `edge_factor::recompute_claim_belief_on_frame`. `claims.{belief, pl,
-//! pignistic_prob, ...}` are frame-agnostic scalars — last writer wins.
-//! Per-claim frames are processed in lexicographic frame-name order so
-//! two runs against the same population converge to the same cached value.
+//! Frame handling: `claims.{belief, pl, pignistic_prob, ...}` is ONE shared
+//! cache, so for each input claim `edge_factor::recompute_claim_cached_belief`
+//! recomputes it from the claim's single owner frame (`binary_truth`, else
+//! `claim_validity`, else the frame the cache already records, else the frame
+//! holding the claim's earliest input; see
+//! `MassFunctionRepository::cache_owner_frame_for_claim`). No other frame name
+//! plays a part, so two runs against the same population converge to
+//! the same cached value.
 //!
 //! Reads claim_ids from a file (one UUID per line) or `--stdin`.
 //!
@@ -196,7 +198,8 @@ async fn run(
         .await;
 
     println!(
-        "done: {} claims recomputed across {} (claim, frame) writes, {} had no BBAs, {} errors (of {total})",
+        "done: {} claims recomputed across {} (claim, frame) writes, {} had no recomputable input \
+         (no BBA, only ingest templates, or a compound; cache left as it was), {} errors (of {total})",
         claims_with_work.load(Ordering::Relaxed),
         frame_writes.load(Ordering::Relaxed),
         claims_empty.load(Ordering::Relaxed),
@@ -208,10 +211,8 @@ async fn run(
     Ok(())
 }
 
-/// Discover every distinct `frame_id` this claim has BBAs on, ordered by
-/// the frame's name, and recompute each. Frame-name ordering gives a
-/// deterministic last-writer for the cached `claims.{belief, pl, betp, ...}`
-/// scalars so that two runs against the same population converge.
+/// Recompute this claim's cached `claims.{belief, pl, betp, ...}` scalars from
+/// its owner frame (see the module doc).
 ///
 /// Returns 1 if the claim's cached scalars were rewritten, 0 otherwise.
 async fn recompute_one_claim_cached_belief(
@@ -225,7 +226,7 @@ async fn recompute_one_claim_cached_belief(
     // which wrote that cache once per frame and let the alphabetically last one
     // win — reliably clobbering the edge-derived `binary_truth` belief, since
     // `binary_truth` sorts first. `recompute_claim_cached_belief` picks the single
-    // owning frame instead.
+    // owning frame instead, independent of frame names.
     // An operator one-shot on the DSN the operator supplies — in practice a
     // superuser, where a tenancy stamp is inert. The acquire is mechanical: the
     // recompute rides ONE connection instead of a checkout per statement.

@@ -39,6 +39,13 @@ pub const OPERATOR_LINK_REQUIRED: &str = "OPL01";
 /// own human writes; admin access is the only thing that crosses groups.
 pub const OPERATOR_SCOPE_REFUSED: &str = "OPL02";
 
+/// SQLSTATE `ROL01`: a claim was written or attributed by an agent attached to
+/// a role (`role_agents`, migration 166) while no human holds that role, or
+/// while the agent's linked human is not the holder. Raised by
+/// `epigraph_require_role_holder`, which the claims trigger's operator-binding
+/// checks call once the database is armed; the valve does not relieve it.
+pub const ROLE_HOLDER_REQUIRED: &str = "ROL01";
+
 /// The remedy every surface prints with an [`DbError::OperatorLinkRequired`].
 /// One string, so the HTTP body, the MCP message and the CLI text cannot drift.
 ///
@@ -204,6 +211,15 @@ pub enum DbError {
     #[error("OPL02 outside the operator's groups: {message}")]
     OperatorScopeRefused { message: String },
 
+    /// An agent attached to a role wrote (or was named as the author) while no
+    /// human holds the role, or while its linked human is not the holder
+    /// (SQLSTATE [`ROLE_HOLDER_REQUIRED`], migration 166). A DENIAL (HTTP 403,
+    /// MCP `INVALID_REQUEST`), fixed only by an operator: grant the role to the
+    /// agent's human, or detach the agent and attach an identity linked to the
+    /// holder (a link never moves to another human).
+    #[error("ROL01 the agent's role has no live holder it belongs to: {message}")]
+    RoleHolderRequired { message: String },
+
     /// A WRITE was asked of an ELEVATED viewer (elevation plan EL-6). An
     /// elevation widens one human's READS for at most 15 minutes and writes
     /// nothing: `ScopedPool::begin_as` refuses to open a transaction for it.
@@ -306,6 +322,14 @@ impl From<sqlx::Error> for DbError {
                     message: db_err.message().to_string(),
                 }
             }
+            // ROL01, migration 166: a role's agent with no live holder of its own.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some(ROLE_HOLDER_REQUIRED) =>
+            {
+                Self::RoleHolderRequired {
+                    message: db_err.message().to_string(),
+                }
+            }
             // All other database errors become QueryFailed
             other => Self::QueryFailed { source: other },
         }
@@ -330,8 +354,9 @@ impl DbError {
     /// cannot fix by changing a parameter and that is never a server fault:
     /// migration 105's two personal-group refusals
     /// ([`Self::is_personal_group_refusal`]) and migration 122's
-    /// [`Self::OperatorLinkRequired`] and [`Self::OperatorScopeRefused`], and
-    /// the elevated viewer's [`Self::ElevatedReadOnly`]. The write surfaces map
+    /// [`Self::OperatorLinkRequired`] and [`Self::OperatorScopeRefused`],
+    /// migration 166's [`Self::RoleHolderRequired`], and the elevated viewer's
+    /// [`Self::ElevatedReadOnly`]. The write surfaces map
     /// exactly this set to a denial (HTTP 403, MCP `INVALID_REQUEST`).
     #[must_use]
     pub fn is_write_authority_refusal(&self) -> bool {
@@ -340,6 +365,7 @@ impl DbError {
                 self,
                 Self::OperatorLinkRequired { .. }
                     | Self::OperatorScopeRefused { .. }
+                    | Self::RoleHolderRequired { .. }
                     | Self::ElevatedReadOnly
             )
     }

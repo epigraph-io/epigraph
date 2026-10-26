@@ -16,6 +16,11 @@
 //! The seeded superseded claim is given the *lower* truth value so it sits
 //! inside the low-truth window the queue actually queries: a test that only
 //! looked at a wide `[0,1]` range would not exercise the queue's real call.
+//!
+//! The same queue call also carries `exclude_spine` (backlog `31e7b727`):
+//! `query_claims_exclude_spine_reaches_the_sql_page` pins that the MCP
+//! parameter reaches the repository's pre-`LIMIT` filter and is off when
+//! omitted.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -101,6 +106,7 @@ async fn run(
             max_truth: Some(max_truth),
             limit: Some(50),
             is_current,
+            exclude_spine: None,
         },
     )
     .await
@@ -170,4 +176,66 @@ async fn seed_claim(
     .await
     .expect("seed claim");
     id
+}
+
+/// Backlog `31e7b727`, through the tool. A newer level-2 spine paragraph and
+/// an older level-3 atom both sit in the `max_truth=0.4` window; with
+/// `limit=1` the paragraph takes the only slot unless `exclude_spine=true`
+/// reaches the SQL. Omitting the parameter must leave the page as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_claims_exclude_spine_reaches_the_sql_page(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let atom = seed_claim(&pool, agent, 0.30, true, None).await;
+    let para = seed_claim(&pool, agent, 0.375, true, None).await;
+    for (id, level, ts) in [
+        (atom, 3, "2026-09-01T00:00:00Z"),
+        (para, 2, "2026-09-02T18:40:27Z"),
+    ] {
+        sqlx::query(
+            "UPDATE claims SET properties = jsonb_build_object('level', $2::int), \
+                               created_at = $3::timestamptz WHERE id = $1",
+        )
+        .bind(id)
+        .bind(level)
+        .bind(ts)
+        .execute(&pool)
+        .await
+        .expect("set level and created_at");
+    }
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_test_server(pool.clone());
+    let page = |exclude_spine: Option<bool>| {
+        let server = &server;
+        let viewer = &viewer;
+        async move {
+            let result = query_claims(
+                server,
+                viewer,
+                QueryClaimsParams {
+                    min_truth: Some(0.0),
+                    max_truth: Some(0.4),
+                    limit: Some(1),
+                    is_current: None,
+                    exclude_spine,
+                },
+            )
+            .await
+            .expect("query_claims");
+            ids_of(&parse_claims(&result))
+        }
+    };
+
+    assert_eq!(
+        page(Some(true)).await,
+        vec![atom.to_string()],
+        "exclude_spine=true must reach the SQL and skip the newer level-2 \
+         paragraph {para}, returning the older atom"
+    );
+    assert_eq!(
+        page(None).await,
+        vec![para.to_string()],
+        "omitting exclude_spine must leave the page unchanged: the newest \
+         in-range row, the paragraph, takes the slot"
+    );
 }

@@ -1,9 +1,11 @@
 //! Single-call claim assessment endpoint.
 //!
 //! `POST /api/v1/claims/:id/assess` — computes a BBA from human-readable
-//! parameters, finds or creates a DS frame, submits the evidence through
-//! the standard combination pipeline, optionally generates an embedding,
-//! and returns the full belief update in one response.
+//! parameters, stores it on the canonical `claim_validity` frame (or an
+//! explicit `frame_id`), combines it with the claim's earlier assessments on
+//! that frame, refreshes the claim's cached belief under the
+//! one-frame-owns-the-cache rule, optionally generates an embedding, and
+//! returns the framed belief update in one response.
 
 use crate::errors::ApiError;
 use crate::middleware::bearer::ViewerExtractor;
@@ -41,7 +43,8 @@ pub struct AssessClaimRequest {
     /// Optional journal name for reliability lookup.
     #[serde(default)]
     pub journal: Option<String>,
-    /// Optional source URL for auto frame scoping.
+    /// Optional source URL. Context only: it no longer selects or names a frame
+    /// (U027 retired the per-source `paper_validity_<slug>` frames).
     #[serde(default)]
     pub source_url: Option<String>,
     /// Optional supporting text stored as evidence context.
@@ -50,7 +53,10 @@ pub struct AssessClaimRequest {
     /// Optional uncertainty text parsed for uncertainty discount.
     #[serde(default)]
     pub uncertainty_text: Option<String>,
-    /// Explicit frame ID, or auto-create if absent.
+    /// Explicit frame ID. Defaults to the canonical `claim_validity` frame
+    /// (`["supported", "refuted", "uncertain"]`), resolved by its fixed id
+    /// (`edge_factor::CLAIM_VALIDITY_FRAME_ID`, seeded by migration 154) and
+    /// never created at request time.
     #[serde(default)]
     pub frame_id: Option<Uuid>,
     /// Fraction of total mass allocated to open-world ignorance, in [0, 0.5].
@@ -71,6 +77,30 @@ pub struct AssessClaimResponse {
     pub mass_on_conflict: Option<f64>,
     pub embedded: bool,
     pub combination_reports: Vec<serde_json::Value>,
+    /// The identity this assessment is recorded under (ruling Q-U027F-2): the
+    /// caller's human (its operator, or the human its client is allowlisted
+    /// to), or the caller itself when bound to none. One assessment per
+    /// (claim, frame, owner).
+    pub owner_agent_id: Option<Uuid>,
+    /// The agent that made this call (the row records the owner).
+    pub assessed_by: Option<Uuid>,
+    /// The owner's earlier assessment this call replaced in place (the slot row
+    /// keeps its id, `mass_function_id` above). Empty when the owner had none.
+    pub replaced_assessments: Vec<ReplacedAssessment>,
+}
+
+/// The owner's earlier assessment a call replaced.
+#[derive(Debug, Serialize)]
+pub struct ReplacedAssessment {
+    /// The slot row (now holding this call's masses).
+    pub mass_function_id: Uuid,
+    /// The owner it was recorded under.
+    pub source_agent_id: Option<Uuid>,
+    /// Its BetP on the claim's hypothesis, alone, before this call replaced it.
+    pub prior_pignistic_prob: Option<f64>,
+    /// Whether it pointed the other way (more belief against the claim's
+    /// hypothesis than for it, or the reverse): the new assessment contests it.
+    pub contested: bool,
 }
 
 // =============================================================================
@@ -89,7 +119,7 @@ pub async fn assess_claim(
     Json(request): Json<AssessClaimRequest>,
 ) -> Result<Json<AssessClaimResponse>, ApiError> {
     use epigraph_ds::{combination, FrameOfDiscernment, MassFunction};
-    use epigraph_engine::bba::{build_bba_directed, BbaParams};
+    use epigraph_engine::bba::{build_bba_directed, remap_binary_bba_to_frame, BbaParams};
     use epigraph_engine::calibration::CalibrationConfig;
     use epigraph_engine::uncertainty::parse_uncertainty;
 
@@ -124,8 +154,12 @@ pub async fn assess_claim(
     let claim_content = claim.content;
 
     // ── 2. Load calibration config ───────────────────────────────────────
-    let calibration_config = CalibrationConfig::load(std::path::Path::new("calibration.toml"))
-        .map_err(|e| ApiError::InternalError {
+    //
+    // Resolved like every other DS path (`CALIBRATION_PATH`, then the
+    // workspace root), not cwd-relative: `Path::new("calibration.toml")` only
+    // worked when the server happened to start in the repo root.
+    let calibration_config =
+        CalibrationConfig::from_workspace_root().map_err(|e| ApiError::InternalError {
             message: format!("Failed to load calibration.toml: {e}"),
         })?;
 
@@ -160,7 +194,19 @@ pub async fn assess_claim(
         }
     })?;
 
-    // ── 6. Find or create frame ──────────────────────────────────────────
+    // ── 6. Resolve the frame ─────────────────────────────────────────────
+    //
+    // U027: with no explicit frame this is ALWAYS the canonical
+    // `claim_validity` frame. It used to find-or-create
+    // `paper_validity_<slug of source_url>` (or `research_validity`), minting a
+    // 2-hypothesis frame per source (74 on prod by 2026-10-05) and panicking
+    // when a multi-byte char straddled the slug's 80-byte cut.
+    //
+    // U027F: resolved by its fixed id, never by name and never created here.
+    // A by-name get-or-create let whoever first named a frame
+    // `claim_validity` (frames.name is UNIQUE) refuse every later call or
+    // receive its evidence. A missing or non-canonical row refuses the call
+    // before anything is written.
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
         let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
@@ -171,36 +217,12 @@ pub async fn assess_claim(
             })?;
         fid
     } else {
-        let frame_name = if let Some(ref url) = request.source_url {
-            let slug: String = url
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-                .to_lowercase();
-            // Truncate to reasonable length
-            let slug = if slug.len() > 80 { &slug[..80] } else { &slug };
-            format!("paper_validity_{slug}")
-        } else {
-            "research_validity".to_string()
-        };
-
-        match epigraph_db::FrameRepository::get_by_name(pool, &viewer, &frame_name).await? {
-            Some(existing) => existing.id,
-            None => {
-                let hypotheses = vec!["supported".to_string(), "unsupported".to_string()];
-                let new_frame = epigraph_db::FrameRepository::create(
-                    pool,
-                    &frame_name,
-                    Some("Auto-created frame for claim assessment"),
-                    &hypotheses,
-                )
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Failed to create frame '{frame_name}': {e}"),
-                })?;
-                new_frame.id
-            }
-        }
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: format!("acquire connection: {e}"),
+        })?;
+        epigraph_engine::edge_factor::resolve_claim_validity_frame(&mut conn, &viewer)
+            .await
+            .map_err(|message| ApiError::InternalError { message })?
     };
 
     // Load the frame row for DS operations
@@ -218,28 +240,133 @@ pub async fn assess_claim(
             }
         })?;
 
-    // ── 7. Convert BBA to masses map (BTreeMap<String, f64>) ─────────────
+    // ── 7. Re-express the BBA on the frame, then as a masses map ─────────
+    //
+    // `build_bba_directed` builds on its own 2-way frame. Its ignorance key
+    // `"0,1"` read on a 3-way frame would mean {supported, refuted}, so the
+    // remap moves it onto the target's Theta.
+    let mass_function = remap_binary_bba_to_frame(&mass_function, &ds_frame).map_err(|e| {
+        ApiError::ValidationError {
+            field: "frame_id".to_string(),
+            reason: e.to_string(),
+        }
+    })?;
     let bba_json = mass_function.masses_to_json();
     let bba_map: BTreeMap<String, f64> =
         serde_json::from_value(bba_json.clone()).unwrap_or_default();
 
-    // ── 8. Submit evidence through the combination pipeline ──────────────
-    // Store the mass function in DB
+    // ── 8. Store under the owner's ONE assessment slot ───────────────────
+    //
+    // Ruling Q-U027F-2 (operator, 2026-10-22): one assessment per (claim,
+    // frame, owner). The owner is the calling agent's human operator, or the
+    // agent itself when it has none. A repeat by ANY agent of that owner
+    // REPLACES the owner's earlier assessment (reported, and flagged when it
+    // reverses the verdict: a contest), and only different owners' assessments
+    // combine as independent evidence. U027F's per-call perspective let one
+    // caller stack: ten identical calls took BetP 0.61 -> 0.997.
+    //
+    // The row is keyed (claim, frame, OWNER, the owner's slot perspective), so
+    // the slot is the table's own `UNIQUE NULLS NOT DISTINCT` key: every agent
+    // of one human upserts the same row, atomically, with no delete authority
+    // needed over a sibling's row and no race between two siblings, and no
+    // other writer's row can share the key (`assessment_slot_perspective`).
+    // `source_agent_id` names the owner, the identity whose one assessment
+    // this is.
+    //
+    // The owner is the caller's HUMAN, by migration 149's `epigraph_human_of`
+    // (live bindings only): the caller itself when it is a human, its live
+    // operator link, or the human its sole client is allowlisted to; the
+    // caller itself when bound to no human. A caller whose ONLY binding is a
+    // retired link is refused: falling back to its own slot would let one
+    // human assess twice through it. A principal-less viewer has one
+    // anonymous slot.
+    let caller = viewer.principal();
+    let owner = match caller {
+        Some(agent) => {
+            let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+                message: format!("acquire connection: {e}"),
+            })?;
+            match epigraph_db::AgentRepository::human_of(&mut conn, agent, true).await? {
+                Some(human) => Some(human),
+                None if epigraph_db::AgentRepository::human_of(&mut conn, agent, false)
+                    .await?
+                    .is_some() =>
+                {
+                    return Err(ApiError::Forbidden {
+                        reason: "this agent's link to its human is retired, so it cannot \
+                                 assess on that human's behalf; nothing was written"
+                            .to_string(),
+                    });
+                }
+                None => Some(agent),
+            }
+        }
+        None => None,
+    };
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
+    // The slot read and the slot upsert are ONE unit per (claim, frame, slot):
+    // a transaction holding a transaction-scoped advisory lock on that key.
+    // Unserialized, two concurrent calls by one owner could both read "no
+    // row" before either upsert landed and both report nothing replaced
+    // (backlog 4a7f90f8). The key is hashed in SQL so every server process
+    // derives the same lock. READ COMMITTED (the default) gives the read
+    // below a snapshot taken AFTER the lock is granted, so it sees the
+    // previous holder's committed row. The transaction commits before the
+    // fold below, which reads on other connections.
+    let mut slot_tx = pool.begin().await.map_err(|e| ApiError::InternalError {
+        message: format!("begin assessment slot transaction: {e}"),
+    })?;
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended( \
+             'epigraph/assess-slot/' || $1::text || '/' || $2::text || '/' || $3::text, 0))",
+    )
+    .bind(claim_id)
+    .bind(frame_id)
+    .bind(slot)
+    .execute(&mut *slot_tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("lock assessment slot: {e}"),
+    })?;
+    // The owner's assessment this call replaces: exactly the row the upsert
+    // below overwrites.
+    let replaced_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> =
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *slot_tx,
+            &viewer,
+            claim_id,
+            frame_id,
+        )
+        .await?
+        .into_iter()
+        .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
+        .map(|row| (row.id, row.source_agent_id, row.masses))
+        .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *slot_tx,
         claim_id,
         frame_id,
-        None, // no agent_id for assess endpoint
-        None, // no perspective_id
+        owner,
+        Some(slot),
         &bba_json,
         None,
         Some("discount"),
         None,
+        // Untyped on purpose (bc06ec6f). `build_bba_directed` already sized
+        // these masses with the request's type weight, so a typed row would be
+        // discounted by it a second time on any later fold.
         None,
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
+    slot_tx
+        .commit()
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("commit assessment slot: {e}"),
+        })?;
 
     // Ensure claim is assigned to frame + create WITHIN_FRAME edge
     let _ = sqlx::query(
@@ -309,7 +436,7 @@ pub async fn assess_claim(
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
     for_combination.extend(group_results);
 
-    // Standard adaptive combination
+    // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
     let (combined, reports) = if for_combination.len() <= 1 {
         (
@@ -335,24 +462,54 @@ pub async fn assess_claim(
 
     let (final_bel, final_pl, final_betp, m_missing) =
         super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
 
-    // Update claim's belief, plausibility, and pignistic probability
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
-        claim_id,
-        epigraph_db::CachedBelief {
-            belief: final_bel,
-            plausibility: final_pl,
-            mass_on_empty: m_empty,
-            pignistic_prob: Some(final_betp),
-            mass_on_missing: m_missing,
-            belief_frame_id: None,
-        },
-    )
-    .await?;
+    // Each replaced assessment, and whether this call reverses its direction:
+    // Bel(h) against Bel(not h) = 1 - Pl(h), so the sign does not depend on
+    // the frame's size (a 0.5 BetP threshold misreads a 3-way frame).
+    let direction = |m: &MassFunction| {
+        let (bel, pl, _, _) = super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx);
+        bel - (1.0 - pl)
+    };
+    let new_direction = direction(&mass_function);
+    let replaced_assessments: Vec<ReplacedAssessment> = replaced_rows
+        .iter()
+        .map(|(id, source, masses)| {
+            let old = MassFunction::from_json_masses(ds_frame.clone(), masses).ok();
+            ReplacedAssessment {
+                mass_function_id: *id,
+                source_agent_id: *source,
+                prior_pignistic_prob: old
+                    .as_ref()
+                    .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
+                contested: old
+                    .as_ref()
+                    .is_some_and(|m| direction(m) * new_direction < 0.0),
+            }
+        })
+        .collect();
+    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
+    let m_empty = combination::fold_conflict(&combined, &reports);
 
-    // Store the combined result as a system mass function
+    // Refresh the claim's cached belief under the one-frame-owns-the-cache
+    // rule. This used to write the numbers above straight into the cache with
+    // `belief_frame_id: None`, NULLing the frame reference and clobbering a
+    // `binary_truth`-owned cache with this one frame's combination. Now
+    // `binary_truth` keeps the cache when the claim has a BBA there; otherwise
+    // the last frame by name owns it (legacy `paper_validity_*` and
+    // `research_validity` frames sort after `claim_validity`). The response
+    // still reports THIS frame's numbers, which may legitimately differ from
+    // the cache: the cache owner's recompute folds every row on its frame.
+    {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: format!("acquire connection: {e}"),
+        })?;
+        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, &viewer, claim_id)
+            .await
+            .map_err(|message| ApiError::InternalError { message })?;
+    }
+
+    // Conflict/method summary of this frame's fold, for the scoped-belief
+    // cache below (no combined mass_functions row is stored).
     let final_k = reports.last().map(|r| r.conflict_k);
     let used_cautious = !analysis.dependent_groups.is_empty();
     let final_method_str = if used_cautious {
@@ -366,19 +523,13 @@ pub async fn assess_claim(
     };
     let final_method = final_method_str.as_deref();
 
-    let combined_json = combined.masses_to_json();
-    let _ = epigraph_db::MassFunctionRepository::store(
-        pool,
-        claim_id,
-        frame_id,
-        None, // system-generated combined result
-        &combined_json,
-        final_k,
-        final_method,
-        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-    )
-    .await;
+    // No "combined result" mass_functions row is stored any more: it sat on the
+    // input BBA's key and overwrote it, and a recompute must never re-combine a
+    // combined row. The per-frame result is cached by the upsert below.
+    // So no cached row can ever sit over an agent-less input (backlog
+    // b5cb3efb): the input is keyed by its owner's assessment slot
+    // perspective, and nothing is stored on the (claim, frame, NULL, NULL)
+    // slot.
 
     // Store global scoped belief cache
     let _ = epigraph_db::ScopedBeliefRepository::upsert(
@@ -484,6 +635,9 @@ pub async fn assess_claim(
         mass_on_conflict: Some(m_empty),
         embedded,
         combination_reports,
+        owner_agent_id: owner,
+        assessed_by: caller,
+        replaced_assessments,
     }))
 }
 

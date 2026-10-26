@@ -12,12 +12,18 @@ use crate::types::*;
 use epigraph_db::SheafRepository;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
 
 /// GET-equivalent: compute CDST sheaf sections for all claims.
+///
+/// Reads every visible claim's whole in-force neighbourhood (relationships
+/// matched case-insensitively) and scores it with
+/// `epigraph_engine::build_cdst_sections`: a directional positive edge
+/// constrains only its target, and `params.profile` picks the restriction
+/// factors. `limit` truncates the OUTPUT (worst first), never the scan.
 pub async fn check_sheaf_consistency(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -25,76 +31,42 @@ pub async fn check_sheaf_consistency(
 ) -> Result<CallToolResult, McpError> {
     let min_radius = params.min_radius.unwrap_or(0.1);
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let profile = match params.profile.as_deref() {
+        Some("regulatory") => epigraph_engine::sheaf::RestrictionProfile::regulatory(),
+        _ => epigraph_engine::sheaf::RestrictionProfile::scientific(),
+    };
 
-    let rows = SheafRepository::get_claim_neighbor_betp_pairs(
-        &server.pool,
-        viewer,
-        None,
-        limit * 10, // fetch more rows since multiple neighbors per claim
-    )
-    .await
-    .map_err(internal_error)?;
+    let rows = SheafRepository::get_claim_neighbor_betp_pairs(&server.pool, viewer, None)
+        .await
+        .map_err(internal_error)?;
 
-    // Group rows by claim_id → (local_interval, neighbors)
-    let mut neighbor_map: HashMap<
-        Uuid,
-        (
-            epigraph_engine::EpistemicInterval,
-            Vec<(
-                epigraph_engine::EpistemicInterval,
-                epigraph_engine::RestrictionKind,
-            )>,
-        ),
-    > = HashMap::new();
+    let neighbor_rows: Vec<epigraph_engine::NeighborRow> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(epigraph_engine::NeighborRow {
+                claim_id: row.claim_id,
+                local: interval(
+                    row.claim_betp?,
+                    row.claim_belief,
+                    row.claim_plausibility,
+                    row.claim_open_world,
+                ),
+                neighbor: interval(
+                    row.neighbor_betp?,
+                    row.neighbor_belief,
+                    row.neighbor_plausibility,
+                    row.neighbor_open_world,
+                ),
+                relationship: row.relationship.clone(),
+                outgoing: row.direction == "outgoing",
+            })
+        })
+        .collect();
 
-    for row in &rows {
-        let claim_betp = match row.claim_betp {
-            Some(v) => v,
-            None => continue,
-        };
-        let neighbor_betp = match row.neighbor_betp {
-            Some(v) => v,
-            None => continue,
-        };
-
-        let local_iv = epigraph_engine::EpistemicInterval::from_scalar(
-            claim_betp,
-            row.claim_belief.unwrap_or(claim_betp),
-            row.claim_plausibility.unwrap_or(claim_betp),
-        );
-        let local_iv = epigraph_engine::EpistemicInterval::new(
-            local_iv.bel,
-            local_iv.pl,
-            row.claim_open_world.unwrap_or(local_iv.open_world),
-        );
-
-        let neighbor_iv = {
-            let base = epigraph_engine::EpistemicInterval::from_scalar(
-                neighbor_betp,
-                neighbor_betp,
-                neighbor_betp,
-            );
-            epigraph_engine::EpistemicInterval::new(
-                base.bel,
-                base.pl,
-                row.neighbor_open_world.unwrap_or(base.open_world),
-            )
-        };
-
-        let rk = epigraph_engine::restriction_kind(&row.relationship);
-        let entry = neighbor_map
-            .entry(row.claim_id)
-            .or_insert_with(|| (local_iv, Vec::new()));
-        entry.1.push((neighbor_iv, rk));
-    }
-
-    // Compute CDST sections.
-    let mut sections: Vec<SheafSectionEntry> = neighbor_map
-        .into_iter()
-        .map(|(claim_id, (local_interval, neighbors))| {
-            let section =
-                epigraph_engine::compute_cdst_section(claim_id, local_interval, &neighbors);
-            SheafSectionEntry {
+    let mut sections: Vec<SheafSectionEntry> =
+        epigraph_engine::build_cdst_sections(&neighbor_rows, &profile)
+            .into_iter()
+            .map(|section| SheafSectionEntry {
                 node_id: section.node_id.to_string(),
                 local_betp: section.local_betp,
                 expected_betp: section.expected_betp,
@@ -106,10 +78,9 @@ pub async fn check_sheaf_consistency(
                 open_world_expected: section.open_world_expected,
                 interval_inconsistency: section.interval_inconsistency,
                 ignorance_inconsistency: section.ignorance_inconsistency,
-            }
-        })
-        .filter(|s| s.consistency_radius >= min_radius)
-        .collect();
+            })
+            .filter(|s| s.consistency_radius >= min_radius)
+            .collect();
 
     // Sort by consistency_radius descending (worst first).
     sections.sort_by(|a, b| {
@@ -129,6 +100,27 @@ pub async fn check_sheaf_consistency(
         min_radius_threshold: min_radius,
         max_radius,
     })
+}
+
+/// A claim's belief interval from its cached scalars: `[bel, pl]` around
+/// BetP, falling back to the point interval at BetP when Bel / Pl are NULL,
+/// with the measured open-world mass when there is one.
+fn interval(
+    betp: f64,
+    belief: Option<f64>,
+    plausibility: Option<f64>,
+    open_world: Option<f64>,
+) -> epigraph_engine::EpistemicInterval {
+    let base = epigraph_engine::EpistemicInterval::from_scalar(
+        betp,
+        belief.unwrap_or(betp),
+        plausibility.unwrap_or(betp),
+    );
+    epigraph_engine::EpistemicInterval::new(
+        base.bel,
+        base.pl,
+        open_world.unwrap_or(base.open_world),
+    )
 }
 
 /// Compute sheaf cohomology — global inconsistency measure with decomposed H¹.

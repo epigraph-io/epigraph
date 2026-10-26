@@ -7,8 +7,8 @@ This guide takes you from a clean PostgreSQL + Rust toolchain to a first success
 - **Rust** ≥ 1.75 (`rustup show` to check)
 - **PostgreSQL** 16+ with the `pgvector` extension installed and available (`SELECT extname FROM pg_extension;` should be runnable as a superuser)
 - **Claude Code** installed and authenticated — this is the MCP client we'll use to drive EpiGraph
-- **OpenAI API key** — exported as `OPENAI_API_KEY`. **Mandatory** for the walkthroughs: `recall_with_context` embeds the query string on every call (see `crates/epigraph-mcp/src/tools/recall.rs`) and fails without a configured embedding provider, even against an empty corpus.
-- **~$5 of OpenAI credit** for the embedding calls in the walkthroughs
+- **OpenAI API key** — exported as `OPENAI_API_KEY`. **Mandatory** for this guide's first MCP call: `recall_with_context` embeds the query string on every call (see `crates/epigraph-mcp/src/tools/recall.rs`) and fails without a configured embedding provider, even against an empty corpus.
+- **~$5 of OpenAI credit** for the embedding calls that `recall_with_context` and the other embedding-backed MCP tools make
 
 Time budget: ~10 minutes to first MCP call if your prereqs are in place; ~30 minutes including a fresh Postgres/pgvector install.
 
@@ -108,13 +108,13 @@ Open Claude Code (in any working directory). Tell it:
 
 > Use the `recall_with_context` MCP tool to search for "test".
 
-Claude should call `mcp__epigraph__recall_with_context({"query": "test"})` and you should see a JSON response with a `corpus_scope` object showing zero claims, paragraphs, papers, and themes (assuming a fresh database). For background on what `recall_with_context` is actually doing — embedding the query, scoring against paragraph- and claim-level vectors, returning a hybrid result — see [`02-concepts.md#5--hierarchical-extraction`](02-concepts.md#5--hierarchical-extraction).
+Claude should call `mcp__epigraph__recall_with_context({"query": "test"})` and you should see a JSON response with an empty `results` list and a `corpus_scope` object showing zero claims, paragraphs, papers, and themes (assuming a fresh database). For background on what `recall_with_context` is actually doing — embedding the query, running a vector nearest-neighbour search over every embedded claim, then batching in each hit's structural context (paper, section, atoms, sibling and neighbour paragraphs, epistemic edges) — see [`02-concepts.md#5--hierarchical-extraction`](02-concepts.md#5--hierarchical-extraction).
 
 Next, ask:
 
 > Use `submit_claim` to add this claim: "EpiGraph is installed correctly."
 
-Claude calls `mcp__epigraph__submit_claim(...)` and returns the created claim's UUID. This newly written row is a noun-claim authored by your agent; the conceptual model behind that split is in [`02-concepts.md#1--noun-claims-vs-verb-edges`](02-concepts.md#1--noun-claims-vs-verb-edges). Call `recall_with_context "installed"` again — you should now see the freshly submitted claim in the results.
+Claude calls `mcp__epigraph__submit_claim(...)` and returns the created claim's UUID. This newly written row is a noun-claim authored by your agent; the conceptual model behind that split is in [`02-concepts.md#1--noun-claims-vs-verb-edges`](02-concepts.md#1--noun-claims-vs-verb-edges). `submit_claim` embeds the claim as it writes it, so call `recall_with_context "installed"` again — you should now see the freshly submitted claim in the results, with its UUID as the hit's `paragraph_id` (the field holds the hit's claim id whatever kind of claim it is). The hit has **no `paper` key**, `section: null` and empty `atoms` / `siblings` lists: those are filled from `ingest_document`'s paper → section → paragraph → atom tree, and a claim submitted on its own has no parent paper. That is expected, not a failure. (The flat `recall` tool finds the claim too.)
 
 If you see the claim, your install is working end-to-end.
 

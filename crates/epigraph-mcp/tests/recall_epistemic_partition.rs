@@ -297,9 +297,10 @@ async fn partition_off_leaves_the_flat_envelope_untouched(pool: PgPool) {
 // ── recall_with_context ───────────────────────────────────────────────────
 //
 // Same three properties on the second surface. The bucketed-vector helpers
-// mirror `recall_graph_expansion.rs`'s fixture: `recall_with_context` is
-// paragraph-primary (level=2 + paper attribution required), so a claim seeded
-// the way the `recall` tests above seed one would never surface here.
+// mirror `recall_graph_expansion.rs`'s fixture. `recall_with_context` was
+// paragraph-primary (level=2 + paper attribution required) when this was
+// written; since drain U082 it seeds on every embedded claim, and the fixture
+// keeps paper paragraphs so the hits carry the full context shape.
 
 mod ctxfx {
     use super::*;

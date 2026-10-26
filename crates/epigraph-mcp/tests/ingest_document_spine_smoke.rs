@@ -225,3 +225,221 @@ async fn full_reingest_returns_already_ingested(pool: PgPool) {
         .expect("new_paragraph_paths is an array");
     assert!(paths.is_empty(), "no new paragraph paths on full re-ingest");
 }
+
+/// Backlog a55aac45 / U039: the spine walk has its OWN copy of the author loop
+/// and byline gate, so it needs its own guard. A placeholder ahead of a real
+/// author must mint no agent, and the real author must keep her per-claim
+/// `asserts` edges (planner and walk skip the same original index).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_rejects_placeholder_author(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-author");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+        {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+    ]);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds — a bad author name is dropped, not fatal");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let placeholder_agents: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM agents WHERE display_name = 'Authors Not Specified'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        placeholder_agents.0, 0,
+        "a placeholder author name must not mint an agent on the spine path"
+    );
+
+    let authored: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+          AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let authored_total: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'authored'",
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(authored.0, 1, "the real author authors the paper");
+    assert_eq!(authored_total.0, 1, "and nobody else does");
+
+    // thesis + 2 sections + 3 paragraphs = 6 spine claims (levels 0–2).
+    let alice_asserts: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts' AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        alice_asserts.0, 6,
+        "the real author asserts every spine claim despite the placeholder ahead of her"
+    );
+}
+
+/// The spine walk's byline gate is its own copy too: an all-placeholder
+/// structured list counts as "no real author", so the body byline is recovered
+/// (it was gated on an EMPTY list only). Byline authors get `authored → paper`
+/// and no per-claim `asserts` (the planner emitted none for the placeholder).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let byline_text =
+        "Spine Smoke Test Paper\n\nGrace Byline, Ada Byline\n\nAbstract\nSpine body text.\n";
+    assert_eq!(
+        epigraph_ingest::document::byline::parse_byline_authors(byline_text).len(),
+        2,
+        "CALIBRATION: the body byline parses to two authors"
+    );
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-byline");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Unknown", "affiliations": [], "roles": ["author"]}
+    ]);
+    v["source_text"] = serde_json::json!(byline_text);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let authored_names: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT a.display_name FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+        ORDER BY a.display_name
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let authored_names: Vec<&str> = authored_names.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        authored_names,
+        vec!["Ada Byline", "Grace Byline"],
+        "exactly the two byline authors author the paper; no 'Unknown'"
+    );
+
+    let byline_asserts: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts'
+          AND a.display_name IN ('Ada Byline', 'Grace Byline', 'Unknown')
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        byline_asserts.0, 0,
+        "byline-recovered authors get authored→paper only, never per-claim asserts"
+    );
+}
+
+/// Spine twin of `existing_placeholder_agent_is_not_reused`: prod already holds
+/// the placeholder-derived agent (c12bddb2 "Authors Not Specified"), and the
+/// spine walk's author loop is its own copy. Its skip must come BEFORE the
+/// lookup by key, or the existing fake agent is reused on every new paper.
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_existing_placeholder_agent_is_not_reused(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let key = epigraph_crypto::did_key::did_key_for_author(None, "Authors Not Specified").1;
+    let fake: uuid::Uuid = epigraph_db::AgentRepository::create(
+        &pool,
+        &epigraph_core::Agent::new(key, Some("Authors Not Specified".to_string())),
+    )
+    .await
+    .expect("seed the name-derived agent")
+    .id
+    .into();
+    let mut v: serde_json::Value = serde_json::from_str(SPINE_FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!("10.1234/spine-placeholder-existing-agent");
+    v["source"]["authors"] = serde_json::json!([
+        {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+        {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+    ]);
+    let extraction: DocumentExtraction = serde_json::from_value(v).expect("fixture parses");
+
+    let result = do_ingest_document_spine(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        &extraction,
+        None,
+    )
+    .await
+    .expect("spine ingest succeeds");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    let paper_id =
+        uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id")).expect("uuid");
+
+    let fake_edges: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND source_type = 'agent'")
+            .bind(fake)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fake_edges.0, 0,
+        "the pre-existing placeholder agent must gain no edge of any kind"
+    );
+    let key_holders: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        key_holders.0, 1,
+        "no second agent minted for the placeholder key"
+    );
+
+    // The walk did run over the structured list: the real author landed.
+    let authored_names: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT a.display_name FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let authored_names: Vec<&str> = authored_names.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(authored_names, vec!["Alice Author"]);
+}

@@ -124,15 +124,21 @@ async fn submit_claim_reports_a_content_hash_hit_and_what_it_kept(pool: PgPool) 
     assert!(second.get("belief").is_none(), "{second}");
 }
 
-/// `source_url` on `empirical` evidence has no slot in the stored evidence type,
-/// so the hit must list it as discarded rather than applied.
+/// `source_url` on `empirical` evidence is stored in `evidence.source_url`
+/// (backlog 43ab8c73, drain U036): the evidence type has no URL slot, but the
+/// column does, so the hit must list it as applied — and the dedup-hit's own
+/// evidence row must carry it. It is also the source identity the combine
+/// step keys same-source re-observations on (backlog 4c42c0bf).
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
+async fn an_empirical_source_url_is_applied_and_stored(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let content = "g11: empirical evidence keeps no url";
+    let content = "g11: empirical evidence keeps its url";
+    // The first (fresh) submission carries NO url, so a stored url can only
+    // have come from the second, deduplicated, call.
     let mut p = submit(content, "ev", &[]);
     p.evidence_type = "empirical".into();
+    p.source_url = None;
     epigraph_mcp::tools::claims::submit_claim(&server, &viewer, p, None)
         .await
         .unwrap();
@@ -147,18 +153,18 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     );
     let d = &second["deduplicated"];
     assert!(
-        strs(&d["inputs_discarded"]).contains(&"source_url".to_string()),
+        strs(&d["inputs_applied"]).contains(&"source_url".to_string()),
         "{second}"
     );
     assert!(
-        !strs(&d["inputs_applied"]).contains(&"source_url".to_string()),
+        !strs(&d["inputs_discarded"]).contains(&"source_url".to_string()),
         "{second}"
     );
-    // MEASURED: no evidence row for this claim carries the url anywhere.
+    // MEASURED: exactly the dedup-hit's evidence row (evidence_data "ev two")
+    // carries the url, in the column.
     let (hits,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM evidence e JOIN claims c ON c.id = e.claim_id \
-         WHERE c.content = $1 AND (e.properties::text LIKE '%' || $2 || '%' \
-                                   OR e.source_url = $2)",
+         WHERE c.content = $1 AND e.raw_content = 'ev two' AND e.source_url = $2",
     )
     .bind(content)
     .bind(&url)
@@ -166,8 +172,8 @@ async fn an_empirical_source_url_is_reported_discarded(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(
-        hits, 0,
-        "the url was stored after all; the list would be wrong"
+        hits, 1,
+        "the dedup hit listed source_url as applied, so its evidence row must store it"
     );
 }
 

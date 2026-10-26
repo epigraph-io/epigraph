@@ -2,9 +2,8 @@
 //!
 //! ## Why this exists
 //!
-//! The workspace pins `rmcp = "0.15"` (Cargo.lock resolves 0.15.0). Its
-//! `StreamableHttpService` answers the session-lifecycle error cases with
-//! status codes that break client recovery:
+//! rmcp 0.15's `StreamableHttpService` answered the session-lifecycle error
+//! cases with status codes that break client recovery:
 //!
 //! | rmcp 0.15.0 response | cause | spec (2025-03-26 streamable HTTP) |
 //! |---|---|---|
@@ -20,9 +19,10 @@
 //! session with the token it already holds. Agents therefore could not
 //! reconnect after a restart.
 //!
-//! rmcp 0.17.0 fixed the first row upstream (unknown session → 404); the 500
-//! and 422 rows are still present in rmcp 3.4.1. Until the bump, this layer
-//! rewrites the three cases.
+//! rmcp 0.17.0 fixed the first row upstream (unknown session → 404, body
+//! `Not Found: Session not found`); the 500 and 422 rows are still present in
+//! rmcp 2.2.0, the version the workspace now resolves. This layer rewrites
+//! those two and keeps the 401 row for any build that still produces it.
 //!
 //! ## What it touches
 //!
@@ -60,13 +60,17 @@ pub type McpHttpService = StreamableHttpService<crate::EpiGraphMcpFull, LocalSes
 /// bodies are well under 200 bytes; anything larger is not one of them.
 pub const MAX_INSPECTED_BODY: u64 = 4096;
 
-/// rmcp 0.15.0's body for an unknown `Mcp-Session-Id` (`tower.rs`, POST and GET).
+/// rmcp 0.15.0's body for an unknown `Mcp-Session-Id` (`tower.rs`, POST and
+/// GET). rmcp 2.2.0 answers that case upstream with `404 Not Found: Session not
+/// found`, so this constant is kept only for a build that still produces the 401.
 pub const RMCP_SESSION_NOT_FOUND_BODY: &str = "Unauthorized: Session not found";
 
-/// Prefix of rmcp 0.15.0's `internal_error_response` bodies.
+/// Prefix of rmcp's `internal_error_response` bodies (`Encounter an error when
+/// {context}: {error}`), verified unchanged in rmcp 2.2.0.
 pub const RMCP_INTERNAL_ERROR_PREFIX: &str = "Encounter an error when";
 
-/// rmcp 0.15.0's body for a non-initialize POST that carries no session id.
+/// rmcp's body for a non-initialize POST that carries no session id
+/// (`unexpected_message_response`), verified unchanged in rmcp 2.2.0.
 pub const RMCP_EXPECT_INITIALIZE_BODY: &str = "Unexpected message, expect initialize request";
 
 /// Would `status` ever be rewritten? Decides whether the body is buffered at
@@ -165,7 +169,10 @@ pub async fn rewrite_rmcp_session_status(req: Request, next: Next) -> Response {
 ///
 /// The service is taken already built (not its session manager) so a test can
 /// keep its own handle on the `LocalSessionManager` it passed in.
-pub fn nest_mcp_service(service: McpHttpService) -> axum::Router {
+pub fn nest_mcp_service<S>(service: StreamableHttpService<S, LocalSessionManager>) -> axum::Router
+where
+    S: rmcp::Service<rmcp::RoleServer> + Send + 'static,
+{
     axum::Router::new()
         .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn(rewrite_rmcp_session_status))

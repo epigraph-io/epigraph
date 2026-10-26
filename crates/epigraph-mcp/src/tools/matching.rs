@@ -33,7 +33,7 @@ use crate::types::*;
 use epigraph_db::{ClaimRepository, DecideOutcome, MatchCandidateRepo};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -347,6 +347,11 @@ pub async fn decide_match_candidate(
 /// provenance — `properties.decided_by` in particular — survives; see
 /// `MatchCandidateRepo::retire`. The derived rows ARE deleted, because they are
 /// materializations that regenerate from live edges.
+///
+/// When the retirement withdrew anything, the cascade then re-derives both
+/// endpoints' belief from their surviving `mass_functions` (reported as
+/// `belief_cascade`; see `admin_cascade::apply_match_retire` for why a later
+/// `bp/propagate` cannot do that repair).
 pub async fn retire_match_candidate(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -387,9 +392,12 @@ pub async fn retire_match_candidate(
         None,
     );
     trigger.candidate_status = Some(before.status.clone());
-    let (cascade, retirement) = match crate::maintenance::admin_cascade_session(server).await {
+    let session = crate::maintenance::admin_cascade_session(server).await;
+    let (cascade, retirement, belief_cascade) = match session {
         Ok(mut session) => {
-            admin_cascade::apply_match_retire(session.conn(), viewer, &trigger, candidate_id).await
+            let (conn, admin_viewer) = session.split();
+            admin_cascade::apply_match_retire(conn, admin_viewer, viewer, &trigger, candidate_id)
+                .await
         }
         // No maintenance connection: nothing about the candidate changes. The
         // whole retirement is recorded as a deferred request, on a transaction
@@ -407,7 +415,7 @@ pub async fn retire_match_candidate(
                 .await
                 .map_err(internal_error)?;
             tx.commit().await.map_err(internal_error)?;
-            (status, None)
+            (status, None, Default::default())
         }
     };
 
@@ -418,6 +426,7 @@ pub async fn retire_match_candidate(
         "previous_status": before.status,
         "retired": retired,
         "cascade": cascade,
+        "belief_cascade": belief_cascade,
         "retirement": retirement,
     }))
 }

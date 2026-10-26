@@ -11,9 +11,12 @@
 //! [`McpAuthState::revocation`] whether the token's `jti` is on migration 141's
 //! durable denylist, the same table the HTTP API's middleware reads. The store
 //! is a REQUIRED field, not an `Option`: there is no configuration in which an
-//! authenticated listener skips the check. A store that cannot answer refuses
-//! the token (fails closed) with the same uniform `invalid_token`; the reason
-//! (`revoked` / `revocation_unavailable`) is logged server-side only.
+//! authenticated listener skips the check. A revoked token is refused with the
+//! uniform 401 `invalid_token`. A store that cannot answer also refuses the
+//! request (fails closed), but with 503 and `Retry-After` and no
+//! `invalid_token` challenge, so a client keeps its still-valid token and
+//! retries. The reason (`revoked` / `revocation_unavailable`) is logged
+//! server-side only.
 //!
 //! The production store is [`DbAccessTokenRevocation`] on the process pool.
 //! There is deliberately no public "never revoked" store in this crate: test
@@ -26,7 +29,10 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use http::{header::WWW_AUTHENTICATE, HeaderValue, StatusCode};
+use http::{
+    header::{RETRY_AFTER, WWW_AUTHENTICATE},
+    HeaderValue, StatusCode,
+};
 
 use epigraph_auth::{AuthContext, JwtConfig};
 
@@ -133,10 +139,11 @@ pub async fn bearer_auth_middleware(
             match state.jwt_config.validate_token(token) {
                 Ok(claims) => {
                     // Revocation (RFC 7009, migration 141), by the jti of a
-                    // token whose signature has just been verified. Refused with
-                    // the same uniform `invalid_token` as every other rejection;
-                    // the reason is logged server-side only. Fails CLOSED: a
-                    // store that cannot answer refuses the token.
+                    // token whose signature has just been verified. A revoked
+                    // token is refused with the same uniform `invalid_token` as
+                    // every other rejection; the reason is logged server-side
+                    // only. Fails CLOSED: a store that cannot answer refuses the
+                    // request, as a 503 the client retries, not a bad token.
                     match state.revocation.is_revoked(claims.jti).await {
                         Ok(false) => {}
                         Ok(true) => {
@@ -152,10 +159,7 @@ pub async fn bearer_auth_middleware(
                                 error = %e,
                                 "MCP bearer token rejected"
                             );
-                            return unauthorized(
-                                state.resource_metadata_url.as_deref(),
-                                INVALID_TOKEN,
-                            );
+                            return revocation_unavailable();
                         }
                     }
                     let auth: AuthContext = claims.into();
@@ -219,6 +223,25 @@ pub fn validate_resource_metadata_url(resource_metadata_url: &str) -> Result<(),
              (control characters or non-ASCII bytes?)"
                 .to_string()
         })
+}
+
+/// Seconds a client is asked to wait (`Retry-After`) when the revocation
+/// store cannot answer.
+const REVOCATION_RETRY_AFTER_SECS: &str = "5";
+
+/// The refusal when the revocation lookup cannot answer: 503 with
+/// `Retry-After`, the REST middleware's answer (`refuse_revoked`). Still fails
+/// CLOSED (the request is not served), but carries NO `invalid_token`
+/// challenge: that tells an OAuth client its token is bad, and connectors
+/// discard it and re-run consent over what is a transient database outage.
+/// The body is bare; the cause is logged server-side only.
+fn revocation_unavailable() -> Response {
+    let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "Service Unavailable").into_response();
+    resp.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_static(REVOCATION_RETRY_AFTER_SECS),
+    );
+    resp
 }
 
 /// Build a 401 with an RFC 9728 WWW-Authenticate challenge.
@@ -338,6 +361,7 @@ pub fn unauthenticated_context(
         // Fail closed until `call_tool` reads the switch (elevation plan
         // EL-10): armed, the listener's injected admin scopes count for nothing.
         admin_scopes: epigraph_auth::AdminScopePosture::Armed,
+        delegated_by: None,
     }
 }
 

@@ -257,7 +257,9 @@ async fn post_packet(router: &Router, packet: serde_json::Value) -> (StatusCode,
 /// duplicate evidence, and the create path persists `properties`.
 ///
 /// Before the fix the second submit reached the bare `INSERT INTO claims` and
-/// hit `uq_claims_content_hash_agent` → 500.
+/// hit `uq_claims_content_hash_agent` → 500. From migration 150 that
+/// constraint is gone, so the same defect would insert a silent second row
+/// instead; the row-count assertion below is what catches it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_packet_durable_idempotency_across_processes(pool: PgPool) {
     // Seed the author agent (FK on claims.agent_id).

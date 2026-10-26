@@ -140,9 +140,9 @@ pub async fn get_provenance(
     .await
     .map_err(internal_error)?;
 
-    Ok(CallToolResult::success(vec![Content::text(build_bundle(
-        claim_id, &lineage, limits,
-    ))]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        build_bundle(claim_id, &lineage, limits),
+    )]))
 }
 
 /// The clamped caps one call applies; echoed in the bundle's `limits`.
@@ -506,6 +506,8 @@ mod tests {
                     id,
                     content: "x".repeat(content_len),
                     truth_value: 0.5,
+                    agent_id: Uuid::nil(),
+                    created_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
                     depth,
                     parent_ids: ps,
                     evidence_ids: ev,

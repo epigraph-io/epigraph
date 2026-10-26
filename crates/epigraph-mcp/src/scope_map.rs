@@ -6,6 +6,13 @@
 //! which `call_tool` translates into 403 Forbidden) AND fails the test
 //! suite.
 
+/// The admin tier of this map, named once. It gates the `claims:admin` rows of
+/// [`SCOPE_MAP`] at dispatch, and inside a tool the admin-only half of a tool
+/// whose ordinary use is `claims:write` (`theme_cluster`'s `wipe_first`, backlog
+/// 5abe23de). Checked only through `AuthContext::has_scope`, the admin-scope
+/// chokepoint (`epigraph-api/tests/admin_scope_literals.rs`).
+pub const CLAIMS_ADMIN: &str = "claims:admin";
+
 /// Look up the OAuth scope required to dispatch `tool_name`.
 ///
 /// Returns `None` for unknown tools. The call site MUST treat `None` as a
@@ -48,6 +55,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_themes", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("get_workflow_executions", "claims:read"),
+    ("get_workflow_plan", "claims:read"),
     ("list_challenges", "claims:read"),
     ("list_events", "claims:read"),
     ("list_frames", "claims:read"),
@@ -57,6 +65,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("query_claims", "claims:read"),
     ("query_claims_by_evidence", "claims:read"),
     ("query_claims_by_label", "claims:read"),
+    ("plan_label_dedup", "claims:read"),
+    ("probe_label_dedup", "claims:read"),
+    ("label_dedup_index_view", "claims:read"),
     ("query_claims_by_methodology", "claims:read"),
     ("query_paper", "claims:read"),
     ("query_triples", "claims:read"),
@@ -128,10 +139,18 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // administrative: it runs on the maintenance connection and is deferred to
     // the replay timer, never with the caller's authority.
     ("mark_duplicate", "claims:write"),
+    // Its reversal: the same per-claim rule over the duplicate and the
+    // canonical it was marked onto; the reversal itself is administrative.
+    ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
     ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
+    // Marks through mark_duplicate's act and writes labels through the
+    // `update_labels` path, each claim under its own per-claim rule.
+    ("apply_label_dedup", "claims:write"),
+    // Its reversal: each step through `update_labels` / `unmark_duplicate`.
+    ("revert_label_dedup", "claims:write"),
     ("update_with_evidence", "claims:write"),
     ("verify_claim", "claims:write"),
     // ─── claims:admin ──────────────────────────────────────────────────
@@ -140,7 +159,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // covers promote/reject on `decide_match_candidate`. Supersession and
     // dedup were in this bucket until batch OA1; they are the caller's own act
     // on its own claim and moved to claims:write above.
-    ("retire_match_candidate", "claims:admin"),
+    ("retire_match_candidate", CLAIMS_ADMIN),
     // Hard-deletes the edge row: irreversible and audit-destroying, so it
     // sits with the other irreversible graph mutations rather than with
     // `patch_edge`. Note this is STRICTER than the HTTP route it wraps
@@ -158,7 +177,7 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // (test fixtures, mis-typed edges with no audit value), not the ordinary
     // way to remove an edge. If retraction proves sufficient in practice,
     // `delete_edge` should be withdrawn rather than left as the easier path.
-    ("delete_edge", "claims:admin"),
+    ("delete_edge", CLAIMS_ADMIN),
     // The three corpus-wide maintenance jobs. They run on a bypass viewer over
     // the maintenance connection, so they read and write EVERY tenant's rows
     // regardless of the caller: `sweep_semantic_duplicates` returns other
@@ -167,9 +186,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // H-a review on config A: a claims:write-only principal with no membership
     // listed two foreign group-private ids and retired one). Cross-tenant power
     // is admin power, the same tier as `mark_duplicate`, which the sweep calls.
-    ("backfill_embeddings", "claims:admin"),
-    ("recompute_beliefs", "claims:admin"),
-    ("sweep_semantic_duplicates", "claims:admin"),
+    ("backfill_embeddings", CLAIMS_ADMIN),
+    ("recompute_beliefs", CLAIMS_ADMIN),
+    ("sweep_semantic_duplicates", CLAIMS_ADMIN),
 ];
 
 #[cfg(test)]
@@ -280,6 +299,23 @@ mod tests {
     fn claim_acts_are_write_scoped() {
         assert_eq!(required_scope("supersede_claim"), Some("claims:write"));
         assert_eq!(required_scope("mark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
+        assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
+        assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+    }
+
+    /// Plan and probe only read, so a `claims:read` bearer reaches them; apply
+    /// writes (above). Asserted by name: the label-dedup tool tests call the
+    /// tool functions directly and never pass through the router's scope
+    /// check, and the coverage test passes for any mapping.
+    #[test]
+    fn label_dedup_reads_are_read_scoped() {
+        assert_eq!(required_scope("plan_label_dedup"), Some("claims:read"));
+        assert_eq!(required_scope("probe_label_dedup"), Some("claims:read"));
+        assert_eq!(
+            required_scope("label_dedup_index_view"),
+            Some("claims:read")
+        );
     }
 
     /// The three maintenance tools act across every tenant on a bypass viewer,

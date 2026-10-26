@@ -99,6 +99,19 @@ async fn main() {
         }
     }
 
+    // Belief modes (SPEC §10.2): read once, here, and journalled, so the log
+    // shows which modes this process booted with; `/health` reports the same.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+    // A typo runs the flag's default; logged here, under this binary's own
+    // target, because the engine logs nothing and the default filter must keep
+    // the warning.
+    for flag in epigraph_engine::belief_modes::unrecognised() {
+        tracing::warn!("belief-mode flag ignored: {flag}");
+    }
+
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,
     // so the refusal is the first and only thing a misconfigured unit reports.
@@ -412,6 +425,8 @@ async fn main() {
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
+            .with_run_tokens(run_tokens_from_env())
+            .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
@@ -726,4 +741,52 @@ async fn main() {
     tracing::info!("Server listening on {}", addr);
 
     axum::serve(listener, app).await.expect("Server error");
+}
+
+/// `EPIGRAPH_BP_APPLY`, read once at boot: whether `POST /api/v1/bp/propagate`
+/// may write its results (`epigraph_api::state::BpApply`). BP apply is retired
+/// and OFF by default; logged when ON, so a journal shows which processes were
+/// armed.
+#[cfg(feature = "db")]
+fn bp_apply_from_env() -> epigraph_api::state::BpApply {
+    use epigraph_api::state::{BpApply, BP_APPLY_ENV};
+    let raw = std::env::var(BP_APPLY_ENV).ok();
+    if BpApply::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_BP_APPLY is set to a value that is neither `on` nor `off`: BP apply stays \
+             OFF on this process (only `on` enables it)"
+        );
+    }
+    let switch = BpApply::parse(raw.as_deref());
+    if switch == BpApply::On {
+        tracing::warn!(
+            "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \
+             claims (BP apply is retired; compounds are never written)"
+        );
+    }
+    switch
+}
+
+/// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a
+/// delegated run token (`epigraph_db::RunTokens`). Logged when ON, so a
+/// journal shows which processes were armed.
+#[cfg(feature = "db")]
+fn run_tokens_from_env() -> epigraph_db::RunTokens {
+    let raw = std::env::var(epigraph_db::RUN_TOKENS_ENV).ok();
+    if epigraph_db::RunTokens::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_RUN_TOKENS is set to a value that is neither `on` nor `off`: delegated \
+             run tokens stay OFF on this process (only `on` admits them)"
+        );
+    }
+    let switch = epigraph_db::RunTokens::parse(raw.as_deref());
+    if switch == epigraph_db::RunTokens::On {
+        tracing::warn!(
+            "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \
+             is live"
+        );
+    }
+    switch
 }

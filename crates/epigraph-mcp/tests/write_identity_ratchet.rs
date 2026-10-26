@@ -346,15 +346,13 @@ const WRITE_BODIES_WITHOUT_AUTH: &[(&str, &str)] = &[
     (
         "report_hierarchical_outcome",
         "read-modify-write of workflows.metadata counters (no row security) plus \
-         behavioral_executions rows; its authority is an open item in the R3 checklist",
+         behavioral_executions rows, which carry no author column. It needs the caller's \
+         VIEWER, not its write identity: the step lookup runs on a transaction stamped with \
+         that viewer, and the tool is gated by claims:write (scope_map.rs)",
     ),
     (
         "sweep_semantic_duplicates",
         "maintenance session over the maintenance connection, gated by claims:admin",
-    ),
-    (
-        "theme_cluster",
-        "corpus-wide job with no author stamp that covers it; R3 checklist item 4",
     ),
 ];
 

@@ -195,6 +195,7 @@ impl Server {
                 AccessTokenBinding {
                     family_id: fam,
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -214,6 +215,7 @@ impl Server {
                 AccessTokenBinding {
                     family_id: Some(p.family),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -1596,8 +1598,9 @@ async fn the_elevated_token_never_outlives_the_assignment(pool: PgPool) {
     let mut auth = SoftAuthenticator::new(MODEL);
     let p = person(&pool, "short-assignment").await;
     let _assignment: Uuid = sqlx::query_scalar(
-        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, \
-                now() + interval '5 minutes', NULL, 'test: a five-minute assignment')",
+        "SELECT public.epigraph_grant_role('role:platform-custodian', $1, \
+                now() - interval '30 seconds', now() + interval '5 minutes', NULL, \
+                'test: a five-minute assignment')",
     )
     .bind(p.person)
     .fetch_one(&pool)
@@ -2618,6 +2621,7 @@ async fn an_elevated_viewer_is_refused_outside_the_recorder(pool: PgPool) {
             AccessTokenBinding {
                 family_id: Some(p.family),
                 elevation_id: elv,
+                delegated_by: None,
             },
         )
         .expect("mint")
@@ -3055,6 +3059,7 @@ async fn an_agent_cannot_propose(pool: PgPool) {
                 AccessTokenBinding {
                     family_id: Some(p.family),
                     elevation_id: elv,
+                    delegated_by: None,
                 },
             )
             .expect("mint")

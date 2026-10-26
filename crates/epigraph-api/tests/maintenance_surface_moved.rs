@@ -36,6 +36,7 @@ fn admin() -> RequireScopeAdmin {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     })
 }
 

@@ -40,59 +40,129 @@ use uuid::Uuid;
 /// The enum is the trust-modifier bucket; the calibration key is the tuned
 /// mass profile.
 fn parse_methodology(s: &str) -> Result<Methodology, String> {
-    match s.to_lowercase().replace('-', "_").as_str() {
-        "bayesian_inference" | "bayesian" => Ok(Methodology::BayesianInference),
-
-        "deductive_logic" | "deductive" | "deductive_reasoning" | "theoretical_derivation" => {
-            Ok(Methodology::Deductive)
-        }
-
-        // meta-analysis is a statistical synthesis over a population of prior
-        // studies — an inductive generalization, not a formal proof. It used to
-        // map to FormalProof, handing the single highest trust modifier in the
-        // system (1.2, above Deductive's 1.1) to an empirical synthesis that
-        // calibration.toml itself ranks BELOW deductive_logic (0.80 vs 0.85).
-        "inductive_generalization" | "inductive" | "meta_analysis" | "meta" => {
-            Ok(Methodology::Inductive)
-        }
-
-        "abductive" => Ok(Methodology::Abductive),
-
-        // Direct observation lands on Instrumental by the repo's own authority:
-        // calibration.toml [methodology_aliases] maps
-        // `experimental_observation = "instrumental"`. `statistical_analysis`
-        // stays here to agree with the sibling mapping
-        // `ingestion::methodology_from_planned`.
-        "statistical_analysis"
-        | "statistical"
-        | "statistical_inference"
-        | "instrumental"
-        | "instrumental_measurement"
-        | "computational"
-        | "computational_simulation"
-        | "observational"
-        | "observation"
-        | "direct_observation"
-        | "experimental_observation"
-        | "negative_result" => Ok(Methodology::Instrumental),
-
-        "visual_inspection" => Ok(Methodology::VisualInspection),
-
-        // Reading an assertion out of a document, rather than deriving or
-        // measuring it.
-        "extraction"
-        | "llm_extraction"
-        | "literature_synthesis"
-        | "legal_document_review"
-        | "textbook_assertion" => Ok(Methodology::Extraction),
-
-        "formal_proof" | "proof" | "mathematical_proof" => Ok(Methodology::FormalProof),
-
-        "expert_elicitation" | "expert" | "testimonial" | "heuristic" => Ok(Methodology::Heuristic),
-
-        other => Err(format!("unknown methodology: {other}")),
-    }
+    let token = normalize_methodology(s);
+    lookup_methodology(&token)
+        .map(|&(_, bucket, _)| bucket)
+        .ok_or_else(|| format!("unknown methodology: {token}"))
 }
+
+/// The `reasoning_traces.reasoning_type` a submitted methodology string is
+/// stored as, or `None` if [`parse_methodology`] would reject the string.
+///
+/// Read from the same [`METHODOLOGY_VOCABULARY`] row as the trust bucket, so
+/// every accepted string has an explicit value by construction. This is
+/// finer than `ReasoningTraceRepository::reasoning_type_for(bucket)`: the
+/// observation family shares the `Instrumental` bucket with the statistical
+/// family but is stored as `observational` (backlog e207bb6d).
+fn reasoning_type_for_submitted(s: &str) -> Option<&'static str> {
+    lookup_methodology(&normalize_methodology(s)).map(|&(_, _, reasoning_type)| reasoning_type)
+}
+
+/// The `reasoning_type` a submission's trace is stored as:
+/// [`reasoning_type_for_submitted`] of the caller's string.
+///
+/// `parse_methodology` has already rejected any string outside
+/// [`METHODOLOGY_VOCABULARY`] before a write starts, so the `None` arm is
+/// unreachable by construction. It falls back to the enum-level mapping
+/// rather than failing the write, and warns; the submitted string is still
+/// recorded verbatim on the trace, so nothing is lost.
+fn trace_reasoning_type(submitted: &str, bucket: Methodology) -> &'static str {
+    reasoning_type_for_submitted(submitted).unwrap_or_else(|| {
+        tracing::warn!(
+            submitted,
+            ?bucket,
+            "methodology accepted by parse_methodology has no vocabulary row; \
+             storing the enum-level reasoning_type"
+        );
+        ReasoningTraceRepository::reasoning_type_for(bucket)
+    })
+}
+
+/// Hyphens normalize to underscores and case folds, so calibration's
+/// `"meta-analysis"` alias and `"Direct-Observation"` resolve. The one
+/// normalizer both lookups share.
+fn normalize_methodology(s: &str) -> String {
+    s.to_lowercase().replace('-', "_")
+}
+
+fn lookup_methodology(token: &str) -> Option<&'static (&'static str, Methodology, &'static str)> {
+    METHODOLOGY_VOCABULARY.iter().find(|(t, _, _)| *t == token)
+}
+
+/// The accepted methodology vocabulary: `(normalized token, trust bucket,
+/// reasoning_type)`. One row per token, so every string the MCP surface
+/// accepts has both a [`Methodology`] and an explicit stored
+/// `reasoning_type`. The third column must be in
+/// `ReasoningTraceRepository::REASONING_TYPES` (the `reasoning_type_valid`
+/// CHECK); `tests::every_accepted_methodology_has_an_explicit_reasoning_type_in_the_check_set`
+/// enforces that.
+///
+/// The `reasoning_type` column equals `ReasoningTraceRepository::reasoning_type_for(bucket)`
+/// on every row except the observation family, which is stored as
+/// `observational` instead of `statistical`. Instrumental, negative_result,
+/// visual_inspection and the extraction family stay `statistical` (the CHECK
+/// has no closer value); the trace keeps the submitted string verbatim at
+/// `properties.submitted_methodology` either way.
+#[rustfmt::skip]
+const METHODOLOGY_VOCABULARY: &[(&str, Methodology, &str)] = &[
+    ("bayesian_inference", Methodology::BayesianInference, "statistical"),
+    ("bayesian", Methodology::BayesianInference, "statistical"),
+
+    ("deductive_logic", Methodology::Deductive, "deductive"),
+    ("deductive", Methodology::Deductive, "deductive"),
+    ("deductive_reasoning", Methodology::Deductive, "deductive"),
+    ("theoretical_derivation", Methodology::Deductive, "deductive"),
+
+    // meta-analysis is a statistical synthesis over a population of prior
+    // studies — an inductive generalization, not a formal proof. It used to
+    // map to FormalProof, handing the single highest trust modifier in the
+    // system (1.2, above Deductive's 1.1) to an empirical synthesis that
+    // calibration.toml itself ranks BELOW deductive_logic (0.80 vs 0.85).
+    ("inductive_generalization", Methodology::Inductive, "inductive"),
+    ("inductive", Methodology::Inductive, "inductive"),
+    ("meta_analysis", Methodology::Inductive, "inductive"),
+    ("meta", Methodology::Inductive, "inductive"),
+
+    ("abductive", Methodology::Abductive, "abductive"),
+
+    // Direct observation lands on Instrumental by the repo's own authority:
+    // calibration.toml [methodology_aliases] maps
+    // `experimental_observation = "instrumental"`. `statistical_analysis`
+    // stays here to agree with the sibling mapping
+    // `ingestion::methodology_from_planned`. The bucket is shared; the stored
+    // reasoning_type is not — an observation is not a statistical inference.
+    ("statistical_analysis", Methodology::Instrumental, "statistical"),
+    ("statistical", Methodology::Instrumental, "statistical"),
+    ("statistical_inference", Methodology::Instrumental, "statistical"),
+    ("instrumental", Methodology::Instrumental, "statistical"),
+    ("instrumental_measurement", Methodology::Instrumental, "statistical"),
+    ("computational", Methodology::Instrumental, "statistical"),
+    ("computational_simulation", Methodology::Instrumental, "statistical"),
+    ("observational", Methodology::Instrumental, "observational"),
+    ("observation", Methodology::Instrumental, "observational"),
+    ("direct_observation", Methodology::Instrumental, "observational"),
+    ("experimental_observation", Methodology::Instrumental, "observational"),
+    ("negative_result", Methodology::Instrumental, "statistical"),
+
+    ("visual_inspection", Methodology::VisualInspection, "statistical"),
+
+    // Reading an assertion out of a document, rather than deriving or
+    // measuring it.
+    ("extraction", Methodology::Extraction, "statistical"),
+    ("llm_extraction", Methodology::Extraction, "statistical"),
+    ("literature_synthesis", Methodology::Extraction, "statistical"),
+    ("legal_document_review", Methodology::Extraction, "statistical"),
+    ("textbook_assertion", Methodology::Extraction, "statistical"),
+
+    ("formal_proof", Methodology::FormalProof, "deductive"),
+    ("proof", Methodology::FormalProof, "deductive"),
+    ("mathematical_proof", Methodology::FormalProof, "deductive"),
+
+    ("expert_elicitation", Methodology::Heuristic, "abductive"),
+    ("expert", Methodology::Heuristic, "abductive"),
+    ("testimonial", Methodology::Heuristic, "abductive"),
+    ("heuristic", Methodology::Heuristic, "abductive"),
+];
 
 /// Load the evidence-type weight from CalibrationConfig.
 ///
@@ -130,8 +200,27 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The largest claim content, in bytes, the claim-writing tools accept. The
+/// same cap as the HTTP twins (`epigraph-api` `routes/submit.rs` and
+/// `routes/batch.rs`, `MAX_CLAIM_CONTENT_LENGTH`), so the two transports agree
+/// on what a claim may be. Document ingest (`ingest_document*`) has its own,
+/// larger cap and does not go through this check.
+pub const MAX_CLAIM_CONTENT_LENGTH: usize = 65_536;
+
+/// Refuse claim `content` longer than [`MAX_CLAIM_CONTENT_LENGTH`] bytes as the
+/// caller's error. Run it before anything is resolved, embedded or written.
+pub(crate) fn check_claim_content_length(content: &str) -> Result<(), McpError> {
+    if content.len() > MAX_CLAIM_CONTENT_LENGTH {
+        return Err(invalid_params(format!(
+            "content is {} bytes; the maximum is {MAX_CLAIM_CONTENT_LENGTH} bytes",
+            content.len()
+        )));
+    }
+    Ok(())
+}
+
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -178,15 +267,17 @@ pub(crate) async fn submit_claim_response(
 ///   its labels, not an evidence row, not a trace.
 /// * [`DedupBy::ContentHash`] — `write_submission` still runs in full on the
 ///   existing claim: `update_labels_conn` UNIONS the labels in; a new Evidence
-///   row (evidence_data, evidence_type, and source_url serialized into the
-///   evidence type) and a new ReasoningTrace (methodology, reasoning,
+///   row (evidence_data, evidence_type, and source_url in `evidence.source_url`)
+///   and a new ReasoningTrace (methodology, reasoning,
 ///   confidence) are written and linked by DERIVED_FROM / HAS_TRACE edges. The
 ///   trace becomes the claim's canonical trace only if it had none. The DS
 ///   auto-wire is skipped (`was_created` is false), so none of it moves the
 ///   existing belief. `novelty_threshold` is never consulted: the exact-content
-///   pre-check skips the gate. `source_url` is written nowhere for `empirical`
-///   evidence, whose evidence type has no URL slot (`parse_evidence_type`) —
-///   true of a fresh insert as well.
+///   pre-check skips the gate. `source_url` is stored in `evidence.source_url`
+///   for every evidence type, `empirical` included (whose evidence type has no
+///   URL slot of its own, `parse_evidence_type`) — true of a fresh insert as
+///   well. It is also the source identity the combine step uses to fold a
+///   re-observation of the same source cautiously (backlog 4c42c0bf).
 ///
 /// Only supplied inputs are listed; see `types::Deduplicated`. On a
 /// novelty-gate hit `novelty_threshold` is the input that DECIDED the hit, so
@@ -194,7 +285,6 @@ pub(crate) async fn submit_claim_response(
 fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams) -> Deduplicated {
     let mut applied: Vec<&'static str> = Vec::new();
     let mut discarded: Vec<&'static str> = Vec::new();
-    let url_has_a_slot = !params.evidence_type.eq_ignore_ascii_case("empirical");
     match by {
         DedupBy::NoveltyGate => {
             discarded.extend(["content", "methodology", "evidence_data", "evidence_type"]);
@@ -217,11 +307,7 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
                 "confidence",
             ]);
             if params.source_url.is_some() {
-                if url_has_a_slot {
-                    applied.push("source_url");
-                } else {
-                    discarded.push("source_url");
-                }
+                applied.push("source_url");
             }
             if params.reasoning.is_some() {
                 applied.push("reasoning");
@@ -296,6 +382,11 @@ async fn prepare_submission(
     mut params: SubmitClaimParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<PreparedSubmission, McpError> {
+    // The size cap FIRST: before the author is resolved, before the novelty
+    // gate embeds the content and before any write. `submit_claim`,
+    // `batch_submit_claims` (per entry) and `resolve_backlog_item` all pass
+    // through here.
+    check_claim_content_length(&params.content)?;
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
     let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
         .map_err(invalid_params)?;
@@ -400,7 +491,7 @@ async fn prepare_submission(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
-                    internal_error(format!(
+                    crate::errors::internal_error_text(format!(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
@@ -573,12 +664,40 @@ async fn write_submission(
     // Persist Trace + Evidence on every submission. In the transaction: a
     // refusal here now rolls the claim back instead of committing it as an
     // orphan.
-    ReasoningTraceRepository::create(&mut *conn, &trace, claim.id)
-        .await
-        .map_err(internal_error)?;
-    EvidenceRepository::create(&mut *conn, &evidence_with_sig)
-        .await
-        .map_err(internal_error)?;
+    //
+    // The trace's reasoning_type comes from the SUBMITTED string, not the
+    // coarser `methodology` bucket, so a direct observation is stored as
+    // `observational` rather than `statistical` (backlog e207bb6d). The string
+    // itself is kept verbatim at `properties.submitted_methodology`. It is the
+    // EFFECTIVE string, defaults included: a `batch_submit_claims` entry that
+    // omitted `methodology` records `BATCH_DEFAULT_METHODOLOGY`, and a
+    // `resolve_backlog_item` call without one records `expert_elicitation`.
+    let reasoning_type = trace_reasoning_type(&params.methodology, *methodology);
+    ReasoningTraceRepository::create_with_reasoning_type(
+        &mut *conn,
+        &trace,
+        claim.id,
+        reasoning_type,
+        Some(&params.methodology),
+    )
+    .await
+    .map_err(internal_error)?;
+    // The caller's URL goes in `evidence.source_url` whatever the evidence
+    // type: `empirical` evidence (an `Observation`) has no URL slot of its own,
+    // so the column is the only place it can live (backlog 43ab8c73). With
+    // the creation BBA's `evidence_id` (below) it is the source identity that
+    // lets a later re-sighting of the same page fold as a repeat, not as
+    // corroboration (backlog 4c42c0bf).
+    EvidenceRepository::create_with_source_url(
+        &mut *conn,
+        &evidence_with_sig,
+        params
+            .source_url
+            .as_deref()
+            .or_else(|| EvidenceRepository::source_url_of(&evidence_with_sig.evidence_type)),
+    )
+    .await
+    .map_err(internal_error)?;
 
     // Verb-edges: every submission references its own Evidence + Trace.
     // Emitted on both branches per the architecture doc's "re-occurrence
@@ -660,6 +779,8 @@ async fn write_submission(
                     weight,
                     supports: true,
                     evidence_type: Some(&params.evidence_type),
+                    // Written above in this transaction, so the FK holds.
+                    evidence_id: Some(evidence_with_sig.id.as_uuid()),
                 },
                 /* persist_truth_from_pignistic */ true,
                 tool_name,
@@ -818,10 +939,24 @@ pub async fn query_claims(
     // gates on (GitHub #395). This used to filter the stale authored
     // `truth_value`, so a refuted claim (BetP 0.18, `truth_value` 0.78) never
     // entered a `max_truth=0.4` assessment queue.
-    let claims =
-        ClaimRepository::list_by_belief_range(&server.pool, viewer, min, max, is_current, limit, 0)
-            .await
-            .map_err(internal_error)?;
+    //
+    // `exclude_spine` drops every claim at properties.level 0-2 (document
+    // spine nodes, and workflow thesis/phase/step nodes too) in the same
+    // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
+    // most of the page (backlog 31e7b727). Off unless the caller asks.
+    let exclude_spine = params.exclude_spine.unwrap_or(false);
+    let claims = ClaimRepository::list_by_belief_range(
+        &server.pool,
+        viewer,
+        min,
+        max,
+        is_current,
+        limit,
+        0,
+        exclude_spine,
+    )
+    .await
+    .map_err(internal_error)?;
 
     // No per-id access map. `list_by_belief_range` is spliced with `viewer`, so
     // a claim this caller may not read is not in `claims`. The map existed to
@@ -939,6 +1074,15 @@ pub async fn get_claim(
         None => None,
     };
 
+    // The URLs of the claim's evidence, always (possibly empty): one
+    // single-id call to the batched, per-evidence-row-filtered read, so a
+    // consumer needs no `get_provenance` to find them (backlog 43ab8c73).
+    let source_urls = EvidenceRepository::source_urls_by_claim_ids(&server.pool, viewer, &[id])
+        .await
+        .map_err(internal_error)?
+        .remove(&id)
+        .unwrap_or_default();
+
     #[derive(serde::Serialize)]
     struct GetClaimResponse {
         #[serde(flatten)]
@@ -946,6 +1090,7 @@ pub async fn get_claim(
         classification: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
+        source_urls: Vec<String>,
     }
 
     success_json(&GetClaimResponse {
@@ -963,6 +1108,7 @@ pub async fn get_claim(
         },
         classification,
         lensed_belief,
+        source_urls,
     })
 }
 
@@ -1058,25 +1204,40 @@ pub async fn verify_claim(
 
     // Authenticity: the stored Ed25519 signature over the stored digest,
     // checked against the SIGNER's public key (resolved by `get_by_id` through
-    // `claims.signer_id -> agents.public_key`). Previously `public_key` was
-    // hardcoded `[0u8; 32]` and `signature` hardcoded `None`, so this check
-    // could never pass for any claim.
+    // `claims.signer_id -> agents.public_key`) and, since agent identity
+    // lineage design D2, against the attested `agent_keys` rows (`signing`,
+    // `identity-legacy`) of the claim's signer and author. In the
+    // separate-signing-key mode the signer's `agents.public_key` is its
+    // IDENTITY key, which signs nothing, so the signature verifies only under
+    // its registered signing key. `key_bound` then asks whether that key is
+    // the AUTHOR's and was valid at `created_at` (`bind_signature`).
     //
     // `signed` keeps "no signature to check" distinguishable from "signature
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
-    let signature_valid = match claim.signature {
-        Some(sig) => {
-            epigraph_crypto::SignatureVerifier::verify(&claim.public_key, &claim.content_hash, &sig)
-                .unwrap_or(false)
-        }
-        None => false,
+    let keys = if signed {
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&server.pool, viewer, id)
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
     };
+    let binding = crate::signing_identity::bind_signature(
+        &claim.content_hash,
+        claim.signature.as_ref(),
+        &claim.public_key,
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        &keys,
+    );
+    let signature_valid = binding.signature_valid;
 
     success_json(&VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
         signed,
+        key_bound: binding.key_bound,
+        key_kind: binding.key_kind,
         hash_check,
         hash_matches: match hash_check {
             HashCheck::Match => Some(true),
@@ -1086,6 +1247,45 @@ pub async fn verify_claim(
         },
         truth_value: claim.truth_value.value(),
     })
+}
+
+/// The steps of `ds_auto::auto_wire_ds_update` (and the helpers it calls)
+/// whose name the caller may read: each is a literal of ds_auto's own,
+/// written as the `"<step>: <cause>"` prefix of its error.
+const DS_UPDATE_STEPS: &[&str] = &[
+    "assign_claim",
+    "binary frame",
+    "build BBA",
+    "combine_multiple",
+    "discount",
+    "ensure_evidence_perspective",
+    "evidence source_url read",
+    "evidence_type_weights",
+    "fallback get_by_name",
+    "get_by_name",
+    "get_for_claim_binary_frames",
+    "intra_evidence_locality_factor",
+    "parse stored BBA",
+    "serialize BBA",
+    "store BBA",
+    "store truth_value seed",
+    "truth_value seed",
+    "update_claim_belief",
+];
+
+/// The caller's message for a failed DS wire in `update_with_evidence`.
+///
+/// `e` is ds_auto's `"<step>: <cause>"`. The cause can be driver text (a
+/// constraint, SQL, a host) and stays in the server log (backlog 49863d2c);
+/// the step is kept only when it is one of [`DS_UPDATE_STEPS`], so an error
+/// of any other shape gets the step-less message (fails closed).
+fn ds_wire_failure_message(e: &str) -> String {
+    const TAIL: &str = "the claim's Dempster-Shafer belief could not be wired. Rolled back; \
+                        nothing from this submission was stored";
+    match e.split_once(": ").map(|(step, _)| step) {
+        Some(step) if DS_UPDATE_STEPS.contains(&step) => format!("{step}: {TAIL}"),
+        _ => TAIL.to_string(),
+    }
 }
 
 pub async fn update_with_evidence(
@@ -1107,7 +1307,9 @@ pub async fn update_with_evidence(
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
-            .map_err(internal_error)?
+            // `InvalidData` (every head of the step's lineage is retired) is
+            // the caller's to fix, not an internal error.
+            .map_err(crate::errors::db_caller_error)?
             .ok_or_else(|| {
                 invalid_params(format!(
                     "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
@@ -1264,12 +1466,25 @@ pub async fn update_with_evidence(
         claim_id,
         &params.labels,
         &[],
+        &[],
     )
     .await?;
 
-    EvidenceRepository::create(&mut *tx, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // As in `write_submission`: the column holds the caller's URL for every
+    // evidence type, including `empirical` (backlog 43ab8c73). It is the
+    // source identity the combine step uses to fold a re-observation of the
+    // SAME source cautiously rather than as independent corroboration
+    // (backlog 4c42c0bf, `epigraph_engine::source_dependence`).
+    EvidenceRepository::create_with_source_url(
+        &mut *tx,
+        &evidence,
+        params
+            .source_url
+            .as_deref()
+            .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+    )
+    .await
+    .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
@@ -1279,10 +1494,11 @@ pub async fn update_with_evidence(
     // Compare pignistic-vs-pignistic. `get_belief_columns` reads the persisted
     // `pignistic_prob` column (distinct from `truth_value`; see claim.rs docs).
     // It is NULL for a claim with no prior DS state — in that case fall back to
-    // `truth_value` (`before`), which is the belief the fresh BBA is combined
-    // against. The monotonicity clamp in `auto_wire_ds_update` bounds BetP below
-    // by the prior column value for supports=true, so the warning is only ever
-    // reachable on the NULL-column (no-prior-DS-state) path.
+    // `truth_value` (`before`), which `auto_wire_ds_update` seeds as a BBA and
+    // the fresh evidence is combined against (backlog fc55465b). Its
+    // monotonicity clamp bounds a supports=true BetP below by that same prior,
+    // up to the combined plausibility, so the warning is reachable only when
+    // the prior sits above what the stored BBAs make plausible.
     let pre_pignistic =
         ClaimRepository::get_belief_columns(&mut *tx, viewer, ClaimId::from_uuid(claim_id))
             .await
@@ -1332,12 +1548,14 @@ pub async fn update_with_evidence(
         params.supports,
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
+        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
     )
     .await
     .map_err(|e| {
-        // Logged as well as returned. `internal_error` only builds the
-        // `McpError`, so without this a dropped wire here would never reach
-        // the server log. #497 added this warn so that one log query
+        // Logged as well as returned. The reply is designed text
+        // (`internal_error_text`, which does not log), so without this a
+        // dropped wire here would never reach the server log, and its cause
+        // reaches only the log. #497 added this warn so that one log query
         // ("ds auto-wire failed") finds every dropped wire, whichever tool
         // dropped it; `submit_claim`'s path emits the same prefix with the same
         // `claim_id`/`tool` fields. The wording differs because the outcome
@@ -1347,7 +1565,7 @@ pub async fn update_with_evidence(
             tool = "update_with_evidence",
             "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
         );
-        internal_error(e)
+        crate::errors::internal_error_text(ds_wire_failure_message(&e))
     })?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
@@ -1620,8 +1838,13 @@ pub(crate) async fn require_owner_or_admin(
         // failed operator lookup (e.g. a database without migration 107) now
         // returns an internal error instead of the ownership denial text — the
         // gate does not decide on an answer it did not get.
-        // `allow_actor = false`: operated agents are stdio-only.
-        if operator_arm_allows(server, caller_agent, target_agent_id, false).await? {
+        // `allow_actor = false`: operated agents are stdio-only, except
+        // through a delegated run token whose delegation is live NOW, which
+        // gets the stdio actor arm (re-checked here, on the deny path only).
+        let allow_actor = crate::tools::viewer::live_delegation(server, Some(auth), caller_agent)
+            .await?
+            .is_some();
+        if operator_arm_allows(server, caller_agent, target_agent_id, allow_actor).await? {
             return Ok(OwnershipGrant::Operator);
         }
         return Err(McpError {
@@ -1716,7 +1939,8 @@ pub(crate) enum OwnershipGrant {
 /// asked for.
 ///
 /// `allow_actor` is `false` on the HTTP transport: there only `caller ==
-/// author_op(target)` (the operator itself) is admitted, never the actor arm.
+/// author_op(target)` (the operator itself) is admitted, never the actor arm,
+/// except for a delegated run token whose delegation is live.
 pub(crate) async fn operator_arm_allows(
     server: &EpiGraphMcpFull,
     caller: uuid::Uuid,
@@ -1894,7 +2118,7 @@ pub async fn resolve_backlog_item(
         // rather than trusted, because following it would retire the item
         // against a claim this call did not write.
         PreparedSubmission::Existing(_) => {
-            return Err(internal_error(
+            return Err(crate::errors::internal_error_text(
                 "resolve_backlog_item: the novelty gate returned an existing claim for a \
                  resolution at threshold 0.0; refusing to retire the item against a claim this \
                  call did not write. Nothing was written.",
@@ -1993,10 +2217,13 @@ pub async fn resolve_backlog_item(
         )
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "resolve_backlog_item: could not record basis {basis_uuid}: {e}. Nothing was \
-                 written: the resolution claim was rolled back with it."
-            ))
+            crate::errors::internal_error_logged(
+                format!(
+                    "resolve_backlog_item: could not record basis {basis_uuid}. Nothing was \
+                     written: the resolution claim was rolled back with it."
+                ),
+                e,
+            )
         })?;
         basis_edge_ids.push(row.id.to_string());
     }
@@ -2036,11 +2263,14 @@ pub async fn resolve_backlog_item(
             )
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing \
-                     was written: the resolution claim and its basis edges were rolled back \
-                     with it."
-                ))
+                crate::errors::internal_error_logged(
+                    format!(
+                        "resolve_backlog_item: could not label {original_id} resolved. Nothing \
+                         was written: the resolution claim and its basis edges were rolled back \
+                         with it."
+                    ),
+                    e,
+                )
             })?
         };
 
@@ -2143,11 +2373,15 @@ async fn gate_retirement_label(
     claim_id: Uuid,
     add: &[String],
     remove: &[String],
+    extra_retirement_labels: &[String],
 ) -> Result<Option<OwnershipGrant>, McpError> {
+    // `extra_retirement_labels`: further labels the CALLER declares carry
+    // retirement semantics for this write (a label-dedup profile's closed
+    // label). Empty for every single-claim tool, so their gate is unchanged.
     let touches_retirement = add
         .iter()
         .chain(remove.iter())
-        .any(|l| l == RETIREMENT_LABEL);
+        .any(|l| l == RETIREMENT_LABEL || extra_retirement_labels.contains(l));
     if !touches_retirement {
         return Ok(None);
     }
@@ -2209,11 +2443,6 @@ pub async fn update_labels(
         return Err(invalid_params("must specify at least one of add/remove"));
     }
     let id = parse_uuid(&params.claim_id)?;
-    // `db_caller_error`, not `internal_error`: a label refused by
-    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
-    // repo layer refuses it inside the same statement that would have written
-    // it, so nothing is persisted — only the reported code was wrong here.
-    //
     // Author-stamped, because this is an `UPDATE claims` and `claims_tenancy`'s
     // WITH CHECK refuses it on an unstamped session. The stamp is the CALLER's
     // (batch H-b, D1): an author, or an operator over its agents' claims, writes
@@ -2224,6 +2453,63 @@ pub async fn update_labels(
     let caller = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, caller, "update_labels").await?;
+    let out = relabel_claim(
+        server,
+        &mut tx,
+        viewer,
+        auth,
+        caller,
+        id,
+        &params.add,
+        &params.remove,
+        &[],
+    )
+    .await?;
+    tx.commit().await.map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "claim_id": id,
+        "labels": out.labels,
+        "admin_path": out.admin_path,
+    }))
+}
+
+/// What one label write through [`relabel_claim`] left on the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelabelOutcome {
+    /// The claim's labels after the write, as the statement returned them.
+    pub labels: Vec<String>,
+    /// Whether the write went through the audited admin path.
+    pub admin_path: bool,
+}
+
+/// The per-claim body of [`update_labels`]: every gate it runs and the write
+/// itself, on a transaction the CALLER opened (stamped from `caller` by
+/// `begin_author_stamped_tx`) and commits.
+///
+/// Shared so a tool that writes several claims in ONE transaction
+/// (`apply_label_dedup`'s write units) takes exactly `update_labels`' path per
+/// claim and adds no ungated label path of its own. `extra_retirement_labels`
+/// widens the retirement-label gate to further labels the caller treats as
+/// retirement (empty for `update_labels`). A refusal returns before
+/// the write; the caller drops `tx`, which rolls back everything the
+/// transaction wrote, earlier claims included.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn relabel_claim(
+    server: &EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: crate::write_identity::WriteIdentity,
+    id: Uuid,
+    add: &[String],
+    remove: &[String],
+    extra_retirement_labels: &[String],
+) -> Result<RelabelOutcome, McpError> {
+    // `db_caller_error`, not `internal_error`: a label refused by
+    // `reject_unexpanded_labels` is the caller's input, not a server fault. The
+    // repo layer refuses it inside the same statement that would have written
+    // it, so nothing is persisted — only the reported code was wrong here.
+    //
     // OWNERSHIP OF THE WHOLE MUTATION on the authenticated transport, exactly as
     // `patch_claim` and the HTTP twin (`PATCH /api/v1/claims/:id/labels`,
     // `require_owner_or_admin`) require. Batch H-b review, measured on config A:
@@ -2246,16 +2532,17 @@ pub async fn update_labels(
     };
     let retirement_grant = gate_retirement_label(
         server,
-        &mut tx,
+        tx,
         viewer,
         auth,
         caller,
         id,
-        &params.add,
-        &params.remove,
+        add,
+        remove,
+        extra_retirement_labels,
     )
     .await?;
-    let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
+    let owner_group = crate::tools::admin_write::owner_group_of(tx, viewer, id).await?;
     let admin_path = crate::tools::admin_write::takes_admin_path(
         grant.or(retirement_grant),
         viewer,
@@ -2263,28 +2550,23 @@ pub async fn update_labels(
     );
     let labels = if admin_path {
         crate::tools::admin_write::admin_patch(
-            &mut tx,
+            tx,
             auth,
             id,
             epigraph_db::AdminClaimAction::UpdateLabels,
-            &params.add,
-            &params.remove,
+            add,
+            remove,
             None,
             None,
         )
         .await?
         .labels
     } else {
-        ClaimRepository::update_labels_conn(&mut tx, id, &params.add, &params.remove)
+        ClaimRepository::update_labels_conn(tx, id, add, remove)
             .await
             .map_err(db_caller_error)?
     };
-    tx.commit().await.map_err(internal_error)?;
-    success_json(&serde_json::json!({
-        "claim_id": id,
-        "labels": labels,
-        "admin_path": admin_path,
-    }))
+    Ok(RelabelOutcome { labels, admin_path })
 }
 
 pub async fn patch_claim(
@@ -2365,6 +2647,7 @@ pub async fn patch_claim(
         id,
         &params.add_labels,
         &params.remove_labels,
+        &[],
     )
     .await?;
     let owner_group = crate::tools::admin_write::owner_group_of(&mut tx, viewer, id).await?;
@@ -2436,11 +2719,16 @@ pub async fn query_undecomposed_claims(
         .await
         .map_err(internal_error)?;
 
-    let results: Vec<ClaimResponse> = claims
+    // `looks_atomic`: the same heuristic `decompose_claims` skips on, so an
+    // agent can tell the terminal-by-policy rows (U073, backlog `5e1debbc`)
+    // from the ones the CLI will actually decompose. Computed per row, not
+    // filtered: dropping rows after the LIMIT would break offset paging.
+    let results: Vec<crate::types::UndecomposedClaimResponse> = claims
         .into_iter()
         .map(|c| {
             let id = c.id.as_uuid();
-            ClaimResponse {
+            let looks_atomic = epigraph_core::atomicity::looks_atomic(&c.content);
+            let claim = ClaimResponse {
                 id: id.to_string(),
                 content: c.content.clone(),
                 truth_value: c.truth_value.value(),
@@ -2455,6 +2743,10 @@ pub async fn query_undecomposed_claims(
                 // `list_undecomposed` projects and post-fixes it.
                 supersedes: c.supersedes.map(|s| s.as_uuid().to_string()),
                 belief_score: None,
+            };
+            crate::types::UndecomposedClaimResponse {
+                claim,
+                looks_atomic,
             }
         })
         .collect();
@@ -2720,5 +3012,263 @@ mod tests {
     fn an_unknown_methodology_is_still_rejected() {
         assert!(parse_methodology("vibes").is_err());
         assert!(parse_methodology("").is_err());
+    }
+
+    use super::{
+        normalize_methodology, reasoning_type_for_submitted, trace_reasoning_type,
+        METHODOLOGY_VOCABULARY,
+    };
+    use epigraph_db::ReasoningTraceRepository;
+
+    /// Every accepted string has an explicit stored reasoning_type, and it is
+    /// one `reasoning_type_valid` admits — so no accepted submission can fail
+    /// at the CHECK, and none silently falls back.
+    #[test]
+    fn every_accepted_methodology_has_an_explicit_reasoning_type_in_the_check_set() {
+        assert!(METHODOLOGY_VOCABULARY.len() >= 36, "vocabulary shrank");
+        for &(token, _, reasoning_type) in METHODOLOGY_VOCABULARY {
+            assert!(
+                ReasoningTraceRepository::REASONING_TYPES.contains(&reasoning_type),
+                "{token:?} maps to {reasoning_type:?}, which reasoning_type_valid refuses"
+            );
+            assert_eq!(
+                reasoning_type_for_submitted(token),
+                Some(reasoning_type),
+                "{token:?}"
+            );
+        }
+    }
+
+    /// A row whose token is not already normalized, or that repeats an
+    /// earlier token, can never be reached by a lookup.
+    #[test]
+    fn every_vocabulary_row_is_reachable() {
+        let mut seen = std::collections::HashSet::new();
+        for &(token, _, _) in METHODOLOGY_VOCABULARY {
+            assert_eq!(
+                normalize_methodology(token),
+                token,
+                "{token:?} is not in normalized form, so no input can match it"
+            );
+            assert!(seen.insert(token), "{token:?} appears twice");
+        }
+    }
+
+    /// The trust bucket and stored reasoning_type for every accepted token,
+    /// written out independently of the table (the buckets are the arms of
+    /// the pre-table `parse_methodology` match), so a moved or mis-edited row
+    /// fails here. Exactly one family (the observation family) differs from
+    /// the enum-level `ReasoningTraceRepository::reasoning_type_for(bucket)`.
+    #[test]
+    fn reasoning_type_table_rows() {
+        let expected: &[(&[&str], Methodology, &str)] = &[
+            (
+                &["bayesian_inference", "bayesian"],
+                Methodology::BayesianInference,
+                "statistical",
+            ),
+            (
+                &[
+                    "deductive_logic",
+                    "deductive",
+                    "deductive_reasoning",
+                    "theoretical_derivation",
+                ],
+                Methodology::Deductive,
+                "deductive",
+            ),
+            (
+                &[
+                    "inductive_generalization",
+                    "inductive",
+                    "meta_analysis",
+                    "meta",
+                ],
+                Methodology::Inductive,
+                "inductive",
+            ),
+            (&["abductive"], Methodology::Abductive, "abductive"),
+            (
+                &[
+                    "statistical_analysis",
+                    "statistical",
+                    "statistical_inference",
+                ],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["computational", "computational_simulation"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &[
+                    "direct_observation",
+                    "observation",
+                    "observational",
+                    "experimental_observation",
+                ],
+                Methodology::Instrumental,
+                "observational",
+            ),
+            (
+                &["instrumental", "instrumental_measurement"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["negative_result"],
+                Methodology::Instrumental,
+                "statistical",
+            ),
+            (
+                &["visual_inspection"],
+                Methodology::VisualInspection,
+                "statistical",
+            ),
+            (
+                &[
+                    "extraction",
+                    "llm_extraction",
+                    "literature_synthesis",
+                    "legal_document_review",
+                    "textbook_assertion",
+                ],
+                Methodology::Extraction,
+                "statistical",
+            ),
+            (
+                &["formal_proof", "proof", "mathematical_proof"],
+                Methodology::FormalProof,
+                "deductive",
+            ),
+            (
+                &["expert_elicitation", "expert", "testimonial", "heuristic"],
+                Methodology::Heuristic,
+                "abductive",
+            ),
+        ];
+        let mut covered = 0;
+        for (tokens, bucket, want) in expected {
+            for token in *tokens {
+                assert_eq!(
+                    parse_methodology(token),
+                    Ok(*bucket),
+                    "{token:?} must stay in the {bucket:?} trust bucket"
+                );
+                assert_eq!(
+                    reasoning_type_for_submitted(token),
+                    Some(*want),
+                    "{token:?} must be stored as {want:?}"
+                );
+                covered += 1;
+            }
+        }
+        assert_eq!(
+            covered,
+            METHODOLOGY_VOCABULARY.len(),
+            "a vocabulary row has no expected reasoning_type here"
+        );
+
+        let differs: Vec<&str> = METHODOLOGY_VOCABULARY
+            .iter()
+            .filter(|(_, bucket, rt)| ReasoningTraceRepository::reasoning_type_for(*bucket) != *rt)
+            .map(|(t, _, _)| *t)
+            .collect();
+        assert_eq!(
+            differs,
+            [
+                "observational",
+                "observation",
+                "direct_observation",
+                "experimental_observation"
+            ],
+            "only the observation family may differ from the enum-level mapping"
+        );
+    }
+
+    #[test]
+    fn the_calibrated_methodology_vocabulary_has_a_reasoning_type() {
+        let cal =
+            CalibrationConfig::from_workspace_root().expect("load workspace calibration.toml");
+        assert!(
+            cal.methodology_aliases
+                .contains_key("experimental_observation"),
+            "calibration.toml did not load (empty fallback) — vacuous otherwise"
+        );
+        for key in cal
+            .methodology_profiles
+            .keys()
+            .filter(|k| k.as_str() != "default")
+            .chain(cal.methodology_aliases.keys())
+        {
+            assert!(
+                reasoning_type_for_submitted(key).is_some(),
+                "calibration.toml knows {key:?} but it has no stored reasoning_type"
+            );
+        }
+    }
+
+    #[test]
+    fn the_trace_reasoning_type_reads_the_submitted_string_and_falls_back_to_the_bucket() {
+        // The submitted string decides, normalized like parse_methodology.
+        assert_eq!(
+            trace_reasoning_type("Direct-Observation", Methodology::Instrumental),
+            "observational"
+        );
+        assert_eq!(
+            trace_reasoning_type("statistical_analysis", Methodology::Instrumental),
+            "statistical"
+        );
+        // Unreachable through submit_claim (parse_methodology rejects first),
+        // but if it ever happens the write still stores a CHECK-valid value:
+        // the enum-level mapping of the bucket, not a hardcoded default.
+        assert_eq!(
+            trace_reasoning_type("vibes", Methodology::FormalProof),
+            "deductive"
+        );
+        assert_eq!(
+            trace_reasoning_type("vibes", Methodology::Instrumental),
+            "statistical"
+        );
+    }
+
+    /// A failed DS wire tells the caller WHICH of ds_auto's steps failed and
+    /// nothing of the cause; an error that does not open with one of those
+    /// steps gets the step-less message (backlog 49863d2c).
+    #[test]
+    fn a_ds_wire_failure_message_keeps_the_step_and_withholds_the_cause() {
+        use super::ds_wire_failure_message;
+        let late = ds_wire_failure_message(
+            "update_claim_belief: error returned from database: new row for relation \
+             \"claims\" violates check constraint \"chk_secret_5c1e\"",
+        );
+        assert!(late.starts_with("update_claim_belief: "), "{late}");
+        assert!(late.contains("Rolled back"), "{late}");
+        assert!(
+            !late.contains("chk_secret_5c1e") && !late.contains("violates"),
+            "{late}"
+        );
+        let spaced = ds_wire_failure_message("store truth_value seed: pool timed out");
+        assert!(spaced.starts_with("store truth_value seed: "), "{spaced}");
+        assert!(!spaced.contains("timed out"), "{spaced}");
+
+        // Not a ds_auto step: the step-less message, whatever the prefix's shape.
+        for e in [
+            "error returned from database: relation \"secret_5c1e\" does not exist",
+            "frame \"binary_truth\": could not open a savepoint: db-host-5c1e",
+            "assign_claim_secret_5c1e: x",
+            "ASSIGN_CLAIM: x",
+            "assign_claim",
+            "",
+        ] {
+            let m = ds_wire_failure_message(e);
+            assert!(
+                m.starts_with("the claim's Dempster-Shafer belief could not be wired"),
+                "{e:?} -> {m}"
+            );
+            assert!(!m.contains("5c1e") && !m.contains("ASSIGN"), "{e:?} -> {m}");
+        }
     }
 }

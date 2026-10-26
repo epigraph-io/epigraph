@@ -419,24 +419,14 @@ async fn graph_expansion_depth_1_does_not_reach_two_hop_claim(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// Backlog 4e856a99: the expansion pool must not promote a non-paragraph.
+// Drain U082 (backlog a1d89aab; operator ruling 2026-10-14): expansion emits
+// every level, like the seed surfaces it extends. This REVERSES backlog
+// 4e856a99's level-2 emission filter, whose only rationale was "match both
+// ANN seed surfaces" while those were level-2 only.
 // ---------------------------------------------------------------------------
 
-/// Seed a level=**3** atom with an embedding and a paper attribution edge.
-///
-/// Both halves are load-bearing and neither is incidental:
-///
-/// * **`asserts` from a paper.** `ingest_document` writes one for EVERY
-///   planned claim, atoms included, so this reproduces production. Without it
-///   the atom would be dropped by `recall_with_context`'s paper-attribution
-///   filter instead of by the level predicate under test — and the assertion
-///   would pass over unmodified code, which is the tautology this fixture
-///   exists to avoid.
-/// * **An embedding in the QUERY's own bucket.** Maximally cosine-similar, so
-///   the atom's absence cannot be explained by distance. The flat kNN
-///   (`search_by_embedding_since`) is level=2-only, so a maximally-similar
-///   atom is *still* not an ANN seed — which leaves graph expansion as the one
-///   and only route by which it could reach `results`.
+/// Seed a level=**3** atom with an embedding and a paper attribution edge,
+/// exactly as `ingest_document` writes one for every planned claim.
 async fn seed_atom(
     pool: &PgPool,
     agent_id: Uuid,
@@ -474,21 +464,21 @@ async fn seed_atom(
     id
 }
 
-/// A level-3 atom one `supports` hop from an ANN seed must NOT be promoted
-/// into the top-level hit list, while a level-2 paragraph at the same hop
-/// distance must be.
+/// A level-3 atom one `supports` hop from an ANN seed IS promoted into the
+/// top-level hit list, exactly like a level-2 paragraph at the same hop
+/// distance.
 ///
-/// The paragraph is the calibration: without it, "the atom is absent" is
-/// equally satisfied by an expansion path that surfaces nothing at all, and
-/// the test would stay green with `graph_expansion_depth` broken outright.
+/// The atom is embedded ORTHOGONAL to the query, so it cannot enter the seed
+/// pool on similarity (now that the seed is the whole corpus, an atom in the
+/// query's own bucket would simply be an ANN hit and prove nothing about
+/// expansion). The `None`-depth run is the control: same fixture, no
+/// expansion, and the atom is absent — so its presence with depth 1 can only
+/// come from the expansion path.
 ///
-/// Pre-fix both are promoted — `graph_expand_seeds_since` walks
-/// `EXPANSION_RELATIONSHIPS` with no level predicate, and
-/// `apply_graph_expansion` folds everything it returns straight into
-/// `raw_hits`. The atom then comes back as a top-level hit with an empty
-/// `atoms` list and no `section`, beside paragraphs that have both.
+/// Pre-fix (with backlog 4e856a99's `paragraph_level_ids` filter) the atom is
+/// dropped from the expansion output and the paragraph is not.
 #[sqlx::test(migrations = "../../migrations")]
-async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
+async fn graph_expansion_promotes_a_level_3_atom_like_the_seed_surfaces(pool: PgPool) {
     let viewer = viewerfx::public_viewer(&pool).await;
     let agent = fixture::seed_agent(&pool).await;
     let paper = fixture::seed_paper(&pool, "10.1/atom-promotion", "Atom promotion test").await;
@@ -498,8 +488,7 @@ async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
     // A: the ANN seed, same bucket as the query.
     let a =
         fixture::seed_paragraph(&pool, agent, paper, "paragraph A: ANN seed", &query_pgvec).await;
-    // PARA: a level=2 paragraph 1 hop from A, orthogonal to the query so it
-    // cannot enter the seed pool on similarity. This is the positive control.
+    // PARA: a level=2 paragraph 1 hop from A, orthogonal to the query.
     let para = fixture::seed_paragraph(
         &pool,
         agent,
@@ -508,19 +497,18 @@ async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
         &fixture::cluster_pgvec(3, 1.0),
     )
     .await;
-    // ATOM: a level=3 atom 1 hop from A, embedded in the query's OWN bucket.
+    // ATOM: a level=3 atom 1 hop from A, orthogonal to the query AND to PARA.
     let atom = seed_atom(
         &pool,
         agent,
         paper,
         "atom ATOM: 1-hop expansion target, level 3",
-        &query_pgvec,
+        &fixture::cluster_pgvec(5, 1.0),
     )
     .await;
 
-    // Two decoys, for the same reason `build_two_hop_fixture` needs them: flat
-    // ANN is pure top-K with no similarity cutoff, so at limit=3 they pin the
-    // seed pool to {A, decoy, decoy} and keep PARA out of it.
+    // Two decoys (cosine ~0.05) pin the seed pool at limit=3 to
+    // {A, decoy, decoy}, keeping PARA and ATOM out of it.
     for i in 0..2 {
         fixture::seed_paragraph(
             &pool,
@@ -549,32 +537,45 @@ async fn graph_expansion_does_not_promote_a_level_3_atom(pool: PgPool) {
         .expect("A supports target");
     }
 
-    let params = base_params(Some(1), 3);
-    let result = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &query_pgvec)
-        .await
-        .expect("recall with graph_expansion_depth=1 succeeds");
-    let resp = parse_response(result);
+    let returned_at = |depth: Option<u32>| {
+        let (server, viewer, query_pgvec) = (&server, &viewer, &query_pgvec);
+        async move {
+            let result = recall_with_context_with_pgvec(
+                server,
+                viewer,
+                base_params(depth, 3),
+                1536,
+                query_pgvec,
+            )
+            .await
+            .expect("recall_with_context succeeds");
+            parse_response(result)
+                .results
+                .iter()
+                .map(|r| r.paragraph_id)
+                .collect::<std::collections::HashSet<Uuid>>()
+        }
+    };
 
-    let returned: std::collections::HashSet<Uuid> =
-        resp.results.iter().map(|r| r.paragraph_id).collect();
+    let control = returned_at(None).await;
+    assert!(
+        !control.contains(&atom) && !control.contains(&para),
+        "control: without expansion neither orthogonal target is a hit; got {control:?}"
+    );
 
+    let returned = returned_at(Some(1)).await;
     assert!(
         returned.contains(&a),
         "ANN seed A must be present; got {returned:?}"
     );
     assert!(
         returned.contains(&para),
-        "the level=2 paragraph one hop from A must be promoted by expansion — \
-         without it this test's negative assertion would be satisfied by an \
-         expansion path that surfaces nothing at all; got {returned:?}"
+        "the level=2 paragraph one hop from A must be promoted by expansion; got {returned:?}"
     );
     assert!(
-        !returned.contains(&atom),
-        "a level=3 atom was promoted into the top-level hit list by graph \
-         expansion (backlog 4e856a99). Both ANN seed surfaces are level=2-only, \
-         and this atom carries a paper `asserts` edge exactly as ingest_document \
-         writes one, so the paper-attribution filter does not catch it. It comes \
-         back with empty atoms and no section beside paragraphs that have both. \
+        returned.contains(&atom),
+        "the level=3 atom one hop from A must be promoted by expansion too: both seed \
+         surfaces draw from the whole corpus, so expansion emits every level (drain U082). \
          Got {returned:?}"
     );
 }

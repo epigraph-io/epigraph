@@ -371,6 +371,13 @@ pub async fn open_elevated_access_gate(pool: &PgPool) {
     .expect("open the elevated-access gate (test stand-in for the recorder)");
 }
 
+/// How far a fixture back-dates a role grant whose grantee (or grantor) a
+/// later statement relies on: far above any backward wall-clock step a build
+/// host has been measured to make (2 s), well inside the one minute CUS02
+/// admits (`epigraph_role_assignments_guard_insert`, "never back-dated").
+/// A Postgres interval literal, bound as `$n::interval`.
+pub const FIXTURE_GRANT_BACKDATE: &str = "30 seconds";
+
 /// Make `agent` a live PLATFORM CUSTODIAN (migration 123): a registered human
 /// ([`make_human_operator`], unless it already is one) holding an open
 /// `role:platform-custodian` assignment. Returns the assignment id (the live
@@ -382,6 +389,15 @@ pub async fn open_elevated_access_gate(pool: &PgPool) {
 /// through `epigraph_grant_role`, so the table's own guards apply: the grant
 /// names the first OTHER live custodian as its grantor (the grantor rule), or
 /// none at bootstrap.
+///
+/// The grant is BACK-DATED [`FIXTURE_GRANT_BACKDATE`] on the database clock
+/// (CUS02 admits up to a minute), never stamped with the definer's `now()`
+/// default: liveness compares the stored `valid_from` with a LATER
+/// transaction's clock with no tolerance (`epigraph_live_role_assignment`,
+/// `ra.valid_from <= p_at`), so on a host whose wall clock steps backward a
+/// grantee used milliseconds after a `now()` grant is "not yet live" (ELV02,
+/// `no_live_assignment`, CUS03). `elevation_sessions.rs`
+/// `make_custodian_survives_a_backward_clock_step` pins this.
 pub async fn make_custodian(pool: &PgPool, agent: Uuid) -> Uuid {
     let human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_operator($1)")
         .bind(agent)
@@ -435,38 +451,52 @@ pub async fn make_custodian(pool: &PgPool, agent: Uuid) -> Uuid {
     .await
     .expect("grantor");
     // Since 130 a grantor that holds a live passkey grants only on a
-    // confirmed `role.grant` act (ELV10 otherwise): stand one in.
+    // confirmed `role.grant` act (ELV10 otherwise): stand one in. The 130
+    // guard recomputes the act's args from the row, so the act states the
+    // back-dated `valid_from` exactly: read ONCE, in the canonical text the
+    // guard digests (microsecond precision, so the cast back is exact).
     let act = match grantor {
-        Some(g) if at_130(pool).await && has_live_passkey(pool, g).await => Some(
-            confirmed_act(
+        Some(g) if at_130(pool).await && has_live_passkey(pool, g).await => {
+            let from: String = sqlx::query_scalar(
+                "SELECT public.epigraph_canonical_timestamp(now() - $1::interval)",
+            )
+            .bind(FIXTURE_GRANT_BACKDATE)
+            .fetch_one(pool)
+            .await
+            .expect("the back-dated valid_from");
+            let act = confirmed_act(
                 pool,
                 "role.grant",
                 &format!(
                     "{{\"role\": \"role:platform-custodian\", \"holder\": \"{agent}\", \
-                     \"valid_from\": null, \"valid_to\": null, \"reason\": \"test fixture\"}}"
+                     \"valid_from\": \"{from}\", \"valid_to\": null, \
+                     \"reason\": \"test fixture\"}}"
                 ),
                 g,
             )
-            .await,
-        ),
+            .await;
+            Some((act, from))
+        }
         _ => None,
     };
     // The six-parameter (123) form when no act is needed, so a database cut
-    // before 130 still takes the fixture.
+    // before 130 (no `epigraph_canonical_timestamp`) still takes the fixture.
     match act {
         None => sqlx::query_scalar(
-            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
-                                              'test fixture')",
-        )
-        .bind(agent)
-        .bind(grantor),
-        Some(act) => sqlx::query_scalar(
-            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, NULL, NULL, $2, \
-                                              'test fixture', $3)",
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, \
+                                              now() - $3::interval, NULL, $2, 'test fixture')",
         )
         .bind(agent)
         .bind(grantor)
-        .bind(act),
+        .bind(FIXTURE_GRANT_BACKDATE),
+        Some((act, from)) => sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:platform-custodian', $1, \
+                                              $4::timestamptz, NULL, $2, 'test fixture', $3)",
+        )
+        .bind(agent)
+        .bind(grantor)
+        .bind(act)
+        .bind(from),
     }
     .fetch_one(pool)
     .await
@@ -684,9 +714,10 @@ pub async fn set_claim_embedding(pool: &PgPool, claim: Uuid, vec: &str) {
 /// and so cannot be omitted) matches nothing; the pointer has to go the other
 /// way too.
 ///
-/// `reasoning_type` must be one of the five values
+/// `reasoning_type` must be one of the six values
 /// `reasoning_type_valid` admits: deductive, inductive, abductive, analogical,
-/// statistical.
+/// statistical, observational (migration 121). The list is
+/// `ReasoningTraceRepository::REASONING_TYPES`.
 ///
 /// # No tenancy columns are declared, deliberately
 ///

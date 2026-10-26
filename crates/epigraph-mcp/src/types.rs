@@ -177,12 +177,21 @@ pub struct QueryClaimsParams {
                        merge the results."
     )]
     pub is_current: Option<bool>,
+
+    #[schemars(
+        description = "When true, drop EVERY claim whose properties.level is 0, 1 or 2, in SQL \
+                       before LIMIT: document thesis/section/paragraph nodes (headings, keyword \
+                       lists, captions, transcript turns) AND workflow thesis/phase/step nodes \
+                       (including evolve_step rows). Atoms (level 3) and unleveled claims are \
+                       kept. Default false (no level filter)."
+    )]
+    pub exclude_spine: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryUndecomposedClaimsParams {
     #[schemars(
-        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first) so scheduled runs make monotonic progress."
+        description = "Maximum number of undecomposed claims to return (default 50, max 1000). Claims are ordered created_at ASC (oldest first), so paging with offset is stable. Atomic rows (looks_atomic=true) never leave this list, so the row count is not a progress measure."
     )]
     pub limit: Option<i64>,
 
@@ -191,6 +200,14 @@ pub struct QueryUndecomposedClaimsParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetWorkflowPlanParams {
+    #[schemars(
+        description = "The hierarchical workflow's id: the `workflows`-table id that ingest_workflow returns (deterministic from canonical_name and generation)."
+    )]
+    pub workflow_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -602,10 +619,13 @@ pub struct RecallParams {
 
     #[schemars(
         description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
-                       object grouping the same hits into `confirmed` (truth_value >= 0.75 and \
+                       object grouping the same hits into `confirmed` (belief_score at or above the \
+                       served belief profile's gates.confirmed_score, default 0.75, and \
                        not contested), `open_question` (is_contested — any live \
-                       contradicts/refutes), and `uncertain` (everything else). Contest is \
-                       checked FIRST, so a high-truth claim carrying a live refutation is \
+                       contradicts/refutes), and `uncertain` (everything else). The score is \
+                       each hit's `belief_score`, the same value `min_truth` gates on, not its \
+                       authored `truth_value`. Contest is \
+                       checked FIRST, so a high-scoring claim carrying a live refutation is \
                        reported as an open question rather than as confirmed. Ranking is \
                        UNCHANGED: each bucket keeps the RRF order the flat list would have had, \
                        and the union of the three buckets is exactly the flat list — this \
@@ -715,10 +735,22 @@ pub struct QueryClaimsByLabelParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "Skip the first N matching claims (default 0). Combine with `limit` to page through large result sets — results are ordered by `created_at DESC`."
+        description = "Skip the first N matching claims (default 0). Kept for compatibility; prefer `after`, whose page boundaries do not drift under concurrent writes. Results are ordered by `(created_at DESC, id DESC)`."
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opaque keyset cursor. When present, the response is an object {claims: [...], next_cursor: string|null} instead of a bare array: pass \"\" for the first page, then each response's next_cursor unchanged; next_cursor is null once the set is exhausted. Omit it for the legacy bare-array response. Cannot be combined with a non-zero `offset`."
+    )]
+    #[serde(default)]
+    pub after: Option<String>,
+
+    #[schemars(
+        description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
+    )]
+    #[serde(default)]
+    pub include_source_urls: bool,
 }
 
 // ── Workflows ──
@@ -749,7 +781,9 @@ pub struct StoreWorkflowParams {
     )]
     pub confidence: Option<f64>,
 
-    #[schemars(description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows'])")]
+    #[schemars(
+        description = "Tags for categorization (e.g. ['deployment', 'rust', 'windows']). Stored on the workflows row as metadata.tags (trimmed, empties dropped, de-duplicated) on the FIRST store only: a re-store of the same goal is a no-op that keeps the original tags. Not added as claim labels."
+    )]
     #[serde(default, deserialize_with = "deserialize_opt_string_array")]
     pub tags: Option<Vec<String>>,
 }
@@ -793,7 +827,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order; steps added later with add_step come after all planned steps."
+        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
     )]
     pub step_index: usize,
 
@@ -817,7 +851,9 @@ pub struct ReportWorkflowOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(description = "Step-by-step execution log: planned vs actual")]
@@ -834,7 +870,7 @@ pub struct ReportWorkflowOutcomeParams {
     pub quality: Option<f64>,
 
     #[schemars(
-        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching, but only for a legacy flat workflow claim: a workflows-table id stores no goal embedding."
+        description = "Your specific goal for this run. If omitted it falls back to the workflow's goal for a legacy flat workflow claim, and to the literal 'hierarchical' for a workflows-table id. More specific goal text improves future affinity matching on both paths; for a workflows-table id an omitted goal is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -871,6 +907,18 @@ pub struct IngestWorkflowParams {
     )]
     #[serde(deserialize_with = "deserialize_workflow_extraction")]
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
+
+    #[schemars(
+        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public."
+    )]
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+
+    #[schemars(
+        description = "Whether to embed the created claims and the workflow goal (default true). false sends no text to the embedding provider and stores no vector, so the claims stay out of semantic recall and semantic dedup."
+    )]
+    #[serde(default)]
+    pub embed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -898,12 +946,12 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and order results by (canonical_name ASC, generation DESC) so the newest variant per lineage is first. Defaults to false (frozen step references, newest-created-at first)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
 
     #[schemars(
-        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows."
+        description = "Minimum truth value to surface; defaults to 0.3 so deprecated rows (truth=0.05 via deprecate_workflow) are hidden. Pass 0.0 to include deprecated workflows. Exception: with resolve_to_latest=true the lineage head of each matched canonical_name is always returned, flagged `lineage_head_deprecated` when its truth is below min_truth."
     )]
     pub min_truth: Option<f64>,
 }
@@ -911,7 +959,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's original plan order (matches `executes`-edge ordering at level=2); steps added later with add_step come after all planned steps. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -935,7 +983,9 @@ pub struct ReportHierarchicalOutcomeParams {
     )]
     pub workflow_id: String,
 
-    #[schemars(description = "true if the workflow succeeded, false if it failed.")]
+    #[schemars(
+        description = "true only if the workflow's goal or expected outcome was achieved: every gate and check passed. A run that ran every step but a gate or check failed is success=false; record what the steps did in the execution log instead."
+    )]
     pub success: bool,
 
     #[schemars(
@@ -960,7 +1010,7 @@ pub struct ReportHierarchicalOutcomeParams {
     pub run_label: Option<String>,
 
     #[schemars(
-        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). This path stores no goal embedding, so it does not feed affinity matching."
+        description = "Your specific goal for this run, stored on each behavioral_executions row (default 'hierarchical'). A non-blank goal is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow; the 'hierarchical' default is not embedded."
     )]
     pub goal_text: Option<String>,
 }
@@ -1081,7 +1131,7 @@ pub struct SubmitDsEvidenceParams {
                        label: Dempster (default), Conjunctive, YagerOpen, YagerClosed, DuboisPrade, \
                        Inagaki. It is validated (an unknown name is refused), stored on the BBA and \
                        echoed as method_used, but the claim's belief is always recomputed by the \
-                       shared adaptive combine that recompute_beliefs uses, whatever this says. Any \
+                       shared Dempster fold that recompute_beliefs uses, whatever this says. Any \
                        value other than Dempster adds an entry to the response's warnings."
     )]
     pub combination_method: Option<String>,
@@ -1223,6 +1273,38 @@ pub struct ClaimResponse {
     pub belief_score: Option<f64>,
 }
 
+/// A [`ClaimResponse`] with the claim's evidence URLs, for tools that surface
+/// them (`query_claims_by_label`'s `include_source_urls`).
+///
+/// A flattened wrapper rather than a `ClaimResponse` field so the other tools'
+/// claim literals are untouched, and so the serialized claim is byte-identical
+/// to a bare `ClaimResponse` when `source_urls` is `None`.
+#[derive(Debug, Serialize)]
+pub struct ClaimWithSources {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// URLs of the evidence attached to the claim, oldest first, deduplicated
+    /// (`EvidenceRepository::source_urls_by_claim_ids`). `None` = not requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_urls: Option<Vec<String>>,
+}
+
+/// A [`ClaimResponse`] row of `query_undecomposed_claims`, with whether the
+/// claim is atomic and so terminal.
+///
+/// A flattened wrapper, like [`ClaimWithSources`], so the other tools' claim
+/// literals are untouched and the claim fields serialize as before.
+#[derive(Debug, Serialize)]
+pub struct UndecomposedClaimResponse {
+    #[serde(flatten)]
+    pub claim: ClaimResponse,
+    /// `epigraph_core::atomicity::looks_atomic(content)`: one sentence and at
+    /// most 160 chars. `decompose_claims` skips these by default, and the
+    /// operator ruled them terminal by policy (backlog `5e1debbc`): not a
+    /// backlog and not a defect.
+    pub looks_atomic: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SubmitClaimResponse {
     pub claim_id: String,
@@ -1347,8 +1429,11 @@ pub enum HashCheck {
 #[derive(Debug, Serialize)]
 pub struct VerifyResponse {
     pub claim_id: String,
-    /// Whether the stored Ed25519 signature verifies against the signer's
-    /// `agents.public_key` over the **stored** `content_hash`.
+    /// Whether the stored Ed25519 signature verifies over the **stored**
+    /// `content_hash`, under the signer's `agents.public_key` or under an
+    /// attested `agent_keys` key (`signing`, `identity-legacy`) of the claim's
+    /// signer or author. See [`Self::key_bound`] for whether that key vouches
+    /// for the author.
     ///
     /// `false` covers two very different states — read it together with
     /// [`Self::signed`]: `signed = false` means the claim carries no signature
@@ -1369,6 +1454,39 @@ pub struct VerifyResponse {
     /// `signed = true, signature_valid = true`. Claims written before that, and
     /// by paths that store no signature, report `signed = false`.
     pub signed: bool,
+    /// Whether the key that verifies the signature is BOUND to the claim's
+    /// AUTHOR (agent identity lineage design D2): an attested `agent_keys` key
+    /// of `claims.agent_id` (`signing`, or migration 161's `identity-legacy`)
+    /// whose window holds the claim's `created_at` (`[valid_from - 60 s,
+    /// valid_until)`, the 60 s absorbing clock skew; active, or rotated /
+    /// expired with a recorded `valid_until`; never revoked or pending).
+    ///
+    /// `false` with `signature_valid = true` is a real signature by a key that
+    /// does not vouch for the author: a key no attested row carries, a key of
+    /// the SIGNER that is not the author's (an HTTP claim authored by its
+    /// caller and signed by the server), a revoked key, or a claim dated
+    /// outside the key's window.
+    ///
+    /// What `true` does NOT prove:
+    /// * that the author asserted THIS claim. The signature covers
+    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
+    ///   evidence distinction (evidence rows are signed the same way). Someone
+    ///   who can write the database directly can copy the author's signature
+    ///   from any claim or evidence row with the same bytes onto a row naming
+    ///   that author, and it reports bound.
+    /// * the date. `created_at` is set by the writer and is not signed, so the
+    ///   window test trusts it: a backdated row passes it.
+    /// * anything, under an `identity-legacy` key: its private half is
+    ///   computable from public inputs, so such a signature, bound or not, is
+    ///   never evidence of authorship.
+    pub key_bound: bool,
+    /// Which kind of key verified the signature: `"signing"` (a registered
+    /// random signing key), `"identity-legacy"` (an agent's pre-existing
+    /// identity key; under the unkeyed scheme its private half is computable
+    /// from public inputs, so such a signature is forgeable), or
+    /// `"unattested"` (only the signer's `agents.public_key` verifies it, and
+    /// no attested row carries that key). `null` when no key verifies.
+    pub key_kind: Option<&'static str>,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
     pub hash_check: HashCheck,
@@ -1460,9 +1578,10 @@ pub struct UpdateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pignistic_prob: Option<f64>,
     /// Populated when supporting evidence *lowered* the pignistic probability
-    /// (weak/high-ignorance-mass BBA on a claim with no prior DS state; this is
-    /// mathematically correct Dempster-Shafer combination, and the warning
-    /// exists so callers don't mistake it for a bug), and when
+    /// (the claim's prior sits above the plausibility its stored BBAs allow, so
+    /// the monotonicity clamp yields to that bound; this is mathematically
+    /// correct Dempster-Shafer combination, and the warning exists so callers
+    /// don't mistake it for a bug), and when
     /// [`Self::cache_written`] is `false`. Several notes are joined by a space.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -1578,9 +1697,15 @@ pub(crate) fn is_false(v: &bool) -> bool {
 /// Score at or above which a NON-contested result is reported as `confirmed`
 /// by [`EpistemicPartition`] (backlog e7736ff6).
 ///
-/// One constant, shared by `recall` and `recall_with_context`, so "confirmed"
-/// cannot come to mean two different things on the two recall surfaces.
-pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
+/// One parameter, shared by `recall` and `recall_with_context`, so "confirmed"
+/// cannot come to mean two different things on the two recall surfaces. It is
+/// the served belief profile's `gates.confirmed_score` (built-in default 0.75,
+/// overridable in `calibration.toml`'s `[belief_profiles.<name>]`).
+pub(crate) fn confirmed_score() -> f64 {
+    epigraph_engine::belief_profile::BeliefProfile::served()
+        .gates
+        .confirmed_score
+}
 
 /// A post-RRF recall page grouped by the epistemic status of each hit, rather
 /// than returned as one flat ranked list (backlog e7736ff6).
@@ -1594,8 +1719,15 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 ///   independent signals; a corpus can hold a 0.9 claim and a live refutation
 ///   of it at the same time, and that pair is precisely what the caller must
 ///   not be told is settled.
-/// * `confirmed` — not contested AND score `>= `[`CONFIRMED_SCORE`].
+/// * `confirmed` — not contested AND gated score `>= `[`confirmed_score`].
 /// * `uncertain` — everything else.
+///
+/// The score is the GATED score: the value `min_truth` compared against
+/// (`RecallGatedSignals::gated_score`), never the authored `truth_value`.
+/// The two differ whenever evidence has moved a claim's DS cache away from
+/// what its author asserted, and a partition that read the authored value
+/// would call a claim `confirmed` that the gate rates 0.4, or `uncertain` a
+/// claim the gate admitted at 0.9.
 ///
 /// Within each bucket the caller's ranking order is PRESERVED (items are
 /// pushed in the order they were given), so bucketing re-groups the page
@@ -1609,7 +1741,7 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 /// without it, and only the JSON shape differs.
 #[derive(Debug, Clone, Serialize)]
 pub struct EpistemicPartition<T> {
-    /// Uncontested and scoring at or above [`CONFIRMED_SCORE`].
+    /// Uncontested, with a gated score at or above [`confirmed_score`].
     pub confirmed: Vec<T>,
     /// Neither confirmed nor contested — believed, but not settled.
     pub uncertain: Vec<T>,
@@ -1617,30 +1749,50 @@ pub struct EpistemicPartition<T> {
     pub open_question: Vec<T>,
 }
 
+/// The two signals [`EpistemicPartition`] buckets a recall hit by.
+///
+/// A trait rather than a caller-supplied closure: the
+/// closure let each call site choose which number to partition on, and both
+/// sites chose the authored `truth_value` while their `min_truth` gate read
+/// `belief_score`. Implementing this on the hit type puts the choice in ONE
+/// place per type, next to the field the gate writes.
+pub(crate) trait RecallGatedSignals {
+    /// The score `min_truth` was compared against for this hit: the DS
+    /// pignistic probability when the claim carries a DS cache, else the
+    /// authored `truth_value` (a hit with no DS state falls back exactly as
+    /// the gate does).
+    fn gated_score(&self) -> f64;
+    /// Whether the dispute post-pass found a live `contradicts`/`refutes`.
+    fn is_contested(&self) -> bool;
+}
+
+impl RecallGatedSignals for RecallResult {
+    fn gated_score(&self) -> f64 {
+        self.belief_score
+    }
+    fn is_contested(&self) -> bool {
+        self.is_contested
+    }
+}
+
 impl<T> EpistemicPartition<T> {
-    /// Bucket `items` by `(score, is_contested)`, as read out of each item by
-    /// `signals`.
-    ///
-    /// `signals` is a closure rather than a trait bound because the two recall
-    /// surfaces carry the same two numbers under different field names
-    /// (`RecallResult::truth_value` / `RecallHit::truth_value`) on types that
-    /// live in different modules — and because the score this partitions on
-    /// must stay the SAME score `min_truth` gates on, which is a decision the
-    /// call site owns, not this type.
-    pub fn from_ranked<I>(items: I, signals: impl Fn(&T) -> (f64, bool)) -> Self
+    /// Bucket `items` by their gated score and contest flag.
+    pub(crate) fn from_ranked<I>(items: I) -> Self
     where
         I: IntoIterator<Item = T>,
+        T: RecallGatedSignals,
     {
         let mut out = Self {
             confirmed: Vec::new(),
             uncertain: Vec::new(),
             open_question: Vec::new(),
         };
+        let confirmed = confirmed_score();
         for item in items {
-            let (score, is_contested) = signals(&item);
+            let (score, is_contested) = (item.gated_score(), item.is_contested());
             if is_contested {
                 out.open_question.push(item);
-            } else if score >= CONFIRMED_SCORE {
+            } else if score >= confirmed {
                 out.confirmed.push(item);
             } else {
                 out.uncertain.push(item);
@@ -1742,13 +1894,12 @@ pub(crate) fn unordered_pair(a: uuid::Uuid, b: uuid::Uuid) -> (uuid::Uuid, uuid:
 /// the flag off the response is byte-identical to what it was before this
 /// parameter existed — `Some(vec![])` still serializes as `"results": []`,
 /// which an empty-page caller relies on.
-pub(crate) fn split_epistemic<T>(
+pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     items: Vec<T>,
     partition: bool,
-    signals: impl Fn(&T) -> (f64, bool),
 ) -> (Option<Vec<T>>, Option<EpistemicPartition<T>>) {
     if partition {
-        (None, Some(EpistemicPartition::from_ranked(items, signals)))
+        (None, Some(EpistemicPartition::from_ranked(items)))
     } else {
         (Some(items), None)
     }
@@ -1763,9 +1914,15 @@ pub struct AuthorResponse {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentParams {
     #[schemars(
-        description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms)."
+        description = "Absolute or working-directory-relative path to a JSON file containing a hierarchical DocumentExtraction (thesis -> sections -> paragraphs -> atoms). The JSON may carry an optional top-level `labels` array of caller labels (e.g. a stage tag), applied to every claim the ingest writes in addition to the writer's own `doi:<document key>` label; a claim another agent authored that the ingest converges onto gets the doi: label only."
     )]
     pub file_path: String,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Inline counterpart to `IngestDocumentParams`. Where `ingest_document`
@@ -1776,10 +1933,16 @@ pub struct IngestDocumentParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentInlineParams {
     #[schemars(
-        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, and an optional top-level source_text. When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
+        description = "Hierarchical document extraction passed inline (no file): source (title, doi/uri, source_type, authors, journal, year, metadata), thesis, thesis_derivation, sections (each with a title + optional heading_span {start,end} and paragraphs, where each paragraph has text (verbatim source), optional span {start,end}, atoms, generality, confidence, methodology, evidence_type), relationships, an optional top-level source_text, and an optional top-level `labels` array of caller labels (e.g. a stage tag) applied to every claim the ingest writes or resolves to, in addition to the writer's own `doi:<document key>` label (a claim another agent authored that the ingest converges onto gets the doi: label only). When source_text is present the writer re-runs the verbatim guard, re-verifying each paragraph's text against its span; when it is absent — the case for AUTHORED records (an ELN entry, run summary, or anything with no external source to quote) — the guard is skipped and each paragraph's text is trusted as-is, so this is a supported SINGLE-CALL path with no `structure_source` / `ingest_document_spine` prerequisite. Lands the same graph as `ingest_document` — paper node, claims at every level down to atoms, decomposes_to / section_follows / supports edges, evidence, traces, embeddings, and CDST mass functions for atoms. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting an abstract then the full paper is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
+    /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
+    #[schemars(
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+    )]
+    #[serde(default)]
+    pub wait: Option<bool>,
 }
 
 /// Parameters for the `ingest_document_spine` MCP tool. Phase 1 of the
@@ -1789,7 +1952,7 @@ pub struct IngestDocumentInlineParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentSpineParams {
     #[schemars(
-        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms."
+        description = "DocumentExtraction whose `atoms` fields are EMPTY (e.g. the output of `structure_source`). Writes thesis + sections + paragraphs into the graph (structural nodes are scoped to this document, not shared with other papers that share a heading); atom fields are ignored. Returns `new_paragraph_paths` — the subset of paragraph paths that are NEW to this ingest. Atomize only those paragraphs, fill their atoms, then call `ingest_document_inline` with the full extraction. Two-phase ingest: spine first → atomize new paragraphs only → inline with atoms. An optional top-level `labels` array of caller labels (e.g. a stage tag) is applied to every node this call writes, in addition to the writer's own `doi:<document key>` label; a node another agent authored gets the doi: label only."
     )]
     #[serde(deserialize_with = "deserialize_document_extraction")]
     pub extraction: epigraph_ingest::schema::DocumentExtraction,
@@ -1813,9 +1976,14 @@ pub struct IngestDocumentSpineResponse {
     /// `ingest_document_inline` with atoms filled for those paths only.
     pub new_paragraph_paths: Vec<String>,
     /// Spine nodes this ingest resolved to that belong to a group the ingesting
-    /// agent cannot write, so the document's `doi:` label was not added to them.
+    /// agent cannot write, so the document's labels (`doi:` and any caller
+    /// `labels`) were not added to them.
     /// See `IngestDocumentResponse::converged_claims_unlabelled`.
     pub converged_claims_unlabelled: usize,
+    /// Spine nodes this ingest resolved to that ANOTHER agent authored: they got
+    /// the document's `doi:` label but not the caller's `labels`.
+    /// See `IngestDocumentResponse::converged_claims_caller_labels_withheld`.
+    pub converged_claims_caller_labels_withheld: usize,
     /// `true` when every paragraph in the extraction already existed; nothing new was written.
     pub already_ingested: bool,
 }
@@ -2047,7 +2215,7 @@ pub struct LinkEpistemicParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or cites, a structural edge that moves no belief. (supersedes is intentionally NOT accepted — use supersede_claim.)"
+        description = "Epistemic relationship type. One of: supports, corroborates, elaborates, generalizes, specializes, contradicts, refutes; or the structural relations that move no belief: cites, and qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief). Use qualifies, not contradicts, for a caveat that limits where the target holds without saying it is false. (supersedes is intentionally NOT accepted — use supersede_claim.)"
     )]
     pub relationship: String,
 
@@ -2092,6 +2260,14 @@ pub struct LinkEpistemicResponse {
     pub owned_by_caller: bool,
     pub relationship: String,
     pub belief_wired: bool,
+    /// Why `belief_wired` is false (backlog 0a996437); omitted when it is
+    /// true. One of `source_has_no_belief`, `structural_relationship`,
+    /// `vacuous_source_mass`, `already_wired` or `refused_or_failed` (the
+    /// wiring was refused, e.g. a target this caller cannot write, or failed);
+    /// `edge_retracted` and `source_author_unresolved` are defensive values
+    /// seen only under a concurrent retraction or removal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_wired_reason: Option<&'static str>,
     /// The claim `target_belief` describes, and the one the belief wire
     /// recomputed.
     ///
@@ -2127,9 +2303,10 @@ pub struct IngestDocumentResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ds_frame_id: Option<String>,
     /// Claims this ingest RESOLVED TO (content-addressed convergence onto a row
-    /// that already existed) but could not tag with the document's `doi:` label,
-    /// because they belong to a group the ingesting agent cannot write. The paper
-    /// still `asserts` each of them; only the label is missing. Disclosed rather
+    /// that already existed) but could not tag with the document's labels (its
+    /// `doi:` label and any caller `labels`), because they belong to a group the
+    /// ingesting agent cannot write. The paper still `asserts` each of them; only
+    /// the labels are missing. Disclosed rather
     /// than swallowed, so a caller counting a paper's claim set by label can
     /// see the gap.
     ///
@@ -2145,6 +2322,15 @@ pub struct IngestDocumentResponse {
     /// edges against its `doi:` label set itself. Stated because an earlier
     /// summary described this field as the disclosure for every ingest path.
     pub converged_claims_unlabelled: usize,
+    /// Claims this ingest RESOLVED TO that another agent authored, which got the
+    /// document's `doi:` label but NOT the caller's `labels`: caller vocabulary
+    /// (a `resolved`, a `policy:` tag) is never written onto someone else's
+    /// claim by an ingest, even one the ingesting agent's group membership lets
+    /// it write. Disjoint from `converged_claims_unlabelled` (which counts rows
+    /// that got no label at all) and always 0 when the extraction carries no
+    /// `labels`. Reaches callers exactly as `converged_claims_unlabelled` does;
+    /// the detached tools log one WARN per claim (target `tenancy.scoped_write`).
+    pub converged_claims_caller_labels_withheld: usize,
     pub already_ingested: bool,
 }
 
@@ -2246,6 +2432,50 @@ pub struct FindWorkflowResult {
     /// when never evaluated. Advisory — callers may prefer promoted variants.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promotable: Option<bool>,
+    /// Hierarchical results only (absent for flat workflow claims). `steps` is
+    /// the FROZEN plan text: the claims the workflow's `executes` edges named
+    /// at ingest. `Some(true)` when at least one of those steps has since been
+    /// evolved (`evolve_step`), so its lineage head differs from the frozen
+    /// claim; the heads are in [`Self::evolved_steps`]. Absent when the
+    /// lineage lookup failed (best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_evolved_steps: Option<bool>,
+    /// The steps whose lineage head is not the frozen claim, indexed the way
+    /// `evolve_step` / `report_hierarchical_outcome` index steps. Absent when
+    /// nothing evolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evolved_steps: Option<Vec<EvolvedStep>>,
+    /// Hierarchical results only: the highest `generation` that exists for
+    /// this workflow's `canonical_name`. Greater than `generation` when a newer
+    /// generation of the same lineage exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_generation: Option<i64>,
+}
+
+/// One frozen step of a hierarchical [`FindWorkflowResult`] whose lineage head
+/// has moved on: listed when the lineage has more than one head, or its single
+/// head is not the frozen claim. A step whose sole head is the frozen claim is
+/// not listed, even when that claim is retired (it never evolved).
+#[derive(Debug, Serialize)]
+pub struct EvolvedStep {
+    /// The index `evolve_step` / `report_hierarchical_outcome` take. It counts
+    /// the `executes` edges the caller can see, so it is not guaranteed to be
+    /// the position of the same step in [`FindWorkflowResult::steps`]; match on
+    /// `frozen_claim_id` when that matters.
+    pub step_index: usize,
+    pub frozen_claim_id: String,
+    /// The newest head with `is_current=true`, which is the claim name-mode
+    /// `evolve_step` and `update_with_evidence` act on. When no head of the
+    /// lineage is current, the newest head, with [`Self::is_current`] false.
+    pub head_claim_id: String,
+    pub head_content: String,
+    /// `false` when every head of the lineage is retired (`is_current=false`
+    /// with no `supersedes` edge): the step cannot be evolved or take
+    /// evidence by name until it is revived or re-ingested.
+    pub is_current: bool,
+    /// The lineage has more than one head (concurrent `revises`); the head
+    /// shown is the newest, and the caller must reconcile before relying on it.
+    pub pending_resolution: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2370,6 +2600,15 @@ pub struct DsEvidenceResponse {
     pub mass_on_missing: f64,
     pub bba_count: i64,
     pub method_used: String,
+    /// What this call did to the caller's BBA for this (claim, frame,
+    /// perspective_id): `inserted` (none existed), `unchanged` (an identical
+    /// BBA was already stored, so nothing new was combined) or `replaced` (an
+    /// earlier, different BBA was overwritten in place, same id). Backlog
+    /// bcbe34b2.
+    pub write_outcome: String,
+    /// True iff `write_outcome` is `unchanged`: an identical resubmission is
+    /// stored once, not combined again.
+    pub deduplicated: bool,
     /// Human-readable notes about inputs that were ACCEPTED but do not do what
     /// their name suggests (e.g. a non-default `combination_method` or any
     /// `gamma`, neither of which changes the returned belief). Omitted when
@@ -2401,6 +2640,14 @@ pub struct BeliefResponse {
     /// top-level belief/plausibility/etc remain the global (unlensed) values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lensed_belief: Option<LensedBelief>,
+    /// The claim's belief under the atom-level model, beside the served value
+    /// (`EPIGRAPH_COMPOUND_BELIEF=shadow` only; omitted, not null, otherwise,
+    /// so a get_belief in the default mode is byte-identical to today). A
+    /// compound carries `basis: "derived"`: computed from its visible atoms,
+    /// not evidence about the claim. The top-level fields stay the served
+    /// values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<epigraph_engine::belief_view::BeliefView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2463,6 +2710,12 @@ pub struct MarkDuplicateParams {
     pub canonical_id: String,
     #[schemars(description = "Reason for marking duplicate")]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UnmarkDuplicateParams {
+    #[schemars(description = "UUID of the claim to un-mark (a claim mark_duplicate retired)")]
+    pub claim_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2799,14 +3052,27 @@ pub struct ReconcileSheafParams {
 pub struct SheafSectionEntry {
     pub node_id: String,
     pub local_betp: f64,
+    /// BetP of the all-neighbour average restricted interval. Display only:
+    /// `consistency_radius` is not `|local_betp - expected_betp|` once a
+    /// Positive neighbour is present.
     pub expected_betp: f64,
+    /// Max of the Positive-group Bel-floor shortfall (the node's Bel below
+    /// the strongest supporter's restricted Bel; over-support scores 0) and
+    /// `|local_betp - expected|` over the Negative/FrameEvidence group.
     pub consistency_radius: f64,
+    /// Neighbour rows that constrain this node. The source side of a
+    /// directional positive edge (supports, elaborates, specializes,
+    /// generalizes) is not counted, so a pure supporter reports 0.
     pub neighbor_count: usize,
     pub local_belief: f64,
     pub local_plausibility: f64,
     pub open_world_local: f64,
     pub open_world_expected: f64,
+    /// Interval twin of `consistency_radius`: the max of the Bel-floor
+    /// shortfall and the Hausdorff distance to the Negative/FrameEvidence
+    /// group's expected interval.
     pub interval_inconsistency: f64,
+    /// `|width_local - width_expected|` against the all-neighbour average.
     pub ignorance_inconsistency: f64,
 }
 
@@ -2987,15 +3253,23 @@ pub struct UpdatePartitionParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryTriplesParams {
-    #[schemars(description = "Subject entity name (optional — omit to wildcard)")]
+    #[schemars(
+        description = "Subject entity name (optional; omit to match any subject). Requires subject_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub subject: Option<String>,
-    #[schemars(description = "Subject entity type: Material, Molecule, Method, etc. (optional)")]
+    #[schemars(
+        description = "Subject entity type_top: Material, Molecule, Method, etc. Required when subject is given; there is no default."
+    )]
     pub subject_type: Option<String>,
     #[schemars(description = "Predicate pattern — matches via trigram similarity (optional)")]
     pub predicate: Option<String>,
-    #[schemars(description = "Object entity name (optional)")]
+    #[schemars(
+        description = "Object entity name (optional; omit to match any object). Requires object_type. A name that matches no entity returns no triples and is listed in `unresolved`."
+    )]
     pub object: Option<String>,
-    #[schemars(description = "Object entity type (optional)")]
+    #[schemars(
+        description = "Object entity type_top. Required when object is given; there is no default."
+    )]
     pub object_type: Option<String>,
     #[schemars(
         description = "Minimum triple confidence threshold, 0.0–1.0 (default 0.0 — no filtering)"
@@ -3229,4 +3503,153 @@ pub struct RecomputeBeliefsParams {
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+}
+
+// ── Label-family dedup (plan / apply / probe) ──
+
+/// One would-be claim a writer asks `probe_label_dedup` about.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupCandidateParam {
+    #[schemars(description = "Caller-chosen key, echoed back with the verdict")]
+    pub key: String,
+    #[schemars(description = "The content the writer is about to file")]
+    pub content: String,
+    #[schemars(description = "The labels the writer is about to file it with")]
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlanLabelDedupParams {
+    #[schemars(
+        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_path: Option<String>,
+    #[schemars(
+        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v1). Refused on stdio. Exactly one of profile_path / profile_json."
+    )]
+    pub profile_json: Option<String>,
+    #[schemars(
+        description = "Reserved: reading the profile from a stored claim is not available yet; a call that sets it is refused (PROFILE_CLAIM_DEFERRED)."
+    )]
+    pub profile_claim_id: Option<String>,
+    #[schemars(
+        description = "REQUIRED. BLAKE3 (hex) of the exact profile bytes; a profile that hashes differently is refused (PROFILE_HASH_MISMATCH). On stdio it must also equal the pin this server was started with (EPIGRAPH_MCP_PROFILE_PIN) when one is set."
+    )]
+    pub profile_hash: String,
+    #[schemars(description = "Run tag substituted into {run_tag}; must be a valid label")]
+    pub run_tag: String,
+    #[schemars(
+        description = "YYYY-MM-DD. Required by the closeout and lifecycle sections; never defaulted to today"
+    )]
+    pub as_of: Option<String>,
+    #[schemars(
+        description = "Sections to plan: any of hygiene, dedup, closeout, lifecycle, signal_dedup. Default [hygiene, dedup]"
+    )]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(
+        description = "Most claims read per family (default and server cap 5000; a larger value is clamped and the clamp reported). A family larger than this is reported truncated, and apply refuses a truncated plan."
+    )]
+    pub max_claims: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ApplyLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub run_tag: String,
+    #[schemars(description = "As plan_label_dedup")]
+    pub as_of: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    #[serde(default)]
+    pub sections: Vec<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+    #[schemars(
+        description = "REQUIRED. The plan_hash of the plan you reviewed. Apply re-plans from live state with the same arguments and refuses with PLAN_DRIFT, writing nothing, when the hash differs."
+    )]
+    pub plan_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProbeLabelDedupParams {
+    #[schemars(description = "As plan_label_dedup (stdio only)")]
+    pub profile_path: Option<String>,
+    #[schemars(description = "As plan_label_dedup (HTTP only)")]
+    pub profile_json: Option<String>,
+    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    pub profile_claim_id: Option<String>,
+    #[schemars(description = "As plan_label_dedup")]
+    pub profile_hash: String,
+    #[schemars(description = "At most 100 would-be claims to classify")]
+    pub candidates: Vec<LabelDedupCandidateParam>,
+    #[schemars(
+        description = "Also match against closed lifecycle signals (verdict match_only). Default false"
+    )]
+    #[serde(default)]
+    pub include_closed_signals: bool,
+    #[schemars(description = "As plan_label_dedup")]
+    pub max_claims: Option<i64>,
+}
+
+/// One label change an apply committed, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedLabelChangeParam {
+    pub unit: String,
+    pub claim_id: String,
+    #[serde(default)]
+    pub labels_added: Vec<String>,
+    #[serde(default)]
+    pub labels_removed: Vec<String>,
+}
+
+/// One duplicate an apply marked, as `apply_label_dedup` returned it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AppliedMarkParam {
+    pub unit: String,
+    #[schemars(description = "The marked duplicate")]
+    pub dup: String,
+    #[schemars(description = "The claim it was marked a duplicate of")]
+    pub canonical: String,
+    #[schemars(description = "The matching tier, as the apply returned it")]
+    pub rule: String,
+    #[serde(default)]
+    pub matched_on: String,
+    #[schemars(
+        description = "The identity edge the mark wrote; when given, a claim marked again since (a new edge) is not un-marked"
+    )]
+    #[serde(default)]
+    pub identity_edge: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RevertLabelDedupParams {
+    #[schemars(description = "applied_units from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_units: Vec<AppliedLabelChangeParam>,
+    #[schemars(description = "applied_marks from the apply_label_dedup response, verbatim")]
+    #[serde(default)]
+    pub applied_marks: Vec<AppliedMarkParam>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LabelDedupIndexViewParams {
+    #[schemars(description = "Canonical claim ids (at most 100)")]
+    pub claim_ids: Vec<String>,
+    #[schemars(
+        description = "Cap on the duplicates read across all canonicals (default and server cap 5000); a read that hits it is reported truncated"
+    )]
+    pub max_claims: Option<i64>,
+    #[schemars(
+        description = "Leave out a duplicate whose author has another owner than the canonical's, as the plan does (default true); each one left out is listed in foreign_duplicates_ignored. false returns every duplicate"
+    )]
+    pub same_owner_only: Option<bool>,
 }

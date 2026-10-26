@@ -112,15 +112,88 @@ impl ReasoningTraceRepository {
         trace: &ReasoningTrace,
         claim_id: ClaimId,
     ) -> Result<ReasoningTrace, DbError> {
+        Self::create_with_reasoning_type(
+            executor,
+            trace,
+            claim_id,
+            Self::reasoning_type_for(trace.methodology),
+            None,
+        )
+        .await
+    }
+
+    /// The `reasoning_type` vocabulary `reasoning_traces.reasoning_type_valid`
+    /// admits. Mirrors that CHECK as of migration 121, which added
+    /// `observational`. A value outside it would be refused by Postgres;
+    /// [`Self::create_with_reasoning_type`] refuses it first, in Rust.
+    pub const REASONING_TYPES: [&str; 6] = [
+        "deductive",
+        "inductive",
+        "abductive",
+        "analogical",
+        "statistical",
+        "observational",
+    ];
+
+    /// `Ok` iff `reasoning_type` is in [`Self::REASONING_TYPES`].
+    fn check_reasoning_type(reasoning_type: &str) -> Result<(), DbError> {
+        if Self::REASONING_TYPES.contains(&reasoning_type) {
+            Ok(())
+        } else {
+            Err(DbError::InvalidData {
+                reason: format!(
+                    "reasoning_type {reasoning_type:?} is not one of {:?}",
+                    Self::REASONING_TYPES
+                ),
+            })
+        }
+    }
+
+    /// [`Self::create`] with the stored `reasoning_type` chosen by the caller
+    /// instead of derived from `trace.methodology`.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Methodology`] is a trust-modifier bucket, coarser than what a caller
+    /// says it did: `direct_observation` and `statistical_analysis` share
+    /// [`Methodology::Instrumental`], which [`Self::reasoning_type_for`] stores
+    /// as `statistical`. A caller that still holds the submitted methodology
+    /// string (the MCP `submit_claim` path) can store the faithful value, e.g.
+    /// `observational`, through this function (backlog e207bb6d). Changing the
+    /// enum-level arm instead would relabel every statistical ingest.
+    ///
+    /// `submitted_methodology`, when `Some`, is recorded verbatim at
+    /// `properties.submitted_methodology`, so the submitted word survives
+    /// even where the 6-value CHECK forces a coarse `reasoning_type`. It is
+    /// whatever string the caller passes here: a caller that filled in a
+    /// default (the MCP batch and backlog-resolution paths do) records that
+    /// default, not an absence.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` if `reasoning_type` is not in
+    /// [`Self::REASONING_TYPES`] (nothing is written); `DbError::QueryFailed`
+    /// if the INSERT fails.
+    #[instrument(skip(executor, trace))]
+    pub async fn create_with_reasoning_type<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        trace: &ReasoningTrace,
+        claim_id: ClaimId,
+        reasoning_type: &str,
+        submitted_methodology: Option<&str>,
+    ) -> Result<ReasoningTrace, DbError> {
+        Self::check_reasoning_type(reasoning_type)?;
+
         let id: Uuid = trace.id.into();
         let agent_id: Uuid = trace.agent_id.into();
         let claim_uuid: Uuid = claim_id.into();
 
-        let properties_json = serde_json::json!({
+        let mut properties_json = serde_json::json!({
             "inputs": trace.inputs,
         });
+        if let Some(submitted) = submitted_methodology {
+            properties_json["submitted_methodology"] = serde_json::json!(submitted);
+        }
 
-        let methodology_str = Self::methodology_to_db_string(trace.methodology);
         let confidence = trace.confidence;
         let explanation = &trace.explanation;
         let created_at = trace.created_at;
@@ -135,7 +208,7 @@ impl ReasoningTraceRepository {
             "#,
             id,
             claim_uuid,
-            methodology_str,
+            reasoning_type,
             confidence,
             explanation,
             properties_json,
@@ -493,8 +566,23 @@ impl ReasoningTraceRepository {
         Ok(traces)
     }
 
-    /// Convert Methodology enum to database string
-    fn methodology_to_db_string(methodology: Methodology) -> &'static str {
+    /// The one [`Methodology`] -> `reasoning_type` mapping, for writers that
+    /// hold only the enum (ingestion, `memorize`, the HTTP routes).
+    ///
+    /// Several variants share a stored value because the CHECK admits only
+    /// [`Self::REASONING_TYPES`]; in particular `Instrumental` stays
+    /// `statistical`, because ingestion lands planned `"statistical"` there. A
+    /// writer that knows the submitted methodology string should use
+    /// [`Self::create_with_reasoning_type`] instead.
+    ///
+    /// # Known asymmetry (inert)
+    ///
+    /// It is not inverted by [`Self::db_string_to_methodology`]: `observational`
+    /// reads back as `Instrumental`, `Instrumental` writes as `statistical`, and
+    /// `statistical` reads back as `BayesianInference`. No code path rewrites a
+    /// trace through the enum (there is no `UPDATE reasoning_traces` outside a
+    /// test), so the asymmetry cannot relabel a stored row today.
+    pub fn reasoning_type_for(methodology: Methodology) -> &'static str {
         match methodology {
             Methodology::Deductive => "deductive",
             Methodology::Inductive => "inductive",
@@ -527,6 +615,112 @@ impl ReasoningTraceRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_with_reasoning_type_rejects_a_value_outside_the_check() {
+        for bad in [
+            "vibes",
+            "",
+            "Observational",
+            "direct_observation",
+            "extraction",
+        ] {
+            match ReasoningTraceRepository::check_reasoning_type(bad) {
+                Err(DbError::InvalidData { reason }) => assert!(
+                    reason.contains(bad),
+                    "the refusal must name the rejected value {bad:?}: {reason}"
+                ),
+                other => panic!("{bad:?} must be refused as InvalidData, got {other:?}"),
+            }
+        }
+        for ok in ReasoningTraceRepository::REASONING_TYPES {
+            assert!(
+                ReasoningTraceRepository::check_reasoning_type(ok).is_ok(),
+                "{ok:?} is admitted by the CHECK and must be accepted"
+            );
+        }
+    }
+
+    /// Drift guard: `REASONING_TYPES` must equal the value list of the LATEST
+    /// migration that (re)creates `reasoning_type_valid`. A future migration
+    /// that widens the CHECK without updating the constant fails here instead
+    /// of as a Rust-side refusal of a value Postgres would admit.
+    #[test]
+    fn reasoning_types_mirror_the_latest_reasoning_type_valid_migration() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read migrations/")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+            .collect();
+        files.sort();
+        // Anchor on the constraint DDL in SQL text only: a header comment that
+        // discusses the constraint (121's does) must not be parsed as it.
+        const ANCHOR: &str = "ADD CONSTRAINT reasoning_type_valid CHECK";
+        let without_comments = |sql: String| -> String {
+            sql.lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (path, sql) = files
+            .iter()
+            .rev()
+            .map(|p| {
+                let sql = std::fs::read_to_string(p).expect("read migration");
+                (p, without_comments(sql))
+            })
+            .find(|(_, sql)| sql.contains(ANCHOR))
+            .expect("some migration adds reasoning_type_valid");
+        let start = sql.find(ANCHOR).expect("anchor present");
+        let body = &sql[start..];
+        let body = &body[..body.find(';').expect("statement terminator")];
+        let mut in_check: Vec<&str> = body.split('\'').skip(1).step_by(2).collect();
+        in_check.sort_unstable();
+        let mut ours = ReasoningTraceRepository::REASONING_TYPES.to_vec();
+        ours.sort_unstable();
+        assert!(
+            in_check.contains(&"observational"),
+            "parsed nothing sensible out of {}: {in_check:?}",
+            path.display()
+        );
+        assert_eq!(
+            ours,
+            in_check,
+            "REASONING_TYPES drifted from {}",
+            path.display()
+        );
+    }
+
+    /// Every arm of the enum-level mapping, written out independently (these
+    /// are the arms of the pre-refactor private `methodology_to_db_string`,
+    /// which ingestion, `memorize`, the HTTP routes and the packet submit
+    /// route all persist through), and each one admitted by the CHECK.
+    #[test]
+    fn every_enum_mapping_is_admitted_by_the_check() {
+        let expected = [
+            (Methodology::Deductive, "deductive"),
+            (Methodology::FormalProof, "deductive"),
+            (Methodology::Inductive, "inductive"),
+            (Methodology::Abductive, "abductive"),
+            (Methodology::Heuristic, "abductive"),
+            // The hard constraint of backlog e207bb6d's fix: the enum-level
+            // Instrumental arm stays `statistical`, because ingestion lands a
+            // planned "statistical" step on Instrumental.
+            (Methodology::Instrumental, "statistical"),
+            (Methodology::Extraction, "statistical"),
+            (Methodology::BayesianInference, "statistical"),
+            (Methodology::VisualInspection, "statistical"),
+        ];
+        for (m, want) in expected {
+            let stored = ReasoningTraceRepository::reasoning_type_for(m);
+            assert_eq!(stored, want, "{m:?} must be stored as {want:?}");
+            assert!(
+                ReasoningTraceRepository::REASONING_TYPES.contains(&stored),
+                "{m:?} maps to {stored:?}, which reasoning_type_valid refuses"
+            );
+        }
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_trace_crud(_pool: sqlx::PgPool) {

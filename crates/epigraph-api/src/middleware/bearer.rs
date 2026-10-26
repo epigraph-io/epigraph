@@ -10,7 +10,8 @@
 // Recorded as `D-PR17-live-memberships-is-parameterised-not-principal-bound`. This entry must
 // never be "converted" — a shard that tries will deadlock the bootstrap, not fix a leak.
 // The revocation lookup (`access_token_is_revoked`, migration 141) is pre-authentication for the
-// same reason: it decides whether the verified token yields a principal at all.
+// same reason: it decides whether the verified token yields a principal at all. So is a delegated
+// run token's delegation check (`admit_delegated`), which runs right after it.
 
 use axum::{extract::State, http::Request, middleware::Next, response::Response};
 
@@ -81,6 +82,164 @@ pub(crate) async fn refuse_revoked(state: &AppState, jti: uuid::Uuid) -> Result<
     }
 }
 
+/// A DELEGATED run token's delegation, found live by the bearer middleware
+/// for THIS request ([`admit_delegated`]) and left in the request's
+/// extensions. [`extract_viewer`] admits the token's operated principal on it
+/// and reads nothing again; a `dlg` context without it gets no viewer.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdmittedDelegation {
+    delegator: uuid::Uuid,
+    principal: uuid::Uuid,
+}
+
+/// The refusal text of a delegated run token whose delegation is not live
+/// (one wording on every transport, so a client sees one answer).
+fn delegation_not_live(principal: Option<uuid::Uuid>, delegator: uuid::Uuid) -> ApiError {
+    let principal = principal.map_or_else(|| "(none)".to_string(), |p| p.to_string());
+    ApiError::Forbidden {
+        reason: format!(
+            "this token was delegated to agent {principal} by agent {delegator}, and that \
+             delegation is not live: delegated run tokens are refused, or the delegator's \
+             allowance, client, or writer membership, or the agent's operator link, has ended"
+        ),
+    }
+}
+
+/// The scope ceiling of a DELEGATED run token, checked before its delegation
+/// is (no read): a token carrying any scope outside
+/// `epigraph_auth::DELEGATED_SCOPE_CEILING` is refused whatever its
+/// delegation says.
+fn refuse_outside_ceiling(
+    auth: &AuthContext,
+    delegator: uuid::Uuid,
+    route: &str,
+) -> Result<(), ApiError> {
+    let outside = epigraph_auth::outside_delegated_ceiling(&auth.scopes);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "auth.delegation.rejected",
+        reason = "scope_outside_ceiling",
+        route = %route,
+        principal = ?auth.agent_id,
+        delegator = %delegator,
+        jti = %auth.jti,
+        scopes = ?outside,
+        "delegated run token refused: it carries scopes outside the delegated ceiling"
+    );
+    Err(ApiError::Forbidden {
+        reason: format!(
+            "a delegated run token may carry only the delegated scope ceiling ({}); this one \
+             also carries {}",
+            epigraph_auth::DELEGATED_SCOPE_CEILING.join(" "),
+            outside.join(" ")
+        ),
+    })
+}
+
+/// THE per-request check of a DELEGATED run token (a token carrying `dlg`),
+/// run by both bearer middlewares on EVERY request that carries one, before
+/// any route, extractor or handler: a route that never resolves a viewer is
+/// covered exactly like one that does. A token without `dlg` reads nothing
+/// here.
+///
+/// First the scope ceiling ([`refuse_outside_ceiling`], no read). Then one
+/// read, `AgentRepository::delegated_principal_pool` (no read at all while
+/// the process's `EPIGRAPH_RUN_TOKENS` switch is off, which refuses every such
+/// token). A live delegation is recorded in `extensions` as
+/// [`AdmittedDelegation`] for [`extract_viewer`]. Fails CLOSED: an answer the
+/// database could not give refuses the token (503).
+///
+/// The read runs on the raw pool for this file's reason: it decides, BEFORE
+/// any viewer exists, whether the verified token yields a principal at all,
+/// and every function it composes is an app-executable `SECURITY DEFINER`
+/// read that does not depend on the session's stamp.
+#[cfg(feature = "db")]
+async fn admit_delegated(
+    state: &AppState,
+    auth: &AuthContext,
+    extensions: &mut axum::http::Extensions,
+    route: &str,
+) -> Result<(), ApiError> {
+    let Some(delegator) = auth.delegated_by else {
+        return Ok(());
+    };
+    refuse_outside_ceiling(auth, delegator, route)?;
+    let Some(principal) = auth.agent_id else {
+        tracing::warn!(
+            target: "auth.delegation.rejected",
+            reason = "no_principal",
+            route = %route,
+            delegator = %delegator,
+            jti = %auth.jti,
+            "delegated run token refused: it names no principal"
+        );
+        return Err(delegation_not_live(None, delegator));
+    };
+    match epigraph_db::AgentRepository::delegated_principal_pool(
+        &state.db_pool,
+        state.run_tokens,
+        delegator,
+        principal,
+    )
+    .await
+    {
+        Ok(Some(_)) => {
+            extensions.insert(AdmittedDelegation {
+                delegator,
+                principal,
+            });
+            Ok(())
+        }
+        Ok(None) => {
+            tracing::warn!(
+                target: "auth.delegation.rejected",
+                reason = "delegation_not_live",
+                route = %route,
+                principal = %principal,
+                delegator = %delegator,
+                jti = %auth.jti,
+                "delegated run token refused: its delegation is not live"
+            );
+            Err(delegation_not_live(Some(principal), delegator))
+        }
+        Err(e) => {
+            tracing::error!(
+                reason = "delegation_check_unavailable",
+                route = %route,
+                principal = %principal,
+                delegator = %delegator,
+                error = %e,
+                "delegated run token refused: the delegation check failed"
+            );
+            Err(ApiError::ServiceUnavailable {
+                service: "delegated token check".to_string(),
+            })
+        }
+    }
+}
+
+/// The non-`db` build has no store to check a delegation against, so it
+/// refuses every delegated run token (fails closed) and admits every other
+/// token unchanged.
+#[cfg(not(feature = "db"))]
+async fn admit_delegated(
+    _state: &AppState,
+    auth: &AuthContext,
+    _extensions: &mut axum::http::Extensions,
+    route: &str,
+) -> Result<(), ApiError> {
+    match auth.delegated_by {
+        None => Ok(()),
+        Some(delegator) => {
+            refuse_outside_ceiling(auth, delegator, route)?;
+            Err(delegation_not_live(auth.agent_id, delegator))
+        }
+    }
+}
+
 /// Middleware: extract Bearer token, validate JWT, inject AuthContext.
 ///
 /// Requests without a valid Bearer token are rejected with 401 Unauthorized,
@@ -120,6 +279,10 @@ pub async fn bearer_auth_middleware(
             if auth_ctx.carries_switch_decided_scope() {
                 auth_ctx.admin_scopes = state.admin_scope_posture().await;
             }
+
+            // A delegated run token's delegation, per request ([`admit_delegated`]).
+            let route = request.uri().path().to_string();
+            admit_delegated(&state, &auth_ctx, request.extensions_mut(), &route).await?;
 
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
@@ -178,6 +341,10 @@ pub async fn optional_bearer_auth_middleware(
             if auth_ctx.carries_switch_decided_scope() {
                 auth_ctx.admin_scopes = state.admin_scope_posture().await;
             }
+            // A present delegated run token is checked as on every other
+            // route ([`admit_delegated`]).
+            let route = request.uri().path().to_string();
+            admit_delegated(&state, &auth_ctx, request.extensions_mut(), &route).await?;
             request.extensions_mut().insert(auth_ctx);
             Ok(next.run(request).await)
         }
@@ -504,12 +671,42 @@ async fn extract_viewer(
                 _ => epigraph_db::Viewer::resolve(&state.db_pool, principal).await,
             }
         };
+        // A DELEGATED run token (`dlg`) reaches here only after the bearer
+        // middleware found its delegation live for THIS request
+        // ([`admit_delegated`], the one read), which left an
+        // [`AdmittedDelegation`] for exactly this delegator and principal.
+        // A `dlg` context without it (no middleware ran) gets no viewer: this
+        // extractor never admits a delegation it did not see checked.
+        let delegated = match auth.delegated_by {
+            None => false,
+            Some(delegator) => match parts.extensions.get::<AdmittedDelegation>() {
+                Some(a) if a.delegator == delegator && a.principal == principal => true,
+                _ => {
+                    tracing::warn!(
+                        target: "visibility.viewer.rejected",
+                        reason = "delegation_not_checked",
+                        route = %route,
+                        principal = %principal,
+                        delegator = %delegator,
+                        "viewer rejected: a delegated run token whose delegation the bearer \
+                         middleware did not find live"
+                    );
+                    return Err(delegation_not_live(Some(principal), delegator));
+                }
+            },
+        };
         let (viewer, actor) = tokio::join!(
             resolve,
             epigraph_db::AgentRepository::operator_of_author_pool(&state.db_pool, principal),
         );
         match actor {
             Ok(None) => {}
+            // The carve-out of the refusal below: a live delegation names this
+            // operated principal's own operator. The viewer is the principal's
+            // own membership set, exactly as on stdio; what it may WRITE is
+            // bounded by the database's operator-scope rule (migration 122,
+            // `OPL02`) to groups its operator writes.
+            Ok(Some(_)) if delegated => {}
             Ok(Some(link)) => {
                 tracing::warn!(
                     target: "visibility.viewer.rejected",
@@ -561,10 +758,9 @@ async fn extract_viewer(
                     "an elevated viewer was resolved for a route the per-access recorder does \
                      not wrap; refused"
                 );
-                return Err(ApiError::InternalError {
+                return Err(ApiError::InternalErrorStatic {
                     message: "ELEVATED ACCESS NOT RECORDED: this route is not recorded; the \
-                              request is refused"
-                        .to_string(),
+                              request is refused",
                 });
             };
             slot.mark(crate::middleware::elevated_access::ElevatedMark {
@@ -697,6 +893,7 @@ mod require_scope_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         });
         parts
     }
@@ -787,6 +984,7 @@ mod viewer_extractor_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

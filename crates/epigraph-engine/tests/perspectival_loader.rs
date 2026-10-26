@@ -5,7 +5,13 @@
 //! DB via the repo layer. Every BBA reserves OPEN-WORLD mass (a `~`/missing
 //! element) so the frame is not treated as exhaustive — genuine open-world CDST.
 //! Then validates the directional archetypes via the REAL `get_perspective_belief`,
-//! and proves the open-world `YagerOpen` rule actually fires at high conflict.
+//! and checks how the reserved open-world mass behaves under high conflict.
+//!
+//! U025 (backlog 9d4821c1): `combine_multiple` no longer selects YagerOpen /
+//! Inagaki per step; every step is Dempster. Reserved `(Omega, true)` mass now
+//! survives a combination only through `missing ∩ missing`; against positive
+//! evidence it is conflict and is normalised away. Whether that is the right
+//! open-world semantics is an operator ruling coupled to U028.
 //!
 //! Run (SEED_DIR supplied via env var; no hardcoded default):
 //!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_demo_dev \
@@ -348,13 +354,12 @@ async fn load_and_validate_open_world() {
         "safety divergence: tradition {sv} vs clinical {sc}"
     );
 
-    // ---- OPEN-WORLD PROOF ----
-    // The engine implements the YagerOpen rule as inagaki_combine(gamma=1.0) (routes ALL
-    // conflict to the open-world/missing element), and the closed high-conflict rule as
-    // inagaki_combine(gamma=0.5). Both report method_used=Inagaki, so we discriminate via
-    // mass_on_missing: at K>=0.5, reserving open-world mass (owf>0.03) selects YagerOpen and
-    // sends the conflict to the open-world element; with no open-world mass it stays closed
-    // and routes only ~half there. More mass-on-missing == the open-world branch genuinely fired.
+    // ---- OPEN-WORLD CHECK (U025) ----
+    // Before U025 this proved the adaptive selector's YagerOpen arm (inagaki gamma=1.0)
+    // fired for open-world inputs at K>=0.5 and parked the conflict on (Omega, true).
+    // combine_multiple now folds with Dempster at every step: conflict is normalised
+    // away, and reserved open-world mass survives only via missing ∩ missing
+    // (0.08 * 0.08 / (1 - 0.7872) = 0.0300752 here); closed inputs keep none.
     let bf = FrameOfDiscernment::new("ow_proof", vec!["a".into(), "b".into()]).unwrap();
     let mk = |idx: usize, ow: f64| {
         let mut m = BTreeMap::new();
@@ -370,8 +375,22 @@ async fn load_and_validate_open_world() {
     let (miss_ow, miss_cl) = (rep_ow[0].mass_on_missing, rep_cl[0].mass_on_missing);
     eprintln!("\nOPEN-WORLD PROOF (K={:.2}): open-world inputs -> mass_on_missing={:.3} ({:?});  closed inputs -> mass_on_missing={:.3} ({:?})",
         rep_ow[0].conflict_k, miss_ow, rep_ow[0].method_used, miss_cl, rep_cl[0].method_used);
-    assert!(miss_ow > miss_cl + 0.10,
-        "open-world reservation should route MORE conflict to the open-world element (YagerOpen, gamma=1.0) than the closed rule: ow={miss_ow} closed={miss_cl}");
+    assert_eq!(
+        rep_ow[0].method_used,
+        combination::CombinationMethod::Dempster
+    );
+    assert_eq!(
+        rep_cl[0].method_used,
+        combination::CombinationMethod::Dempster
+    );
+    assert!(
+        miss_cl.abs() < 1e-12,
+        "closed-world inputs must stay closed-world: {miss_cl}"
+    );
+    assert!(
+        (miss_ow - 0.0064 / 0.2128).abs() < 1e-9,
+        "open-world reservation survives only as missing ∩ missing under Dempster: ow={miss_ow}"
+    );
 
     eprintln!("\nALL OPEN-WORLD VALIDATION CHECKS PASS");
 }

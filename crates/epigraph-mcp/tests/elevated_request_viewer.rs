@@ -207,6 +207,7 @@ fn http_auth(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> Aut
         elevation_claim: elv,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -462,6 +463,7 @@ fn refused_as_elevated<T: std::fmt::Debug>(r: &Result<T, rmcp::model::ErrorData>
 
 fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
     epigraph_mcp::types::IngestDocumentInlineParams {
+        wait: None,
         extraction: serde_json::from_value(serde_json::json!({
             "source": {"title": format!("Elevated ingest {doi}"), "doi": doi,
                        "source_type": "Paper", "authors": []},
@@ -803,6 +805,7 @@ fn el8_token(person: Uuid, client: Uuid, family: Uuid, elv: Option<Uuid>) -> Str
             epigraph_auth::AccessTokenBinding {
                 family_id: Some(family),
                 elevation_id: elv,
+                delegated_by: None,
             },
         )
         .expect("mint")
@@ -1165,6 +1168,7 @@ async fn an_elevated_request_holds_the_admin_read_scopes_at_the_mcp_gate(pool: P
                 epigraph_auth::AccessTokenBinding {
                     family_id: Some(family),
                     elevation_id: Some(elv),
+                    delegated_by: None,
                 },
             )
             .expect("mint")
@@ -1252,6 +1256,7 @@ fn el11_token(
             epigraph_auth::AccessTokenBinding {
                 family_id: family,
                 elevation_id: elv,
+                delegated_by: None,
             },
         )
         .expect("mint")

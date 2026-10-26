@@ -103,8 +103,47 @@
 //! of a batch. Derived rows follow through 070's arm (d), which is a
 //! STATEMENT-level trigger: one UPDATE per derived table per batch, joined to
 //! the batch's transition table, however many claims the batch holds. The
-//! agent-keyed arms (`perspectives`, `recall_events`) are batched and cursored
-//! the same way instead of one unbounded UPDATE each.
+//! agent-keyed arm (`recall_events`) is batched and cursored the same way
+//! instead of one unbounded UPDATE.
+//!
+//! # `perspectives` and `communities` are instance-wide registries, like `frames` and `contexts`
+//!
+//! Migration 077 names four instance-wide registries (`frames`, `contexts`,
+//! `perspectives`, `communities`) and gives them, and only them, a WITH CHECK
+//! arm that admits `('public', world)`. This binary stamps none of the four:
+//! `run` does not re-own a row and `verify` does not count a world-owned one as
+//! residue ([`INSTANCE_WIDE_REGISTRIES`]).
+//!
+//! Every writer of `perspectives` declares `TenancyDecl::instance_wide()`
+//! (`('public', world)`) on purpose: `PerspectiveRepository::create`,
+//! `ensure_evidence_perspective` and `ensure_edge_perspective`. Migration 077's
+//! registry WITH CHECK admits exactly that declaration, and a perspective is a
+//! lens, or a per-evidence / per-edge key on `mass_functions`, not authored
+//! content. So `run` does not re-own a perspective and `verify` does not count
+//! a world-owned one as residue. An earlier revision walked `perspectives` as
+//! an agent-keyed arm on `owner_agent_id`; once the DS auto-wire began
+//! recording an `owner_agent_id` on the synthetic perspectives, every
+//! perspective an operator-linked agent wrote failed `verify` until a re-run
+//! moved it into the operator's group, against the writers' declaration.
+//! `--entity perspectives` is still accepted and does nothing.
+//!
+//! `communities` has one writer, `CommunityRepository::create`, and it declares
+//! the row instance-wide on purpose: the community's projected group (migration
+//! 068, id-preserving) "is not the owner of the registry row", because a
+//! community's directory entry is how others decide whether to join it. An
+//! earlier revision re-stamped every world-owned community to
+//! `('public', communities.id)`, and `verify` counted every world-owned
+//! community as residue in every mode, so each community created after a run
+//! failed the deploy pre-flight until a re-run moved it into its own group,
+//! against the writer's declaration. The plan assigns `communities` no
+//! derivation at all; that arm was this binary's own. `--entity communities` is
+//! still accepted and does nothing.
+//!
+//! Rows an earlier revision already moved (perspectives into an operator's
+//! group, communities into their own group) stay where they are. They are still
+//! `visibility = 'public'`, so no reader distinguishes them from world-owned
+//! rows; migrations 115 and 117 let their owner group DELETE or UPDATE them,
+//! where nobody could for a world-owned row.
 //!
 //! # `--legacy-owner operator|platform` (required on `run`)
 //!
@@ -146,6 +185,26 @@ const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
+
+/// Migration 074's seed group, the other sentinel owner (062's
+/// `NOT IN (world, seed)` check). One spelling, shared with the operator tool.
+const SEED: Uuid = epigraph_cli::operator::SEED;
+
+/// The instance-wide registries (migration 077 section 2b): their writers
+/// declare `('public', world)` on purpose, so this binary stamps none of them,
+/// `verify` does not count their world-owned rows, and `settle_remaining`
+/// settles their progress rows. See the module doc, "`perspectives` and
+/// `communities` are instance-wide registries".
+const INSTANCE_WIDE_REGISTRIES: &[&str] = &["frames", "contexts", "perspectives", "communities"];
+
+/// What `run --entity perspectives|communities` (and its dry run) says instead
+/// of walking `table`.
+fn instance_wide_note(table: &str) -> String {
+    format!(
+        "{table} is an instance-wide registry (its writers declare ('public', world)); \
+         nothing to stamp."
+    )
+}
 
 /// Resolve an agent's personal group, as a correlated scalar subquery over an
 /// `{agent}` expression the caller substitutes.
@@ -512,17 +571,21 @@ async fn run(
     // owner for their claims and the backfill stalls on batch 1.
     // Only the `operator` decision falls back to an author's personal group;
     // a `platform` run stamps live-linked authors to their operator only.
-    if mode == LegacyOwner::Operator
-        && (wants(Entity::Claims) || wants(Entity::Perspectives) || wants(Entity::RecallEvents))
-    {
+    if mode == LegacyOwner::Operator && (wants(Entity::Claims) || wants(Entity::RecallEvents)) {
         materialize_personal_groups(pool, dry_run).await?;
     }
 
     if dry_run {
         for (e, table) in [
-            (Entity::Claims, "claims"),
             (Entity::Communities, "communities"),
             (Entity::Perspectives, "perspectives"),
+        ] {
+            if wants(e) {
+                println!("dry-run: {}", instance_wide_note(table));
+            }
+        }
+        for (e, table) in [
+            (Entity::Claims, "claims"),
             (Entity::RecallEvents, "recall_events"),
             (Entity::HarvesterFragments, "harvester_fragments"),
         ] {
@@ -559,21 +622,14 @@ async fn run(
             return Ok(end);
         }
     }
-    if wants(Entity::Communities) {
-        backfill_communities(pool).await?;
-    }
-    if wants(Entity::Perspectives) {
-        let w = backfill_agent_keyed(
-            pool,
-            "perspectives",
-            "owner_agent_id",
-            batch_size,
-            deadline,
-            mode,
-        )
-        .await?;
-        if let Some(end) = settle("perspectives", w)? {
-            return Ok(end);
+    // No walk for the registries: see the module doc. A full run settles their
+    // progress rows in `settle_remaining`, with `frames` and `contexts`.
+    for (e, table) in [
+        (Entity::Communities, "communities"),
+        (Entity::Perspectives, "perspectives"),
+    ] {
+        if wants(e) {
+            println!("run: {}", instance_wide_note(table));
         }
     }
     if wants(Entity::RecallEvents) {
@@ -934,38 +990,15 @@ fn claims_batch_update_sql(mode: LegacyOwner) -> String {
     )
 }
 
-/// `communities` → `('public', communities.id)`.
+/// `recall_events` → the owner of its agent column.
 ///
-/// Migration 068 projects each community onto a group **ID-preservingly**
-/// ("Project each community into a group, ID-PRESERVING so no mapping table is
-/// needed"), so the community's own id IS its group id. The join to `groups`
-/// is a guard, not a lookup: a community created after 068 ran has no projected
-/// group yet, and stamping a nonexistent group would trip the FK. Those are
-/// left for `verify` to name.
-async fn backfill_communities(pool: &PgPool) -> anyhow::Result<()> {
-    let n = sqlx::query(
-        "UPDATE communities c SET owner_group_id = g.id, visibility = 'public'
-           FROM groups g
-          WHERE g.id = c.id AND g.kind = 'community'
-            AND c.owner_group_id = $1",
-    )
-    .bind(WORLD)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    finish_entity(pool, "communities", n as i64).await?;
-    Ok(())
-}
-
-/// `perspectives` / `recall_events` → the personal group of their agent column.
-///
-/// **These are two of the five entities the plan assigns no derivation at all**
-/// (the others are `frames`, `contexts`, `communities`). Both agent columns are
-/// NULLABLE — `perspectives.owner_agent_id` is the hole 068's projection
-/// comment already documents, and `recall_events.agent_id` is annotated by 062
-/// as "keyed on the QUERYING agent, not on a claim". A NULL row therefore has
-/// no derivable owner and is left `('public', world)`: see `settle_remaining`
-/// for why that is legal.
+/// **One of the five entities the plan assigns no derivation at all** (the
+/// others are `frames`, `contexts`, `perspectives`, `communities`). The agent
+/// column is NULLABLE — `recall_events.agent_id` is annotated by 062 as "keyed
+/// on the QUERYING agent, not on a claim". A NULL row therefore has no
+/// derivable owner and is left `('public', world)`: see `settle_remaining` for
+/// why that is legal. `perspectives` used to be walked here too, on
+/// `owner_agent_id`; it is an instance-wide registry and is not (module doc).
 ///
 /// Batched and cursored like the claims arm (OB6: it used to be one unbounded
 /// UPDATE per table), with the owner resolved once per distinct agent of the
@@ -1080,18 +1113,20 @@ async fn backfill_agent_keyed(
 /// residual this pass exists for is rows that were already on disk when 089
 /// applied, not new writes.
 ///
-/// # ⚠ The two predicates are NOT the same, and the difference is measured
+/// # The predicate is migration 089's, on purpose
 ///
-/// This one binds `f.owner_group_id = $1` with [`WORLD`] alone; 089's target side
-/// matches BOTH sentinels, `(world, seed)`. 089 names the seed sentinel because
-/// migration 074 made this table a parentless root whose seed arm COALESCEs an
-/// undeclared insert to `('public', <seed group>)` on a session that is a member
-/// of `epigraph_seed`. A seed-owned fragment already on disk is therefore
-/// reachable by NEITHER instrument: 089 fires only on a new provenance insert,
-/// and this predicate skips it. [`residual`] has the same world-only binding, so
-/// `verify` does not count those rows either. No code change here: widening this
-/// predicate changes what the backfill does to existing rows, which is outside
-/// this batch. Recorded as finding `F-089-D` in `docs/tenancy/progress.json`.
+/// TARGET: `f.owner_group_id IN (world, seed)`. 089 names the seed sentinel
+/// because migration 074 made this table a parentless root whose seed arm
+/// COALESCEs an undeclared insert to `('public', <seed group>)` on a session
+/// that is a member of `epigraph_seed`. A seed-owned fragment already on disk is
+/// reachable by no trigger (089 fires only on a new provenance insert), so this
+/// pass is its only repair. SOURCE: `c.owner_group_id <> world`, plus
+/// `(f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id,
+/// c.visibility)`, so a seed fragment on a seed claim is not rewritten in place
+/// (no inflated `rows_done`), a seed fragment on a WORLD claim is never stamped
+/// with the other sentinel, and a world fragment on a seed claim still moves as
+/// it always has. [`harvester_fragment_residual`] counts exactly the rows this
+/// statement can move (finding `F-089-D`).
 async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     let n = sqlx::query(
         "UPDATE harvester_fragments f
@@ -1099,10 +1134,12 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
            FROM harvester_claim_provenance p
            JOIN claims c ON c.id = p.claim_id
           WHERE f.id = p.fragment_id
-            AND f.owner_group_id = $1
-            AND c.owner_group_id <> $1",
+            AND f.owner_group_id IN ($1, $2)
+            AND c.owner_group_id <> $1
+            AND (f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)",
     )
     .bind(WORLD)
+    .bind(SEED)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1136,6 +1173,10 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
 ///   against `information_schema`: `frames` has `parent_frame_id`, `contexts`
 ///   has none. There is nothing to derive an owner from, so they stay
 ///   `('public', world)`.
+/// * **`perspectives`** has an `owner_agent_id`, and **`communities`** a
+///   projected group of its own, but every writer of either declares the row
+///   instance-wide on purpose (module doc), so their world-owned rows are a
+///   declaration, not residue, exactly as on `frames` and `contexts`.
 ///
 /// That is legal, and the constraint that says so is narrow enough to be worth
 /// naming: the "deferred strong CHECK `owner_group_id <> world`" is scoped to
@@ -1217,7 +1258,8 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
     }
     for t in CLAIM_DERIVED
         .iter()
-        .chain(["edges", "frames", "contexts"].iter())
+        .chain(std::iter::once(&"edges"))
+        .chain(INSTANCE_WIDE_REGISTRIES.iter())
     {
         let n = residual_for(pool, t, Some(mode)).await?;
         // `rows_done` means ROWS DECLARED, not table size. An earlier revision
@@ -1227,7 +1269,7 @@ async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()
             .fetch_one(pool)
             .await?;
         let done = total - n;
-        if n > 0 && *t != "frames" && *t != "contexts" && *t != "edges" {
+        if n > 0 && *t != "edges" && !INSTANCE_WIDE_REGISTRIES.contains(t) {
             tracing::warn!(
                 table = t,
                 residual = n,
@@ -1567,6 +1609,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_lock_public_claim_for_attach", 114),
     ("epigraph_dedup_move_bbas", 114),
     ("epigraph_reown_legacy_writer_bbas", 114),
+    // 168 (ruling R-3), the claim owner's challenge-resolution definer, kept
+    // beside the 114 machinery 168 reuses. Fails CLOSED under a non-member
+    // owner: its `challenges` read is filtered by 168's claim-readable policy
+    // and its UPDATE by 077's WITH CHECK (the outsider's row is not the
+    // owner's), so every resolution is refused "not found" or 42501 (loud).
+    ("epigraph_resolve_challenge", 168),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -1866,6 +1914,110 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // skip never fires, while the allowance read still works (loud refusals
     // only).
     ("epigraph_operator_links_refuse_allowlisted_agent", 149),
+    // 161, agent identity lineage. The registration writes three FORCEd tables
+    // whose policies admit only `epigraph_definer_bypass()`, plus `agents`,
+    // `agent_keys`, the link tables and `security_events` (whose
+    // `agent.identity_` family is reserved to the same arm): under a
+    // non-member owner every registration is refused (loud). The history read
+    // reads the same FORCEd tables through the same arm: under a non-member
+    // owner it returns the lineage with no snapshot at all, i.e. "this agent
+    // ran nothing" (quiet, the stake that makes the owner a control here).
+    ("epigraph_register_agent_identity", 161),
+    ("epigraph_agent_prompt_history", 161),
+    // 161 (review CR6), the re-runnable identity-legacy key backfill. It skips
+    // a host-registered identity by reading `agent_prompt_snapshots`, a FORCEd
+    // table whose policy admits only `epigraph_definer_bypass()`: under a
+    // non-member owner that read sees no snapshot, so a cut-over re-run gives
+    // every keyed identity a legacy row it must never have (quiet, and in the
+    // direction of binding a key that never signs).
+    ("epigraph_backfill_legacy_agent_keys", 161),
+    // 164, the keyless team-group verbs. Each body refuses any session that is
+    // not a maintenance member (or a superuser), and the FORCEd reads it makes
+    // (`groups`, `group_memberships`) are admitted by the CALLER's
+    // `epigraph_bypass()` arm, which keys on `session_user`, so a wrong owner
+    // does not filter them. The owner decides the table privileges the writes
+    // run with: under an application-role owner the `groups` /
+    // `group_memberships` / `security_events` writes fail CLOSED (42501, loud);
+    // under the migrating superuser (a no-opped `OWNER TO`) they keep working
+    // with more authority than intended (083's case). Registered so the re-own
+    // ratchet sees every 164 definer.
+    ("epigraph_create_team_group", 164),
+    ("epigraph_team_group_add_member", 164),
+    ("epigraph_team_group_remove_member", 164),
+    ("epigraph_team_group_set_member_role", 164),
+    // 164 (review), the roster guard on `group_memberships`. It reads
+    // `groups` (FORCEd) to decide whether a row belongs to a verb-made group.
+    // Under a non-member owner that read is filtered for an application
+    // caller, so every group reads as "not verb-made" and the guard admits
+    // every application write (QUIET, the direction that reopens the roster
+    // to any stamped admin or creator). The gate itself keys on
+    // `session_user`, which no owner changes.
+    ("epigraph_team_group_roster_verbs_only", 164),
+    // 077's viewer group-set read, re-stated by 164 (a verb-made group's row
+    // counts only while its member belongs to a registered human). It reads
+    // `group_memberships` and `groups` (FORCEd) for a caller that has no
+    // principal stamped yet (`Viewer::resolve` runs before the stamp exists):
+    // under a non-member owner both reads are filtered to nothing, and every
+    // viewer resolves to public-only (loud, fail-closed).
+    ("epigraph_live_memberships", 164),
+    // 165, role-derived group membership. The four table triggers of
+    // `group_role_bindings` read `platform_roles` and `groups` and write
+    // `security_events` (`platform.` family): under a non-member owner the
+    // audit insert is refused by 123's privileged-prefix policy (loud), and
+    // the guards' catalog read is unfiltered (`platform_roles` is public).
+    ("epigraph_group_role_bindings_guard_insert", 165),
+    ("epigraph_group_role_bindings_guard_update", 165),
+    ("epigraph_group_role_bindings_refuse_delete", 165),
+    ("epigraph_group_role_bindings_audit", 165),
+    // The three binding verbs write `agents`, `platform_roles` and the
+    // bindings: under an application-role owner each write fails CLOSED
+    // (42501); under the migrating superuser they keep working with more
+    // authority than intended (083's case).
+    ("epigraph_bind_group_role", 165),
+    ("epigraph_define_group_role", 165),
+    ("epigraph_end_group_role_binding", 165),
+    // The derivation and the roster read the
+    // FORCEd `group_role_bindings`, `role_assignments` and `group_memberships`
+    // through `epigraph_definer_bypass()`: under a non-member owner every
+    // read is filtered to nothing, so nobody derives anything (fail-closed,
+    // QUIET: role members silently lose the group).
+    ("epigraph_role_derived_memberships", 165),
+    ("epigraph_group_role_roster", 165),
+    // 166, role-attached agents. `role_agents` is FORCEd and admits only a
+    // privileged session or a maintenance-owned definer frame. The guards and
+    // the audit run in a definer frame: under a non-member owner the insert
+    // guard's overlap read sees no row (quiet: a duplicate attachment lands)
+    // and the audit's `platform.` row is refused (loud). The lineage copy
+    // reads FORCEd `agent_succession` through the same arm: under a
+    // non-member owner it sees no successor (quiet: the running successor
+    // of an attached identity stays unattached). The verbs' writes are
+    // refused by the policies (loud). The gate reads `role_agents` and
+    // `role_assignments` (both FORCEd) through the same arm: under a
+    // non-member owner it would see no attachment and read every role's
+    // agent as UNATTACHED, so it checks its own frame first and fails CLOSED
+    // (loud: every armed claim write is refused ROL01 and epigraph-mcp
+    // refuses to boot). The question and the check only call the gate.
+    // The lineage copy also reads FORCEd `agent_prompt_snapshots` to FLAG a
+    // SHARED successor it attaches: under a non-member owner it sees no
+    // snapshot and writes no flag (quiet, audit only: the successor is
+    // attached either way). `epigraph_role_agent_write_check` (the
+    // statement trigger on every app-writable table, and the claims author
+    // arm) calls the maintenance-only check: under a non-member owner it is
+    // denied EXECUTE and every armed application write fails 42501 (loud).
+    // `epigraph_agent_is_retired` calls `epigraph_human_of`, whose EXECUTE is
+    // the maintenance role's: under a non-member owner every armed claim
+    // update, delete or restatement that reaches it fails 42501 (loud).
+    ("epigraph_role_agents_guard_insert", 166),
+    ("epigraph_role_agents_guard_update", 166),
+    ("epigraph_role_agents_audit", 166),
+    ("epigraph_role_agents_follow_lineage", 166),
+    ("epigraph_attach_agent_to_role", 166),
+    ("epigraph_detach_agent_from_role", 166),
+    ("epigraph_role_agent_gate", 166),
+    ("epigraph_role_agent_may_run", 166),
+    ("epigraph_require_role_holder", 166),
+    ("epigraph_agent_is_retired", 166),
+    ("epigraph_role_agent_write_check", 166),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2458,6 +2610,133 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_admin_acts_of_principal(integer)",
             true,
         ),
+        // 161: the shared link body is a link function (maintenance only);
+        // the identity registration belongs to the attestor role alone; the
+        // prompt-history read is principal-gated and called on the request DSN.
+        (
+            "epigraph_link_operator_body",
+            "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_register_agent_identity",
+            "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
+            false,
+        ),
+        (
+            "epigraph_agent_prompt_history",
+            "public.epigraph_agent_prompt_history(uuid)",
+            true,
+        ),
+        // 161 (review CR6): the cut-over's legacy-key backfill is a
+        // maintenance act; the request DSN never runs it.
+        (
+            "epigraph_backfill_legacy_agent_keys",
+            "public.epigraph_backfill_legacy_agent_keys()",
+            false,
+        ),
+        // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
+        // it on the request DSN.
+        (
+            "epigraph_live_memberships",
+            "public.epigraph_live_memberships(uuid)",
+            true,
+        ),
+        // 164: creating a team group and changing its roster are maintenance
+        // acts; the request DSN must never call them.
+        (
+            "epigraph_create_team_group",
+            "public.epigraph_create_team_group(text, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_add_member",
+            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_remove_member",
+            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_team_group_set_member_role",
+            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
+            false,
+        ),
+        // 165: binding a role to a group is a maintenance act, and the
+        // derivation and the roster answer for any principal (a roster
+        // oracle); the request DSN calls none of them. It reaches the
+        // derivation only through `epigraph_live_memberships` and the claims
+        // trigger's writer scope, both maintenance-owned.
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+            false,
+        ),
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            false,
+        ),
+        (
+            "epigraph_end_group_role_binding",
+            "public.epigraph_end_group_role_binding(uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_role_derived_memberships",
+            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_group_role_roster",
+            "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
+            false,
+        ),
+        // 166: attaching and detaching a role's agents is a maintenance act;
+        // the request DSN asks whether an agent may run, and reaches the write
+        // check only through the maintenance-owned writer checks; never the
+        // gate's any-time form.
+        (
+            "epigraph_attach_agent_to_role",
+            "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
+             timestamp with time zone, text)",
+            false,
+        ),
+        (
+            "epigraph_detach_agent_from_role",
+            "public.epigraph_detach_agent_from_role(text, uuid, text)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_gate",
+            "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_may_run",
+            "public.epigraph_role_agent_may_run(uuid)",
+            true,
+        ),
+        (
+            "epigraph_require_role_holder",
+            "public.epigraph_require_role_holder(uuid)",
+            false,
+        ),
+        // The author relief and the write trigger are reached only from
+        // maintenance-owned definers and triggers; the application role
+        // EXECUTEs neither.
+        (
+            "epigraph_agent_is_retired",
+            "public.epigraph_agent_is_retired(uuid)",
+            false,
+        ),
+        (
+            "epigraph_role_agent_write_check",
+            "public.epigraph_role_agent_write_check()",
+            false,
+        ),
     ];
 
     let app_exists: bool =
@@ -2511,11 +2790,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
 ///
 /// **The world group ONLY, which is narrower than "carries no real owner".** 062
 /// names two sentinels and 074's seed arm produces the other one, so a
-/// seed-stamped row is not counted here and `verify`'s tier-A residual line reads
-/// zero over it. Left as-is deliberately: this is the gate's reporting predicate,
-/// changing it changes what `verify` prints for every tier-A table, and the census
-/// that would replace it is an operator decision rather than a fix. Recorded with
-/// [`backfill_harvester_fragments`]' matching asymmetry as finding `F-089-D`.
+/// seed-stamped row is not counted here. Left as-is deliberately for the generic
+/// tier-A census: seed-owned rows that no repair in this binary can move would
+/// turn the gate red with nothing to run. `harvester_fragments` is the exception,
+/// because [`backfill_harvester_fragments`] does repair its seed-owned rows; it
+/// is counted by [`harvester_fragment_residual`] instead (finding `F-089-D`).
 async fn residual(pool: &PgPool, table: &str) -> anyhow::Result<i64> {
     Ok(sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE owner_group_id = $1"
@@ -2539,17 +2818,15 @@ async fn residual_for(
     table: &str,
     mode: Option<LegacyOwner>,
 ) -> anyhow::Result<i64> {
+    if table == "harvester_fragments" {
+        return harvester_fragment_residual(pool, mode).await;
+    }
     if mode != Some(LegacyOwner::Platform) {
         return residual(pool, table).await;
     }
     let extra = match table {
         "claims" => author_filter(LegacyOwner::Platform, "t.agent_id"),
-        "perspectives" => author_filter(LegacyOwner::Platform, "t.owner_agent_id"),
         "recall_events" => author_filter(LegacyOwner::Platform, "t.agent_id"),
-        "harvester_fragments" => "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
-                                   JOIN claims c ON c.id = p.claim_id \
-                                  WHERE p.fragment_id = t.id AND c.owner_group_id <> $1)"
-            .to_string(),
         t if t == "evidence" || CLAIM_DERIVED.contains(&t) => {
             "EXISTS (SELECT 1 FROM claims c WHERE c.id = t.claim_id AND c.owner_group_id <> $1)"
                 .to_string()
@@ -2564,6 +2841,49 @@ async fn residual_for(
     .await?)
 }
 
+/// `harvester_fragments` rows that SHOULD have moved: the rows
+/// [`backfill_harvester_fragments`] can repair, which is migration 089's
+/// predicate over rows already on disk (a sentinel-owned fragment linked to a
+/// non-world claim whose tenancy differs from it).
+///
+/// * `platform`: exactly those rows.
+/// * `None` / `operator` (strict): every world-owned fragment, as [`residual`]
+///   counts it, PLUS the repairable seed-owned ones. Seed-owned fragments the
+///   repair cannot move (no provenance, or only world or seed claims) are not
+///   counted, so a strict `verify` never fails on a row this binary has no way
+///   to fix.
+async fn harvester_fragment_residual(
+    pool: &PgPool,
+    mode: Option<LegacyOwner>,
+) -> anyhow::Result<i64> {
+    let filter = harvester_fragment_residual_filter(mode);
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM harvester_fragments t WHERE {filter}"
+    ))
+    .bind(WORLD)
+    .bind(SEED)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// The `WHERE` clause (over `harvester_fragments t`, binding `$1` = [`WORLD`],
+/// `$2` = [`SEED`]) shared by [`harvester_fragment_residual`]'s count and
+/// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
+/// rows it counted.
+fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
+    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
+                                JOIN claims c ON c.id = p.claim_id \
+                               WHERE p.fragment_id = t.id \
+                                 AND c.owner_group_id <> $1 \
+                                 AND (t.owner_group_id, t.visibility) \
+                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
+    if mode == Some(LegacyOwner::Platform) {
+        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
+    } else {
+        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
+    }
+}
+
 /// The deploy pre-flight. Returns the number of FAILING checks.
 ///
 /// Live counts, per plan §3 (ops F16): the `SECURITY DEFINER` ownership
@@ -2573,9 +2893,10 @@ async fn residual_for(
 /// over the rest. Offending ids are PRINTED, because a guard that says "3 rows
 /// are wrong" and not which ones cannot be acted on.
 ///
-/// `frames` and `contexts` are exempt from the residual check for the reason
-/// `settle_remaining` documents: a `('public', world)` row on those tables is a
-/// correct declaration, not an undeclared one. `edges` is exempt from the
+/// The instance-wide registries ([`INSTANCE_WIDE_REGISTRIES`]: `frames`,
+/// `contexts`, `perspectives`, `communities`) are exempt from the residual check
+/// for the reason `settle_remaining` documents: a `('public', world)` row on
+/// those tables is a correct declaration, not an undeclared one. `edges` is exempt from the
 /// blanket residual but gets the sharper endpoint predicate instead.
 /// No NON-superuser maintenance role may CREATE in schema `public` (review
 /// cp3: SEC-03).
@@ -2641,12 +2962,84 @@ async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result
     Ok(1)
 }
 
+/// 166: every public table the application role can write carries the
+/// role-holder write check (`role_agent_write_check`, a BEFORE ... FOR EACH
+/// STATEMENT trigger) on INSERT, UPDATE, DELETE and TRUNCATE, except
+/// `security_events`' INSERT (an actor's own audit record). The migration
+/// installs it on the set it measures when it runs; a table handed to the
+/// application role AFTER that (a later grant, a default privilege, a table
+/// created by hand) carries none, and an attached agent writes it freely in
+/// its role's gap. Skipped on a database without the check (before 166) or
+/// without the application role.
+async fn verify_role_holder_write_check_coverage(pool: &PgPool) -> anyhow::Result<usize> {
+    let applies: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.epigraph_role_agent_write_check()') IS NOT NULL \
+            AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !applies {
+        return Ok(0);
+    }
+    // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32.
+    let uncovered: Vec<(String, i32, i32)> = sqlx::query_as(
+        "WITH writable AS (
+             SELECT c.oid, c.relname::text AS t
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+                AND (has_table_privilege('epigraph_app', c.oid, 'INSERT')
+                     OR has_table_privilege('epigraph_app', c.oid, 'UPDATE')
+                     OR has_table_privilege('epigraph_app', c.oid, 'DELETE')
+                     OR EXISTS (SELECT 1 FROM pg_attribute a
+                                 WHERE a.attrelid = c.oid AND a.attnum > 0
+                                   AND NOT a.attisdropped
+                                   AND (has_column_privilege('epigraph_app', c.oid,
+                                                             a.attnum, 'INSERT')
+                                        OR has_column_privilege('epigraph_app', c.oid,
+                                                                a.attnum, 'UPDATE'))))),
+         covered AS (
+             SELECT t.tgrelid, bit_or(t.tgtype::int & 60) AS bits
+               FROM pg_trigger t
+              WHERE NOT t.tgisinternal AND t.tgenabled <> 'D'
+                AND t.tgfoid = 'public.epigraph_role_agent_write_check()'::regprocedure
+                AND (t.tgtype & 3) = 2
+              GROUP BY 1),
+         judged AS (
+             SELECT w.t, COALESCE(c.bits, 0) AS bits,
+                    CASE WHEN w.t = 'security_events' THEN 56 ELSE 60 END AS needs
+               FROM writable w LEFT JOIN covered c ON c.tgrelid = w.oid)
+         SELECT t, bits, needs FROM judged WHERE bits & needs <> needs ORDER BY t",
+    )
+    .fetch_all(pool)
+    .await?;
+    if uncovered.is_empty() {
+        return Ok(0);
+    }
+    let listed: Vec<String> = uncovered
+        .iter()
+        .map(|(t, bits, needs)| format!("{t} (covers {bits}, needs {needs})"))
+        .collect();
+    eprintln!(
+        "FAIL: {} table(s) the application role can write carry no complete role-holder write \
+         check (migration 166; INSERT 4, DELETE 8, UPDATE 16, TRUNCATE 32): {}. An agent \
+         attached to a role writes them freely while no human holds the role. Re-run 166's \
+         trigger-install DO block on the migration DSN (it measures the catalog), or for each: \
+         CREATE TRIGGER role_agent_write_check BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON \
+         public.<table> FOR EACH STATEMENT EXECUTE FUNCTION \
+         public.epigraph_role_agent_write_check().",
+        uncovered.len(),
+        listed.join(", ")
+    );
+    Ok(1)
+}
+
 async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usize> {
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
+    failures += verify_role_holder_write_check_coverage(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL
@@ -2817,13 +3210,20 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     }
 
     for t in TIER_A {
-        if matches!(*t, "frames" | "contexts" | "edges" | "claims" | "evidence") {
+        if INSTANCE_WIDE_REGISTRIES.contains(t) || matches!(*t, "edges" | "claims" | "evidence") {
             continue;
         }
         let n = residual_for(pool, t, mode).await?;
         if n > 0 {
             failures += 1;
-            eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
+            if *t == "harvester_fragments" {
+                eprintln!(
+                    "FAIL: {n} row(s) in {t} still owned by a sentinel group (world, or seed \
+                     with a repairable claim); `run --entity harvester-fragments` moves them."
+                );
+            } else {
+                eprintln!("FAIL: {n} row(s) in {t} still owned by the world group.");
+            }
             if !platform {
                 print_offenders(pool, t).await?;
             }
@@ -2834,11 +3234,10 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     // while that author has an operator link (any state). They are declared,
     // so the tenancy gate is satisfied; operator binding wants them in the
     // operator's group, and `epigraph-operator reown-linked` moves them.
-    for (table, agent_col) in [
-        ("claims", "agent_id"),
-        ("perspectives", "owner_agent_id"),
-        ("recall_events", "agent_id"),
-    ] {
+    // `perspectives` is not listed: its owner is not this binary's concern (the
+    // module doc, "`perspectives` and `communities` are instance-wide
+    // registries").
+    for (table, agent_col) in [("claims", "agent_id"), ("recall_events", "agent_id")] {
         let n = linked_author_personal_residue(pool, table, agent_col).await?;
         if n > 0 {
             eprintln!(
@@ -2888,8 +3287,40 @@ async fn linked_author_personal_residue(
 /// Print up to 20 offending ids. Tables without an `id` column
 /// (`claim_frames`, `claim_cluster_membership`, `claim_neighborhood_membership`)
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
-/// acceptance line implies.
+/// acceptance line implies. `harvester_claim_provenance` has no `id` and no
+/// single-column key (its PK is `(claim_id, fragment_id)`), so its rows are
+/// listed by both key columns.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
+    if table == "harvester_claim_provenance" {
+        let keys: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT claim_id, fragment_id FROM harvester_claim_provenance \
+              WHERE owner_group_id = $1 ORDER BY claim_id, fragment_id LIMIT 20",
+        )
+        .bind(WORLD)
+        .fetch_all(pool)
+        .await?;
+        for (claim_id, fragment_id) in keys {
+            eprintln!("    {table}.(claim_id, fragment_id) = ({claim_id}, {fragment_id})");
+        }
+        return Ok(());
+    }
+    if table == "harvester_fragments" {
+        // Strict mode only (the caller skips this under `platform`): list the
+        // rows `harvester_fragment_residual` counted, seed-owned repairable
+        // ones included, not just the world-owned ones.
+        let filter = harvester_fragment_residual_filter(None);
+        let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT t.id FROM harvester_fragments t WHERE {filter} ORDER BY t.id LIMIT 20"
+        ))
+        .bind(WORLD)
+        .bind(SEED)
+        .fetch_all(pool)
+        .await?;
+        for id in ids {
+            eprintln!("    {table}.id = {id}");
+        }
+        return Ok(());
+    }
     let key = match table {
         "claim_frames" | "claim_cluster_membership" | "claim_neighborhood_membership" => "claim_id",
         _ => "id",
@@ -2962,6 +3393,14 @@ mod definer_register_tests {
         "epigraph_writer_owner_guard",
         // 115: the owner-immutability guard.
         "epigraph_owner_immutable_guard",
+        // 161: `epigraph_link_operator`'s body, shared with the identity
+        // registration. It runs as whichever maintenance-owned definer calls it
+        // (or as a maintenance session); EXECUTE is the maintenance role's alone.
+        "epigraph_link_operator_body",
+        // 164: the team-group verbs' audit `actor`, read from the caller's
+        // own transaction-local setting; EXECUTE is the maintenance role's
+        // alone.
+        "epigraph_team_group_actor",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
@@ -2977,7 +3416,8 @@ mod definer_register_tests {
         "epigraph_derived_require_tenancy",
         "epigraph_root_require_tenancy",
         "epigraph_is_group_admin",
-        "epigraph_live_memberships",
+        // epigraph_live_memberships: re-stated and re-owned by 164 (moved to
+        // DEFINER_FUNCTIONS with its stake).
         "epigraph_is_group_creator",
         "epigraph_ensure_personal_group",
         "epigraph_provision_oauth_agent",
@@ -3473,5 +3913,65 @@ mod definer_register_tests {
                 "public.{name} is exempt as dropped by {version}, but {recreated:?} name it again"
             );
         }
+    }
+
+    /// `verify`'s 166 coverage check passes on a database migrated to head,
+    /// and fails for a table the application role is handed after the
+    /// migration ran (the deployed-database drift a clean-migrate ratchet
+    /// cannot see) and for a table whose trigger was dropped. CONTROL:
+    /// covering the new table with the trigger passes again.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_an_app_writable_table_without_the_role_holder_write_check(
+        pool: sqlx::PgPool,
+    ) {
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            0,
+            "a database migrated to head is covered"
+        );
+        for stmt in [
+            // 077's default privileges hand a new table full DML; take them
+            // back so the table carries exactly the grant named here.
+            "CREATE TABLE public.rol_probe_after_166 (id integer)",
+            "REVOKE ALL ON public.rol_probe_after_166 FROM epigraph_app",
+            "GRANT INSERT ON public.rol_probe_after_166 TO epigraph_app",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a table granted to the application role after 166 is reported"
+        );
+        sqlx::query(
+            "CREATE TRIGGER role_agent_write_check \
+             BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON public.rol_probe_after_166 \
+             FOR EACH STATEMENT EXECUTE FUNCTION public.epigraph_role_agent_write_check()",
+        )
+        .execute(&pool)
+        .await
+        .expect("cover it");
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            0,
+            "CONTROL: covered, it passes"
+        );
+        sqlx::query("DROP TRIGGER role_agent_write_check ON public.events")
+            .execute(&pool)
+            .await
+            .expect("drop one");
+        assert_eq!(
+            super::verify_role_holder_write_check_coverage(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a table whose trigger was dropped is reported"
+        );
     }
 }

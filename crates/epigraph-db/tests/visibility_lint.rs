@@ -76,6 +76,9 @@
 //! those have no `sqlx::query` in their own body and are correctly skipped,
 //! because the callee is itself subject to this lint.
 
+mod lint_text;
+
+use lint_text::spend_views;
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking repo function carrying a `VISIBILITY-EXEMPT:` marker,
@@ -185,6 +188,49 @@ const EXEMPT_MARKER: &str = "VISIBILITY-EXEMPT:";
 /// pass a lint keyed on the accessor and fail this one. Requiring the predicate
 /// TEXT is what makes this check about the query rather than about the call.
 const SPENT_MARKERS: &[&str] = &[".splice(", ".splice_write(", "visibility = 'public'"];
+
+/// Does `body` spend its viewer?
+///
+/// Each marker is matched only where it can take effect, through
+/// [`spend_views`]: a method-call marker (`.splice(`, `.splice_write(`) against
+/// the body's CODE — Rust comments removed and string contents blanked — and
+/// the SQL-text marker (`visibility = 'public'`) against its LIVE SQL — Rust
+/// comments removed, string contents kept minus their own `--` / `/* */`
+/// comments. So a commented-out call, a log line naming the method, and a
+/// predicate commented out of the statement all fail to count.
+///
+/// Only the spend side is stripped. [`EXEMPT_MARKER`] is read from the raw body
+/// here and in [`the_exemption_set_is_exactly_what_was_reviewed`]: the
+/// convention is carried in comments by design, some of them Rust line comments
+/// rather than in-SQL `--` ones, and stripping it would turn reviewed exemptions
+/// into offenders. See `lint_text/mod.rs` for the full account.
+fn spends_viewer(body: &str) -> bool {
+    let (code, live_sql) = spend_views(body);
+    SPENT_MARKERS.iter().any(|m| {
+        let is_call = m.starts_with('.') && m.ends_with('(');
+        let view = if is_call { &code } else { &live_sql };
+        view.contains(m)
+    })
+}
+
+/// One line per viewer-taking fn that runs SQL, does not spend its viewer and
+/// carries no [`EXEMPT_MARKER`] — the verdict
+/// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] asserts empty.
+fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for f in fns {
+        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
+            // Delegating wrapper: the callee is subject to this same lint.
+            continue;
+        }
+        let spends = spends_viewer(&f.body);
+        let exempt = f.body.contains(EXEMPT_MARKER);
+        if !spends && !exempt {
+            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
+        }
+    }
+    offenders
+}
 
 fn repos_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/repos")
@@ -308,7 +354,17 @@ struct ViewerFn {
 
 /// Every `fn` under `src/repos/` whose parameter list mentions `Viewer`.
 fn viewer_taking_fns() -> Vec<ViewerFn> {
-    repo_fns()
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| viewer_taking_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`viewer_taking_fns`] over ONE source string. The selector lives here and
+/// only here, so a synthetic fixture is selected by exactly the rule the real
+/// scan uses.
+fn viewer_taking_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
+    repo_fns_in(file, src)
         .into_iter()
         .filter(|f| f.params.contains("Viewer"))
         .collect()
@@ -316,65 +372,72 @@ fn viewer_taking_fns() -> Vec<ViewerFn> {
 
 /// Every `fn` under `src/repos/`, with its parameter list and body.
 fn repo_fns() -> Vec<ViewerFn> {
+    repo_files()
+        .into_iter()
+        .flat_map(|(file, src)| repo_fns_in(&file, &src))
+        .collect()
+}
+
+/// [`repo_fns`] over ONE source string, so the verdicts can be exercised on
+/// synthetic sources that do not exist under `src/repos/`.
+fn repo_fns_in(file: &str, src: &str) -> Vec<ViewerFn> {
     let mut out = Vec::new();
-    for (file, src) in repo_files() {
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find("fn ") {
-            let at = from + rel;
-            from = at + 3;
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find("fn ") {
+        let at = from + rel;
+        from = at + 3;
 
-            // `fn` must be a whole token.
-            if at > 0 {
-                let prev = src.as_bytes()[at - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue;
-                }
-            }
-
-            let after = &src[at + 3..];
-            let name_end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            if name_end == 0 {
+        // `fn` must be a whole token.
+        if at > 0 {
+            let prev = src.as_bytes()[at - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
                 continue;
             }
-            let name = after[..name_end].to_string();
-
-            // Skip an optional generic list, then require the parameter list.
-            let mut cursor = at + 3 + name_end;
-            let rest = src[cursor..].trim_start();
-            let mut generics = String::new();
-            if rest.starts_with('<') {
-                let lt = src[cursor..].find('<').expect("just matched") + cursor;
-                let g = balanced(&src, lt, b'<', b'>');
-                cursor = lt + g.len();
-                generics = g.to_string();
-            }
-            let Some(paren_rel) = src[cursor..].find('(') else {
-                continue;
-            };
-            let paren = cursor + paren_rel;
-            // Anything other than whitespace between the name and `(` means
-            // this is not a declaration we can read.
-            if !src[cursor..paren].trim().is_empty() {
-                continue;
-            }
-            let params = balanced(&src, paren, b'(', b')');
-            let Some(brace_rel) = src[paren + params.len()..].find('{') else {
-                continue;
-            };
-            let brace = paren + params.len() + brace_rel;
-            let body = balanced(&src, brace, b'{', b'}').to_string();
-
-            out.push(ViewerFn {
-                file: file.clone(),
-                line: src[..at].matches('\n').count() + 1,
-                name,
-                generics,
-                params: params.to_string(),
-                body,
-            });
         }
+
+        let after = &src[at + 3..];
+        let name_end = after
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after.len());
+        if name_end == 0 {
+            continue;
+        }
+        let name = after[..name_end].to_string();
+
+        // Skip an optional generic list, then require the parameter list.
+        let mut cursor = at + 3 + name_end;
+        let rest = src[cursor..].trim_start();
+        let mut generics = String::new();
+        if rest.starts_with('<') {
+            let lt = src[cursor..].find('<').expect("just matched") + cursor;
+            let g = balanced(src, lt, b'<', b'>');
+            cursor = lt + g.len();
+            generics = g.to_string();
+        }
+        let Some(paren_rel) = src[cursor..].find('(') else {
+            continue;
+        };
+        let paren = cursor + paren_rel;
+        // Anything other than whitespace between the name and `(` means
+        // this is not a declaration we can read.
+        if !src[cursor..paren].trim().is_empty() {
+            continue;
+        }
+        let params = balanced(src, paren, b'(', b')');
+        let Some(brace_rel) = src[paren + params.len()..].find('{') else {
+            continue;
+        };
+        let brace = paren + params.len() + brace_rel;
+        let body = balanced(src, brace, b'{', b'}').to_string();
+
+        out.push(ViewerFn {
+            file: file.to_string(),
+            line: src[..at].matches('\n').count() + 1,
+            name,
+            generics,
+            params: params.to_string(),
+            body,
+        });
     }
     out
 }
@@ -392,18 +455,7 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
         fns.len()
     );
 
-    let mut offenders = Vec::new();
-    for f in &fns {
-        if !f.body.contains("sqlx::query") && !f.body.contains("sqlx::raw_sql") {
-            // Delegating wrapper: the callee is subject to this same lint.
-            continue;
-        }
-        let spends = SPENT_MARKERS.iter().any(|m| f.body.contains(m));
-        let exempt = f.body.contains(EXEMPT_MARKER);
-        if !spends && !exempt {
-            offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
-        }
-    }
+    let offenders = unspent_offenders(&fns);
 
     assert!(
         offenders.is_empty(),
@@ -423,6 +475,193 @@ fn every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer() {
          a `{EXEMPT_MARKER}` comment WITH A REASON and raise the count in \
          EXPECTED_EXEMPTIONS.\n",
         offenders.join("\n")
+    );
+}
+
+/// A spend marker counts only where it is CODE, never where it is prose.
+///
+/// The fixtures are synthetic source strings run through the same selector and
+/// the same verdict as the real scan, so this test cannot be satisfied by
+/// editing `src/repos/`.
+#[test]
+fn spend_markers_count_only_in_code_not_in_comments() {
+    let viewer_fns = |src: &str| viewer_taking_fns_in("synthetic.rs", src);
+
+    // 1. All three markers present only in comments (line, block, doc): the
+    //    SQL runs with no predicate, so the function must be reported.
+    let commented = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            // let sql = viewer.splice("SELECT c.content FROM claims c WHERE /* {VISIBILITY:c} */", 1);
+            // or viewer.splice_write(..) once this becomes a write
+            /* previously: AND (c.visibility = 'public' OR ...) */
+            /// TODO restore viewer.splice( here
+            let rows = sqlx::query_scalar("SELECT content FROM claims")
+                .fetch_all(pool)
+                .await?;
+            Ok(rows)
+        }
+    "#;
+    let fns = viewer_fns(commented);
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    let offenders = unspent_offenders(&fns);
+    assert_eq!(
+        offenders.len(),
+        1,
+        "a viewer-taking fn whose only spend-marker text is inside comments \
+         runs its SQL unfiltered and must be reported, got {offenders:?}"
+    );
+    assert!(offenders[0].contains("titles"), "{}", offenders[0]);
+
+    // 2. Real `.splice(` and `.splice_write(` calls spend the viewer.
+    for call in ["splice", "splice_write"] {
+        let src = format!(
+            r#"
+            pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<u64, DbError> {{
+                let sql = viewer.{call}("UPDATE claims AS c SET x = 1 WHERE c.id = $1", 2);
+                Ok(sqlx::query(&sql).execute(pool).await?.rows_affected())
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "a real `.{call}(` call must count as spending the viewer"
+        );
+    }
+
+    // 3. The static three-bind predicate lives INSIDE the SQL string literal,
+    //    so string contents must stay visible to the spend check.
+    let three_bind = r#"
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {
+            let rows = sqlx::query_scalar!(
+                "SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+                viewer.bypass_bind(),
+                &viewer.group_bind()
+            )
+            .fetch_all(pool)
+            .await?;
+            Ok(rows)
+        }
+    "#;
+    assert!(
+        unspent_offenders(&viewer_fns(three_bind)).is_empty(),
+        "the static three-bind predicate inside a SQL literal must count as \
+         spending the viewer"
+    );
+
+    // 4. `VISIBILITY-EXEMPT:` is a comment convention by design — in-SQL
+    //    `--` and Rust `//` alike. Both must still exempt.
+    for marker in [
+        "// VISIBILITY-EXEMPT: corpus-cardinality scalar.\n",
+        "let _ = \"-- VISIBILITY-EXEMPT: corpus-cardinality scalar.\";\n",
+    ] {
+        let src = format!(
+            r#"
+            pub async fn corpus_size(pool: &PgPool, viewer: &Viewer) -> Result<i64, DbError> {{
+                {marker}
+                Ok(sqlx::query_scalar("SELECT COUNT(*) FROM claims").fetch_one(pool).await?)
+            }}
+        "#
+        );
+        assert!(
+            unspent_offenders(&viewer_fns(&src)).is_empty(),
+            "an exemption written as {marker:?} must still exempt the function"
+        );
+    }
+}
+
+/// A synthetic viewer-taking repo function whose body is `body`, for the
+/// SQL-text spend fixtures below.
+fn viewer_fn_fixture(body: &str) -> String {
+    format!(
+        "
+        pub async fn titles(pool: &PgPool, viewer: &Viewer) -> Result<Vec<String>, DbError> {{
+            {body}
+        }}
+    "
+    )
+}
+
+/// The verdict for one synthetic function: is it reported as unspent?
+fn fixture_is_unspent(body: &str) -> bool {
+    let fns = viewer_taking_fns_in("synthetic.rs", &viewer_fn_fixture(body));
+    assert_eq!(fns.len(), 1, "the fixture must be selected: {}", fns.len());
+    unspent_offenders(&fns).len() == 1
+}
+
+/// `visibility = 'public'` commented out INSIDE the SQL text with `--` is not a
+/// predicate the database evaluates, so it must not spend the viewer.
+#[test]
+fn a_predicate_inside_an_sql_line_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE c.id = $1 -- AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3::uuid[]))").fetch_all(pool).await?)"#
+        ),
+        "a three-bind predicate after an in-SQL `--` is commented out of the \
+         statement and must not count as spending the viewer"
+    );
+}
+
+/// The same for an in-SQL `/* */` comment.
+#[test]
+fn a_predicate_inside_an_sql_block_comment_does_not_spend() {
+    assert!(
+        fixture_is_unspent(
+            r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* WHERE c.visibility = 'public' */").fetch_all(pool).await?)"#
+        ),
+        "a predicate inside an in-SQL `/* */` comment must not count as \
+         spending the viewer"
+    );
+}
+
+/// `.splice(` / `.splice_write(` are METHOD CALLS: written inside a string
+/// literal (a log line, an error message) they call nothing.
+#[test]
+fn a_splice_call_named_only_inside_a_string_does_not_spend() {
+    for call in ["splice", "splice_write"] {
+        let body = format!(
+            r#"tracing::debug!("not yet routed through viewer.{call}( here");
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c").fetch_all(pool).await?)"#
+        );
+        assert!(
+            fixture_is_unspent(&body),
+            "`.{call}(` inside a string literal is not a call and must not \
+             count as spending the viewer"
+        );
+    }
+}
+
+/// The over-strip guard for the two tests above: an in-SQL `--` comment ends at
+/// the end of ITS line, so a live predicate on the next line of the same
+/// literal — a real newline or a `\n` escape — still spends the viewer.
+#[test]
+fn an_sql_comment_does_not_hide_a_live_predicate_on_a_later_line() {
+    let multi_line = r#"Ok(sqlx::query_scalar(
+                "SELECT c.content FROM claims c
+                 -- visibility: the static three-bind form
+                 WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+            ).fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(multi_line),
+        "a `--` line must not hide the live predicate on the next line"
+    );
+
+    let escaped = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c -- read path\n WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(escaped),
+        "a `\\n` escape ends an in-SQL `--` comment like a real newline does"
+    );
+
+    let after_block = r#"Ok(sqlx::query_scalar("SELECT c.content FROM claims c /* read path */ WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(after_block),
+        "an in-SQL `/* */` comment must not hide the predicate after it"
+    );
+
+    let char_quote = r#"let _q = '"';
+            Ok(sqlx::query_scalar("SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))").fetch_all(pool).await?)"#;
+    assert!(
+        !fixture_is_unspent(char_quote),
+        "a `'\"'` char literal must not desynchronise the string state"
     );
 }
 
@@ -814,6 +1053,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          FOR UPDATE read is part of the mutation it guards, and claims_tenancy's WITH CHECK \
          (keyed on epigraph_writable_groups()) authorises the row. Both callers check the \
          caller's read authority with a viewer-filtered get before they reach it.",
+    ),
+    (
+        "claim.rs",
+        "lock_content_hash_agent",
+        "NO ROW READ. Takes a transaction-scoped advisory lock keyed on (content_hash, agent_id) \
+         (backlog 00f1a517, migration 150) and returns nothing: it reads no table, so there is \
+         no row for a viewer to filter. Its callers follow it with their own find: \
+         create_or_get_signed and POST /claims' if_not_exists=false branch with \
+         find_by_content_hash_and_agent, which takes the caller's viewer; create_conn_serialized \
+         and consolidate_act_conn with their existing VISIBILITY-EXEMPT write-path probes; \
+         epigraph-cli's method_search binary (a maintenance connection) with its content-hash \
+         probe.",
     ),
     (
         "claim.rs",
@@ -1309,6 +1560,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "human_of",
+        "READ through migration 149's `epigraph_human_of` SECURITY DEFINER function; same \
+         reason as `operator_actor`. It returns one id (the human the NAMED agent acts for) \
+         or NULL.",
+    ),
+    (
+        "agent.rs",
         "operates_agents",
         "READ through migration 107's `epigraph_operates_agents` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns one boolean for the NAMED agent (does any \
@@ -1338,6 +1596,44 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `link_retired_agent`: the CONNECTION's privilege is the authorisation, so there is \
          nothing for a Viewer to filter. Returns only the outcome of the named (agent, operator) \
          retired link.",
+    ),
+    (
+        "agent_identity.rs",
+        "register",
+        "WRITE through migration 161's `epigraph_register_agent_identity` SECURITY DEFINER \
+         function, EXECUTE-able by the `epigraph_identity_attestor` role ONLY (PUBLIC, \
+         epigraph_app and its owner revoked): the CONNECTION's role is the authorisation, \
+         precisely because a session principal is forgeable, so there is nothing for a Viewer \
+         to filter. Writes agents, agent_succession, agent_prompt_snapshots, \
+         agent_prompt_blobs, agent_keys and an inherited link; returns only the outcome for the \
+         named identity.",
+    ),
+    (
+        "agent_identity.rs",
+        "prompt_history",
+        "READ through migration 161's `epigraph_agent_prompt_history` SECURITY DEFINER function, \
+         the only reader of agent_prompt_snapshots / agent_prompt_blobs / agent_succession \
+         (FORCE RLS, no application policy). It gates on the SESSION principal itself (the \
+         agent's operator or an admin, else AID06) and withholds content of lineage members \
+         the principal does not operate, so the caller's stamped connection is what is spent; \
+         a Viewer splice has no tenancy column to act on.",
+    ),
+    (
+        "agent_identity.rs",
+        "prompt_history_index",
+        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
+         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
+         admin, else AID06); it projects only keys and metadata out of the definer, so it reads \
+         strictly less than `prompt_history` and a Viewer splice has no tenancy column to act on.",
+    ),
+    (
+        "agent_identity.rs",
+        "prompt_history_blob",
+        "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
+         function as `prompt_history`, with the same gate on the SESSION principal (operator or \
+         admin, else AID06), filtered to the one file a row the definer marks `readable` names: \
+         it returns a subset of what `prompt_history` returns to the same caller, so a Viewer \
+         splice has no tenancy column to act on.",
     ),
     (
         "agent.rs",
@@ -1434,6 +1730,26 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          projects back only the row this statement just inserted; `create_strict` delegates to it.",
     ),
     (
+        "claim.rs",
+        "tenancy_on_session_conn",
+        "READ of `claims` (`id, visibility, owner_group_id` only) for ids the caller already \
+         holds, with row security on the CONNECTION as the only filter, deliberately: the \
+         question is what the connection's own stamp can see, not what a viewer can. Its one \
+         caller is a declared-tenancy workflow ingest, on its system-agent stamped transaction, \
+         asking about the claims it reused before it writes an edge to any of them; an id \
+         missing from the answer exists but is invisible to the stamp and refuses the ingest. \
+         The answer is never returned to a caller (the caller-filtered read is \
+         `tenancy_of_conn`, which takes a viewer).",
+    ),
+    (
+        "security_event.rs",
+        "workflow_caller_write",
+        "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
+         write (who acted, for which human, under which arm), on the write's own system-stamped \
+         transaction, attributed to the session principal as 077's `security_events_append` \
+         requires. There is no read to filter; the row records a write the caller just made.",
+    ),
+    (
         "security_event.rs",
         "admin_audit_write",
         "WRITE through migration 112's SECURITY DEFINER `epigraph_admin_audit_write` (batch \
@@ -1453,11 +1769,34 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "ingest_anchors",
-        "READ of `workflows` only: three `find_root_by_canonical` / `head_by_canonical` lookups \
-         by `canonical_name` (batch H-b review, H3's lineage-takeover fix). `workflows` has no \
-         row security and no policy, as `find_root_by_canonical` records, so there is nothing \
-         for a viewer to filter; the ingest entry points call it on the plan walk's own \
-         transaction to decide which existing rows need the caller's authority.",
+        "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
+         `resolve_ingest_parent` lookups by `canonical_name` (batch H-b review, H3's \
+         lineage-takeover fix). `workflows` has no row security and no policy, as \
+         `find_root_by_canonical` records, so there is nothing for a viewer to filter; the \
+         ingest entry points call it on the plan walk's own transaction to decide which \
+         existing rows need the caller's authority.",
+    ),
+    (
+        "workflow.rs",
+        "resolve_ingest_parent",
+        "READ of `workflows` only (U032): the row an ingest links as `parent_id`, the named \
+         parent at `generation - 1` or the lineage's predecessor. `workflows` has no row \
+         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
+         viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
+         own transaction so the row authority-checked is the row linked.",
+    ),
+    (
+        "workflow.rs",
+        "workflows_executing_step_lineage",
+        "AUTHORITY READ of `edges` (`executes`), `claims` (the parent's `step_lineage_id` \
+         siblings) and `workflows` (no row security), for the `evolve_step` gate: it returns the \
+         workflows the caller must hold workflow authority over, so a spliced viewer predicate \
+         could only DROP workflows from that set, which makes the gate fail open, never safer. \
+         Both callers run it on the caller's own stamped write transaction (MCP \
+         `begin_author_stamped_tx`, REST `begin_claim_write`), before the act it gates, so row \
+         security on that connection still applies; the residual it leaves (lineage members \
+         split across tenancies out of band) is stated on the function. Returns workflow ids \
+         only, never content.",
     ),
     (
         "system_agent.rs",
@@ -1577,6 +1916,24 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "create_conn_serialized",
+        "WRITE. `create_conn`'s body, run inside the scope `create_conn` opens so the \
+         (content_hash, agent_id) dedup lock outlives its own statement (backlog 00f1a517). Same \
+         argument as create_conn: the lock reads no row, the `content_hash` dedup probe is the \
+         existing VISIBILITY-EXEMPT write-path read, and the INSERT is authorised by \
+         claims_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim.rs",
+        "find_by_content_hash_legacy_conn",
+        "WRITE-PATH READ. `create_conn`'s legacy `content_hash` dedup probe, moved into one \
+         function so the unlocked hit check and the re-check under the (content_hash, agent_id) \
+         dedup lock run the same SQL (backlog 00f1a517). It is the existing VISIBILITY-EXEMPT \
+         write-path read: its only callers are create_conn and create_conn_serialized, which \
+         return the row as the answer to their own create, not a disclosure to a viewer.",
+    ),
+    (
+        "claim.rs",
         "set_properties_conn",
         "WRITE. `UPDATE claims SET properties` by primary key on a claim the same transaction \
          just created — the ingest walk's hierarchy metadata. Authorised by claims_tenancy's \
@@ -1614,7 +1971,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim.rs",
         "migrate_superseded_edges",
         "WRITE. The two edge-migration statements, unchecked; called only after the caller \
-         established the privilege and the supersession.",
+         established the privilege and the supersession. Its reads classify the pair (a shared \
+         step lineage; a non-public old claim, OD-32) for the statements that follow.",
+    ),
+    (
+        "claim.rs",
+        "non_public_frozen_relationships",
+        "WRITE-path probe, privileged only through its callers (`migrate_superseded_edges`, \
+         `repair_marked_duplicate`). Reads the retired claim's own `visibility` to decide which \
+         relationships its edge migration leaves on it (OD-32); returns a relationship list, \
+         never row content, and is no disclosure to a caller.",
     ),
     (
         "claim.rs",
@@ -1659,6 +2025,44 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "mark_duplicate_act_attributed_conn",
+        "WRITE. mark_duplicate_act_conn with the caller's provenance on the identity edge; the \
+         same act on the caller's stamped transaction, authorised by claims_tenancy's and \
+         edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim.rs",
+        "mark_duplicate_with_repair_attributed_conn",
+        "WRITE, privileged only (refuses otherwise). mark_duplicate_with_repair_conn with the \
+         caller's provenance; act and repair in one transaction on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "session_may_unmark_conn",
+        "READ of the session's own write authority (`epigraph_session_writes_node`) over two \
+         claims the caller already read through its viewer, plus the canonical's visibility; \
+         projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
+        "session_may_mark_conn",
+        "READ. session_may_unmark_conn's predicate (the mark act's own authority), asked by a \
+         planner predicting which marks apply; projects one boolean, no tenant content.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate_conn",
+        "WRITE, privileged only (refuses otherwise). The reversal of a dedup's repair from its \
+         revert record, on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
+        "reverse_marked_duplicate",
+        "WRITE. The reversal's statements, unchecked; called only after the caller established \
+         the privilege.",
+    ),
+    (
+        "claim.rs",
         "repair_marked_duplicate_conn",
         "WRITE, privileged only (refuses otherwise). The dedup's repair on the maintenance \
          connection; its read verifies the committed act.",
@@ -1668,6 +2072,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "repair_marked_duplicate",
         "WRITE. The dedup repair's statements, unchecked; called only after the caller \
          established the privilege and the act.",
+    ),
+    (
+        "claim.rs",
+        "backfill_legacy_dedup_identity_edges_conn",
+        "WRITE, privileged only (refuses otherwise). The operator backfill of the identity \
+         edge of legacy fuzzy_dedup_claims duplicates; its selection over claims and edges is \
+         corpus-wide by design and runs on the maintenance connection.",
     ),
     (
         "claim.rs",
@@ -1835,6 +2246,28 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          was COMPUTED from, not the set the connection CARRIES — the question is the latter. \
          Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
          `IngestTx::owner_decl`, which refuses the ingest when it is false.",
+    ),
+    // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
+    // the raw pool onto the route's stamped transaction.
+    (
+        "triple.rs",
+        "batch_create_mentions",
+        "WRITE of `entity_mentions` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_mentions` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `entity_mentions_tenancy`'s WITH CHECK applies on the \
+         stamped connection. An INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "triple.rs",
+        "batch_create_triples",
+        "WRITE of `triples` rows on the caller's connection, which \
+         `routes/entities.rs::batch_create_triples` stamps with the caller's viewer AFTER it has \
+         resolved every target claim through that viewer (`ClaimRepository::write_target_of`) \
+         and refused a claim whose owning group is not writable. Each row inherits its claim's \
+         tenancy (migrations 070/074) and `triples_tenancy`'s WITH CHECK applies on the stamped \
+         connection. An INSERT has no read for a viewer marker to filter.",
     ),
 ];
 
@@ -2046,6 +2479,27 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "admin_cascade.rs",
+        "record_dedup_revert",
+        "INSERT INTO `security_events` of a `cascade.dedup_revert_record` row with agent_id \
+         NULL, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
+         session). Returns the new id, no tenant content.",
+    ),
+    (
+        "admin_cascade.rs",
+        "dedup_revert_record",
+        "READ of `security_events` for the administrative un-mark, on the maintenance \
+         connection: the revert record is agent-less, so `security_events_read` shows it to \
+         privileged and admin sessions only; nothing reaches a caller (apply_unmark reports \
+         counts).",
+    ),
+    (
+        "admin_cascade.rs",
+        "open_dedup_cascades",
+        "READ of `security_events` (the replay's pending window) for the administrative \
+         un-mark, on the maintenance connection; returns row ids it retires, never to a caller.",
+    ),
+    (
+        "admin_cascade.rs",
         "retire_pending",
         "INSERT INTO `security_events` of a `cascade.retired` row copied from a pending cascade \
          row, on the maintenance connection only (117 refuses a `cascade.*` row from any other \
@@ -2107,9 +2561,24 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "INSERT INTO `reasoning_traces`. A WRITE, which is what makes this entry different in          kind from every read above: the control on a write is not an in-query viewer predicate          but migration 077's `WITH CHECK (owner_group_id = ANY(epigraph_writable_groups()))`,          evaluated by PostgreSQL against the CONNECTION's session GUCs. A `&Viewer` parameter          here would be spent on nothing -- `Viewer::splice` has no marker to fill on an INSERT          with no FROM -- while `Viewer::splice_write` is PR-16's, not this change's. WHY THE          EXECUTOR MOVED: the only connection that can satisfy that `WITH CHECK` is one stamped          by `ScopedPool::begin_as`, which hands back a transaction; a `&PgPool` parameter made          this function unreachable from the one connection shape that works, which is why every          MCP `reasoning_traces` INSERT failed with `42501` once the deployed DSN moved to          `epigraph_app`. `rls_enforcement.rs::an_unstamped_app_connection_cannot_write_a_claim_derived_row`          is the pin on both halves (arm 1 refuses unstamped, arm 3 admits author-stamped).          SCOPE: the executor widened, the SQL is byte-identical and was not re-derived.",
     ),
     (
+        "trace.rs",
+        "create_with_reasoning_type",
+        "INSERT INTO `reasoning_traces` -- the SAME statement as `trace.rs::create` above, which \
+         is now a one-line delegate to it; the SQL text moved byte-identically. Same argument: a \
+         WRITE governed by migration 077's WITH CHECK against the connection's stamped GUCs, not \
+         an in-query viewer predicate. It differs only in letting the caller choose the \
+         CHECK-validated `reasoning_type` and record `properties.submitted_methodology` \
+         (backlog e207bb6d).",
+    ),
+    (
         "evidence.rs",
         "create",
         "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "evidence.rs",
+        "create_with_source_url",
+        "INSERT INTO `evidence`: the body of `evidence.rs::create` above, moved verbatim (the `query!` text is unchanged; only the `source_url` bind is now a parameter) so a caller can store a URL the evidence type has no slot for (MCP `empirical`, backlog 43ab8c73) and the combine step can key same-source re-observations on it (backlog 4c42c0bf). `create` delegates to it. Same argument as `create`: a write authorized by the table's `WITH CHECK` on the stamped connection, not an in-query predicate.",
     ),
     (
         "edge.rs",
@@ -2120,7 +2589,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "community.rs",
         "add_member",
         "ONE statement, `SELECT public.epigraph_community_add_member($1, $2, $3)` (migration \
-         106, batch F). A WRITE, and its authorization is neither an in-query viewer predicate \
+         106, batch F; re-stated by 159). A WRITE, and its authorization is neither an in-query viewer predicate \
          nor the caller's `WITH CHECK`: the SECURITY DEFINER function takes the actor from the \
          CONNECTION's stamped `epigraph_principal_id()` (a differing `acting_agent` is DENIED \
          unless the session is `epigraph_bypass()`), locks the group's roster and `groups` row, \
@@ -2306,6 +2775,19 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "behavioral_execution.rs",
+        "behavioral_affinity_hierarchical",
+        "U033: scores hierarchical outcome reports. FROM `behavioral_executions` JOIN `workflows` \
+         and nothing else -- no `claims`, no `edges`. Neither relation carries a `visibility` or \
+         `owner_group_id` column, and row security is off on both (`residual_unstamped_writes.rs` \
+         records `workflows` as MEASURED `relrowsecurity = false`; `behavioral_executions` as \
+         not claim-derived with no `owner_group_id`). It projects only `(workflows.id, float8, \
+         bigint)` -- no content column. The `workflows` ids it can return are the same ones the \
+         viewer-less `search_hierarchical_by_embedding_scored` already returns to every caller of \
+         `find_workflow`. The flat (claim-rooted) twin, `behavioral_affinity_lineage`, keeps its \
+         Viewer and its markers; this is a separate fn precisely so the claim arm is unchanged.",
+    ),
+    (
+        "behavioral_execution.rs",
         "rolling_success_rate",
         "Aggregates `AVG(success::int)` over the newest `window` rows of `behavioral_executions` \
          for one workflow. The statement's FROM is `behavioral_executions` alone, and what it \
@@ -2365,6 +2847,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          are unchanged. REACH IS WIDER THAN MOTIVATION: three other production call sites, all \
          in `epigraph-mcp/src/tools/rdf.rs`, still pass `&PgPool` and were not edited.",
     ),
+    (
+        "entity.rs",
+        "upsert",
+        "WRITE of one `entities` row (insert, or merge on the canonical `(lower(name), type_top)` \
+         pair). `entities` is the instance-wide RDF dictionary: no `visibility` / \
+         `owner_group_id` column and row security off, the posture `entity.rs::get` records above, \
+         so there is no predicate to splice and no policy to select. Widened from `&PgPool` so \
+         `routes/entities.rs::create_entity` writes on the caller's STAMPED transaction (backlog \
+         850dcc61), which refuses an elevated read-only token; the SQL is unchanged and the \
+         engine tests' `&PgPool` callers still satisfy the bound.",
+    ),
     // ── FIVE MORE WRITES, from the conversion of the MCP tools PR #494 left
     // unconverted. Same argument as the three writes at the top of this
     // register — the control on a write is migration 077's `WITH CHECK`
@@ -2384,10 +2877,24 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          policy for table \"challenges\"` and writing nothing. The only connection that can \
          satisfy that check comes from `ScopedPool::begin_as`, which hands back a transaction. \
          WHOSE group: the row is claim-derived, so 074's `epigraph_derived_require_tenancy` fills \
-         its tenancy from the CHALLENGED CLAIM and 070 arm (c) re-stamps it unconditionally — the \
-         check is about the claim's owning group, not the challenger's, and \
-         `tool_write_tables_require_a_stamp.rs` pins all three directions of that. SCOPE: the \
-         executor widened, the SQL is byte-identical and was not re-derived.",
+         its tenancy from the CHALLENGED CLAIM for an insider; since migration 168 (ruling R-CH1) \
+         an outsider's challenge on a PUBLIC claim is owned by the challenger's own write group \
+         (114's attach rule), and `tool_write_tables_require_a_stamp.rs` / \
+         `challenge_ownership.rs` pin both. SCOPE: the executor widened, the SQL is \
+         byte-identical and was not re-derived.",
+    ),
+    (
+        "challenge.rs",
+        "resolve_as_claim_owner",
+        "`SELECT public.epigraph_resolve_challenge(..)` (migration 168 section 7, ruling R-3). A \
+         WRITE of four resolution columns of one `challenges` row, through a maintenance-owned \
+         definer, and it returns nothing, so a `&Viewer` would be spent on nothing: there is no \
+         FROM and no marker to fill. The read control is inside the definer, from the same \
+         session GUCs a Viewer is stamped from: the challenge's CLAIM must be public or in \
+         `epigraph_session_groups()` (else 'challenge not found', the same text as a random id), \
+         and the claim's owner must be in `epigraph_writable_groups()`. It needs the stamped \
+         transaction of `ScopedPool::begin_as` (an unstamped session has no principal and is \
+         refused CR01). Pinned by `challenge_ownership.rs` and `elevated_arms.rs`.",
     ),
     (
         "frame.rs",
@@ -2416,6 +2923,39 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          further down its own pipeline — the same BBA is re-stored rather than combined twice — \
          which is why this half was convertible ahead of the pool-bound DS recompute it feeds. \
          SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "scoped_belief.rs",
+        "upsert",
+        "INSERT INTO `ds_combined_beliefs` (ON CONFLICT on `(frame_id, claim_id, scope_type, \
+         scope_id)` DO UPDATE); a WRITE with no FROM for a viewer splice. Its control is the \
+         table's FORCE'd RLS (079) against the connection's GUCs, tenancy inherited from the \
+         claim. Generic since U024 so REST `submit_evidence` can write its global scoped belief \
+         on the handler's `write_as` transaction: on the unstamped raw pool FORCE refused it \
+         without an error. Pinned by `epigraph-api/tests/frames_evidence_app_role.rs::\
+         the_owners_global_scoped_belief_lands_when_the_raw_pool_is_the_app_role`. The other \
+         callers still pass their pool. SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "divergence.rs",
+        "store",
+        "INSERT INTO `ds_bayesian_divergence` ... RETURNING id; a WRITE with no FROM for a \
+         viewer splice. Its control is the table's FORCE'd RLS (079) against the connection's \
+         GUCs, tenancy inherited from the claim (070's inheritor list, 114's writer-owned arm). \
+         Generic so REST `submit_evidence` can write its divergence record on a `write_as` \
+         transaction: on the unstamped raw pool FORCE refused it without an error. Pinned by \
+         `epigraph-api/tests/frames_evidence_armed.rs`. SCOPE: executor only; the \
+         SQL is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "copy_to_frame",
+        "Runs no SQL of its own: it re-stores an already-read `MassFunctionRow` onto another \
+         frame through `store_with_perspective` (the entry above), an INSERT INTO \
+         `mass_functions` whose write-side control is that table's `WITH CHECK` against the \
+         connection's GUCs. There is nothing to filter: the caller (hypothesis promotion) read \
+         the source row through `get_for_claim_frame` with its own viewer. Generic executor so \
+         the promotion's transaction can hold the copy and its `claim_frames` insert together.",
     ),
     (
         "claim.rs",
@@ -2465,6 +3005,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          is in the SESSION's writable set (migration 120's `owned_by_caller`). A writable group \
          is always a readable one, so it answers true only for an edge this session can \
          already see, and false says nothing about an edge it cannot.",
+    ),
+    (
+        "edge.rs",
+        "session_writer_group",
+        "Reads NO table row of its own: `SELECT public.epigraph_writer_group()` (migration \
+         114), which returns the SESSION's own writer group (its operator's or its own \
+         personal group, and only if it is in the session's writable set) from the session's \
+         principal stamp. It answers a question about the caller's identity, not about any \
+         row a viewer predicate could filter.",
     ),
     (
         "edge.rs",
@@ -2521,6 +3070,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
+        "backfill_evidence_type_where_untyped",
+        "WRITE: `UPDATE mass_functions SET evidence_type` for the legacy evidence-type backfill \
+         (backlog bc06ec6f), only on rows still untyped. Maintenance connection only (the binary \
+         refuses an unset MAINTENANCE_DATABASE_URL); the backfill is corpus-wide by definition, \
+         so there is no viewer to filter by.",
+    ),
+    (
+        "mass_function.rs",
         "clear_claim_belief",
         "WRITE: `UPDATE claims` clearing the cached belief columns. Authorised by claims_tenancy's \
          WITH CHECK on the caller's stamped connection, like `update_claim_belief`.",
@@ -2542,6 +3099,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
          authorised by migration 115's cascade definer on the caller's connection, not by a \
          viewer.",
+    ),
+    (
+        "mass_function.rs",
+        "untyped_provenance_page",
+        "READ of every tenant's untyped `mass_functions` rows with their stored provenance, for \
+         the legacy evidence-type backfill (backlog bc06ec6f). Maintenance connection only: a \
+         per-viewer page would leave every other tenant's rows untyped while reporting the run \
+         complete.",
     ),
     (
         "mass_function.rs",
@@ -2672,6 +3237,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          that follows (carries a `VISIBILITY-EXEMPT: WRITE path` note), on the ingest system \
          agent's stamped transaction that owns these claims; the caller's authority is the \
          workflow authority rule, not read visibility, so no caller viewer is spliced.",
+    ),
+    (
+        "workflow.rs",
+        "lock_for_plan_edit",
+        "READ of `workflows` only, `FOR UPDATE`: locks the one row `add_step` is about to \
+         extend, so two concurrent calls cannot take the same next `plan_index`. `workflows` \
+         has no row security and no policy, so there is nothing for a viewer to filter; the \
+         caller's authority is `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "executes_plan_indices",
+        "READ of `edges`: the target, `plan_index` and publicness of each live `executes` edge \
+         of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \
+         existing edge is written. It runs on the ingest system agent's stamped transaction, \
+         so it is bounded to what that stamp may read, and an index is written only when every \
+         edge it read is public, so the index discloses nothing a reader of the new public \
+         edge could not read; the caller's authority is the workflow authority rule, not read \
+         visibility, so no caller viewer is spliced.",
     ),
 ];
 

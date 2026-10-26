@@ -40,7 +40,7 @@ use epigraph_db::MassFunctionRepository;
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
 use epigraph_mcp::types::SubmitDsEvidenceParams;
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
-use rmcp::model::RawContent;
+use rmcp::model::ContentBlock;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -60,8 +60,8 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 
 fn result_json(out: rmcp::model::CallToolResult) -> serde_json::Value {
     let first = out.content.first().cloned().expect("first content");
-    let text = match first.raw {
-        RawContent::Text(t) => t.text,
+    let text = match first {
+        ContentBlock::Text(t) => t.text,
         other => panic!("expected text content, got {other:?}"),
     };
     serde_json::from_str(&text).expect("result is JSON")

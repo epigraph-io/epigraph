@@ -49,7 +49,16 @@ pub struct EpiGraphMcpFull {
     /// than defaulted, mirroring `McpEmbedder::on_a_privileged_pool`: a server
     /// on an ORDINARY pool with no `ScopedPool` keeps failing closed.
     pub(crate) privileged_pool: Option<&'static str>,
+    /// The key every signature this server makes is by. In the legacy modes
+    /// it is also the agent's identity (`agents.public_key`); in the
+    /// separate-signing-key mode (agent identity lineage design D2) it is the
+    /// agent's registered `agent_keys` signing key and names no agent.
     pub(crate) signer: Arc<AgentSigner>,
+    /// The agent's IDENTITY public key when it is not the signer's
+    /// ([`Self::with_identity_public_key`]): [`Self::agent_id`] finds the agent
+    /// by this key, and the signer only signs. `None` in every constructor,
+    /// which keeps the legacy behaviour (the signer's key is the identity).
+    pub(crate) identity_public_key: Option<[u8; 32]>,
     pub(crate) agent_db_id: Arc<Mutex<Option<uuid::Uuid>>>,
     pub(crate) embedder: Arc<McpEmbedder>,
     pub(crate) read_only: bool,
@@ -120,6 +129,12 @@ pub struct EpiGraphMcpFull {
     /// is. Off, a token without `elv` resolves the plain scoped viewer with no
     /// liveness round trip at all.
     pub(crate) connector_elevation: bool,
+    /// Whether an HTTP request may carry a DELEGATED run token (a token with
+    /// `dlg`): admitted by `call_tool`'s dispatch check
+    /// (`tools::viewer::admit_delegated_call`) only while its delegation is
+    /// live, refused by every federated tool whatever this says. OFF in every constructor; `main` sets it from
+    /// `EPIGRAPH_RUN_TOKENS` at boot ([`Self::with_run_tokens`]).
+    pub(crate) run_tokens: epigraph_db::RunTokens,
     /// The admin-scope switch (migration 128) as this process reads it,
     /// behind a short cache (elevation plan EL-10); shared by every session
     /// the factory clones. [`Self::admin_scope_posture`].
@@ -129,6 +144,11 @@ pub struct EpiGraphMcpFull {
     /// plan EL-11). `None` in every constructor and unless `main` reads it:
     /// with none, `sudo` refuses (it cannot name a page).
     pub(crate) public_base_url: Option<String>,
+    /// The label-dedup tools' profile root, stdio pin and `max_claims` cap,
+    /// read once at startup ([`Self::with_label_dedup_config`]). The default
+    /// has no root and no pin, so stdio `profile_path` is refused until `main`
+    /// sets one.
+    pub(crate) label_dedup: Arc<crate::tools::label_dedup::LabelDedupConfig>,
 }
 
 impl EpiGraphMcpFull {
@@ -426,7 +446,9 @@ impl EpiGraphMcpFull {
         if let Some(id) = *cached {
             return Ok(id);
         }
-        let pub_key = self.signer.public_key();
+        // The identity key names the agent; the signer only signs (D2). In the
+        // legacy modes the two are one key.
+        let pub_key = self.identity_key();
         let agent = if let Some(a) =
             epigraph_db::AgentRepository::get_by_public_key(&self.pool, &pub_key)
                 .await
@@ -756,6 +778,19 @@ impl EpiGraphMcpFull {
                 data: None,
             });
         };
+        // A DELEGATED run token never reaches a federated tool, whatever its
+        // scopes: the call would forward its bearer to the extension, which
+        // runs no delegation check of its own.
+        if auth.delegated_by.is_some() {
+            return Err(McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::Owned(format!(
+                    "Forbidden: federated tool '{tool_name}' is unavailable to a delegated run \
+                     token (its bearer is never forwarded to an extension)"
+                )),
+                data: None,
+            });
+        }
         if !auth.has_scope(required) {
             return Err(McpError {
                 code: rmcp::model::ErrorCode::INVALID_REQUEST,
@@ -1056,6 +1091,7 @@ impl EpiGraphMcpFull {
             scoped: None,
             privileged_pool: None,
             signer: Arc::new(signer),
+            identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder: Arc::new(embedder),
             read_only,
@@ -1065,8 +1101,10 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
+            label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
         }
     }
 
@@ -1106,6 +1144,14 @@ impl EpiGraphMcpFull {
         self
     }
 
+    /// Set the delegated run-token switch (see the field's doc; OFF is the
+    /// default).
+    #[must_use]
+    pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
+        self.run_tokens = run_tokens;
+        self
+    }
+
     /// Set the public origin `sudo` names the ceremony page under (the API's
     /// `EPIGRAPH_PUBLIC_BASE_URL`; a trailing `/` is dropped). `None`, or a
     /// blank value: `sudo` refuses.
@@ -1114,6 +1160,17 @@ impl EpiGraphMcpFull {
         self.public_base_url = base
             .map(|b| b.trim().trim_end_matches('/').to_string())
             .filter(|b| !b.is_empty());
+        self
+    }
+
+    /// Set the label-dedup tools' profile root, stdio pin and `max_claims`
+    /// cap (`main` passes `LabelDedupConfig::from_env()`).
+    #[must_use]
+    pub fn with_label_dedup_config(
+        mut self,
+        config: crate::tools::label_dedup::LabelDedupConfig,
+    ) -> Self {
+        self.label_dedup = Arc::new(config);
         self
     }
 
@@ -1173,6 +1230,7 @@ impl EpiGraphMcpFull {
             scoped: None,
             privileged_pool: None,
             signer,
+            identity_public_key: None,
             agent_db_id: Arc::new(Mutex::new(None)),
             embedder,
             read_only,
@@ -1182,8 +1240,10 @@ impl EpiGraphMcpFull {
             seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
+            run_tokens: epigraph_db::RunTokens::Off,
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
+            label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
         }
     }
 
@@ -1207,6 +1267,30 @@ impl EpiGraphMcpFull {
     pub fn with_generated_signer_identity(mut self) -> Self {
         self.signer_identity_declared = false;
         self
+    }
+
+    /// Name this server's agent by a separate IDENTITY public key (agent
+    /// identity lineage design D1, D2): [`Self::agent_id`] finds or creates the
+    /// agent by `key`, while every signature is still the signer's. Used by
+    /// `main` in the separate-signing-key mode, which is stdio-only, after
+    /// [`crate::signing_identity::check_signing_key`] has confirmed that the
+    /// signer is an active `signing` key of that agent.
+    ///
+    /// Consumed-self builder, for the same reason as
+    /// [`Self::with_generated_signer_identity`]. Sessions of a
+    /// [`SessionFactory`] are clones of the template, so they carry it.
+    #[must_use]
+    pub fn with_identity_public_key(mut self, key: [u8; 32]) -> Self {
+        self.identity_public_key = Some(key);
+        self
+    }
+
+    /// The public key this server's agent is found by: the declared identity
+    /// key, else the signer's own.
+    #[must_use]
+    pub fn identity_key(&self) -> [u8; 32] {
+        self.identity_public_key
+            .unwrap_or_else(|| self.signer.public_key())
     }
 
     /// Inject a deployment's own write-authorization gate (builder pattern).
@@ -1243,7 +1327,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. Returns claims with their labels and retirement state."
+        description = "Query epistemic claims by belief-score range (min_truth / max_truth), newest first. The score is the claim's Dempster-Shafer pignistic probability when it has DS state, else its authored truth_value: the same score recall's min_truth gates on, so a claim refuted by epistemic edges is found by max_truth even while its stale truth_value is high. Each result carries truth_value (the authored value, unchanged) and belief_score (what the range compared). Current claims only unless is_current=false. exclude_spine=true drops every claim whose properties.level is 0-2 before the limit applies: document thesis/section/paragraph nodes (headings, keyword lists, captions, transcript turns) and workflow thesis/phase/step nodes alike, keeping atoms (level 3) and unleveled claims. Returns claims with their labels and retirement state."
     )]
     async fn query_claims(
         &self,
@@ -1256,7 +1340,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow; feed the returned claim_ids to the decompose_claims CLI."
+        description = "List claims that have NEVER been decomposed — claims that are neither parent (source) nor child (target) of any decomposes_to edge. These are standalone claims from non-hierarchical paths (memorize, submit_claim, legacy imports). Excludes host-telemetry claims and content <=10 chars. Ordered oldest-first. Step 1 of the 'Process undecomposed claims through decomposition pipeline' workflow. Each row carries looks_atomic. Rows with looks_atomic=true are terminal by policy (one sentence, at most 160 chars): decompose_claims skips them by default, they never get a decomposes_to edge and so stay in this list, and they are NOT a backlog or a defect; do not file them. Feed only looks_atomic=false claim_ids to the decompose_claims CLI. This list's row count is not a progress measure; decompose_claims' selection line (eligible claims) is."
     )]
     async fn query_undecomposed_claims(
         &self,
@@ -1269,7 +1353,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state."
+        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
     )]
     async fn get_claim(
         &self,
@@ -1282,7 +1366,20 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false."
+        description = "Read the FROZEN plan of one hierarchical workflow generation by its workflows-table id, as the caller. Returns the row (canonical_name, generation, goal, parent_id, truth_value, submitter) and every executes target of THIS generation at every level, in the order its edge's plan_index gives: plan_index, level, claim_id, content, phase, content_hash (hex), content_hash_ok (seed-aware: the stored hash must match the content under this workflow's name, or the plain hash on rows without the scope marker), visibility, owner_group_id, truth_value, is_current and heads_diverged (an evolve_step happened; the frozen step is still what this generation executes). Integrity counts: hidden_count (edges you can see whose target you cannot read: a count, never ids), unindexed_edges (no integer plan_index or level, e.g. a step add_step did not index; not items), plan_index_gaps, duplicate_plan_indices and retracted_edges (not items). digest_echo is the wfd1 digest of the items, present only when every count is zero; it is informational, because plan_index is a mutable edge property and the order is reported as stored, never repaired, and it does not prove the plan is complete (items missing from the END of the plan raise no count; only a comparison with a digest pinned outside the server detects them). Not found when no such workflow exists or when you can see none of its executes edges (for example, a plan whose items are all private to a group you are not in; a plan mixing public and private items reads with gaps instead)."
+    )]
+    async fn get_workflow_plan(
+        &self,
+        Parameters(params): Parameters<crate::types::GetWorkflowPlanParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflow_plan::get_workflow_plan(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false. The signature is also checked against the attested agent_keys rows (signing, identity-legacy) of the claim's signer and author, because a server running with a separate signing key records its IDENTITY key as agents.public_key and signs with a registered signing key. key_bound says whether the verifying key is an attested key of the claim's AUTHOR that was valid when the claim was created; key_kind names it (signing, identity-legacy, or unattested when only the signer's agents.public_key verifies; null when nothing verifies). A claim authored by an HTTP caller and signed by the server reports key_bound=false: the key is the server's, not the author's. An identity-legacy key is derived from public inputs, so a signature under it is forgeable even when bound. key_bound covers only blake3(content): the signature names no author or date, and created_at is writer-set, so a direct database write can copy a bound signature onto another row with the same content."
     )]
     async fn verify_claim(
         &self,
@@ -1309,7 +1406,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the claim (admin or writer membership; being its author is not enough), or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a claim it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). The database refuses a row the stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
+        description = "Create a new claim that supersedes an existing one (semantic versioning). Old claim's is_current flips to false; new claim's supersedes column points at the old. NEW CLAIM INHERITS THE OLD CLAIM'S agent_id. NEW CLAIM INHERITS THE OLD CLAIM'S LABELS, except near-duplicate (the novelty gate's flag on the old submission); properties are not carried. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the claim (admin or writer membership; being its author is not enough), or hold claims:admin (which admits any claim it can read). A claim the caller cannot read is reported as not found, exactly like a missing one; one it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The retirement and the new claim commit together on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a claim it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). The database refuses a row the stamp cannot write. The follow-on cascade (moving other writers' edges onto the replacement, invalidating their frozen BBAs) is administrative: it is reported as cascade.status=\"deferred\" and applied by the replay timer. Use mark_duplicate to mark a duplicate WITHOUT creating a new claim."
     )]
     async fn supersede_claim(
         &self,
@@ -1323,7 +1420,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
+        description = "Mark a claim as a duplicate of a canonical claim WITHOUT creating a new claim. Sets supersedes+is_current=false on the duplicate; canonical's own row untouched. It also writes a same_as identity edge duplicate -> canonical whose properties.dedup records this tool, the rule and your reason (when given). unmark_duplicate reverses the dedup, but only on a server holding the administrative connection (request-serving servers refuse it), so treat a mark as one-way. USE IT when one claim restates another and only one should stay current; the canonical must be CURRENT (a mark onto a retired claim is refused with nothing written). For two claims that should BOTH stay current, link them instead (an EQUIVALENT_TO edge via HTTP POST /api/v1/edges, scope edges:write, or link_epistemic corroborates); for an operational index family (a lead list, a tracker), use plan_label_dedup / apply_label_dedup (docs/conventions/duplicates-and-index-hygiene.md). WHO MAY: scope claims:write, and the caller must WRITE the group that owns the DUPLICATE (admin or writer membership; being its author is not enough), or hold claims:admin; the caller must likewise write the group that owns the CANONICAL (or hold claims:admin), because the cascade moves other writers' edges and mass functions onto it; a canonical it can read but not write is refused the same way, naming the canonical. The act commits on one transaction stamped with the CALLER's own authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio); only a claims:admin caller on a duplicate it does not write acts with this server's agent's authority instead, and only while its token's own client record still grants claims:admin (a de-scoped or revoked client's token, and the injected context of an --allow-unauthenticated-http listener, which has no client record, are refused there with ADM02 and nothing written). A duplicate or canonical the caller cannot read is reported as not found, exactly like a missing one; a duplicate it can read but may not retire is refused with data.error=\"not_owner\", data.rule=\"not_claim_writer\" and nothing written. The follow-on cascade is administrative and reported as cascade.status=\"deferred\" (the replay timer applies it): the duplicate's edges move to the canonical and their edge-keyed mass functions move with them; when the canonical is a PUBLIC claim the caller cannot write (reachable with claims:admin only), the moved mass functions are owned by their writers' groups (public) and the canonical's frame assignments are created through an audited path (a duplicate bound to binary_truth at a non-zero hypothesis_index cannot pass that binding to such a canonical: the call is refused with nothing written). Use REST endpoint POST /api/v1/claims/:id/dedup for audit-trail provenance."
     )]
     async fn mark_duplicate(
         &self,
@@ -1334,6 +1431,87 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         crate::tools::supersede::mark_duplicate(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Reverse a mark_duplicate: the claim is current again (supersedes cleared, re-embedded best-effort), its same_as identity edge is retracted, and the dedup's repair is undone from the record the repair kept (edges re-pointed back onto it, its mass functions returned with their old ownership, edges and mass functions the repair retracted or deleted restored, frame bindings it added to the canonical removed); both claims' belief is then re-derived. Rows a later write has changed are left as they are and counted as drifted. WHO MAY: as mark_duplicate (scope claims:write, and write authority over the duplicate's AND the canonical's owning groups, or claims:admin); the caller's authority is proved on a transaction stamped with its own identity, then the act and the reversal commit together on the server's administrative connection, audited as cause \"undedup\" naming the caller. Only a claim a dedup marked (one with an in-force same_as identity edge to the claim it supersedes, and a recorded repair or a still-pending one, or a legacy fuzzy_dedup_claims mark whose edge backfill_dedup_identity_edges reconstructed: nothing to restore, reported as cascade.touched.legacy_mark) can be un-marked; anything else is refused with nothing written and the reason. A canonical superseded or consolidated since the mark is followed to its current replacement (current_canonical_id) and the duplicate is restored against it; the caller needs the same write authority over every claim of that chain as over the canonical. REQUIRES the administrative connection: an un-mark cannot be deferred to the replay, so a server without it refuses the call before writing anything."
+    )]
+    async fn unmark_duplicate(
+        &self,
+        Parameters(params): Parameters<crate::types::UnmarkDuplicateParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::supersede::unmark_duplicate(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Plan a label-family dedup pass over an operational INDEX family (label dedup is index bookkeeping, never a merge of knowledge claims: mark those one by one with mark_duplicate). READ-ONLY. The family and its rules come from a dedup profile (schema label-dedup-profile/v2, every family declared family_kind 'index') pinned by profile_hash, and every family it names must be on this server's index-family allowlist (EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES; empty refuses all, FAMILY_NOT_ALLOWED / FAMILY_NOT_INDEX before any read): on stdio a profile_path under this server's profile root (EPIGRAPH_MCP_PROFILE_ROOT), and profile_hash must equal the server's pin (EPIGRAPH_MCP_PROFILE_PIN) when one is set; over HTTP inline profile_json. Reads every CURRENT family claim YOU can read (rows you cannot read are invisible), in id order, up to max_claims (default and server cap 5000; a larger request is clamped and reported), each with the duplicates its own owner already marked onto it (their fields, such as a later deadline, count where the claim's own do; another owner's are ignored and listed in coverage.foreign_duplicates_ignored). Returns plan_hash, coverage (members, truncated, snapshot_at), hygiene, clusters (survivor, losers, carried ids), review_pairs, vetoed_chains, past_due, lifecycle, signal sections, the write units apply would run (label writes, and per cluster the losers it marks duplicates of the survivor), write_check (per write target, whether your identity may write it) and unit_check (per unit, whether it is predicted to apply: every member owned, ONE owner across the cluster, else review, and per mark whether your own write authority admits the dedup act). plan_hash covers profile_hash, run_tag, as_of, sections and the units (marks included) only."
+    )]
+    async fn plan_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::PlanLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::plan_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Apply a label-family dedup plan you reviewed. Takes the plan_label_dedup arguments plus plan_hash. Re-plans from live state first and writes nothing when the family read was truncated (refused TRUNCATED) or the fresh plan_hash differs (refused PLAN_DRIFT, with the fresh plan to review). Otherwise runs each unit in ONE transaction as your write identity: a cluster MARKS every loser a duplicate of its survivor through mark_duplicate's act (the loser becomes non-current, keeps its labels and evidence, and gains a same_as identity edge whose properties.dedup records this tool, the matching tier, run_tag and plan_hash; the cascade runs on the administrative connection or is deferred), then writes the survivor's labels; a hygiene, close-out or lifecycle unit writes labels through the update_labels path. A cluster of more than one owner is never marked, whatever your grant: it fails CROSS_OWNER_MEMBER and is listed in review. Every member and every write target must be yours (CROSS_OWNER_MEMBER / TARGET_NOT_OWNED); over HTTP claims:admin passes ownership, but a mark still needs your own write authority, as mark_duplicate's: you must write the duplicate and the group that owns the (still current) canonical (MARK_REFUSED otherwise). A refused unit writes nothing and later units continue. Returns status applied | nothing_to_do | refused, per-unit results, counts, review, applied_marks and applied_units (every label each committed write actually changed): pass both to revert_label_dedup to undo the apply (its un-marks need the administrative connection, which request-serving servers do not hold, so there a mark is one-way)."
+    )]
+    async fn apply_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::ApplyLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::apply_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Classify up to 100 would-be claims against a label family before filing them. READ-ONLY. Same profile arguments as plan_label_dedup. Each candidate gets verdict new (file it), match (an auto-merge rule matched a live member: matched_id, tier), review (similar, a human decides), or match_only (matched only a closed signal, with include_closed_signals). Reads only claims you can read; a family read that hit max_claims is refused (TRUNCATED) rather than answered new."
+    )]
+    async fn probe_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::ProbeLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::probe_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Undo one apply_label_dedup from its own response: pass its applied_units and applied_marks verbatim. With marks, it runs only on a server holding the administrative (maintenance) connection; request-serving servers refuse it (a label-only revert runs anywhere). Nothing is written until every un-mark is proved admissible: the server's administrative connection (ADMIN_CONNECTION_REQUIRED), and per un-mark unmark_duplicate's own gate with the claim still carrying the mark the apply made (same canonical and identity_edge; a canonical itself marked must be un-marked earlier in the same call), else UNMARK_REFUSED naming each. Then reverses the label writes (newest first, each through the update_labels path), then un-marks each duplicate (newest first, through unmark_duplicate). Every step takes the gates its single-claim tool takes. Returns status reverted | partial and every step with its outcome."
+    )]
+    async fn revert_label_dedup(
+        &self,
+        Parameters(params): Parameters<crate::types::RevertLabelDedupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::revert_label_dedup(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "The label-dedup index view. READ-ONLY. For up to 100 canonical claim ids, each canonical with every claim marked a duplicate of it (followed down a chain of marks): a marked duplicate leaves the index family yet keeps its own fields, so read a cluster's latest deadline or extra ids here. Only claims you can read are returned; an unreadable canonical is listed in missing. Each duplicate carries its agent_id. Like the plan, a duplicate whose author has another owner than the canonical's is left out and listed in foreign_duplicates_ignored (same_owner_only, default true; false returns every duplicate). max_claims caps the duplicates read (default and server cap 5000; truncated when hit)."
+    )]
+    async fn label_dedup_index_view(
+        &self,
+        Parameters(params): Parameters<crate::types::LabelDedupIndexViewParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::label_dedup::label_dedup_index_view(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -1396,7 +1574,7 @@ impl EpiGraphMcpFull {
     // ── Provenance (1 tool) ──
 
     #[tool(
-        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order."
+        description = "Get the provenance lineage for a claim — all ancestor claims, evidence, and reasoning traces in topological order. Walks derivation edges only: supports/elaborates/decomposes_to (incoming) and supersedes (to the predecessor the claim replaced). Contradicts, refutes and cross-source corroborations are not ancestry and are not walked — use get_neighborhood for those."
     )]
     async fn get_provenance(
         &self,
@@ -1461,7 +1639,11 @@ impl EpiGraphMcpFull {
                        success the sources are no longer current, so repeating the call fails \
                        with 'source ... is not current', which means the first call landed. If \
                        this agent already holds a claim with identical merged_content, that \
-                       claim is returned with already_existed=true and nothing changes."
+                       claim is returned with already_existed=true and nothing changes. \
+                       Unlike mark_duplicate, it writes no same_as identity edge, carries no \
+                       belief inputs over to the merged claim, and has no un-mark: when one \
+                       existing claim already says it all, mark the others duplicates of it \
+                       instead (docs/conventions/duplicates-and-index-hygiene.md)."
     )]
     async fn consolidate_claims(
         &self,
@@ -1530,7 +1712,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 claim with a live refutation lands in open_question."
+        description = "Recall relevant memories using semantic search with epistemic quality scoring. Optional theme_id / theme_label (from list_themes) PINS the candidate pool to one theme's members in SQL — on the hybrid dense leg, the hybrid lexical leg, and the embedder-down lexical fallback alike — before each leg's LIMIT, and echoes the resolved theme back as theme_scope. Unlike recall_with_context's diverse=true, which picks themes internally by centroid similarity and exposes neither the choice nor a way to override it. With offset, walks one theme to exhaustion: the response's paging.more_available (derived from the SQL page size, not the post-filtered results) is the stop condition, because min_truth / exclude_contested run after the page and can empty it while pages remain. theme_id/theme_label and offset are both rejected alongside include_workflows=true — workflows carry no theme_id and have no page-consistent counterpart. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 claim with a live refutation lands in open_question."
     )]
     async fn recall(
         &self,
@@ -1543,7 +1725,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Paragraph-primary semantic search over the claim graph with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, and CORROBORATES neighbors. Auto-detects centroid_dim (1536 vs 3072) by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest paragraphs belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — and contest wins over truth_value, so a 0.9 paragraph with a live refutation lands in open_question."
+        description = "Semantic search over every embedded claim in the graph (paragraphs, atoms, sections, workflow steps, submit_claim / memorize claims) with batched structural context: parent paper, parent section, child atoms (with cross-paragraph bridges; each atom carries its authored truth_value and its belief_score, the effective belief on the same scale as the hit's own belief_score), sibling paragraphs, neighbor paragraphs reachable via continues_argument / atom-bridge / atom-atom-bridge, CORROBORATES neighbors, and epistemic-edge neighbours (epistemic_edges: supports / refutes / contradicts / specializes / elaborates / cites, each with relationship, direction incoming|outgoing, truth_value; capped per relationship by epistemic_limit, default 4; epistemic_edges_total / _truncated report the full count). Parentage is enrichment, not eligibility: a hit with no paper attribution omits `paper` and has `section: null`. atoms, siblings and neighbor_paragraphs are built from the paper hierarchy, so only level-2 paragraph hits get them filled (an atom or section hit still carries `paper`, with those lists empty); corroborates and epistemic_edges come from the hit's own edges at any level, with or without a paper. `paragraph_id` is the hit's claim id whatever its level. Auto-detects centroid_dim (1536 vs 3072) from all embedded claims by default. Set diverse=true (optional max_themes, diversity_weight) to spread results across multiple themes via submodular selection — falls back to flat ANN (same response shape, no indication in it) when the corpus has no themes yet, or when fewer than half of the query's nearest claims belong to the max_themes themes it would draw from, so a partial or stale theme set cannot crowd out relevant unthemed results. epistemic_partition=true CHANGES THE RESPONSE SHAPE: `results` is omitted and the same hits come back grouped under `epistemic_partition` as confirmed / uncertain / open_question. diversity_radius (cosine distance, (0.0,2.0], try 0.15) drops any hit too close to a better-ranked one already kept — it SHRINKS the page rather than back-filling, and hits with no measurable distance (workflow hits, unembedded claims, the embedder-down lexical leg) are always kept. The grouping is post-retrieval and order-preserving — same set, same ranking within each bucket — buckets read each hit's belief_score (the value min_truth gates on, not the authored truth_value), and contest wins over score, so a 0.9 paragraph with a live refutation lands in open_question."
     )]
     async fn recall_with_context(
         &self,
@@ -1556,7 +1738,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent."
+        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent. With 'supersedes' the new claim records supersedes = parent and the administrative Supersede cascade (as supersede_claim runs it) carries the retired step's edges onto it; the response's `cascade` reports it (status applied; deferred, for the replay timer to apply, when this server has no maintenance connection; or failed, and replayable), with `belief_cascade`. The workflow's `executes` edge, its step chain (`step_follows` / `phase_follows`), the lineage's `revises` history and other agents' `asserts` / `AUTHORED` stay on the retired step. 'revises' retires nothing and runs no cascade. Authority: when any workflow executes the parent's step lineage (the parent or any claim sharing its step_lineage_id, retracted `executes` edges included), over HTTP the caller needs workflow authority over EVERY such workflow, as add_step and delete_step need over theirs: its recorded submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter admits only the audited admin path. Anyone else is refused with nothing written, and the refusal names the workflow and its submitter. Each admitted write is recorded as one workflows.caller_write (or workflows.admin_write) security event per workflow. A claim no workflow executes is unaffected, and stdio callers are not checked."
     )]
     async fn evolve_step(
         &self,
@@ -1572,7 +1754,7 @@ impl EpiGraphMcpFull {
     // ── Ingestion ──
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms; the path must be inside the server's working directory). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Same writer and same ASYNCHRONOUS contract as ingest_document_inline (read it): a write-authority refusal is a synchronous error with nothing written; otherwise the call returns {status: 'queued', paper_id, document_key} and the all-or-nothing walk runs in the background, where any failure (verbatim guard, malformed axis, a rejected row) reaches only the server log. Confirm it landed by query_paper(document_key)'s claim_count rising, not by the paper existing. Re-runs converge on existing nodes, so retrying is safe."
+        description = "Ingest a hierarchical DocumentExtraction JSON file (thesis -> sections -> paragraphs -> atoms; the path must be inside the server's working directory). Creates a paper node, claims at each level, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms. Same writer and same ASYNCHRONOUS contract as ingest_document_inline (read it): a write-authority refusal is a synchronous error with nothing written; otherwise the call returns {status: 'queued', paper_id, document_key} and the all-or-nothing walk runs in the background, where any failure (verbatim guard, malformed axis, a rejected row) reaches only the server log. Confirm it landed by query_paper(document_key)'s claim_count rising, not by the paper existing. Pass wait: true (preferred for a single document) to run the walk in the request instead: the call then returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, so a failed walk is reported to you rather than only logged; that result's `doi` field is the document_key. Re-runs converge on existing nodes, so retrying is safe."
     )]
     async fn ingest_document(
         &self,
@@ -1599,7 +1781,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: on any error (including a refusal because the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write its personal group) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. A node another author already wrote is reused, never rewritten; converged_claims_unlabelled counts reused nodes you could not give this document's doi: label."
+        description = "Phase 1 of the two-phase ingest flow. Ingests a DocumentExtraction with EMPTY atoms (e.g. output of structure_source): writes thesis + sections + paragraphs into the graph, ignores atom fields. Returns new_paragraph_paths — the paths (e.g. 'sections[0].paragraphs[1]') of paragraphs that are NEW to this ingest. Atomize only those paragraphs (LLM cost saved on already-ingested paragraphs), then call ingest_document_inline with atoms for those paths. Idempotent PER DOCUMENT: structural nodes are keyed on (document title, structural path, text), so re-running spine on a paper whose abstract was already ingested returns the abstract paragraphs in paragraphs_deduped and the new body paragraphs in new_paragraph_paths. A DIFFERENT paper that happens to share a section heading or a boilerplate paragraph does NOT dedup against it — each document owns its own spine. SYNCHRONOUS and all-or-nothing: the nodes are authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked. On any error (including a refusal because that agent cannot write the owning group: an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) no claims or edges are written, and retrying is safe. It writes the paper's processed_by edge, so check_already_ingested reports true from here on, before any atoms exist. An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every node this call writes, in addition to the document's own doi: label. A node another author already wrote is reused, never rewritten, and never gets your caller `labels` (only the doi: label); converged_claims_caller_labels_withheld counts those, and converged_claims_unlabelled counts reused nodes you could not give any of this document's labels (doi: and caller `labels`) because their owner group is one you cannot write."
     )]
     async fn ingest_document_spine(
         &self,
@@ -1615,7 +1797,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously — if the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write its personal group (membership revoked or read-only) it returns an error and writes nothing — then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and if its owner group is one you cannot write it does not get this document's doi: label. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest (in the background task, so only the server log shows it) rather than silently falling back to binary."
+        description = "Ingest a hierarchical DocumentExtraction passed INLINE (thesis -> sections -> paragraphs -> atoms) — same writer as `ingest_document` but the typed `extraction` is in the call, not a file path, so the full shape is self-documenting and no file write is needed (use this from MCP-only clients). Creates a paper node, claims at each level down to atoms, decomposes_to / section_follows / supports / contradicts / refines edges, evidence, traces, embeddings, and CDST mass functions for atoms (the mass functions are wired after the claims commit, best-effort). ASYNCHRONOUS: the call first checks write authority synchronously. Every claim is authored by the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) and owned by that agent's personal group, or by its operator's personal group when the agent is operator-linked; if that agent cannot write the owning group (an operator revoked the membership, it is read-only, or the agent is not bound to an operator where binding is enforced) the call returns an error and writes nothing. It then creates the paper row and returns {status: 'queued', paper_id, document_key}, and everything else is written by a background task. That task is all-or-nothing: if it fails (verbatim-guard mismatch, malformed axis, a rejected row) the error reaches only the server log, no claims or edges are written, and retrying is safe. To confirm it landed, compare query_paper(document_key)'s claim_count before and after: the paper row exists as soon as the call returns, so finding the paper proves nothing, and check_already_ingested is already true after ingest_document_spine or any earlier ingest of the same document. WAIT MODE (preferred for a single document): pass wait: true and the call runs that same walk in the request, after the same write-authority check, and returns the walk's own result (claims_ingested, claims_skipped_dedup, relationships_created, ...) instead of {status: 'queued'}; a failed walk (verbatim-guard mismatch, malformed axis, a rejected row) is returned to you as an error with no claims or edges written, and retrying is safe. The wait-mode result's `doi` field is the document_key to query and label with. Idempotent per document: structural nodes (thesis/section/paragraph) are keyed on (document title, structural path, text) and atoms on content hash, so re-ingesting a full paper after its abstract was ingested is safe — existing nodes are reused and only new content is written. Structural nodes are NOT shared between documents; atoms still converge across documents by design: an atom another author already stored is reused, never rewritten, and never gets your caller `labels` (only this document's doi: label); if its owner group is one you cannot write it gets none of this document's labels (doi: and caller `labels`). An optional top-level `labels` array on the extraction (e.g. a stage tag) is applied to every claim this call writes, in addition to the doi: label; a label containing an unexpanded shell variable (`$`) is refused synchronously, before anything is written. For AUTHORED records (an ELN entry, run summary, or other content with no external source to quote) omit the top-level source_text: the verbatim guard is then skipped and this is a supported SINGLE-CALL path — structure_source / ingest_document_spine are NOT required and exist only to re-verify EXTRACTED text byte-for-byte. For the two-phase flow that saves LLM atomization cost on extracted papers, use ingest_document_spine first. By default every atom's CDST mass function is placed on the binary {TRUE, FALSE} frame. To place atoms on a genuinely multi-valued field axis instead — an ordinal scale like {ineffective, mild, moderate, strong} or a categorical partition like {vata, pitta, kapha} — declare `axis: {frame, hypotheses, label}` on a paragraph (or on a section, inherited by its paragraphs), with optional per-atom `axis_labels` positionally overriding `label`. A binary opposition (safe/harmful) does NOT need an axis: model it as a proposition on {TRUE, FALSE} where harm is mass on FALSE. Frames dedupe by name, so one frame name must always mean one ordered hypothesis list; a malformed or inconsistent axis fails the ingest rather than silently falling back to binary (detached, only the server log shows it; with wait: true it is returned to you as an error)."
     )]
     async fn ingest_document_inline(
         &self,
@@ -1667,7 +1849,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: supports, corroborates, elaborates, generalizes, specializes (these STRENGTHEN the target's belief), contradicts, refutes (these WEAKEN it); cites is also accepted as a structural edge that moves no belief. Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: positive: supports, corroborates, elaborates, generalizes, specializes (they transmit the source's belief toward the target); negative: contradicts, refutes (they transmit it against the target); cites is also accepted as a structural edge that moves no belief, and so is qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief) — use it instead of contradicts for a caveat that limits where the target holds without saying it is false. For a positive edge polarity is not a guarantee of direction: the edge carries the source's whole belief interval, scaled by the relationship's factor, so the source's doubt travels with its belief, both its disbelief (1 - plausibility) and its open-world (frame-incompleteness) mass. So a positive edge can LOWER the target's belief and pignistic_prob when the source is weakly believed or frame-incomplete (open-world mass hits hardest when the target carries open-world mass of its own); read target_belief rather than assuming a rise. A negative edge means mutual exclusion (source and target cannot both be true): only the source's belief arrives, scaled by the relationship's factor, as disbelief in the target, together with the source's open-world mass; the source's disbelief transfers nothing. So a negative edge puts no mass on the target being true, a weakly believed or disbelieved source barely moves its target, and a negative edge cannot RAISE the target's belief or pignistic_prob (beyond the renormalisation of open-world mass the target already carries, which combining any new mass function causes). Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the source's restricted mass is vacuous (e.g. a contradictor with ~no belief), the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). belief_wired_reason names which, and is omitted when belief_wired is true: source_has_no_belief, vacuous_source_mass, already_wired, structural_relationship, or refused_or_failed (a refused or failed wiring). Two further values are defensive and appear only when the edge or its source changes underneath the call (a concurrent retraction or removal): edge_retracted and source_author_unresolved. target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn link_epistemic(
         &self,
@@ -1761,7 +1943,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state, per-frame, in deterministic frame-name order. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: recompute_claim_belief."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state. Each claim's cache is written from ONE owner frame, chosen among the frames holding the claim's input BBAs (stored combination results are not inputs): binary_truth if the claim has an input there, else claim_validity, else the frame the cache already records (belief_frame_id) while it still holds an input, else the frame holding the claim's earliest input (ties by frame id). No other frame name plays a part, and no frame is created. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: recompute_claim_belief."
     )]
     async fn recompute_beliefs(
         &self,
@@ -1779,7 +1961,7 @@ impl EpiGraphMcpFull {
     // ── Workflows (8 tools) ──
 
     #[tool(
-        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. The steps are filed under a phase titled 'Body'; its rows (and the step rows) are scoped to this workflow, so phase and step texts shared with other workflows do not conflict. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing."
+        description = "Store a new workflow with ordered steps and prerequisites. Returns a workflow_id from the hierarchical `workflows` table — NOT a claim id, so `get_claim` on it 404s. Retrieve it with `find_workflow` (which searches both stores) or `find_workflow_hierarchical`. Use `report_workflow_outcome` with the returned id to record execution results. All-or-nothing: on any error nothing is written. The steps are filed under a phase titled 'Body'; its rows (and the step rows) are scoped to this workflow, so phase and step texts shared with other workflows do not conflict. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none."
     )]
     async fn store_workflow(
         &self,
@@ -1793,7 +1975,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array."
+        description = "Search for existing workflows by goal using semantic search. Searches BOTH workflow stores — flat `workflow`-labelled claims and hierarchical `workflows` rows (what `store_workflow` / `ingest_workflow` write) — and returns one list ranked by similarity. Hierarchical workflows whose steps cannot be resolved are withheld rather than returned with an empty `steps` array. For a hierarchical result, `steps` is the frozen plan text recorded at ingest, not the current step versions: `has_evolved_steps` is true when a step has since been evolved (evolve_step), `evolved_steps` lists each such step with its current head (`head_claim_id`, `head_content`: the newest head with is_current=true, the one evolve_step acts on; `is_current` is false when every head of that step is retired; `pending_resolution` when concurrent heads exist), and `latest_generation` is the newest generation of the same canonical_name (a newer generation exists when it exceeds `generation`). Use find_workflow_hierarchical with resolve_to_latest=true for the full per-step head view."
     )]
     async fn find_workflow(
         &self,
@@ -1843,7 +2025,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record what actually happened when you used a workflow. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows, no evidence, no belief change, NOT idempotent, and execution_log[].step_index mapped to the steps in original plan order. Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe). On a PUBLIC flat workflow claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most shared workflows), the outcome evidence and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public, the claim's cached belief is recombined through an audited path when it carries binary_truth or has no cache (cache_written; warning otherwise), and the claim's truth_value is NOT written (truth_written=false, truth_after=truth_before). A group-private workflow claim the calling agent cannot write is refused."
+        description = "Record what actually happened when you used a workflow. success=true means the workflow's goal was achieved (every gate and check passed), not merely that every step ran; a run whose gates or checks failed is success=false. For a workflows-table id (what `store_workflow` / `ingest_workflow` return) it delegates to `report_hierarchical_outcome` and has that tool's response and semantics: counters plus per-step rows written all-or-nothing (an error writes nothing), no evidence, no belief change, NOT idempotent (do not retry a call that succeeded), and execution_log[].step_index mapped to the steps you can read in original plan order (an index that matches none is recorded with a null step_claim_id and listed in unresolved_step_indices). Legacy flat workflow claim IDs are still supported: there the run is recorded as evidence plus a Dempster-Shafer truth update, all-or-nothing (an error writes nothing, so an identical retry is safe). On a PUBLIC flat workflow claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write (most shared workflows), the outcome evidence and its BBA are owned by the calling agent's own group (its operator's group for an operated agent) and stay public, the claim's cached belief is recombined through an audited path when it carries binary_truth or has no cache (cache_written; warning otherwise), and the claim's truth_value is NOT written (truth_written=false, truth_after=truth_before). A group-private workflow claim the calling agent cannot write is refused."
     )]
     async fn report_workflow_outcome(
         &self,
@@ -1857,7 +2039,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Deprecate a workflow (and, with cascade, its lineage), all-or-nothing. A flat workflow claim gets truth 0.05 and is_current=false (cascade follows its variant_of / supersedes claims). A hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return) retires the workflow as a unit: its `workflows` row gets truth 0.05, and its thesis, phase and step claims are retired (is_current=false, embeddings removed) unless another live workflow still executes them, in which case they are kept and listed in kept_shared_claim_ids; operation atoms are never retired, since their ids are shared globally. With cascade, every later generation or variant linked to it as parent is deprecated in the same call. Over HTTP a hierarchical workflow can be deprecated only by its submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter (created before batch H-b) only through that admin path; stdio callers are not checked; a refusal writes nothing. The response lists only what changed: deprecated_ids (workflow ids whose state changed; a re-run lists none) and retired_claim_ids. An id that is neither a claim you can read nor a workflows row is an error. Known limitation: a retired thesis, phase or step claim is not revived when a later generation or add_step reuses its exact text, so that workflow then executes a non-current claim."
+        description = "Deprecate a workflow (and, with cascade, its lineage), all-or-nothing. A flat workflow claim gets truth 0.05 and is_current=false (cascade follows its variant_of / supersedes claims). A hierarchical workflow id (what store_workflow, ingest_workflow, find_workflow and find_workflow_hierarchical return) retires the workflow as a unit: its `workflows` row gets truth 0.05, and its thesis, phase and step claims are retired (is_current=false, embeddings removed) unless another live workflow still executes them, in which case they are kept and listed in kept_shared_claim_ids; operation atoms are never retired, since their ids are shared globally. With cascade, every later generation or variant linked to it as parent is deprecated in the same call. Over HTTP a hierarchical workflow can be deprecated only by its submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter (created before batch H-b) only through that admin path; stdio callers are not checked; a refusal writes nothing. Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). The response lists only what changed: deprecated_ids (workflow ids whose state changed; a re-run lists none) and retired_claim_ids. An id that is neither a claim you can read nor a workflows row is an error. Known limitation: a retired thesis, phase or step claim is not revived when a later generation or add_step reuses its exact text, so that workflow then executes a non-current claim."
     )]
     async fn deprecate_workflow(
         &self,
@@ -1878,7 +2060,7 @@ impl EpiGraphMcpFull {
     // variants independently of its workflow root.
 
     #[tool(
-        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. Thesis, phase and step claims are scoped to this canonical_name, so texts another workflow already uses do not conflict; operation atoms are shared across workflows and documents by text. Within one workflow, do not reuse the thesis text as a phase summary (phase text is the summary, or the title when the summary is empty): the two would resolve to the same claim. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and a parent_canonical_name is checked against exactly the parent row it links (generation - 1). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing."
+        description = "Ingest a hierarchical WorkflowExtraction: persists thesis → phases → steps → operation atoms as claim nodes, writes `executes` edges from the workflow root to every planned claim (recording plan order), and resolves author identities. All-or-nothing: on any error nothing is written. Idempotent: re-ingesting the same canonical_name+generation is a no-op. Thesis, phase and step claims are scoped to this canonical_name, so texts another workflow already uses do not conflict; operation atoms are shared across workflows and documents by text. Within one workflow, do not reuse the thesis text as a phase summary (phase text is the summary, or the title when the summary is empty): the two would resolve to the same claim. The workflow records its submitter, the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may later add or delete its steps or add a generation; a re-ingest never changes the recorded submitter. Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A NEW generation of a canonical_name that already has rows is a generation of that lineage whether or not parent_canonical_name is set: over HTTP it needs the same authority over the lineage's latest generation and inherits its submitter, and every new generation is checked against exactly the row it links as parent. A new generation links to its parent: the parent_canonical_name row at generation - 1 when it exists, otherwise (no parent named, or this same lineage named at a missing generation) the highest existing generation of this canonical_name below it. A generation above 0 with no steps is refused (invalid params, nothing written), and so is an extraction with no thesis and no phases at any generation; steps under an unrecognised key are ignored and count as no steps. Generation 0 with a thesis and no steps is accepted (the store_workflow scaffold). A lineage with no recorded submitter (created before batch H-b) is platform corpus: over HTTP only the audited claims:admin path may add a generation to it or link a variant to it as parent, and the new row records no submitter either. A refusal writes nothing. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none. TENANCY: by default every claim the call creates is public. With tenancy={\"visibility\":\"group\",\"owner_group_id\":G} every claim it creates, and its executes edges, are readable only by live members of G; the calling agent ITSELF must hold a live writer or admin membership of G (its operator's membership does not count) and so must the workflow-ingest system agent, otherwise the call is refused and nothing is written. Claims the plan reuses keep their own tenancy and are listed in the response's reused_items ({claim_id, visibility, owner_group_id}), on a re-ingest too; reused_items is present only when tenancy is given. A plan that reuses an existing claim private to a group you do not yourself write is refused and writes nothing; on a re-ingest (nothing is written) such a claim is listed with a null tenancy. The workflows row itself (canonical_name, goal, metadata, and the goal embedding unless embed=false) stays readable instance-wide whatever the tenancy, so keep those neutral. embed=false (default true) embeds nothing: no claim or goal text is sent to the embedding provider."
     )]
     async fn ingest_workflow(
         &self,
@@ -1892,7 +2074,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation. Same all-or-nothing behaviour as ingest_workflow; texts unchanged from the parent are reused, not duplicated. Over HTTP, requires authority over the parent lineage when it records a submitter (the submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused); batch H-b), and the new generation inherits that submitter; a lineage with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may improve it, and the new generation records no submitter either (stdio callers are not checked)."
+        description = "Create a generation-incremented hierarchical variant of an existing workflow. Looks up parent by canonical_name, finds its latest generation, and ingests the new extraction with generation = parent + 1 and parent_canonical_name linked. Same-lineage improvement only: the new variant's canonical_name and parent_canonical_name are both set to the tool's `parent_canonical_name` param; cross-lineage variants are not supported. Each call produces a new generation, so the extraction must carry at least one step: an extraction with no steps (including steps under an unrecognised key, which are ignored) is refused as invalid params and mints no generation; fix the payload rather than retrying it. Same all-or-nothing behaviour as ingest_workflow; texts unchanged from the parent are reused, not duplicated. Over HTTP, requires authority over the parent lineage when it records a submitter (the submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused); batch H-b), and the new generation inherits that submitter; a lineage with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may improve it, and the new generation records no submitter either (stdio callers are not checked). Every generation the submitter or its operator adds over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for and the parent lineage's workflow (the rows themselves stay authored by the workflow-ingest system agent). AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none."
     )]
     async fn improve_workflow_hierarchy(
         &self,
@@ -1906,7 +2088,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps."
+        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps. With resolve_to_latest=true the true lineage head (highest generation of each matched canonical_name) is always present and flagged `is_lineage_head`, even when its goal no longer matches the query or it is deprecated (`lineage_head_deprecated`)."
     )]
     async fn find_workflow_hierarchical(
         &self,
@@ -1919,18 +2101,21 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them; steps added with add_step come after all planned steps). Writes no evidence and changes no belief. NOT idempotent: every call adds to the counters and rows, so do not retry a call that succeeded. Not all-or-nothing either: the counters are written first, a per-step row that fails is skipped (step_executions_written says how many landed), and an out-of-range step_index is stored with a null step_claim_id. There is no ownership check on the workflow. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
+        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them; a step add_step left without a plan_index comes after every indexed step). Writes no evidence and changes no belief. All-or-nothing: the counters and every step row commit together, so an error (including a step row the database refuses) writes nothing and step_executions_written always equals the number of step_executions sent; a `quality` outside [0, 1] is refused before anything is written. NOT idempotent: every successful call adds to the counters and rows, so do not retry a call that succeeded (a call that returned an error wrote nothing and can be retried). Each step_index is resolved against the steps YOU can read: a step_index that is out of range, or whose step is not visible to you (for example a group-private step outside your groups), is stored with a null step_claim_id, and the response lists it in unresolved_step_indices with a warning (the two causes are not told apart). A non-blank goal_text is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow. There is no ownership check on the workflow, but a caller that can read none of its plan (none of its executes edges) gets the same not-found error as an unknown id, and nothing is written. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(
         &self,
         Parameters(params): Parameters<ReportHierarchicalOutcomeParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
-        tools::workflow_hierarchical::report_hierarchical_outcome(self, params).await
+        tools::workflow_hierarchical::report_hierarchical_outcome(self, viewer, params).await
     }
 
     #[tool(
-        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. `position` does NOT change plan order: find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome all place an added step AFTER every originally planned step (added steps in the order they were added). Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing. The step row is scoped to this workflow, so a step text another workflow already uses does not conflict. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written."
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. plan_index in the response is where the step sits in plan order (the order find_workflow, find_workflow_hierarchical, get_workflow_plan and the step_index of report_workflow_outcome / report_hierarchical_outcome use). An append to a workflow whose every executes edge the workflow-ingest stamp can read is public gets one past the largest plan_index it can read, and nothing moves. Every other add (an insert; an append to a workflow with a non-public executes edge, or with no integer plan_index) is left unindexed: plan_index is null, no index changes, and plan order lists the step after every indexed step, while for an insert the step_follows chain has it at slot i. Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing. The step row is scoped to this workflow, so a step text another workflow already uses does not conflict. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none."
     )]
     async fn add_step(
         &self,
@@ -1946,7 +2131,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written."
+        description = "Soft-delete a workflow step by step_lineage_id. Sets the head claim's truth_value to 0.05; default min_truth filters hide it from active queries while preserving history. Does not rewire the step_follows chain. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written."
     )]
     async fn delete_step(
         &self,
@@ -2164,7 +2349,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it. The belief is recomputed by the same adaptive combine recompute_beliefs uses: combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the BBA is owned by the calling agent's own group (its operator's group for an operated agent) and stays public; the claim's frame assignment stays owned by the claim's group (created if missing, never changed: an existing hypothesis_index is kept; a missing binary_truth assignment can be created only at hypothesis_index 0, i.e. TRUE, and any other index is refused with nothing written) and its cached belief is recombined over every writer's BBAs through an audited path only on the frame the cache already carries, or on binary_truth when the claim has no cache at all (a warning says when it was not); the claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it; the response's write_outcome says which happened (inserted, unchanged for an identical resubmission that was not combined again, or replaced), deduplicated is true exactly when it is unchanged, and an unchanged or replaced write adds an entry to warnings. The belief is recomputed by the same combine recompute_beliefs uses (a Dempster fold over the claim's BBAs that reports the fold's aggregate conflict as mass_on_conflict): combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the BBA is owned by the calling agent's own group (its operator's group for an operated agent) and stays public; the claim's frame assignment stays owned by the claim's group (created if missing, never changed: an existing hypothesis_index is kept; a missing binary_truth assignment can be created only at hypothesis_index 0, i.e. TRUE, and any other index is refused with nothing written) and its cached belief is recombined over every writer's BBAs through an audited path only on the frame the cache already carries, or on binary_truth when the claim has no cache at all (a warning says when it was not); the claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn submit_ds_evidence(
         &self,
@@ -2178,7 +2363,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation."
+        description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation. A `shadow` object appears only when the server runs with EPIGRAPH_COMPOUND_BELIEF=shadow: the claim's atom-level view beside the served values, which it does not change. basis=derived: computed from N visible atoms (shadow.derived.leaves_used); not evidence about this claim; never cite or resubmit as evidence."
     )]
     async fn get_belief(
         &self,
@@ -2245,7 +2430,7 @@ impl EpiGraphMcpFull {
     // ── Sheaf (3 tools) ──
 
     #[tool(
-        description = "Check CDST sheaf consistency across all claims. Computes per-node consistency radii using restriction maps — identifies claims whose local belief diverges from what their epistemic neighbors would predict. Returns sections sorted by inconsistency (worst first). Use this to find belief staleness, local contradictions, and open-world spread in the knowledge graph."
+        description = "Check CDST sheaf consistency across all claims. Scans every claim's whole in-force epistemic neighbourhood (relationship names matched case-insensitively) and computes per-node consistency radii using restriction maps — identifies claims whose local belief diverges from what their epistemic neighbors would predict. Supporting neighbours (supports, elaborates, specializes, generalizes, corroborates) act as a one-sided floor: a claim is flagged only when its belief sits BELOW the strongest supporter's discounted belief, never for being over-supported. supports, elaborates, specializes and generalizes constrain only their target, not their source; corroborates constrains both ends. Refuting, contradicting and frame neighbours are scored symmetrically. `profile` selects the restriction factors. Returns sections sorted by inconsistency (worst first); `limit` caps the output, not the scan. Use this to find belief staleness, local contradictions, and open-world spread in the knowledge graph."
     )]
     async fn check_sheaf_consistency(
         &self,
@@ -2345,20 +2530,22 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536. Default `wipe_first=true` ensures clean rebuilds on each call. Pass `false` only for additive runs with a unique `label_prefix` (otherwise duplicate themes accumulate — see backlog: missing UNIQUE constraint on claim_themes.label)."
+        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536, wipe_first=false (additive: new themes are added alongside the existing set, and repeated runs under one label_prefix accumulate duplicate labels). `wipe_first=true` deletes EVERY existing theme, whatever its prefix, and clears every claim's theme assignment before rebuilding: it requires claims:admin and the canonical label_prefix \"auto\", and is refused otherwise with nothing written. To read the current themes use list_themes / get_theme, never this tool."
     )]
     async fn theme_cluster(
         &self,
         Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
         self.reject_if_read_only()?;
-        crate::tools::themes::theme_cluster(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        crate::tools::themes::theme_cluster(self, params, auth).await
     }
 
     // ── RDF Triple Layer (3 tools) ──
 
     #[tool(
-        description = "Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional (omit to wildcard). Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
+        description = "UNPOPULATED INDEX: no pipeline populates the triple/entity index today, so this tool normally returns nothing. Empty results are NOT evidence that the corpus lacks the fact; check the response's index_populated (whether any triple is visible to you) and use recall or query_claims for content questions. Query RDF-style triples extracted from claims. Filter by subject entity, predicate pattern, and/or object entity. All filters optional; an omitted filter matches anything. A subject or object name needs its type (subject_type / object_type), and a name that matches no entity returns no triples and is listed in unresolved. Optional min_confidence threshold (default 0.0, no filtering). Returns triples with source claim references."
     )]
     async fn query_triples(
         &self,
@@ -2371,7 +2558,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Get everything known about an entity — all triples where it appears as subject or object, grouped by predicate. Pass entity name (e.g. 'DNA origami') or UUID."
+        description = "UNPOPULATED INDEX: no pipeline populates the triple/entity index today, so this tool normally returns nothing. Empty results are NOT evidence that the corpus lacks the fact; check the response's index_populated (whether any triple is visible to you) and use recall or query_claims for content questions. Get everything known about an entity — all triples where it appears as subject or object, grouped by predicate. Pass entity name (e.g. 'DNA origami') or UUID."
     )]
     async fn entity_neighborhood(
         &self,
@@ -2384,7 +2571,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search triples via natural language. Uses embedding similarity to find relevant claims, then returns their structured triples. Complements query_triples (structured) with fuzzy discovery."
+        description = "UNPOPULATED INDEX: no pipeline populates the triple/entity index today, so this tool normally returns nothing. Empty results are NOT evidence that the corpus lacks the fact; check the response's index_populated (whether any triple is visible to you) and use recall or query_claims for content questions. Search triples via natural language. Uses embedding similarity to find relevant claims, then returns their structured triples. Complements query_triples (structured) with fuzzy discovery."
     )]
     async fn search_triples(
         &self,
@@ -2438,7 +2625,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, and flips the candidate to stale. Retirement is administrative end to end: the flip, the edge retraction and the derived-row deletes run together on the server's maintenance connection and are audited. Without one nothing changes and the retirement is recorded as a deferred request for the operator's replay (the result's `retired` and `cascade` say which: applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
+        description = "Retire a promoted match candidate: RETRACTS the matcher edge (closes valid_to — the row and its properties.decided_by survive, so the original promoter stays recoverable), deletes the factors/bp_messages/BBAs derived from it, flips the candidate to stale, and, when the retirement withdrew anything (an edge, factor or edge-keyed BBA), re-derives both endpoints' cached belief from the BBAs that survive (an endpoint no BBA backs has its cache cleared; reported as `belief_cascade`, which is empty for a candidate never promoted or already retired). Retirement is administrative end to end: the flip, the edge retraction and the derived-row deletes run together on the server's maintenance connection and are audited. Without one nothing changes and the retirement is recorded as a deferred request for the operator's replay (the result's `retired` and `cascade` say which: applied, deferred or failed). Requires claims:admin, unlike promote/reject on decide_match_candidate: retirement withdraws an assertion another principal made, which is the same class of act as supersession. Honours read-only mode."
     )]
     // `pub` so `tests/matching_tools_smoke.rs` can drive this dispatch body,
     // not just the tool function under it: the maintenance-connection choice
@@ -2529,7 +2716,7 @@ impl EpiGraphMcpFull {
         // `AuthContext`; stdio has none.
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let tools = self.manifest_for(auth.is_some(), auth).await;
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&tools).map_err(crate::errors::internal_error)?,
         )]))
     }
@@ -2571,7 +2758,7 @@ impl EpiGraphMcpFull {
 // Manual `ServerHandler` impl (in lieu of `#[tool_handler]`) so `call_tool`
 // can be wrapped with durable event emission. Mirrors the macro's expansion
 // for `list_tools` and `get_tool` verbatim — see
-// `rmcp-macros-0.15.0/src/tool_handler.rs` for the canonical body.
+// `rmcp-macros/src/tool_handler.rs` (2.2.0) for the canonical body.
 //
 // `call_tool` is the single chokepoint for every MCP tool invocation. We
 // emit one `tool.invoked` event per call (closes #61's tool.invoked
@@ -2580,11 +2767,8 @@ impl EpiGraphMcpFull {
 // dispatch.
 impl ServerHandler for EpiGraphMcpFull {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(Self::server_instructions(self.read_only)),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(Self::server_instructions(self.read_only))
     }
 
     async fn call_tool(
@@ -2617,6 +2801,23 @@ impl ServerHandler for EpiGraphMcpFull {
                 .and_then(|p| p.extensions.get::<crate::auth::RawBearerToken>())
                 .map(|t| t.0.clone());
         }
+        // A DELEGATED run token (`dlg`) is checked FIRST, on every call, before
+        // any other gate, the lineage write or the tool
+        // (`tools::viewer::admit_delegated_call`: one read, none for any other
+        // token). A tool that resolves no viewer is covered like one that
+        // does; the live answer is handed to the tool's own viewer and
+        // ownership checks below (`with_admitted_delegation`).
+        let admitted_delegation =
+            match tools::viewer::admit_delegated_call(self, auth_owned.as_ref(), &request.name)
+                .await
+            {
+                Ok(admitted) => admitted,
+                Err(err) => {
+                    self.emit_tool_invoked(&format!("denied:{}", request.name))
+                        .await;
+                    return Err(err);
+                }
+            };
         // THE CHECK CHOKEPOINT's switch (elevation plan EL-10): whether the
         // caller's admin-only scopes count (`AuthContext::has_scope`). Read
         // before any scope gate, the federated one included, for a token it
@@ -2820,7 +3021,11 @@ impl ServerHandler for EpiGraphMcpFull {
         }
 
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = tools::viewer::with_admitted_delegation(
+            admitted_delegation,
+            self.tool_router.call(tcc),
+        )
+        .await;
         match (elevated, recording) {
             (Some(viewer), Some((tool, arguments, jti))) => {
                 crate::elevated_access::record_elevated_call(
@@ -2896,6 +3101,7 @@ mod scope_guard_tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
         }
     }
 

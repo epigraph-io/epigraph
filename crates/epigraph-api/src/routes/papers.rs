@@ -81,7 +81,8 @@ pub struct PaperResponse {
 /// Query parameters for paper listing
 #[derive(Deserialize, Debug)]
 pub struct PaperListParams {
-    /// Filter by exact DOI
+    /// Filter by DOI: any spelling of one document key (`https://doi.org/…`,
+    /// `doi:…` or bare) matches the same paper
     #[serde(default)]
     pub doi: Option<String>,
     #[serde(default = "default_limit")]
@@ -111,8 +112,10 @@ pub struct PaginatedPaperResponse {
 ///
 /// POST /api/v1/papers
 ///
-/// Inserts a new paper or returns the existing one if the DOI already exists.
-/// Uses `ON CONFLICT (doi) DO UPDATE` to upsert title/journal when provided.
+/// Inserts a new paper under the canonical document key
+/// (`epigraph_db::repos::paper::canonical_document_key`), or returns the
+/// existing one found under any spelling of that key, updating title/journal
+/// when provided.
 #[cfg(feature = "db")]
 pub async fn create_paper(
     State(state): State<AppState>,
@@ -133,11 +136,21 @@ pub async fn create_paper(
 
     use sqlx::Row;
 
-    // Check for existing paper first (papers.doi has btree index but no UNIQUE constraint)
+    // One document key per paper, shared with the MCP ingestion tools
+    // (backlog 90756d26): `https://doi.org/10.x/y`, `doi:10.x/y` and `10.x/y`
+    // are one paper. A new row is stored under the canonical (bare) key; an
+    // existing row is found under any of its spellings, canonical first, so a
+    // row an older writer keyed on the resolver URL is reused rather than
+    // twinned.
+    let doi = epigraph_db::repos::paper::canonical_document_key(&request.doi);
+    let spellings = epigraph_db::repos::paper::document_key_spellings(&request.doi);
+
+    // Check for existing paper first
     let existing: Option<_> = sqlx::query(
-        "SELECT id, doi, title, journal, created_at FROM papers WHERE doi = $1 LIMIT 1",
+        "SELECT id, doi, title, journal, created_at FROM papers \
+         WHERE doi = ANY($1) ORDER BY array_position($1, doi) LIMIT 1",
     )
-    .bind(&request.doi)
+    .bind(&spellings)
     .fetch_optional(&state.db_pool)
     .await
     .map_err(|e| ApiError::DatabaseError {
@@ -145,15 +158,17 @@ pub async fn create_paper(
     })?;
 
     let row = if let Some(existing_row) = existing {
-        // Paper exists — update title/journal if new values provided, then re-fetch
+        // Paper exists — update title/journal if new values provided, then
+        // re-fetch. By id: the row found may be keyed on a legacy spelling.
+        let existing_id: Uuid = existing_row.get("id");
         if request.title.is_some() || request.journal.is_some() {
             sqlx::query(
                 r#"UPDATE papers
                    SET title   = COALESCE($2, title),
                        journal = COALESCE($3, journal)
-                   WHERE doi = $1"#,
+                   WHERE id = $1"#,
             )
-            .bind(&request.doi)
+            .bind(existing_id)
             .bind(&request.title)
             .bind(&request.journal)
             .execute(&state.db_pool)
@@ -162,26 +177,30 @@ pub async fn create_paper(
                 message: format!("Failed to update paper: {e}"),
             })?;
             // Re-fetch updated row
-            sqlx::query(
-                "SELECT id, doi, title, journal, created_at FROM papers WHERE doi = $1 LIMIT 1",
-            )
-            .bind(&request.doi)
-            .fetch_one(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to re-fetch paper: {e}"),
-            })?
+            sqlx::query("SELECT id, doi, title, journal, created_at FROM papers WHERE id = $1")
+                .bind(existing_id)
+                .fetch_one(&state.db_pool)
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to re-fetch paper: {e}"),
+                })?
         } else {
             existing_row
         }
     } else {
-        // New paper — insert
+        // New paper — insert under the canonical key. `ON CONFLICT`: every
+        // spelling now maps to that one key, so a concurrent POST of the same
+        // new document under another spelling collides here; the loser gets
+        // the winner's row instead of a unique violation (a 500).
         sqlx::query(
             r#"INSERT INTO papers (doi, title, journal)
                VALUES ($1, $2, $3)
+               ON CONFLICT (doi) DO UPDATE SET
+                   title   = COALESCE(EXCLUDED.title, papers.title),
+                   journal = COALESCE(EXCLUDED.journal, papers.journal)
                RETURNING id, doi, title, journal, created_at"#,
         )
-        .bind(&request.doi)
+        .bind(&doi)
         .bind(&request.title)
         .bind(&request.journal)
         .fetch_one(&state.db_pool)
@@ -225,11 +244,14 @@ pub async fn list_papers(
     use sqlx::Row;
 
     if let Some(ref doi) = params.doi {
-        // Exact DOI lookup
+        // DOI lookup under every spelling of the document key (the same
+        // normalizer the writer and the MCP tools use), canonical first.
+        let spellings = epigraph_db::repos::paper::document_key_spellings(doi);
         let rows: Vec<_> = sqlx::query(
-            "SELECT id, doi, title, journal, created_at FROM papers WHERE doi = $1 LIMIT $2 OFFSET $3",
+            "SELECT id, doi, title, journal, created_at FROM papers \
+             WHERE doi = ANY($1) ORDER BY array_position($1, doi) LIMIT $2 OFFSET $3",
         )
-        .bind(doi)
+        .bind(&spellings)
         .bind(limit)
         .bind(offset)
         .fetch_all(&state.db_pool)
@@ -238,8 +260,8 @@ pub async fn list_papers(
             message: format!("Failed to query papers: {e}"),
         })?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
-            .bind(doi)
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = ANY($1)")
+            .bind(&spellings)
             .fetch_one(&state.db_pool)
             .await
             .map_err(|e| ApiError::DatabaseError {

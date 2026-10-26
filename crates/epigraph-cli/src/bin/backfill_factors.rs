@@ -15,8 +15,18 @@
 //!
 //! Run order matters: evidence-phase first so edge-phase sees fresh source
 //! intervals.
+//!
+//! Phase 3 (`--phase rewire-edges`, never part of `all`): re-derives every
+//! ALREADY-wired edge-factor BBA from its source's current interval, so rows
+//! written under an older BBA shape (before #401's open-world discount) are
+//! rewritten. A full refresh of every edge factor it selects; see
+//! `epigraph_cli::backfill_factors` for the selection rules and the paging
+//! idiom (fixed `--written-before`, `--limit N`, `--offset` advanced by the
+//! printed `next --offset`, done when a page makes no progress).
 
 use clap::{Parser, ValueEnum};
+use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -36,6 +46,15 @@ struct Cli {
     /// Log what would be written without persisting
     #[arg(long)]
     dry_run: bool,
+    /// rewire-edges only: rewrite only edge-factor rows last written before
+    /// this RFC 3339 instant (e.g. the deploy time of the new BBA shape)
+    #[arg(long)]
+    written_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Proceed with a writing run although this process's belief modes differ
+    /// from the API's `/health` report (or cannot be read). For tests and a
+    /// deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq)]
@@ -43,6 +62,8 @@ enum Phase {
     All,
     Evidence,
     Edges,
+    /// Rewrite already-wired edge-factor BBAs (not part of `all`)
+    RewireEdges,
 }
 
 #[tokio::main]
@@ -53,6 +74,18 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Before the database: a writing run must show its belief modes match the
+    // API's (SPEC §10.2). A dry run writes nothing and is exempt.
+    let intent = if cli.dry_run {
+        RunIntent::WritesNothing
+    } else {
+        RunIntent::Writes
+    };
+    enforce_or_exit("backfill_factors", intent, cli.allow_mode_skew).await;
+    // Agreement on the flag is not enough: this build's cache writers fold only
+    // the legacy way, so a writing run under another fold refuses.
+    enforce_build_fold_or_exit("backfill_factors", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
@@ -88,6 +121,31 @@ async fn run(
     if matches!(cli.phase, Phase::All | Phase::Edges) {
         let summary = run_edge_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
         println!("edge phase: {summary}");
+    }
+    if cli.phase == Phase::RewireEdges {
+        let opts = RewireOptions {
+            limit: cli.limit,
+            offset: cli.offset,
+            dry_run: cli.dry_run,
+            written_before: cli.written_before,
+        };
+        let summary = run_rewire_phase(&pool, viewer, &opts).await?;
+        println!("rewire-edges phase: {summary}");
+        if !cli.dry_run && summary.eligible > 0 {
+            // Skipped-non-epistemic and failed rows stay selected; the next
+            // page must step past them or it reselects them forever.
+            println!(
+                "rewire-edges paging: next --offset {} (same --written-before)",
+                cli.offset + summary.persisting()
+            );
+            if !summary.made_progress() {
+                eprintln!(
+                    "rewire-edges: this page rewrote or removed nothing ({} persisting rows); \
+                     do not repeat it at the same --offset",
+                    summary.persisting()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -209,6 +267,10 @@ async fn run_evidence_phase(
             true, // existing ingest semantics: evidence supports its claim
             Some(&evidence_type),
             Some(evidence_id),
+            // No truth_value seed: a factorless claim's truth_value may already
+            // be derived from the very evidence this backfills, so seeding it
+            // would count that evidence twice (drain U026, operator Q3).
+            false,
         )
         .await
         {
@@ -221,28 +283,6 @@ async fn run_evidence_phase(
     }
     Ok(summary)
 }
-
-/// Edge-phase eligibility: factorless target claim, claim-to-claim edge with
-/// epistemic relationship. Uses `signer_id` when present, otherwise falls back
-/// to the source claim's `agent_id` (always populated) — the edge factor is
-/// attributable to the source claim's author since they're asserting the
-/// support/contradiction via the edge.
-const EDGE_QUERY: &str = r#"
-SELECT e.id, COALESCE(e.signer_id, src.agent_id) AS agent_id,
-       e.source_id, e.target_id, e.relationship
-FROM edges e
-JOIN claims tgt ON tgt.id = e.target_id
-JOIN claims src ON src.id = e.source_id
-WHERE tgt.is_current AND src.is_current
-  AND e.source_type = 'claim' AND e.target_type = 'claim'
-  AND LOWER(e.relationship) IN (
-    'supports','corroborates','contradicts','refutes','refines','undercuts','rebuts',
-    'elaborates','specializes','generalizes','supersedes','informs','frame_validates'
-  )
-  AND NOT EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.claim_id = tgt.id)
-ORDER BY e.target_id, e.created_at
-LIMIT $1 OFFSET $2
-"#;
 
 async fn run_edge_phase(
     pool: &PgPool,

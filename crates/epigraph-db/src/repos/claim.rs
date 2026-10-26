@@ -171,8 +171,14 @@ pub struct LabelQuery<'a> {
     pub min_truth: f64,
     /// Max rows returned.
     pub limit: i64,
-    /// Rows to skip, for paging `created_at DESC`.
+    /// Rows to skip, for paging `(created_at DESC, id DESC)`. Kept for
+    /// compatibility; prefer [`Self::after`], which does not drift.
     pub offset: i64,
+    /// Keyset position: return only rows strictly after this one in
+    /// `(created_at DESC, id DESC)` order. `None` starts at the newest row.
+    /// Unlike `offset`, a page boundary does not move when rows are inserted
+    /// or retired between pages.
+    pub after: Option<LabelCursor>,
 }
 
 impl Default for LabelQuery<'_> {
@@ -184,8 +190,140 @@ impl Default for LabelQuery<'_> {
             min_truth: 0.0,
             limit: 100,
             offset: 0,
+            after: None,
         }
     }
+}
+
+/// A keyset position in [`ClaimRepository::list_by_labels`]'s
+/// `(created_at DESC, id DESC)` order: the last row of the previous page.
+///
+/// Callers see it only as the opaque token from [`Self::encode`], which the
+/// REST `GET /api/v1/claims/by-labels` and MCP `query_claims_by_label`
+/// surfaces hand out as the next-page cursor and accept back as `after`.
+/// A token names a row the caller was already served, and a forged one
+/// only moves the starting point of a read that stays viewer-filtered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabelCursor {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: Uuid,
+}
+
+/// Version prefix of [`LabelCursor`]'s token, so a later format can be told
+/// apart (and an old one refused) rather than half-parsed.
+const LABEL_CURSOR_PREFIX: &str = "k1.";
+
+/// Postgres `timestamptz`'s earliest value (4714-11-24 00:00 BC UTC) in Unix
+/// microseconds. chrono reaches further back, so without this check a forged
+/// token could decode and then fail at bind time ("timestamp out of range"),
+/// which the surfaces would report as an internal error instead of a refused
+/// cursor. chrono's latest value is inside Postgres's upper bound (294276 AD),
+/// so only the lower edge needs checking.
+const PG_TIMESTAMPTZ_MIN_MICROS: i64 = -210_866_803_200_000_000;
+
+impl LabelCursor {
+    /// The cursor of `claim`, the last row of a page.
+    #[must_use]
+    pub fn of(claim: &Claim) -> Self {
+        Self {
+            created_at: claim.created_at,
+            id: claim.id.as_uuid(),
+        }
+    }
+
+    /// The next-page cursor for a page `rows` read with `limit`: the last
+    /// row's position when the page is full (more rows may follow), `None`
+    /// when it is short (the set is exhausted). `limit` is clamped exactly as
+    /// [`ClaimRepository::list_by_labels`] clamps it.
+    #[must_use]
+    pub fn next_page(rows: &[(Claim, Vec<String>)], limit: i64) -> Option<Self> {
+        let limit = usize::try_from(limit.clamp(1, 1000)).unwrap_or(usize::MAX);
+        if rows.len() < limit {
+            return None;
+        }
+        rows.last().map(|(c, _)| Self::of(c))
+    }
+
+    /// The opaque token: `k1.<created_at micros>.<id hex>`. URL-safe.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!(
+            "{LABEL_CURSOR_PREFIX}{}.{}",
+            self.created_at.timestamp_micros(),
+            self.id.simple()
+        )
+    }
+
+    /// Parse a token from [`Self::encode`]. `None` for anything else,
+    /// including a position Postgres `timestamptz` cannot represent, so every
+    /// decoded cursor binds.
+    #[must_use]
+    pub fn decode(token: &str) -> Option<Self> {
+        let rest = token.strip_prefix(LABEL_CURSOR_PREFIX)?;
+        let (micros, id) = rest.split_once('.')?;
+        let micros: i64 = micros.parse().ok()?;
+        if micros < PG_TIMESTAMPTZ_MIN_MICROS {
+            return None;
+        }
+        let created_at = chrono::DateTime::from_timestamp_micros(micros)?;
+        let id = Uuid::try_parse(id).ok()?;
+        Some(Self { created_at, id })
+    }
+}
+
+/// One row of [`ClaimRepository::list_all_by_labels_ordered_by_id`]: the
+/// fields a label-family planner reads, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct LabelFamilyRow {
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One row of [`ClaimRepository::marked_duplicates_of`]: a claim marked a
+/// duplicate (at any depth) of `canonical`, with the fields a label-family
+/// planner reads.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct MarkedDuplicateRow {
+    pub canonical: Uuid,
+    pub id: Uuid,
+    pub content: String,
+    pub labels: Vec<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The duplicate's author.
+    pub agent_id: Uuid,
+    /// The canonical's author, so a caller can tell a duplicate of another
+    /// owner from one of the canonical's own.
+    pub canonical_agent_id: Uuid,
+}
+
+/// The deepest chain [`ClaimRepository::marked_duplicates_of`] follows.
+pub const MAX_DUPLICATE_CHAIN_DEPTH: i32 = 16;
+
+/// What [`ClaimRepository::marked_duplicates_of`] read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkedDuplicates {
+    /// At most `cap + 1` rows, none deeper than [`MAX_DUPLICATE_CHAIN_DEPTH`].
+    pub rows: Vec<MarkedDuplicateRow>,
+    /// Whether some chain went on past [`MAX_DUPLICATE_CHAIN_DEPTH`]: the
+    /// duplicates beyond it are not in `rows`, so the read is incomplete.
+    pub chain_truncated: bool,
+}
+
+/// One row of the walk behind [`ClaimRepository::marked_duplicates_of`]: the
+/// truncation flag, and a duplicate when there is one (the statement always
+/// returns at least the flag row).
+#[derive(sqlx::FromRow)]
+struct MarkedDuplicateWalkRow {
+    chain_truncated: bool,
+    canonical: Option<Uuid>,
+    id: Option<Uuid>,
+    content: Option<String>,
+    labels: Option<Vec<String>>,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
+    agent_id: Option<Uuid>,
+    canonical_agent_id: Option<Uuid>,
 }
 
 /// Result row for [`ClaimRepository::search_by_embedding`].
@@ -196,6 +334,23 @@ impl Default for LabelQuery<'_> {
 pub struct ClaimEmbeddingHit {
     pub claim_id: Uuid,
     pub similarity: f64,
+}
+
+/// Which claims [`ClaimRepository::search_by_embedding_since`] draws its kNN
+/// candidates from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingSeedScope {
+    /// Level-2 (`(properties->>'level')::int = 2`) claims only: the paragraph
+    /// layer of `ingest_document`'s hierarchy, plus anything else written at
+    /// level 2 (workflow steps). The historical contract, kept by the
+    /// [`ClaimRepository::search_by_embedding`] wrapper.
+    Paragraphs,
+    /// Every claim with a vector in the searched column, at any level or
+    /// none: memorized and `submit_claim` claims, sections, atoms, workflow
+    /// steps and paragraphs alike. MCP `recall_with_context` seeds here
+    /// (drain U082, backlog a1d89aab): parentage is an enrichment attribute,
+    /// not an eligibility filter.
+    AllClaims,
 }
 
 /// One link in the supersession chain returned by
@@ -421,6 +576,13 @@ pub struct LineageHead {
     pub content: String,
     pub truth_value: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `COALESCE(claims.is_current, true)`. Headship (no incoming
+    /// `supersedes` edge) and `is_current` are independent: a claim retired
+    /// without a supersedes edge (a deprecated workflow's step reused by a
+    /// later generation, a marked duplicate) is still a head, and
+    /// `evolve_step_conn` refuses to supersede it. Flagged, not filtered: a
+    /// sole lineage member would otherwise vanish from the lineage silently.
+    pub is_current: bool,
 }
 
 /// Result of a successful [`ClaimRepository::evolve_step`] call.
@@ -466,7 +628,335 @@ pub struct DedupRepair {
     /// `binary_truth` bindings at a non-zero index that were NOT copied onto a
     /// canonical owned by another group (review finding W2's rule, FA07).
     pub skipped_false_bindings: u64,
+    /// The duplicate's non-edge BBAs (its creation row, assess rows, agent
+    /// BBAs) moved onto the canonical so their evidence is pooled there.
+    pub pooled_bbas: Vec<Uuid>,
+    /// The duplicate's non-edge BBAs left on it: a key the canonical already
+    /// holds (the same source counted once), an `attributed_v1` row, or every
+    /// such row when the canonical is a compound.
+    pub kept_on_duplicate: Vec<Uuid>,
+    /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
+    /// pooled onto it.
+    pub canonical_is_compound: bool,
+    /// What the repair changed, with the before-state an un-mark needs. It
+    /// names other writers' rows, so it is persisted only where a privileged
+    /// session reads it (the administrative cascade's applied audit row),
+    /// never returned to a caller.
+    pub revert: DedupRevert,
 }
+
+/// A BBA the dedup repair moved onto the canonical, with its tenancy before
+/// the move.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct MovedBba {
+    /// The `mass_functions` row.
+    pub id: Uuid,
+    /// Its `owner_group_id` on the duplicate.
+    pub owner_group_id: Option<Uuid>,
+    /// Its `visibility` on the duplicate.
+    pub visibility: String,
+    /// Its `writer_owned` on the duplicate.
+    pub writer_owned: bool,
+}
+
+/// An edge the dedup repair re-pointed, with its tenancy before the move (the
+/// edge tenancy trigger re-derives it from the new endpoints).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct EdgeTenancy {
+    /// The edge.
+    pub id: Uuid,
+    /// Its `owner_group_id` before the re-point.
+    pub owner_group_id: Option<Uuid>,
+    /// Its `visibility` before the re-point.
+    pub visibility: String,
+    /// Its `co_owner_group_id` before the re-point.
+    pub co_owner_group_id: Option<Uuid>,
+}
+
+/// The revert record of one dedup repair: every row it changed, and enough of
+/// the before-state to put each back. Keyed to the act's identity edge.
+///
+/// [`ClaimRepository::reverse_marked_duplicate_conn`] reads it. Rows are
+/// restored only while they are still where the repair left them; anything
+/// another write has touched since is left alone and reported.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DedupRevert {
+    /// The `same_as` identity edge of the act this repair followed.
+    pub identity_edge: Option<Uuid>,
+    /// Edges the collision guards retracted (`valid_to` set).
+    pub retracted_edges: Vec<Uuid>,
+    /// The `valid_to` the repair stamped on them (its transaction's `now()`).
+    /// An un-mark puts back only an edge still carrying exactly this stamp: a
+    /// different `valid_to` is a later decision, not the repair's.
+    #[serde(default)]
+    pub retracted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Edges re-pointed from the duplicate onto the canonical as their TARGET.
+    pub retargeted_edges: Vec<Uuid>,
+    /// Edges re-pointed from the duplicate onto the canonical as their SOURCE.
+    pub resourced_edges: Vec<Uuid>,
+    /// The tenancy each re-pointed edge had before the re-point.
+    #[serde(default)]
+    pub edge_tenancy: Vec<EdgeTenancy>,
+    /// BBAs moved from the duplicate onto the canonical (edge-keyed and pooled).
+    pub moved_bbas: Vec<MovedBba>,
+    /// BBAs the repair deleted (those of retracted edges, and the duplicate's
+    /// copies the canonical already held), each as its whole row.
+    pub deleted_bbas: Vec<serde_json::Value>,
+    /// Frames the repair bound the canonical to.
+    pub copied_frames: Vec<Uuid>,
+    /// The canonical's own input BBAs on those frames when the repair bound
+    /// it. An un-mark removes a binding only while the canonical has no input
+    /// on that frame beyond these (a later writer's input needs it).
+    #[serde(default)]
+    pub canonical_frame_inputs: Vec<Uuid>,
+}
+
+/// What [`ClaimRepository::reverse_marked_duplicate_conn`] put back, and what
+/// it had to leave.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DedupReversal {
+    /// `(edge_id, target_id, relationship)` of claim->claim edges re-sourced
+    /// back onto the duplicate: their far-end BBAs were re-derived from the
+    /// canonical's interval and must be re-derived from the duplicate's.
+    pub resourced_back: Vec<(Uuid, Uuid, String)>,
+    /// Edges re-pointed back onto the duplicate as their target.
+    pub retargeted_back: Vec<Uuid>,
+    /// Retracted edges back in force.
+    pub unretracted_edges: Vec<Uuid>,
+    /// Moved BBAs returned to the duplicate with their old tenancy.
+    pub returned_bbas: Vec<Uuid>,
+    /// Deleted BBAs re-inserted.
+    pub restored_bbas: Vec<Uuid>,
+    /// Frame bindings the repair added to the canonical, removed again.
+    pub unbound_frames: Vec<Uuid>,
+    /// The canonical's cached combination rows removed because a returning
+    /// input needed their slot on the duplicate (re-derived by the cascade).
+    pub cleared_cached_rows: u64,
+    /// Rows the record names that a later write has moved, re-pointed or
+    /// deleted; left as they are.
+    pub drifted: Vec<Uuid>,
+    /// Claims whose cached belief no longer matches their BBA set.
+    pub stale_claims: Vec<Uuid>,
+}
+
+impl DedupReversal {
+    /// The reversal as the belief cascade's input
+    /// (`retraction_cascade::cascade_after_dedup` with the DUPLICATE as the
+    /// claim whose own interval is refreshed first).
+    #[must_use]
+    pub fn as_repair(&self) -> DedupRepair {
+        DedupRepair {
+            stale_claims: self.stale_claims.clone(),
+            resourced_edges: self.resourced_back.clone(),
+            ..DedupRepair::default()
+        }
+    }
+}
+
+/// A marked duplicate an un-mark's act restored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmarkedDuplicate {
+    /// The canonical it had been marked a duplicate of.
+    pub canonical: Uuid,
+    /// That canonical, then each claim that replaced it in turn (supersession
+    /// or consolidation), ending with the CURRENT canonical the duplicate is
+    /// restored against (operator ruling R-11); `[canonical]` when the
+    /// canonical is still current ([`ClaimRepository::unmark_chain_conn`]).
+    pub chain: Vec<Uuid>,
+    /// The identity edge the act retracted.
+    pub identity_edge: Uuid,
+    /// The identity edge is one the legacy backfill wrote
+    /// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]): a mark
+    /// the raw-SQL `fuzzy_dedup_claims` made, which kept no repair record.
+    /// Read from the edge's reserved `properties.dedup` (only the act and the
+    /// backfill write it), never from the claim's patchable properties.
+    pub legacy_backfill: bool,
+}
+
+impl UnmarkedDuplicate {
+    /// The current canonical: the last claim of [`Self::chain`].
+    #[must_use]
+    pub fn current_canonical(&self) -> Uuid {
+        self.chain.last().copied().unwrap_or(self.canonical)
+    }
+}
+
+/// The relationship of the identity edge a dedup's act writes,
+/// `duplicate -> canonical`.
+pub const DUPLICATE_IDENTITY_RELATIONSHIP: &str = "same_as";
+
+/// The key under which the identity edge's `properties` carry its
+/// [`DuplicateProvenance`]. An in-force `same_as` edge out of a retired claim
+/// with this key is a dedup's record; a `same_as` edge without it is somebody's
+/// assertion and no dedup reads or retracts it.
+pub const DUPLICATE_IDENTITY_PROPERTY: &str = "dedup";
+
+/// Whether an application edge write's `properties` carry
+/// [`DUPLICATE_IDENTITY_PROPERTY`]. That key marks a dedup act's identity edge,
+/// which the un-mark and the revert-record lookup key on, so only the act
+/// writes it: every application surface that writes edge `properties` (create
+/// and patch, HTTP and MCP) refuses a body that carries it.
+#[must_use]
+pub fn carries_dedup_identity_key(properties: &serde_json::Value) -> bool {
+    properties.get(DUPLICATE_IDENTITY_PROPERTY).is_some()
+}
+
+/// The refusal text for [`carries_dedup_identity_key`].
+pub const DEDUP_IDENTITY_KEY_RESERVED: &str =
+    "properties.dedup is reserved for the identity edge a dedup act writes \
+     (mark_duplicate); nothing was written";
+
+/// The tool the legacy raw-SQL marks name in `claims.properties.deduped_by`:
+/// `scripts/fuzzy_dedup_claims.py` before it marked through the dedup endpoint.
+pub const LEGACY_FUZZY_DEDUP_TOOL: &str = "fuzzy_dedup_claims";
+
+/// The `run_tag` of an identity edge the legacy backfill wrote
+/// ([`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`]).
+pub const LEGACY_IDENTITY_BACKFILL_RUN_TAG: &str = "legacy_identity_backfill";
+
+/// The legacy backfill's selection of a claim `c` whose `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]: what the legacy mark wrote is all still there
+/// (the `deduped` label, the claim retired, and its `supersedes` still the
+/// `deduped_into` the mark named), so its identity edge can be reconstructed.
+/// One fragment for the backfill and the un-mark's refusal
+/// ([`legacy_mark_refusal`]), so the two cannot disagree on which marks the
+/// backfill reaches.
+const LEGACY_MARK_RECONSTRUCTABLE_SQL: &str = "\
+    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])) \
+    AND NOT COALESCE(c.is_current, true) \
+    AND c.supersedes IS NOT NULL \
+    AND c.supersedes::text = c.properties->>'deduped_into'";
+
+/// One duplicate the legacy identity-edge backfill selected.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LegacyDuplicate {
+    /// The retired duplicate.
+    pub duplicate: Uuid,
+    /// The claim its `supersedes` (and its legacy `deduped_into`) names.
+    pub canonical: Uuid,
+    /// The identity edge written for it (`None` on a dry run).
+    pub identity_edge: Option<Uuid>,
+}
+
+/// What [`ClaimRepository::backfill_legacy_dedup_identity_edges_conn`] found
+/// and, with `apply`, wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct LegacyIdentityBackfill {
+    /// Whether the edges were written (false: a dry run, nothing written).
+    pub applied: bool,
+    /// Every selected duplicate, in id order.
+    pub duplicates: Vec<LegacyDuplicate>,
+    /// Identity edges written.
+    pub inserted: u64,
+}
+
+/// Who marked a duplicate, through which tool, and by which rule: the
+/// `properties.dedup` of the `same_as` identity edge the act writes. The act
+/// adds `marked_at` (the transaction's `now()`), and `marked_by` from the
+/// session principal when the caller names none.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateProvenance {
+    /// The surface that marked it (`mark_duplicate`, `http:mark_duplicate`,
+    /// `sweep_semantic_duplicates`, `label_dedup`, ...).
+    pub tool: String,
+    /// Why the two claims are one: [`Self::RULE_CALLER_ASSERTED`],
+    /// [`Self::RULE_EXACT_RESTATEMENT`], or a caller's own rule name.
+    pub rule: String,
+    /// What the rule matched on (a shared identifier, a score), when it has
+    /// something to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_on: Option<serde_json::Value>,
+    /// The run that marked it, when the caller is a batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_tag: Option<String>,
+    /// The hash of the plan the mark came from, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
+    /// The acting agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marked_by: Option<Uuid>,
+    /// The caller's free-text reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl DuplicateProvenance {
+    /// A caller named the canonical itself (`mark_duplicate`).
+    pub const RULE_CALLER_ASSERTED: &'static str = "caller_asserted";
+    /// The two claims have the same content hash (the semantic sweep's only
+    /// automatic collapse).
+    pub const RULE_EXACT_RESTATEMENT: &'static str = "exact_restatement";
+
+    /// Provenance with only the tool and rule set.
+    #[must_use]
+    pub fn new(tool: impl Into<String>, rule: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            rule: rule.into(),
+            matched_on: None,
+            run_tag: None,
+            plan_hash: None,
+            marked_by: None,
+            reason: None,
+        }
+    }
+
+    /// What the repository's own wrappers record when their caller gave no
+    /// provenance: the act through [`ClaimRepository::mark_duplicate`] and the
+    /// other provenance-less entry points.
+    #[must_use]
+    pub fn unattributed() -> Self {
+        Self::new("repository", Self::RULE_CALLER_ASSERTED)
+    }
+
+    /// Set the acting agent.
+    #[must_use]
+    pub fn marked_by(mut self, agent: Option<Uuid>) -> Self {
+        self.marked_by = agent;
+        self
+    }
+
+    /// Set what the rule matched on.
+    #[must_use]
+    pub fn matched_on(mut self, matched_on: serde_json::Value) -> Self {
+        self.matched_on = Some(matched_on);
+        self
+    }
+
+    /// Set the batch run tag.
+    #[must_use]
+    pub fn run_tag(mut self, tag: impl Into<String>) -> Self {
+        self.run_tag = Some(tag.into());
+        self
+    }
+
+    /// Set the plan hash.
+    #[must_use]
+    pub fn plan_hash(mut self, hash: impl Into<String>) -> Self {
+        self.plan_hash = Some(hash.into());
+        self
+    }
+
+    /// The longest reason, in characters, an identity edge keeps.
+    pub const MAX_REASON_CHARS: usize = 1000;
+
+    /// Set the caller's reason (an empty one is dropped; a longer one is cut
+    /// at [`Self::MAX_REASON_CHARS`]).
+    #[must_use]
+    pub fn reason(mut self, reason: Option<&str>) -> Self {
+        self.reason = reason
+            .filter(|r| !r.is_empty())
+            .map(|r| r.chars().take(Self::MAX_REASON_CHARS).collect());
+        self
+    }
+}
+
+/// Labels a supersession does NOT carry from the retired claim onto its
+/// replacement ([`ClaimRepository::supersede_act_conn`] carries every other
+/// one). `near-duplicate` is the novelty gate's flag on one submission (its
+/// content was near another claim's); on the replacement, whose content is
+/// new, it would read as pointing at its own predecessor.
+pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
 
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -478,6 +968,87 @@ pub struct SupersedeEdgeMigration {
     /// SOURCE.
     pub resourced: Vec<Uuid>,
 }
+
+/// Relationships a STEP-LINEAGE supersession (`evolve_step(supersedes)`) leaves
+/// on the retired step, in either direction.
+///
+/// `executes` attaches a workflow to its FROZEN original step: the live head is
+/// resolved through the lineage (`WorkflowRepository`'s `ResolvedStep`,
+/// `ClaimRepository::latest_in_lineage`), so moving the edge would detach the
+/// frozen step the workflow was defined with.
+///
+/// `step_follows` (between steps) and `phase_follows` (between phases) are the
+/// workflow's chain, and they link those same FROZEN claims:
+/// `workflow_steps::ordered_steps` takes its id set from the `executes`
+/// targets and follows `step_follows` only inside it. Moved onto the head, the
+/// chain would leave that set, the walk would stop at the evolved slot, and a
+/// later `add_step` there would find no `prev -> next` row to replace and fork
+/// the chain.
+///
+/// `revises` is lineage-internal history, like `supersedes` (which no
+/// supersession moves): `R -revises-> S` records that R branched from S.
+/// Carried onto S's successor it would say R branched from a version that did
+/// not exist when R was written; carried onto R's successor it would say the
+/// successor branched from S directly.
+pub(crate) const STEP_LINEAGE_FROZEN_RELATIONSHIPS: &[&str] =
+    &["executes", "step_follows", "phase_follows", "revises"];
+
+/// Relationships every replacement of a NON-PUBLIC claim leaves on the retired
+/// claim, in either direction: a supersession ([`migrate_superseded_edges`]),
+/// a dedup ([`repair_marked_duplicate`]) and a merge
+/// ([`migrate_consolidated_edges`]), whether or not the pair shares a step
+/// lineage (OD-32).
+///
+/// `executes` names the steps of a FROZEN workflow generation, and a pinned
+/// group-private generation is verified against exactly those edges (their
+/// `plan_index`, and each target's id and content). A plain `supersede_claim`
+/// writes no `step_lineage_id`, so [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] never
+/// applies to it, and the dedup and merge paths have no lineage rule at all:
+/// without this set, each of them re-points (a merge of two executed steps also
+/// retracts) the edge and the generation no longer verifies. A non-public
+/// step's content changes only through a new generation.
+///
+/// The rule is read from the retired claim's row (`visibility <> 'public'`, a
+/// missing row counting as non-public), never from a caller flag, because the
+/// deferred replay of each cascade runs the same function knowing nothing of
+/// the original caller. A PUBLIC claim keeps the previous behaviour.
+pub(crate) const NON_PUBLIC_FROZEN_RELATIONSHIPS: &[&str] = &["executes"];
+
+/// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] when `claim` is not public (or has no
+/// row), else nothing: the relationships a replacement of `claim` must leave
+/// on it.
+async fn non_public_frozen_relationships(
+    conn: &mut sqlx::PgConnection,
+    claim: Uuid,
+) -> Result<Vec<String>, DbError> {
+    let non_public: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the retired claim for the edge migration that follows.
+        SELECT NOT EXISTS (
+            SELECT 1 FROM claims WHERE id = $1 AND visibility::text = 'public')"#,
+    )
+    .bind(claim)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(if non_public {
+        NON_PUBLIC_FROZEN_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Relationships an AGENT holds on a step that a step-lineage supersession
+/// leaves on the retired step (incoming edges with `source_type = 'agent'`).
+///
+/// `evolve_step` writes its successor under the CALLER's `agent_id`, not the
+/// retired step's (unlike the supersede act, which keeps the old author). An
+/// agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
+/// content; carried onto the successor it would record the agent asserting
+/// content it never saw. (Scope U047 sub-decision A, default "exclude"; the
+/// opposite ruling is removing this constant's use.)
+pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
 /// Refuse a non-privileged session, naming `what` needs the privilege.
 ///
@@ -518,6 +1089,27 @@ async fn require_privileged_session(
 /// `contradicts`) attached to the claim they were filed against or by; see the
 /// "Edge migration policy" section of [`ClaimRepository::supersede`]'s doc
 /// comment for why (issue #398).
+///
+/// A STEP-LINEAGE supersession (old and new share a non-null
+/// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step, and its agents'
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
+/// derived from the rows, not from a caller flag, because the deferred replay
+/// runs this same function knowing nothing of the original caller.
+///
+/// A supersession of a NON-PUBLIC claim also leaves
+/// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
+/// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// Neither direction moves a dedup identity edge
+/// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
+/// [`DUPLICATE_IDENTITY_PROPERTY`]), as [`repair_marked_duplicate`] does not:
+/// it names the claim its duplicate's `supersedes` names, and the un-mark and
+/// the index view read it by that pointer. A duplicate of a canonical that is
+/// later superseded (or consolidated) therefore keeps its edge to the retired
+/// canonical, and stays marked: its un-mark follows the supersession (or
+/// merge) to the current canonical and restores the duplicate against that one
+/// (operator ruling R-11, [`ClaimRepository::unmark_chain_conn`]).
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
@@ -527,6 +1119,38 @@ async fn migrate_superseded_edges(
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+
+    // Is this a step-lineage supersession? Both rows must carry the SAME
+    // lineage: a plain supersede of a step writes a successor with no
+    // `step_lineage_id` (supersede_act_conn's INSERT omits it), so the lineage
+    // rule does not apply to it; its `executes` still moves unless the old
+    // claim is non-public (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, below).
+    let step_lineage: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; this read classifies the supersession the mutation below carries out.
+        SELECT EXISTS (
+            SELECT 1 FROM claims o JOIN claims n ON n.id = $1
+             WHERE o.id = $2
+               AND o.step_lineage_id IS NOT NULL
+               AND n.step_lineage_id = o.step_lineage_id)"#,
+    )
+    .bind(new_uuid)
+    .bind(old_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let step_lineage_set = |set: &[&str]| -> Vec<String> {
+        if step_lineage {
+            set.iter().map(|s| (*s).to_string()).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    let mut frozen = step_lineage_set(STEP_LINEAGE_FROZEN_RELATIONSHIPS);
+    for rel in non_public_frozen_relationships(&mut *conn, old_uuid).await? {
+        if !frozen.contains(&rel) {
+            frozen.push(rel);
+        }
+    }
+    let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -538,12 +1162,17 @@ async fn migrate_superseded_edges(
          WHERE target_id = $2 AND target_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
+           AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
+    .bind(&agent_authorship)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -553,12 +1182,15 @@ async fn migrate_superseded_edges(
          WHERE source_id = $2 AND source_type = 'claim' \
            AND relationship != 'supersedes' \
            AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(new_uuid)
     .bind(old_uuid)
     .bind(&weakening)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -652,9 +1284,10 @@ pub struct PatchClaimDiff {
 /// tampered body verified clean.
 ///
 /// Callers that expose or verify crypto state MUST extend their `SELECT` and
-/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly three
-/// do: [`ClaimRepository::get_by_id`], [`ClaimRepository::get_by_id_conn`] and
-/// [`ClaimRepository::get_by_id_with_labels`].
+/// post-fix the returned `Claim` via [`post_fix_crypto_columns`]. Exactly two
+/// do: [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`];
+/// [`ClaimRepository::get_by_id_conn`] delegates to the first.
 ///
 /// # The residual set is NOT just the bulk readers
 ///
@@ -807,6 +1440,74 @@ fn post_fix_crypto_columns(claim: &mut Claim, cols: RowCryptoColumns) -> Result<
     Ok(())
 }
 
+/// One claim row as the single-claim readers project it: the seven
+/// `claim_from_row` columns plus the retirement state and the crypto columns
+/// both post-fixes read. Shared by [`ClaimRepository::get_by_id`] and
+/// [`ClaimRepository::get_by_id_with_labels`] (and, through delegation,
+/// [`ClaimRepository::get_by_id_conn`]) so the mapping exists once.
+///
+/// Decoded through `query_as` + `FromRow`, never `sqlx::Row::get`: `Row::get`
+/// panics on a missing column or a type mismatch, where a `FromRow` decode
+/// returns `Err` for the same row.
+#[derive(sqlx::FromRow)]
+struct SingleClaimRow {
+    id: Uuid,
+    content: String,
+    truth_value: f64,
+    agent_id: Uuid,
+    trace_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    is_current: bool,
+    supersedes: Option<Uuid>,
+    content_hash: Vec<u8>,
+    signature: Option<Vec<u8>>,
+    signer_public_key: Option<Vec<u8>>,
+}
+
+impl SingleClaimRow {
+    /// Build the `Claim` and post-fix it with the row's real retirement state
+    /// (instead of `claim_from_row`'s `is_current = true, supersedes = None`)
+    /// and its stored crypto columns (instead of the recomputed digest and
+    /// blank signature).
+    ///
+    /// # Errors
+    /// * [`DbError::CoreError`] if `truth_value` is outside `[0, 1]`.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    fn into_claim(self) -> Result<Claim, DbError> {
+        let truth_value = TruthValue::new(self.truth_value)?;
+        let mut claim = claim_from_row(
+            self.id,
+            self.content,
+            self.agent_id,
+            self.trace_id,
+            truth_value,
+            self.created_at,
+            self.updated_at,
+        );
+        claim.is_current = self.is_current;
+        claim.supersedes = self.supersedes.map(ClaimId::from_uuid);
+        post_fix_crypto_columns(
+            &mut claim,
+            RowCryptoColumns {
+                content_hash: self.content_hash,
+                signature: self.signature,
+                signer_public_key: self.signer_public_key,
+            },
+        )?;
+        Ok(claim)
+    }
+}
+
+/// [`SingleClaimRow`] plus `claims.labels`, for
+/// [`ClaimRepository::get_by_id_with_labels`].
+#[derive(sqlx::FromRow)]
+struct SingleClaimRowWithLabels {
+    #[sqlx(flatten)]
+    row: SingleClaimRow,
+    labels: Vec<String>,
+}
+
 impl ClaimRepository {
     /// The declaration a write path uses when its caller expressed no
     /// preference: **`('public', <the author's personal group>)`**.
@@ -899,6 +1600,70 @@ impl ClaimRepository {
         // The allowlist does not re-home the agent's own authorship.
         crate::repos::AgentRepository::require_operator_scope(conn, agent_id, group).await?;
         Ok(TenancyDecl::public(group))
+    }
+
+    /// The `(id, visibility, owner_group_id)` of each of `ids` that `viewer`
+    /// may read, in no particular order.
+    ///
+    /// Filtered twice: by `viewer`'s predicate in the SQL, and by row security
+    /// on `conn`'s own stamp, which may be a different principal's. An id
+    /// missing from the answer is a claim that does not exist or that one of
+    /// the two may not read. It is the question a declared-tenancy workflow
+    /// ingest asks about the claims it REUSED rather than created
+    /// (`epigraph_ingest_executor`'s `reused_items`): on the system-agent
+    /// stamped transaction, through the CALLER's viewer, so the answer never
+    /// tells a caller the tenancy of a claim it cannot read.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn tenancy_of_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String, Uuid)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, visibility::text, owner_group_id FROM claims \
+              WHERE id = ANY($1) /* {VISIBILITY:claims} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String, Uuid)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// The `(id, visibility, owner_group_id)` of each of `ids` that `conn`'s own
+    /// session may read, in no particular order.
+    ///
+    /// Row security on `conn`'s stamp is the ONLY filter: there is no viewer
+    /// predicate, so this answers "what can the principal this connection is
+    /// stamped as see", never a caller's question. A declared-tenancy workflow
+    /// ingest asks it on its system-agent stamped transaction about the claims
+    /// it REUSED, before it writes an edge to any of them: an id missing from
+    /// the answer is a claim that exists (the ingest's `ON CONFLICT` saw it)
+    /// but that the stamp cannot read. Never return this answer to a caller; it
+    /// is the stamp's view, not theirs ([`Self::tenancy_of_conn`] is the
+    /// caller-filtered read).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    pub async fn tenancy_on_session_conn(
+        conn: &mut sqlx::PgConnection,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String, Uuid)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as::<_, (Uuid, String, Uuid)>(
+            "SELECT id, visibility::text, owner_group_id FROM claims WHERE id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?)
     }
 
     /// The id of `agent_id`'s personal group, resolved by the `SECURITY DEFINER`
@@ -1083,6 +1848,15 @@ impl ClaimRepository {
     /// internal callers of this method are migrated as a separate
     /// out-of-band task.
     ///
+    /// **Concurrency:** a first, unlocked find answers a dedup HIT on an
+    /// already-committed row without taking any lock. On a miss, the find is
+    /// re-run and the insert made under [`Self::lock_content_hash_agent`] for
+    /// the `(content_hash, agent_id)` the INSERT writes, inside one scope (a
+    /// real `BEGIN` on a bare connection, a SAVEPOINT in a caller's
+    /// transaction). Two concurrent first creates of one pair therefore yield
+    /// one row, and the lock is shared with `create_or_get`. Creates of the
+    /// same content by DIFFERENT agents are not serialized against each other.
+    ///
     /// `decl` declares the row's tenancy. Migration 074 drops the
     /// `visibility` / `owner_group_id` defaults, so a write that names neither
     /// and has no parent to inherit from raises `23502`. This method's INSERT
@@ -1123,6 +1897,91 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
+        use sqlx::Acquire;
+
+        // A dedup HIT on an already-committed row is answered here, unlocked
+        // and outside any scope, exactly as before the dedup lock existed. Only
+        // a MISS goes on to take the lock: inside `ingest_document`'s document
+        // transaction a lock taken on a hit would be held until the whole
+        // document commits, so two same-author ingests sharing pre-existing
+        // atoms would serialize (and could deadlock) on rows neither writes.
+        // This find decides nothing on a miss; the one under the lock does.
+        let content_hash = ContentHasher::hash(claim.content.as_bytes());
+        if let Some(existing) =
+            Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
+        {
+            return Ok(existing);
+        }
+
+        // The serialization scope, exactly as in `create_or_get_signed`: a real
+        // BEGIN on a bare connection (the `create(pool)` path, where an
+        // advisory xact lock taken in autocommit would be released at the end
+        // of its own statement), a SAVEPOINT inside the caller's transaction
+        // (the lock then lives until the caller's transaction ends). Closed
+        // explicitly on every path below.
+        let mut scope = conn
+            .begin()
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        match Self::create_conn_serialized(&mut scope, claim, decl).await {
+            Ok(out) => {
+                scope
+                    .commit()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Ok(out)
+            }
+            Err(e) => {
+                scope
+                    .rollback()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The legacy content-hash dedup probe of [`Self::create_conn`]: any row
+    /// with this `content_hash`, by any agent. Run twice by a create that
+    /// misses: unlocked first (a hit returns without taking the dedup lock),
+    /// then again under the lock, where its answer decides the insert.
+    async fn find_by_content_hash_legacy_conn(
+        conn: &mut sqlx::PgConnection,
+        content_hash: &[u8],
+    ) -> Result<Option<Claim>, DbError> {
+        let existing = sqlx::query!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
+               FROM claims WHERE content_hash = $1 LIMIT 1"#,
+            content_hash
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        existing
+            .map(|row| {
+                let tv = TruthValue::new(row.truth_value)?;
+                Ok(claim_from_row(
+                    row.id,
+                    row.content,
+                    row.agent_id,
+                    row.trace_id,
+                    tv,
+                    row.created_at,
+                    row.updated_at,
+                ))
+            })
+            .transpose()
+    }
+
+    /// The miss path of [`Self::create_conn`], run inside its serialization
+    /// scope: the `(content_hash, agent_id)` dedup lock, the legacy
+    /// content-hash find again (now deciding), then the insert.
+    async fn create_conn_serialized(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+    ) -> Result<Claim, DbError> {
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -1133,29 +1992,23 @@ impl ClaimRepository {
         // Calculate content hash using BLAKE3
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
-        // Dedup: if a claim with this content already exists, return it instead of
-        // inserting a duplicate. Two round-trips are acceptable; the race window is
-        // tiny and duplicate claims are idempotent in practice.
-        let existing = sqlx::query!(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-               SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-               FROM claims WHERE content_hash = $1 LIMIT 1"#,
-            content_hash.as_slice()
-        )
-        .fetch_optional(&mut *conn)
-        .await?;
+        // Serialize against every other find-then-insert of this
+        // `(content_hash, agent_id)` — `create_or_get`, POST /claims, a
+        // consolidation, and another caller of this method — before the
+        // deciding find (backlog 00f1a517). Without it two first creates both
+        // miss the find (neither can see the other's uncommitted row) and both
+        // insert. The find stays content-hash-only (the legacy contract); the
+        // lock serializes the pair the INSERT writes.
+        Self::lock_content_hash_agent(&mut *conn, content_hash.as_slice(), agent_id).await?;
 
-        if let Some(existing_row) = existing {
-            let tv = TruthValue::new(existing_row.truth_value)?;
-            return Ok(claim_from_row(
-                existing_row.id,
-                existing_row.content,
-                existing_row.agent_id,
-                existing_row.trace_id,
-                tv,
-                existing_row.created_at,
-                existing_row.updated_at,
-            ));
+        // Dedup, re-run under the lock: a new statement under READ COMMITTED,
+        // so it sees a row a previous lock holder committed after
+        // `create_conn`'s unlocked probe missed. If a claim with this content
+        // now exists, return it instead of inserting a duplicate.
+        if let Some(existing) =
+            Self::find_by_content_hash_legacy_conn(&mut *conn, content_hash.as_slice()).await?
+        {
+            return Ok(existing);
         }
 
         let row = sqlx::query!(
@@ -1409,11 +2262,22 @@ impl ClaimRepository {
     /// Claims absent from the returned map are absent because the **viewer
     /// cannot see them** (or they were deleted mid-page). Callers must fall back
     /// to the `truth_value` they already hydrated rather than treating absence
-    /// as pass-or-drop — see the four `min_truth` call sites.
+    /// as pass-or-drop — see the four `min_truth` call sites
+    /// (`epigraph-mcp` `tools::memory::recall_post_embed`,
+    /// `tools::recall::recall_with_context_post_embed`, `tools::graph::traverse`,
+    /// and `epigraph-engine` `recall::effective_beliefs`).
+    ///
+    /// One caller is not a gate: `recall_with_context_post_embed` adds its
+    /// hits' context-atom ids to the same batch and reports each atom's value
+    /// as that atom's `belief_score`. It relies on the same fall-back contract,
+    /// so an atom absent from the map keeps its `truth_value`.
+    ///
+    /// `claim_ids` is kept out of the tracing span (only its length is
+    /// recorded): that context-atom page can carry thousands of ids.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
+    #[instrument(skip(executor, viewer, claim_ids), fields(claim_count = claim_ids.len()))]
     pub async fn effective_belief_batch<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -1438,58 +2302,6 @@ impl ClaimRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(executor).await?.into_iter().collect())
-    }
-
-    /// The subset of `claim_ids` that occupy the **paragraph** role —
-    /// `(properties->>'level')::int = 2` — as the viewer sees them.
-    ///
-    /// Backlog `4e856a99`. `recall_with_context` is paragraph-primary on every
-    /// ANN surface it has: the flat kNN is level=2 only and the diverse path
-    /// coerces to level=2. Its graph-expansion pool
-    /// ([`Self::graph_expand_seeds_since`]) had no level predicate at all, so a
-    /// level-3 atom reached over a `supports`/`elaborates` edge could be folded
-    /// straight into the top-level hit list beside paragraphs — and
-    /// `ingest_document` writes a `paper -asserts-> claim` edge for EVERY
-    /// planned claim including atoms, so the paper-attribution drop downstream
-    /// does not catch it. This is the predicate that does.
-    ///
-    /// The spelling is deliberately IDENTICAL to the one the seed surfaces use
-    /// (`recall.rs`'s flat kNN and sibling queries, `Self::nearest_by_embedding`
-    /// and friends), so the two candidate-producing surfaces cannot drift into
-    /// disagreeing about what a paragraph is.
-    ///
-    /// A claim with NO `level` property is therefore also excluded — `NULL` is
-    /// not `2`. That is the `decompose_claims` population, which carries no
-    /// level property at all and was never reachable as a top-level
-    /// `recall_with_context` hit on any path, so excluding it here changes
-    /// nothing; it is stated because the arm is silent in the SQL.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
-    pub async fn paragraph_level_ids<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        claim_ids: &[Uuid],
-    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
-        if claim_ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-        let sql = viewer.splice(
-            "SELECT id FROM claims \
-             WHERE id = ANY($1) AND (properties->>'level')::int = 2 \
-             /* {VISIBILITY:claims} */",
-            2,
-        );
-        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(claim_ids);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        Ok(q.fetch_all(executor)
-            .await?
-            .into_iter()
-            .map(|(id,)| id)
-            .collect())
     }
 
     /// Walk a claim's supersession chain and return every version the viewer
@@ -2327,7 +3139,7 @@ impl ClaimRepository {
     /// Create a new claim within an existing transaction (LEGACY — implicit content-hash dedup)
     ///
     /// Same as `create()` but accepts a `&mut PgConnection` for transactional use.
-    /// Uses runtime query (not compile-time macro) to support the connection executor.
+    /// Delegates to [`Self::create_conn`], which is the same contract.
     ///
     /// **Legacy behavior:** see the note on `create()` — this method shares
     /// the same cross-agent collapse bug. New transactional code should use
@@ -2340,88 +3152,10 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
-        let id: Uuid = claim.id.into();
-        let agent_id: Uuid = claim.agent_id.into();
-        let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
-        let truth_value = claim.truth_value.value();
-        let created_at = claim.created_at;
-        let updated_at = claim.updated_at;
-        let content_hash = ContentHasher::hash(claim.content.as_bytes());
-
-        use sqlx::Row;
-
-        // Dedup check within the same transaction
-        let existing = sqlx::query(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at
-             FROM claims WHERE content_hash = $1 LIMIT 1"#,
-        )
-        .bind(content_hash.as_slice())
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        if let Some(existing_row) = existing {
-            let truth_val: f64 = existing_row.get("truth_value");
-            let tv = TruthValue::new(truth_val)?;
-            return Ok(claim_from_row(
-                existing_row.get("id"),
-                existing_row.get("content"),
-                existing_row.get("agent_id"),
-                existing_row.get("trace_id"),
-                tv,
-                existing_row.get("created_at"),
-                existing_row.get("updated_at"),
-            ));
-        }
-
-        let row = sqlx::query(
-            r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at"#,
-        )
-        .bind(id)
-        .bind(&claim.content)
-        .bind(content_hash.as_slice())
-        .bind(truth_value)
-        .bind(agent_id)
-        .bind(trace_id)
-        .bind(created_at)
-        .bind(updated_at)
-        .bind(decl.visibility_bind())
-        .bind(decl.owner_group_bind())
-        .fetch_one(&mut *conn)
-        .await?;
-
-        let row_id: Uuid = row.get("id");
-        let row_agent_id: Uuid = row.get("agent_id");
-        let row_truth_value: f64 = row.get("truth_value");
-
-        // Fire-and-forget claim.created event (closes #61). Same rationale
-        // as the create() method: emitted only on the post-INSERT branch
-        // (the dedup early-return above does not reach here). Uses
-        // publish_or_log_conn so the event rides the caller's transaction.
-        let _ = crate::repos::EventRepository::publish_or_log_conn(
-            &mut *conn,
-            "claim.created",
-            Some(row_agent_id),
-            &serde_json::json!({
-                "claim_id": row_id,
-                "agent_id": row_agent_id,
-                "truth_value": row_truth_value,
-            }),
-        )
-        .await;
-
-        let tv = TruthValue::new(row_truth_value)?;
-        Ok(claim_from_row(
-            row_id,
-            row.get("content"),
-            row_agent_id,
-            row.get("trace_id"),
-            tv,
-            row.get("created_at"),
-            row.get("updated_at"),
-        ))
+        // One implementation of the legacy find-then-insert, so this entry point
+        // takes the same `(content_hash, agent_id)` dedup lock (backlog
+        // 00f1a517) and emits the same `claim.created` event.
+        Self::create_conn(conn, claim, decl).await
     }
 
     /// The authoring agent of a claim, or `None` when no such claim exists.
@@ -2470,14 +3204,18 @@ impl ClaimRepository {
     /// body verified clean) and `signature = None` (so the signature check
     /// could never pass).
     ///
-    /// Uses a runtime `query_as` with a local `Row` rather than `sqlx::query!`,
-    /// mirroring [`Self::list`]: the `LEFT JOIN agents` needed to resolve
-    /// `signer_id → public_key` would otherwise require regenerating `.sqlx`,
-    /// which is a serialized, separately owned step in this repo.
+    /// Uses a runtime `query_as` over [`SingleClaimRow`] rather than
+    /// `sqlx::query!`, mirroring [`Self::list`]: the `LEFT JOIN agents` needed
+    /// to resolve `signer_id → public_key` would otherwise require regenerating
+    /// `.sqlx`, which is a serialized, separately owned step in this repo.
+    /// [`Self::get_by_id_with_labels`] decodes the same row type, so the
+    /// mapping and both post-fixes exist once.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
     /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     ///
     /// # Not a `sqlx::query!` macro site any more
     ///
@@ -2504,22 +3242,6 @@ impl ClaimRepository {
     ) -> Result<Option<Claim>, DbError> {
         let uuid: Uuid = id.into();
 
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            content: String,
-            truth_value: f64,
-            agent_id: Uuid,
-            trace_id: Option<Uuid>,
-            created_at: chrono::DateTime<chrono::Utc>,
-            updated_at: chrono::DateTime<chrono::Utc>,
-            is_current: bool,
-            supersedes: Option<Uuid>,
-            content_hash: Vec<u8>,
-            signature: Option<Vec<u8>>,
-            signer_public_key: Option<Vec<u8>>,
-        }
-
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -2534,45 +3256,21 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRow>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.truth_value)?;
-                let mut claim = claim_from_row(
-                    row.id,
-                    row.content,
-                    row.agent_id,
-                    row.trace_id,
-                    truth_value,
-                    row.created_at,
-                    row.updated_at,
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults (is_current=true,
-                // supersedes=None).
-                claim.is_current = row.is_current;
-                claim.supersedes = row.supersedes.map(ClaimId::from_uuid);
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.content_hash,
-                        signature: row.signature,
-                        signer_public_key: row.signer_public_key,
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        row.map(SingleClaimRow::into_claim).transpose()
     }
 
-    /// Fetch only the labels for a single claim. Used by MCP `get_claim` to
-    /// surface labels without re-fetching the whole Claim.
+    /// Fetch only the labels for a single claim.
+    ///
+    /// No production caller remains: MCP and REST `get_claim` read the claim
+    /// and its labels in one statement through [`Self::get_by_id_with_labels`].
+    /// Kept as a test oracle (it answers `[]` for a row the viewer cannot see,
+    /// which several tests rely on).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -2603,8 +3301,15 @@ impl ClaimRepository {
     /// Postgres MVCC, so this is the atomic alternative for callers (e.g. MCP
     /// `get_claim`) that need both together.
     ///
+    /// Decodes through [`SingleClaimRowWithLabels`] (`query_as` + `FromRow`),
+    /// the same row type and post-fixes [`Self::get_by_id`] uses, so a
+    /// drifted column is an `Err` rather than a `sqlx::Row::get` panic.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
+    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if the stored `truth_value` is outside `[0, 1]`.
     #[instrument(skip(executor, viewer))]
     pub async fn get_by_id_with_labels<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
@@ -2613,7 +3318,6 @@ impl ClaimRepository {
     ) -> Result<Option<(Claim, Vec<String>)>, DbError> {
         let uuid: Uuid = id.into();
 
-        use sqlx::Row;
         let sql = viewer.splice(
             r#"
             SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
@@ -2628,51 +3332,17 @@ impl ClaimRepository {
             "#,
             2,
         );
-        let mut q = sqlx::query(&sql).bind(uuid);
+        let mut q = sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql).bind(uuid);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let row = q.fetch_optional(executor).await?;
 
-        match row {
-            Some(row) => {
-                let truth_value = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    truth_value,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state so callers see real DB values
-                // instead of `claim_from_row`'s defaults, mirroring `get_by_id`.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, for the same reason. MCP
-                // `get_claim` renders this `content_hash` to the caller as hex
-                // as the claim's stable identity; serving a digest recomputed
-                // from the body there is the same fabrication `verify_claim`
-                // was caught on. (It was also fed to `redact_content` until
-                // PR-14 deleted redaction — a non-visible row is now absent
-                // rather than blanked, so the hex rendering is the only
-                // surviving reader.)
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                let labels: Vec<String> = row.get("labels");
-                Ok(Some((claim, labels)))
-            }
-            None => Ok(None),
-        }
+        // The crypto post-fix matters here as much as in `get_by_id`: MCP
+        // `get_claim` renders this `content_hash` to the caller as hex as the
+        // claim's stable identity, and serving a digest recomputed from the
+        // body there is the same fabrication `verify_claim` was caught on.
+        row.map(|r| Ok((r.row.into_claim()?, r.labels))).transpose()
     }
 
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
@@ -2714,28 +3384,67 @@ impl ClaimRepository {
             limit,
             paper_doi_filter,
             None,
+            EmbeddingSeedScope::Paragraphs,
         )
         .await
     }
 
     /// [`Self::search_by_embedding`] plus an optional `created_at >= since`
-    /// window.
+    /// window and a choice of candidate population ([`EmbeddingSeedScope`]).
     ///
     /// The predicate sits in the same WHERE clause as the level/NULL guards,
     /// i.e. before `ORDER BY … LIMIT`, so the window narrows the candidate
     /// pool rather than trimming an already-truncated top-K (see
     /// [`Self::search_hybrid_scoped_since`] for why that distinction decides
     /// correctness rather than performance).
+    ///
+    /// # Scope
+    ///
+    /// [`EmbeddingSeedScope::Paragraphs`] keeps the `level = 2` predicate (and
+    /// so, at 1536d, the partial HNSW index from migration 029).
+    /// [`EmbeddingSeedScope::AllClaims`] drops it, so the 1536d statement is
+    /// served by `idx_claims_embedding_hnsw` (migration 001, `WHERE embedding
+    /// IS NOT NULL`). No `is_current` predicate is needed in either scope:
+    /// `chk_deprecated_no_embedding` guarantees a retired claim carries no
+    /// vector in either column.
+    ///
+    /// # Iterative HNSW scan
+    ///
+    /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
+    /// default 40), and the predicates the index does not encode (`since`, the
+    /// DOI `EXISTS`, the visibility splice, and in the `AllClaims` scope every
+    /// row the viewer cannot see out of the whole corpus) are applied AFTER
+    /// it. So, exactly as in [`Self::semantic_search_flat`], the statement
+    /// runs in a short transaction that first sets, `is_local`:
+    ///
+    ///  - `hnsw.iterative_scan = strict_order`: keep scanning past
+    ///    `ef_search` until `LIMIT $2` matching rows are found, in exact
+    ///    distance order;
+    ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`.
+    ///
+    /// The transaction is ROLLED BACK, not committed: on a caller's own
+    /// transaction `begin()` opens a savepoint, and releasing it would carry
+    /// the `SET LOCAL` values into the caller's later HNSW reads.
+    /// `hnsw.max_scan_tuples` stays at its default (20,000). The 3072d column
+    /// has no ANN index, so there the settings are inert and the statement is
+    /// an exact scan.
+    ///
+    /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`).
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(executor, viewer, query_embedding_pgvector))]
-    pub async fn search_by_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn search_by_embedding_since<'a, A>(
+        executor: A,
         viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         dim: u32,
         limit: i64,
         paper_doi_filter: Option<&str>,
         since: Option<DateTime<Utc>>,
-    ) -> Result<Vec<ClaimEmbeddingHit>, DbError> {
+        scope: EmbeddingSeedScope,
+    ) -> Result<Vec<ClaimEmbeddingHit>, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         let column = match dim {
             1536 => "embedding",
             3072 => "embedding_3072",
@@ -2747,8 +3456,16 @@ impl ClaimRepository {
         };
 
         // Two query shapes — paper-filter vs no-filter — to keep both
-        // index-friendly. The shared WHERE predicate matches the partial
-        // HNSW index from migration 029 for the 1536d path.
+        // index-friendly. In the `Paragraphs` scope the shared WHERE
+        // predicate matches the partial HNSW index from migration 029 for the
+        // 1536d path; in the `AllClaims` scope it matches migration 001's
+        // `idx_claims_embedding_hnsw`.
+        //
+        // `level_clause` is one of two static literals, never caller input.
+        let level_clause = match scope {
+            EmbeddingSeedScope::Paragraphs => "(c.properties->>'level')::int = 2 AND",
+            EmbeddingSeedScope::AllClaims => "",
+        };
         //
         // `since` is bound at a FIXED $3 in BOTH shapes and the conditional
         // DOI moves to $4. Appending `since` after a conditionally-bound
@@ -2765,15 +3482,14 @@ impl ClaimRepository {
                 SELECT c.id AS claim_id,
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
-                WHERE (c.properties->>'level')::int = 2
-                  AND c.{column} IS NOT NULL
+                WHERE {level_clause} c.{column} IS NOT NULL
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   AND EXISTS (
                       SELECT 1 FROM edges e
                       JOIN papers p ON p.id = e.source_id
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
-                        AND p.doi = $4
+                        AND p.doi = ANY($4::text[])
                   )
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -2786,8 +3502,7 @@ impl ClaimRepository {
                 SELECT c.id AS claim_id,
                        1 - (c.{column} <=> $1::vector) AS similarity
                 FROM claims c
-                WHERE (c.properties->>'level')::int = 2
-                  AND c.{column} IS NOT NULL
+                WHERE {level_clause} c.{column} IS NOT NULL
                   AND ($3::timestamptz IS NULL OR c.created_at >= $3::timestamptz)
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -2807,13 +3522,28 @@ impl ClaimRepository {
             .bind(limit)
             .bind(since);
         if let Some(doi) = paper_doi_filter {
-            q = q.bind(doi);
+            // Every stored spelling of the document key (backlog 90756d26),
+            // through the normalizer the paper writers use: a bare filter
+            // finds a URL-keyed legacy paper and vice versa.
+            q = q.bind(crate::repos::paper::document_key_spellings(doi));
         }
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
 
-        Ok(q.fetch_all(executor).await?)
+        // See "Iterative HNSW scan" above.
+        let mut tx = executor.begin().await?;
+        sqlx::query(
+            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                    set_config('hnsw.ef_search', $1, true)",
+        )
+        .bind(limit.clamp(40, 1000).to_string())
+        .execute(&mut *tx)
+        .await?;
+        let rows = q.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+
+        Ok(rows)
     }
 
     /// Search **current** claims by embedding similarity across **all levels**.
@@ -3693,95 +4423,35 @@ impl ClaimRepository {
     /// Get a claim by ID on a caller-supplied connection.
     ///
     /// The connection-taking twin of [`Self::get_by_id`], and — since PR-23 —
-    /// the shape a request handler reaches through `AppState::read_as`. It
-    /// takes the `Viewer` and splices `/* {VISIBILITY:c} */`, so it is
-    /// visibility-equivalent to its pool-taking sibling.
+    /// the shape a request handler reaches through `AppState::read_as`.
     ///
-    /// # It is now FIELD-equivalent too, and it was not before
+    /// Delegates to the generic form, which accepts any executor — `&mut
+    /// PgConnection` included — so the visibility predicate, the projection
+    /// and the retirement / crypto post-fix exist in exactly one SQL text and
+    /// one decode. The same shape as [`Self::list_conn`] and
+    /// [`Self::count_conn`].
     ///
-    /// This function used to select seven columns where `get_by_id` selects
-    /// nine, leaving `claim_from_row`'s defaults (`is_current = true`,
-    /// `supersedes = None`) in place. That is a *widening* default rather than
-    /// a visibility defect — a superseded claim read as current — and it is
-    /// invisible to every gate, because the dropped fields default to plausible
-    /// values instead of erroring. The projection and the post-fix below are
-    /// now the same as `get_by_id`'s, per the `claim_from_row` rule in
-    /// `CLAUDE.md`: extend the caller's `SELECT` and post-fix the `Claim`.
+    /// # Why this is a delegator and not a copy
     ///
-    /// **A `*_conn` sibling is not automatically a drop-in for its pool-taking
-    /// twin.** A conversion shard must diff the projected columns as well as
-    /// the visibility marker.
-    ///
-    /// # …and CRYPTO-equivalent, which is the same argument one column further
-    ///
-    /// Backlog `49c17386` added `content_hash` / `signature` /
-    /// `signer_public_key` to `get_by_id` because `claim_from_row` fabricates
-    /// the first (recomputing it from `content`, so `computed == stored`
-    /// compared a value against itself) and blanks the second. That is the
-    /// identical *widening-default* class the section above names, and leaving
-    /// it here would have made this function a drop-in that silently verifies
-    /// clean. The `LEFT JOIN agents` is why this is a spliced runtime query
-    /// rather than a macro site — see [`Self::get_by_id`].
+    /// It used to be a hand-written second copy of `get_by_id`'s SQL, and that
+    /// copy drifted once already: it projected seven columns where its twin
+    /// projected nine, so a superseded claim read back as current. No gate
+    /// sees that class — `visibility_lint.rs` checks that each SQL text carries
+    /// a marker, never that two texts agree — so the copy is gone rather than
+    /// re-synchronised (backlog `fd47651c`). The reason it was once left as a
+    /// copy (`get_by_id` being a `sqlx::query!` macro site with a fixed bind
+    /// arity) stopped holding when `get_by_id` moved to a spliced runtime
+    /// `query_as`. `tests/get_by_id_conn_delegates_to_get_by_id.rs` pins both
+    /// the delegation and the field-for-field equivalence.
     ///
     /// # Errors
-    /// * [`DbError::QueryFailed`] if the database query fails.
-    /// * [`DbError::InvalidData`] if the stored `content_hash` is not 32 bytes.
+    /// As [`Self::get_by_id`].
     pub async fn get_by_id_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         id: ClaimId,
     ) -> Result<Option<Claim>, DbError> {
-        let uuid: Uuid = id.into();
-
-        use sqlx::Row;
-        let sql = viewer.splice(
-            r#"SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
-                      c.created_at, c.updated_at, c.is_current, c.supersedes,
-                      c.content_hash, c.signature,
-                      s.public_key AS signer_public_key
-            FROM claims c
-            LEFT JOIN agents s ON s.id = c.signer_id
-            WHERE c.id = $1 /* {VISIBILITY:c} */"#,
-            2,
-        );
-        let mut q = sqlx::query(&sql).bind(uuid);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let row = q.fetch_optional(&mut *conn).await?;
-
-        match row {
-            Some(row) => {
-                let tv = TruthValue::new(row.get::<f64, _>("truth_value"))?;
-                let mut claim = claim_from_row(
-                    row.get("id"),
-                    row.get("content"),
-                    row.get("agent_id"),
-                    row.get("trace_id"),
-                    tv,
-                    row.get("created_at"),
-                    row.get("updated_at"),
-                );
-                // Post-fix retirement state, exactly as `get_by_id` does.
-                // `claims.is_current` is NOT NULL in the schema, so the plain
-                // `bool` decode is safe; `supersedes` is nullable.
-                claim.is_current = row.get::<bool, _>("is_current");
-                claim.supersedes = row
-                    .get::<Option<Uuid>, _>("supersedes")
-                    .map(ClaimId::from_uuid);
-                // ... and the crypto state, also exactly as `get_by_id` does.
-                post_fix_crypto_columns(
-                    &mut claim,
-                    RowCryptoColumns {
-                        content_hash: row.get("content_hash"),
-                        signature: row.get("signature"),
-                        signer_public_key: row.get("signer_public_key"),
-                    },
-                )?;
-                Ok(Some(claim))
-            }
-            None => Ok(None),
-        }
+        Self::get_by_id(&mut *conn, viewer, id).await
     }
 
     /// List claims with pagination
@@ -4194,8 +4864,34 @@ impl ClaimRepository {
     /// currency it never read — the defect `ClaimRepository::list` had in
     /// backlog `f1992766` and this query still had in `a85ee585`.
     ///
-    /// `is_current` occupies `$3`, so the viewer's group bind is `$6`, not the
-    /// `$5` the pre-`a85ee585` shape used.
+    /// # `exclude_spine`
+    ///
+    /// When `true`, every claim whose `properties.level` is 0, 1 or 2 is
+    /// dropped in SQL *before* `LIMIT`. The target is the verbatim document
+    /// spine (thesis, section heading, paragraph), but the predicate reads
+    /// `level` alone, so workflow thesis/phase/step nodes (the workflow
+    /// builder, the ingest executor's steps, `evolve_step` rows, which carry
+    /// no `source_type`) go too. Narrowing by `source_type` would leak the
+    /// `evolve_step` rows, so the predicate deliberately does not.
+    ///
+    /// Backlog `31e7b727`: the `max_truth=0.4` assessment page is
+    /// newest-first, and "Keywords:" lists, captions, headings and transcript
+    /// turns, each carrying its paragraph's low extraction confidence, filled
+    /// it (64% of the newest 50 low-truth rows on prod, 2026-10-14) before the
+    /// agent could discard them; the same reason the range itself is filtered
+    /// before `LIMIT` (`5a55a48e`). Atoms (level 3) and claims with no `level`
+    /// at all (`submit_claim`, `memorize`) are kept. The comparison is on the
+    /// text value, never a cast, so an absent or odd `level` cannot raise.
+    /// `false` folds the predicate away and leaves the page unchanged.
+    ///
+    /// # Bind layout
+    ///
+    /// `is_current` occupies `$3` and `exclude_spine` `$6`, so the viewer's
+    /// group bind is `$7`. The group bind is conditional (a `Bypass` or
+    /// elevated viewer binds nothing), so it must stay LAST: were it `$6`, a
+    /// bind-less viewer would leave the statement one value short of the
+    /// `$7` it references.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_by_belief_range<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -4204,6 +4900,7 @@ impl ClaimRepository {
         is_current: Option<bool>,
         limit: i64,
         offset: i64,
+        exclude_spine: bool,
     ) -> Result<Vec<(Claim, f64)>, DbError> {
         // Inline row type, NOT the shared `ClaimRow`: adding these columns to
         // `ClaimRow` would break every other `query_as::<_, ClaimRow>` whose
@@ -4236,6 +4933,7 @@ impl ClaimRepository {
                 r#" AS belief_score
                 FROM claims
                 WHERE ($3::bool IS NULL OR COALESCE(is_current, true) = $3)
+                  AND (NOT $6::bool OR COALESCE(properties->>'level', '') NOT IN ('0', '1', '2'))
                   /* {VISIBILITY:claims} */
             ) scored
             WHERE belief_score >= $1 AND belief_score <= $2
@@ -4244,14 +4942,15 @@ impl ClaimRepository {
             "#,
             ]
             .concat(),
-            6,
+            7,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(min_belief)
             .bind(max_belief)
             .bind(is_current)
             .bind(limit)
-            .bind(offset);
+            .bind(offset)
+            .bind(exclude_spine);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -4310,6 +5009,53 @@ impl ClaimRepository {
         // non-current id lowers the count below the distinct cardinality.
         let distinct: std::collections::HashSet<&uuid::Uuid> = ids.iter().collect();
         Ok(live as usize == distinct.len())
+    }
+
+    /// Each of `ids` the viewer reads, with whether it is current, LOCKED
+    /// `FOR NO KEY UPDATE` (in id order) until the caller's transaction ends.
+    ///
+    /// The locking twin of [`Self::are_all_current`], for a check that a later
+    /// write in the same transaction relies on (a dedup mark onto a canonical
+    /// that must stay current). Supersede, deprecate, consolidate and mark
+    /// retire a claim with a plain `UPDATE` (itself a `FOR NO KEY UPDATE`
+    /// lock), which this conflicts with: a retirement that has not committed
+    /// when this runs is waited for and its result read; one that starts
+    /// afterwards waits for the caller's commit. `FOR KEY SHARE` would not
+    /// conflict with it at all. `FOR SHARE` would, but two callers would then
+    /// both hold the row and deadlock when each goes on to `UPDATE` it (a
+    /// label-dedup unit relabels its canonical after marking onto it), where
+    /// `FOR NO KEY UPDATE` makes the second wait for the first and then read
+    /// its result. It does not conflict with `FOR KEY SHARE`, so a foreign-key
+    /// check against the row is not blocked.
+    ///
+    /// `is_current` is returned, not filtered on: under READ COMMITTED a row
+    /// retired while this waited is re-read and comes back `false`, rather
+    /// than vanishing. An id absent from the result is missing, invisible, or
+    /// not lockable by the session (a locking read takes the UPDATE row
+    /// policy, which admits only rows in the session's writable groups).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn current_state_locked<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<(uuid::Uuid, bool)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT id, COALESCE(is_current, true) FROM claims \
+             WHERE id = ANY($1) \
+             /* {VISIBILITY:claims} */ \
+             ORDER BY id FOR NO KEY UPDATE OF claims",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (uuid::Uuid, bool)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
     }
 
     /// Fetch `(id, content)` for a batch of claim ids, current rows only.
@@ -4594,7 +5340,21 @@ impl ClaimRepository {
     /// List claims that contain ALL of the specified labels.
     ///
     /// Uses the GIN index on `claims.labels` for efficient `@>` containment queries.
-    /// Results are ordered by `created_at DESC` and filtered by optional truth threshold.
+    /// Results are ordered by `(created_at DESC, id DESC)`, a total order, and
+    /// filtered by optional truth threshold.
+    ///
+    /// # Paging
+    /// - `after` (keyset, preferred): rows strictly after a [`LabelCursor`]
+    ///   taken from the previous page with [`LabelCursor::next_page`]. A
+    ///   boundary does not drift when rows are inserted or retired between
+    ///   pages, and the sort keeps `limit` rows rather than `limit + offset`.
+    ///   It is not an index seek: there is no `(created_at, id)` index and
+    ///   the predicate is optional (`$7 IS NULL OR ...`), so the planner may
+    ///   still read every matching row (via the labels GIN index) and top-N
+    ///   sort it. A composite index is a follow-up if a re-measure shows the
+    ///   scan itself matters.
+    /// - `offset` (compatibility): skip N rows. It still applies when `after`
+    ///   is set, but the API surfaces refuse that combination.
     ///
     /// # Filters
     /// - `exclude_labels`: drop any claim whose label set intersects this
@@ -4625,6 +5385,7 @@ impl ClaimRepository {
             min_truth,
             limit,
             offset,
+            after,
         } = query;
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -4651,12 +5412,13 @@ impl ClaimRepository {
               AND c.truth_value >= $2
               AND ($3::text[] = '{}'::text[] OR NOT (c.labels && $3))
               AND ($4 = false OR COALESCE(c.is_current, true) = true)
+              AND ($7::timestamptz IS NULL OR (c.created_at, c.id) < ($7::timestamptz, $8::uuid))
               /* {VISIBILITY:c} */
-            ORDER BY c.created_at DESC
+            ORDER BY c.created_at DESC, c.id DESC
             LIMIT $5
             OFFSET $6
             "#,
-            7,
+            9,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql)
             .bind(labels)
@@ -4664,7 +5426,9 @@ impl ClaimRepository {
             .bind(exclude_labels)
             .bind(current_only)
             .bind(limit)
-            .bind(offset);
+            .bind(offset)
+            .bind(after.map(|a| a.created_at))
+            .bind(after.map(|a| a.id));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -4687,6 +5451,218 @@ impl ClaimRepository {
             out.push((claim, row.labels));
         }
         Ok(out)
+    }
+
+    /// Every claim carrying ALL of `include` and NONE of `exclude`, in id
+    /// order, with no offset: a whole label family in one deterministic read.
+    ///
+    /// Returns at most `cap + 1` rows. A caller that receives more than `cap`
+    /// knows the family is larger than its cap and must treat the read as
+    /// truncated (the planner refuses to act on a prefix), which offset paging
+    /// over `created_at` could never tell it: a page boundary drifts under
+    /// concurrent writes.
+    ///
+    /// Viewer-scoped: rows the viewer cannot read are absent. Under forced
+    /// row security a group-private row is visible only on a connection
+    /// stamped from a viewer that reads its group, so call it on
+    /// `ScopedPool::read_as`.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` when `include` is empty (that would read every
+    /// claim) or `cap` is negative; `DbError::QueryFailed` on a database
+    /// failure.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_all_by_labels_ordered_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        include: &[String],
+        exclude: &[String],
+        current_only: bool,
+        cap: i64,
+    ) -> Result<Vec<LabelFamilyRow>, DbError> {
+        if include.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: "a label-family read needs at least one include label; an empty set \
+                         would read every claim"
+                    .to_string(),
+            });
+        }
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("a label-family read needs a non-negative cap, got {cap}"),
+            });
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at
+            FROM claims c
+            WHERE c.labels @> $1
+              AND ($2::text[] = '{}'::text[] OR NOT (c.labels && $2))
+              AND ($3 = false OR COALESCE(c.is_current, true) = true)
+              /* {VISIBILITY:c} */
+            ORDER BY c.id
+            LIMIT $4
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_as::<_, LabelFamilyRow>(&sql)
+            .bind(include)
+            .bind(exclude)
+            .bind(current_only)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The label-dedup `index_view`: for each of `canonicals`, every claim
+    /// marked a duplicate of it, down a chain (a duplicate of a duplicate, to
+    /// [`MAX_DUPLICATE_CHAIN_DEPTH`]), through IN-FORCE dedup identity edges
+    /// only (`same_as` carrying `properties.dedup`; a plain `same_as`, or the
+    /// retracted edge of an un-marked duplicate, is not followed). Only
+    /// non-current claims are returned (a marked duplicate is retired).
+    ///
+    /// The walk looks one step past the bound: a duplicate found there is not
+    /// returned, and [`MarkedDuplicates::chain_truncated`] says the chain went
+    /// on, so a caller never takes a cut-off chain for a whole one.
+    ///
+    /// Filtered by `viewer` on every edge and claim it reads: a duplicate the
+    /// viewer cannot read is not returned, so a caller that needs every
+    /// duplicate must use a viewer that reads them all.
+    ///
+    /// Ordered by `(canonical, id)`; at most `cap + 1` rows, so a caller sees
+    /// that more than `cap` exist.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for a negative cap; `DbError::QueryFailed`.
+    pub async fn marked_duplicates_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        canonicals: &[Uuid],
+        cap: i64,
+    ) -> Result<MarkedDuplicates, DbError> {
+        if cap < 0 {
+            return Err(DbError::InvalidData {
+                reason: format!("an index-view read needs a non-negative cap, got {cap}"),
+            });
+        }
+        if canonicals.is_empty() {
+            return Ok(MarkedDuplicates::default());
+        }
+        // `walk` goes to depth $4 + 1; `hits` keeps what the viewer reads and
+        // marks the rows past the bound; `kept` is the capped answer. The
+        // final LEFT JOIN returns the flag even when nothing is kept.
+        let sql = viewer.splice(
+            r#"
+            WITH RECURSIVE walk(canonical, dup, depth) AS (
+                SELECT e.target_id, e.source_id, 1
+                  FROM edges e
+                 WHERE e.target_id = ANY($1) AND e.target_type = 'claim'
+                   AND e.source_type = 'claim' AND e.relationship = $2
+                   AND e.valid_to IS NULL AND e.properties ? $3
+                   /* {EDGE_VISIBILITY:e} */
+                UNION
+                SELECT w.canonical, e.source_id, w.depth + 1
+                  FROM walk w
+                  JOIN edges e ON e.target_id = w.dup
+                 WHERE e.target_type = 'claim' AND e.source_type = 'claim'
+                   AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+                   AND w.depth <= $4
+                   /* {EDGE_VISIBILITY:e} */
+            ),
+            hits AS (
+                SELECT w.canonical, c.id, c.content,
+                       COALESCE(c.labels, ARRAY[]::text[]) AS labels, c.created_at,
+                       c.agent_id, k.agent_id AS canonical_agent_id,
+                       w.depth > $4 AS beyond
+                  FROM walk w
+                  JOIN claims c ON c.id = w.dup
+                  JOIN claims k ON k.id = w.canonical
+                 WHERE NOT COALESCE(c.is_current, true) AND c.id <> w.canonical
+                   /* {VISIBILITY:c} */
+                   /* {VISIBILITY:k} */
+            ),
+            kept AS (
+                SELECT DISTINCT canonical, id, content, labels, created_at,
+                       agent_id, canonical_agent_id
+                  FROM hits
+                 WHERE NOT beyond
+                 ORDER BY canonical, id
+                 LIMIT $5
+            )
+            SELECT EXISTS (SELECT 1 FROM hits WHERE beyond) AS chain_truncated,
+                   kept.canonical, kept.id, kept.content, kept.labels, kept.created_at,
+                   kept.agent_id, kept.canonical_agent_id
+              FROM (SELECT 1) AS one
+              LEFT JOIN kept ON true
+             ORDER BY kept.canonical, kept.id
+            "#,
+            6,
+        );
+        let mut q = sqlx::query_as::<_, MarkedDuplicateWalkRow>(&sql)
+            .bind(canonicals)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(MAX_DUPLICATE_CHAIN_DEPTH)
+            .bind(cap.saturating_add(1));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let walked = q.fetch_all(executor).await?;
+        let chain_truncated = walked.first().is_some_and(|r| r.chain_truncated);
+        let rows = walked
+            .into_iter()
+            .filter_map(|r| {
+                Some(MarkedDuplicateRow {
+                    canonical: r.canonical?,
+                    id: r.id?,
+                    content: r.content?,
+                    labels: r.labels?,
+                    created_at: r.created_at?,
+                    agent_id: r.agent_id?,
+                    canonical_agent_id: r.canonical_agent_id?,
+                })
+            })
+            .collect();
+        Ok(MarkedDuplicates {
+            rows,
+            chain_truncated,
+        })
+    }
+
+    /// The in-force dedup identity edge out of `dup` (`same_as` carrying
+    /// `properties.dedup`), with the claim it names, when the viewer can read
+    /// it: which mark a claim currently carries, so a revert can tell the mark
+    /// it made from a later one onto the same canonical.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed`.
+    pub async fn dedup_identity_edge_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+    ) -> Result<Option<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.id, e.target_id
+              FROM edges e
+             WHERE e.source_id = $1 AND e.source_type = 'claim' AND e.target_type = 'claim'
+               AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3
+               /* {EDGE_VISIBILITY:e} */
+             ORDER BY e.created_at DESC, e.id
+             LIMIT 1
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
+            .bind(dup)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// List claims that have NEVER been touched by decomposition: claims that
@@ -4712,8 +5688,11 @@ impl ClaimRepository {
     /// skip-patterns. Also drops trivially short content (`length > 10`), the
     /// one filter ported verbatim from V2.
     ///
-    /// Ordered `created_at ASC` (oldest first) so a bounded batch makes
-    /// monotonic progress through the backlog across scheduled runs.
+    /// Ordered `created_at ASC` (oldest first) so offset paging is stable.
+    /// Claims that `epigraph_core::atomicity::looks_atomic` accepts are
+    /// terminal by policy (U073, backlog `5e1debbc`): `decompose_claims` skips
+    /// them, so they never leave this population and its row count is not a
+    /// progress measure.
     ///
     /// Every returned row is current by the `WHERE` clause, so `claim_from_row`'s
     /// `is_current = true` default is already true here; `supersedes` is NOT
@@ -5078,8 +6057,12 @@ impl ClaimRepository {
 
     /// Batch update truth values for multiple claims in a single query
     ///
-    /// Uses PostgreSQL UPDATE with CASE WHEN for efficient bulk updates.
-    /// Only updates claims that exist - non-existent IDs are silently skipped.
+    /// One static `UPDATE … FROM unnest($1::uuid[], $2::float8[])` statement,
+    /// so the SQL text and the bind count (two) do not depend on the batch
+    /// size. Only updates claims that exist - non-existent IDs are silently
+    /// skipped. An id listed more than once is updated once, with the value
+    /// of its FIRST occurrence (the contract the previous `CASE id WHEN …`
+    /// form had: its first matching arm won).
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -5114,35 +6097,32 @@ impl ClaimRepository {
             return Ok(0);
         }
 
-        // Build UPDATE with CASE WHEN for efficiency
-        // UPDATE claims SET truth_value = CASE id
-        //   WHEN uuid1 THEN value1
-        //   WHEN uuid2 THEN value2
-        // END, updated_at = NOW()
-        // WHERE id IN (uuid1, uuid2, ...)
+        // One static statement over two parallel arrays. The previous form
+        // built `CASE id WHEN $1 THEN $2 …` plus `WHERE id IN ($1, $3, …)` with
+        // two placeholders per item, so its text varied with the batch size
+        // (one prepared statement per size) and a batch above 32767 items
+        // exceeded the protocol's 65535-bind limit. `unnest` binds two arrays
+        // whatever the size.
+        //
+        // Deduplicated here, first occurrence kept: `UPDATE … FROM` joining a
+        // target row to several source rows applies an unspecified one of
+        // them, so the old first-wins contract has to be made explicit.
+        let mut seen = std::collections::HashSet::with_capacity(updates.len());
+        let (ids, values): (Vec<Uuid>, Vec<f64>) = updates
+            .iter()
+            .map(|(claim_id, truth_value)| (Uuid::from(*claim_id), truth_value.value()))
+            .filter(|(id, _)| seen.insert(*id))
+            .unzip();
 
-        let mut case_builder = String::from("UPDATE claims SET truth_value = CASE id ");
-        let mut where_ids = Vec::with_capacity(updates.len());
-        let mut param_idx = 1;
-
-        for _ in updates {
-            case_builder.push_str(&format!("WHEN ${} THEN ${} ", param_idx, param_idx + 1));
-            where_ids.push(format!("${}", param_idx));
-            param_idx += 2;
-        }
-
-        case_builder.push_str("END, updated_at = NOW() WHERE id IN (");
-        case_builder.push_str(&where_ids.join(", "));
-        case_builder.push(')');
-
-        let mut query = sqlx::query(&case_builder);
-
-        for (claim_id, truth_value) in updates {
-            let uuid: Uuid = (*claim_id).into();
-            query = query.bind(uuid).bind(truth_value.value());
-        }
-
-        let result = query.execute(pool).await?;
+        let result = sqlx::query(
+            "UPDATE claims c SET truth_value = u.tv, updated_at = NOW() \
+             FROM unnest($1::uuid[], $2::float8[]) AS u(id, tv) \
+             WHERE c.id = u.id",
+        )
+        .bind(&ids)
+        .bind(&values)
+        .execute(pool)
+        .await?;
 
         Ok(result.rows_affected() as usize)
     }
@@ -5210,6 +6190,38 @@ impl ClaimRepository {
     /// mirror-image judgement call, but their failure mode is the loss of a
     /// positive signal rather than the manufacture of a negative one, and
     /// changing them is not this function's decision to make.
+    ///
+    /// ## Step lineages (backlog 8d3b4527)
+    ///
+    /// `evolve_step(supersedes)` is a supersession too: it records
+    /// `supersedes = parent`, and the request paths run the same administrative
+    /// cascade. When the old and new claims share a non-null `step_lineage_id`,
+    /// the migration also leaves `executes` (the workflow's FROZEN step; the
+    /// head is resolved through the lineage), the workflow's chain edges
+    /// `step_follows` / `phase_follows` in either direction (they link the
+    /// frozen steps `executes` names, which is the id set
+    /// `workflow_steps::ordered_steps` walks), `revises` in either direction
+    /// (the lineage's branch history, like `supersedes`) and agents'
+    /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
+    /// caller, not by the agents that asserted the old content) on the retired
+    /// step. A supersession made here writes no `step_lineage_id`, so the
+    /// lineage rule does not apply to it. The rule is read from the rows,
+    /// because the deferred replay knows nothing of the original caller.
+    ///
+    /// ## Non-public steps keep their `executes` (OD-32)
+    ///
+    /// Whatever the lineage, a supersession of a claim whose `visibility` is
+    /// not `public` leaves `executes`
+    /// ([`NON_PUBLIC_FROZEN_RELATIONSHIPS`]) on the retired claim, in either
+    /// direction. That edge is how a frozen workflow generation names its
+    /// steps, and a pinned group-private generation is verified against it, so
+    /// a plain supersede (which writes no lineage) must not re-point it. The
+    /// dedup and merge cascades apply the same rule. The workflow keeps
+    /// executing the retired step until a new generation is published; the
+    /// chain edges `step_follows` / `phase_follows` still move as before
+    /// outside a step lineage. A public step's `executes` moves as before. The
+    /// rule is read from the old claim's row, so the deferred replay gives the
+    /// same result.
     ///
     /// ## Self-loop guards — deliberately unreachable
     ///
@@ -5324,51 +6336,77 @@ impl ClaimRepository {
         let content_hash = ContentHasher::hash(new_content.as_bytes());
         let new_truth_val = new_truth.value();
 
-        // Verify old claim exists and is current; also pull labels so the new
-        // claim can inherit them. Without the label carry, downstream consumers
-        // that filter by labels (e.g. find_workflow's `labels @> ['workflow']`
-        // predicate) silently lose the replacement. Properties are NOT carried
+        // Retire the old claim and read what the replacement inherits in ONE
+        // statement. `AND is_current` is what makes two concurrent
+        // supersessions of one claim mutually exclusive: under READ COMMITTED
+        // the second blocks on the first's row lock, re-evaluates the WHERE
+        // once the first commits, and matches nothing. A separate unlocked
+        // `SELECT is_current` followed by `UPDATE … WHERE id = $1` let both
+        // pass and insert two current successors.
+        //
+        // Both embedding columns are nulled in this same statement: the CHECK
+        // constraint `chk_deprecated_no_embedding` (migration 052) fires
+        // per-statement, not per-transaction, so a two-step update would
+        // violate it between statements.
+        //
+        // Labels are carried so that downstream consumers that filter by
+        // labels (e.g. find_workflow's `labels @> ['workflow']` predicate) do
+        // not silently lose the replacement. Properties are NOT carried
         // forward: if the supersession is fixing something that lived in
         // `properties` (e.g. a stale `confidence_source`), blanket copy would
         // propagate the bug the supersede was meant to correct. Callers that
         // want to preserve specific properties on the new claim should set
         // them via a follow-up `patch_claim`.
-        let old_row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
-            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-             SELECT agent_id, COALESCE(is_current, true),
-                    COALESCE(labels, ARRAY[]::text[])
-             FROM claims WHERE id = $1"#,
+        let retired: Option<(Uuid, Vec<String>)> = sqlx::query_as(
+            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+             updated_at = NOW() WHERE id = $1 AND is_current \
+             RETURNING agent_id, COALESCE(labels, ARRAY[]::text[])",
         )
         .bind(old_uuid)
         .fetch_optional(&mut *conn)
         .await?;
 
-        let (agent_id, is_current, old_labels) = old_row.ok_or(DbError::NotFound {
-            entity: "Claim".to_string(),
-            id: old_uuid,
-        })?;
-
-        if !is_current {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "Claim {} has already been superseded",
-                    old_uuid
-                )),
-            });
-        }
-
-        // Mark old claim as non-current and null both embedding columns in one
-        // statement. Combining all three in a single UPDATE is required by the
-        // CHECK constraint `chk_deprecated_no_embedding` (migration 052) which
-        // fires per-statement, not per-transaction: a two-step update would
-        // violate it between statements.
-        sqlx::query(
-            "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
-             updated_at = NOW() WHERE id = $1",
-        )
-        .bind(old_uuid)
-        .execute(&mut *conn)
-        .await?;
+        let (agent_id, mut old_labels) = match retired {
+            Some(r) => r,
+            None => {
+                // Nothing retired: tell a missing claim from a retired one, the
+                // two refusals this function has always distinguished.
+                let is_current: Option<bool> = sqlx::query_scalar(
+                    r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read classifies the refusal of the mutation it guards, not a disclosure to a caller.
+                     SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
+                )
+                .bind(old_uuid)
+                .fetch_optional(&mut *conn)
+                .await?;
+                return Err(match is_current {
+                    None => DbError::NotFound {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                    },
+                    Some(false) => DbError::QueryFailed {
+                        source: sqlx::Error::Protocol(format!(
+                            "Claim {} has already been superseded",
+                            old_uuid
+                        )),
+                    },
+                    // Visible and current, yet the UPDATE matched no row: the
+                    // session may read it but not retire it (an UPDATE policy
+                    // whose USING hides the row, e.g. an elevated session's
+                    // `claims_elevated_no_update`). Refuse rather than insert
+                    // a successor next to a still-current claim; both
+                    // transports map `WriteRefused` to a denial (HTTP 403,
+                    // MCP INVALID_REQUEST).
+                    Some(true) => DbError::WriteRefused {
+                        entity: "Claim".to_string(),
+                        id: old_uuid,
+                        action: "supersede".to_string(),
+                    },
+                });
+            }
+        };
+        // Per-submission review flags describe the OLD content, not the
+        // replacement's, so they do not carry (see `NON_CARRIED_LABELS`).
+        old_labels.retain(|l| !NON_CARRIED_LABELS.contains(&l.as_str()));
 
         // Insert new claim with supersedes link, carrying forward only labels
         // from the old row. Embeddings are intentionally NOT copied: the new
@@ -5513,24 +6551,138 @@ impl ClaimRepository {
         }
     }
 
+    /// Serialize every find-then-insert of one `(content_hash, agent_id)` for
+    /// the rest of the caller's CURRENT TRANSACTION.
+    ///
+    /// # Why the database does not do this
+    ///
+    /// Migration 013's `uq_claims_content_hash_agent` is absent on the
+    /// long-lived database (migrations/README.md, "Known schema drift"), and
+    /// migration 150 drops it everywhere else so CI matches it. Without it,
+    /// "find, and insert on a miss" is a check-then-act race: the find runs on
+    /// a snapshot that cannot see a concurrent caller's uncommitted insert, so
+    /// two first creates of one pair both miss and both insert. This lock is
+    /// the contract now; the `DuplicateKey` catch arms stay for a future
+    /// partial unique index (`WHERE is_current`).
+    ///
+    /// # How a caller must use it
+    ///
+    /// Take it as its OWN statement, inside a transaction, BEFORE the find whose
+    /// answer decides the insert, and keep that transaction open until the
+    /// insert commits. An earlier unlocked find may answer a hit on its own (a
+    /// committed row is a committed row); it must not decide a miss. A
+    /// `pg_advisory_xact_lock` is released at the end of the transaction that
+    /// took it — on an autocommit connection that is the end of this very
+    /// statement, which serializes nothing. Under READ COMMITTED the find,
+    /// issued after the lock is granted, reads a snapshot that includes the
+    /// previous holder's committed row.
+    ///
+    /// The two-key form keeps this lock space disjoint from the single-key
+    /// locks elsewhere; `'epigraph.claim_dedup'` keeps it disjoint from
+    /// `policies.rs::create_challenge`'s `'epigraph.policy_challenge'`.
+    ///
+    /// A caller that creates many claims in one transaction holds one lock per
+    /// distinct pair until it commits, in input order.
+    ///
+    /// # Who takes it
+    ///
+    /// Every writer that looks for an existing row of the pair (or of its
+    /// content hash) and inserts on a miss: [`Self::create_or_get`] /
+    /// [`Self::create_or_get_signed`], POST /claims' duplicate check
+    /// (`if_not_exists=false`), the legacy content-hash creates
+    /// ([`Self::create_conn`], and [`Self::create`] / [`Self::create_with_tx`],
+    /// which delegate to it), [`Self::consolidate_act_conn`]'s "identical
+    /// merged claim already exists" probe, and the `method_search` maintenance
+    /// binary in `epigraph-cli`. Each takes it BEFORE the find that decides its
+    /// insert, and before any row lock of its own. `create_conn` and
+    /// `method_search` first run an unlocked find that answers only a hit.
+    ///
+    /// Writers that do not take it:
+    ///
+    /// - [`Self::create_strict`] and the other unconditional INSERTs
+    ///   (supersede, `evolve_step`, `batch_create`, hypothesis creation) have
+    ///   no find, so there is no check-then-act to race.
+    /// - [`Self::create_with_id_if_absent`] and the ingest-executor's
+    ///   workflow `add_step` dedup on a caller-derived deterministic id
+    ///   (`ON CONFLICT (id)`), which the primary key already serializes among
+    ///   their own callers; one id means one pair. They have NO pair dedup at
+    ///   all, so they do not dedup against a random-id row of the same pair:
+    ///   a [`Self::create_or_get`] of exact atom text by the same agent,
+    ///   committed earlier or running concurrently, followed by a
+    ///   deterministic-id create of that atom, leaves two rows of the pair.
+    ///   Taking this lock without adding a pair find would close neither
+    ///   case, so the gap stays open here and is tracked separately.
+    /// - `policies.rs::create_challenge` finds on the pair PLUS the
+    ///   `policy:challenge` label and serializes its own callers under
+    ///   `'epigraph.policy_challenge'`. A non-challenge row of the same pair
+    ///   does not satisfy its find, so the shared key would not change its
+    ///   outcome.
+    ///
+    /// A concurrent writer of the same pair that does not take this lock can
+    /// still add a row that a lock holder's find did not see.
+    ///
+    /// # Deadlocks and lock-table use
+    ///
+    /// The ingest atoms reach it through [`Self::create_conn`] inside one
+    /// document transaction. `create_conn` answers a hit on an
+    /// already-committed atom with an unlocked find and takes the lock only
+    /// on a MISS, so an ingest holds one lock per NEWLY INSERTED atom until it
+    /// commits; atoms that already existed cost no lock and add no wait.
+    /// Ingest against ingest keeps the wait graph it had without the lock: a
+    /// miss is an atom some concurrent ingest may be inserting, and since an
+    /// atom's id is `atom_id(content_hash)` an overlapping same-author ingest
+    /// already waited on the other's uncommitted primary-key entry (and then
+    /// failed on that key instead of returning the first's row). New: a
+    /// same-author ingest against a multi-pair [`Self::create_or_get`]
+    /// transaction or a consolidation into the same content, meeting shared
+    /// NEW pairs in opposite orders, can now deadlock (40P01, retryable) where
+    /// it previously minted a duplicate.
+    ///
+    /// Every lock held until commit takes a slot in the shared lock table
+    /// (`max_locks_per_transaction` x (`max_connections` +
+    /// `max_prepared_transactions`)), which the primary-key waits did not. A
+    /// document with very many new atoms, or several concurrent large ones,
+    /// uses correspondingly many slots.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the lock statement fails.
+    pub async fn lock_content_hash_agent(
+        conn: &mut sqlx::PgConnection,
+        content_hash: &[u8],
+        agent_id: Uuid,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('epigraph.claim_dedup'), \
+                    hashtext(encode($1, 'hex') || $2::text))",
+        )
+        .bind(content_hash)
+        .bind(agent_id)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Insert a claim row unconditionally (no implicit dedup).
     ///
     /// Use this when the caller has already determined that an insert is
-    /// the correct action (or wants the post-107 UNIQUE constraint to be
-    /// the authoritative dedup gate).
+    /// the correct action. A caller that must not mint a second row for one
+    /// `(content_hash, agent_id)` takes [`Self::lock_content_hash_agent`] and
+    /// runs [`Self::find_by_content_hash_and_agent`] first, in the same
+    /// transaction (or uses [`Self::create_or_get`], which does both).
     ///
-    /// **Pre-107:** inserts a duplicate row when `(content_hash, agent_id)`
-    /// already exists.
+    /// **Without `uq_claims_content_hash_agent`** (the long-lived database,
+    /// and every database from migration 150): inserts a duplicate row when
+    /// `(content_hash, agent_id)` already exists.
     ///
-    /// **Post-107:** the `uq_claims_content_hash_agent` constraint surfaces
-    /// duplicate insertions as `DbError::DuplicateKey`.
+    /// **With it** (a database that re-adds it, or a future partial unique
+    /// index): duplicate insertions surface as `DbError::DuplicateKey`.
     ///
     /// Takes `&mut PgConnection` for transactional composition.
     ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` on a `(content_hash, agent_id)`
-    /// collision (post-107 only). Returns `DbError::QueryFailed` for other
-    /// database errors.
+    /// collision (only where a unique constraint on the pair exists). Returns
+    /// `DbError::QueryFailed` for other database errors.
     pub async fn create_strict(
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
@@ -5664,17 +6816,26 @@ impl ClaimRepository {
     /// `was_created=false`. Otherwise inserts and returns the new row with
     /// `was_created=true`.
     ///
-    /// **Post-107 race handling:** if a concurrent writer inserts the same
-    /// `(content_hash, agent_id)` between the find and the insert, the INSERT
-    /// fails with the unique constraint. This helper catches that error,
-    /// re-runs the find, and returns the resulting row with
-    /// `was_created=false`.
+    /// **Race handling:** the find and the insert run inside one transaction
+    /// (a real `BEGIN` on a bare connection, a SAVEPOINT inside the caller's)
+    /// that first takes [`Self::lock_content_hash_agent`]. Two concurrent first
+    /// creates of one pair therefore serialize: the second waits for the
+    /// first's transaction to end, then its find sees the committed row and it
+    /// returns `was_created=false`. This holds without any unique constraint,
+    /// which is the shape of the long-lived database and, from migration 150,
+    /// of every database (backlog 00f1a517). Inside a caller's transaction the
+    /// lock is held until THAT transaction ends, which is what keeps the
+    /// caller's still-uncommitted row from being missed.
     ///
-    /// **Pre-107 (constraint not yet applied):** the catch path is
-    /// unreachable, and a concurrent race may produce two rows. S2 backfill
-    /// (future) cleans up any rows produced during the S1→S4 transition.
+    /// **Belt-and-braces catch:** a writer that inserts the pair WITHOUT the
+    /// lock (see [`Self::lock_content_hash_agent`], "Who takes it") can still
+    /// win between the find and the insert. Where a unique
+    /// constraint on the pair exists, the INSERT then fails; this helper
+    /// catches that error, re-runs the find, and returns the resulting row with
+    /// `was_created=false`. Without such a constraint that writer's row is a
+    /// duplicate this helper cannot see.
     ///
-    /// **Constraint match assumption:** the post-107 catch path matches
+    /// **Constraint match assumption:** the catch path matches
     /// `DbError::DuplicateKey { .. }` only because
     /// `uq_claims_content_hash_agent` is the only unique constraint that can
     /// fire on a fresh-UUID `INSERT INTO claims`. If a future migration adds
@@ -5705,10 +6866,11 @@ impl ClaimRepository {
     /// `epigraph-mcp/src/claim_helper.rs::emit_verb_edge_best_effort`, for the
     /// same reason.
     ///
-    /// On a connection that is NOT already in a transaction, `conn.begin()` is a
-    /// real `BEGIN`/`COMMIT` pair around the one INSERT — same durability, one
-    /// extra round trip, and the same visible behaviour the pre-savepoint code
-    /// had.
+    /// On a connection that is NOT already in a transaction, the outer scope is
+    /// a real `BEGIN`/`COMMIT` pair around the lock, the find and the insert,
+    /// and the insert's own scope is a SAVEPOINT inside it — same durability,
+    /// and the row is visible to the next lock holder the moment the lock is
+    /// released.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` for non-unique-violation database errors,
@@ -5740,8 +6902,48 @@ impl ClaimRepository {
     ) -> Result<(Claim, bool), DbError> {
         use sqlx::Acquire;
 
+        // The serialization scope: a real BEGIN on a bare connection (an
+        // advisory xact lock taken in autocommit is released at the end of its
+        // own statement), a SAVEPOINT inside the caller's transaction (the lock
+        // then lives until the caller's transaction ends). Closed explicitly on
+        // every path below.
+        let mut scope = conn
+            .begin()
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        match Self::create_or_get_serialized(&mut scope, viewer, claim, decl, signer_id).await {
+            Ok(out) => {
+                scope
+                    .commit()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Ok(out)
+            }
+            Err(e) => {
+                scope
+                    .rollback()
+                    .await
+                    .map_err(|source| DbError::QueryFailed { source })?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Self::create_or_get_signed`], run inside its
+    /// serialization scope: lock, find, then the savepointed insert.
+    async fn create_or_get_serialized(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<(Claim, bool), DbError> {
+        use sqlx::Acquire;
+
         let agent_id: Uuid = claim.agent_id.into();
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
+
+        Self::lock_content_hash_agent(&mut *conn, content_hash.as_slice(), agent_id).await?;
 
         if let Some(existing) = Self::find_by_content_hash_and_agent(
             &mut *conn,
@@ -5778,7 +6980,8 @@ impl ClaimRepository {
         match attempt {
             Ok(c) => Ok((c, true)),
             Err(DbError::DuplicateKey { .. }) => {
-                // Post-107 race: another writer won. Re-find and return.
+                // A writer that bypassed the lock won, and a unique constraint
+                // on the pair caught it. Re-find and return.
                 let existing = Self::find_by_content_hash_and_agent(
                     &mut *conn,
                     viewer,
@@ -5956,7 +7159,8 @@ impl ClaimRepository {
         // would return MORE, and wrong. Only `c` carries the predicate.
         let sql = viewer.splice(
             r#"
-            SELECT c.id, c.content, c.truth_value, c.created_at
+            SELECT c.id, c.content, c.truth_value, c.created_at,
+                   COALESCE(c.is_current, true) AS is_current
             FROM claims c
             WHERE c.step_lineage_id = $1
               AND NOT EXISTS (
@@ -6637,6 +7841,13 @@ impl ClaimRepository {
     /// `level` defaults to 2 (step). The `properties` JSONB on the new claim
     /// includes `level` and `step_lineage_id` so existing find_workflow_hierarchical
     /// queries (which filter on `properties->>'level' = '2'`) still work.
+    ///
+    /// With `supersedes`, the new claim also records `supersedes = parent`, so
+    /// the Supersede admin cascade (and its deferred replay) migrates the
+    /// parent's edges onto it; see [`Self::migrate_superseded_edges_conn`] and
+    /// the step-lineage paragraph of [`Self::supersede`]'s edge migration
+    /// policy. This function performs only the act: the request paths run the
+    /// cascade after it commits.
     #[instrument(skip(pool))]
     pub async fn evolve_step(
         pool: &PgPool,
@@ -6678,11 +7889,16 @@ impl ClaimRepository {
         level: u32,
         agent_id: Uuid,
     ) -> Result<EvolveStepResult, DbError> {
+        // The two refusals below are the CALLER's to fix (backlog 769989ae):
+        // `InvalidData` (HTTP 400, MCP INVALID_PARAMS) for a request outside
+        // the vocabulary and `Conflict` (HTTP 409) for a parent that is no
+        // longer current. A `QueryFailed` here read as a server fault on both
+        // transports.
         if !matches!(edge_type, "supersedes" | "revises") {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
+            return Err(DbError::InvalidData {
+                reason: format!(
                     "evolve_step: edge_type must be 'supersedes' or 'revises', got {edge_type}"
-                )),
+                ),
             });
         }
         let parent_uuid: Uuid = parent.into();
@@ -6734,10 +7950,8 @@ impl ClaimRepository {
             }
         };
         if edge_type == "supersedes" && !parent_current {
-            return Err(DbError::QueryFailed {
-                source: sqlx::Error::Protocol(format!(
-                    "evolve_step: cannot supersede a non-current step {parent_uuid}"
-                )),
+            return Err(DbError::Conflict {
+                reason: format!("evolve_step: cannot supersede a non-current step {parent_uuid}"),
             });
         }
         let lineage_id = match existing_lineage {
@@ -6759,10 +7973,17 @@ impl ClaimRepository {
             "level": level,
             "step_lineage_id": lineage_id.to_string(),
         });
+        // A `supersedes` step also records the supersession in the column, as
+        // the supersede act does: that is what `migrate_superseded_edges_conn`
+        // (the Supersede admin cascade, and its deferred replay) and migration
+        // 120's deferral check verify before carrying the retired step's edges
+        // to this one. A `revises` branch supersedes nothing (both heads stay
+        // current), so it records none.
+        let supersedes: Option<Uuid> = (edge_type == "supersedes").then_some(parent_uuid);
         sqlx::query(
             "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, labels, properties, step_lineage_id, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8)",
+                                 visibility, owner_group_id, supersedes) \
+             VALUES ($1, $2, $3, 0.5, $4, true, ARRAY[]::text[], $5, $6, $7, $8, $9)",
         )
         .bind(new_uuid)
         .bind(new_content)
@@ -6772,6 +7993,7 @@ impl ClaimRepository {
         .bind(lineage_id)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(supersedes)
         .execute(&mut *tx)
         .await?;
 
@@ -6915,6 +8137,26 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<DedupRepair, DbError> {
+        Self::mark_duplicate_with_repair_attributed_conn(
+            conn,
+            dup,
+            canonical,
+            &DuplicateProvenance::unattributed(),
+        )
+        .await
+    }
+
+    /// [`Self::mark_duplicate_with_repair_conn`] with the caller's
+    /// [`DuplicateProvenance`] on the identity edge the act writes.
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_with_repair_conn`].
+    pub async fn mark_duplicate_with_repair_attributed_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+        provenance: &DuplicateProvenance,
+    ) -> Result<DedupRepair, DbError> {
         use sqlx::Acquire;
         require_privileged_session(
             &mut *conn,
@@ -6924,7 +8166,7 @@ impl ClaimRepository {
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
         let repair = repair_marked_duplicate(&mut tx, dup_uuid, canon_uuid).await?;
         tx.commit().await?;
         Ok(repair)
@@ -6947,8 +8189,8 @@ impl ClaimRepository {
     /// non-zero index (FALSE) does not hand that binding to a canonical the
     /// caller cannot write and that has none (FA07, review finding W2). The
     /// repair also skips such a copy; refusing here keeps the act and the
-    /// repair from diverging when the caller can see the edge that would move
-    /// it.
+    /// repair from diverging when the caller can see the edge or the BBA (the
+    /// repair pools the duplicate's own BBAs too) that would carry it.
     ///
     /// And it keeps 114's attach rule for the canonical (FA04: a non-owner may
     /// attach only to a PUBLIC claim). The repair moves the duplicate's
@@ -6971,11 +8213,33 @@ impl ClaimRepository {
         dup: ClaimId,
         canonical: ClaimId,
     ) -> Result<(), DbError> {
+        Self::mark_duplicate_act_attributed_conn(
+            conn,
+            dup,
+            canonical,
+            &DuplicateProvenance::unattributed(),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::mark_duplicate_act_conn`] with the caller's
+    /// [`DuplicateProvenance`]. Returns the id of the `same_as` identity edge
+    /// the act wrote.
+    ///
+    /// # Errors
+    /// As [`Self::mark_duplicate_act_conn`].
+    pub async fn mark_duplicate_act_attributed_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+        provenance: &DuplicateProvenance,
+    ) -> Result<Uuid, DbError> {
         use sqlx::Acquire;
         let dup_uuid: Uuid = dup.into();
         let canon_uuid: Uuid = canonical.into();
         let mut tx = conn.begin().await?;
-        mark_duplicate_act(&mut tx, dup_uuid, canon_uuid).await?;
+        let identity_edge = mark_duplicate_act(&mut tx, dup_uuid, canon_uuid, provenance).await?;
         let foreign_private_canonical: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -7008,11 +8272,13 @@ impl ClaimRepository {
                       AND cf.hypothesis_index IS DISTINCT FROM 0
                       AND NOT EXISTS (SELECT 1 FROM claim_frames c2
                                        WHERE c2.claim_id = $2 AND c2.frame_id = cf.frame_id))
-               AND EXISTS (
+               AND (EXISTS (
                    SELECT 1 FROM edges e
                     WHERE e.target_id = $1 AND e.target_type = 'claim'
                       AND e.relationship != 'supersedes' AND e.valid_to IS NULL
-                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))"#,
+                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))
+                 -- The repair's pooling (part 3) copies the frame bindings too.
+                 OR EXISTS (SELECT 1 FROM mass_functions m WHERE m.claim_id = $1))"#,
         )
         .bind(dup_uuid)
         .bind(canon_uuid)
@@ -7028,7 +8294,7 @@ impl ClaimRepository {
             });
         }
         tx.commit().await?;
-        Ok(())
+        Ok(identity_edge)
     }
 
     /// The dedup's repair, as the administrative cascade runs it after the
@@ -7084,6 +8350,474 @@ impl ClaimRepository {
         Ok(repair)
     }
 
+    /// Backfill the `same_as` identity edge of every duplicate the legacy
+    /// raw-SQL `fuzzy_dedup_claims` marked (backlog d5781a48). Dry run unless
+    /// `apply`; an operator runs it (`epigraph-cli backfill_dedup_identity_edges`).
+    ///
+    /// Before 2026-10 that script retired a duplicate with its own
+    /// `UPDATE claims` and wrote no identity edge, so no reader of the dedup
+    /// identity (the index view [`Self::marked_duplicates_of`], the un-mark)
+    /// sees the mark. Selected, and nothing else: a claim carrying the
+    /// `deduped` label with `properties.deduped_by =`
+    /// [`LEGACY_FUZZY_DEDUP_TOOL`], retired (`is_current = false`), whose
+    /// `supersedes` is still the `properties.deduped_into` the mark wrote, and
+    /// that has no in-force identity edge to it. A consolidation source or a
+    /// supersession (no marker), a soft-marked duplicate still current, a mark
+    /// whose claim was since re-pointed elsewhere, and a dedup act's mark (it
+    /// has its edge) are all left alone, and a second run finds nothing.
+    ///
+    /// The edge carries [`DuplicateProvenance`] under
+    /// [`DUPLICATE_IDENTITY_PROPERTY`] with the legacy tool, the
+    /// [`LEGACY_IDENTITY_BACKFILL_RUN_TAG`], the mark's own `deduped_at` as
+    /// `marked_at` and a `backfilled_at`; no `marked_by`, which the legacy mark
+    /// never recorded. The legacy `deduped_at` is Postgres timestamp text
+    /// (`now()::text`); `marked_at` is re-encoded as the act writes it
+    /// (`to_jsonb` of the `timestamptz`), and left out when the text is not
+    /// timestamp-shaped, so a stray non-timestamp value does not abort the
+    /// run's single transaction. Like the act's edge it is written after the
+    /// retirement, so `edges_auto_factor` mints no factor for it.
+    ///
+    /// Once its edge is written the mark is an ordinary dedup record
+    /// (operator ruling R-7): the administrative un-mark makes the duplicate
+    /// current again and retracts the edge. The legacy script kept no repair
+    /// record, so that un-mark has nothing to put back (it reports
+    /// `legacy_mark`); a legacy mark this selection does not reach is refused
+    /// with the reason ([`ClaimRepository::unmark_duplicate_act_conn`]).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session (the selection is
+    /// corpus-wide, and row security would hide most of it);
+    /// `DbError::QueryFailed` on a failed statement.
+    pub async fn backfill_legacy_dedup_identity_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        apply: bool,
+    ) -> Result<LegacyIdentityBackfill, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "backfill_legacy_dedup_identity_edges_conn (it selects and writes across every owner)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let select_sql = format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; the selection is a corpus-wide maintenance backfill.
+             SELECT c.id, c.supersedes FROM claims c
+              WHERE c.properties->>'deduped_by' = $1
+                AND {LEGACY_MARK_RECONSTRUCTABLE_SQL}
+                AND NOT EXISTS (
+                    SELECT 1 FROM edges e
+                     WHERE e.source_id = c.id AND e.source_type = 'claim'
+                       AND e.target_id = c.supersedes AND e.target_type = 'claim'
+                       AND e.relationship = $2 AND e.valid_to IS NULL
+                       AND e.properties ? $3)
+              ORDER BY c.id
+              FOR UPDATE OF c"#
+        );
+        let selected: Vec<(Uuid, Uuid)> = sqlx::query_as(&select_sql)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut out = LegacyIdentityBackfill {
+            applied: apply,
+            duplicates: selected
+                .iter()
+                .map(|(duplicate, canonical)| LegacyDuplicate {
+                    duplicate: *duplicate,
+                    canonical: *canonical,
+                    identity_edge: None,
+                })
+                .collect(),
+            inserted: 0,
+        };
+        if !apply || selected.is_empty() {
+            tx.rollback().await?;
+            return Ok(out);
+        }
+        let provenance = DuplicateProvenance::new(LEGACY_FUZZY_DEDUP_TOOL, "legacy_fuzzy_dedup")
+            .run_tag(LEGACY_IDENTITY_BACKFILL_RUN_TAG)
+            .reason(Some(
+                "identity edge backfilled for a duplicate fuzzy_dedup_claims retired by raw SQL \
+                 before identity edges were recorded; no repair record exists for this mark",
+            ));
+        let provenance_json =
+            serde_json::to_value(&provenance).map_err(|e| DbError::InvalidData {
+                reason: format!("legacy identity backfill: provenance does not serialize: {e}"),
+            })?;
+        let duplicate_ids: Vec<Uuid> = selected.iter().map(|(d, _)| *d).collect();
+        let written: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+             SELECT c.id, 'claim', c.supersedes, 'claim', $2,
+                    jsonb_build_object($3::text,
+                        $4::jsonb
+                        || jsonb_strip_nulls(jsonb_build_object(
+                               'marked_at', CASE WHEN c.properties->>'deduped_at'
+                                   ~ '^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?\s*(Z|[+-]\d{2}(:?\d{2})?)?\s*$'
+                                   THEN to_jsonb((c.properties->>'deduped_at')::timestamptz)
+                                   END,
+                               'backfilled_at', now())))
+               FROM claims c WHERE c.id = ANY($1)
+             RETURNING source_id, id"#,
+        )
+        .bind(&duplicate_ids)
+        .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+        .bind(DUPLICATE_IDENTITY_PROPERTY)
+        .bind(&provenance_json)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        for d in &mut out.duplicates {
+            d.identity_edge = written
+                .iter()
+                .find(|(dup, _)| *dup == d.duplicate)
+                .map(|(_, edge)| *edge);
+        }
+        out.inserted = written.len() as u64;
+        Ok(out)
+    }
+
+    /// The un-mark's own act, on the CALLER's stamped transaction: `dup` is
+    /// current again (`is_current = true`, `supersedes = NULL`) and the act's
+    /// `same_as` identity edge is retracted. The database decides write
+    /// authority over both rows.
+    ///
+    /// Only a duplicate a dedup act marked can be un-marked: one with an
+    /// in-force identity edge to the claim its `supersedes` names (a legacy
+    /// `fuzzy_dedup_claims` mark has one once the backfill wrote it, and is
+    /// then an ordinary record, `legacy_backfill`). A claim retired some other
+    /// way (a consolidation source, a supersession) is refused, because there
+    /// is no record of which rows a reversal would have to put back; so is a
+    /// legacy mark without its edge, saying whether the backfill can still
+    /// reconstruct it or why it cannot.
+    ///
+    /// A canonical superseded or consolidated since the mark is followed to
+    /// its current replacement ([`Self::unmark_chain_conn`]), and the
+    /// reversal restores the duplicate against that one; a canonical that
+    /// was itself marked a duplicate is refused (un-mark it first).
+    ///
+    /// The embeddings stay NULL: the caller re-embeds after commit
+    /// (best-effort, as every write path does), or a backfill does.
+    ///
+    /// # Errors
+    /// `DbError::NotFound` for a missing claim; `DbError::QueryFailed` for a
+    /// claim that is not a marked duplicate or a refused statement.
+    pub async fn unmark_duplicate_act_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: ClaimId,
+    ) -> Result<UnmarkedDuplicate, DbError> {
+        Self::unmark_duplicate_act_authorized_conn(conn, viewer, dup, None).await
+    }
+
+    /// [`Self::unmark_duplicate_act_conn`] for a request path that checked the
+    /// caller's authority over every claim of the canonical's chain, read
+    /// through the CALLER ([`Self::unmark_chain_conn`]): `authorized_chain` is
+    /// that chain. An act whose own read (under `viewer`, on the request paths
+    /// the maintenance connection's bypass viewer) resolves any other chain,
+    /// or none, is refused with nothing written: the canonical was replaced
+    /// again since the caller was checked. That refusal names no claim of the
+    /// chain the act read, which the caller may not be able to read.
+    ///
+    /// # Errors
+    /// As [`Self::unmark_duplicate_act_conn`].
+    pub async fn unmark_duplicate_act_authorized_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: ClaimId,
+        authorized_chain: Option<&[Uuid]>,
+    ) -> Result<UnmarkedDuplicate, DbError> {
+        use sqlx::Acquire;
+        let dup_uuid: Uuid = dup.into();
+        let mut tx = conn.begin().await?;
+        // Every read below is filtered by the viewer, like the writes: a claim
+        // or edge it cannot read is "not marked", never an existence oracle.
+        let sql = viewer.splice(
+            "SELECT c.supersedes, COALESCE(c.is_current, true) FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */ FOR UPDATE",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Option<Uuid>, bool)>(&sql).bind(dup_uuid);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let row = q.fetch_optional(&mut *tx).await?;
+        let Some((supersedes, current)) = row else {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: dup_uuid,
+            });
+        };
+        let not_marked = |why: &str| DbError::QueryFailed {
+            source: sqlx::Error::Protocol(format!(
+                "unmark_duplicate: claim {dup_uuid} {why}; nothing was written"
+            )),
+        };
+        let canonical = match (supersedes, current) {
+            (Some(c), false) => c,
+            _ => return Err(not_marked("is not a retired duplicate")),
+        };
+        let sql = viewer.splice(
+            "SELECT e.id, \
+                    COALESCE(e.properties->$4->>'tool' = $5 \
+                             AND e.properties->$4->>'run_tag' = $6, false) \
+               FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.created_at DESC, e.id DESC LIMIT 1 FOR UPDATE",
+            7,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, bool)>(&sql)
+            .bind(dup_uuid)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(LEGACY_IDENTITY_BACKFILL_RUN_TAG);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let identity_edge = q.fetch_optional(&mut *tx).await?;
+        // No identity edge is refused FIRST, with its reason (a legacy mark
+        // says whether the backfill can still write it, operator ruling R-7),
+        // before anything about the canonical: the missing edge is what blocks
+        // this un-mark whatever became of the canonical since.
+        let Some((identity_edge, legacy_backfill)) = identity_edge else {
+            return Err(not_marked(
+                &no_identity_edge_refusal(&mut tx, viewer, dup_uuid).await?,
+            ));
+        };
+        // A canonical superseded or consolidated since is followed to its
+        // current replacement (operator ruling R-11); one that was itself
+        // marked a duplicate is refused (un-mark it first).
+        let chain = match (
+            canonical_chain(&mut tx, viewer, canonical, ChainLock::ForShare).await?,
+            authorized_chain,
+        ) {
+            (Ok(chain), None) => chain,
+            (Err(why), None) => return Err(not_marked(&why)),
+            (Ok(chain), Some(authorized)) if chain.as_slice() == authorized => chain,
+            // Said without the claims this read found: under the maintenance
+            // viewer they may include a replacement the caller cannot read.
+            (_, Some(_)) => {
+                return Err(not_marked(
+                    "has a canonical that was replaced again since the caller's authority was \
+                     checked (the chain the un-mark would follow is no longer the one checked); \
+                     retry the un-mark",
+                ))
+            }
+        };
+        // Both writes carry the write predicate: on an application session the
+        // viewer's writable groups, on the maintenance session (a bypass
+        // viewer) nothing, as row security decides there too.
+        let claim_sql = viewer.splice_write(
+            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW() \
+              WHERE c.id = $1 /* {WRITABLE:c} */",
+            2,
+        );
+        let mut q = sqlx::query(&claim_sql).bind(dup_uuid);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let restored = q.execute(&mut *tx).await?.rows_affected();
+        let edge_sql = viewer.splice_write(
+            "UPDATE edges AS e SET valid_to = now() WHERE e.id = $1 /* {WRITABLE:e} */",
+            2,
+        );
+        let mut q = sqlx::query(&edge_sql).bind(identity_edge);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let retracted = q.execute(&mut *tx).await?.rows_affected();
+        if restored != 1 || retracted != 1 {
+            return Err(not_marked(
+                "or its identity edge is not writable by this session",
+            ));
+        }
+        tx.commit().await?;
+        Ok(UnmarkedDuplicate {
+            canonical,
+            chain,
+            identity_edge,
+            legacy_backfill,
+        })
+    }
+
+    /// What an un-mark of `dup`, marked a duplicate of `canonical`, restores
+    /// it against, read through `viewer`, with the act's refusals in the
+    /// act's order: `Err` with the reason when `dup` has no in-force dedup
+    /// identity edge to `canonical` (a legacy `fuzzy_dedup_claims` mark says
+    /// whether the backfill can still write it, operator ruling R-7), then
+    /// the canonical chain's verdict: `Ok` with `canonical`, then each claim
+    /// that replaced it in turn (supersession or consolidation), ending with
+    /// the current one (`[canonical]` when it is current), or `Err` with the
+    /// reason there is none (a claim of the chain was itself marked a
+    /// duplicate, was deprecated, or has two replacements; operator ruling
+    /// R-11). The request paths resolve it before the act, to check the
+    /// caller's authority over every claim the reversal acts on, so they
+    /// refuse with the act's own reason.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn unmark_chain_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+        canonical: Uuid,
+    ) -> Result<Result<Vec<Uuid>, String>, DbError> {
+        let sql = viewer.splice(
+            "SELECT e.id FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT 1",
+            5,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(dup)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *conn).await?.is_none() {
+            return Ok(Err(no_identity_edge_refusal(conn, viewer, dup).await?));
+        }
+        canonical_chain(conn, viewer, canonical, ChainLock::None).await
+    }
+
+    /// Whether THIS session may un-mark `dup` from `canonical`: a privileged
+    /// writer may; otherwise it writes the duplicate, and it writes the
+    /// canonical or the canonical is public (the dedup act's FA04 attach rule,
+    /// mirrored: the reversal moves rows off the canonical with administrative
+    /// authority). The same predicates the act's own row security and FA04
+    /// check apply.
+    ///
+    /// The request paths ask this on the caller's stamped transaction instead
+    /// of rehearsing [`Self::unmark_duplicate_act_conn`] there: once operator
+    /// binding is armed, migration 153 refuses any application session that
+    /// clears a `supersedes`, whatever its authority, and the act that commits
+    /// runs on the maintenance connection anyway.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn session_may_unmark_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<bool, DbError> {
+        let dup_uuid: Uuid = dup.into();
+        let canon_uuid: Uuid = canonical.into();
+        Ok(sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
+            SELECT public.epigraph_session_is_privileged_writer()
+                OR (public.epigraph_session_writes_node($1, 'claim')
+                    AND (public.epigraph_session_writes_node($2, 'claim')
+                         OR EXISTS (SELECT 1 FROM claims k
+                                     WHERE k.id = $2 AND k.visibility::text = 'public')))"#,
+        )
+        .bind(dup_uuid)
+        .bind(canon_uuid)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
+    /// Whether THIS session's [`Self::mark_duplicate_act_attributed_conn`]
+    /// would pass the act's authority checks for `dup` onto `canonical`: the
+    /// same predicate as [`Self::session_may_unmark_conn`] (row security on
+    /// the duplicate, and FA04's attach rule for the canonical). A prediction
+    /// that writes nothing, for a planner showing which marks will apply;
+    /// FA07 and a concurrent change are left to the act.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn session_may_mark_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical: ClaimId,
+    ) -> Result<bool, DbError> {
+        Self::session_may_unmark_conn(conn, dup, canonical).await
+    }
+
+    /// Put back what a dedup repair did, from its [`DedupRevert`] record, along
+    /// `canonical_chain` (the recorded canonical first, the current one last:
+    /// [`UnmarkedDuplicate::chain`]; a supersession or merge since the mark
+    /// carried some of the repaired rows on to a replacement and left others):
+    /// re-source and re-target its edges onto `dup`, return its moved BBAs
+    /// with their old tenancy, re-insert the BBAs it deleted, put its
+    /// retracted edges back in force, and remove the frame bindings it added
+    /// to the canonical. Returns what the belief cascade must re-derive.
+    ///
+    /// Each step acts only on rows still where the repair left them (an edge
+    /// still pointing at the canonical, a BBA still on it); a row a later
+    /// write has changed is left alone and reported in
+    /// [`DedupReversal::drifted`].
+    ///
+    /// Runs on a PRIVILEGED session (it re-points other writers' edges and
+    /// moves their BBAs), as the repair does.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session; `DbError::QueryFailed`
+    /// on a failed statement (nothing is changed).
+    pub async fn reverse_marked_duplicate_conn(
+        conn: &mut sqlx::PgConnection,
+        dup: ClaimId,
+        canonical_chain: &[Uuid],
+        record: &DedupRevert,
+    ) -> Result<DedupReversal, DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "reverse_marked_duplicate_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let out = reverse_marked_duplicate(&mut tx, dup.into(), canonical_chain, record).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// The un-mark's act and its reversal in ONE transaction on a privileged
+    /// connection (the shape the semantic sweep and the tests use; a request
+    /// path runs the act on the caller's stamped transaction instead).
+    ///
+    /// # Errors
+    /// As [`Self::unmark_duplicate_act_conn`] and
+    /// [`Self::reverse_marked_duplicate_conn`].
+    pub async fn unmark_duplicate_with_reversal_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: ClaimId,
+        record: &DedupRevert,
+    ) -> Result<(UnmarkedDuplicate, DedupReversal), DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "unmark_duplicate_with_reversal_conn (its reversal re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        let unmarked = Self::unmark_duplicate_act_conn(&mut tx, viewer, dup).await?;
+        if record.identity_edge != Some(unmarked.identity_edge) {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "the revert record names identity edge {:?}, but the duplicate's in-force \
+                     identity edge is {}; refusing to reverse another mark's repair",
+                    record.identity_edge, unmarked.identity_edge
+                ),
+            });
+        }
+        let reversal =
+            reverse_marked_duplicate(&mut tx, dup.into(), &unmarked.chain, record).await?;
+        tx.commit().await?;
+        Ok((unmarked, reversal))
+    }
+
     /// Apply a patch atomically on the supplied connection. Returns a diff so
     /// callers can build provenance or HTTP responses. No provenance writing here.
     ///
@@ -7098,7 +8832,7 @@ impl ClaimRepository {
     ///
     /// The function stays atomic on its own. The body opens `conn.begin()`, which
     /// is a real transaction on a bare connection and a SAVEPOINT inside a caller's
-    /// transaction. The FOR UPDATE read and the up-to-three UPDATEs therefore land
+    /// transaction. The FOR UPDATE read and the (at most two) UPDATEs therefore land
     /// together in both shapes. A `&mut Transaction` caller still compiles
     /// unchanged through deref coercion.
     pub async fn patch_claim_atomic_conn(
@@ -7122,22 +8856,28 @@ impl ClaimRepository {
         let before_props: serde_json::Value = row.get("properties");
         let before_trace: Option<Uuid> = row.get("trace_id");
 
-        let mut after_trace = before_trace;
-        if let Some(t) = patch.trace_id {
-            sqlx::query("UPDATE claims SET trace_id = $1 WHERE id = $2")
-                .bind(t)
-                .bind(id_uuid)
-                .execute(&mut *tx)
-                .await?;
-            after_trace = Some(t);
-        }
-
+        // trace_id and properties land in ONE statement, issued only when the
+        // patch sets either. `PatchClaimInput::trace_id` is `Option<Uuid>` and
+        // `None` means "leave it", never "clear it", so `COALESCE($2, trace_id)`
+        // is exactly the old `if let Some(t)` write; the CASE keeps the column
+        // untouched when no properties were supplied and otherwise applies the
+        // same shallow `||` merge as before.
+        let after_trace = patch.trace_id.or(before_trace);
         let mut after_props = before_props.clone();
-        if let Some(p) = &patch.properties {
+        if patch.trace_id.is_some() || patch.properties.is_some() {
             sqlx::query(
-                "UPDATE claims SET properties = COALESCE(properties, '{}'::jsonb) || $1 WHERE id = $2"
+                "UPDATE claims SET trace_id = COALESCE($2::uuid, trace_id), \
+                 properties = CASE WHEN $3::jsonb IS NULL THEN properties \
+                                   ELSE COALESCE(properties, '{}'::jsonb) || $3::jsonb END \
+                 WHERE id = $1",
             )
-            .bind(p).bind(id_uuid).execute(&mut *tx).await?;
+            .bind(id_uuid)
+            .bind(patch.trace_id)
+            .bind(patch.properties.as_ref())
+            .execute(&mut *tx)
+            .await?;
+        }
+        if let Some(p) = &patch.properties {
             if let (Some(merged), Some(po)) = (after_props.as_object_mut(), p.as_object()) {
                 for (k, v) in po {
                     merged.insert(k.clone(), v.clone());
@@ -9053,6 +10793,19 @@ impl ClaimRepository {
 
         let mut tx = conn.begin().await?;
 
+        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
+
+        // Serialize every find-then-insert of the merged claim's
+        // `(content_hash, acting agent)` — another consolidation into the same
+        // content, `create_or_get`, POST /claims, the legacy creates — before
+        // the "already exists" probe below (backlog 00f1a517). Without it two
+        // concurrent merges into identical content both miss the probe and
+        // both insert. Taken FIRST, before the sources' row locks: a merge
+        // then never holds a source row lock while it waits on the pair, which
+        // is the order every other holder of this lock uses (pair lock, then
+        // its own row writes).
+        Self::lock_content_hash_agent(&mut tx, content_hash.as_slice(), acting_agent_id).await?;
+
         // Lock every source up front so a concurrent merge/supersede cannot
         // interleave between validation and retirement.
         let locked = sqlx::query!(
@@ -9227,11 +10980,10 @@ impl ClaimRepository {
             }
         }
 
-        let content_hash = epigraph_crypto::ContentHasher::hash(merged_content.as_bytes()).to_vec();
-
-        // Post-107 (content_hash, agent_id) uniqueness: an identical merged
-        // claim by this agent is returned rather than erroring (novelty-gate
-        // style), so a retried merge is idempotent instead of fatal.
+        // An identical merged claim by this agent is returned rather than
+        // inserted again (novelty-gate style), so a retried merge is idempotent
+        // instead of minting a second row. Runs under the pair lock taken above,
+        // so a concurrent merge's committed row is visible here.
         if let Some(existing) = sqlx::query!(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              SELECT id FROM claims WHERE content_hash = $1 AND agent_id = $2"#,
@@ -9419,17 +11171,41 @@ async fn migrate_consolidated_edges(
     // interior to the merge (both endpoints inside the source set) — those
     // would collapse to merged→merged self-loops. A retracted edge stays where
     // it is: it is history, and leaving it makes a second run a no-op.
+    //
+    // A NON-PUBLIC source keeps its `executes` edges
+    // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
+    // frozen workflow generation, so they are neither moved nor retracted as
+    // a redundant copy. The test is on the source endpoint's own row (a
+    // missing row counting as non-public), so the deferred replay gives the
+    // same result.
+    //
+    // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
+    // candidate either: it names the claim its duplicate supersedes, so it is
+    // neither moved nor retracted (see `migrate_superseded_edges`).
+    let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let candidates: Vec<(Uuid, Uuid, Uuid, String, String, String)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT id, source_id, target_id, source_type, target_type, relationship
-        FROM edges
-        WHERE relationship != 'supersedes'
-          AND valid_to IS NULL
-          AND ( (source_id = ANY($1) AND source_type = 'claim')
-             OR (target_id = ANY($1) AND target_type = 'claim') )
-        ORDER BY created_at, id"#,
+        SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
+        FROM edges e
+        WHERE e.relationship != 'supersedes'
+          AND e.valid_to IS NULL
+          AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
+             OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
+          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+          AND NOT ( e.relationship = ANY($2) AND (
+                  (e.source_id = ANY($1) AND e.source_type = 'claim'
+                   AND NOT EXISTS (SELECT 1 FROM claims c
+                                    WHERE c.id = e.source_id AND c.visibility::text = 'public'))
+               OR (e.target_id = ANY($1) AND e.target_type = 'claim'
+                   AND NOT EXISTS (SELECT 1 FROM claims c
+                                    WHERE c.id = e.target_id AND c.visibility::text = 'public')) ) )
+        ORDER BY e.created_at, e.id"#,
     )
     .bind(source_ids)
+    .bind(&frozen)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -9721,31 +11497,266 @@ impl ClaimRepository {
     }
 }
 
-/// The checks and the one `claims` UPDATE of a dedup's act. The callers
-/// ([`ClaimRepository::mark_duplicate_act_conn`],
-/// [`ClaimRepository::mark_duplicate_with_repair_conn`]) own the transaction.
+/// Whether [`canonical_chain`] locks the claims it walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainLock {
+    /// A plain read (the request paths, on the caller's read transaction).
+    None,
+    /// `FOR SHARE OF c` on each claim of the chain (the un-mark's act).
+    ForShare,
+}
+
+/// The most replacements [`canonical_chain`] follows from one canonical: far
+/// above any real supersession depth, as the version-chain walk's cap.
+const CANONICAL_CHAIN_MAX: usize = 100;
+
+/// `canonical`, then each claim that replaced it in turn, ending with the
+/// current one; or why there is no current canonical to restore a duplicate
+/// against. Read through `viewer` (an unreadable `canonical` is taken as it
+/// is, as the act always has).
+///
+/// The replacement of a retired claim `C` is the source `N` of an in-force
+/// claim-to-claim `supersedes` edge targeting `C` whose rows agree: a
+/// supersession (`N.supersedes = C`, [`ClaimRepository::supersede_act_conn`])
+/// or a consolidation (`C.supersedes = N`,
+/// [`ClaimRepository::consolidate_act_conn`]); both write that edge, `N -> C`,
+/// and no dedup does. Refused: a claim of the chain that is itself a marked
+/// duplicate (it carries a dedup identity edge; un-mark it first), one retired
+/// with no replacement (a deprecation), one with two, a cycle, and a chain
+/// longer than [`CANONICAL_CHAIN_MAX`].
+///
+/// [`ChainLock::ForShare`] (the un-mark's act, on the maintenance connection)
+/// holds every claim of the chain `FOR SHARE` until the act's transaction
+/// ends, so none can be retired while the reversal re-mints factors on the
+/// head; the request paths read it without locks.
+async fn canonical_chain(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    canonical: Uuid,
+    lock: ChainLock,
+) -> Result<Result<Vec<Uuid>, String>, DbError> {
+    let mut chain = vec![canonical];
+    loop {
+        let at = *chain.last().unwrap_or(&canonical);
+        let which = if at == canonical {
+            "which".to_string()
+        } else {
+            format!("whose replacement {at}")
+        };
+        let mut sql = viewer.splice(
+            "SELECT COALESCE(c.is_current, true) FROM claims c \
+              WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        if lock == ChainLock::ForShare {
+            sql.push_str(" FOR SHARE OF c");
+        }
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(at);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *conn).await? != Some(false) {
+            return Ok(Ok(chain));
+        }
+        if chain.len() > CANONICAL_CHAIN_MAX {
+            return Ok(Err(format!(
+                "supersedes {canonical}, which was replaced more than {CANONICAL_CHAIN_MAX} \
+                 times; refusing to follow the chain further"
+            )));
+        }
+        let sql = viewer.splice(
+            "SELECT e.target_id FROM edges e JOIN claims c ON c.id = e.source_id \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                AND e.relationship = $2 AND e.valid_to IS NULL AND e.properties ? $3 \
+                AND e.target_id = c.supersedes \
+                /* {EDGE_VISIBILITY:e} */ \
+              LIMIT 1",
+            4,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(at)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if let Some(of) = q.fetch_optional(&mut *conn).await? {
+            return Ok(Err(format!(
+                "supersedes {canonical}, {which} is itself retired (a marked duplicate of \
+                 {of}); un-mark {at} first"
+            )));
+        }
+        let sql = viewer.splice(
+            "SELECT e.source_id FROM edges e \
+               JOIN claims n ON n.id = e.source_id \
+               JOIN claims o ON o.id = e.target_id \
+              WHERE e.target_id = $1 AND e.target_type = 'claim' AND e.source_type = 'claim' \
+                AND e.relationship = 'supersedes' AND e.valid_to IS NULL \
+                AND e.source_id <> e.target_id \
+                AND (n.supersedes = o.id OR o.supersedes = n.id) \
+                /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:n} */ \
+              ORDER BY e.source_id",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(at);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let mut next: Vec<Uuid> = q.fetch_all(&mut *conn).await?;
+        next.dedup();
+        match next.as_slice() {
+            [] => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, {which} is retired with no replacement (it was \
+                     deprecated, or retired by another act); there is no current canonical to \
+                     restore it against"
+                )))
+            }
+            [n] if chain.contains(n) => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, whose replacements form a cycle at {n}; refusing \
+                     to follow it"
+                )))
+            }
+            [n] => chain.push(*n),
+            many => {
+                return Ok(Err(format!(
+                    "supersedes {canonical}, {which} has {} replacements ({}); refusing to pick \
+                     one",
+                    many.len(),
+                    many.iter()
+                        .map(Uuid::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        }
+    }
+}
+
+/// Why the un-mark refuses `dup`, retired with no in-force dedup identity edge
+/// to the claim it supersedes: [`legacy_mark_refusal`]'s reason for a legacy
+/// `fuzzy_dedup_claims` mark, otherwise that it was retired by another act.
+async fn no_identity_edge_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<String, DbError> {
+    if let Some(why) = legacy_mark_refusal(conn, viewer, dup).await? {
+        return Ok(why);
+    }
+    Ok(
+        "has no dedup identity edge to the claim it supersedes (it was retired by another \
+        act, or marked before identity edges were recorded)"
+            .to_string(),
+    )
+}
+
+/// Why the un-mark refuses `dup`, retired with no dedup identity edge, when it
+/// is a legacy `fuzzy_dedup_claims` mark (its `deduped_by` names
+/// [`LEGACY_FUZZY_DEDUP_TOOL`]); `None` for any other claim. Says whether the
+/// backfill can still reconstruct the edge (by its own selection,
+/// [`LEGACY_MARK_RECONSTRUCTABLE_SQL`]) and, if not, why not. Read through the
+/// un-mark's viewer, like every read of the act.
+async fn legacy_mark_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &crate::visibility::Viewer,
+    dup: Uuid,
+) -> Result<Option<String>, DbError> {
+    let sql = viewer.splice(
+        &format!(
+            "SELECT COALESCE(({LEGACY_MARK_RECONSTRUCTABLE_SQL}), false), \
+                    'deduped' = ANY(COALESCE(c.labels, ARRAY[]::text[])), \
+                    c.properties->>'deduped_into', c.supersedes \
+               FROM claims c \
+              WHERE c.id = $1 AND c.properties->>'deduped_by' = $2 /* {{VISIBILITY:c}} */"
+        ),
+        3,
+    );
+    let mut q = sqlx::query_as::<_, (bool, bool, Option<String>, Option<Uuid>)>(&sql)
+        .bind(dup)
+        .bind(LEGACY_FUZZY_DEDUP_TOOL);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    let Some((reconstructable, labelled, deduped_into, supersedes)) =
+        q.fetch_optional(&mut *conn).await?
+    else {
+        return Ok(None);
+    };
+    let head = format!(
+        "is a legacy {LEGACY_FUZZY_DEDUP_TOOL} mark (made by raw SQL, without an identity edge)"
+    );
+    if reconstructable {
+        return Ok(Some(format!(
+            "{head} whose same_as identity edge has not been reconstructed yet; an operator's \
+             `backfill_dedup_identity_edges --apply` writes it, after which the mark can be \
+             un-marked"
+        )));
+    }
+    let why = if !labelled {
+        "it no longer carries the `deduped` label the mark wrote".to_string()
+    } else {
+        match (deduped_into, supersedes) {
+            (None, _) => "it records no deduped_into".to_string(),
+            (Some(into), Some(sup)) if into != sup.to_string() => {
+                format!("its supersedes {sup} is no longer the claim the mark named (deduped_into {into})")
+            }
+            (Some(into), _) => {
+                format!("it no longer supersedes the claim the mark named (deduped_into {into})")
+            }
+        }
+    };
+    Ok(Some(format!(
+        "{head} that backfill_dedup_identity_edges cannot reconstruct: {why}; it cannot be \
+         un-marked"
+    )))
+}
+
+/// The checks, the one `claims` UPDATE and the identity edge of a dedup's act.
+/// The callers ([`ClaimRepository::mark_duplicate_act_attributed_conn`],
+/// [`ClaimRepository::mark_duplicate_with_repair_attributed_conn`]) own the
+/// transaction. Returns the identity edge's id.
 async fn mark_duplicate_act(
     conn: &mut sqlx::PgConnection,
     dup_uuid: Uuid,
     canon_uuid: Uuid,
-) -> Result<(), DbError> {
+    provenance: &DuplicateProvenance,
+) -> Result<Uuid, DbError> {
     if dup_uuid == canon_uuid {
         return Err(DbError::QueryFailed {
             source: sqlx::Error::Protocol("mark_duplicate: dup == canonical".into()),
         });
     }
-    let canon_exists: bool = sqlx::query_scalar(
+    // The canonical must exist and be CURRENT: a mark onto a retired claim
+    // names a canonical the caller never saw as one, which the un-mark then
+    // has to follow or refuse. A plain read, not FOR SHARE
+    // (that would take the UPDATE policy on the caller's stamped session); a
+    // concurrent retirement after it makes an ordinary chain, which the
+    // un-mark already orders.
+    let canon_current: Option<bool> = sqlx::query_scalar(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
-        SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)"#,
+        SELECT COALESCE(is_current, true) FROM claims WHERE id = $1"#,
     )
     .bind(canon_uuid)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    if !canon_exists {
-        return Err(DbError::NotFound {
-            entity: "Claim".into(),
-            id: canon_uuid,
-        });
+    match canon_current {
+        None => {
+            return Err(DbError::NotFound {
+                entity: "Claim".into(),
+                id: canon_uuid,
+            })
+        }
+        Some(false) => {
+            return Err(DbError::QueryFailed {
+                source: sqlx::Error::Protocol(format!(
+                    "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
+                     dedup chain onto a retired claim"
+                )),
+            })
+        }
+        Some(true) => {}
     }
     let row: Option<(Option<Uuid>,)> = sqlx::query_as(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -9781,7 +11792,41 @@ async fn mark_duplicate_act(
     .bind(dup_uuid)
     .execute(&mut *conn)
     .await?;
-    Ok(())
+    // The identity, as a traversable and attributed graph fact: one `same_as`
+    // edge duplicate -> canonical carrying who marked it, how and when.
+    // `supersedes` stays the pointer readers already follow; the edge is what
+    // an audit or an un-mark reads.
+    //
+    // Written AFTER the UPDATE above on purpose: `auto_create_factor_from_edge`
+    // skips an edge with a non-current endpoint, so the identity edge never
+    // becomes a belief factor between the pair. `same_as` is in no DS auto-wire
+    // list either, so no BBA is keyed to it.
+    //
+    // It is the caller's own row (its tenancy is derived from the two
+    // endpoints), so it lands on the caller's stamped transaction with the act.
+    // The repair's resource and collision clauses all exclude edges whose
+    // other end is the canonical, so the edge stays on the duplicate.
+    let provenance_json = serde_json::to_value(provenance).map_err(|e| DbError::InvalidData {
+        reason: format!("mark_duplicate: provenance does not serialize: {e}"),
+    })?;
+    let identity_edge: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
+           VALUES ($1, 'claim', $2, 'claim', $3,
+                   jsonb_build_object($4::text,
+                       jsonb_strip_nulls(jsonb_build_object(
+                           'marked_by', public.epigraph_principal_id()))
+                       || $5::jsonb
+                       || jsonb_build_object('marked_at', now())))
+           RETURNING id"#,
+    )
+    .bind(dup_uuid)
+    .bind(canon_uuid)
+    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+    .bind(DUPLICATE_IDENTITY_PROPERTY)
+    .bind(&provenance_json)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(identity_edge)
 }
 
 /// The dedup's repair of the edge and derived-record layers, unchecked: the
@@ -9823,6 +11868,33 @@ async fn repair_marked_duplicate(
     //      edges per triple).
     //
     // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+    //
+    // A NON-PUBLIC duplicate also keeps its `executes` edges
+    // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
+    // frozen workflow generation, so neither the collision guards nor the
+    // migration below touch them. Read from the duplicate's row, so the
+    // deferred replay gives the same result. Every shipped `executes` writer
+    // is workflow-sourced, so only the incoming retarget below meets one
+    // today; the outgoing clauses and the claim-sourced incoming collision
+    // guard cover a claim-sourced `executes`, which the edges table accepts.
+    let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
+
+    // The act's identity edge, which keys this repair's revert record (a
+    // mark made before identity edges existed has none).
+    let identity_edge: Option<Uuid> = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT id FROM edges
+          WHERE source_id = $1 AND source_type = 'claim'
+            AND target_id = $2 AND target_type = 'claim'
+            AND relationship = $3 AND valid_to IS NULL AND properties ? $4
+          ORDER BY created_at DESC, id DESC LIMIT 1"#,
+    )
+    .bind(dup_uuid)
+    .bind(canon_uuid)
+    .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+    .bind(DUPLICATE_IDENTITY_PROPERTY)
+    .fetch_optional(&mut *conn)
+    .await?;
 
     // Drop incoming dup-edges whose migrated triple already exists on canonical.
     // Alias the outer table as `e` so the correlated subquery references
@@ -9841,6 +11913,8 @@ async fn repair_marked_duplicate(
          UPDATE edges AS e SET valid_to = now()
          WHERE e.target_id = $2 AND e.target_type = 'claim'
          AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+         AND NOT (e.relationship = ANY($3))
+         AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
          AND e.source_type = 'claim' AND e.source_id != $1
          AND e.valid_to IS NULL
          AND EXISTS (
@@ -9856,6 +11930,7 @@ async fn repair_marked_duplicate(
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -9868,6 +11943,8 @@ async fn repair_marked_duplicate(
              UPDATE edges AS e SET valid_to = now()
              WHERE e.source_id = $2 AND e.source_type = 'claim'
              AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND NOT (e.relationship = ANY($3))
+             AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
              AND e.target_type = 'claim' AND e.target_id != $1
              AND e.valid_to IS NULL
              AND EXISTS (
@@ -9883,6 +11960,7 @@ async fn repair_marked_duplicate(
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
+        .bind(&frozen)
         .fetch_all(&mut *conn)
         .await?,
     );
@@ -9941,11 +12019,39 @@ async fn repair_marked_duplicate(
     // on a privileged session (the caller's precondition), so it is the plain
     // statement (migration 117).
     let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
+    // The rows are about to be deleted, so the revert record keeps them whole.
+    let mut deleted_rows: Vec<serde_json::Value> = if deleted_edge_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT to_jsonb(mf) FROM mass_functions mf
+              WHERE mf.perspective_id = ANY($1) ORDER BY mf.id"#,
+        )
+        .bind(&deleted_edge_ids)
+        .fetch_all(&mut *conn)
+        .await?
+    };
     let deleted_bbas = crate::repos::mass_function::delete_edge_bbas(
         &mut *conn,
         &deleted_edge_ids,
         crate::repos::mass_function::EdgeBbaCascade::DedupRetractedEdge,
     )
+    .await?;
+
+    // The tenancy of every in-force edge on the duplicate, before the
+    // re-points below make the edge tenancy trigger re-derive it; the revert
+    // record keeps the re-pointed ones.
+    let edge_tenancy_before: Vec<EdgeTenancy> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT id, owner_group_id, visibility::text AS visibility, co_owner_group_id
+           FROM edges
+          WHERE valid_to IS NULL
+            AND ((target_id = $1 AND target_type = 'claim')
+                 OR (source_id = $1 AND source_type = 'claim'))"#,
+    )
+    .bind(dup_uuid)
+    .fetch_all(&mut *conn)
     .await?;
 
     let retargeted: Vec<(Uuid,)> = sqlx::query_as(
@@ -9957,10 +12063,15 @@ async fn repair_marked_duplicate(
            -- rewrite history, and it would also leave two rows for the same
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (relationship = ANY($3)) \
+           -- A dedup identity edge names the claim its duplicate SUPERSEDES;
+           -- it stays with it when that claim is itself marked a duplicate.
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -9972,7 +12083,41 @@ async fn repair_marked_duplicate(
     let mut moved_bbas = 0_u64;
     let mut dropped_duplicate_copies = 0_u64;
     let mut skipped_false_bindings = 0_u64;
-    if !retargeted_ids.is_empty() {
+    let mut copied_frames: Vec<Uuid> = Vec::new();
+    let mut canonical_frame_inputs: Vec<Uuid> = Vec::new();
+    let mut moved_rows: Vec<MovedBba> = Vec::new();
+
+    // Part 3 (below) pools the duplicate's own belief inputs on the canonical,
+    // unless the canonical is a COMPOUND (an in-force `decomposes_to`
+    // out-edge): under atom-level belief a compound is a query over its atoms
+    // and takes no BBA of its own, so nothing is moved onto one.
+    let canonical_is_compound: bool = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT EXISTS (SELECT 1 FROM edges e
+                         WHERE e.source_id = $1 AND e.source_type = 'claim'
+                           AND e.relationship = 'decomposes_to' AND e.valid_to IS NULL)"#,
+    )
+    .bind(canon_uuid)
+    .fetch_one(&mut *conn)
+    .await?;
+    let poolable_sql = poolable_bba_sql();
+    let poolable: Vec<Uuid> = if canonical_is_compound {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT mf.id FROM mass_functions mf
+              WHERE mf.claim_id = $2 AND {poolable_sql}
+                AND NOT EXISTS ({CANONICAL_HOLDS_KEY_SQL})
+              ORDER BY mf.id"#
+        ))
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+
+    if !retargeted_ids.is_empty() || !poolable.is_empty() {
         // `canonical` must be assigned to every frame whose BBAs it is about
         // to inherit, or the frame-scoped read paths
         // (`claim_frames.hypothesis_index`) would not see them. The copy is
@@ -10003,7 +12148,7 @@ async fn repair_marked_duplicate(
         .fetch_one(&mut *conn)
         .await
         .map(|n| u64::try_from(n).unwrap_or(0))?;
-        sqlx::query(
+        copied_frames = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index)
              SELECT $1, cf.frame_id, cf.hypothesis_index FROM claim_frames cf
@@ -10013,12 +12158,26 @@ async fn repair_marked_duplicate(
               WHERE cf.claim_id = $2
                 AND NOT (f.name = 'binary_truth' AND cf.hypothesis_index IS DISTINCT FROM 0
                          AND c.owner_group_id IS DISTINCT FROM d.owner_group_id)
-             ON CONFLICT (claim_id, frame_id) DO NOTHING"#,
+             ON CONFLICT (claim_id, frame_id) DO NOTHING
+             RETURNING frame_id"#,
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
+        if !copied_frames.is_empty() {
+            canonical_frame_inputs = sqlx::query_scalar(&format!(
+                r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+                 SELECT mf.id FROM mass_functions mf
+                  WHERE mf.claim_id = $1 AND mf.frame_id = ANY($2) AND NOT {}
+                  ORDER BY mf.id"#,
+                crate::repos::mass_function::cached_combination_predicate("mf.")
+            ))
+            .bind(canon_uuid)
+            .bind(&copied_frames)
+            .fetch_all(&mut *conn)
+            .await?;
+        }
 
         // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
         // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
@@ -10028,7 +12187,7 @@ async fn repair_marked_duplicate(
         // moment their masses were frozen differs, and the canonical's row may
         // be another writer's contribution, which a dedup does not destroy
         // (migration 115 section 4's rule, now the only one).
-        dropped_duplicate_copies = sqlx::query(
+        let dropped: Vec<serde_json::Value> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions d
               WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
@@ -10037,14 +12196,16 @@ async fn repair_marked_duplicate(
                      WHERE c.claim_id = $1
                        AND c.perspective_id = d.perspective_id
                        AND c.frame_id = d.frame_id
-                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)"#,
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)
+             RETURNING to_jsonb(d)"#,
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
         .bind(&retargeted_ids)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        .fetch_all(&mut *conn)
+        .await?;
+        dropped_duplicate_copies = dropped.len() as u64;
+        deleted_rows.extend(dropped);
 
         // The move keeps "a writer's contribution is the writer's" (migration
         // 114). Onto a PUBLIC canonical, a row keeps its owner and comes out
@@ -10052,29 +12213,76 @@ async fn repair_marked_duplicate(
         // insert on the canonical does not re-stamp it to the canonical's
         // owner); onto a group-private canonical it becomes the claim's own
         // row, as every derived row of a private claim is.
-        let moved = sqlx::query(
+        let moved: Vec<MovedBba> = sqlx::query_as(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
-             UPDATE mass_functions mf
-                SET claim_id       = c.id,
-                    owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
-                                          ELSE c.owner_group_id END,
-                    visibility     = c.visibility,
-                    writer_owned   = CASE
-                                       WHEN c.visibility IS DISTINCT FROM 'public' THEN false
-                                       WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
-                                            THEN true
-                                       ELSE mf.writer_owned END
-               FROM claims c
-              WHERE c.id = $1
-                AND mf.claim_id = $2 AND mf.perspective_id = ANY($3)"#,
-        )
+             WITH before AS (
+                 SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
+                   FROM mass_functions b
+                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3))
+             {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
+        ))
         .bind(canon_uuid)
         .bind(dup_uuid)
         .bind(&retargeted_ids)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
-        moved_bbas = moved.rows_affected();
+        moved_bbas = moved.len() as u64;
+        moved_rows.extend(moved);
     }
+
+    // ── Derived-record repair, part 3: POOL the duplicate's own inputs ────
+    // Parts 1 and 2 move only EDGE-keyed BBAs, with their edges. The
+    // duplicate's other BBAs -- its auto-wired creation row, assess rows,
+    // agent BBAs (`perspective_id` NULL or naming no edge) -- would otherwise
+    // stay on a claim no reader folds (V-1), so the canonical would not count
+    // evidence the duplicate had. They move under part 2's ownership rule
+    // (migration 114). Three kinds stay on the duplicate, and are reported:
+    //
+    // * a row whose (frame, source agent, perspective) key the canonical
+    //   already holds: the same source's view of the same proposition, which
+    //   pooling would count twice; the canonical keeps its own and the
+    //   duplicate's copy is KEPT (not dropped, unlike part 2's edge rule), so
+    //   nothing is destroyed and an un-mark has nothing to restore;
+    // * an `attributed_v1` row: under atom-level belief those are re-derived
+    //   by the attributor for the canonical, never moved;
+    // * every row, when the canonical is a compound (above).
+    //
+    // The duplicate's `evidence` rows never move: they are its provenance, a
+    // moved BBA keeps citing its row through `evidence_id`, and the canonical
+    // reaches them through the identity edge.
+    let mut pooled_bbas: Vec<Uuid> = Vec::new();
+    if !poolable.is_empty() {
+        let pooled: Vec<MovedBba> = sqlx::query_as(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             WITH before AS (
+                 SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
+                   FROM mass_functions b
+                  WHERE b.claim_id = $2 AND b.id = ANY($3))
+             {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
+        ))
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&poolable)
+        .fetch_all(&mut *conn)
+        .await?;
+        pooled_bbas = pooled.iter().map(|m| m.id).collect();
+        pooled_bbas.sort_unstable();
+        moved_rows.extend(pooled);
+    }
+    let kept_on_duplicate: Vec<Uuid> = sqlx::query_scalar(&format!(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         SELECT mf.id FROM mass_functions mf
+          WHERE mf.claim_id = $2
+            AND (mf.perspective_id IS NULL
+                 OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id))
+            AND ($3 OR NOT {poolable_sql} OR EXISTS ({CANONICAL_HOLDS_KEY_SQL}))
+          ORDER BY mf.id"#
+    ))
+    .bind(canon_uuid)
+    .bind(dup_uuid)
+    .bind(canonical_is_compound)
+    .fetch_all(&mut *conn)
+    .await?;
 
     // Outgoing edges are re-sourced at `canonical`. Their BBAs live on the
     // far end and are unmoved, but their *content* was frozen from `dup`'s
@@ -10090,16 +12298,61 @@ async fn repair_marked_duplicate(
            -- rewrite history, and it would also leave two rows for the same
            -- pair (one live, one retracted) where callers expect one.
            AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (relationship = ANY($3)) \
+           AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id, target_id, relationship, target_type",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
+    .bind(&frozen)
     .fetch_all(&mut *conn)
     .await?;
+    let resourced_rows_ids: Vec<Uuid> = resourced_rows.iter().map(|r| r.0).collect();
+
+    // The BP factor graph (backlog ddb231b7). The act's retirement of the
+    // duplicate deleted every factor naming it (`claims_deactivate_factors`),
+    // and the two re-points above are UPDATEs, which `edges_auto_factor`
+    // (INSERT only) never sees: without this, belief propagation never sees
+    // an edge the canonical inherited. Mint each moved edge's factor as the
+    // trigger would now, and only those (an existing `(type, pair)` slot on
+    // the canonical is kept, as the trigger's ON CONFLICT keeps it). The
+    // un-mark's stale-factor DELETE removes these again by `source_edge_id`.
+    let moved_edges: Vec<Uuid> = retargeted_ids
+        .iter()
+        .chain(resourced_rows_ids.iter())
+        .copied()
+        .collect();
+    if !moved_edges.is_empty() {
+        sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+            .bind(canon_uuid)
+            .bind(canon_uuid)
+            .bind(Vec::<String>::new())
+            .bind(Some(&moved_edges))
+            .execute(&mut *conn)
+            .await?;
+    }
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
         .into_iter()
         .filter(|(_, _, _, target_type)| target_type == "claim")
         .map(|(id, target_id, relationship, _)| (id, target_id, relationship))
+        .collect();
+
+    let deleted_edge_ids_for_revert = deleted_edge_ids.clone();
+    // The collision guards stamped `valid_to = now()`, the transaction's time.
+    let retracted_at: Option<chrono::DateTime<chrono::Utc>> = if deleted_edge_ids.is_empty() {
+        None
+    } else {
+        Some(
+            sqlx::query_scalar("SELECT now()")
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    };
+    let retargeted_for_revert = retargeted_ids.clone();
+    let resourced_for_revert: Vec<Uuid> = resourced_rows_ids;
+    let edge_tenancy: Vec<EdgeTenancy> = edge_tenancy_before
+        .into_iter()
+        .filter(|t| retargeted_for_revert.contains(&t.id) || resourced_for_revert.contains(&t.id))
         .collect();
 
     // Claims whose cached scalars no longer match their BBA set: the two
@@ -10120,5 +12373,494 @@ async fn repair_marked_duplicate(
         retargeted_edges: retargeted_ids,
         dropped_duplicate_copies,
         skipped_false_bindings,
+        pooled_bbas,
+        kept_on_duplicate,
+        canonical_is_compound,
+        revert: DedupRevert {
+            identity_edge,
+            retracted_edges: deleted_edge_ids_for_revert,
+            retracted_at,
+            retargeted_edges: retargeted_for_revert,
+            resourced_edges: resourced_for_revert,
+            edge_tenancy,
+            moved_bbas: moved_rows,
+            deleted_bbas: deleted_rows,
+            copied_frames,
+            canonical_frame_inputs,
+        },
     })
 }
+
+/// The tail of both BBA moves onto the canonical (`$1`) in the dedup repair:
+/// the UPDATE over a `before` CTE of the rows to move (`id`, and their
+/// tenancy before the move), returning that before-state for the revert
+/// record. The move keeps migration 114's "a writer's contribution is the
+/// writer's" rule.
+const MOVE_BBAS_ONTO_CANONICAL_SQL: &str = "\
+     UPDATE mass_functions mf
+        SET claim_id       = c.id,
+            owner_group_id = CASE WHEN c.visibility = 'public' THEN mf.owner_group_id
+                                  ELSE c.owner_group_id END,
+            visibility     = c.visibility,
+            writer_owned   = CASE
+                               WHEN c.visibility IS DISTINCT FROM 'public' THEN false
+                               WHEN mf.owner_group_id IS DISTINCT FROM c.owner_group_id
+                                    THEN true
+                               ELSE mf.writer_owned END
+       FROM claims c, before b
+      WHERE c.id = $1 AND mf.id = b.id
+     RETURNING b.id, b.owner_group_id, b.visibility, b.writer_owned";
+
+/// The reversal of a dedup repair, unchecked: the callers establish the
+/// privilege and own the transaction. See
+/// [`ClaimRepository::reverse_marked_duplicate_conn`].
+async fn reverse_marked_duplicate(
+    conn: &mut sqlx::PgConnection,
+    dup_uuid: Uuid,
+    canonical_chain: &[Uuid],
+    record: &DedupRevert,
+) -> Result<DedupReversal, DbError> {
+    // The recorded canonical (where the repair bound frames) and the current
+    // one (whose BP factor slots the un-mark frees); a repaired row is taken
+    // back from wherever along the chain it now is.
+    let (Some(&canon_uuid), Some(&head_uuid)) = (canonical_chain.first(), canonical_chain.last())
+    else {
+        return Err(DbError::InvalidData {
+            reason: "reverse_marked_duplicate: an empty canonical chain".into(),
+        });
+    };
+    let chain: Vec<Uuid> = canonical_chain.to_vec();
+    let mut out = DedupReversal::default();
+    let mut drifted: Vec<Uuid> = Vec::new();
+    let note_drift = |asked: &[Uuid], done: &[Uuid], drifted: &mut Vec<Uuid>| {
+        drifted.extend(asked.iter().filter(|id| !done.contains(id)).copied());
+    };
+
+    // Edges first, so the BBAs below go back beside the edges they are keyed
+    // to. Only an edge still in force and still on the canonical moves.
+    let resourced: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         UPDATE edges SET source_id = $2
+          WHERE id = ANY($3) AND source_id = ANY($1) AND source_type = 'claim' AND valid_to IS NULL
+         RETURNING id, target_id, relationship, target_type"#,
+    )
+    .bind(&chain)
+    .bind(dup_uuid)
+    .bind(&record.resourced_edges)
+    .fetch_all(&mut *conn)
+    .await?;
+    let done: Vec<Uuid> = resourced.iter().map(|r| r.0).collect();
+    note_drift(&record.resourced_edges, &done, &mut drifted);
+    out.resourced_back = resourced
+        .into_iter()
+        .filter(|(_, _, _, tt)| tt == "claim")
+        .map(|(id, target, rel, _)| (id, target, rel))
+        .collect();
+
+    out.retargeted_back = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         UPDATE edges SET target_id = $2
+          WHERE id = ANY($3) AND target_id = ANY($1) AND target_type = 'claim' AND valid_to IS NULL
+         RETURNING id"#,
+    )
+    .bind(&chain)
+    .bind(dup_uuid)
+    .bind(&record.retargeted_edges)
+    .fetch_all(&mut *conn)
+    .await?;
+    let done = out.retargeted_back.clone();
+    note_drift(&record.retargeted_edges, &done, &mut drifted);
+
+    // The re-pointed edges take back the tenancy they had where the trigger
+    // cannot derive it: re-pointed onto a private canonical it re-stamped them
+    // private, and re-pointed back onto two PUBLIC endpoints its no-widening
+    // arm keeps them so. Only that case is restored. With either endpoint
+    // non-public the re-point has already given the edge its endpoints' meet
+    // as they are NOW, and a recorded tenancy could only be wider.
+    let repointed: Vec<Uuid> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .collect();
+    if !repointed.is_empty() && !record.edge_tenancy.is_empty() {
+        let tenancy =
+            serde_json::to_value(&record.edge_tenancy).map_err(|e| DbError::InvalidData {
+                reason: format!("revert record: {e}"),
+            })?;
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE edges e
+                SET owner_group_id = r.owner_group_id,
+                    visibility = r.visibility,
+                    co_owner_group_id = r.co_owner_group_id
+               FROM jsonb_to_recordset($1)
+                    AS r(id uuid, owner_group_id uuid, visibility text, co_owner_group_id uuid)
+              WHERE e.id = r.id AND e.id = ANY($2)
+                AND e.source_type = 'claim' AND e.target_type = 'claim'
+                AND EXISTS (SELECT 1 FROM claims s
+                             WHERE s.id = e.source_id AND s.visibility::text = 'public')
+                AND EXISTS (SELECT 1 FROM claims t
+                             WHERE t.id = e.target_id AND t.visibility::text = 'public')
+                AND (e.owner_group_id, e.visibility::text, e.co_owner_group_id)
+                    IS DISTINCT FROM (r.owner_group_id, r.visibility, r.co_owner_group_id)"#,
+        )
+        .bind(&tenancy)
+        .bind(&repointed)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    // Only an edge still retracted BY THE REPAIR (its exact stamp) and still
+    // touching the duplicate comes back; any other retraction is a later
+    // decision this un-mark has no record of.
+    out.unretracted_edges = match record.retracted_at {
+        Some(at) => {
+            sqlx::query_scalar(
+                r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+                 UPDATE edges SET valid_to = NULL
+                  WHERE id = ANY($1) AND valid_to = $2
+                    AND (source_id = $3 OR target_id = $3)
+                 RETURNING id"#,
+            )
+            .bind(&record.retracted_edges)
+            .bind(at)
+            .bind(dup_uuid)
+            .fetch_all(&mut *conn)
+            .await?
+        }
+        None => Vec::new(),
+    };
+    let done = out.unretracted_edges.clone();
+    note_drift(&record.retracted_edges, &done, &mut drifted);
+
+    // The BP factor graph. Retiring the duplicate deleted every factor naming
+    // it (`claims_deactivate_factors`), and the edges came back above by
+    // UPDATE, which `edges_auto_factor` (INSERT only) never sees. A factor
+    // keyed to an edge just moved back off the canonical names the canonical
+    // (one an earlier un-mark in a chain minted there) and is stale; it goes
+    // first, and the `(type, pair)` slots it held on the canonical are kept.
+    // Then the duplicate's edges are re-minted, and on the canonical only
+    // those freed slots: the un-mark leaves every other canonical factor as
+    // it found it. Two statements, not one data-modifying CTE: in one
+    // statement the INSERT's ON CONFLICT would still see the rows being
+    // deleted and leave the freed slot empty.
+    let moved_back: Vec<String> = out
+        .retargeted_back
+        .iter()
+        .copied()
+        .chain(out.resourced_back.iter().map(|(id, _, _)| *id))
+        .map(|id| id.to_string())
+        .collect();
+    let freed_slots: Vec<String> = if moved_back.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM factors f
+              WHERE f.variable_ids @> ARRAY[$1]::uuid[]
+                AND f.properties->>'source_edge_id' = ANY($2)
+             RETURNING f.factor_type || ':' || array_to_string(f.variable_ids, ',')"#,
+        )
+        .bind(head_uuid)
+        .bind(&moved_back)
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+        .bind(dup_uuid)
+        .bind(head_uuid)
+        .bind(&freed_slots)
+        .bind(None::<Vec<Uuid>>)
+        .execute(&mut *conn)
+        .await?;
+
+    // BBAs moved onto the canonical go back with their old tenancy while the
+    // duplicate is still public (its audience then is what it was); on a
+    // duplicate that has since gone non-public a row becomes the claim's own,
+    // as every derived row of a private claim is, and is never left public. A
+    // returning input's slot on the duplicate may since hold the duplicate's
+    // re-derived CACHED combination (the cascade recomputed it); that row is
+    // derived and is cleared so the input can return. Any other occupant of
+    // the slot is a later write: the row stays where it is (drifted).
+    let moved_ids: Vec<Uuid> = record.moved_bbas.iter().map(|m| m.id).collect();
+    let moved_json =
+        serde_json::to_value(&record.moved_bbas).map_err(|e| DbError::InvalidData {
+            reason: format!("revert record: {e}"),
+        })?;
+    if !moved_ids.is_empty() {
+        out.cleared_cached_rows = sqlx::query(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM mass_functions k
+              USING mass_functions m
+              WHERE k.claim_id = $2 AND {}
+                AND m.id = ANY($3) AND m.claim_id = ANY($1)
+                AND m.frame_id = k.frame_id
+                AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
+                AND m.perspective_id IS NOT DISTINCT FROM k.perspective_id"#,
+            crate::repos::mass_function::cached_combination_predicate("k.")
+        ))
+        .bind(&chain)
+        .bind(dup_uuid)
+        .bind(&moved_ids)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        out.returned_bbas = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET claim_id = $2,
+                    owner_group_id = CASE WHEN d.visibility::text = 'public'
+                                          THEN r.owner_group_id ELSE d.owner_group_id END,
+                    visibility = CASE WHEN d.visibility::text = 'public'
+                                      THEN r.visibility ELSE d.visibility END,
+                    writer_owned = CASE WHEN d.visibility::text = 'public'
+                                        THEN r.writer_owned ELSE false END
+               FROM jsonb_to_recordset($3)
+                    AS r(id uuid, owner_group_id uuid, visibility text, writer_owned boolean),
+                    claims d
+              WHERE d.id = $2 AND mf.id = r.id AND mf.claim_id = ANY($1)
+                AND NOT EXISTS (SELECT 1 FROM mass_functions k
+                                 WHERE k.claim_id = $2 AND k.frame_id = mf.frame_id
+                                   AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id
+                                   AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id)
+             RETURNING mf.id"#,
+        )
+        .bind(&chain)
+        .bind(dup_uuid)
+        .bind(&moved_json)
+        .fetch_all(&mut *conn)
+        .await?;
+        let done = out.returned_bbas.clone();
+        note_drift(&moved_ids, &done, &mut drifted);
+    }
+
+    // BBAs the repair deleted come back whole (same id, same tenancy), but
+    // only beside an edge that is in force again: every one of them is keyed
+    // to an edge, and a BBA on a retracted edge is exactly the orphan the
+    // repair exists to prevent. One whose id or key is taken again is a later
+    // write's and is skipped.
+    if !record.deleted_bbas.is_empty() {
+        let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
+        let asked: Vec<Uuid> = record
+            .deleted_bbas
+            .iter()
+            .filter_map(|r| {
+                r.get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+            })
+            .collect();
+        out.restored_bbas = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             INSERT INTO mass_functions
+             SELECT r.* FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
+              WHERE EXISTS (SELECT 1 FROM edges e
+                             WHERE e.id = r.perspective_id AND e.valid_to IS NULL)
+                -- Every row the record names must still be insertable: its
+                -- claim, frame, perspective, agent and evidence still exist.
+                -- One that is not is reported drifted, never fatal.
+                AND EXISTS (SELECT 1 FROM claims c WHERE c.id = r.claim_id)
+                AND EXISTS (SELECT 1 FROM frames f WHERE f.id = r.frame_id)
+                AND EXISTS (SELECT 1 FROM perspectives p WHERE p.id = r.perspective_id)
+                AND (r.source_agent_id IS NULL
+                     OR EXISTS (SELECT 1 FROM agents a WHERE a.id = r.source_agent_id))
+                AND (r.evidence_id IS NULL
+                     OR EXISTS (SELECT 1 FROM evidence ev WHERE ev.id = r.evidence_id))
+             ON CONFLICT DO NOTHING
+             RETURNING id"#,
+        )
+        .bind(&deleted)
+        .fetch_all(&mut *conn)
+        .await?;
+        // An INSERT re-derives tenancy from the claim (migrations 070, 114);
+        // the restored row takes back what it had while its claim is still
+        // public, and otherwise keeps the claim's own (never a public row on a
+        // claim that went private since).
+        sqlx::query(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             UPDATE mass_functions mf
+                SET owner_group_id = r.owner_group_id,
+                    visibility = r.visibility,
+                    writer_owned = r.writer_owned
+               FROM jsonb_populate_recordset(NULL::mass_functions, $1) r, claims c
+              WHERE mf.id = r.id AND mf.id = ANY($2)
+                AND c.id = mf.claim_id AND c.visibility::text = 'public'
+                AND (mf.owner_group_id, mf.visibility, mf.writer_owned)
+                    IS DISTINCT FROM (r.owner_group_id, r.visibility, r.writer_owned)"#,
+        )
+        .bind(&deleted)
+        .bind(&out.restored_bbas)
+        .execute(&mut *conn)
+        .await?;
+        let done = out.restored_bbas.clone();
+        note_drift(&asked, &done, &mut drifted);
+    }
+
+    // The frame bindings the repair added go, unless the canonical has since
+    // gained an input on that frame (one it did not hold when it was bound and
+    // that is not on its way back to the duplicate above).
+    if !record.copied_frames.is_empty() {
+        out.unbound_frames = sqlx::query_scalar(&format!(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             DELETE FROM claim_frames cf
+              WHERE cf.claim_id = $1 AND cf.frame_id = ANY($2)
+                AND NOT EXISTS (SELECT 1 FROM mass_functions mf
+                                 WHERE mf.claim_id = $1 AND mf.frame_id = cf.frame_id
+                                   AND NOT {}
+                                   AND NOT (mf.id = ANY($3)))
+             RETURNING cf.frame_id"#,
+            crate::repos::mass_function::cached_combination_predicate("mf.")
+        ))
+        .bind(canon_uuid)
+        .bind(&record.copied_frames)
+        .bind(&record.canonical_frame_inputs)
+        .fetch_all(&mut *conn)
+        .await?;
+        let done = out.unbound_frames.clone();
+        note_drift(&record.copied_frames, &done, &mut drifted);
+    }
+
+    // Claims whose BBA set changed: the duplicate, every claim of the chain,
+    // and every far-end claim a restored BBA landed on.
+    let mut stale = vec![dup_uuid];
+    for c in &chain {
+        if !stale.contains(c) {
+            stale.push(*c);
+        }
+    }
+    if !out.restored_bbas.is_empty() {
+        let targets: Vec<Uuid> = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT DISTINCT claim_id FROM mass_functions WHERE id = ANY($1)"#,
+        )
+        .bind(&out.restored_bbas)
+        .fetch_all(&mut *conn)
+        .await?;
+        for t in targets {
+            if !stale.contains(&t) {
+                stale.push(t);
+            }
+        }
+    }
+    out.stale_claims = stale;
+    drifted.sort_unstable();
+    drifted.dedup();
+    out.drifted = drifted;
+    Ok(out)
+}
+
+/// The INSERT minting the BP factors `edges_auto_factor` would mint, as if
+/// each edge were inserted now, for every in-force claim-claim edge whose
+/// endpoints are both current and that either touches the claim `$1` or
+/// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
+/// (as `type:lo,hi`), and, when `$4` (`uuid[]`) is not NULL, is one of the
+/// edges it lists. Both dedup directions move edges by UPDATE, which that
+/// INSERT trigger never sees:
+///
+/// * the un-mark puts edges back onto a claim made current again: `$1` is the
+///   duplicate, `$2` its canonical, `$3` the slots the stale-factor DELETE
+///   freed there, `$4` NULL;
+/// * the mark's repair ([`repair_marked_duplicate`]) re-points the retired
+///   duplicate's edges onto the canonical, whose factors the retirement
+///   deleted (`claims_deactivate_factors`): `$1` and `$2` are the canonical,
+///   `$3` empty and `$4` the edges it moved, so only those are minted and a
+///   canonical edge whose factor something else removed stays without one.
+///
+/// It is the body of migration 038's `auto_create_factor_from_edge`, over a
+/// set, and must stay that: a migration that changes the trigger's mapping,
+/// potentials, description or properties changes this too (the
+/// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
+/// Like the trigger it mints `decomposes_to` factors, on the duplicate's
+/// edges. A dedup identity edge is skipped (the act writes it after retiring
+/// the duplicate, so it never had one). One factor per `(factor_type, pair)`,
+/// from the earliest edge, and an existing one is kept
+/// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
+const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         INSERT INTO factors (factor_type, variable_ids, potential, description, properties)
+         SELECT DISTINCT ON (x.ft, x.var_ids) x.ft, x.var_ids, x.pot, x.descr, x.props
+           FROM (
+             SELECT e.id, e.created_at, m.ft, (e.source_id = $1 OR e.target_id = $1) AS on_dup,
+                    CASE WHEN e.source_id < e.target_id
+                         THEN ARRAY[e.source_id, e.target_id]
+                         ELSE ARRAY[e.target_id, e.source_id] END AS var_ids,
+                    CASE WHEN m.ft = 'mutual_exclusion' THEN '{}'::jsonb
+                         WHEN m.ft = 'directional_support' THEN jsonb_build_object(
+                              'forward_strength', m.fwd, 'reverse_strength', m.rev,
+                              'source_var', e.source_id::text)
+                         ELSE jsonb_build_object('strength', m.fwd) END AS pot,
+                    format('Auto-generated from %s edge %s', e.relationship, e.id) AS descr,
+                    jsonb_build_object('source_edge_id', e.id, 'relationship', e.relationship,
+                                       'edge_source_id', e.source_id,
+                                       'edge_target_id', e.target_id) AS props
+               FROM edges e
+               JOIN claims s ON s.id = e.source_id
+               JOIN claims t ON t.id = e.target_id
+               CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+               -- 038's override: a cross-source matcher's evidential_support
+               -- edge carries its own strength in properties.score, clamped
+               -- to [0, 1]. The trigger casts it at INSERT; properties can be
+               -- patched since, so a score that is not a decimal number falls
+               -- back to the constant (as a missing one does) instead of
+               -- failing the whole un-mark. The exponent is bounded to three
+               -- digits so the numeric cast itself cannot overflow (numeric_in
+               -- raises on e.g. "1e999999"); clamped as numeric, then cast, so
+               -- a large in-range exponent cannot overflow the double either.
+               CROSS JOIN LATERAL (
+                 SELECT ft.factor_type AS ft,
+                        COALESCE(ms.score, ft.forward_strength) AS fwd,
+                        COALESCE(ms.score, ft.reverse_strength) AS rev
+                   FROM (SELECT CASE WHEN ft.factor_type = 'evidential_support'
+                                      AND e.properties ? 'source'
+                                      AND e.properties->>'source' = 'cross_source_matcher'
+                                      AND e.properties ? 'score'
+                                      AND e.properties->>'score'
+                                          ~ '^\s*[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]{1,3})?\s*$'
+                                     THEN GREATEST(0.0, LEAST(1.0,
+                                              (e.properties->>'score')::numeric))::double precision
+                                END AS score) ms
+               ) m
+              WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+                -- `EDGE_IN_FORCE` (`repos::edge`), inlined into a const.
+                AND (e.valid_to IS NULL OR e.valid_to > now())
+                AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
+                AND ($4::uuid[] IS NULL OR e.id = ANY($4::uuid[]))
+                AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
+                AND m.ft IS NOT NULL
+           ) x
+          WHERE x.on_dup
+             OR (x.ft || ':' || array_to_string(x.var_ids, ',')) = ANY($3)
+          ORDER BY x.ft, x.var_ids, x.created_at, x.id
+         ON CONFLICT DO NOTHING"#;
+
+/// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
+/// keyed to any edge (those follow their edge, or stay with it), not an
+/// `attributed_v1` row, and not a cached combination (the duplicate's own fold
+/// of its inputs; folded again on the canonical it would count them twice),
+/// and not wider-reaching on the canonical (`$1`) than it is now: a public row
+/// pools anywhere, a group's row only onto a non-public canonical of the same
+/// group. Otherwise the move would disclose the group's assessment and fold it
+/// into a belief a wider audience reads (migration 114's move rule makes a row
+/// on a public canonical public). Fully parenthesized: it is spliced after a
+/// `NOT`.
+fn poolable_bba_sql() -> String {
+    format!(
+        "((mf.perspective_id IS NULL \
+           OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
+          AND mf.combination_method IS DISTINCT FROM 'attributed_v1' \
+          AND NOT {} \
+          AND (mf.visibility::text = 'public' \
+               OR EXISTS (SELECT 1 FROM claims k \
+                           WHERE k.id = $1 AND k.visibility::text <> 'public' \
+                             AND k.owner_group_id = mf.owner_group_id)))",
+        crate::repos::mass_function::cached_combination_predicate("mf.")
+    )
+}
+
+/// The canonical (`$1`) already holds a row under the duplicate row `mf`'s
+/// `mass_functions_unique_per_perspective` key (migration 034).
+const CANONICAL_HOLDS_KEY_SQL: &str = "SELECT 1 FROM mass_functions k \
+      WHERE k.claim_id = $1 AND k.frame_id = mf.frame_id \
+        AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
+        AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id";

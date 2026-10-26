@@ -204,6 +204,46 @@ impl SecurityEventRepository {
         Ok(())
     }
 
+    /// The `event_type` of [`Self::workflow_caller_write`]'s row.
+    pub const WORKFLOW_CALLER_WRITE: &'static str = "workflows.caller_write";
+
+    /// Record the PROVENANCE of a hierarchical-workflow write admitted over the
+    /// authenticated transport through a non-admin arm (the submitter or the
+    /// submitter's operator), on the CALLER's transaction, so it commits or
+    /// rolls back with the write.
+    ///
+    /// Those writes are authored by, and stamped from, the workflow-ingest
+    /// system agent, so the rows they make name no caller; `details` carries
+    /// who acted and on whose authority. The row is attributed (`agent_id`) to
+    /// the SESSION principal, `epigraph_principal_id()`, which on that
+    /// transaction is the system agent: migration 077's
+    /// `security_events_append` admits an attributed row only for the session
+    /// principal, and the acting agent is not it. Attributing it there is also
+    /// the truth about who wrote the rows; the actor is `details`'
+    /// `acting_agent`. (The admin arm's row goes through migration 112's
+    /// definer instead, [`Self::admin_audit_write`], which re-checks the admin
+    /// grant and records the admin as the event's agent.)
+    ///
+    /// No `RETURNING`, for the reason [`Self::log`] gives.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the INSERT fails; the caller's write
+    /// then rolls back with it.
+    pub async fn workflow_caller_write(
+        conn: &mut sqlx::PgConnection,
+        details: &JsonValue,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, public.epigraph_principal_id(), true, $2)",
+        )
+        .bind(Self::WORKFLOW_CALLER_WRITE)
+        .bind(details)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Query security events matching optional filter criteria.
     ///
     /// Results are ordered by `created_at DESC` (most recent first).

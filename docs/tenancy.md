@@ -308,9 +308,36 @@ locked are stepped over. Run one.
 2. **Phase 0** — mints a personal group, plus a live membership in it, for every
    claim author that lacks one (migration 057 documents ~1,198 orphan agents
    that have never authenticated).
-3. The entity arms: `claims`, `communities`, `perspectives`, `recall_events`,
-   `harvester_fragments`.
+3. The entity arms: `claims`, `recall_events`, `harvester_fragments`.
+   (`--entity perspectives` and `--entity communities` are accepted and do
+   nothing; see below.)
 4. `settle_remaining`, then `verify`.
+
+**`perspectives` is not re-owned, and `verify` does not count it.** Every
+writer of `perspectives` (`PerspectiveRepository::create`,
+`ensure_evidence_perspective`, `ensure_edge_perspective`) declares
+`TenancyDecl::instance_wide()`, `('public', world)`, on purpose. 077's registry
+WITH CHECK admits exactly that declaration, as it does for `frames` and
+`contexts`. The backfill used to walk `perspectives` on `owner_agent_id` like
+`recall_events`. Since the DS auto-wire records an `owner_agent_id` on its
+per-evidence and per-edge perspectives, that walk made `verify --legacy-owner
+platform` fail after every perspective an operator-linked agent wrote, until a
+re-run moved the row into the operator's group, against the writer's
+declaration. A moved perspective stays `public`, so nobody lost read access. Its
+owner group can UPDATE it (117) where nobody could before. Rows an earlier run
+moved are left as they are.
+
+**`communities` is not re-owned either, for the same reason.** Its one writer,
+`CommunityRepository::create`, declares `TenancyDecl::instance_wide()` and
+projects the community's own group (068's id-preserving shape) without making
+that group the row's owner: a community's directory entry is how others decide
+whether to join it. The backfill used to re-stamp every world-owned community
+to `('public', communities.id)`, and `verify` counted every world-owned
+community as residue in every mode, so each community created after a run
+failed the pre-flight until a re-run moved it, against the writer's
+declaration. A moved community stays `public`; its own group can UPDATE or
+DELETE it (115, 117) where nobody could before. Communities an earlier run
+moved are left as they are.
 
 A fifth arm, **legacy `ownership` transcription**, ran between (3) and (4) until
 PR-22. It re-fired migration 071's write-through trigger over every `ownership`
@@ -437,8 +464,28 @@ claim that retired duplicates point at still works. No claim names ITSELF in
 armed, an application session may not clear `claims.supersedes`, nor re-point
 it on a claim that stays current (`OPL02`); setting it on a claim that had
 none, and re-pointing it while retiring the claim in the same statement (the
-dedup and consolidate acts), are unchanged; re-opening such a claim later is
-checked as an insert ("Scope" below). With a principal
+dedup and consolidate acts), are unchanged, except that a claim that stays
+current never names a predecessor in another owner group (below); re-opening
+such a claim later is checked as an insert ("Scope" below).
+
+**A lineage stays in its owner group (`OPL02`, migration 153).** Once armed, on
+every session but a privileged one, a claim that is CURRENT after the
+statement and names `supersedes` must be owned by the same group as that
+predecessor: at its insert, at a re-open, and when `supersedes` is first set
+on a claim that stays current. Before 153 a writer could declare its own
+group on a claim naming, say, a world-owned corpus claim it cannot retire;
+that current successor blocked the corpus claim's custodial supersede (the
+inherited-author rule needs "no other current successor") and showed up in
+the claim's version history. The supersede act declares no owner, so it
+inherits the predecessor's group and never meets this; a writer that writes
+both groups supersedes in place. A retired row may still name a claim in
+another group (the dedup and consolidate acts' shape), and a privileged
+session is not checked. The rule compares groups only: a writer of the
+predecessor's OWN group can still attach a second current successor there,
+with the same effect on that claim's inherited-author supersede. The world
+group has no writer memberships by design, which keeps the corpus out of that
+reach; `docs/deploy.md` (migration 153) checks it before arming. Rows written
+before arming are not revisited; the census is in the same section. With a principal
 equal to the author, or a privileged session, the author is the one checked.
 An APPLICATION session with NO principal (a write on an unstamped connection)
 is an unbound writer: refused `OPL01` once armed, so a path that forgot to
@@ -494,6 +541,16 @@ CLIs, workflow ingest, default and explicit tenancy declarations, and a raw
 `INSERT` on any role (an unstamped application session included, as above).
 `ClaimRepository::default_decl_for_author` runs the same check before it
 resolves a personal group, so no group is provisioned for a refused author.
+The MCP document ingests (`ingest_document`, `ingest_document_inline`,
+`ingest_document_spine`) resolve their owner group with reads only
+(`IngestTx::owner_decl`) and ask the claims trigger's own questions first:
+`OPL01` for an author not bound to a registered human (asked of every author,
+since an acting link does not read the human registry), then an acting link's
+operator group or else the author's own personal group, then the trigger's
+writer scope on that group (`OPL02` for a link that is not acting, and for an
+author bound only through the client allowlist). The detached ingests run
+that check before they write the paper row, so a refusal reaches the caller
+instead of the background task.
 Workflow ingest authors every row as ONE shared system agent under that agent's
 own stamp, so the database sees only it; its request paths therefore bind their
 real CALLER before writing (`OPL01` for an unbound caller, `OPL02` for a caller
@@ -546,8 +603,11 @@ since migration 123; before it the instance-admin exemption skipped the
 check). The inherited-author rules therefore hold across statements: retiring a successor, adding a second one and re-opening the
 first, or re-pointing a successor while retiring it and then re-opening it,
 meets the same refusal as the one-statement form. No repository or route
-re-opens a claim. Every other claim UPDATE (content, truth value, labels,
-retiring a claim, a first `supersedes`, properties, embedding: the retire half
+re-opens a claim. A first `supersedes` on a claim that stays current is
+checked for its predecessor's owner group (migration 153, above). Every other
+claim UPDATE (content, truth value, labels,
+retiring a claim, a first `supersedes` set while retiring the claim, properties,
+embedding: the retire half
 of a supersede, a dedup, a relabel, a re-score) is gated by tenancy row
 security alone, not by `OPL01` / `OPL02`. On a schema with only this series' policies
 that is the owner-group rule: an update needs the row readable and its owner
@@ -691,12 +751,14 @@ human (`OPL02`).
   registered human that is not itself linked. Suspending or revoking the
   client, revoking the human, or creating a second client for the agent
   unbinds it at once.
-* **What it does not do.** It is not an operator link: nothing on the token,
-  bearer, viewer or webhook path reads it, so the client keeps minting tokens
-  and keeps its viewer, and an operated agent is still refused whether or not
-  it is allowlisted. It is not an ownership relation (the human does not own
-  the agent's claims). And it does not reach the membership door
-  (`epigraph_require_operator_scope` reads links only).
+* **What it does not do.** It is not an operator link: nothing on the token
+  or webhook path reads it, so the client keeps minting tokens and keeps its
+  viewer, and an operated agent is still refused whether or not it is
+  allowlisted. The bearer layers read it only to check a DELEGATED run
+  token's delegator (below); an ordinary token never reaches that read. It is
+  not an ownership relation (the human does not own the agent's claims). And
+  it does not reach the membership door (`epigraph_require_operator_scope`
+  reads links only).
 * **The door gap.** Because of that last point, an allowlisted agent's
   evidence, edge and belief writes into a group its operator does not write
   are not refused by the binding, although its claims there are (`OPL02`).
@@ -745,6 +807,72 @@ human (`OPL02`).
   `--apply` refuses on them under the same `--allow-unbound-writers`
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
+
+### Delegated run tokens (dormant)
+
+An operated agent is stdio-only, with ONE carve-out: a delegated run token.
+Such a token is an ordinary `agent` access token for the operated agent
+whose `dlg` claim names the agent of the OAuth client that asked for it (the
+DELEGATOR). Nothing mints one yet.
+
+**What is checked, on every request that carries `dlg`.** The REST bearer
+middlewares (`middleware/bearer.rs::admit_delegated`, right after the
+revoked-token check) and the MCP dispatch (`call_tool`, before any other gate,
+the lineage write or the tool) check a delegated token on EVERY request,
+whether or not the route or tool resolves a viewer. A token without `dlg`
+reads nothing extra. A delegated token is refused unless:
+
+* it carries no scope outside the delegated ceiling,
+  `epigraph_auth::DELEGATED_SCOPE_CEILING` (`claims:read claims:write
+  claims:challenge evidence:read evidence:submit edges:read edges:write
+  agents:read`): no group or agent management, no webhooks, no client or
+  admin-only scope. `AuthContext::has_scope` also never answers `true` outside
+  the ceiling for a delegated context, so no `claims:admin` arm runs for one;
+* the process read `EPIGRAPH_RUN_TOKENS=on` at boot (both `epigraph-api` and
+  the MCP HTTP listener; unset or any other value, every `dlg` token is
+  refused with no read, and a value other than `on`/`off` is warned about at
+  boot);
+* `AgentRepository::delegated_principal_pool` answers `Some`, in one read:
+  * the delegator is bound through arm (c) above (`client_allowlist`: the
+    allowance is live, its client `active` and the agent's only client);
+  * the delegator's human (`epigraph_human_of`) is the operator of the
+    operated agent's ACTING link (not retired, writer row live);
+  * the delegator itself holds a live `writer`/`admin` membership of that
+    operator's group. Grant it as a membership; a link would make the
+    delegator operated.
+
+The viewers and the ownership gate reuse that one answer for the request.
+Refusals are logged (`auth.delegation.rejected`) with the principal, the
+delegator and the jti, never the token.
+
+**What a live delegation can do.** The viewer is the operated agent's OWN
+membership set, exactly as on stdio: never the delegator's. The delegator's
+writer row is a precondition of admission, not a bound on the token. What the
+token may WRITE is bounded by the database's operator-scope rule (migration
+122, `OPL02`, armed): only into groups the operator writes, never into the
+agent's own personal group or another human's. Claim OWNERSHIP follows the
+stdio actor arm: the token may retire, supersede or relabel a claim authored
+by ANY agent whose link record, in any state, names the same operator,
+including the operator's other live agents, not only its retired
+predecessors.
+
+**Revocation.** Each of these refuses the next request, on a long-lived MCP
+session too, with no restart: revoking the allowance (final), suspending the
+delegator's client, giving the delegator's agent a second client, revoking the
+delegator's writer row, retiring the agent's link or revoking its writer row,
+and revoking the token's jti. Disarming the switch needs a restart.
+
+| Site | A live delegation |
+|---|---|
+| Any REST route or MCP tool | admitted within the ceiling |
+| REST viewer (`middleware/bearer.rs::extract_viewer`) | the agent's own viewer |
+| MCP viewer (`tools/viewer.rs::request_viewer`) | the agent's own viewer |
+| Claim ownership (`require_owner_or_admin`) | the actor arm, as on stdio; never the `claims:admin` arm |
+| Federated tools (`enforce_federated_scope`) | refused (the bearer is never forwarded) |
+| Webhooks | registration refused (outside the ceiling); delivery keys on the principal, which is operated |
+
+An old binary decodes a `dlg` token as an ordinary token for an operated agent
+and refuses it, so any deploy order fails closed.
 
 Deploy 149 with or after the system-agent registry (148): its
 "not a registered system agent" conjunct reads `system_agents` softly and is
@@ -1070,6 +1198,116 @@ scopes; arming is an operator step (`docs/deploy.md`).
   surface is widened.
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
+
+## Keyless team groups (migration 164)
+
+A team group is a visibility boundary, not an encryption one: it carries no
+key, no key epoch and no wrapped shares. The operator creates one, and changes
+its roster, on the maintenance DSN only:
+
+```bash
+epigraph-operator create-group --kind team --name "<name>" --admin <person agent id> \
+    --reason "<why>" [--apply]
+epigraph-operator group-member add --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member set-role --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member remove --group <id> --agent <agent id> \
+    --reason "<why>" [--apply]
+```
+
+Every command is a dry run without `--apply` (the definer runs and its
+transaction, audit row included, is rolled back). The rules live in the
+database functions these commands call:
+
+* the creator and every `admin` is a registered human operator;
+* a member belongs to a live human: the human itself, or an agent with a LIVE
+  operator link (or a client allowance) to one; unbound and retired-linked
+  agents are refused;
+* an operated agent is a member, at any role, only of a group its operator
+  writes, and an operator cannot be removed or demoted to `reader` while one
+  of its agents is a live member (remove the agents first);
+* the last live admin cannot be removed or demoted;
+* a removal sets `revoked_at` and keeps the row; adding the agent back writes
+  a new row;
+* every applied act writes one `group.*` `security_events` row.
+
+* a group the commands created (its `did_key` is `did:epigraph:group:<id>`)
+  has ONE writer, these commands: no application session, whatever principal
+  it is stamped as (the group's admin, its creator, demoted or not), can
+  insert or change one of its membership rows or change its group row, and no
+  application session can create a keyless team group or one in that
+  namespace (42501, from the triggers migration 164 adds). The REST routes
+  therefore cannot change such a roster either: add needs a key epoch, and
+  remove is refused like any other application write;
+* a member's access LAPSES with the binding that admitted it: a verb-made
+  group's live row counts in a viewer's group set only while the member still
+  belongs to a registered human operator, so revoking a client allowance or a
+  human's registration (or suspending its human client) ends the member's
+  claim reads and writes (everything decided from its resolved viewer) at its
+  next resolve. The row itself stays until `group-member remove` revokes it,
+  and the REST group routes that read the roster table directly (the
+  group-admin check, group info) still see it until then; the roster itself
+  stays closed to them;
+* the last-admin rule counts only admins that are still registered humans;
+* each audit row also carries `actor`: the CLI's tool, command, version and
+  process identity (real and login uid), since `session_user` is a shared
+  login.
+
+Two limits remain. Row security reads the SESSION's group set, so a session
+stamped before a removal (a cached viewer, a long-lived connection) still
+reads the group until it re-resolves; a removal takes effect at the next
+resolve. And the application DSN is not the boundary for anything an
+application session may do, for the reason "Arming, and the valve" gives: a
+holder of it can stamp any principal. That is why a verb-made group's roster
+is closed to every application session rather than to some principals.
+
+
+## Group membership that follows a role (migration 165)
+
+A group's membership can follow a platform role instead of a hand-kept list.
+The operator binds a NON-ELEVATING role to the group, then grants the role to
+humans for a window, on the maintenance DSN:
+
+```bash
+epigraph-operator define-group-role --key role:<key> --description "<what it is>" \
+    --group <group id> --member-role writer --include-agents --reason "<why>" [--apply]
+epigraph-operator grant-role --role role:<key> --holder <person agent id> \
+    (--valid-to <RFC3339> | --open-ended) --reason "<why>" [--apply]
+epigraph-operator group-roster --group <group id> [--at <RFC3339>]
+epigraph-operator end-group-role-binding --binding <binding id> --reason "<why>" [--apply]
+```
+
+While the binding is live, a registered human holding a live assignment of the
+role reads (and, at `writer`, writes) the group; with `--include-agents`, so
+does every agent registered to such a human: an agent with an ACTING live
+operator link, or a service client allowed for that human
+(`allow-author-binding-client`). A retired link, an agent whose acting row was
+revoked, and anyone whose human was revoked or whose human client was
+suspended never derive. A binding never confers `admin`, and a role that
+elevates or reads the audit trail cannot be bound. Once the operator binding
+is armed, the database's claim-write check (OPL02) asks the same question,
+keyed on the WRITING principal itself: an agent that does not derive the group
+is refused a claim write into it even with a forged stamp, and even with its
+session's link valve open.
+
+Nothing is written to the group's roster for these members. Membership is
+computed each time a viewer is resolved, so it LAPSES at the assignment's
+`valid_to` (or its `end-role-assignment`, or the binding's end) with no job:
+reads at the next request, tool call or worker job; claim writes, once the
+operator binding is armed, at the first statement after `valid_to`, even
+inside a transaction opened before it, whatever the session's stamp says
+(OPL02). A request already in flight reads on its old stamp.
+
+Two consequences to know:
+
+* readers of the roster TABLE itself (the REST group routes, the consolidate
+  act's membership test, a profile's detail check) see explicit rows only, so
+  a derived member is refused there; use `group-roster` to see who holds a
+  group through its bindings;
+* an explicit membership is never granted on the strength of a derived one:
+  `group-member add` of a teammate's agent still requires the teammate's own
+  explicit writer row (GRP03), so no explicit row outlives a window.
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

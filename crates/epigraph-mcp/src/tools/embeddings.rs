@@ -89,7 +89,7 @@ pub async fn embedding_neighborhood_density(
         "embedding_dim": embedding_dim,
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
@@ -175,7 +175,7 @@ pub async fn backfill_embeddings(
             "failed": 0,
             "dry_run": dry_run,
         });
-        return Ok(CallToolResult::success(vec![Content::text(
+        return Ok(CallToolResult::success(vec![ContentBlock::text(
             serde_json::to_string_pretty(&body).map_err(internal_error)?,
         )]));
     }
@@ -233,7 +233,7 @@ pub async fn backfill_embeddings(
         "dry_run": false,
         "errors": errors,
     });
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }

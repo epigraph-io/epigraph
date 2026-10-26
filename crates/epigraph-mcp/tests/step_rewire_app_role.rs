@@ -253,6 +253,13 @@ async fn a_mid_chain_add_step_never_forks_the_chain(pool: PgPool) {
 /// Appending (no DELETE) still works on the same legacy workflow, and a
 /// mid-chain insert into a chain the system agent wrote itself (the ordinary
 /// shape: `add_step` twice) rewires cleanly.
+///
+/// `plan_index` on the stdio tool: each append to this all-public plan is
+/// indexed one past the plan's last edge (the phase and steps hold 0..=3).
+/// An insert is never indexed: it would have to move `b`'s world-owned
+/// `executes` edge up by one, which no application session may update, so the
+/// new edge is left unindexed and the tool answers a null `plan_index` instead
+/// of colliding with `b`'s index.
 #[sqlx::test(migrations = "../../migrations")]
 async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPool) {
     let wf = legacy_workflow(&pool).await;
@@ -278,8 +285,12 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
             )
         }
     };
-    let a = parse_uuid_field(&add("appended a", None).await, "step_claim_id");
-    let b = parse_uuid_field(&add("appended b", None).await, "step_claim_id");
+    let added_a = add("appended a", None).await;
+    let added_b = add("appended b", None).await;
+    assert_eq!(added_a["plan_index"], serde_json::json!(4), "{added_a}");
+    assert_eq!(added_b["plan_index"], serde_json::json!(5), "{added_b}");
+    let a = parse_uuid_field(&added_a, "step_claim_id");
+    let b = parse_uuid_field(&added_b, "step_claim_id");
     assert_eq!(successors(&pool, s2).await, vec![a]);
     assert_eq!(successors(&pool, a).await, vec![b]);
     // The a -> b link carries an edge-keyed BBA (seeded privileged), so the
@@ -331,7 +342,23 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
 
     // Between a and b: both are the system agent's claims, so it may delete
     // a -> b and the insert lands.
-    let mid = parse_uuid_field(&add("between a and b", Some(4)).await, "step_claim_id");
+    let added_mid = add("between a and b", Some(4)).await;
+    assert_eq!(
+        added_mid.get("plan_index"),
+        Some(&serde_json::Value::Null),
+        "b's world-owned executes edge cannot move, so the insert is unindexed: {added_mid}"
+    );
+    let mid = parse_uuid_field(&added_mid, "step_claim_id");
+    let indices: Vec<Option<i64>> = sqlx::query_scalar(
+        "SELECT (e.properties->>'plan_index')::bigint FROM edges e \
+          WHERE e.source_type = 'workflow' AND e.relationship = 'executes' \
+            AND e.target_id = ANY($1) ORDER BY array_position($1, e.target_id)",
+    )
+    .bind(vec![b, mid])
+    .fetch_all(&pool)
+    .await
+    .expect("indices of b and mid");
+    assert_eq!(indices, vec![Some(5), None], "b keeps 5; mid has none");
     assert_eq!(
         successors(&pool, a).await,
         vec![mid],
@@ -356,6 +383,63 @@ async fn add_step_appends_and_rewires_a_chain_the_system_agent_wrote(pool: PgPoo
     assert_eq!(
         deferred, 1,
         "the deleted link's edge-keyed BBA cleanup was deferred in the act"
+    );
+}
+
+/// An append to a plan whose `executes` edges carry no integer `plan_index`
+/// (written before the ordinal existed) has no numbering to extend: the new
+/// edge is written unindexed and the tool answers a null `plan_index`, rather
+/// than starting a numbering of its own that would put the step FIRST in plan
+/// order, ahead of every unindexed item.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_append_to_a_plan_without_plan_index_is_left_unindexed(pool: PgPool) {
+    let wf = legacy_workflow(&pool).await;
+    let stripped = sqlx::query(
+        "UPDATE edges SET properties = properties - 'plan_index' \
+          WHERE source_type = 'workflow' AND relationship = 'executes' \
+            AND source_id = (SELECT id FROM workflows WHERE canonical_name = $1)",
+    )
+    .bind(&wf.name)
+    .execute(&pool)
+    .await
+    .expect("harness: strip the ordinals")
+    .rows_affected();
+    assert_eq!(stripped, 4, "fixture shape: the phase and three steps");
+    let server = app_role_server(&pool).await;
+
+    let added = first_text(
+        &epigraph_mcp::tools::step_ops::add_step(
+            &server,
+            &stdio_viewer(&server).await,
+            AddStepParams {
+                canonical_name: wf.name.clone(),
+                step_text: "appended to an unindexed plan".to_string(),
+                position: None,
+            },
+            None,
+        )
+        .await
+        .expect("add_step"),
+    );
+    assert_eq!(
+        added.get("plan_index"),
+        Some(&serde_json::Value::Null),
+        "{added}"
+    );
+    let a = parse_uuid_field(&added, "step_claim_id");
+    let properties: serde_json::Value = sqlx::query_scalar(
+        "SELECT properties FROM edges WHERE source_type = 'workflow' \
+            AND relationship = 'executes' AND target_id = $1",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("the new executes edge");
+    assert_eq!(properties, serde_json::json!({"level": 2}));
+    assert_eq!(
+        successors(&pool, wf.steps[2].0).await,
+        vec![a],
+        "calibration: the append landed at the end of the chain"
     );
 }
 
@@ -527,7 +611,14 @@ async fn two_callers_chain_edges_share_the_workflow_ingest_owner(pool: PgPool) {
             Some(shared),
             "{rel}: the author record is the shared agent's"
         );
-        let want = if rel == "executes" { world } else { shared };
+        // `executes` (a workflow endpoint) and `AUTHORED` (an agent endpoint,
+        // the acting caller's authorship of the step it created) are outside
+        // migration 120's writer scope, so the trigger owns them by the world.
+        let want = if rel == "executes" || rel == "AUTHORED" {
+            world
+        } else {
+            shared
+        };
         assert_eq!(*owner, want, "{rel}: {owners:?}");
     }
     for g in [

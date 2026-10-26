@@ -22,6 +22,57 @@ pub const LIVE_LINK_BINDING: &str = "live_link";
 /// keeps its HTTP token and viewer.
 pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
 
+/// The environment variable that switches delegated run tokens on for a
+/// request-serving process ([`RunTokens`]). Read ONCE, at boot.
+pub const RUN_TOKENS_ENV: &str = "EPIGRAPH_RUN_TOKENS";
+
+/// Whether this process admits a delegated run token: an access token whose
+/// `dlg` claim names a delegator that asked for it on an operated agent's
+/// behalf. OFF by default in every constructor; ON only when the binary read
+/// `EPIGRAPH_RUN_TOKENS=on` at boot ([`Self::from_env`]). While OFF, every
+/// site that would admit such a token refuses it without a database read, so
+/// the feature is dormant until an operator arms it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunTokens {
+    /// Delegated run tokens are refused everywhere.
+    #[default]
+    Off,
+    /// A delegated run token is admitted where its delegation is live.
+    On,
+}
+
+impl RunTokens {
+    /// The switch's parse, apart from the environment: ONLY the exact value
+    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
+    /// `1` or a typo leave it OFF.
+    #[must_use]
+    pub fn parse(raw: Option<&str>) -> Self {
+        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+
+    /// Whether `raw` is SET to a value that is neither `on` nor `off`
+    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
+    /// OFF, which a binary warns about at boot so an operator who typed `true`
+    /// or `1` learns why every delegated token is refused. Unset or blank is
+    /// the plain default and is not flagged.
+    #[must_use]
+    pub fn is_unrecognised(raw: Option<&str>) -> bool {
+        raw.map(str::trim).is_some_and(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
+        })
+    }
+
+    /// [`Self::parse`] of [`RUN_TOKENS_ENV`]. For a binary's boot only.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::parse(std::env::var(RUN_TOKENS_ENV).ok().as_deref())
+    }
+}
+
 /// One ACTING operator link: the operator's agent id and the id of the
 /// operator's personal group, which owns the operated agent's new claims.
 ///
@@ -30,6 +81,16 @@ pub const CLIENT_ALLOWLIST_BINDING: &str = "client_allowlist";
 /// `writer`/`admin` membership, and the operator's own personal group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperatorLink {
+    pub operator_id: Uuid,
+    pub operator_group_id: Uuid,
+}
+
+/// A LIVE delegation of an operated agent (a delegated run token's `dlg`):
+/// the operator both sides answer to, and the operator's group the delegated
+/// principal writes. Produced only by
+/// [`AgentRepository::delegated_principal_pool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationLive {
     pub operator_id: Uuid,
     pub operator_group_id: Uuid,
 }
@@ -46,6 +107,23 @@ pub struct AuthorOperator {
     /// The link is retired (migration 107 section 7): the agent never acts for
     /// the operator.
     pub retired: bool,
+}
+
+/// Whether an agent attached to a role may run now (migration 166's
+/// `epigraph_role_agent_may_run`): the answer epigraph-mcp checks at boot and
+/// the host checks before it starts a role's container or schedule.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RoleAgentRunGate {
+    /// `false` only for an agent with a live attachment whose role has no live
+    /// holder, or whose linked human is not that holder.
+    pub may_run: bool,
+    /// The role of the first failing attachment, else of the first live one;
+    /// `None` for an unattached agent.
+    pub role: Option<String>,
+    /// The holder, only when it is the agent's own linked human (`held`).
+    pub holder: Option<Uuid>,
+    /// `unattached`, `held`, `no_holder` or `not_holder`.
+    pub reason: String,
 }
 
 /// What one [`AgentRepository::link_operator`] call did, for the startup log.
@@ -1478,6 +1556,52 @@ impl AgentRepository {
         }))
     }
 
+    /// The HUMAN `agent` acts for (migration 149's `epigraph_human_of`): the
+    /// agent itself when it is a registered human operator; else its operator
+    /// link (only a non-retired one when `live_only`); else the human its sole
+    /// client is allowlisted to (149 arm (c)). `None` when it is bound to no
+    /// human, and, with `live_only`, when its only link is retired. The one
+    /// read that answers "which human is this" across all three bindings.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn human_of(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        live_only: bool,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_human_of($1, $2)")
+                .bind(agent_id)
+                .bind(live_only)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
+    /// May `agent_id` run now? Migration 166's `epigraph_role_agent_may_run`,
+    /// EXECUTE-able on the request DSN (and by the identity attestor). An
+    /// unattached agent always may; an attached one only while its linked
+    /// human holds every role it is attached to.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database that has
+    /// not applied migration 166) or the read fails. Deliberately NOT mapped to
+    /// "may run": a binary that cannot ask must not start as if the answer
+    /// were yes.
+    pub async fn role_agent_may_run(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<RoleAgentRunGate, DbError> {
+        Ok(sqlx::query_as::<_, RoleAgentRunGate>(
+            "SELECT may_run, role, holder, reason \
+               FROM public.epigraph_role_agent_may_run($1)",
+        )
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
     /// [`Self::operator_actor`] for a caller holding a pool.
     ///
     /// # Errors
@@ -1489,6 +1613,71 @@ impl AgentRepository {
     ) -> Result<Option<OperatorLink>, DbError> {
         let mut conn = pool.acquire().await?;
         Self::operator_actor(&mut conn, agent_id).await
+    }
+
+    /// "May a token that `delegator_agent` asked for act as `principal`?" —
+    /// THE per-request liveness check of a delegated run token (a token whose
+    /// `dlg` claim names `delegator_agent`), run once per request by the REST
+    /// bearer middlewares and the MCP dispatch, whose answer the viewers and
+    /// the ownership gate reuse. `Some` iff ALL of these hold at the moment of
+    /// the read:
+    ///
+    /// * `run_tokens` is [`RunTokens::On`] (else `None` with no read at all);
+    /// * `delegator_agent` is bound to a human through migration 149's
+    ///   allowlist ([`CLIENT_ALLOWLIST_BINDING`]): its allowance is not
+    ///   revoked, its client is `active` and `service`/`agent`, it holds no
+    ///   operator link and operates no agent, and its operator is a registered
+    ///   human (149's arm (c), `epigraph_author_binding`);
+    /// * that human (`epigraph_human_of(delegator, true)`) is the operator of
+    ///   `principal`'s ACTING link ([`Self::operator_actor`]: a not-retired
+    ///   record and a live writer membership of the operator's group);
+    /// * `delegator_agent` ITSELF holds a live `writer`/`admin` membership of
+    ///   that operator's group (`epigraph_live_memberships`, the read the
+    ///   viewer resolves on). A PRECONDITION of admission, not a bound on
+    ///   what the token may do: the admitted viewer is the principal's own
+    ///   membership set, as on stdio, and its writes are bounded by the
+    ///   database's operator-scope rule (migration 122, `OPL02`) to groups
+    ///   the operator writes.
+    ///
+    /// An unlinked `principal` is never delegated to: it has no acting link.
+    ///
+    /// ONE statement on one connection, every read through an app-executable
+    /// `SECURITY DEFINER` function, so it answers the same on an unstamped
+    /// `epigraph_app` session as on a privileged one, and from one snapshot.
+    /// No cache: a revoke, a retire or a suspension takes effect on the next
+    /// request.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a function is absent or the read fails.
+    /// Never mapped to "not live" by this function; every caller refuses on an
+    /// error (fails closed).
+    pub async fn delegated_principal_pool(
+        pool: &PgPool,
+        run_tokens: RunTokens,
+        delegator_agent: Uuid,
+        principal: Uuid,
+    ) -> Result<Option<DelegationLive>, DbError> {
+        if run_tokens != RunTokens::On {
+            return Ok(None);
+        }
+        let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT a.operator_id, a.operator_group_id \
+               FROM public.epigraph_operator_actor($2) a \
+              WHERE public.epigraph_author_binding($1) = $3 \
+                AND public.epigraph_human_of($1, true) = a.operator_id \
+                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) m \
+                             WHERE m.group_id = a.operator_group_id \
+                               AND m.role IN ('writer', 'admin'))",
+        )
+        .bind(delegator_agent)
+        .bind(principal)
+        .bind(CLIENT_ALLOWLIST_BINDING)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(operator_id, operator_group_id)| DelegationLive {
+            operator_id,
+            operator_group_id,
+        }))
     }
 
     /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that
@@ -1984,6 +2173,51 @@ impl AgentRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::RunTokens;
+
+    /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
+    /// and a typo all leave delegated run tokens refused. Mutation caught:
+    /// accepting any non-empty value.
+    #[test]
+    fn only_on_switches_run_tokens_on() {
+        for off in [
+            None,
+            Some(""),
+            Some("true"),
+            Some("1"),
+            Some("yes"),
+            Some("onn"),
+        ] {
+            assert_eq!(RunTokens::parse(off), RunTokens::Off, "{off:?}");
+        }
+        for on in [Some("on"), Some(" ON "), Some("On")] {
+            assert_eq!(RunTokens::parse(on), RunTokens::On, "{on:?}");
+        }
+        assert_eq!(RunTokens::default(), RunTokens::Off);
+    }
+
+    /// A value that is SET but neither `on` nor `off` is flagged (it reads as
+    /// OFF silently otherwise); unset, blank, `on` and `off` in any case are
+    /// not. Mutation caught: flagging nothing (an operator who typed `true`
+    /// sees no warning) or flagging `off`.
+    #[test]
+    fn an_unrecognised_run_tokens_value_is_flagged() {
+        for flagged in ["true", "1", "yes", "onn", "enabled"] {
+            assert!(RunTokens::is_unrecognised(Some(flagged)), "{flagged:?}");
+        }
+        for quiet in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("on"),
+            Some(" ON "),
+            Some("off"),
+            Some("OFF"),
+        ] {
+            assert!(!RunTokens::is_unrecognised(quiet), "{quiet:?}");
+        }
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_agent_crud(_pool: sqlx::PgPool) {
         // Placeholder: full CRUD coverage is in tests/agent_tests.rs

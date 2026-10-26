@@ -195,7 +195,19 @@ use std::path::{Path, PathBuf};
 /// the assertion so it dodges the scanner, which is the same laundering this
 /// register exists to prevent. The handler-read register below is UNCHANGED —
 /// that is the number "do not raise it" is about, and the one a leak would move.
-const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 3), ("submit.rs", 1)];
+///
+/// **`claims.rs` 3 -> 4, on the `submit.rs` precedent above, and it is a
+/// `#[cfg(test)]` read-back, not a new handler read.**
+///
+/// `test_create_claim_core_missing_scope_403` (issue #477) calls
+/// `create_claim_core` directly with a token lacking `claims:write` and asserts
+/// the refusal leaves no row. Its statement is
+/// `SELECT COUNT(*) FROM claims WHERE content = $1` inside
+/// `#[cfg(all(test, feature = "db"))] mod db_tests` — a scalar count that
+/// projects no content. Registered rather than rewritten to dodge the scanner,
+/// for the reason the `submit.rs` note gives. The handler-read register below
+/// is again UNCHANGED.
+const TEST_ONLY_INLINE_READS: &[(&str, usize)] = &[("claims.rs", 4), ("submit.rs", 1)];
 
 /// The register entries with **no filter and, since PR-14, no post-pass
 /// anywhere in the tree**.
@@ -275,7 +287,11 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // 4 -> 3 (batch H-a): `report_outcome`'s unfiltered `SELECT content FROM
     // claims` for the goal fallback became a `get_by_id_with_labels` read
     // through the caller's viewer.
-    ("workflows.rs", 3),
+    // 3 -> 2: `report_hierarchical_outcome`'s `edges ⨝ claims` step lookup
+    // (it projected `claims.properties`) moved to
+    // `WorkflowRepository::plan_step_claim_ids`, with its viewer predicates,
+    // run on a transaction stamped with the caller's viewer.
+    ("workflows.rs", 2),
 ];
 
 /// Fail-open scope-check sites: `if let Some(..) = auth_ctx { check_scopes(..) }`
@@ -345,7 +361,19 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
     // the sole per-principal narrowing on the table this route reads, and a
     // fail-open scope check on the caller-facing end of a policy being widened in
     // the same commit is not a debt worth carrying forward one more PR.
-    ("claims.rs", 1),
+    // `("claims.rs", 1)` REMOVED by the batch-claims change (issue #477), on
+    // the PR-10 precedent below. The site was `create_claim`'s
+    // `if let Some(axum::Extension(ref auth)) = auth_ctx { check_scopes(..) }`.
+    // Moving that body into `create_claim_core` first RESPELLED it as
+    // `if let Some(auth) = auth_ctx` over `Option<&AuthContext>` — a spelling
+    // `AUTH_CTX_NEEDLES` does not match — so the file read 0 while the check
+    // was still conditional. That reading was the scanner losing sight of the
+    // site, not a fix, and lowering this row on it alone would have laundered
+    // the debt. The row is removed because the site is now FIXED:
+    // `create_claim_core` takes the prescribed
+    // `let Some(ctx) = auth_ctx else { return Err(ApiError::Unauthorized ..) }`
+    // shape as its first statement and checks `claims:write` unconditionally.
+    // Removed rather than set to `0` for the reason the PR-10 note gives.
     // 7 before PR-16/16b. `update_evidence` moved its `raw_content` UPDATE into
     // `EvidenceRepository::update_raw_content` behind the write-side predicate,
     // and took the prescribed
@@ -390,7 +418,11 @@ const FAIL_OPEN_SCOPE_SITES: &[(&str, usize)] = &[
 /// unauthenticated write path. It is a debt register, not a permission slip.
 const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
     ("agents.rs", 1),
-    ("claims.rs", 1),
+    // `("claims.rs", 1)` REMOVED by the batch-claims change (issue #477), for
+    // the reason recorded on the matching `FAIL_OPEN_SCOPE_SITES` removal: the
+    // provenance block was respelled out of the needles' view by the move into
+    // `create_claim_core`, and the row goes only because the block is now
+    // unconditional on the `ctx` the function binds as its first statement.
     ("crud.rs", 4),
     // `("edges.rs", 4)` REMOVED by batch W12b: the provenance blocks of
     // `create_edge`, `delete_edge`, `patch_edge` and `relate_claims` sit in
@@ -512,7 +544,10 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     // `UPDATE claims` (truth value, counters) became
     // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
     // viewer-stamped transaction.
-    ("workflows.rs", 2),
+    // 2 -> 0, key removed (backlog 5ce88457): the post-commit
+    // `UPDATE claims SET embedding` in `store_workflow` and `ingest_workflow`
+    // became `ClaimRepository::store_embedding_if_unsealed` on a
+    // system-agent-stamped transaction (`embed_inserted_workflow_claims`).
 ];
 
 /// Tenancy-scoped tables whose route-layer writes this lint counts.

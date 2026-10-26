@@ -14,7 +14,7 @@ use epigraph_db::{
 use epigraph_ds::{combination, CombinationMethod, FocalElement, FrameOfDiscernment, MassFunction};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -125,38 +125,13 @@ pub async fn submit_ds_evidence(
     let mut warnings = deprecated_parameter_warnings(method, params.gamma);
 
     // Get frame from DB
-    let frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
+    let mut frame_row = FrameRepository::get_by_id(&server.pool, viewer, frame_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("frame {frame_id} not found")))?;
 
     let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())
         .map_err(internal_error)?;
-
-    // Backlog 45cbaef4 (G6): an index that names none of the frame's
-    // hypotheses is stored as given (the column is an unconstrained integer, and
-    // refusing would change a call that used to succeed), but every belief
-    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
-    // Say so rather than let the caller believe it addressed that hypothesis.
-    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
-        Some(params.hypothesis_index),
-        frame.hypothesis_count(),
-    );
-    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
-        warnings.push(format!(
-            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
-             was stored as given, but every belief read, including the belief returned here, \
-             is about hypothesis 0 ({:?}).",
-            params.hypothesis_index,
-            frame.hypothesis_count(),
-            frame.hypothesis_count().saturating_sub(1),
-            frame_row
-                .hypotheses
-                .first()
-                .map(String::as_str)
-                .unwrap_or_default(),
-        ));
-    }
 
     // Parse the mass function. Reliability handling forks on whether the
     // caller opted into calibrated per-source-class discounting:
@@ -187,25 +162,12 @@ pub async fn submit_ds_evidence(
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_masses_json(&frame, &params.masses)?;
     let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+    // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
+    // caller's own key lowercased when the calibration does not know it
+    // (bc06ec6f). The vocabulary warning below still names what the caller sent.
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
 
-    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
-    // recompute resolves is ACCEPTED and silently combined at the 0.5
-    // unknown-type weight (`effective_source_strength`'s last tier: this path
-    // stores no `source_strength`). Report it, never refuse it — the vocabulary
-    // is operator-extensible and a new key may be deliberate.
-    let unknown_keys = match calibrated_evidence_type {
-        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
-            warnings.push(format!(
-                "evidence_type={et:?} is not in the calibration vocabulary \
-                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
-                 has no entry in this frame's evidence_type_weights override, so this BBA is \
-                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
-                known_evidence_type_keys().join(", ")
-            ));
-            vec![et.to_string()]
-        }
-        _ => Vec::new(),
-    };
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
     } else {
@@ -307,6 +269,86 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?
     .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
+    // Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis goes
+    // to the frame its readers read, `research_validity` (writers follow the
+    // readers, operator ruling R-8; `POST /frames/:id/evidence` does the same).
+    // The target has the named frame's hypothesis count (refused otherwise), so
+    // the masses parsed above address it unchanged.
+    let named_frame = frame_id;
+    let frame_id = match epigraph_engine::promotion::promoted_hypothesis_evidence_frame(
+        &mut tx, viewer, claim_id, frame_id,
+    )
+    .await
+    // The redirect's refusals are the CALLER's (the masses cannot address the
+    // target frame, or it is missing), answered as invalid params like the
+    // REST twin's 400/404, with nothing written; anything else is internal.
+    .map_err(|e| match e {
+        epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::NotFound { .. } => {
+            invalid_params(e.to_string())
+        }
+        other => internal_error(other),
+    })? {
+        Some(target) => {
+            warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
+                claim_id,
+                named_frame,
+                target.id,
+            ));
+            let id = target.id;
+            frame_row = target;
+            id
+        }
+        None => frame_id,
+    };
+
+    // The frame-scoped checks below are about the frame the BBA is FILED on
+    // (the redirect's target, when there is one), not the one named: its
+    // hypotheses and its `evidence_type_weights` override are what the
+    // recompute reads.
+    // Backlog 45cbaef4 (G6): an index that names none of the frame's
+    // hypotheses is stored as given (the column is an unconstrained integer, and
+    // refusing would change a call that used to succeed), but every belief
+    // reader resolves it to 0 through `edge_factor::resolve_hypothesis_index`.
+    // Say so rather than let the caller believe it addressed that hypothesis.
+    let resolved_index = epigraph_engine::edge_factor::resolve_hypothesis_index(
+        Some(params.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+    if usize::try_from(params.hypothesis_index).ok() != Some(resolved_index) {
+        warnings.push(format!(
+            "hypothesis_index={} names none of this frame's {} hypotheses (valid: 0..={}); it \
+             was stored as given, but every belief read, including the belief returned here, \
+             is about hypothesis 0 ({:?}).",
+            params.hypothesis_index,
+            frame.hypothesis_count(),
+            frame.hypothesis_count().saturating_sub(1),
+            frame_row
+                .hypotheses
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default(),
+        ));
+    }
+
+    // Backlog 86ee2d30 (G12): an `evidence_type` outside the vocabulary the
+    // recompute resolves is ACCEPTED and silently combined at the 0.5
+    // unknown-type weight (`effective_source_strength`'s last tier: this path
+    // stores no `source_strength`). Report it, never refuse it — the vocabulary
+    // is operator-extensible and a new key may be deliberate.
+    let unknown_keys = match calibrated_evidence_type {
+        Some(et) if !evidence_type_resolves(server, frame_id, et).await => {
+            warnings.push(format!(
+                "evidence_type={et:?} is not in the calibration vocabulary \
+                 (calibration.toml [evidence_type_weights] keys or [evidence_type_aliases]) and \
+                 has no entry in this frame's evidence_type_weights override, so this BBA is \
+                 combined at the 0.5 unknown-type reliability. Known keys: {}.",
+                known_evidence_type_keys().join(", ")
+            ));
+            vec![et.to_string()]
+        }
+        _ => Vec::new(),
+    };
+
     // Migration 114: on a public claim this caller does not own, the BBA is the
     // caller's own row, but the claim's frame assignment and its cached belief
     // stay the owner's. Say so in the response rather than let a kept
@@ -325,6 +367,15 @@ pub async fn submit_ds_evidence(
         ));
     }
 
+    // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
+    // addressable only through assess: a row keyed (agent, the agent's slot
+    // perspective) would overwrite or forge it.
+    if epigraph_db::repos::mass_function::is_assessment_slot(Some(agent_id), perspective_id) {
+        return Err(invalid_params(
+            "perspective_id is this agent's assessment slot, written only by \
+             POST /api/v1/claims/:id/assess; choose another perspective",
+        ));
+    }
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;
@@ -334,6 +385,48 @@ pub async fn submit_ds_evidence(
     // (effective_source_strength), and the legacy path already baked the
     // raw `reliability` float into the pre-discounted masses above rather
     // than caching it here — unchanged from pre-change behavior.
+    //
+    // Backlog bcbe34b2: the upsert below returns only the row id, so an
+    // identical resubmission and a silent overwrite both looked like a first
+    // submission. Read this agent's row for the key first, on the same
+    // transaction, and report what the write does to it. (The caller's row
+    // has an agent, so the cached-combination exclusion never hides it.)
+    // The key's prior row is picked by the probe the REST twin shares
+    // (`bba_write_outcome::prior_for`), so the transports agree on it.
+    use epigraph_db::bba_write_outcome::{prior_for, BbaWriteOutcome};
+    let rows = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
+        .await
+        .map_err(internal_error)?;
+    let write_outcome = match prior_for(&rows, Some(agent_id), perspective_id) {
+        None => BbaWriteOutcome::Inserted,
+        Some(row)
+            if restates_bba(
+                row,
+                &masses_json,
+                &method_name,
+                stored_evidence_type.as_deref(),
+                stored_locality_tag,
+            ) =>
+        {
+            BbaWriteOutcome::Unchanged
+        }
+        Some(_) => BbaWriteOutcome::Replaced,
+    };
+    match write_outcome {
+        BbaWriteOutcome::Unchanged => warnings.push(
+            "this BBA is identical to the one this agent already stored for this claim, frame \
+             and perspective_id; it is stored once and was not combined again, so the belief \
+             did not move on its account."
+                .to_string(),
+        ),
+        BbaWriteOutcome::Replaced => warnings.push(
+            "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
+             perspective_id (same mass_function_id); it was not added beside it. To add \
+             independent evidence, submit it under a distinct perspective_id."
+                .to_string(),
+        ),
+        BbaWriteOutcome::Inserted => {}
+    }
     let mf_id = MassFunctionRepository::store_with_perspective(
         &mut *tx,
         claim_id,
@@ -344,8 +437,8 @@ pub async fn submit_ds_evidence(
         None,
         Some(&method_name),
         None,
-        calibrated_evidence_type, // NULL unless caller opted in (backlog a2b71568)
-        stored_locality_tag,      // "unknown" unless evidence_type was also supplied
+        stored_evidence_type.as_deref(), // NULL unless caller opted in (backlog a2b71568)
+        stored_locality_tag,             // "unknown" unless evidence_type was also supplied
         None, // manual DS submission has no evidence row in scope (issue #197 Phase 3)
     )
     .await
@@ -366,13 +459,13 @@ pub async fn submit_ds_evidence(
     // second, divergent implementation. Backlog 2bffdfdc: the old inline
     // combine here used raw stored masses with no dynamic reliability
     // discount and a fixed-method pairwise loop, while `recompute_beliefs`
-    // applies the issue-197 discount chain and adaptive rule selection —
+    // applies the issue-197 discount chain and `combine_multiple` —
     // same BBA rows, two different answers. Delegating here makes the two
     // tools compute identically by construction.
     //
     // `params.combination_method` and `params.gamma` do not influence the
-    // stored/returned belief: the shared recompute always resolves the method
-    // adaptively (via `combine_multiple`). This is the accepted consequence of
+    // stored/returned belief: the shared recompute always folds with Dempster
+    // (via `combine_multiple`, since U025). This is the accepted consequence of
     // unification; both are deprecated and warned about (backlog 82dcff9d).
     //
     // `params.hypothesis_index` DOES: it is stored in `claim_frames` just above,
@@ -524,28 +617,56 @@ pub async fn submit_ds_evidence(
         mass_on_missing,
         bba_count: bba_count as i64,
         method_used: method_name,
+        write_outcome: write_outcome.as_str().to_string(),
+        deduplicated: write_outcome.deduplicated(),
         warnings,
         unknown_keys,
     })
 }
 
-/// The calibration the belief recompute itself uses — same loader, same
-/// fallback as `edge_factor::compute_combined_belief` — so a vocabulary
-/// verdict here agrees with what the combine will actually do.
-fn recompute_calibration() -> epigraph_engine::calibration::CalibrationConfig {
-    epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(|_| {
-        epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback()
-    })
+/// Whether `row` already holds exactly what this call is about to store, by
+/// the probe `POST /api/v1/frames/:id/evidence` shares
+/// (`epigraph_db::bba_write_outcome`), with this path's columns: no
+/// `source_strength`, `conflict_k` or `evidence_id`.
+fn restates_bba(
+    row: &epigraph_db::MassFunctionRow,
+    masses_json: &serde_json::Value,
+    method_name: &str,
+    evidence_type: Option<&str>,
+    locality_tag: &str,
+) -> bool {
+    epigraph_db::bba_write_outcome::restates(
+        row,
+        &epigraph_db::bba_write_outcome::BbaWrite {
+            masses: masses_json,
+            combination_method: method_name,
+            evidence_type,
+            locality_tag,
+            source_strength: None,
+            conflict_k: None,
+            evidence_id: None,
+        },
+    )
 }
 
-/// Every evidence-type key the calibration resolves (canonical keys and
+/// The belief profile the recompute folds under before any frame tier: the
+/// served (default) profile, whose weight and alias tables come from
+/// `calibration.toml` and its `[belief_profiles]` table. A vocabulary verdict
+/// read from it agrees with the weights `edge_factor::compute_combined_belief`
+/// resolves (a frame's own `evidence_type_weights` key is checked separately,
+/// in [`evidence_type_resolves`]).
+fn recompute_profile() -> &'static epigraph_engine::belief_profile::BeliefProfile {
+    epigraph_engine::belief_profile::BeliefProfile::served()
+}
+
+/// Every evidence-type key the served profile resolves (canonical keys and
 /// aliases), sorted — what a caller told its key is unknown needs to see.
 pub(crate) fn known_evidence_type_keys() -> Vec<String> {
-    let c = recompute_calibration();
-    let mut keys: Vec<String> = c
+    let r = &recompute_profile().reliability;
+    let mut keys: Vec<String> = r
         .evidence_type_weights
         .keys()
-        .chain(c.evidence_type_aliases.keys())
+        .chain(r.evidence_type_aliases.keys())
         .cloned()
         .collect();
     keys.sort();
@@ -555,7 +676,7 @@ pub(crate) fn known_evidence_type_keys() -> Vec<String> {
 
 /// Would the recompute resolve `evidence_type` to a real weight for a BBA on
 /// `frame_id` rather than the 0.5 unknown-type fallback? True when it is in the
-/// engine's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key`])
+/// served profile's vocabulary ([`epigraph_engine::edge_factor::is_known_evidence_type_key_in`])
 /// or the frame's own strict-key `evidence_type_weights` override names it
 /// (Tier 1 of `effective_source_strength`).
 ///
@@ -564,7 +685,7 @@ pub(crate) fn known_evidence_type_keys() -> Vec<String> {
 /// yes/no about the caller's own key. A failed read counts as "no override",
 /// matching the recompute's own `.ok().flatten()`.
 async fn evidence_type_resolves(server: &EpiGraphMcpFull, frame_id: uuid::Uuid, et: &str) -> bool {
-    if epigraph_engine::edge_factor::is_known_evidence_type_key(et, &recompute_calibration()) {
+    if epigraph_engine::edge_factor::is_known_evidence_type_key_in(et, recompute_profile()) {
         return true;
     }
     FrameRepository::get_per_frame_evidence_type_weights(&server.pool, frame_id)
@@ -585,7 +706,7 @@ fn deprecated_parameter_warnings(method: CombinationMethod, gamma: Option<f64>) 
         out.push(format!(
             "combination_method={method:?} is deprecated: it was stored on the BBA and is \
              echoed as method_used, but it did not change the returned belief. The claim's \
-             belief is always recomputed by the shared adaptive combine (the one \
+             belief is always recomputed by the shared Dempster fold (the one \
              recompute_beliefs uses)."
         ));
     }
@@ -602,6 +723,24 @@ pub async fn get_belief(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     params: GetBeliefParams,
+) -> Result<CallToolResult, McpError> {
+    get_belief_in_mode(
+        server,
+        viewer,
+        params,
+        epigraph_engine::belief_view::CompoundBeliefMode::current(),
+    )
+    .await
+}
+
+/// [`get_belief`] under an explicit `EPIGRAPH_COMPOUND_BELIEF` mode: in
+/// `shadow` the response also carries the claim's atom-level `shadow` view;
+/// in `legacy` it is exactly today's response.
+pub async fn get_belief_in_mode(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: GetBeliefParams,
+    mode: epigraph_engine::belief_view::CompoundBeliefMode,
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
     let frame_id = params.frame_id.as_deref().map(parse_uuid).transpose()?;
@@ -674,6 +813,9 @@ pub async fn get_belief(
         None => None,
     };
 
+    let shadow =
+        epigraph_engine::belief_query::shadow_belief(&server.pool, viewer, claim_id, mode).await;
+
     let ignorance = interval.plausibility - interval.belief;
     success_json(&BeliefResponse {
         claim_id: claim_id.to_string(),
@@ -685,6 +827,7 @@ pub async fn get_belief(
         mass_on_missing: interval.mass_on_missing,
         source: interval.source,
         lensed_belief,
+        shadow,
     })
 }
 

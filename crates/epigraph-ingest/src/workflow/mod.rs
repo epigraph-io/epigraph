@@ -3,6 +3,7 @@
 //! ID derivation, ATOM_NAMESPACE for cross-source convergence).
 
 pub mod builder;
+pub mod frozen_plan;
 pub mod schema;
 
 pub use builder::build_ingest_plan;

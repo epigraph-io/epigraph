@@ -130,9 +130,12 @@ pub struct SheafSection {
     pub node_id: Uuid,
     /// Actual pignistic probability at this node.
     pub local_betp: f64,
-    /// Expected BetP from neighborhood restriction maps.
+    /// Expected BetP from neighborhood restriction maps (all-neighbour
+    /// average; display only).
     pub expected_betp: f64,
-    /// |local - expected|: how inconsistent this node is.
+    /// How inconsistent this node is: the max of the Positive-group floor
+    /// shortfall and the Negative-group ceiling excess. See
+    /// [`compute_section`].
     pub consistency_radius: f64,
     /// Number of epistemic neighbors contributing.
     pub neighbor_count: usize,
@@ -144,9 +147,14 @@ pub struct SheafSection {
 
 /// Compute expected BetP from neighbors' beliefs and edge types.
 ///
-/// For each neighbor with `Positive(factor)`, the expected contribution
-/// is `neighbor_betp * factor`. For `Negative(factor)`, it's
-/// `(1.0 - neighbor_betp) * factor`. Neutral neighbors are ignored.
+/// Each neighbour contributes the Bel its restriction map commits the node
+/// to. For `Positive(factor)` that is `neighbor_betp * factor`. For
+/// `Negative(factor)` it is `0.0`: under mutual exclusion a contradicter only
+/// caps the node (at `1 − neighbor_betp * factor`, see [`compute_section`])
+/// and never commits it to anything (the complement law's
+/// `(1.0 - neighbor_betp) * factor` turned a disbelieved contradicter into
+/// support; U075). Neutral neighbors are ignored. Display only: no radius is
+/// computed from this average.
 ///
 /// Returns `None` if there are no epistemic (non-neutral) neighbors.
 pub fn compute_expected_betp(neighbors: &[(f64, RestrictionKind)]) -> Option<f64> {
@@ -159,8 +167,8 @@ pub fn compute_expected_betp(neighbors: &[(f64, RestrictionKind)]) -> Option<f64
                 sum += neighbor_betp * factor;
                 count += 1;
             }
-            RestrictionKind::Negative(factor) => {
-                sum += (1.0 - neighbor_betp) * factor;
+            RestrictionKind::Negative(_) => {
+                // Mutual exclusion commits the node to nothing (bel 0).
                 count += 1;
             }
             RestrictionKind::FrameEvidence(_) => {} // CDST path only
@@ -176,6 +184,19 @@ pub fn compute_expected_betp(neighbors: &[(f64, RestrictionKind)]) -> Option<f64
 }
 
 /// Build a sheaf section for a single node.
+///
+/// `consistency_radius` is the max of two terms:
+/// - **Positive** neighbours are a one-sided floor (the node twin of
+///   [`compute_edge_inconsistency`]'s Positive arm): the node must be at least
+///   `max(neighbor_betp * factor)` over its supporters, and only a shortfall
+///   below that floor counts. Over-support is benign and scores 0.
+/// - **Negative** neighbours are a one-sided ceiling (the node twin of
+///   [`compute_edge_inconsistency`]'s Negative arm, mutual exclusion): the
+///   node may be at most `min(1 − neighbor_betp * factor)` over its
+///   contradicters, and only an excess above that ceiling counts. A
+///   disbelieved contradicter imposes almost no ceiling (U075).
+///
+/// `expected_betp` stays the all-neighbour average for display.
 pub fn compute_section(
     node_id: Uuid,
     local_betp: f64,
@@ -184,7 +205,30 @@ pub fn compute_section(
     neighbors: &[(f64, RestrictionKind)],
 ) -> SheafSection {
     let expected = compute_expected_betp(neighbors);
-    let consistency_radius = expected.map_or(0.0, |e| (local_betp - e).abs());
+
+    let positive_shortfall = neighbors
+        .iter()
+        .filter_map(|&(neighbor_betp, kind)| match kind {
+            RestrictionKind::Positive(factor) => Some(neighbor_betp * factor),
+            _ => None,
+        })
+        .reduce(f64::max)
+        .map_or(0.0, |floor| {
+            if local_betp < floor {
+                floor - local_betp
+            } else {
+                0.0
+            }
+        });
+    let negative_excess = neighbors
+        .iter()
+        .filter_map(|&(neighbor_betp, kind)| match kind {
+            RestrictionKind::Negative(factor) => Some(neighbor_betp.mul_add(-factor, 1.0)),
+            _ => None,
+        })
+        .reduce(f64::min)
+        .map_or(0.0, |ceiling| (local_betp - ceiling).max(0.0));
+    let consistency_radius = positive_shortfall.max(negative_excess);
     let neighbor_count = neighbors
         .iter()
         .filter(|(_, k)| {
@@ -352,9 +396,10 @@ mod tests {
         ];
         let expected = compute_expected_betp(&neighbors).unwrap();
         // Positive: 0.9 * 0.8 = 0.72
-        // Negative: (1 - 0.8) * 0.9 = 0.18
-        // Avg: (0.72 + 0.18) / 2 = 0.45
-        assert!((expected - 0.45).abs() < 1e-9);
+        // Negative: mutual exclusion commits the node to nothing -> 0
+        // (the complement law contributed (1 - 0.8) * 0.9 = 0.18)
+        // Avg: (0.72 + 0) / 2 = 0.36
+        assert!((expected - 0.36).abs() < 1e-9, "got {expected}");
     }
 
     #[test]
@@ -374,12 +419,162 @@ mod tests {
     }
 
     #[test]
-    fn test_section_high_radius_when_stale() {
+    fn test_section_over_support_is_consistent() {
         let id = Uuid::new_v4();
-        // Node BetP=0.9 but supporter has BetP=0.3
-        // Expected: 0.3 * 0.8 = 0.24 → radius = |0.9 - 0.24| = 0.66
+        // Node BetP=0.9, supporter BetP=0.3. A supports edge is a one-sided
+        // floor: the node must be at least 0.3 * 0.8 = 0.24, and 0.9 is above
+        // it, so this over-support is benign corroboration: radius 0.
+        // (The symmetric |0.9 - 0.24| = 0.66 this test used to pin was the
+        // I043 bug, the node twin of compute_edge_inconsistency's floor.)
         let section = compute_section(id, 0.9, 0.7, 0.95, &[(0.3, RestrictionKind::Positive(0.8))]);
-        assert!((section.consistency_radius - 0.66).abs() < 1e-9);
+        assert!(
+            section.consistency_radius < 1e-9,
+            "over-support must have radius 0, got {}",
+            section.consistency_radius
+        );
+        assert_eq!(section.neighbor_count, 1);
+    }
+
+    #[test]
+    fn test_section_under_support_still_flags() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.1 under a supporter at 0.8: floor 0.64 -> shortfall 0.54.
+        let section = compute_section(
+            id,
+            0.1,
+            0.05,
+            0.15,
+            &[(0.8, RestrictionKind::Positive(0.8))],
+        );
+        assert!(
+            (section.consistency_radius - 0.54).abs() < 1e-9,
+            "under-support shortfall should be 0.54, got {}",
+            section.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_section_floor_is_max_over_supporters() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.55; supporters 0.9 (floor 0.72) and 0.1 (floor 0.08).
+        // Binding floor is the max: radius 0.72 - 0.55 = 0.17, which equals
+        // the worst compute_edge_inconsistency over the supports edges.
+        // (A mean floor 0.40 would give 0; the old symmetric metric 0.15.)
+        let section = compute_section(
+            id,
+            0.55,
+            0.5,
+            0.6,
+            &[
+                (0.9, RestrictionKind::Positive(0.8)),
+                (0.1, RestrictionKind::Positive(0.8)),
+            ],
+        );
+        let worst_edge = compute_edge_inconsistency(0.9, 0.55, "supports")
+            .0
+            .max(compute_edge_inconsistency(0.1, 0.55, "supports").0);
+        assert!((worst_edge - 0.17).abs() < 1e-9);
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst supports-edge shortfall {}",
+            section.consistency_radius,
+            worst_edge
+        );
+    }
+
+    #[test]
+    fn test_section_mixed_floor_shortfall_dominates_negative_distance() {
+        let id = Uuid::new_v4();
+        // Node BetP=0.15; supporter 0.9 at Positive(0.8): floor 0.72 ->
+        // shortfall 0.57. Contradicter 0.9 at Negative(0.9): ceiling
+        // 1 - 0.9 * 0.9 = 0.19, 0.15 is under it -> 0. max(0.57, 0) = 0.57:
+        // a contradicter must not hide the floor shortfall.
+        // (The old all-neighbour average (0.72 + 0.09) / 2 = 0.405 gave
+        // |0.15 - 0.405| = 0.255.)
+        let section = compute_section(
+            id,
+            0.15,
+            0.1,
+            0.2,
+            &[
+                (0.9, RestrictionKind::Positive(0.8)),
+                (0.9, RestrictionKind::Negative(0.9)),
+            ],
+        );
+        assert!(
+            (section.consistency_radius - 0.57).abs() < 1e-9,
+            "mixed node radius should be max(0.57, 0) = 0.57, got {}",
+            section.consistency_radius
+        );
+        assert_eq!(section.neighbor_count, 2);
+    }
+
+    #[test]
+    fn test_section_negative_only_scores_over_ceiling() {
+        let id = Uuid::new_v4();
+        // Two believed claims that contradict each other still flag, on the
+        // ceiling: 1 - 0.8 * 0.9 = 0.28, radius 0.8 - 0.28 = 0.52, which is
+        // exactly the contradicts edge's own inconsistency. (The complement
+        // law's symmetric |0.8 - 0.18| gave 0.62.)
+        let section = compute_section(id, 0.8, 0.7, 0.9, &[(0.8, RestrictionKind::Negative(0.9))]);
+        let edge = compute_edge_inconsistency(0.8, 0.8, "contradicts").0;
+        assert!((edge - 0.52).abs() < 1e-9, "edge path gave {edge}");
+        assert!(
+            (section.consistency_radius - edge).abs() < 1e-12,
+            "node radius {} must equal the contradicts-edge excess {edge}",
+            section.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_section_disbelieved_pair_is_consistent() {
+        // Node BetP 0.30 contradicted by a source at BetP 0.125, f = 0.9:
+        // mutual exclusion caps the node at 1 − 0.125·0.9 = 0.8875, and
+        // 0.30 is under it, so radius 0. (The complement average expected
+        // (1 − 0.125)·0.9 = 0.7875 and gave |0.30 − 0.7875| = 0.4875.)
+        let section = compute_section(
+            Uuid::new_v4(),
+            0.30,
+            0.20,
+            0.40,
+            &[(0.125, RestrictionKind::Negative(0.9))],
+        );
+        assert!(
+            section.consistency_radius < 1e-9,
+            "disbelieved pair must have radius 0, got {}",
+            section.consistency_radius
+        );
+    }
+
+    #[test]
+    fn test_section_negative_radius_equals_worst_contradicts_edge() {
+        // The node twin of compute_edge_inconsistency's Negative ceiling: a
+        // Negative-only node's radius is its worst contradicts-edge excess.
+        // Node 0.70; contradicters 0.40 (ceiling 0.64), 0.10 (ceiling 0.91):
+        // binding ceiling 0.64 -> 0.06.
+        let section = compute_section(
+            Uuid::new_v4(),
+            0.70,
+            0.6,
+            0.8,
+            &[
+                (0.40, RestrictionKind::Negative(0.9)),
+                (0.10, RestrictionKind::Negative(0.9)),
+            ],
+        );
+        let worst_edge = compute_edge_inconsistency(0.40, 0.70, "contradicts")
+            .0
+            .max(compute_edge_inconsistency(0.10, 0.70, "contradicts").0);
+        assert!(
+            (worst_edge - 0.06).abs() < 1e-9,
+            "edge path gave {worst_edge}"
+        );
+        assert!(
+            (section.consistency_radius - worst_edge).abs() < 1e-12,
+            "node radius {} must equal the worst contradicts-edge excess {}",
+            section.consistency_radius,
+            worst_edge
+        );
     }
 
     #[test]

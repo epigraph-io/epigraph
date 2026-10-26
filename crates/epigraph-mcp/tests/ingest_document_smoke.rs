@@ -11,8 +11,10 @@ use epigraph_ingest::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
-use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document_inline};
-use epigraph_mcp::types::{IngestDocumentInlineParams, RecomputeBeliefsParams};
+use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document, ingest_document_inline};
+use epigraph_mcp::types::{
+    IngestDocumentInlineParams, IngestDocumentParams, RecomputeBeliefsParams,
+};
 use sqlx::PgPool;
 
 const FIXTURE: &str = r#"{
@@ -659,6 +661,58 @@ fn inline_tool_wire_schema_is_self_contained() {
     }
 }
 
+/// `wait` is reachable only through the published schema and the wire
+/// payload: every handler test builds the params struct directly. Pin that
+/// both detached ingest tools publish a boolean `wait` and that a wire payload
+/// carrying it deserializes to `Some(true)`, so a serde or schemars change
+/// cannot silently drop it and bring back the queued-only contract.
+#[test]
+fn ingest_tools_publish_and_deserialize_the_wait_flag() {
+    let tools = epigraph_mcp::server::EpiGraphMcpFull::all_tools_json();
+    let arr = tools.as_array().expect("tool array");
+    for name in ["ingest_document_inline", "ingest_document"] {
+        let tool = arr
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} registered in live tool router"));
+        let wait = &tool["inputSchema"]["properties"]["wait"];
+        let ty = &wait["type"];
+        let is_boolean = ty == "boolean"
+            || ty
+                .as_array()
+                .is_some_and(|a| a.iter().any(|t| t == "boolean"));
+        assert!(
+            is_boolean,
+            "{name} must publish a boolean `wait`; got {wait}"
+        );
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !required.iter().any(|r| r == "wait"),
+            "{name}: `wait` is opt-in and must not be required: {required:?}"
+        );
+    }
+
+    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture JSON");
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture, "wait": true }))
+            .expect("inline params with wait deserialize");
+    assert_eq!(inline.wait, Some(true));
+    let inline: IngestDocumentInlineParams =
+        serde_json::from_value(serde_json::json!({ "extraction": fixture }))
+            .expect("inline params without wait deserialize");
+    assert_eq!(
+        inline.wait, None,
+        "omitted `wait` keeps the queued contract"
+    );
+    let file: IngestDocumentParams =
+        serde_json::from_value(serde_json::json!({ "file_path": "x.json", "wait": true }))
+            .expect("file-path params with wait deserialize");
+    assert_eq!(file.wait, Some(true));
+}
+
 /// The discoverability fix: the typed inline param must expose the full
 /// hierarchical `DocumentExtraction` shape as a JSON schema, so an MCP client
 /// can introspect exactly what to produce — down to atoms — instead of
@@ -695,7 +749,10 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
     let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
-    let params = IngestDocumentInlineParams { extraction };
+    let params = IngestDocumentInlineParams {
+        extraction,
+        wait: None,
+    };
 
     let result = ingest_document_inline(&server, &viewer, params, None)
         .await
@@ -728,6 +785,447 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
         atom_count.0, 2,
         "both atoms persisted as claim nodes via the inline path"
     );
+}
+
+// ── Backlog b1924b39 / 417ab1c2 / 189d6d8f: `wait` reports the walk's outcome ──
+//
+// Detached, a walk that fails past the synchronous write-authority preflight
+// reaches only the server log: the caller holds `status: queued` and can infer
+// the failure only from `query_paper`'s claim_count staying 0. `wait: true` runs
+// the same walk in-request and returns its result or its error.
+
+/// A refusal no preflight can see: every `reasoning_traces` INSERT raises
+/// 42501, so the walk fails on its FIRST claim's trace, past the verbatim and
+/// axis guards and past `preflight_write_authority` (which writes nothing).
+async fn refuse_every_trace_insert(pool: &PgPool) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refuse_trace_for_test() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             -- The table name comes from TG_TABLE_NAME, so the refusal's text
+             -- appears only in the raised error and never in this statement,
+             -- which the test's captured log also records.
+             RAISE EXCEPTION 'refused % insert (test trigger)', TG_TABLE_NAME
+                 USING ERRCODE = '42501';
+         END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("create the refusing trigger function");
+    sqlx::query(
+        "CREATE TRIGGER refuse_trace_for_test BEFORE INSERT ON reasoning_traces
+         FOR EACH ROW EXECUTE FUNCTION refuse_trace_for_test()",
+    )
+    .execute(pool)
+    .await
+    .expect("install the refusing trigger");
+}
+
+const SMOKE_DOI: &str = "10.1234/hierarchy-smoke";
+
+async fn claims_labelled(pool: &PgPool, label: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM claims WHERE $1 = ANY(labels)")
+        .bind(label)
+        .fetch_one(pool)
+        .await
+        .expect("count labelled claims")
+}
+
+/// `processed_by` edges from the paper keyed on `doi` (0 when no row exists).
+async fn processed_by_edges(pool: &PgPool, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges e JOIN papers p ON p.id = e.source_id
+         WHERE p.doi = $1 AND e.relationship = 'processed_by'",
+    )
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count processed_by edges")
+}
+
+/// Asserts the failed walk's error reached the caller and that it wrote nothing.
+async fn assert_failed_walk_reported(
+    pool: &PgPool,
+    outcome: Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>,
+) {
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the walk's error, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    // The walk's own cause is recorded in the server log (each caller of this
+    // helper asserts that); the caller gets the fixed message plus the walk's
+    // remedy, without the database's text (backlog 49863d2c).
+    assert!(
+        !err.message.contains("refused reasoning_traces insert"),
+        "the database's error text must not reach the caller, got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains(SMOKE_DOI) && err.message.contains("retry"),
+        "the error must name the document key and say a retry is safe, got: {}",
+        err.message
+    );
+    assert_eq!(
+        claims_labelled(pool, &format!("doi:{SMOKE_DOI}")).await,
+        0,
+        "the walk is one transaction: a failed walk leaves no claim behind"
+    );
+    assert_eq!(
+        processed_by_edges(pool, SMOKE_DOI).await,
+        0,
+        "a failed walk must not stamp the paper as processed"
+    );
+}
+
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    assert_failed_walk_reported(&pool, outcome).await;
+    assert!(
+        logs_contain("refused reasoning_traces insert"),
+        "the walk's own cause must be the recorded one"
+    );
+}
+
+/// The file-path entry point is the second detached handler; same contract.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+
+    // Under the current directory: the handler refuses a path outside it.
+    let path = std::env::current_dir()
+        .expect("current dir")
+        .join(format!("wait-mode-fixture-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, FIXTURE).expect("write fixture");
+    let outcome = ingest_document(
+        &server,
+        &viewer,
+        IngestDocumentParams {
+            file_path: path.display().to_string(),
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+    assert_failed_walk_reported(&pool, outcome).await;
+    assert!(
+        logs_contain("refused reasoning_traces insert"),
+        "the walk's own cause must be the recorded one"
+    );
+}
+
+/// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the
+/// caller and leaves no `papers` row: the wait arm skips the handler's eager
+/// `ensure_paper_node`, and the walk's own get-or-create runs after its guards.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": "Wait Drift Doc",
+            "doi": "10.1/wait-drift",
+            "source_type": "InternalDocument",
+            "authors": [{"name": "test", "affiliations": [], "roles": ["author"]}],
+            "metadata": {}
+        },
+        "thesis": "t",
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "S",
+            "paragraphs": [{
+                "text": "TAMPERED",
+                "span": { "start": 0, "end": 5 },
+                "atoms": ["a"],
+                "generality": [0],
+                "confidence": 0.8
+            }]
+        }],
+        "relationships": [],
+        "source_text": "alpha beta"
+    }))
+    .unwrap();
+
+    let outcome = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await;
+    let err = match outcome {
+        Ok(ok) => panic!(
+            "wait=true must return the guard refusal, not an acknowledgement: {}",
+            result_text(&ok)
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.message.contains("verbatim guard"),
+        "the refusal must be the verbatim guard, got: {}",
+        err.message
+    );
+    let papers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
+        .bind("10.1/wait-drift")
+        .fetch_one(&pool)
+        .await
+        .expect("count papers");
+    assert_eq!(
+        papers, 0,
+        "a guard refusal in wait mode must leave no papers row"
+    );
+}
+
+/// Positive arm: with `wait: true` a walk that succeeds returns the walk's own
+/// counts (not a queue acknowledgement), and its claims exist the moment the
+/// call returns, with no sleep.
+#[sqlx::test(migrations = "../../migrations")]
+async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let result = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction,
+            wait: Some(true),
+        },
+        None,
+    )
+    .await
+    .expect("a valid document ingests in wait mode");
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert!(
+        json.get("status").is_none(),
+        "wait mode returns the walk's result, not a queue acknowledgement: {json}"
+    );
+    assert_eq!(json["claims_ingested"], serde_json::json!(5), "{json}");
+    assert_eq!(json["doi"], SMOKE_DOI, "{json}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "every level is committed by the time the call returns"
+    );
+    assert_eq!(processed_by_edges(&pool, SMOKE_DOI).await, 1);
+}
+
+// ── DOI key canonicalization: a resolver-URL DOI keys the bare-DOI row ─────
+
+/// `check_already_ingested(doi, pipeline_version)`'s JSON answer.
+async fn gate_json(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    doi: &str,
+    pipeline_version: Option<&str>,
+) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::ingestion::check_already_ingested(
+        server,
+        &viewer,
+        epigraph_mcp::types::CheckAlreadyIngestedParams {
+            doi: doi.to_string(),
+            pipeline_version: pipeline_version.map(str::to_string),
+        },
+    )
+    .await
+    .expect("check_already_ingested answers");
+    serde_json::from_str(&result_text(&result)).expect("check_already_ingested JSON")
+}
+
+/// Seed a paper row keyed VERBATIM on `key` (as the writer stored a
+/// resolver-URL DOI before keys were canonicalized), stamped `processed_by`
+/// the hierarchical pipeline by the server's agent. Returns the paper id.
+async fn seed_processed_paper(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    key: &str,
+    title: &str,
+) -> uuid::Uuid {
+    // A raw INSERT, not `PaperRepository::get_or_create`: that writer stores
+    // the canonical key, and this seed must reproduce the verbatim legacy one.
+    let paper_id: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $2) RETURNING id")
+            .bind(key)
+            .bind(title)
+            .fetch_one(pool)
+            .await
+            .expect("seed a paper row");
+    let agent = server.server_agent_id().await.expect("server agent");
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(
+        &mut conn,
+        paper_id,
+        agent,
+        "hierarchical_extraction_v2",
+        "ingest_document",
+    )
+    .await
+    .expect("stamp the seeded paper processed_by");
+    assert_eq!(
+        processed_by_edges(pool, key).await,
+        1,
+        "CALIBRATION: the seeded row carries one processed_by stamp"
+    );
+    paper_id
+}
+
+async fn query_paper_json(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> serde_json::Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let result = tools::paper_queries::query_paper(
+        server,
+        &viewer,
+        epigraph_mcp::types::QueryPaperParams {
+            doi: doi.to_string(),
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("query_paper answers");
+    serde_json::from_str(&result_text(&result)).expect("query_paper JSON")
+}
+
+/// Observed: an agent ingested with `doi: "https://doi.org/10.1021/..."` and
+/// the URL was stored verbatim as the paper key, so `query_paper` on the bare
+/// DOI kept answering the zero-shaped "not in the graph" response. The ingest
+/// must key the bare DOI, and both probes (`query_paper`,
+/// `check_already_ingested`) must find it by the bare DOI.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_finds_url_form_ingest_by_bare_doi(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let mut extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    extraction.source.doi = Some(format!("https://doi.org/{SMOKE_DOI}"));
+
+    do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest succeeds");
+
+    let paper = query_paper_json(&server, &pool, SMOKE_DOI).await;
+    assert_eq!(paper["title"], "Test Hierarchical Paper", "{paper}");
+    assert_eq!(paper["claim_count"], serde_json::json!(5), "{paper}");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        5,
+        "the claims carry the bare-DOI label, not `doi:https://doi.org/...`"
+    );
+
+    let gate = gate_json(&server, &pool, SMOKE_DOI, None).await;
+    assert_eq!(gate["already_ingested"], serde_json::json!(true), "{gate}");
+    let stamp = gate["matched_pipeline_versions"][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("the walk wrote a processed_by stamp: {gate}"))
+        .to_string();
+
+    // The URL spelling, asked later, names the same paper: through query_paper
+    // and through BOTH arms of the dedup gate (the family arm, and the exact
+    // arm that runs through `paper_already_ingested`). A probe that asks with
+    // the URL form must not read "not ingested" and re-extract the paper.
+    let url = format!("https://doi.org/{SMOKE_DOI}");
+    let by_url = query_paper_json(&server, &pool, &url).await;
+    assert_eq!(by_url["claim_count"], serde_json::json!(5), "{by_url}");
+    for pipeline_version in [None, Some(stamp.as_str())] {
+        let gate = gate_json(&server, &pool, &url, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({url:?}, {pipeline_version:?}): {gate}"
+        );
+    }
+}
+
+/// A row written under a resolver-URL key BEFORE keys were canonicalized is
+/// still found by that spelling: the lookup falls back to the key as given.
+/// The not-found contract (a zero-shaped response, not an error) is unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_still_finds_a_legacy_url_form_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let legacy = "https://doi.org/10.5555/legacy-url-key";
+    let paper_id = seed_processed_paper(&server, &pool, legacy, "Legacy URL-keyed").await;
+
+    let paper = query_paper_json(&server, &pool, legacy).await;
+    assert_eq!(paper["title"], "Legacy URL-keyed", "{paper}");
+    // The dedup gate falls back to the as-given spelling too, on both arms.
+    for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+        let gate = gate_json(&server, &pool, legacy, pipeline_version).await;
+        assert_eq!(
+            gate["already_ingested"],
+            serde_json::json!(true),
+            "check_already_ingested({legacy:?}, {pipeline_version:?}): {gate}"
+        );
+        assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+    }
+
+    let unknown = query_paper_json(&server, &pool, "https://doi.org/10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
+}
+
+/// The filed probe: the row was written under `https://doi.org/<doi>` before
+/// keys were canonicalized, and the monitor asks by the BARE DOI. Both probes
+/// must find that legacy row, or the monitor reads "not ingested", re-extracts
+/// the paper, and the re-ingest mints a bare-keyed twin of it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bare_doi_finds_a_legacy_resolver_url_keyed_row(pool: PgPool) {
+    let server = make_server(pool.clone()).await;
+    let bare = "10.5555/legacy-bare-probe";
+    for (n, prefix) in ["https://doi.org/", "http://dx.doi.org/"]
+        .iter()
+        .enumerate()
+    {
+        let bare = format!("{bare}-{n}");
+        let legacy = format!("{prefix}{bare}");
+        let paper_id = seed_processed_paper(&server, &pool, &legacy, "Legacy by bare").await;
+
+        let paper = query_paper_json(&server, &pool, &bare).await;
+        assert_eq!(
+            paper["title"], "Legacy by bare",
+            "query_paper({bare:?}): {paper}"
+        );
+        for pipeline_version in [None, Some("hierarchical_extraction_v2")] {
+            let gate = gate_json(&server, &pool, &bare, pipeline_version).await;
+            assert_eq!(
+                gate["already_ingested"],
+                serde_json::json!(true),
+                "check_already_ingested({bare:?}, {pipeline_version:?}) on {legacy:?}: {gate}"
+            );
+            assert_eq!(gate["paper_id"], paper_id.to_string(), "{gate}");
+        }
+    }
+
+    // A bare DOI nobody ingested, under any spelling, is still the
+    // zero-shaped not-found answer.
+    let unknown = query_paper_json(&server, &pool, "10.5555/never-ingested").await;
+    assert_eq!(unknown["title"], "", "{unknown}");
+    assert_eq!(unknown["claim_count"], serde_json::json!(0), "{unknown}");
 }
 
 /// D9 writer-side guard: when an extraction carries `source_text`, every
@@ -771,6 +1269,317 @@ async fn writer_rejects_span_text_drift(pool: PgPool) {
         err.message.contains("verbatim guard"),
         "rejection must come from the verbatim guard, got: {err:?}"
     );
+}
+
+// ── Backlog a55aac45 / U039: placeholder author names ──────────────────────
+//
+// arXiv:2606.16707 was ingested with `source.authors = [{"name": "Authors Not
+// Specified"}]`. The byline back-fill only fired on an EMPTY list and the author
+// loop only skipped EMPTY names, so the placeholder string minted a deterministic
+// author agent that `authored` the paper and `asserts`-ed every one of its 269
+// claims. These tests pin the tool-boundary behaviour: a placeholder-shaped name
+// never becomes an agent, and an all-placeholder list is treated as "no real
+// author" so the body-byline backstop gets its chance.
+
+/// `FIXTURE` with its DOI and author list replaced, and an optional
+/// `source_text`. Paragraphs carry no `span`, so the D9 verbatim guard has
+/// nothing to compare and the byline parser sees exactly `source_text`.
+fn placeholder_fixture(
+    doi: &str,
+    authors: serde_json::Value,
+    source_text: Option<&str>,
+) -> DocumentExtraction {
+    let mut v: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture parses");
+    v["source"]["doi"] = serde_json::json!(doi);
+    v["source"]["authors"] = authors;
+    if let Some(text) = source_text {
+        v["source_text"] = serde_json::json!(text);
+    }
+    serde_json::from_value(v).expect("modified fixture parses")
+}
+
+async fn agents_named(pool: &PgPool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE display_name = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+/// `authored` edges into `paper_id` from the agent(s) whose display name is `name`.
+async fn authored_by(pool: &PgPool, paper_id: uuid::Uuid, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored'
+          AND e.source_type = 'agent' AND a.display_name = $2
+        "#,
+    )
+    .bind(paper_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+async fn authored_total(pool: &PgPool, paper_id: uuid::Uuid) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'authored'",
+    )
+    .bind(paper_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// agent→claim `asserts` edges from the agent(s) whose display name is `name`.
+async fn claim_asserts_by(pool: &PgPool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.source_type = 'agent' AND e.target_type = 'claim'
+          AND e.relationship = 'asserts' AND a.display_name = $1
+        "#,
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// ALL agent→claim `asserts` edges, whoever the agent is. The document walk
+/// writes these only for planned `author_placeholder` edges (its own claim
+/// assertions are paper→claim), so this count is name-independent.
+async fn agent_claim_asserts_total(pool: &PgPool) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*) FROM edges
+        WHERE source_type = 'agent' AND target_type = 'claim' AND relationship = 'asserts'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// Edges of ANY relationship whose source is the agent `agent_id`.
+async fn edges_from_agent(pool: &PgPool, agent_id: uuid::Uuid) -> i64 {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM edges WHERE source_id = $1 AND source_type = 'agent'")
+            .bind(agent_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    row.0
+}
+
+/// Pre-seed the agent a placeholder NAME derives (`did_key_for_author`), as prod
+/// already holds one (c12bddb2 "Authors Not Specified").
+async fn seed_name_derived_agent(pool: &PgPool, name: &str) -> uuid::Uuid {
+    let key = epigraph_crypto::did_key::did_key_for_author(None, name).1;
+    let agent = epigraph_core::Agent::new(key, Some(name.to_string()));
+    let created = epigraph_db::AgentRepository::create(pool, &agent)
+        .await
+        .expect("seed the name-derived agent");
+    created.id.into()
+}
+
+async fn agents_with_name_key(pool: &PgPool, name: &str) -> i64 {
+    let key = epigraph_crypto::did_key::did_key_for_author(None, name).1;
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents WHERE public_key = $1")
+        .bind(key.as_slice())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+fn paper_id_of(result: &rmcp::model::CallToolResult) -> uuid::Uuid {
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(result)).expect("response JSON");
+    uuid::Uuid::parse_str(json["paper_id"].as_str().expect("paper_id in response"))
+        .expect("paper_id is a uuid")
+}
+
+/// The 2606.16707 defect at the tool boundary: a lone placeholder author (no
+/// `source_text`, so no byline to recover) must leave the paper with NO author
+/// rather than a shared fake one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn placeholder_author_name_mints_no_author_agent(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-author",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds — a bad author name is dropped, not fatal");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        agents_named(&pool, "Authors Not Specified").await,
+        0,
+        "a placeholder author name must not mint an agent"
+    );
+    assert_eq!(
+        authored_total(&pool, paper_id).await,
+        0,
+        "with only a placeholder author the paper has no authored edge"
+    );
+    assert_eq!(
+        agent_claim_asserts_total(&pool).await,
+        0,
+        "no agent at all asserts the paper's claims: its only author was a placeholder"
+    );
+    // The ingest itself still lands: dropping a bad name must not cost the claims.
+    let json: serde_json::Value =
+        serde_json::from_str(&result_text(&result)).expect("response JSON");
+    assert_eq!(json["claims_ingested"].as_u64().unwrap(), 5);
+}
+
+/// An all-placeholder structured list counts as "no real author", so the
+/// body-byline backstop (previously gated on an EMPTY list) recovers the real
+/// names. Byline-recovered authors get `authored → paper` only: the planner
+/// emitted no `author_placeholder` edges (every structured entry was dropped),
+/// so they assert no claims — the same as today's empty-list fallback.
+#[sqlx::test(migrations = "../../migrations")]
+async fn placeholder_only_authors_fall_back_to_body_byline(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let byline_text = "Test Hierarchical Paper\n\nAlice Smith, Bob Jones\n\nAbstract: Hierarchies converge through layered claims.";
+    assert_eq!(
+        epigraph_ingest::document::byline::parse_byline_authors(byline_text).len(),
+        2,
+        "CALIBRATION: the body byline parses to two authors"
+    );
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-byline",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]}
+        ]),
+        Some(byline_text),
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(authored_by(&pool, paper_id, "Alice Smith").await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Bob Jones").await, 1);
+    assert_eq!(
+        authored_total(&pool, paper_id).await,
+        2,
+        "exactly the two byline authors author the paper"
+    );
+    assert_eq!(agents_named(&pool, "Authors Not Specified").await, 0);
+    assert_eq!(
+        claim_asserts_by(&pool, "Alice Smith").await + claim_asserts_by(&pool, "Bob Jones").await,
+        0,
+        "byline-recovered authors get authored→paper only, never per-claim asserts"
+    );
+}
+
+/// A placeholder BEFORE a real author: the planner and the walk must skip the
+/// same ORIGINAL index, so the real author's `asserts` edges (keyed by
+/// `author_index`) still resolve to her. A filter-then-enumerate on either side
+/// shifts Alice to index 0 on one side only and drops (or misattributes) her
+/// per-claim assertions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mixed_real_and_placeholder_authors_keep_index_alignment(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-mixed",
+        serde_json::json!([
+            {"name": "Unknown", "affiliations": [], "roles": ["author"]},
+            {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        agents_named(&pool, "Unknown").await,
+        0,
+        "no 'Unknown' agent"
+    );
+    assert_eq!(authored_total(&pool, paper_id).await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Alice Author").await, 1);
+    assert_eq!(
+        claim_asserts_by(&pool, "Alice Author").await,
+        5,
+        "the real author asserts every one of the 5 claims"
+    );
+    // `authored.position` is the ORIGINAL extraction index, so a dropped
+    // placeholder leaves a gap rather than renumbering the real authors.
+    let position: (serde_json::Value,) = sqlx::query_as(
+        r#"
+        SELECT e.properties->'position' FROM edges e JOIN agents a ON a.id = e.source_id
+        WHERE e.target_id = $1 AND e.relationship = 'authored' AND a.display_name = 'Alice Author'
+        "#,
+    )
+    .bind(paper_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(position.0, serde_json::json!(1));
+}
+
+/// Prod already holds the placeholder-derived agent (c12bddb2 "Authors Not
+/// Specified"). The skip must come BEFORE the lookup by key: a guard on the
+/// create branch alone would still REUSE the existing fake agent and keep
+/// growing its `authored` / `asserts` edges on every new paper. A real author
+/// follows the placeholder so the walk iterates the structured list (a
+/// placeholder-only list would take the byline fallback and never look the
+/// key up).
+#[sqlx::test(migrations = "../../migrations")]
+async fn existing_placeholder_agent_is_not_reused(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let fake = seed_name_derived_agent(&pool, "Authors Not Specified").await;
+    let extraction = placeholder_fixture(
+        "10.1234/placeholder-existing-agent",
+        serde_json::json!([
+            {"name": "Authors Not Specified", "affiliations": [], "roles": ["author"]},
+            {"name": "Alice Author", "affiliations": [], "roles": ["author"]}
+        ]),
+        None,
+    );
+
+    let result = do_ingest_document(&server, &viewer, &extraction, None)
+        .await
+        .expect("ingest_document succeeds");
+    let paper_id = paper_id_of(&result);
+
+    assert_eq!(
+        edges_from_agent(&pool, fake).await,
+        0,
+        "the pre-existing placeholder agent must gain no edge of any kind"
+    );
+    assert_eq!(
+        agents_with_name_key(&pool, "Authors Not Specified").await,
+        1,
+        "only the seeded agent holds the placeholder key; none re-minted"
+    );
+    // The walk did run over the structured list: the real author landed.
+    assert_eq!(authored_total(&pool, paper_id).await, 1);
+    assert_eq!(authored_by(&pool, paper_id, "Alice Author").await, 1);
+    assert_eq!(claim_asserts_by(&pool, "Alice Author").await, 5);
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {

@@ -128,6 +128,340 @@ async fn overview_returns_seeded_supernodes(pool: PgPool) {
     assert_eq!(body["degraded"], false);
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in bound on /graph/communities/overview (backlog cc21d1fe).
+//
+// The route used to return EVERY supernode and EVERY cluster edge of the latest
+// run, and ignored its query string, so a caller with a body cap (the Explorer
+// BFF, 8 MB) had no way to ask for less. These arms pin the opt-in params
+// `limit`, `min_size`, `include_edges` and `edge_limit` by their EFFECT: which
+// rows come back, in which order, and what `total_supernodes` / `truncated`
+// report. The no-params arm is the guard that the default body is unchanged.
+//
+// The seed inserts clusters SMALLEST first and edges LIGHTEST first, so a
+// handler that lost its `ORDER BY` cannot pass on heap order.
+// ---------------------------------------------------------------------------
+
+struct ThreeClusters {
+    a: uuid::Uuid,
+    b: uuid::Uuid,
+}
+
+/// One run with clusters A (size 5), B (size 3), C (size 1) and the three
+/// edges A–B (weight 4), B–C (weight 2), A–C (weight 1).
+async fn seed_three_clusters(pool: &PgPool) -> ThreeClusters {
+    let run_id = uuid::Uuid::new_v4();
+    let (a, b, c) = (
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    );
+    for (id, label, size) in [(c, "C", 1_i32), (b, "B", 3), (a, "A", 5)] {
+        sqlx::query(
+            "INSERT INTO graph_clusters (id, run_id, label, size, mean_betp, dominant_type, dominant_frame_id, degraded) \
+             VALUES ($1, $2, $3, $4, 0.5, 'claim', NULL, FALSE)",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(label)
+        .bind(size)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    for (x, y, weight) in [(a, c, 1_i32), (b, c, 2), (a, b, 4)] {
+        // CHECK (cluster_a < cluster_b) in migrations/015_graph_clusters.sql.
+        let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+        sqlx::query(
+            "INSERT INTO cluster_edges (run_id, cluster_a, cluster_b, weight) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(run_id)
+        .bind(lo)
+        .bind(hi)
+        .bind(weight)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 3, FALSE)",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    ThreeClusters { a, b }
+}
+
+/// GET the overview with `query` (no leading `?`; empty for none) against the
+/// per-test database at `url`, assert 200 and return the JSON body.
+async fn get_overview(url: &str, query: &str) -> Value {
+    let (addr, _shutdown) = common::spawn_app(url).await;
+    let target = if query.is_empty() {
+        format!("http://{addr}/api/v1/graph/communities/overview")
+    } else {
+        format!("http://{addr}/api/v1/graph/communities/overview?{query}")
+    };
+    let resp = reqwest::Client::new()
+        .get(target)
+        .header(
+            "Authorization",
+            format!("Bearer {}", common::test_bearer_token()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "GET overview?{query}");
+    resp.json().await.unwrap()
+}
+
+fn supernode_labels(body: &Value) -> Vec<String> {
+    body["supernodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["label"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn edge_weights(body: &Value) -> Vec<i64> {
+    body["cluster_edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["weight"].as_i64().unwrap())
+        .collect()
+}
+
+fn edge_endpoints(edge: &Value) -> std::collections::BTreeSet<String> {
+    [edge["a"].as_str().unwrap(), edge["b"].as_str().unwrap()]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn ids(of: &[uuid::Uuid]) -> std::collections::BTreeSet<String> {
+    of.iter().map(uuid::Uuid::to_string).collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_limit_returns_top_n_by_size_with_induced_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "limit=2").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B"]);
+    // Only the edge whose BOTH ends were returned survives: B–C and A–C point
+    // at C, which the bound dropped.
+    assert_eq!(edge_weights(&body), [4]);
+    assert_eq!(edge_endpoints(&body["cluster_edges"][0]), ids(&[s.a, s.b]));
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_min_size_drops_small_clusters_and_their_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "min_size=2").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B"]);
+    assert_eq!(edge_weights(&body), [4]);
+    assert_eq!(edge_endpoints(&body["cluster_edges"][0]), ids(&[s.a, s.b]));
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_include_edges_false_returns_no_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "limit=5&include_edges=false").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B", "C"]);
+    assert_eq!(edge_weights(&body), Vec::<i64>::new());
+    assert_eq!(body["total_supernodes"], 3);
+    // Every supernode came back and the edges were declined, not cut: that is
+    // not truncation.
+    assert_eq!(body["truncated"], false);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_edge_limit_keeps_heaviest_edges_and_flags_only_a_real_cut(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    // One edge short of the induced set: the lightest is cut and reported.
+    let cut = get_overview(&url, "limit=3&edge_limit=2").await;
+    assert_eq!(supernode_labels(&cut), ["A", "B", "C"]);
+    assert_eq!(edge_weights(&cut), [4, 2]);
+    assert_eq!(cut["truncated"], true);
+
+    // Exactly the induced set: nothing is cut, so nothing is reported.
+    let exact = get_overview(&url, "limit=3&edge_limit=3").await;
+    assert_eq!(edge_weights(&exact), [4, 2, 1]);
+    assert_eq!(exact["total_supernodes"], 3);
+    assert_eq!(exact["truncated"], false);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_edge_limit_alone_caps_the_whole_run_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "edge_limit=1").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B", "C"]);
+    assert_eq!(edge_weights(&body), [4]);
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_limit_breaks_size_ties_by_cluster_id(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let run_id = uuid::Uuid::new_v4();
+    let (x, y) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (lo, hi) = if x < y { (x, y) } else { (y, x) };
+    // Equal sizes, HIGHER id inserted first: heap order would return `hi`.
+    for (id, label) in [(hi, "HI"), (lo, "LO")] {
+        sqlx::query(
+            "INSERT INTO graph_clusters (id, run_id, label, size, mean_betp, dominant_type, dominant_frame_id, degraded) \
+             VALUES ($1, $2, $3, 2, 0.5, 'claim', NULL, FALSE)",
+        )
+        .bind(id)
+        .bind(run_id)
+        .bind(label)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 2, FALSE)",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let body = get_overview(&url, "limit=1").await;
+
+    assert_eq!(supernode_labels(&body), ["LO"]);
+    assert_eq!(body["supernodes"][0]["cluster_id"], lo.to_string());
+    assert_eq!(body["total_supernodes"], 2);
+    assert_eq!(body["truncated"], true);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_limit_below_one_is_clamped_to_one(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    for query in ["limit=0", "limit=-5"] {
+        let body = get_overview(&url, query).await;
+        assert_eq!(supernode_labels(&body), ["A"], "{query}");
+        assert_eq!(edge_weights(&body), Vec::<i64>::new(), "{query}");
+        assert_eq!(body["truncated"], true, "{query}");
+    }
+}
+
+/// `edge_limit` shares `limit`'s `1..=10_000` clamp. No `limit` is sent, so
+/// every supernode comes back and only the edge cap is under test: `0` and
+/// `-5` must both mean "the single heaviest edge", never a 500 from a
+/// negative `LIMIT` and never an empty edge list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_edge_limit_below_one_is_clamped_to_one(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    for query in ["edge_limit=0", "edge_limit=-5"] {
+        let body = get_overview(&url, query).await;
+        assert_eq!(supernode_labels(&body), ["A", "B", "C"], "{query}");
+        assert_eq!(edge_weights(&body), [4], "{query}");
+        assert_eq!(
+            edge_endpoints(&body["cluster_edges"][0]),
+            ids(&[s.a, s.b]),
+            "{query}"
+        );
+        assert_eq!(body["total_supernodes"], 3, "{query}");
+        assert_eq!(body["truncated"], true, "{query}");
+    }
+}
+
+/// `min_size` drops clusters BELOW the size, so a cluster of exactly
+/// `min_size` is kept: B (size 3) survives `min_size=3`, C (size 1) does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_min_size_keeps_a_cluster_of_exactly_that_size(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let s = seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "min_size=3").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B"]);
+    assert_eq!(edge_weights(&body), [4]);
+    assert_eq!(edge_endpoints(&body["cluster_edges"][0]), ids(&[s.a, s.b]));
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], true);
+}
+
+/// `include_edges=false` on its own is an opt-out the handler must honour:
+/// no other param makes the request bounded, so this arm alone pins that
+/// `include_edges` selects the bounded body.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_include_edges_false_alone_skips_edges(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    let body = get_overview(&url, "include_edges=false").await;
+
+    assert_eq!(supernode_labels(&body), ["A", "B", "C"]);
+    assert_eq!(edge_weights(&body), Vec::<i64>::new());
+    assert_eq!(body["total_supernodes"], 3);
+    assert_eq!(body["truncated"], false);
+}
+
+/// Guard, and meant to pass on main as well: with no bound in the query string
+/// the body is today's body — every supernode, every edge, and no new
+/// top-level key. The epigraph-gui reads `cluster_edges` unbounded from this
+/// exact shape. `color_by` is a pre-existing param that never changed the
+/// body, so it must not opt the caller into the bounded shape either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_without_params_is_unchanged(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    seed_three_clusters(&pool).await;
+
+    for query in ["", "color_by=type"] {
+        let body = get_overview(&url, query).await;
+
+        let keys: std::collections::BTreeSet<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "cluster_edges",
+                "degraded",
+                "generated_at",
+                "run_id",
+                "supernodes"
+            ]
+            .into_iter()
+            .collect(),
+            "{query:?}"
+        );
+        assert_eq!(supernode_labels(&body), ["A", "B", "C"], "{query:?}");
+        let mut weights = edge_weights(&body);
+        weights.sort_unstable();
+        assert_eq!(weights, [1, 2, 4], "{query:?}");
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn expand_returns_cluster_members_with_induced_edges(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;

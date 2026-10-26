@@ -212,6 +212,7 @@ async fn serve_api_hanging(
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_api::middleware::bearer::AdminScopePosture::Unarmed,
+                delegated_by: None,
             },
         ))
         .with_state(state);
@@ -305,6 +306,7 @@ async fn snapshot(pool: &PgPool, w: &World) -> Vec<(String, i64)> {
     let (events, _) = epigraph_api::routes::events::global_event_store()
         .list(&epigraph_api::routes::events::EventFilter {
             since: None,
+            after_id: None,
             event_type: None,
             limit: Some(1000),
             offset: None,

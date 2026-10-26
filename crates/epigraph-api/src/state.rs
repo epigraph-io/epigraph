@@ -314,6 +314,17 @@ pub struct AppState {
     /// handed a maintenance pool (the test harness) enables it.
     #[cfg(feature = "db")]
     pub admin_cascade: bool,
+    /// Whether this process admits a DELEGATED run token (a token carrying
+    /// `dlg`), which the bearer middlewares check on every request
+    /// (`middleware::bearer::admit_delegated`). OFF in every constructor;
+    /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
+    #[cfg(feature = "db")]
+    pub run_tokens: epigraph_db::RunTokens,
+    /// Whether `POST /api/v1/bp/propagate` may WRITE its results
+    /// (`apply_updates: true`). OFF in every constructor; `bin/server.rs` sets
+    /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
+    #[cfg(feature = "db")]
+    pub bp_apply: BpApply,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -452,6 +463,78 @@ pub struct AppState {
     /// (fail closed; dev and CI run this way).
     #[cfg(feature = "db")]
     pub passkeys: Option<Arc<epigraph_passkey::Passkeys>>,
+}
+
+/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
+pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
+
+/// Whether `POST /api/v1/bp/propagate` may write its results to `claims`
+/// (`apply_updates: true`).
+///
+/// BP apply is RETIRED under atom-level belief (SPEC §6.2, hazard H4): a
+/// whole-graph loopy-BP run rewrote claim caches, compounds included, with
+/// values that echo an atom's own evidence back to it through the factor
+/// graph. Nothing schedules it. It stays reachable only behind an explicit
+/// operator switch, read once at boot like every belief-mode flag, and even
+/// then it writes atoms only (a compound is a query over its atoms and has no
+/// cache of its own to write). Read-only BP runs stay available as a
+/// diagnostic whatever this says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BpApply {
+    /// `apply_updates: true` is refused (409). The default everywhere.
+    #[default]
+    Off,
+    /// `apply_updates: true` writes BP's values to the non-compound claims
+    /// the caller can see.
+    On,
+}
+
+impl BpApply {
+    /// The switch's parse, apart from the environment: ONLY the exact value
+    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
+    /// `1` or a typo leave it OFF, so a mistyped value fails closed.
+    #[must_use]
+    pub fn parse(raw: Option<&str>) -> Self {
+        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+
+    /// Whether `raw` is SET to a value that is neither `on` nor `off`
+    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
+    /// OFF, which the server warns about at boot. Unset or blank is the plain
+    /// default and is not flagged.
+    #[must_use]
+    pub fn is_unrecognised(raw: Option<&str>) -> bool {
+        raw.map(str::trim).is_some_and(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
+        })
+    }
+}
+
+#[cfg(test)]
+mod bp_apply_switch_tests {
+    use super::BpApply;
+
+    #[test]
+    fn only_on_switches_bp_apply_on() {
+        for on in ["on", "ON", " On "] {
+            assert_eq!(BpApply::parse(Some(on)), BpApply::On, "{on:?}");
+            assert!(!BpApply::is_unrecognised(Some(on)), "{on:?}");
+        }
+        // Values an operator might mean as "yes" stay OFF, and are flagged.
+        for typo in ["true", "1", "yes", "enabled", "onn"] {
+            assert_eq!(BpApply::parse(Some(typo)), BpApply::Off, "{typo:?}");
+            assert!(BpApply::is_unrecognised(Some(typo)), "{typo:?}");
+        }
+        for off in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
+            assert_eq!(BpApply::parse(off), BpApply::Off, "{off:?}");
+            assert!(!BpApply::is_unrecognised(off), "{off:?}");
+        }
+        assert_eq!(BpApply::default(), BpApply::Off);
+    }
 }
 
 /// API configuration options
@@ -608,6 +691,18 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // The pending admin acts (130), FORCEd by the migration that creates
     // them, on the same precedent.
     "pending_admin_acts",
+    // Agent identity lineage (161): prompt blobs, prompt snapshots and the
+    // succession record, FORCEd by the migration that creates them, on the
+    // same precedent.
+    "agent_prompt_blobs",
+    "agent_prompt_snapshots",
+    "agent_succession",
+    // The role-to-group bindings (165), FORCEd by the migration that creates
+    // them, on the same precedent.
+    "group_role_bindings",
+    // Role-attached agents (166), FORCEd by the migration that creates it, on
+    // the same precedent.
+    "role_agents",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1068,6 +1163,9 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
+            bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1140,6 +1238,22 @@ impl AppState {
     #[must_use]
     pub fn with_admin_cascade(mut self, enabled: bool) -> Self {
         self.admin_cascade = enabled;
+        self
+    }
+
+    /// Set the delegated run-token switch; see [`Self::run_tokens`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
+        self.run_tokens = run_tokens;
+        self
+    }
+
+    /// Set the BP-apply switch; see [`Self::bp_apply`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
+        self.bp_apply = bp_apply;
         self
     }
 
@@ -1430,6 +1544,9 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
+            bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1498,6 +1615,9 @@ impl AppState {
             scoped: None,
             #[cfg(feature = "db")]
             admin_cascade: false,
+            #[cfg(feature = "db")]
+            run_tokens: epigraph_db::RunTokens::Off,
+            bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

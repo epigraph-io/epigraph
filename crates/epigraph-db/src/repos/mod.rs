@@ -9,19 +9,23 @@ pub mod admin_act_ceremony;
 pub mod admin_cascade;
 pub mod admin_scope_enforcement;
 pub mod agent;
+pub mod agent_identity;
 pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
+pub mod atom_axiom;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
 pub mod claim_encryption;
+pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
 pub mod cluster_run;
 pub mod community;
+pub mod compound_valuation;
 pub mod conflict_density;
 pub mod context;
 pub mod corpus_stats;
@@ -92,21 +96,30 @@ pub use admin_scope_enforcement::{
 };
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
-    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
 };
+pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
-pub use agent_key::{AgentKeyRepository, AgentKeyRow};
+pub use agent_identity::{
+    AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
+    PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
+};
+pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    AdminClaimAction, AdminClaimWrite, AdminToken, BeliefBoundedClaimHit, BeliefSort,
-    ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor,
-    ClaimPairDistance, ClaimRepository, ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration,
-    ConsolidateMode, ConsolidateResult, DedupRepair, EvolveStepResult, FrameClaimBeliefHit,
-    GraphExpansionHit, GroundedNeighbor, HybridHit, LabelQuery, LevelAndSourceType, LineageHead,
-    NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection, SupersedeEdgeMigration,
-    SweepCandidate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, EXPANSION_RELATIONSHIPS,
+    carries_dedup_identity_key, AdminClaimAction, AdminClaimWrite, AdminToken,
+    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
+    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
+    ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
+    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
+    LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
+    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
+    SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -130,10 +143,10 @@ pub use elevation_ceremony::{
 };
 pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
-pub use event::{EventRepository, EventRow};
+pub use event::{EventCursor, EventRepository, EventRow};
 pub use evidence::{
-    EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
-    EvidenceRepository, EvidenceSearchResult,
+    DerivationEvidence, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter,
+    EvidenceListRow, EvidenceRepository, EvidenceSearchResult,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
@@ -177,8 +190,9 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    ExecutedClaim, HierarchicalWorkflowRow, ResolvedStep, ScoredHierarchicalWorkflowRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    ExecutedClaim, FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow, HierarchicalWorkflowRow,
+    ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
+    WorkflowRecallResult, WorkflowRepository,
 };
 
 // Privacy / encryption repositories

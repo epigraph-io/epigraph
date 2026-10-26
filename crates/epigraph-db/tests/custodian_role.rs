@@ -35,9 +35,19 @@ fn assert_code<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>, code: &str, what:
     );
 }
 
+/// The `maint_insert` offset of an assignment a later statement relies on
+/// being LIVE (as a holder, or as the grantor CUS03 re-reads at `now()`):
+/// back-dated 30 s, inside the minute CUS02 admits. Liveness compares the
+/// stored `valid_from` with a later transaction's clock with no tolerance
+/// (`epigraph_live_role_assignment`, `ra.valid_from <= p_at`), so a row
+/// stamped `now()` is "not yet live" for a moment on a host whose wall clock
+/// steps backward (`elevation_sessions.rs`
+/// `a_backward_clock_step_refuses_a_grant_stamped_now`).
+const LIVE: &str = "-30 seconds";
+
 /// A raw `role_assignments` INSERT on a maintenance session: the path every
 /// guard must hold for, whatever wrote it. `valid_from` is `now()` plus
-/// `offset` (an SQL interval literal, e.g. `'0'` or `'-1 hour'`).
+/// `offset` (an SQL interval literal, e.g. [`LIVE`] or `'-1 hour'`).
 async fn maint_insert(
     pool: &PgPool,
     role: &str,
@@ -212,7 +222,7 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
         .expect("suspend the human's client");
     let node = role_node(&pool, CUSTODIAN).await;
 
-    let first = maint_insert(&pool, CUSTODIAN, human, "0", None, None).await;
+    let first = maint_insert(&pool, CUSTODIAN, human, LIVE, None, None).await;
     assert!(
         first.is_ok(),
         "a registered human is granted (bootstrap): {first:?}"
@@ -225,7 +235,7 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
         (suspended, "a human whose client is suspended"),
     ] {
         for role in [CUSTODIAN, AUDITOR] {
-            let r = maint_insert(&pool, role, agent, "0", None, Some(human)).await;
+            let r = maint_insert(&pool, role, agent, LIVE, None, Some(human)).await;
             assert_code(&r, "CUS01", &format!("{what} granted {role}"));
             let text = r.expect_err("refused").to_string();
             assert!(
@@ -262,7 +272,7 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
             "a registered human retired-linked as an agent",
         ),
     ] {
-        let r = maint_insert(&pool, CUSTODIAN, agent, "0", None, Some(human)).await;
+        let r = maint_insert(&pool, CUSTODIAN, agent, LIVE, None, Some(human)).await;
         assert_code(&r, "CUS01", what);
         assert_eq!(
             assignments_of(&pool, agent).await,
@@ -270,7 +280,7 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
             "{what} holds nothing"
         );
     }
-    let later_asg = maint_insert(&pool, CUSTODIAN, later, "0", None, Some(human))
+    let later_asg = maint_insert(&pool, CUSTODIAN, later, LIVE, None, Some(human))
         .await
         .expect("an unlinked registered human is granted");
     assert!(holds_at(&pool, later, CUSTODIAN, "now()").await, "it holds");
@@ -319,10 +329,20 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
     // A LAPSED assignment (past its valid_to, never ended) holds nothing, so
     // it does not block a link (review R2-OQ-TST-2).
     let (lapsing, _) = fixture::seed_human_operator(&pool, "lapsed-holder").await;
-    maint_insert(&pool, AUDITOR, lapsing, "0", Some("1 second"), Some(human))
-        .await
-        .expect("an auditor assignment for one second");
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    // Seeded already lapsed (CUS02 admits a window that began under a minute
+    // ago, and no guard refuses a past `valid_to`), not a one-second window
+    // and a sleep: a backward wall-clock step during the sleep would keep it
+    // live.
+    maint_insert(
+        &pool,
+        AUDITOR,
+        lapsing,
+        "-50 seconds",
+        Some("-10 seconds"),
+        Some(human),
+    )
+    .await
+    .expect("an auditor assignment that lapsed ten seconds ago");
     assert!(
         !holds_at(&pool, lapsing, AUDITOR, "now()").await,
         "PREMISE: the assignment has lapsed"
@@ -356,7 +376,7 @@ async fn an_agent_never_holds_a_role(pool: PgPool) {
     // Defence in depth: a link that reached the table past the guard (here a
     // superuser with triggers off) still ends holding at READ time.
     let (bypassed, _) = fixture::seed_human_operator(&pool, "linked-past-the-guard").await;
-    maint_insert(&pool, CUSTODIAN, bypassed, "0", None, Some(human))
+    maint_insert(&pool, CUSTODIAN, bypassed, LIVE, None, Some(human))
         .await
         .expect("granted");
     link_past_the_guard(&pool, bypassed, human).await;
@@ -405,7 +425,8 @@ async fn grant_in(
     granted_by: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
     sqlx::query_scalar::<_, Uuid>(
-        "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'race test')",
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '30 seconds', NULL, $3, \
+                                          'race test')",
     )
     .bind(role)
     .bind(holder)
@@ -468,7 +489,7 @@ async fn holding_and_links(pool: &PgPool, who: Uuid) -> (i64, i64) {
 async fn a_concurrent_grant_and_link_see_each_other(pool: PgPool) {
     let (custodian, _) = fixture::seed_human_operator(&pool, "race-custodian").await;
     let (operator, _) = fixture::seed_human_operator(&pool, "race-operator").await;
-    maint_insert(&pool, CUSTODIAN, custodian, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, custodian, LIVE, None, None)
         .await
         .expect("bootstrap custodian");
 
@@ -612,30 +633,32 @@ async fn a_concurrent_grant_and_link_see_each_other(pool: PgPool) {
 async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
     let (operator, _) = fixture::seed_human_operator(&pool, "bulk-operator").await;
     let (custodian, _) = fixture::seed_human_operator(&pool, "bulk-custodian").await;
-    maint_insert(&pool, CUSTODIAN, custodian, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, custodian, LIVE, None, None)
         .await
         .expect("bootstrap custodian");
     let (live, _) = fixture::seed_human_operator(&pool, "departed-live").await;
     let (future, _) = fixture::seed_human_operator(&pool, "departed-future").await;
     let (lapsed, _) = fixture::seed_human_operator(&pool, "departed-lapsed").await;
     let (ended, _) = fixture::seed_human_operator(&pool, "departed-ended").await;
-    maint_insert(&pool, AUDITOR, live, "0", None, Some(custodian))
+    maint_insert(&pool, AUDITOR, live, LIVE, None, Some(custodian))
         .await
         .expect("a live auditor");
     maint_insert(&pool, AUDITOR, future, "1 day", None, Some(custodian))
         .await
         .expect("an auditor from tomorrow");
+    // Seeded already lapsed, not a one-second window and a sleep (a backward
+    // wall-clock step during the sleep would keep it live).
     maint_insert(
         &pool,
         AUDITOR,
         lapsed,
-        "0",
-        Some("1 second"),
+        "-50 seconds",
+        Some("-10 seconds"),
         Some(custodian),
     )
     .await
-    .expect("an auditor for one second");
-    let ended_asg = maint_insert(&pool, AUDITOR, ended, "0", None, Some(custodian))
+    .expect("an auditor that lapsed ten seconds ago");
+    let ended_asg = maint_insert(&pool, AUDITOR, ended, LIVE, None, Some(custodian))
         .await
         .expect("an auditor, ended below");
     assert!(end_role(&pool, ended_asg).await.expect("end"), "ended");
@@ -660,7 +683,6 @@ async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
             .await
             .expect("revoke the client");
     }
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let un_ended: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM role_assignments \
           WHERE holder_person_id = ANY($1) AND revoked_at IS NULL",
@@ -745,7 +767,7 @@ async fn a_departed_holder_never_aborts_the_legacy_bulk_link(pool: PgPool) {
 async fn assignments_are_append_only(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "h").await;
     let (h2, _) = fixture::seed_human_operator(&pool, "h2").await;
-    let id = maint_insert(&pool, CUSTODIAN, h, "0", None, None)
+    let id = maint_insert(&pool, CUSTODIAN, h, LIVE, None, None)
         .await
         .expect("bootstrap grant");
 
@@ -970,10 +992,10 @@ async fn assignments_are_append_only(pool: PgPool) {
 async fn the_app_role_cannot_write_assignments(pool: PgPool) {
     let (h, hg) = fixture::seed_human_operator(&pool, "h").await;
     let (h2, _) = fixture::seed_human_operator(&pool, "h2").await;
-    let id = maint_insert(&pool, CUSTODIAN, h, "0", None, None)
+    let id = maint_insert(&pool, CUSTODIAN, h, LIVE, None, None)
         .await
         .expect("grant h");
-    maint_insert(&pool, AUDITOR, h2, "0", None, Some(h))
+    maint_insert(&pool, AUDITOR, h2, LIVE, None, Some(h))
         .await
         .expect("grant h2");
 
@@ -1066,40 +1088,40 @@ async fn the_grantor_rule(pool: PgPool) {
     let (b, _) = fixture::seed_human_operator(&pool, "b").await;
     let (c, _) = fixture::seed_human_operator(&pool, "c").await;
 
-    maint_insert(&pool, CUSTODIAN, a, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, a, LIVE, None, None)
         .await
         .expect("bootstrap: no live custodian, no grantor");
-    maint_insert(&pool, CUSTODIAN, a, "0", Some("30 days"), Some(a))
+    maint_insert(&pool, CUSTODIAN, a, LIVE, Some("30 days"), Some(a))
         .await
         .expect("the ONLY holder extends itself");
     assert_code(
-        &maint_insert(&pool, CUSTODIAN, b, "0", None, None).await,
+        &maint_insert(&pool, CUSTODIAN, b, LIVE, None, None).await,
         "CUS03",
         "no grantor once a custodian exists",
     );
     assert_code(
-        &maint_insert(&pool, CUSTODIAN, b, "0", None, Some(c)).await,
+        &maint_insert(&pool, CUSTODIAN, b, LIVE, None, Some(c)).await,
         "CUS03",
         "a grantor that holds no custodian assignment",
     );
-    maint_insert(&pool, CUSTODIAN, b, "0", None, Some(a))
+    maint_insert(&pool, CUSTODIAN, b, LIVE, None, Some(a))
         .await
         .expect("A grants B");
     assert_code(
-        &maint_insert(&pool, CUSTODIAN, b, "0", Some("1 year"), Some(b)).await,
+        &maint_insert(&pool, CUSTODIAN, b, LIVE, Some("1 year"), Some(b)).await,
         "CUS03",
         "B extends B while A holds",
     );
     assert_code(
-        &maint_insert(&pool, CUSTODIAN, a, "0", Some("1 year"), Some(a)).await,
+        &maint_insert(&pool, CUSTODIAN, a, LIVE, Some("1 year"), Some(a)).await,
         "CUS03",
         "A extends A while B holds",
     );
-    maint_insert(&pool, AUDITOR, c, "0", None, Some(b))
+    maint_insert(&pool, AUDITOR, c, LIVE, None, Some(b))
         .await
         .expect("B grants C the auditor role");
     assert_code(
-        &maint_insert(&pool, AUDITOR, b, "0", None, Some(c)).await,
+        &maint_insert(&pool, AUDITOR, b, LIVE, None, Some(c)).await,
         "CUS03",
         "an auditor is no grantor",
     );
@@ -1190,7 +1212,7 @@ async fn the_catalog_identity_is_fixed(pool: PgPool) {
 async fn the_grantor_rule_counts_only_live_custodians(pool: PgPool) {
     let (a, _) = fixture::seed_human_operator(&pool, "a").await;
     let (b, _) = fixture::seed_human_operator(&pool, "b").await;
-    maint_insert(&pool, CUSTODIAN, a, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, a, LIVE, None, None)
         .await
         .expect("bootstrap A");
     fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
@@ -1203,11 +1225,11 @@ async fn the_grantor_rule_counts_only_live_custodians(pool: PgPool) {
     })
     .await;
     assert_code(
-        &maint_insert(&pool, CUSTODIAN, b, "0", None, Some(a)).await,
+        &maint_insert(&pool, CUSTODIAN, b, LIVE, None, Some(a)).await,
         "CUS03",
         "a revoked human is no grantor",
     );
-    maint_insert(&pool, CUSTODIAN, b, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, b, LIVE, None, None)
         .await
         .expect("with no live custodian left, the bootstrap is admitted again");
 }
@@ -1238,10 +1260,10 @@ async fn holds_at(pool: &PgPool, who: Uuid, role: &str, at: &str) -> bool {
 async fn holding_is_bounded_in_time(pool: PgPool) {
     let (h, _) = fixture::seed_human_operator(&pool, "h").await;
     let (h2, _) = fixture::seed_human_operator(&pool, "h2").await;
-    let id = maint_insert(&pool, CUSTODIAN, h, "0", Some("1 day"), None)
+    let id = maint_insert(&pool, CUSTODIAN, h, LIVE, Some("1 day"), None)
         .await
         .expect("grant h");
-    let id2 = maint_insert(&pool, CUSTODIAN, h2, "0", None, Some(h))
+    let id2 = maint_insert(&pool, CUSTODIAN, h2, LIVE, None, Some(h))
         .await
         .expect("grant h2");
     let window = |id: Uuid| {
@@ -1338,7 +1360,7 @@ async fn holding_is_bounded_in_time(pool: PgPool) {
 async fn holds_role_is_subject_bound(pool: PgPool) {
     let (x, xg) = fixture::seed_human_operator(&pool, "x").await;
     let (y, yg) = fixture::seed_human_operator(&pool, "y").await;
-    let id = maint_insert(&pool, CUSTODIAN, y, "0", None, None)
+    let id = maint_insert(&pool, CUSTODIAN, y, LIVE, None, None)
         .await
         .expect("grant y");
     let ask = |principal: Option<Uuid>, groups: Vec<Uuid>| {
@@ -1428,13 +1450,13 @@ async fn only_a_live_elevating_assignment_is_an_elevating_role(pool: PgPool) {
     let (a, ag) = fixture::seed_human_operator(&pool, "elev-a").await;
     let (l, lg) = fixture::seed_human_operator(&pool, "elev-l").await;
     let (e, eg) = fixture::seed_human_operator(&pool, "elev-e").await;
-    maint_insert(&pool, CUSTODIAN, c, "0", None, None)
+    maint_insert(&pool, CUSTODIAN, c, LIVE, None, None)
         .await
         .expect("grant c the custodian role");
-    maint_insert(&pool, AUDITOR, a, "0", None, Some(c))
+    maint_insert(&pool, AUDITOR, a, LIVE, None, Some(c))
         .await
         .expect("grant a the auditor role");
-    let ended = maint_insert(&pool, CUSTODIAN, e, "0", None, Some(c))
+    let ended = maint_insert(&pool, CUSTODIAN, e, LIVE, None, Some(c))
         .await
         .expect("grant e the custodian role");
     maint_exec(
@@ -1528,7 +1550,8 @@ async fn grant_role(
     let role = role.to_string();
     fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let r = sqlx::query_scalar::<_, Uuid>(
-            "SELECT public.epigraph_grant_role($1, $2, NULL, NULL, $3, 'custodian test')",
+            "SELECT public.epigraph_grant_role($1, $2, now() - interval '30 seconds', NULL, $3, \
+                                              'custodian test')",
         )
         .bind(&role)
         .bind(holder)
@@ -1577,7 +1600,7 @@ async fn every_assignment_change_is_audited_and_unforgeable(pool: PgPool) {
     let via_definer = grant_role(&pool, CUSTODIAN, a, None)
         .await
         .expect("the definer grants");
-    let raw = maint_insert(&pool, CUSTODIAN, b, "0", None, Some(a))
+    let raw = maint_insert(&pool, CUSTODIAN, b, LIVE, None, Some(a))
         .await
         .expect("a raw maintenance INSERT");
     let auditor = grant_role(&pool, AUDITOR, c, Some(a))
@@ -1828,10 +1851,10 @@ async fn occupies_mirrors_assignments_and_is_never_read_for_authz(pool: PgPool) 
     let custodian_node = role_node(&pool, CUSTODIAN).await;
     let auditor_node = role_node(&pool, AUDITOR).await;
 
-    let ia = maint_insert(&pool, CUSTODIAN, a, "0", None, None)
+    let ia = maint_insert(&pool, CUSTODIAN, a, LIVE, None, None)
         .await
         .expect("a");
-    let ib = maint_insert(&pool, CUSTODIAN, b, "0", Some("30 days"), Some(a))
+    let ib = maint_insert(&pool, CUSTODIAN, b, LIVE, Some("30 days"), Some(a))
         .await
         .expect("b");
     let ic = maint_insert(&pool, AUDITOR, c, "1 day", None, Some(a))
@@ -2019,6 +2042,11 @@ async fn bare_agent(pool: &PgPool) -> Uuid {
     id
 }
 
+/// The `granted_at` of a legacy row whose carried assignment a later
+/// statement relies on being live: 123 carries it into `valid_from`, so it is
+/// back-dated like [`LIVE`].
+const LEGACY_NOW: &str = "now() - interval '30 seconds'";
+
 /// A legacy `instance_admins` row, written while the schema is at 122.
 async fn legacy_admin(pool: &PgPool, agent: Uuid, granted_at: &str, revoked: bool, note: &str) {
     sqlx::query(&format!(
@@ -2066,7 +2094,7 @@ async fn is_instance_admin_answers_from_the_role(pool: PgPool) {
         let legacy = &mut legacy;
         async move {
             *legacy = bare_agent(&pool).await;
-            legacy_admin(&pool, *legacy, "now()", false, "legacy").await;
+            legacy_admin(&pool, *legacy, LEGACY_NOW, false, "legacy").await;
         }
     })
     .await;
@@ -2146,8 +2174,8 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
                     .await
                     .expect("a registered human linked as another human's agent");
             }
-            legacy_admin(&pool, suspended, "now()", false, "suspended client").await;
-            legacy_admin(&pool, linked, "now()", false, "linked as an agent").await;
+            legacy_admin(&pool, suspended, LEGACY_NOW, false, "suspended client").await;
+            legacy_admin(&pool, linked, LEGACY_NOW, false, "linked as an agent").await;
             *more = (suspended, linked);
             let agent = bare_agent(&pool).await;
             legacy_admin(
@@ -2158,9 +2186,9 @@ async fn instance_admins_is_migrated_then_frozen(pool: PgPool) {
                 "first operator",
             )
             .await;
-            legacy_admin(&pool, second, "now()", false, "second").await;
-            legacy_admin(&pool, revoked, "now()", true, "revoked").await;
-            legacy_admin(&pool, agent, "now()", false, "an agent").await;
+            legacy_admin(&pool, second, LEGACY_NOW, false, "second").await;
+            legacy_admin(&pool, revoked, LEGACY_NOW, true, "revoked").await;
+            legacy_admin(&pool, agent, LEGACY_NOW, false, "an agent").await;
             *ids = (human, second, revoked, agent);
         }
     })
@@ -2600,15 +2628,39 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
     let (b, _) = fixture::seed_human_operator(&pool, "custodian-b").await;
     let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
     let mut conn = maint.acquire().await.expect("maintenance connection");
+    // A and B are relied on as LIVE right after their grants (A grants B,
+    // CUS03; A records an act, CUS04 `valid_from > clock_timestamp()`), so
+    // both are back-dated by [`LIVE`] on the database clock rather than
+    // stamped with the definer's `now()`.
+    let live_from: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT now() + $1::interval")
+            .bind(LIVE)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the back-dated valid_from");
 
-    let ia =
-        RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, a, None, None, None, "bootstrap")
-            .await
-            .expect("grant A");
-    let ib =
-        RoleAssignmentRepository::grant(&mut conn, CUSTODIAN, b, None, None, Some(a), "second")
-            .await
-            .expect("A grants B");
+    let ia = RoleAssignmentRepository::grant(
+        &mut conn,
+        CUSTODIAN,
+        a,
+        Some(live_from),
+        None,
+        None,
+        "bootstrap",
+    )
+    .await
+    .expect("grant A");
+    let ib = RoleAssignmentRepository::grant(
+        &mut conn,
+        CUSTODIAN,
+        b,
+        Some(live_from),
+        None,
+        Some(a),
+        "second",
+    )
+    .await
+    .expect("A grants B");
     let future = RoleAssignmentRepository::grant(
         &mut conn,
         CUSTODIAN,
@@ -2725,14 +2777,22 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
         RoleAssignmentRepository::grant(&mut conn, AUDITOR, c, None, None, Some(a), "audit")
             .await
             .expect("an auditor");
+    // Seeded already past its `valid_to` (on the database clock), not a
+    // 1.5 s window and a sleep: a backward wall-clock step during the sleep
+    // would keep it live.
+    let (lapsed_from, lapsed_to): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT now() - interval '50 seconds', now() - interval '10 seconds'")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a window that has passed");
     let expiring = RoleAssignmentRepository::grant(
         &mut conn,
         CUSTODIAN,
         d,
-        None,
-        Some(chrono::Utc::now() + chrono::Duration::milliseconds(1500)),
+        Some(lapsed_from),
+        Some(lapsed_to),
         Some(a),
-        "expires in a moment",
+        "expired ten seconds ago",
     )
     .await
     .expect("a time-bounded custodian");
@@ -2751,10 +2811,6 @@ async fn a_custodial_act_names_a_live_assignment_of_its_actor(pool: PgPool) {
     // triggers off: the guard refuses a holder's link, CUS01), so the act's
     // own link check is what refuses below.
     link_past_the_guard(&pool, f, a).await;
-    sqlx::query("SELECT pg_sleep(2)")
-        .execute(&mut *conn)
-        .await
-        .expect("let the time-bounded assignment expire");
     for (assignment, actor, what) in [
         (auditor, c, "an auditor assignment"),
         (expiring, d, "an assignment past its valid_to"),
@@ -2939,7 +2995,7 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
             *kept_group = kg;
             let skipped = bare_agent(&pool).await;
             for h in [ended, revoked, kept, skipped] {
-                legacy_admin(&pool, h, "now()", false, "pre-123 admin").await;
+                legacy_admin(&pool, h, LEGACY_NOW, false, "pre-123 admin").await;
             }
             *ids = (ended, revoked, kept, skipped);
         }
@@ -2969,7 +3025,16 @@ async fn the_rollback_restores_122_and_083(pool: PgPool) {
     );
 
     // A later migration that re-bodies 123's functions is undone before this
-    // one (docs/deploy.md): 130 adds act-taking overloads of 123's definers.
+    // one (docs/deploy.md): 153 re-bodies 123's claims trigger function, and
+    // 130 adds act-taking overloads of 123's definers.
+    let undo_153 = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/153-undo.sql"),
+    )
+    .expect("153-undo.sql");
+    sqlx::raw_sql(&undo_153)
+        .execute(&pool)
+        .await
+        .expect("153's undo applies first");
     let undo_130 = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/130-undo.sql"),
     )

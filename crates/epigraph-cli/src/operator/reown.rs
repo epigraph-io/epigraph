@@ -492,6 +492,7 @@ pub fn records_for(claims: &[ClaimRow], attached: &Snapshot, specs: &[TableSpec]
             hidden: false,
             after: false,
             neighbour: false,
+            writer_owned: None,
         });
     }
     for a in attached.values() {
@@ -506,6 +507,7 @@ pub fn records_for(claims: &[ClaimRow], attached: &Snapshot, specs: &[TableSpec]
             hidden: false,
             after: false,
             neighbour: false,
+            writer_owned: None,
         });
     }
     out
@@ -548,6 +550,7 @@ fn post_records_for(
             hidden: false,
             after: true,
             neighbour: true,
+            writer_owned: None,
         });
     }
     for c in claims {
@@ -561,6 +564,7 @@ fn post_records_for(
             hidden: false,
             after: true,
             neighbour: false,
+            writer_owned: None,
         });
     }
     for (k, t) in s2 {
@@ -575,6 +579,7 @@ fn post_records_for(
             hidden: false,
             after: true,
             neighbour: false,
+            writer_owned: None,
         });
     }
     out

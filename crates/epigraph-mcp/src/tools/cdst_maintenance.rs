@@ -3,8 +3,10 @@
 //! [`recompute_beliefs`] is the in-server, queryable sibling of the
 //! `epigraph-recompute-belief` operator binary: it refreshes the cached
 //! `claims.{belief, plausibility, pignistic_prob, conflict_k, missing_mass}`
-//! scalars from current `mass_functions` state, per-frame, in deterministic
-//! frame-name order.
+//! scalars from current `mass_functions` state, writing each claim's cache from
+//! its ONE owner frame (`binary_truth`, else `claim_validity`, else the frame the
+//! cache already records, else the frame holding the claim's earliest input;
+//! see `MassFunctionRepository::cache_owner_frame_for_claim`).
 //!
 //! Why it exists: several write paths populate or discount BBAs without
 //! refreshing the cached belief — e.g. initial `ingest_document` writes the
@@ -26,7 +28,7 @@ use crate::types::RecomputeBeliefsParams;
 use epigraph_db::{ClaimRepository, MassFunctionRepository};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -34,7 +36,9 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 #[derive(serde::Serialize)]
 struct RecomputeError {
     claim_id: String,
-    frame_id: String,
+    /// The owner frame the recompute targeted; `null` when the failure came
+    /// before the owner was resolved.
+    frame_id: Option<String>,
     error: String,
 }
 
@@ -46,7 +50,9 @@ struct RecomputeBeliefsResult {
     claims_considered: usize,
     /// Claims that had at least one (claim, frame) belief recomputed.
     claims_recomputed: usize,
-    /// Candidate claims that carried no BBAs, so nothing was recomputed.
+    /// Candidate claims with no recomputable input, so nothing was written:
+    /// no BBA at all, only ingest template rows, or a non-procedural compound
+    /// (see `MassFunctionRepository::cache_owner_frame_for_claim`).
     claims_skipped_no_bba: usize,
     /// Total (claim, frame) belief writes performed.
     frame_writes: usize,
@@ -61,8 +67,9 @@ struct RecomputeBeliefsResult {
 ///
 /// Target precedence: `claim_ids` (explicit) > `labels` (current claims with
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
-/// claim's cache is written from ONE owner frame (`binary_truth` when present),
-/// see `recompute_claim_cached_belief`.
+/// claim's cache is written from ONE owner frame (`binary_truth`, else
+/// `claim_validity`, else the recorded owner, else the first-writer frame), see
+/// `MassFunctionRepository::cache_owner_frame_for_claim`.
 ///
 /// # Every statement runs on the maintenance session's connection
 ///
@@ -72,9 +79,9 @@ struct RecomputeBeliefsResult {
 /// (`tests/maintenance_tools_spend_only_the_session.rs`), so the bypass viewer
 /// cannot be spent on a connection that would filter it into zero rows.
 ///
-/// Each claim's recompute is its OWN transaction on that connection. The frame
-/// get-or-create and the cached-belief UPDATE land together or not at all, and a
-/// failure on one claim is rolled back alone and reported in `errors`.
+/// Each claim's recompute is its OWN transaction on that connection. The
+/// cached-belief UPDATE (and its classification) land together or not at all,
+/// and a failure on one claim is rolled back alone and reported in `errors`.
 /// `claims_recomputed` / `frame_writes` count only claims whose transaction
 /// COMMITTED a cache write, so the response cannot claim a write that was
 /// rolled back (#395).
@@ -139,65 +146,76 @@ pub async fn recompute_beliefs(
     let mut errors: Vec<RecomputeError> = Vec::new();
 
     for claim_id in claim_ids {
-        let frames = MassFunctionRepository::list_frames_for_claim(&mut *conn, viewer, claim_id)
-            .await
-            .map_err(internal_error)?;
-        if frames.is_empty() {
-            claims_skipped_no_bba += 1;
-            continue;
-        }
-        // Exactly ONE frame owns the shared claims.* cache (backlog 696d3a1c).
-        // Looping over every frame here wrote that cache once per frame and let
-        // the alphabetically last one win, silently reverting edge-derived
-        // belief. `frame_writes` is consequently now at most 1 per claim.
-        let owner_frame = frames
-            .iter()
-            .map(|(id, _)| *id)
-            .next()
-            .expect("frames is non-empty: checked above");
-        let mut wrote_any = false;
         // ONE TRANSACTION PER CLAIM, on the maintenance connection. A bulk
         // recompute is authored by nobody, so it is not stamped from anyone's
         // viewer; its authority is the connection's bypass, checked by
-        // `maintenance_viewer`. The transaction makes the claim's frame
-        // get-or-create and its cached-belief UPDATE one unit, and a failure is
-        // rolled back alone (it is reported, and the sweep continues).
+        // `maintenance_viewer`. The owner lookup, the cached-belief UPDATE and its
+        // classification are one unit, and a failure is rolled back alone (it is
+        // reported, and the sweep continues).
         let mut tx = match conn.begin().await {
             Ok(tx) => tx,
             Err(e) => {
                 errors.push(RecomputeError {
                     claim_id: claim_id.to_string(),
-                    frame_id: owner_frame.to_string(),
+                    frame_id: None,
                     error: format!("could not begin the per-claim transaction: {e}"),
                 });
                 continue;
             }
         };
-        match epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut tx, viewer, claim_id)
-            .await
+        // Exactly ONE frame owns the shared claims.* cache (backlog 696d3a1c), so
+        // `frame_writes` is at most 1 per claim. These are the two steps of
+        // `edge_factor::recompute_claim_cached_belief`, taken here so the owner is
+        // resolved once, inside the transaction, and an error names the frame the
+        // recompute actually targeted.
+        let owner_frame =
+            match MassFunctionRepository::cache_owner_frame_for_claim(&mut *tx, viewer, claim_id)
+                .await
+            {
+                Ok(Some(owner)) => owner,
+                // No recomputable input (none, only ingest templates, or a
+                // compound): nothing to write. Dropping `tx` rolls it back.
+                Ok(None) => {
+                    claims_skipped_no_bba += 1;
+                    continue;
+                }
+                Err(e) => {
+                    errors.push(RecomputeError {
+                        claim_id: claim_id.to_string(),
+                        frame_id: None,
+                        error: format!("could not resolve the cache owner: {e}"),
+                    });
+                    continue;
+                }
+            };
+        let frame_id = Some(owner_frame.to_string());
+        match epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            &mut tx,
+            viewer,
+            claim_id,
+            owner_frame,
+        )
+        .await
         {
             Ok(true) => match tx.commit().await {
                 Ok(()) => {
                     frame_writes += 1;
-                    wrote_any = true;
+                    claims_recomputed += 1;
                 }
                 Err(e) => errors.push(RecomputeError {
                     claim_id: claim_id.to_string(),
-                    frame_id: owner_frame.to_string(),
+                    frame_id,
                     error: format!("recomputed but could not commit: {e}"),
                 }),
             },
-            // No BBA on the owner frame: nothing was written. Dropping `tx`
+            // No input on the owner frame: nothing was written. Dropping `tx`
             // rolls back the (empty) transaction.
             Ok(false) => {}
             Err(e) => errors.push(RecomputeError {
                 claim_id: claim_id.to_string(),
-                frame_id: owner_frame.to_string(),
+                frame_id,
                 error: e,
             }),
-        }
-        if wrote_any {
-            claims_recomputed += 1;
         }
     }
 

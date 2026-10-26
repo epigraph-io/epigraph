@@ -378,7 +378,9 @@ if want theme; then
                  '$MA', ARRAY['bh-theme']::text[], 'public', '$OG', $V)" >/dev/null
     done
   done
-  R=$(tool theme_cluster '{"k":2,"min_claims_per_theme":1,"wipe_first":true,"label_prefix":"bh"}')
+  # label_prefix "auto": a wipe under any other prefix is refused before the run
+  # (backlog 5abe23de, theme_kmeans::validate_config); this stack is throwaway.
+  R=$(tool theme_cluster '{"k":2,"min_claims_per_theme":1,"wipe_first":true,"label_prefix":"auto"}')
   echo "   theme_cluster: $(verdict "$R") themes_created=$(field "$R" themes_created) claims_assigned=$(field "$R" claims_assigned) | themes=$(q "SELECT count(*) FROM claim_themes") prior_survives=$(q "SELECT count(*) FROM claim_themes WHERE id='$PRIOR'") themed_claims=$(q "SELECT count(*) FROM claims WHERE theme_id IS NOT NULL")"
 fi
 

@@ -19,7 +19,7 @@ use epigraph_db::{
 use crate::embed::{format_pgvector, HYBRID_CANDIDATE_POOL, HYBRID_RRF_K};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -30,6 +30,9 @@ pub async fn memorize(
     params: MemorizeParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // Same content cap as submit_claim and the HTTP twins, checked before the
+    // author is resolved, the content is embedded, or anything is written.
+    crate::tools::claims::check_claim_content_length(&params.content)?;
     // Author = the request's principal (batch H-b, D1); signer = this server.
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
@@ -102,7 +105,7 @@ pub async fn memorize(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
-                    internal_error(format!(
+                    crate::errors::internal_error_text(format!(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
@@ -255,7 +258,15 @@ pub async fn memorize(
                     confidence,
                     weight: 0.6,
                     supports: true,
-                    evidence_type: None,
+                    // The evidence row this call wrote above is
+                    // `EvidenceType::Testimony` (DB tag `testimony`), and DS runs
+                    // only on first create, when that row always exists. ds_auto
+                    // resolves the tag to its canonical key, `testimonial`, whose
+                    // calibrated weight is the 0.6 stored above (bc06ec6f).
+                    evidence_type: Some("testimony"),
+                    // memorize takes no source_url, so its evidence row can
+                    // carry no source identity; the BBA stays unkeyed.
+                    evidence_id: None,
                 },
                 /* persist_truth_from_pignistic */ false,
                 "memorize",
@@ -1054,13 +1065,13 @@ async fn recall_post_embed(
     //  * AFTER the audit block — that block derives `returned_claim_ids` from
     //    `results`, and this consumes `results` by value.
     //
-    // The score is the SAME `truth_value` `min_truth` gates on above, read out
-    // of the already-built result rather than recomputed, so the threshold and
-    // the gate cannot come to disagree about what a claim's belief is.
+    // The score is `belief_score`, the value `min_truth` gated on above, read
+    // out of the already-built result through `RecallGatedSignals` rather than
+    // chosen here: this site used to pass `truth_value`, which the gate stopped
+    // reading when it moved to the DS cache, so the threshold and the gate
+    // disagreed on every claim whose evidence has moved it.
     let (results, epistemic_partition) =
-        crate::types::split_epistemic(results, params.epistemic_partition, |r| {
-            (r.truth_value, r.is_contested)
-        });
+        crate::types::split_epistemic(results, params.epistemic_partition);
 
     success_json(&RecallEnvelope {
         results,

@@ -11,16 +11,36 @@ WHY
 source-class confidence capped at 0.85, and stores it ONLY in `claims.truth_value`.
 It has no representation in the DS layer, so most of the corpus reads `no_bbas`.
 
-A bare scalar conflates "85% likely true" with "credible source, incomplete
-evidence". As a consonant (simple-support) BBA those separate cleanly:
+THE SEED IS THE RUNTIME'S SEED (backlog fc55465b, drain U026)
+--------------------------------------------------------------
+Each BBA written here is exactly the one `ds_auto::auto_wire_ds_update` seeds on a
+BBA-less claim's first evidence update: `MassFunction::from_pignistic_prior`, the
+least-committed binary BBA whose pignistic probability equals truth_value:
 
-    m({asserted}) = truth_value        what the source asserts, in THIS frame
-    m(Theta)      = 1 - truth_value    "high but not 1.0" IS the ignorance mass
+    t > 1/2:  m({asserted}) = 2t - 1,  m(Theta) = 2 - 2t     BetP(asserted) = t
+    t < 1/2:  m({other})    = 1 - 2t,  m(Theta) = 2t         BetP(asserted) = t
+    t = 1/2:  vacuous -> nothing is written
+
+with t first capped to [0.005, 0.995] (committed mass <= 0.99, never categorical),
+and tagged `combination_method = 'truth_value_seed'`. The #472 draft of this script
+used the simple-support shape m({asserted}) = t, whose BetP is (1+t)/2: 0.875 for a
+0.75 claim, so the migration alone would have RAISED belief. Because both writers
+skip a (claim, frame) that already has a BBA, two shapes would never reconcile.
+
+BINARY FRAMES ONLY. `from_pignistic_prior` is defined for two-hypothesis frames, so
+a frame with any other arity is refused (validate_targets, and again per pair).
 
 The unit of work is a (claim, frame) PAIR, not a claim. The same provenance
 confidence is a statement about the claim in each context it applies to, so a claim
-assigned to three frames gets three BBAs — one per context, each carrying that
-context's own hypothesis index and its own Theta.
+assigned to three binary frames gets three BBAs — one per context, each carrying
+that context's own hypothesis index.
+
+RELIABILITY DISCOUNT. The runtime seed is stored undiscounted (source_strength 1.0,
+evidence_type NULL), so its BetP stays t. These rows carry --evidence-type (default
+textbook_assertion), so edge_factor::effective_source_strength weights them by that
+type's calibrated weight w and the effective BetP is 1/2 + w(t - 1/2). The shape is
+the runtime's; whether the provenance prior should ALSO be discounted is an open
+operator decision (drain U026, OPERATOR-QUEUE).
 
 SAFETY POSTURE
 --------------
@@ -36,8 +56,11 @@ SAFETY POSTURE
   reads identically until a separate recompute runs.
 * Skips any claim that already has a BBA in the target frame. Real evidence
   outranks a synthesized prior.
-* Every inserted row is tagged `combination_method = 'provenance_migration_v1'`,
-  used by no other writer, so rollback is an exactly-scoped delete.
+* Every inserted row is tagged `combination_method = 'truth_value_seed'` (the
+  runtime seed's tag) and `locality_tag = 'provenance'` (the runtime writes
+  'unknown'). Rollback deletes only manifest ids that still carry BOTH, so it is
+  an exactly-scoped delete; the manifest names the migration
+  ('provenance_migration_v1').
 * Every insert is journalled to a manifest JSONL before the transaction commits,
   and `--rollback` replays that manifest.
 
@@ -82,7 +105,19 @@ from psycopg2.extras import RealDictCursor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from maintenance_dsn import maintenance_dsn  # noqa: E402
 
-MARKER = "provenance_migration_v1"
+# The migration's name, recorded in every manifest line.
+MIGRATION = "provenance_migration_v1"
+# The runtime seed's tag (crates/epigraph-mcp/src/tools/ds_auto.rs
+# TRUTH_VALUE_SEED_METHOD): one convention, one tag.
+SEED_METHOD = "truth_value_seed"
+# What tells this migration's rows apart from runtime seeds ('unknown').
+LOCALITY_TAG = "provenance"
+# ds_auto.rs SEED_TRUTH_BOUNDS: committed mass <= 0.99, the cap
+# build_bba_on_index puts on evidence. A categorical seed would absorb every
+# later BBA under Dempster's rule.
+SEED_TRUTH_BOUNDS = (0.005, 0.995)
+# epigraph-ds mass.rs SUM_TOLERANCE: t within this of 1/2 is the vacuous BBA.
+SUM_TOLERANCE = 1e-9
 
 # Claims that are operational exhaust rather than semantic content. Mirrors the
 # telemetry carve-out documented in CLAUDE.md's embedding policy.
@@ -147,6 +182,7 @@ def census(cur, frame_ids: list, default_idx: int) -> None:
                COUNT(*) FILTER (WHERE needs_assignment)      AS would_assign,
                COUNT(*) FILTER (WHERE truth_value = 0.85)    AS at_cap_085,
                COUNT(*) FILTER (WHERE truth_value = 0.5)     AS raw_050,
+               COUNT(*) FILTER (WHERE truth_value < 0.5)     AS below_half,
                COUNT(*) FILTER (WHERE truth_value > 0.85)    AS above_cap,
                COUNT(DISTINCT hypothesis_index)              AS distinct_idx,
                MIN(hypothesis_index)                         AS min_idx,
@@ -171,7 +207,8 @@ def census(cur, frame_ids: list, default_idx: int) -> None:
         print(f"    eligible pairs            : {r['pairs']}")
         print(f"    would create a claim_frames row: {r['would_assign']}")
         print(f"    at the 0.85 provenance cap: {r['at_cap_085']}")
-        print(f"    at raw 0.5 (unscored)     : {r['raw_050']}")
+        print(f"    at raw 0.5 (vacuous seed: written as NOTHING): {r['raw_050']}")
+        print(f"    truth_value < 0.5 (FALSE-leaning seed): {r['below_half']}")
         print(f"    truth_value > 0.85        : {r['above_cap']}   <- NOT from calculate_initial_truth")
         print(f"    hypothesis_index          : {r['min_idx']}..{r['max_idx']} "
               f"({r['distinct_idx']} distinct)")
@@ -212,9 +249,15 @@ def validate_targets(cur, frame_ids: list, perspective_id: str, agent_id: str,
             f"FATAL: frame(s) do not exist: {missing}. This script does not create frames."
         )
     for f in frames:
-        # NOT a binary-only check. A provenance prior is expressible in any frame:
-        # m({asserted}) = tv and m(Theta) = 1 - tv, where Theta is the full
-        # hypothesis set. What must hold is that the asserted index EXISTS.
+        # Binary only: the seed is `from_pignistic_prior`'s shape, which the
+        # runtime defines (and refuses otherwise) for two-hypothesis frames.
+        if len(f["hypotheses"]) != 2:
+            sys.exit(
+                f"FATAL: frame '{f['name']}' defines {len(f['hypotheses'])} hypotheses "
+                f"{f['hypotheses']}. The truth_value seed (from_pignistic_prior) is\n"
+                "defined for binary frames only; a pignistic-preserving n-ary prior is an\n"
+                "open design question, not a script default."
+            )
         if default_idx >= len(f["hypotheses"]):
             sys.exit(
                 f"FATAL: --default-hypothesis-index {default_idx} is out of range for frame\n"
@@ -266,6 +309,31 @@ def theta_key(n_hypotheses: int) -> str:
     return ",".join(str(i) for i in range(n_hypotheses))
 
 
+def pignistic_prior_masses(truth_value: float, hypothesis_idx: int, n_hypotheses: int):
+    """The runtime's truth_value seed as a masses map, or None when it is vacuous.
+
+    Mirrors `MassFunction::from_pignistic_prior` after ds_auto's cap: t is clamped
+    to SEED_TRUTH_BOUNDS, then t > 1/2 commits 2t-1 to the asserted hypothesis and
+    t < 1/2 commits 1-2t to the OTHER one, the rest to Theta, so BetP(asserted) = t.
+    Raises ValueError for a non-binary frame, an index outside it, or a t outside
+    [0, 1] (NaN included), as the Rust constructor refuses them.
+    """
+    if n_hypotheses != 2:
+        raise ValueError(f"the truth_value seed is defined for binary frames only, got {n_hypotheses} hypotheses")
+    if hypothesis_idx not in (0, 1):
+        raise ValueError(f"hypothesis index {hypothesis_idx} is outside a binary frame")
+    if not 0.0 <= truth_value <= 1.0:  # NaN fails both comparisons
+        raise ValueError(f"truth_value {truth_value!r} is not a probability")
+    t = min(max(truth_value, SEED_TRUTH_BOUNDS[0]), SEED_TRUTH_BOUNDS[1])
+    if abs(t - 0.5) < SUM_TOLERANCE:
+        return None
+    if t > 0.5:
+        lean, mass = hypothesis_idx, 2.0 * t - 1.0
+    else:
+        lean, mass = 1 - hypothesis_idx, 1.0 - 2.0 * t
+    return {str(lean): round(mass, 12), theta_key(2): round(1.0 - mass, 12)}
+
+
 def migrate(cur, args, manifest) -> int:
     extra = ""
     params = {"frame_ids": args.frame_ids, "default_idx": args.default_hypothesis_index}
@@ -282,6 +350,7 @@ def migrate(cur, args, manifest) -> int:
           f"(limit={args.limit} offset={args.offset})")
 
     written = 0
+    vacuous = 0
     for r in rows:
         tv = float(r["truth_value"])
         idx = int(r["hypothesis_index"])
@@ -292,10 +361,13 @@ def migrate(cur, args, manifest) -> int:
                 f"'{r['frame_name']}', which defines only {n_hyp} hypotheses. Refusing to write\n"
                 "mass against an index the frame does not define."
             )
-        # m({asserted}) = tv, m(Theta) = 1 - tv. Generalizes to any arity: Theta is the
-        # full hypothesis set, so the residual stays ignorance rather than being
-        # spread across the other hypotheses as if the source had an opinion on them.
-        masses = {str(idx): round(tv, 12), theta_key(n_hyp): round(1.0 - tv, 12)}
+        try:
+            masses = pignistic_prior_masses(tv, idx, n_hyp)
+        except ValueError as e:
+            sys.exit(f"FATAL: claim {r['claim_id']} in frame '{r['frame_name']}': {e}")
+        if masses is None:
+            vacuous += 1  # t = 1/2: the vacuous BBA; there is nothing to store
+            continue
 
         if not args.execute:
             written += 1
@@ -322,7 +394,7 @@ def migrate(cur, args, manifest) -> int:
                locality_tag)
             VALUES (gen_random_uuid(), %(claim)s, %(frame)s, %(agent)s, %(persp)s,
                     %(masses)s::jsonb, 0.0, %(marker)s, %(strength)s,
-                    %(etype)s, 'provenance')
+                    %(etype)s, %(locality)s)
             ON CONFLICT DO NOTHING
             RETURNING id
             """,
@@ -332,7 +404,8 @@ def migrate(cur, args, manifest) -> int:
                 "agent": args.source_agent_id,
                 "persp": args.perspective_id,
                 "masses": json.dumps(masses),
-                "marker": MARKER,
+                "marker": SEED_METHOD,
+                "locality": LOCALITY_TAG,
                 "strength": args.source_strength,
                 "etype": args.evidence_type,
             },
@@ -354,7 +427,8 @@ def migrate(cur, args, manifest) -> int:
                     "created_assignment": created_assignment,
                     "prior_truth_value": tv,
                     "masses": masses,
-                    "marker": MARKER,
+                    "combination_method": SEED_METHOD,
+                    "migration": MIGRATION,
                     "at": datetime.now(timezone.utc).isoformat(),
                 }
             )
@@ -363,6 +437,8 @@ def migrate(cur, args, manifest) -> int:
         manifest.flush()
         written += 1
 
+    if vacuous:
+        print(f"skipped {vacuous} pairs at truth_value 0.5 (vacuous seed: nothing to write)")
     return written
 
 
@@ -388,19 +464,20 @@ def rollback(cur, args, manifest_path: str) -> int:
     if not args.execute:
         cur.execute(
             "SELECT COUNT(*) AS n FROM mass_functions "
-            "WHERE id = ANY(%s::uuid[]) AND combination_method = %s",
-            (ids, MARKER),
+            "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s",
+            (ids, SEED_METHOD, LOCALITY_TAG),
         )
         print(f"would delete {cur.fetchone()['n']} BBAs "
               f"and {len(assignments)} assignments (dry-run)")
         return 0
 
-    # The marker predicate is belt-and-braces: even a corrupted manifest cannot
-    # delete a row this migration did not write.
+    # The tag + locality predicate is belt-and-braces: even a corrupted manifest
+    # cannot delete a row this migration did not write (a runtime seed carries
+    # locality 'unknown', evidence BBAs a different combination_method).
     cur.execute(
         "DELETE FROM mass_functions "
-        "WHERE id = ANY(%s::uuid[]) AND combination_method = %s",
-        (ids, MARKER),
+        "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s",
+        (ids, SEED_METHOD, LOCALITY_TAG),
     )
     deleted = cur.rowcount
     print(f"deleted {deleted} BBAs")

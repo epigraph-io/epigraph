@@ -24,8 +24,9 @@
 //!
 //! Every TCP listener enforces a `Host`/`Origin` allowlist (`localhost`,
 //! `127.0.0.1`, `::1`, the `--listen` authority, plus `--allowed-host`) as the
-//! DNS-rebinding defense rmcp 0.15 does not provide. A reverse-proxied
-//! deployment MUST add the public name, since Caddy forwards the client's Host.
+//! DNS-rebinding defense (rmcp's own Host check is fed the same list). A
+//! reverse-proxied deployment MUST add the public name, since Caddy forwards
+//! the client's Host.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use rmcp::ServiceExt;
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::EpiGraphMcpFull;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -110,8 +112,8 @@ struct Cli {
     /// (repeatable; comma-separated in the env var).
     ///
     /// The listener rejects any request whose `Host` — or, when present, `Origin`
-    /// — is outside its allowlist, which is the DNS-rebinding defense rmcp 0.15
-    /// does not provide. The allowlist always contains `localhost`, `127.0.0.1`,
+    /// — is outside its allowlist, which is the DNS-rebinding defense (rmcp's
+    /// in-service Host check is given the same list). The allowlist always contains `localhost`, `127.0.0.1`,
     /// `::1` and the `--listen` authority; a reverse-proxied deployment must add
     /// the public name the proxy forwards (e.g. `mcp.example.com`), because
     /// Caddy's `reverse_proxy` preserves the client's original `Host`.
@@ -180,6 +182,24 @@ struct Cli {
         hide_env_values = true
     )]
     agent_system_prompt_hash: Option<String>,
+
+    /// The agent's IDENTITY public key (64 hex chars), in the
+    /// separate-signing-key mode (agent identity lineage design D1, D2).
+    ///
+    /// The host derives the identity from a secret it never shares, registers
+    /// the agent under this key, and passes only the public half. The agent is
+    /// found by it; nothing is signed with it. Requires
+    /// `EPIGRAPH_AGENT_SIGNING_KEY`, and excludes `--agent-model` and
+    /// `--agent-key`. Stdio only: refused with `--listen`.
+    ///
+    /// The SIGNING private key (64 hex chars) is read from
+    /// `EPIGRAPH_AGENT_SIGNING_KEY` in the environment ONLY, never from the
+    /// command line, where `ps` and `/proc/<pid>/cmdline` would show it (see
+    /// [`signing_key_from_env`]). Every signature this process makes is by it;
+    /// its public half must be an ACTIVE `signing` key of the identity's agent
+    /// in `agent_keys`, registered by the host before the container starts.
+    #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
+    agent_identity_pubkey: Option<String>,
 }
 
 /// Outcome of signer selection: the Ed25519 signer plus, when the identity was
@@ -203,6 +223,18 @@ struct SelectedSigner {
     /// so that comparison can never match a pre-existing claim — see
     /// [`EpiGraphMcpFull::with_generated_signer_identity`].
     identity_declared: bool,
+    /// The agent's IDENTITY public key when it is not the signer's (rung 0,
+    /// the separate-signing-key mode): the agent is found by it, and the
+    /// signer only signs. `None` on every legacy rung.
+    identity_public_key: Option<[u8; 32]>,
+}
+
+/// The separate-signing-key inputs (rung 0): the identity PUBLIC key and the
+/// signing PRIVATE key, both as given (hex).
+#[derive(Clone, Copy, Default)]
+struct SeparateSigningKey<'a> {
+    identity_pubkey: Option<&'a str>,
+    signing_key: Option<&'a str>,
 }
 
 /// Select the agent signer from CLI/env inputs, returning the signer paired with
@@ -210,6 +242,12 @@ struct SelectedSigner {
 /// precedence order is unit-testable without a process/DB.
 ///
 /// Precedence (first match wins):
+/// 0. `separate` (`EPIGRAPH_AGENT_IDENTITY_PUBKEY` + `EPIGRAPH_AGENT_SIGNING_KEY`,
+///    agent identity lineage design D1/D2): the signer is the signing key and
+///    the agent is named by the identity key. Both are required, and neither
+///    combines with `model` or `agent_key`: a half or mixed configuration is
+///    an error, never a fall-through to a generated key, which would run the
+///    container as a throwaway identity.
 /// 1. `model` AND `prompt_hash` -> `keypair_from_llm_agent_prehashed` (the hash
 ///    is used verbatim; feeding it to the raw path would blake3(hash) -> a
 ///    different, silently-orphaned key).
@@ -226,7 +264,50 @@ fn select_signer(
     raw_prompt: Option<&str>,
     prompt_hash: Option<&str>,
     agent_key: Option<&str>,
+    separate: SeparateSigningKey<'_>,
 ) -> Result<SelectedSigner, String> {
+    // (0) separate identity and signing keys.
+    match (separate.identity_pubkey, separate.signing_key) {
+        (None, None) => {}
+        (Some(identity), Some(signing)) => {
+            if model.is_some() || agent_key.is_some() {
+                return Err(
+                    "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY name the agent \
+                     and its signing key; they cannot be combined with --agent-model or \
+                     --agent-key (EPIGRAPH_AGENT_MODEL / EPIGRAPH_MCP_AGENT_KEY). Set one \
+                     identity source."
+                        .to_string(),
+                );
+            }
+            let identity = parse_hex32(identity, "agent-identity-pubkey")?;
+            // Wiped on drop: the signer keeps its own copy.
+            let signing = Zeroizing::new(parse_hex32(signing, "agent-signing-key")?);
+            let signer =
+                AgentSigner::from_bytes(&signing).map_err(|e| format!("agent-signing-key: {e}"))?;
+            if signer.public_key() == identity {
+                return Err(
+                    "EPIGRAPH_AGENT_SIGNING_KEY is the identity key's own private half; the \
+                     signing key must be a separate random key (the identity key signs nothing)"
+                        .to_string(),
+                );
+            }
+            return Ok(SelectedSigner {
+                signer,
+                llm_identity: None,
+                identity_declared: true,
+                identity_public_key: Some(identity),
+            });
+        }
+        _ => {
+            return Err(
+                "EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set \
+                 together (the separate-signing-key mode); refusing to start with only one \
+                 rather than fall back to another identity"
+                    .to_string(),
+            );
+        }
+    }
+
     if let Some(model) = model {
         // (1) model + explicit hash -> prehashed path (hash used verbatim).
         if let Some(hash) = prompt_hash {
@@ -235,6 +316,7 @@ fn select_signer(
                 signer,
                 llm_identity: Some((model.trim().to_string(), hash.to_string())),
                 identity_declared: true,
+                identity_public_key: None,
             });
         }
         // (2) model + raw prompt (or empty) -> raw path, which hashes the
@@ -253,6 +335,7 @@ fn select_signer(
             signer,
             llm_identity: Some((model.trim().to_string(), hash)),
             identity_declared: true,
+            identity_public_key: None,
         });
     }
 
@@ -264,6 +347,7 @@ fn select_signer(
             signer,
             llm_identity: None,
             identity_declared: true,
+            identity_public_key: None,
         });
     }
 
@@ -272,7 +356,62 @@ fn select_signer(
         signer: AgentSigner::generate(),
         llm_identity: None,
         identity_declared: false,
+        identity_public_key: None,
     })
+}
+
+/// The environment variable the signing PRIVATE key is read from.
+const SIGNING_KEY_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY";
+
+/// Read the separate-signing-key mode's signing PRIVATE key from
+/// [`SIGNING_KEY_ENV`], and only from there: it is deliberately not a clap
+/// argument, so it cannot be passed on the command line (visible in `ps` and
+/// `/proc/<pid>/cmdline` to every process in the container). An empty value
+/// counts as unset, as clap treats the other env-backed arguments. The value
+/// is held in a [`Zeroizing`] string, wiped when dropped.
+///
+/// The variable itself is left in place: removing it would not clear
+/// `/proc/<pid>/environ` (that shows the environment the process was started
+/// with) and would race the runtime's worker threads.
+///
+/// # Errors
+/// The variable is set but is not valid UTF-8 (refused rather than read as
+/// unset, which would fall through to another identity). The message does not
+/// include the value.
+fn signing_key_from_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<Zeroizing<String>>, String> {
+    match value {
+        Ok(v) if v.is_empty() => Ok(None),
+        Ok(v) => Ok(Some(Zeroizing::new(v))),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{SIGNING_KEY_ENV} is not valid UTF-8; expected exactly 64 hex chars (32 bytes); \
+             the value is not shown"
+        )),
+    }
+}
+
+/// The separate-signing-key mode (rung 0) is stdio-only.
+///
+/// An HTTP listener signs for EVERY caller. In this mode its key is an
+/// attested `signing` key of its agent, so it would hand any caller a
+/// signature over `blake3(content)` that `verify_claim` binds to that agent,
+/// and a caller who can also write the database directly (the principal
+/// settings are self-settable) could plant a claim "by" the listener's agent
+/// that verifies as bound. The mode exists for one agent's own container,
+/// which serves stdio. Pure, so it runs before the database connect.
+fn check_separate_key_transport(listen: Option<&str>, separate: bool) -> Result<(), String> {
+    if separate && listen.is_some() {
+        return Err(
+            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY: the separate-signing-key \
+             mode is stdio-only, and is refused on an HTTP listener (--listen): a listener signs \
+             for every caller, and its signatures would bind to this agent. Run the listener \
+             with its own --agent-key or --agent-model identity."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Parse an `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` value into its 32 bytes.
@@ -285,22 +424,29 @@ fn select_signer(
 /// operator asked for one specific key. No error message echoes any part of
 /// the value: it is a secret, and `main` prints the error.
 fn parse_agent_key(raw: &str) -> Result<[u8; 32], String> {
+    parse_hex32(raw, "agent-key")
+}
+
+/// [`parse_agent_key`]'s rules for any 32-byte hex input, with `name` in its
+/// messages. No message echoes any part of the value: `name` may be a secret
+/// (`agent-signing-key`), and `main` prints the error.
+fn parse_hex32(raw: &str, name: &str) -> Result<[u8; 32], String> {
     const EXPECTED: &str = "expected exactly 64 hex chars (32 bytes); the value is not shown";
     let key_hex = raw.trim();
     if !key_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
-            "invalid agent-key: it contains a non-hex character; {EXPECTED}"
+            "invalid {name}: it contains a non-hex character; {EXPECTED}"
         ));
     }
     if key_hex.len() % 2 != 0 {
         return Err(format!(
-            "invalid agent-key: odd number of hex chars ({}); {EXPECTED}",
+            "invalid {name}: odd number of hex chars ({}); {EXPECTED}",
             key_hex.len()
         ));
     }
     if key_hex.len() != 64 {
         return Err(format!(
-            "agent-key must be exactly 32 bytes: got {} hex chars; {EXPECTED}",
+            "{name} must be exactly 32 bytes: got {} hex chars; {EXPECTED}",
             key_hex.len()
         ));
     }
@@ -308,7 +454,7 @@ fn parse_agent_key(raw: &str) -> Result<[u8; 32], String> {
     // Cannot fail after the checks above; map the error to a fixed string
     // anyway, because `FromHexError`'s Display names the offending character.
     hex::decode_to_slice(key_hex, &mut key)
-        .map_err(|_| format!("invalid agent-key hex; {EXPECTED}"))?;
+        .map_err(|_| format!("invalid {name} hex; {EXPECTED}"))?;
     Ok(key)
 }
 
@@ -392,19 +538,25 @@ fn unauthenticated_writes(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                // `tenancy=info` so the default filter carries the D9 boot line
-                // below (target `tenancy.maintenance`), which is what an
-                // operator greps the journal for after a deploy.
-                .unwrap_or_else(|_| "epigraph_mcp=info,tenancy=info".parse().unwrap()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Logging to stderr (stdout reserved for MCP JSON-RPC in stdio mode).
+    // RUST_LOG, with rmcp held at INFO so tool bodies never reach the journal.
+    epigraph_mcp::log_filter::init_stderr();
 
     let cli = Cli::parse();
+
+    // Belief modes (SPEC §10.2): read once, here, and journalled under this
+    // crate's target (the default filter keeps it), so the log shows which
+    // modes this process booted with; `system_stats` reports the same.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+    // A typo runs the flag's default; logged here, under this binary's own
+    // target, because the engine logs nothing and the default filter must keep
+    // the warning.
+    for flag in epigraph_engine::belief_modes::unrecognised() {
+        tracing::warn!("belief-mode flag ignored: {flag}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN, and this binary is one on every transport (`--listen`
@@ -451,12 +603,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it runs here, before the DB connect, and only its side effects (printing a
     // generated key) stay below; that lets the gate read the rung off
     // `select_signer`'s own answer instead of re-deriving it.
-    let selected_signer = select_signer(
+    let agent_signing_key = match signing_key_from_env(std::env::var(SIGNING_KEY_ENV)) {
+        Ok(key) => key,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
+    let selected_signer = match select_signer(
         cli.agent_model.as_deref(),
         cli.agent_system_prompt.as_deref(),
         cli.agent_system_prompt_hash.as_deref(),
         cli.agent_key.as_deref(),
-    )?;
+        SeparateSigningKey {
+            identity_pubkey: cli.agent_identity_pubkey.as_deref(),
+            signing_key: agent_signing_key.as_deref().map(String::as_str),
+        },
+    ) {
+        Ok(selected) => selected,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(reason) = check_separate_key_transport(
+        cli.listen.as_deref(),
+        selected_signer.identity_public_key.is_some(),
+    ) {
+        eprintln!("ERROR: {reason}");
+        std::process::exit(1);
+    }
     if let Err(reason) = epigraph_mcp::operator::check_operator_transport(
         cli.listen.as_deref(),
         cli.operator_id,
@@ -598,7 +774,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer,
         llm_identity,
         identity_declared,
+        identity_public_key,
     } = selected_signer;
+    // Separate-signing-key mode (agent identity lineage design D2): refuse to
+    // serve unless the signing key is an ACTIVE `signing` key of the agent the
+    // identity key names. Read-only and BEFORE anything resolves (and so may
+    // create) the server's agent row: `self_link` and the first tool call both
+    // do, and a refused boot must leave no row behind. (The mode is stdio-only:
+    // `check_separate_key_transport` refused `--listen` before the connect.)
+    if let Some(identity) = &identity_public_key {
+        match epigraph_mcp::signing_identity::check_signing_key(
+            &pool,
+            identity,
+            &signer.public_key(),
+        )
+        .await
+        {
+            Ok(agent) => tracing::info!(
+                agent_id = %agent,
+                identity_public_key = %hex::encode(identity),
+                signing_public_key = %hex::encode(signer.public_key()),
+                "separate signing key: an active signing key of the identity's agent"
+            ),
+            Err(reason) => {
+                eprintln!("ERROR: {reason}");
+                std::process::exit(1);
+            }
+        }
+    }
     // Read the rung off `select_signer`'s own return value rather than
     // re-deriving `agent_model.is_none() && agent_key.is_none()` here: the
     // precedence table is documented as living in one place, and a second copy
@@ -637,7 +840,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    tracing::info!(public_key = %hex::encode(signer.public_key()), "Agent identity ready");
+    // The key the agent is found by: the identity key in the separate-signing-key
+    // mode, the signer's own key otherwise.
+    let identity_key = identity_public_key.unwrap_or_else(|| signer.public_key());
+    // Migration 166: an agent attached to a role runs only while its linked
+    // human holds the role. Refused at boot, on every transport, so a gap
+    // fails fast instead of at the first write (ROL01). Read-only, and before
+    // `self_link` or any tool resolves (and so may create) the agent row.
+    match epigraph_mcp::role_gate::check_role_holder(&pool, &identity_key).await {
+        Ok(Some((agent, gate))) if gate.role.is_some() => tracing::info!(
+            agent_id = %agent,
+            role = gate.role.as_deref().unwrap_or_default(),
+            "role-attached agent: its linked human holds the role"
+        ),
+        Ok(_) => {}
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    }
+    tracing::info!(public_key = %hex::encode(identity_key), "Agent identity ready");
 
     // Create embedder.
     //
@@ -727,17 +949,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(addr) = &cli.listen {
         // ── HTTP transport (TCP or Unix socket) ────────────────────────
         // (auth gate already enforced above at startup; --allow-unauthenticated-http was checked)
-        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-        use rmcp::transport::streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-        };
 
         // Constraint: never serve HTTP as an OPERATED signer. `--operator-id`
         // was already refused above; this catches a link recorded earlier by a
         // stdio process under the same key. Read-only, and before anything
         // below resolves (and so creates) the signer's agent row.
         if let Err(reason) =
-            epigraph_mcp::operator::refuse_operated_http_signer(&pool, &signer.public_key()).await
+            epigraph_mcp::operator::refuse_operated_http_signer(&pool, &identity_key).await
         {
             eprintln!("ERROR: {reason}");
             std::process::exit(1);
@@ -759,10 +977,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_scoped_pool(scoped.clone())
         .with_connector_elevation(connector_elevation_from_env())
+        .with_run_tokens(run_tokens_from_env())
         // The ceremony page's public origin, for the URL `sudo` returns
         // (elevation plan EL-11): the API's own variable. Unset, `sudo`
         // refuses.
-        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok());
+        .with_public_base_url(std::env::var("EPIGRAPH_PUBLIC_BASE_URL").ok())
+        // `max_claims` cap only: HTTP refuses `profile_path` and ignores the pin.
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         let template = if identity_declared {
             template
         } else {
@@ -831,22 +1052,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 epigraph_mcp::auth::UnauthenticatedPrincipal::unresolvable()
             };
 
-        let service = StreamableHttpService::new(
-            // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and
-            // this closure runs once PER SESSION. Every session is a clone of
-            // the one template above: it carries the template's `ScopedPool`
-            // (an attachment on the stdio path alone would leave every real
-            // caller on a server whose `scoped` is `None`, turning the 42501
-            // into a total `submit_claim` / `memorize` refusal) and SHARES its
-            // `agent_db_id` cell, so the server agent is resolved — and its
-            // personal group provisioned — once per process, not once per
-            // session. See `SessionFactory` for the measurement.
-            move || Ok(sessions.session()),
-            Arc::new(LocalSessionManager::default()),
-            StreamableHttpServerConfig::default(),
-        );
+        // THE PRODUCTION TRANSPORT. Prod serves MCP over HTTP (:3101), and the
+        // factory closure runs once PER SESSION. Every session is a clone of
+        // the one template above: it carries the template's `ScopedPool` (an
+        // attachment on the stdio path alone would leave every real caller on
+        // a server whose `scoped` is `None`, turning the 42501 into a total
+        // `submit_claim` / `memorize` refusal) and SHARES its `agent_db_id`
+        // cell, so the server agent is resolved — and its personal group
+        // provisioned — once per process, not once per session. See
+        // `SessionFactory` for the measurement.
+        //
+        // `mcp_http_listener` also picks the rmcp config and the session
+        // manager, and returns the TCP Host/Origin allowlist (`None` on a unix
+        // socket) that the outer guard layer below installs: the rmcp config
+        // and that layer are built from one value. The HTTP test suites build
+        // their listeners through the same function.
+        let epigraph_mcp::http_listener::McpHttpListener {
+            service,
+            tcp_allowlist,
+            ..
+        } = epigraph_mcp::http_listener::mcp_http_listener(addr, &cli.allowed_host, move || {
+            Ok(sessions.session())
+        });
 
-        // Innermost layer: rewrite rmcp 0.15's session-error statuses to the MCP
+        // Innermost layer: rewrite rmcp's remaining session-error statuses to the MCP
         // spec's (unknown/ended session 401/500 -> 404, no-session non-initialize
         // 422 -> 400). A 401 on an unknown session made OAuth clients discard a
         // valid token after every restart instead of re-initializing. It wraps
@@ -892,23 +1121,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // ── DNS-rebinding guard (CVE-2026-42559 class) ──────────────────
-        // rmcp 0.15's StreamableHttpServerConfig has no allowed_hosts /
-        // allowed_origins knob and the crate validates neither header, so a
-        // browser pointed at a page whose DNS rebinds to this listener could
-        // otherwise drive every tool. Applied LAST, i.e. OUTERMOST, so it runs
+        // A browser pointed at a page whose DNS rebinds to this listener could
+        // otherwise drive every tool. rmcp's service checks Host too (fed the
+        // same allowlist via `streamable_http_server_config`), but only after
+        // auth; this layer is the authoritative one. Applied LAST, i.e. OUTERMOST, so it runs
         // BEFORE the auth layer: a rebound request is refused on its headers
         // alone. TCP only — a unix socket is unreachable from a browser, so the
         // guard would add no security there while risking a 403 on the one
         // listener kind allowed to run unauthenticated.
-        let router = if epigraph_mcp::is_unix_listener(addr) {
-            tracing::info!(
-                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
-                 DNS-rebinding surface); filesystem permissions are the trust gate"
-            );
-            router
-        } else {
-            let allowlist =
-                epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(addr, &cli.allowed_host);
+        let router = if let Some(allowlist) = tcp_allowlist {
             tracing::info!(
                 allowed_hosts = %allowlist.describe(),
                 "Host/Origin allowlist active on the MCP HTTP listener (DNS-rebinding guard); \
@@ -918,6 +1139,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist,
                 epigraph_mcp::host_guard::host_guard_middleware,
             ))
+        } else {
+            tracing::info!(
+                "Unix-socket listener: Host/Origin allowlist not applied (a unix socket has no \
+                 DNS-rebinding surface); filesystem permissions are the trust gate"
+            );
+            router
         };
 
         tracing::info!("Starting EpiGraph MCP server in {mode} mode on {addr}");
@@ -941,7 +1168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The stdio transport writes too — epiclaw's scheduled agents reach
         // `submit_claim` / `memorize` over stdio — so it needs the same stamped
         // pool as the HTTP factory above, not a read-only subset of it.
-        .with_scoped_pool(scoped);
+        .with_scoped_pool(scoped)
+        // The label-dedup profile root and pin (set by the host when a
+        // workflow ships a dedup profile).
+        .with_label_dedup_config(epigraph_mcp::tools::label_dedup::LabelDedupConfig::from_env());
         // Rung-4 signer: the owner-equality fallback in
         // `require_owner_or_admin` has no stable identity to compare against.
         // See `EpiGraphMcpFull::with_generated_signer_identity`.
@@ -949,6 +1179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server
         } else {
             server.with_generated_signer_identity()
+        };
+        let server = match identity_public_key {
+            Some(identity) => server.with_identity_public_key(identity),
+            None => server,
         };
         // Declared operator: record the link before serving, fatally on refusal
         // (`epigraph_mcp::operator::self_link`). `check_operator_transport`
@@ -1094,7 +1328,10 @@ mod unauthenticated_writes_gate_tests {
 
 #[cfg(test)]
 mod signer_selection_tests {
-    use super::{select_signer, SelectedSigner};
+    use super::{
+        check_separate_key_transport, select_signer, signing_key_from_env, SelectedSigner,
+        SeparateSigningKey,
+    };
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
@@ -1113,7 +1350,14 @@ mod signer_selection_tests {
             signer,
             llm_identity,
             ..
-        } = select_signer(Some(model), Some(raw_prompt), Some(hash), Some(KEY_HEX)).unwrap();
+        } = select_signer(
+            Some(model),
+            Some(raw_prompt),
+            Some(hash),
+            Some(KEY_HEX),
+            SeparateSigningKey::default(),
+        )
+        .unwrap();
 
         // Key is the verbatim-hash derivation, proving the prehashed rung ran
         // and neither the raw-prompt path nor the agent-key path was taken.
@@ -1143,7 +1387,14 @@ mod signer_selection_tests {
             signer,
             llm_identity,
             ..
-        } = select_signer(Some(model), Some(prompt), None, None).unwrap();
+        } = select_signer(
+            Some(model),
+            Some(prompt),
+            None,
+            None,
+            SeparateSigningKey::default(),
+        )
+        .unwrap();
 
         let expected_signer = epigraph_crypto::keypair_from_llm_agent(model, prompt);
         assert_eq!(signer.public_key(), expected_signer.public_key());
@@ -1169,7 +1420,7 @@ mod signer_selection_tests {
             signer,
             llm_identity,
             ..
-        } = select_signer(Some(model), None, None, None).unwrap();
+        } = select_signer(Some(model), None, None, None, SeparateSigningKey::default()).unwrap();
 
         let expected = epigraph_crypto::keypair_from_llm_agent(model, "");
         assert_eq!(signer.public_key(), expected.public_key());
@@ -1185,7 +1436,14 @@ mod signer_selection_tests {
             signer,
             llm_identity,
             ..
-        } = select_signer(None, None, None, Some(KEY_HEX)).unwrap();
+        } = select_signer(
+            None,
+            None,
+            None,
+            Some(KEY_HEX),
+            SeparateSigningKey::default(),
+        )
+        .unwrap();
 
         let key: [u8; 32] = [0x01; 32];
         let expected = epigraph_crypto::AgentSigner::from_bytes(&key).unwrap();
@@ -1200,8 +1458,8 @@ mod signer_selection_tests {
     /// differ from each other (it is genuinely random, not a fixed seed).
     #[test]
     fn no_inputs_generates_random_signer_without_identity() {
-        let a = select_signer(None, None, None, None).unwrap();
-        let b = select_signer(None, None, None, None).unwrap();
+        let a = select_signer(None, None, None, None, SeparateSigningKey::default()).unwrap();
+        let b = select_signer(None, None, None, None, SeparateSigningKey::default()).unwrap();
         assert!(a.llm_identity.is_none());
         assert!(b.llm_identity.is_none());
         assert_ne!(
@@ -1221,18 +1479,37 @@ mod signer_selection_tests {
     fn identity_declared_tracks_the_rung_not_the_llm_identity() {
         // Rung 1: model + hash.
         assert!(
-            select_signer(Some("m"), None, Some("abc123"), None)
-                .unwrap()
-                .identity_declared
+            select_signer(
+                Some("m"),
+                None,
+                Some("abc123"),
+                None,
+                SeparateSigningKey::default()
+            )
+            .unwrap()
+            .identity_declared
         );
         // Rung 2: model + raw prompt.
         assert!(
-            select_signer(Some("m"), Some("prompt"), None, None)
-                .unwrap()
-                .identity_declared
+            select_signer(
+                Some("m"),
+                Some("prompt"),
+                None,
+                None,
+                SeparateSigningKey::default()
+            )
+            .unwrap()
+            .identity_declared
         );
         // Rung 3: agent-key alone — `llm_identity` is None, yet DECLARED.
-        let rung3 = select_signer(None, None, None, Some(KEY_HEX)).unwrap();
+        let rung3 = select_signer(
+            None,
+            None,
+            None,
+            Some(KEY_HEX),
+            SeparateSigningKey::default(),
+        )
+        .unwrap();
         assert!(rung3.llm_identity.is_none());
         assert!(
             rung3.identity_declared,
@@ -1241,7 +1518,7 @@ mod signer_selection_tests {
         );
         // Rung 4: nothing supplied.
         assert!(
-            !select_signer(None, None, None, None)
+            !select_signer(None, None, None, None, SeparateSigningKey::default())
                 .unwrap()
                 .identity_declared
         );
@@ -1251,7 +1528,9 @@ mod signer_selection_tests {
     /// and not a silent generate() — the operator asked for a specific key.
     #[test]
     fn malformed_agent_key_is_an_error() {
-        assert!(select_signer(None, None, None, Some("zz")).is_err());
+        assert!(
+            select_signer(None, None, None, Some("zz"), SeparateSigningKey::default()).is_err()
+        );
     }
 
     /// A key read from an env file or a shell export can carry surrounding
@@ -1260,10 +1539,16 @@ mod signer_selection_tests {
     /// silent `generate()` would also be.
     #[test]
     fn agent_key_with_surrounding_whitespace_is_the_same_signer() {
-        let clean = select_signer(None, None, None, Some(KEY_HEX))
-            .unwrap()
-            .signer
-            .public_key();
+        let clean = select_signer(
+            None,
+            None,
+            None,
+            Some(KEY_HEX),
+            SeparateSigningKey::default(),
+        )
+        .unwrap()
+        .signer
+        .public_key();
         for padded in [
             format!("{KEY_HEX} "),
             format!("{KEY_HEX}\r"),
@@ -1271,8 +1556,14 @@ mod signer_selection_tests {
             format!("{KEY_HEX}\r\n"),
             format!(" \t{KEY_HEX}"),
         ] {
-            let selected = select_signer(None, None, None, Some(&padded))
-                .unwrap_or_else(|e| panic!("{padded:?} must parse after trimming: {e}"));
+            let selected = select_signer(
+                None,
+                None,
+                None,
+                Some(&padded),
+                SeparateSigningKey::default(),
+            )
+            .unwrap_or_else(|e| panic!("{padded:?} must parse after trimming: {e}"));
             assert_eq!(
                 selected.signer.public_key(),
                 clean,
@@ -1304,7 +1595,9 @@ mod signer_selection_tests {
             "   ",
             "\r\n",
         ] {
-            let outcome = std::panic::catch_unwind(|| select_signer(None, None, None, Some(bad)));
+            let outcome = std::panic::catch_unwind(|| {
+                select_signer(None, None, None, Some(bad), SeparateSigningKey::default())
+            });
             let result = outcome.unwrap_or_else(|_| panic!("{bad:?} must not panic"));
             assert!(result.is_err(), "{bad:?} must be refused, not generate()d");
         }
@@ -1320,7 +1613,9 @@ mod signer_selection_tests {
         let odd = secret[..63].to_string();
         let wrong_len = secret[..62].to_string();
         for bad in [non_hex, odd, wrong_len] {
-            let Err(msg) = select_signer(None, None, None, Some(&bad)) else {
+            let Err(msg) =
+                select_signer(None, None, None, Some(&bad), SeparateSigningKey::default())
+            else {
                 panic!("{bad:?} must be refused");
             };
             for window in bad.as_bytes().windows(16) {
@@ -1335,6 +1630,148 @@ mod signer_selection_tests {
                 "the error must not name the bad char: {msg}"
             );
         }
+    }
+
+    fn separate<'a>(identity: Option<&'a str>, signing: Option<&'a str>) -> SeparateSigningKey<'a> {
+        SeparateSigningKey {
+            identity_pubkey: identity,
+            signing_key: signing,
+        }
+    }
+
+    /// Rung 0: the signer is the SIGNING key and the agent is named by the
+    /// IDENTITY key, which differs from the signer's own public key. No LLM
+    /// identity is recorded (the host recorded it at registration).
+    #[test]
+    fn separate_keys_sign_with_the_signing_key_and_name_the_identity() {
+        let identity = epigraph_crypto::AgentSigner::from_bytes(&[0x0A; 32])
+            .unwrap()
+            .public_key();
+        let identity_hex = hex::encode(identity);
+        let signing_hex = "0b".repeat(32);
+        let selected = select_signer(
+            None,
+            None,
+            None,
+            None,
+            separate(Some(&identity_hex), Some(&signing_hex)),
+        )
+        .unwrap();
+        let expected = epigraph_crypto::AgentSigner::from_bytes(&[0x0B; 32]).unwrap();
+        assert_eq!(selected.signer.public_key(), expected.public_key());
+        assert_eq!(selected.identity_public_key, Some(identity));
+        assert_ne!(
+            selected.identity_public_key,
+            Some(selected.signer.public_key())
+        );
+        assert!(selected.llm_identity.is_none());
+        assert!(selected.identity_declared);
+    }
+
+    /// Half a pair, or the pair with a legacy identity source, is an error,
+    /// never a fall-through: rung 4 would run the container as a throwaway
+    /// identity and rung 1/3 as an unregistered one.
+    #[test]
+    fn a_half_or_mixed_separate_configuration_is_refused() {
+        let identity_hex = "0c".repeat(32);
+        let signing_hex = "0d".repeat(32);
+        for (model, key, pair) in [
+            (None, None, separate(Some(&identity_hex), None)),
+            (None, None, separate(None, Some(&signing_hex))),
+            (
+                Some("m"),
+                None,
+                separate(Some(&identity_hex), Some(&signing_hex)),
+            ),
+            (
+                None,
+                Some(KEY_HEX),
+                separate(Some(&identity_hex), Some(&signing_hex)),
+            ),
+        ] {
+            assert!(
+                select_signer(model, None, Some("h"), key, pair).is_err(),
+                "{model:?} {key:?} must be refused"
+            );
+        }
+    }
+
+    /// The signing key may not be the identity key's own private half, and a
+    /// malformed signing key is refused without echoing it.
+    #[test]
+    fn the_signing_key_must_be_separate_and_is_never_echoed() {
+        let same = epigraph_crypto::AgentSigner::from_bytes(&[0x0E; 32])
+            .unwrap()
+            .public_key();
+        let same_hex = hex::encode(same);
+        let secret_hex = "0e".repeat(32);
+        assert!(select_signer(
+            None,
+            None,
+            None,
+            None,
+            separate(Some(&same_hex), Some(&secret_hex))
+        )
+        .is_err());
+
+        let bad = format!("{}zz", "f".repeat(62));
+        let Err(msg) = select_signer(
+            None,
+            None,
+            None,
+            None,
+            separate(Some(&same_hex), Some(&bad)),
+        ) else {
+            panic!("a malformed signing key must be refused");
+        };
+        assert!(msg.contains("agent-signing-key"), "{msg}");
+        assert!(
+            !msg.contains(&bad[..20]),
+            "the value must not be echoed: {msg}"
+        );
+    }
+
+    /// The signing key's env read: a value is kept, an unset or empty
+    /// variable is "not configured", and a non-UTF-8 value is refused (never
+    /// read as unset, which would fall through to another identity) without
+    /// naming its bytes.
+    #[test]
+    fn the_signing_key_env_read() {
+        use std::env::VarError;
+        let hex = "0b".repeat(32);
+        assert_eq!(
+            signing_key_from_env(Ok(hex.clone()))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some(hex.as_str())
+        );
+        assert!(signing_key_from_env(Ok(String::new())).unwrap().is_none());
+        assert!(signing_key_from_env(Err(VarError::NotPresent))
+            .unwrap()
+            .is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = std::ffi::OsString::from_vec(vec![0x30, 0xff, 0x31]);
+            let err = signing_key_from_env(Err(VarError::NotUnicode(raw)))
+                .expect_err("a non-UTF-8 key is refused");
+            assert!(err.contains("not valid UTF-8"), "{err}");
+        }
+    }
+
+    /// The separate-signing-key mode is refused on every listener kind and
+    /// admitted on stdio; the legacy rungs are untouched by this gate.
+    #[test]
+    fn the_separate_key_mode_is_stdio_only() {
+        for listen in ["127.0.0.1:3100", "unix:/run/epigraph-mcp.sock"] {
+            let err = check_separate_key_transport(Some(listen), true)
+                .expect_err("the new mode on a listener is refused");
+            assert!(err.contains("stdio-only"), "{err}");
+            assert!(check_separate_key_transport(Some(listen), false).is_ok());
+        }
+        assert!(check_separate_key_transport(None, true).is_ok());
+        assert!(check_separate_key_transport(None, false).is_ok());
     }
 }
 
@@ -1358,6 +1795,28 @@ fn connector_elevation_from_env() -> bool {
         );
     }
     on
+}
+
+/// `EPIGRAPH_RUN_TOKENS`: whether this listener admits a delegated run token
+/// (`epigraph_db::RunTokens`; only the exact value `on` enables it). Logged
+/// when ON.
+fn run_tokens_from_env() -> epigraph_db::RunTokens {
+    let raw = std::env::var(epigraph_db::RUN_TOKENS_ENV).ok();
+    if epigraph_db::RunTokens::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_RUN_TOKENS is set to a value that is neither `on` nor `off`: delegated \
+             run tokens stay OFF on this listener (only `on` admits them)"
+        );
+    }
+    let switch = epigraph_db::RunTokens::parse(raw.as_deref());
+    if switch == epigraph_db::RunTokens::On {
+        tracing::warn!(
+            "EPIGRAPH_RUN_TOKENS=on: delegated run tokens are admitted where their delegation \
+             is live"
+        );
+    }
+    switch
 }
 
 /// The switch's parse, apart from the environment: only `on`.

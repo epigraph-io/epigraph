@@ -142,6 +142,13 @@ pub struct IngestAnchors {
     pub linked_parent: Option<Uuid>,
 }
 
+/// An `executes` edge's `plan_index` as a `bigint`, or NULL unless it is a
+/// JSON integer of at most nine digits. A `CASE`, not a `WHERE` guard plus a
+/// cast: PostgreSQL does not promise to evaluate a guard before the cast.
+const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') = 'number' \
+                                    AND properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                               THEN (properties->>'plan_index')::bigint END)";
+
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
@@ -266,6 +273,53 @@ impl WorkflowRepository {
         Ok(row.map(|(id,)| id))
     }
 
+    /// Lock one `workflows` row (`FOR UPDATE`) for the rest of the caller's
+    /// transaction. `Ok(false)` when no row has this id.
+    ///
+    /// `add_step` takes it before it reads the plan it is about to extend, so
+    /// two concurrent `add_step`s on one workflow cannot both compute the same
+    /// next `plan_index`. `workflows` has no row security, so this needs no
+    /// viewer.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn lock_for_plan_edit<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
+                .bind(workflow_id)
+                .fetch_optional(executor)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
+    /// session can see, as `(target claim, plan_index, is public)`. The index
+    /// is `None` unless the edge's `plan_index` is a JSON integer of at most
+    /// nine digits (the bound every plan-order reader's `^[0-9]{1,9}$` uses),
+    /// so a string `"3"` or a fraction is unindexed here as it is in the frozen
+    /// plan read. A retracted edge is not a plan item for any reader, so it
+    /// takes no part in where a new item goes.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn executes_plan_indices<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        workflow_id: Uuid,
+    ) -> Result<Vec<(Uuid, Option<i64>, bool)>, sqlx::Error> {
+        let sql = format!(
+            "SELECT target_id, {PLAN_INDEX_INT}, COALESCE(visibility::text = 'public', false) FROM edges \
+              WHERE source_id = $1 AND source_type = 'workflow' \
+                AND relationship = 'executes' AND valid_to IS NULL"
+        );
+        sqlx::query_as(&sql)
+            .bind(workflow_id)
+            .fetch_all(executor)
+            .await
+    }
+
     /// The existing rows an ingest of `(canonical_name, generation)` with
     /// `parent_canonical_name` would touch or link (batch H-b, H3 review):
     ///
@@ -280,9 +334,9 @@ impl WorkflowRepository {
     ///   record itself as submitter and then pass every head-keyed authority
     ///   check (the takeover the review measured).
     /// * `linked_parent` — exactly the row the executor links as `parent_id`
-    ///   (`find_root_by_canonical(parent, generation - 1)`, the same saturating
-    ///   arithmetic), so authority is checked against the row actually linked,
-    ///   not a different generation of the parent's name.
+    ///   ([`Self::resolve_ingest_parent`], the SAME function the executor
+    ///   calls), so authority is checked against the row actually linked, not a
+    ///   different generation of the parent's name.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if a query fails.
@@ -294,17 +348,72 @@ impl WorkflowRepository {
     ) -> Result<IngestAnchors, sqlx::Error> {
         let existing = Self::find_root_by_canonical(&mut *conn, canonical_name, generation).await?;
         let lineage_head = Self::head_by_canonical(&mut *conn, canonical_name).await?;
-        let linked_parent = match parent_canonical_name {
-            Some(pcn) => {
-                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?
-            }
-            None => None,
-        };
+        let linked_parent = Self::resolve_ingest_parent(
+            &mut *conn,
+            canonical_name,
+            generation,
+            parent_canonical_name,
+        )
+        .await?;
         Ok(IngestAnchors {
             existing,
             lineage_head,
             linked_parent,
         })
+    }
+
+    /// The row an ingest of `(canonical_name, generation)` links as its
+    /// `parent_id` (and `variant_of` target). The executor and
+    /// [`Self::ingest_anchors`] both call this, so the row whose authority is
+    /// checked is exactly the row that gets linked.
+    ///
+    /// 1. `parent_canonical_name = Some(p)`: `(p, generation - 1)` with the
+    ///    same saturating arithmetic as before (issue #51 semantics, forks
+    ///    included).
+    /// 2. Otherwise — or when (1) finds nothing and `p` names this same
+    ///    lineage — the PREDECESSOR: the highest generation of
+    ///    `canonical_name` strictly BELOW `generation`. Not the lineage head:
+    ///    for a gap-filling ingest (gen 2 while gen 5 exists) the head is above
+    ///    the new row and must never become its parent (U032).
+    /// 3. `None` when there is no predecessor (a lineage may legitimately
+    ///    start above generation 0), or when a DIFFERENT lineage named in `p`
+    ///    has no row at `generation - 1`: the named parent links nothing,
+    ///    exactly as before, and there is no fallback to `canonical_name`'s own
+    ///    predecessor. If `canonical_name` has no rows that ingest starts a new
+    ///    lineage; if it already has lower generations, the row is stored
+    ///    parentless even though [`Self::ingest_anchors`] treats it as a
+    ///    generation of that lineage (authority over `lineage_head`, submitter
+    ///    inherited). That residual is the current default pending operator
+    ///    question Q2 (U032 scope §6), pinned by
+    ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
+    ///
+    /// `workflows` has no row security, as [`Self::find_root_by_canonical`]
+    /// records, so this read needs no viewer.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn resolve_ingest_parent(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+        generation: i32,
+        parent_canonical_name: Option<&str>,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        if let Some(pcn) = parent_canonical_name {
+            let named =
+                Self::find_root_by_canonical(&mut *conn, pcn, generation.saturating_sub(1)).await?;
+            if named.is_some() || pcn != canonical_name {
+                return Ok(named);
+            }
+        }
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM workflows WHERE canonical_name = $1 AND generation < $2 \
+             ORDER BY generation DESC LIMIT 1",
+        )
+        .bind(canonical_name)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(|(id,)| id))
     }
 
     /// The distinct `canonical_name`s of the workflows that EXECUTE `claim_id`
@@ -355,6 +464,61 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         q.fetch_all(pool).await.map_err(DbError::from)
+    }
+
+    /// The ids of every workflow that EXECUTES the step lineage of `claim_id`:
+    /// a `workflow —executes→ claim` edge into `claim_id` itself or into any
+    /// claim sharing its non-null `step_lineage_id`. Ascending by id.
+    ///
+    /// Exists for the `evolve_step` authority gate (MCP
+    /// `tools/evolve_step.rs`, REST `routes/workflows.rs::evolve_step`), which
+    /// requires workflow authority over EVERY workflow returned. The lineage is
+    /// read, not just the parent's own edges, because `executes` stays on the
+    /// frozen step when it is evolved (`migrate_superseded_edges`' step-lineage
+    /// rule): the new head is executed by nothing directly, and a gate keyed on
+    /// the parent's edges would admit anyone to the second evolve. A parent
+    /// with no lineage yet (`evolve_step` mints one for it) is its own lineage.
+    ///
+    /// RETRACTED edges are included ON PURPOSE, as in
+    /// [`Self::executing_canonical_names`]. Any principal that writes the
+    /// owning group of a group-private `executes` edge can retract it
+    /// (`EdgeRepository::retract_by_id`), so filtering on `valid_to` would let
+    /// that writer lift the gate it is held to. Edge `properties` (e.g.
+    /// `plan_index`, which the same writers can rewrite) play no part.
+    ///
+    /// NOT viewer-spliced, deliberately: this is an authority read, and an
+    /// in-query viewer predicate could only remove workflows from the set the
+    /// caller must hold authority over. It runs on the caller's own write
+    /// transaction, so the one filter left is the row security that session is
+    /// held to. Residual, stated: a lineage member or `executes` edge that
+    /// row security hides from the caller is not counted. Every claim of a
+    /// lineage takes its parent's tenancy at `evolve_step`, and an `executes`
+    /// edge takes its step's, so a caller who can lock the parent can normally
+    /// see them all; a lineage whose members were later split across tenancies
+    /// out of band is the case this does not cover.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn workflows_executing_step_lineage(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT w.id \
+             FROM edges e \
+             JOIN workflows w ON w.id = e.source_id \
+             WHERE e.relationship = 'executes' \
+               AND e.source_type = 'workflow' AND e.target_type = 'claim' \
+               AND (e.target_id = $1 \
+                    OR e.target_id IN ( \
+                        SELECT m.id FROM claims m \
+                        JOIN claims p ON p.step_lineage_id = m.step_lineage_id \
+                        WHERE p.id = $1)) \
+             ORDER BY w.id",
+        )
+        .bind(claim_id)
+        .fetch_all(&mut *conn)
+        .await
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
@@ -765,6 +929,123 @@ impl WorkflowRepository {
         Ok(resolved)
     }
 
+    /// The workflow's level-2 step claims whose PLAN POSITION `viewer` can
+    /// establish, in plan order: the lookup an outcome report maps each
+    /// `step_index` through, shared by the MCP tool and the HTTP route so step
+    /// N is one step on both transports. Element N is step N; a step whose
+    /// position the viewer cannot establish is not listed, and neither is any
+    /// step after it.
+    ///
+    /// Same order key as [`Self::resolve_steps_to_heads`] (`plan_index` first,
+    /// `created_at` only for edges that carry none), and the same two
+    /// predicates, on the edge and on the claim.
+    ///
+    /// # Run it on the caller's STAMPED transaction
+    ///
+    /// `conn` must be stamped with `viewer`. On an unstamped application
+    /// session row security admits only public rows, so a group's own member
+    /// would get none of its group-private steps back, without an error.
+    ///
+    /// # Only a provable prefix is returned
+    ///
+    /// A step the viewer cannot read is absent from what it reads, so counting
+    /// the visible steps would shift every visible step after a hidden one
+    /// onto the hidden one's index, and an outcome row would be attributed to
+    /// the WRONG step with no signal. That is reachable: `add_step` declares
+    /// its step public (`ClaimRepository::default_decl_for_author` of the
+    /// system agent) and its `executes` edge carries no `plan_index`, so a
+    /// group-private plan can end in a public step that a non-member sees
+    /// alone. So the list stops where the viewer can no longer prove a step's
+    /// position (`provable_plan_steps`):
+    ///
+    /// * The ingest executor numbers EVERY plan claim's `executes` edge
+    ///   `0..n` (`plan_index`, phases included, so `plan_index` is not the step
+    ///   index). A gap in the ordinals the viewer reads means an edge it
+    ///   cannot see; nothing from the gap on is listed.
+    /// * Edges with no ordinal (written by `add_step`, or before the ordinal
+    ///   existed) sort after every ordinal one. They are listed only when the
+    ///   viewer reads the plan they follow: at least one ordinal edge, or (a
+    ///   plan written before the ordinal) a level-1 phase edge.
+    ///
+    /// A step that is not listed is reported by the callers like an
+    /// out-of-range index (NULL `step_claim_id`, disclosed as unresolved). The
+    /// two are deliberately indistinguishable: the difference is the existence
+    /// of a step the caller cannot see. Residual, not detectable without a
+    /// privileged read: hidden ordinal edges AFTER every visible one, followed
+    /// by visible unordered steps. One ingest writes a plan's ordinal edges
+    /// under one owner, so it needs a later re-ownership of part of a plan.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn plan_step_claim_ids(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        // Every level, not only steps: the phases' ordinals are part of the
+        // sequence a gap is detected in.
+        let sql = viewer.splice(
+            "SELECT c.id, c.properties->>'level', \
+                    CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                         THEN (e.properties->>'plan_index')::int END \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q =
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<i32>)>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
+        Ok(provable_plan_steps(&rows))
+    }
+
+    /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
+    /// edges (any level: thesis, phase, step or operation), through the same
+    /// edge and claim predicates as [`Self::plan_step_claim_ids`].
+    ///
+    /// This is the outcome reports' authority predicate. `workflows` has no
+    /// row security, so a report's counter write cannot be scoped by the
+    /// database; the plan's claims and edges can. The ingest executor gives
+    /// every plan claim an `executes` edge, so a caller that reads none of
+    /// them cannot read the workflow at all, and the reports answer it as
+    /// for an id that does not exist. It deliberately does NOT require a
+    /// resolvable step prefix: a member whose first ordinal edge was
+    /// re-owned still reads the rest of the plan and may report.
+    ///
+    /// Run it on the caller's STAMPED transaction, as
+    /// [`Self::plan_step_claim_ids`] must be.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn viewer_reads_any_executes_edge(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM edges e \
+               JOIN claims c ON c.id = e.target_id \
+               WHERE e.source_id = $1 AND e.relationship = 'executes' \
+                 /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
@@ -779,8 +1060,17 @@ impl WorkflowRepository {
     /// Returns `Ok(None)` when the workflow name is unknown or `step_index` is
     /// out of range.
     ///
+    /// "Current head" means a head with `is_current` (newest first): a head
+    /// is structural (no incoming `supersedes` edge), so a claim retired
+    /// without one is still listed as a head, and superseding it is refused
+    /// by `evolve_step_conn` with an opaque guard error (bridge 00132b1d).
+    /// When the lineage has heads and NONE is current, this refuses with
+    /// [`DbError::InvalidData`] naming the retired head, rather than handing
+    /// back a claim the caller cannot evolve or should not attach evidence to.
+    ///
     /// # Errors
-    /// Returns `DbError` if a database query fails.
+    /// Returns `DbError` if a database query fails, and
+    /// `DbError::InvalidData` when every head of the step's lineage is retired.
     pub async fn resolve_step_claim(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,
@@ -805,10 +1095,17 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let target = if prefer_head {
-            step.heads
-                .first()
-                .map(|h| h.id)
-                .unwrap_or(step.frozen_claim_id)
+            let current = step.heads.iter().find(|h| h.is_current);
+            if let (None, Some(retired)) = (current, step.heads.first()) {
+                let reason = format!(
+                    "step {step_index} of workflow '{canonical_name}': its lineage head {} is \
+                     retired (is_current=false, with no supersedes edge), so it cannot be \
+                     evolved or take evidence; revive or re-ingest the step first",
+                    retired.id
+                );
+                return Err(DbError::InvalidData { reason });
+            }
+            current.map_or(step.frozen_claim_id, |h| h.id)
         } else {
             step.frozen_claim_id
         };
@@ -942,12 +1239,14 @@ impl WorkflowRepository {
                 content: String,
                 truth_value: f64,
                 created_at: chrono::DateTime<chrono::Utc>,
+                is_current: bool,
             }
 
             // The `NOT EXISTS` over `edges` is an exclusion test, left
             // unfiltered for the same reason as `latest_in_lineage`'s.
             let head_sql = viewer.splice(
-                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at \
+                "SELECT c.step_lineage_id AS lineage_id, c.id, c.content, c.truth_value, c.created_at, \
+                        COALESCE(c.is_current, true) AS is_current \
                  FROM claims c \
                  WHERE c.step_lineage_id = ANY($1) \
                    AND NOT EXISTS ( \
@@ -974,6 +1273,7 @@ impl WorkflowRepository {
                         content: row.content,
                         truth_value: row.truth_value,
                         created_at: row.created_at,
+                        is_current: row.is_current,
                     });
             }
         }
@@ -1014,8 +1314,24 @@ impl WorkflowRepository {
     ///
     /// When `resolve_to_latest` is true, callers want the newest generation
     /// per `canonical_name`; ordering becomes `(canonical_name ASC,
-    /// generation DESC, created_at DESC)` so callers can dedup by walking
-    /// the head of each canonical group without a sort.
+    /// deprecated LAST, generation DESC, created_at DESC)`, where "deprecated"
+    /// is `truth_value < min_truth`. A live head therefore leads its canonical
+    /// group, and a deprecated head (only the added head can be below
+    /// `min_truth`) sorts after the live rows of its group: still returned,
+    /// never the first row a caller walking the group picks.
+    ///
+    /// **`resolve_to_latest` also guarantees the lineage head is present.** The
+    /// ILIKE predicate matches each row's OWN goal text, and sibling
+    /// generations carry different goals, so the head of a matched lineage
+    /// could be filtered out before ordering ran (bridge 37d65fe0, backlog
+    /// ed6a953e). So for every `canonical_name` among the matched rows, its
+    /// highest-generation row (the head `max_generation_by_canonical` and
+    /// `improve_workflow_hierarchy` use) is added when it was not matched,
+    /// regardless of its goal or `truth_value`: a deprecated head is still the
+    /// head, and the caller sees its truth. The result can therefore hold up
+    /// to `limit` matched rows plus one head per matched lineage, and the
+    /// highest generation of each canonical group in it IS the lineage head
+    /// ([`lineage_heads_in`]).
     ///
     /// Used by `GET /api/v1/workflows/hierarchical/search` and the MCP
     /// `find_workflow_hierarchical` tool.
@@ -1041,19 +1357,43 @@ impl WorkflowRepository {
         // shared lineage signal. Likewise, a caller that sends the slug
         // verbatim should still match a goal that wrote out the words.
         let pattern = format!("%{}%", query.trim().replace('-', " "));
-        let order_clause = if resolve_to_latest {
-            "ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC"
+        let sql = if resolve_to_latest {
+            // `matched` is the old statement, LIMIT included; `heads` adds the
+            // highest generation of each matched canonical_name with no goal
+            // or truth filter. Both read `workflows` alone. The union is
+            // wrapped so the ORDER BY may sort on an expression: a head below
+            // `min_truth` ($2) trails the live rows of its group.
+            "WITH matched AS ( \
+                 SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
+                 FROM workflows \
+                 WHERE (replace(canonical_name, '-', ' ') || ' ' || replace(goal, '-', ' ')) ILIKE $1 \
+                   AND truth_value >= $2 \
+                 ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC \
+                 LIMIT $3 \
+             ), heads AS ( \
+                 SELECT DISTINCT ON (w.canonical_name) \
+                        w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                        w.created_at, w.truth_value \
+                 FROM workflows w \
+                 WHERE w.canonical_name IN (SELECT canonical_name FROM matched) \
+                 ORDER BY w.canonical_name, w.generation DESC \
+             ) \
+             SELECT * FROM ( \
+                 SELECT * FROM matched \
+                 UNION ALL \
+                 SELECT * FROM heads h WHERE h.id NOT IN (SELECT id FROM matched) \
+             ) u \
+             ORDER BY canonical_name ASC, (truth_value < $2) ASC, generation DESC, created_at DESC, id ASC"
+                .to_string()
         } else {
-            "ORDER BY created_at DESC, id ASC"
-        };
-        let sql = format!(
             "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
              FROM workflows \
              WHERE (replace(canonical_name, '-', ' ') || ' ' || replace(goal, '-', ' ')) ILIKE $1 \
                AND truth_value >= $2 \
-             {order_clause} \
+             ORDER BY created_at DESC, id ASC \
              LIMIT $3"
-        );
+                .to_string()
+        };
         sqlx::query_as::<_, HierarchicalWorkflowRow>(&sql)
             .bind(&pattern)
             .bind(min_truth)
@@ -1070,10 +1410,18 @@ impl WorkflowRepository {
     ///
     /// `similarity_threshold` filters by `(1 - cosine_distance) >=
     /// threshold`. `min_truth` filters out deprecated rows
-    /// (`deprecate_workflow` writes 0.05). When `resolve_to_latest` is
-    /// true, ordering is `(canonical_name ASC, generation DESC,
-    /// distance ASC)` so heads-of-lineage surface first; otherwise
-    /// `distance ASC, created_at DESC`.
+    /// (`deprecate_workflow` writes 0.05). Ordering is by distance; when
+    /// `resolve_to_latest` is true a higher generation breaks ties, and
+    /// otherwise `created_at DESC` does.
+    ///
+    /// With `resolve_to_latest`, as in [`Self::search_hierarchical_by_text`],
+    /// the lineage head of every matched `canonical_name` is guaranteed
+    /// present: a head with no `goal_embedding`, below the similarity floor,
+    /// below `min_truth` or past the LIMIT is added. An added LIVE head sorts at
+    /// its group's best match distance, ahead of that match; an added
+    /// DEPRECATED head (`truth_value < min_truth`) sorts at its group's worst
+    /// match distance, after that match, so it trails every live row of its
+    /// group. Either way the matched rows keep their relative order.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
@@ -1103,11 +1451,58 @@ impl WorkflowRepository {
         // resolve_to_latest is requested, prefer higher generation as a
         // tiebreaker so newer variants of an equally-close lineage surface
         // first.
-        let order_clause = if resolve_to_latest {
-            "ORDER BY distance ASC, generation DESC, created_at DESC"
-        } else {
-            "ORDER BY distance ASC, created_at DESC, id ASC"
-        };
+        if resolve_to_latest {
+            // `matched` is the old statement, LIMIT included; `heads` adds the
+            // highest generation of each matched canonical_name with no
+            // embedding, similarity or truth filter. All three CTEs read
+            // `workflows` alone. The final ORDER BY sits on the outermost
+            // SELECT: an injected live head (no distance) takes its group's
+            // best distance and sorts ahead of that row; an injected
+            // deprecated head takes the group's worst distance and sorts after
+            // it. Only an injected head can be below `min_truth` ($3).
+            let sql = "WITH q AS (SELECT $1::vector AS v), \
+                 matched AS ( \
+                     SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                            w.created_at, w.truth_value, (w.goal_embedding <=> q.v) AS distance \
+                     FROM workflows w, q \
+                     WHERE w.goal_embedding IS NOT NULL \
+                       AND w.truth_value >= $3 \
+                       AND (1 - (w.goal_embedding <=> q.v)) >= $2 \
+                     ORDER BY distance ASC, generation DESC, created_at DESC \
+                     LIMIT $4 \
+                 ), heads AS ( \
+                     SELECT DISTINCT ON (w.canonical_name) \
+                            w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                            w.created_at, w.truth_value, NULL::float8 AS distance \
+                     FROM workflows w \
+                     WHERE w.canonical_name IN (SELECT canonical_name FROM matched) \
+                     ORDER BY w.canonical_name, w.generation DESC \
+                 ), combined AS ( \
+                     SELECT m.*, false AS injected FROM matched m \
+                     UNION ALL \
+                     SELECT h.*, true AS injected FROM heads h \
+                     WHERE h.id NOT IN (SELECT id FROM matched) \
+                 ), ranked AS ( \
+                     SELECT c.*, (c.truth_value < $3) AS deprecated, \
+                            CASE WHEN c.truth_value < $3 \
+                                 THEN MAX(c.distance) OVER (PARTITION BY c.canonical_name) \
+                                 ELSE COALESCE(c.distance, \
+                                      MIN(c.distance) OVER (PARTITION BY c.canonical_name)) \
+                            END AS sort_distance \
+                     FROM combined c \
+                 ) \
+                 SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
+                 FROM ranked \
+                 ORDER BY sort_distance ASC, deprecated ASC, injected DESC, generation DESC, created_at DESC, id ASC";
+            return sqlx::query_as::<_, HierarchicalWorkflowRow>(sql)
+                .bind(&vec_str)
+                .bind(similarity_threshold)
+                .bind(min_truth)
+                .bind(limit)
+                .fetch_all(executor)
+                .await;
+        }
+        let order_clause = "ORDER BY distance ASC, created_at DESC, id ASC";
         let sql = format!(
             "WITH q AS (SELECT $1::vector AS v) \
              SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value, \
@@ -1340,6 +1735,40 @@ impl WorkflowRepository {
         Ok(r.rows_affected())
     }
 
+    /// `(id, goal)` of hierarchical workflows whose `goal_embedding` is NULL,
+    /// oldest first, at most `limit` rows. The recovery half of
+    /// [`Self::set_goal_embedding`].
+    ///
+    /// Every write path embeds the goal best-effort and continues on an
+    /// embedder failure, and the three embedding searches here
+    /// (`find_hierarchical_by_embedding`, `search_by_goal_embedding_since`,
+    /// `search_hierarchical_by_embedding_scored`) filter
+    /// `goal_embedding IS NOT NULL`, so such a row stays invisible to them
+    /// until the `embed_backfill` CLI embeds it from this list.
+    ///
+    /// A blank goal has nothing to embed and is excluded, or it would be
+    /// reported (and fail) on every run.
+    ///
+    /// No viewer: `workflows` has `relrowsecurity = false` and no policy (see
+    /// `set_truth_value`), so the read is the same on any connection.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn find_needing_goal_embedding(
+        pool: &PgPool,
+        limit: i64,
+    ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT id, goal FROM workflows \
+             WHERE goal_embedding IS NULL AND btrim(goal) <> '' \
+             ORDER BY created_at ASC, id ASC \
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Set `workflows.truth_value` for the given workflow id. Used by
     /// `deprecate_workflow` to cascade truth=0.05 from the flat-claim row
     /// onto the hierarchical-table row so `find_workflow_hierarchical`
@@ -1541,6 +1970,156 @@ impl WorkflowRepository {
             .map(|(id, shared)| ExecutedClaim { id, shared })
             .collect())
     }
+
+    /// The `workflows` row and every `executes` edge of `workflow_id` that
+    /// `viewer` may see, each joined to its target claim when `viewer` may read
+    /// it. The raw input of the frozen-plan read
+    /// (`epigraph_ingest_executor::workflow_plan::frozen_plan`), which derives
+    /// the order, the integrity counts and the digest echo from these rows.
+    ///
+    /// `Ok(None)` when no `workflows` row has this id.
+    ///
+    /// # What is and is not filtered
+    ///
+    /// * The edges carry `{EDGE_VISIBILITY:e}` and the target claim
+    ///   `{VISIBILITY:c}`, so a target the viewer cannot read comes back as an
+    ///   edge with `readable = false` and no claim column: the caller counts it
+    ///   and never sees its id or content past this function. An edge the viewer
+    ///   cannot see does not come back at all. That is most hidden items: an
+    ///   `executes` edge takes its target's tenancy (migration 072's meet).
+    /// * RETRACTED edges (`valid_to` set) are returned, flagged, not dropped:
+    ///   a retraction changes the plan and the caller must be able to say so.
+    /// * `workflows` has no row security, so the row read needs no predicate.
+    /// * `heads_diverged` asks whether the target's step lineage has a head
+    ///   other than the target that the viewer may read (`{VISIBILITY:h}`). The
+    ///   `supersedes` exclusion inside it carries no viewer predicate, as in
+    ///   [`ClaimRepository::latest_in_lineage`], but on an RLS-bound
+    ///   connection the policy still hides a `supersedes` edge in a group the
+    ///   viewer is not in, so a head that edge retired can still count and
+    ///   the flag can read `true` spuriously. It is informational (a resolver
+    ///   warns on it and never refuses), so the over-report is accepted.
+    ///
+    /// Takes the ONE viewer-stamped connection of the request, so the in-query
+    /// predicate and the session's tenancy GUCs agree under forced RLS.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a query fails.
+    pub async fn frozen_plan(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Option<FrozenPlanRead>, DbError> {
+        let row: Option<FrozenPlanRow> = sqlx::query_as(
+            "SELECT id, canonical_name, generation, goal, parent_id, truth_value, metadata \
+               FROM workflows WHERE id = $1",
+        )
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let sql = viewer.splice(
+            r#"
+            SELECT e.properties AS edge_properties,
+                   (e.valid_to IS NOT NULL) AS retracted,
+                   e.target_id,
+                   (t.id IS NOT NULL) AS readable,
+                   t.content, t.content_hash, t.properties AS claim_properties,
+                   t.visibility, t.owner_group_id, t.truth_value, t.is_current,
+                   t.heads_diverged
+              FROM edges e
+              LEFT JOIN LATERAL (
+                  SELECT c.id, c.content, c.content_hash, c.properties,
+                         c.visibility::text AS visibility, c.owner_group_id,
+                         c.truth_value, c.is_current,
+                         (c.step_lineage_id IS NOT NULL AND EXISTS (
+                              SELECT 1 FROM claims h
+                               WHERE h.step_lineage_id = c.step_lineage_id
+                                 AND h.id <> c.id
+                                 AND NOT EXISTS (
+                                     SELECT 1 FROM edges s
+                                      WHERE s.target_id = h.id
+                                        AND s.relationship = 'supersedes')
+                                 /* {VISIBILITY:h} */
+                         )) AS heads_diverged
+                    FROM claims c
+                   WHERE c.id = e.target_id AND e.target_type = 'claim'
+                     /* {VISIBILITY:c} */
+              ) t ON true
+             WHERE e.source_id = $1 AND e.relationship = 'executes'
+               /* {EDGE_VISIBILITY:e} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrozenPlanEdgeRow>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let edges = q.fetch_all(&mut *conn).await?;
+        Ok(Some(FrozenPlanRead { row, edges }))
+    }
+}
+
+/// The lineage head of each `canonical_name` in `rows`: its highest
+/// generation, as `(id, generation, truth_value)`.
+///
+/// Exact for the result of [`WorkflowRepository::search_hierarchical_by_text`]
+/// or [`WorkflowRepository::find_hierarchical_by_embedding`] with
+/// `resolve_to_latest = true`, which add each matched lineage's head, and
+/// `UNIQUE (canonical_name, generation)` makes the highest generation a single
+/// row. On any other row set it is only the highest generation PRESENT.
+#[must_use]
+pub fn lineage_heads_in(rows: &[HierarchicalWorkflowRow]) -> HashMap<String, (Uuid, i32, f64)> {
+    let mut heads: HashMap<String, (Uuid, i32, f64)> = HashMap::new();
+    for r in rows {
+        let entry =
+            heads
+                .entry(r.canonical_name.clone())
+                .or_insert((r.id, r.generation, r.truth_value));
+        if r.generation > entry.1 {
+            *entry = (r.id, r.generation, r.truth_value);
+        }
+    }
+    heads
+}
+
+/// The `workflows` row of [`WorkflowRepository::frozen_plan`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub truth_value: f64,
+    pub metadata: serde_json::Value,
+}
+
+/// One visible `executes` edge of [`WorkflowRepository::frozen_plan`]. Every
+/// claim column is `None` when `readable` is false.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrozenPlanEdgeRow {
+    pub edge_properties: Option<serde_json::Value>,
+    pub retracted: bool,
+    pub target_id: Uuid,
+    pub readable: bool,
+    pub content: Option<String>,
+    pub content_hash: Option<Vec<u8>>,
+    pub claim_properties: Option<serde_json::Value>,
+    pub visibility: Option<String>,
+    pub owner_group_id: Option<Uuid>,
+    pub truth_value: Option<f64>,
+    pub is_current: Option<bool>,
+    pub heads_diverged: Option<bool>,
+}
+
+/// What [`WorkflowRepository::frozen_plan`] read.
+#[derive(Debug, Clone)]
+pub struct FrozenPlanRead {
+    pub row: FrozenPlanRow,
+    pub edges: Vec<FrozenPlanEdgeRow>,
 }
 
 /// One row of [`WorkflowRepository::executed_structural_claims`].
@@ -1552,9 +2131,100 @@ pub struct ExecutedClaim {
     pub shared: bool,
 }
 
+/// The level-2 steps of one plan whose position is provable from the
+/// `executes` edges a viewer reads: `rows` are `(claim id, claim level text,
+/// edge plan_index)` in plan order (ordinal edges first, ascending). See
+/// [`WorkflowRepository::plan_step_claim_ids`] for the rule; element N of the
+/// result is step N.
+#[must_use]
+fn provable_plan_steps(rows: &[(Uuid, Option<String>, Option<i32>)]) -> Vec<Uuid> {
+    let level = |l: &Option<String>| l.as_deref().and_then(|v| v.trim().parse::<i64>().ok());
+    let mut steps = Vec::new();
+    let mut next_ordinal: i32 = 0;
+    let mut unordered = Vec::new();
+    for (id, lvl, plan_index) in rows {
+        match plan_index {
+            Some(pi) => {
+                // A gap (or a repeat) means an ordinal edge this viewer cannot
+                // read, or a plan it cannot number: no later position holds.
+                if *pi != next_ordinal {
+                    return steps;
+                }
+                next_ordinal += 1;
+                if level(lvl) == Some(2) {
+                    steps.push(*id);
+                }
+            }
+            None => unordered.push((*id, level(lvl))),
+        }
+    }
+    let anchored = next_ordinal > 0 || unordered.iter().any(|(_, l)| *l == Some(1));
+    if anchored {
+        steps.extend(
+            unordered
+                .into_iter()
+                .filter(|(_, l)| *l == Some(2))
+                .map(|(id, _)| id),
+        );
+    }
+    steps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(level: &str, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
+        (Uuid::new_v4(), Some(level.to_string()), plan_index)
+    }
+
+    /// A fully visible current-format plan (phase 0, steps 1..=2, phase 3,
+    /// step 4) plus an appended unordered step: every step is listed, in
+    /// order, and the phases' ordinals do not count as steps.
+    #[test]
+    fn a_complete_plan_lists_every_step_in_plan_order() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(2)),
+            row("1", Some(3)),
+            row("2", Some(4)),
+            row("2", None),
+        ];
+        let want: Vec<Uuid> = [1, 2, 4, 5].iter().map(|i| rows[*i].0).collect();
+        assert_eq!(provable_plan_steps(&rows), want);
+    }
+
+    /// A hidden ordinal edge (here plan_index 2) stops the list: the step at
+    /// plan_index 3 would otherwise be reported as step 1, and the appended
+    /// step after it as step 2.
+    #[test]
+    fn a_gap_in_the_ordinals_stops_the_list() {
+        let rows = vec![
+            row("1", Some(0)),
+            row("2", Some(1)),
+            row("2", Some(3)),
+            row("2", None),
+        ];
+        assert_eq!(provable_plan_steps(&rows), vec![rows[1].0]);
+
+        // A plan whose first ordinal is hidden yields nothing at all.
+        let rows = vec![row("2", Some(1)), row("2", Some(2))];
+        assert!(provable_plan_steps(&rows).is_empty());
+    }
+
+    /// Unordered steps alone, with no ordinal edge and no phase visible, are
+    /// the appended tail of a plan the viewer cannot read: their position is
+    /// unknown, so none is listed. With a phase visible (a plan written before
+    /// the ordinal existed) they are listed positionally, as before.
+    #[test]
+    fn unordered_steps_need_a_visible_plan_to_follow() {
+        let appended = vec![row("2", None)];
+        assert!(provable_plan_steps(&appended).is_empty());
+
+        let legacy = vec![row("1", None), row("2", None), row("2", None)];
+        assert_eq!(provable_plan_steps(&legacy), vec![legacy[1].0, legacy[2].0]);
+    }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn insert_root_creates_workflows_row(pool: sqlx::PgPool) {
@@ -1823,8 +2493,12 @@ mod tests {
 
         // With only gen 0 embedded, the embedding search must return exactly one
         // row (gen 0). Gen 1 is invisible because its goal_embedding IS NULL.
+        // Default mode: with `resolve_to_latest` the unembedded head is ADDED
+        // as its lineage's head (see
+        // `find_hierarchical_by_embedding_resolve_to_latest_includes_unembedded_head`),
+        // so the ANN predicate itself is observed with it off.
         let hits =
-            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, true)
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.0, 0.0, 10, false)
                 .await
                 .unwrap();
         assert_eq!(
@@ -1849,6 +2523,356 @@ mod tests {
         assert_eq!(
             hits[0].generation, 1,
             "higher generation surfaces first with resolve_to_latest ordering"
+        );
+    }
+
+    /// Bridge 37d65fe0 / backlog ed6a953e, embedding path: the ANN predicate
+    /// (`goal_embedding IS NOT NULL`, similarity floor) runs BEFORE ordering,
+    /// so a lineage head with no embedding, or one whose goal moved away from
+    /// the query, never reached `generation DESC`. With `resolve_to_latest`
+    /// the head of every matched `canonical_name` must be present and lead its
+    /// group. Here the head (gen 2) has no embedding at all, and an unrelated
+    /// lineage with a CLOSER match keeps its rank ahead of it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_resolve_to_latest_includes_unembedded_head(
+        pool: sqlx::PgPool,
+    ) {
+        let canonical = "embed-head-test";
+        let mut ids = Vec::new();
+        for g in 0..3 {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                &pool,
+                id,
+                canonical,
+                g,
+                "Send daily digest email",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let other = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            other,
+            "other-lineage",
+            0,
+            "Unrelated but closer",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        // gens 0 and 1 embedded (similarity 0.8); gen 2 (the head) has none.
+        for id in &ids[..2] {
+            WorkflowRepository::set_goal_embedding(&pool, *id, &near)
+                .await
+                .unwrap();
+        }
+        WorkflowRepository::set_goal_embedding(&pool, other, &qvec)
+            .await
+            .unwrap();
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 10, true)
+                .await
+                .unwrap();
+        let order: Vec<(String, i32)> = hits
+            .iter()
+            .map(|h| (h.canonical_name.clone(), h.generation))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("other-lineage".to_string(), 0),
+                (canonical.to_string(), 2),
+                (canonical.to_string(), 1),
+                (canonical.to_string(), 0),
+            ],
+            "the unembedded head must be injected ahead of its matched siblings, \
+             and the closer lineage keeps its rank"
+        );
+
+        // Default mode is unchanged: the unembedded head stays invisible.
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 10, false)
+                .await
+                .unwrap();
+        assert!(hits.iter().all(|h| h.id != ids[2]));
+    }
+
+    /// Embedding path, the LIMIT drop: the head is embedded and above the
+    /// similarity floor but farther than a sibling, so with `limit = 1` only
+    /// the sibling survives the matched LIMIT. `resolve_to_latest` must still
+    /// return the head, ahead of that sibling; default mode returns the
+    /// sibling alone.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_resolve_to_latest_includes_head_past_the_limit(
+        pool: sqlx::PgPool,
+    ) {
+        let canonical = "limit-head-test";
+        let mut ids = Vec::new();
+        for g in 0..2 {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                &pool,
+                id,
+                canonical,
+                g,
+                "Rotate the signing keys",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        // gen 0 is the exact match; the head (gen 1) is above the 0.5 floor
+        // (similarity 0.8) but farther.
+        WorkflowRepository::set_goal_embedding(&pool, ids[0], &qvec)
+            .await
+            .unwrap();
+        WorkflowRepository::set_goal_embedding(&pool, ids[1], &near)
+            .await
+            .unwrap();
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, true)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            order,
+            vec![ids[1], ids[0]],
+            "the head cut by the LIMIT must be added, leading its group"
+        );
+
+        let hits =
+            WorkflowRepository::find_hierarchical_by_embedding(&pool, &qvec, 0.5, 0.0, 1, false)
+                .await
+                .unwrap();
+        let order: Vec<uuid::Uuid> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(order, vec![ids[0]], "default mode keeps the plain LIMIT");
+    }
+
+    /// Text path: the head of a matched `canonical_name` is returned even when
+    /// its goal does not match and its truth is below `min_truth`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_resolve_to_latest_includes_head(pool: sqlx::PgPool) {
+        let canonical = "text-head-test";
+        for g in 0..2 {
+            WorkflowRepository::insert_root(
+                &pool,
+                uuid::Uuid::new_v4(),
+                canonical,
+                g,
+                "consider all available tools",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        let head = uuid::Uuid::new_v4();
+        WorkflowRepository::insert_root(
+            &pool,
+            head,
+            canonical,
+            2,
+            "rewrite the plan",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        WorkflowRepository::set_truth_value(&pool, head, 0.05)
+            .await
+            .unwrap();
+
+        let hits = WorkflowRepository::search_hierarchical_by_text(
+            &pool,
+            "available tools",
+            10,
+            0.3,
+            true,
+        )
+        .await
+        .unwrap();
+        let gens: Vec<i32> = hits.iter().map(|h| h.generation).collect();
+        assert_eq!(
+            gens,
+            vec![1, 0, 2],
+            "the head (truth 0.05, below min_truth) is injected but, being \
+             deprecated, trails the live rows of its group"
+        );
+        assert_eq!(hits[2].id, head);
+
+        let hits = WorkflowRepository::search_hierarchical_by_text(
+            &pool,
+            "available tools",
+            10,
+            0.3,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 2, "default mode unchanged");
+    }
+
+    /// Seeds `canonical` gens 0..=1 (live, truth 1.0 and 0.6, goal
+    /// "consider all available tools") and a head at gen 2 with
+    /// `head_truth` and a goal the text query misses. Gen 0 sits at cosine
+    /// similarity 0.8 to the axis-0 query vector, gen 1 at 1.0, and the head
+    /// has no embedding, so on both search paths the head is ADDED. Returns
+    /// `(ids by generation, query vector)`.
+    async fn seed_threshold_lineage(
+        pool: &sqlx::PgPool,
+        canonical: &str,
+        head_truth: f64,
+    ) -> (Vec<uuid::Uuid>, Vec<f32>) {
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        let mut ids = Vec::new();
+        for (g, goal, truth, emb) in [
+            (0, "consider all available tools", 1.0, Some(&near)),
+            (1, "consider all available tools", 0.6, Some(&qvec)),
+            (2, "rewrite the plan", head_truth, None),
+        ] {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                pool,
+                id,
+                canonical,
+                g,
+                goal,
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            WorkflowRepository::set_truth_value(pool, id, truth)
+                .await
+                .unwrap();
+            if let Some(v) = emb {
+                WorkflowRepository::set_goal_embedding(pool, id, v)
+                    .await
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        (ids, qvec)
+    }
+
+    /// Text path: "deprecated" is `truth_value < min_truth` for the CALLER's
+    /// `min_truth`, not a constant. A 0.4 head leads at 0.3 and trails at
+    /// 0.5; a 0.05 head leads at 0.0. Each case fails a hardcoded threshold
+    /// (`< 0.3` fails 0.5, `<= 0.05` fails 0.5, any constant above 0.05
+    /// fails 0.0).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, _) = seed_threshold_lineage(&pool, "text-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let p = &pool;
+        let at = move |min_truth: f64| {
+            WorkflowRepository::search_hierarchical_by_text(
+                p,
+                "available tools",
+                10,
+                min_truth,
+                true,
+            )
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
+        );
+    }
+
+    /// Embedding path, the same thresholds. A deprecated head takes its
+    /// group's WORST distance, which here is gen 0's: the tie is decided by
+    /// the `deprecated` tiebreak alone (`injected DESC` would put the head
+    /// first). A live head takes the BEST distance, gen 1's. The statement
+    /// spells the predicate twice (tiebreak column, distance CASE); with
+    /// either copy on a constant `< 0.3`, the 0.5 case comes out by
+    /// generation `[1, 2, 0]` instead of `[1, 0, 2]`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, qvec) = seed_threshold_lineage(&pool, "embed-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let (p, q) = (&pool, &qvec[..]);
+        let at = move |min_truth: f64| {
+            WorkflowRepository::find_hierarchical_by_embedding(p, q, 0.5, min_truth, 10, true)
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
         );
     }
 }

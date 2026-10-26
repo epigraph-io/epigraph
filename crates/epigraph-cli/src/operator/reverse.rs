@@ -525,6 +525,13 @@ pub struct Report {
     pub evidence_unhidden: usize,
     /// Hide manifests: rows already on their prior tenancy, unpinned.
     pub evidence_already: usize,
+    /// Restrict manifests: recorded edges left on their (narrow) meet because
+    /// an endpoint the manifest moved is not restored yet (held, or in a later
+    /// batch); the batch that restores it restores the edge.
+    pub edges_deferred: usize,
+    /// Restrict manifests: audit rows written (one per manifest reversed under
+    /// `--apply` that changed anything).
+    pub restrict_audit_rows: usize,
 }
 
 fn tally(
@@ -621,7 +628,7 @@ pub async fn run(
     // before the re-own it followed.
     let mut resolved = Vec::with_capacity(ordered.len());
     for (p, m) in &ordered {
-        if super::hide::is_hide_manifest(m) {
+        if super::hide::is_hide_manifest(m) || super::restrict::is_restrict_manifest(m) {
             resolved.push((p, None, m));
         } else {
             resolved.push((p, Some(resolve(m, &specs)?), m));
@@ -635,6 +642,25 @@ pub async fn run(
     )?;
     let mut report = Report::default();
     'manifests: for (path, res, m) in &resolved {
+        // A restrict manifest (`restrict-claims --apply`) restores visibility
+        // too; its own batches (see `restrict`'s module doc).
+        if super::restrict::is_restrict_manifest(m) {
+            if !super::restrict::reverse_manifest(
+                conn,
+                path,
+                m,
+                &specs,
+                &unkeyed,
+                opts,
+                &mut report,
+                out,
+            )
+            .await?
+            {
+                break 'manifests;
+            }
+            continue;
+        }
         let Some(res) = res else {
             let mut tx = sqlx::Connection::begin(&mut *conn).await?;
             let r = super::hide::reverse_manifest(&mut tx, m, &opts.lock_timeout).await;
@@ -728,6 +754,21 @@ pub async fn run(
     }
     for (t, n) in &report.rows_restored {
         writeln!(out, "  {t}: rows restored to their own recorded owner: {n}")?;
+    }
+    if report.edges_deferred > 0 {
+        writeln!(
+            out,
+            "  restrict manifests: {} edge(s) left on their narrow meet because an endpoint the \
+             manifest moved is not restored (held)",
+            report.edges_deferred
+        )?;
+    }
+    if report.restrict_audit_rows > 0 {
+        writeln!(
+            out,
+            "  restrict manifests: {} audit row(s) written",
+            report.restrict_audit_rows
+        )?;
     }
     if report.missing_rows > 0 {
         writeln!(

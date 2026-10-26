@@ -295,9 +295,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
         "system_agent_write_authority",
-        1,
-        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step). Same \
-         preflight, same refusals (InternalError).",
+        2,
+        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step), and \
+         `embed_inserted_workflow_claims` (the same two handlers' post-commit embed, backlog \
+         5ce88457), which runs only after that transaction committed, so the agent already \
+         resolved once in the request. Same preflight; a refusal there logs and stores no \
+         vector.",
     ),
     (
         "epigraph-cli/src/bin/hypothesis.rs",
@@ -308,8 +311,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-cli/src/bin/method_search.rs",
         "default_decl_for_author",
-        1,
-        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused.",
+        2,
+        "Operator CLI on its maintenance connection. Definer answer: a revoked author is refused. \
+         The second call is in the bin's #[cfg(test)] dedup_race_tests module: it mints the \
+         fixture author's personal group, committed, on the throwaway #[sqlx::test] database \
+         before the racers start, and runs in no build of the binary.",
     ),
 ];
 
@@ -341,6 +347,13 @@ const REVIVE_REGISTER: &[(&str, usize, &str)] = &[
          `reader` role, reachable only by a live admin actor (`'denied_readmit'` otherwise); \
          pinned by `community_membership_integrity.rs`.",
     ),
+    (
+        "migrations/159_community_bootstrap_maintenance_only.sql",
+        1,
+        "159 re-states `epigraph_community_add_member` (bootstrap of a never-populated group \
+         only from a maintenance session); the revival is 106's restore, unchanged: a REVOKED \
+         community row at `reader`, only for a live admin actor.",
+    ),
 ];
 
 /// Every function whose LATEST migration definition arm 3 checks, with the
@@ -357,8 +370,17 @@ const GUARDED_DEFINERS: &[(&str, usize, &[&str])] = &[
     // would drop it), and 0 pins that neither body revives. RVK01 / RVK02 from
     // the call abort the link: `operator_link.rs::a_link_to_an_operator_with_only_a_revoked_own_row_is_refused`
     // and `a_squatted_personal_group_is_not_the_operators` (ARM B).
+    // Migration 161 moved `epigraph_link_operator`'s body, unchanged, into
+    // `epigraph_link_operator_body` (shared with the attested registration's
+    // inherited link). The entry point must still go through that body, and
+    // the body carries the call and the no-revival contract.
     (
         "epigraph_link_operator",
+        0,
+        &["public.epigraph_link_operator_body(p_agent,p_operator,"],
+    ),
+    (
+        "epigraph_link_operator_body",
         0,
         &["public.epigraph_ensure_personal_group(p_operator)"],
     ),

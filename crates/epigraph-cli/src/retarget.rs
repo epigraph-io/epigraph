@@ -88,6 +88,12 @@
 //! `retargeted_to` is fully wired (`retarget_unwired == []`). Meanwhile,
 //! exclude parent edges carrying `retargeted_to` from row-count conflict
 //! metrics.
+//!
+//! The same reason fixes the ATOM's evidence policy (U041): atoms carry
+//! derivation provenance, not derived belief, until `decomposes_to`
+//! propagation exists. `decompose_claims` records one `document` evidence row
+//! per atom naming its parent and writes no BBA, so an atom's belief comes only
+//! from independent evidence or from edges such as the retargets above.
 
 use crate::decompose::strip_code_fence;
 use serde::{Deserialize, Serialize};
@@ -119,9 +125,9 @@ Items:
 
 /// The spelling a retargeted atom edge is sent (and therefore stored) with:
 /// the lower-case conflict relationship, the spelling every exact-case reader
-/// matches (`ClaimRepository::dispute_batch`, `repos/sheaf.rs`,
-/// `routes/computation.rs`, `repos/alternative_set.rs`, and
-/// `create_symmetric_if_absent_oriented`'s dedup). A relationship this
+/// matches (`ClaimRepository::dispute_batch`, `routes/computation.rs`,
+/// `repos/alternative_set.rs`, and `create_symmetric_if_absent_oriented`'s
+/// dedup). A relationship this
 /// function does not know is returned unchanged and left to the API to judge.
 ///
 /// This is NOT always a spelling `POST /api/v1/edges` accepts: see

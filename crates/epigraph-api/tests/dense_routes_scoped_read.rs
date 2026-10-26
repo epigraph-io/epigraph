@@ -86,6 +86,7 @@
 //! |---|---|---|
 //! | `political.rs::epistemic_profile` | `AgentRepository::get_by_id`, `PoliticalRepository::{get_agent_profile_claims, get_agent_evidence_distribution}` | [`epistemic_profile_counts_the_viewers_own_group_private_claim`] |
 //! | `political.rs::claim_genealogy` | `PoliticalRepository::get_claim_genealogy` | [`claim_genealogy_serves_the_viewers_own_group_private_edge`] |
+//! | `political.rs::claim_genealogy` (existence probe) | `ClaimRepository::visible_claim_ids` | [`claim_genealogy_private_claim_is_404_like_a_missing_one`] |
 //! | `political.rs::compare_agents` | `AgentRepository::get_by_id`, `PoliticalRepository::get_agent_profile_claims`, over N agents | [`compare_agents_measures_every_agent_against_the_same_corpus`] |
 //! | `structural.rs::get_structural_features` | nine `StructuralRepository` reads on one connection | [`structural_features_counts_the_viewers_own_group_private_claim`] |
 //!
@@ -249,6 +250,7 @@ fn admin_auth(agent: Uuid) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -428,6 +430,88 @@ async fn claim_genealogy_serves_the_viewers_own_group_private_edge(pool: PgPool)
          viewer; a different count means the predicate is admitting or dropping rows \
          for a reason this arm does not model. got {agents:?}"
     );
+}
+
+/// `GET /api/v1/claims/:id/genealogy` must not be an existence oracle: a claim
+/// the viewer cannot read answers exactly like a claim that does not exist.
+///
+/// The probe that decides 404-vs-200 runs on the stamped connection, and that
+/// connection is a SUPERUSER session in this harness (see the module doc), so
+/// no row policy filters it. Only an in-query visibility predicate on the probe
+/// can turn the stranger's request into a 404 here, which is what this arm
+/// measures: a viewer-less `SELECT EXISTS(SELECT 1 FROM claims WHERE id = $1)`
+/// answers 200 with an empty tree for another group's private claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claim_genealogy_private_claim_is_404_like_a_missing_one(pool: PgPool) {
+    let (owner, group) = seed_agent_with_group(&pool, "s5-gen-oracle-owner").await;
+    let (stranger, _) = seed_agent_with_group(&pool, "s5-gen-oracle-stranger").await;
+    let private = seed_group_claim(&pool, owner, group, "s5 gen oracle: private").await;
+    let public = seed_public_claim(&pool, owner, "s5 gen oracle: public").await;
+
+    // CALIBRATION: the owner reads its own private claim's genealogy, so a 404
+    // below is the visibility verdict and not a broken handler or fixture.
+    let served = claim_genealogy(
+        ViewerExtractor(viewer_for(&pool, owner).await),
+        State(split_state(&pool).await),
+        Path(private),
+    )
+    .await;
+    assert!(
+        served.is_ok(),
+        "CALIBRATION: the owner must be served its own group-private claim's \
+         genealogy; got {:?}",
+        served.err()
+    );
+
+    // CALIBRATION: the SAME stranger is served a public claim it does not own,
+    // so a 404 below is the private-claim verdict, not a probe that fails
+    // closed for anything outside the caller's own groups.
+    let stranger_public = claim_genealogy(
+        ViewerExtractor(viewer_for(&pool, stranger).await),
+        State(split_state(&pool).await),
+        Path(public),
+    )
+    .await;
+    assert!(
+        stranger_public.is_ok(),
+        "CALIBRATION: a stranger must be served a public claim's genealogy; got {:?}",
+        stranger_public.err()
+    );
+
+    // The reference answer: a UUID naming no claim at all.
+    let missing = claim_genealogy(
+        ViewerExtractor(viewer_for(&pool, stranger).await),
+        State(split_state(&pool).await),
+        Path(Uuid::new_v4()),
+    )
+    .await;
+    assert!(
+        matches!(&missing, Err(epigraph_api::errors::ApiError::NotFound { entity, .. }) if entity == "Claim"),
+        "CALIBRATION: a random UUID must be a Claim NotFound; got {:?}",
+        missing.as_ref().map(|j| j.0.propagation_tree.len())
+    );
+
+    let hidden = claim_genealogy(
+        ViewerExtractor(viewer_for(&pool, stranger).await),
+        State(split_state(&pool).await),
+        Path(private),
+    )
+    .await;
+    match hidden {
+        Err(epigraph_api::errors::ApiError::NotFound { entity, id }) => {
+            assert_eq!(entity, "Claim", "same NotFound entity as a missing claim");
+            assert_eq!(id, private.to_string());
+        }
+        Err(other) => panic!(
+            "another group's private claim must answer NotFound, like a missing \
+             one; got a different error {other:?}"
+        ),
+        Ok(out) => panic!(
+            "another group's private claim answered 200 (tree of {} steps) where a \
+             missing claim answers 404: the existence probe is an oracle",
+            out.0.propagation_tree.len()
+        ),
+    }
 }
 
 /// `GET /api/v1/agents/compare` — the arm that exists because this handler's

@@ -34,23 +34,38 @@ Cross-agent **semantic** dedup of the `claims` table, driven by a
 precomputed embedding-similarity snapshot from
 `epigraph-gui/public/semantic-dedup.json`.
 
-**Retracts** duplicates — `supersedes = canonical`, `is_current = false`,
-`embedding = NULL`, `embedding_3072 = NULL`, the same columns the canonical Rust path
-`ClaimRepository::mark_duplicate_with_repair` writes — and additionally marks
-them with the `deduped` label and a `deduped_into` property pointer, so the
-GUI's collapse-equivalents view stays coherent and any hard-delete sweep can
-come later.
+**Marks** each duplicate through the API, `POST /api/v1/claims/{dup}/dedup
+{"canonical_id": ...}`, the same act as MCP `mark_duplicate`: the duplicate is
+retired (`supersedes = canonical`, `is_current = false`, both embeddings
+nulled), gets its `same_as` identity edge carrying `properties.dedup` (so
+`unmark_duplicate` can reverse it and `label_dedup_index_view` reads it), and
+the administrative cascade moves its evidence, edges and mass functions onto
+the canonical with a revert record. The database connection is read-only; it
+only picks canonicals and skips retired members.
 
-The retraction matters because `recall()` filters `WHERE c.embedding IS NOT
-NULL AND c.is_current`. Before 2026-09 this script only wrote the label and
-properties, so every duplicate it "merged" stayed current and kept answering
-recall alongside its canonical — a single-origin figure read as two-to-four-way
-corroboration (backlog c40ab067). Rows soft-marked by a pre-2026-09 run are
-still current and need a one-shot re-retraction; they are identifiable by
-`properties->>'deduped_by' = 'fuzzy_dedup_claims' AND is_current`.
+Until 2026-10 the script marked with its own SQL (a raw `UPDATE claims` plus
+lossy re-pointing) and wrote no identity edge (rows carrying
+`properties->>'deduped_by' = 'fuzzy_dedup_claims'`). Once an operator's
+`backfill_dedup_identity_edges --apply` (epigraph-cli, dry run by default) has
+written the edge they are ordinary dedup records: the index view lists them,
+and `unmark_duplicate` makes the claim current again and restores nothing (that
+SQL kept no repair record; the answer says `legacy_mark`). A legacy mark the
+backfill cannot reconstruct is refused with the reason. An un-marked legacy
+claim keeps its `deduped` label; the script treats that label as a mark only
+while the claim is retired.
 
-A duplicate that already carries a `supersedes` pointer is **refused**, not
-re-pointed, and reported as `duplicates_skipped_already_superseded`.
+`--execute` needs a bearer token (`--token` or `EPIGRAPH_TOKEN`) and refuses to
+start without one; `EPIGRAPH_API_BASE` (or `--api-base`) names the API. The
+endpoint needs the `claims:write` scope and write authority over both claims,
+so a cross-agent cluster needs a token that also carries `claims:admin`. A
+refused mark, or a request that got no HTTP answer, is reported with its
+status and the run exits 1; the cluster's other marks still count.
+
+A member that is not current, or already carries a `supersedes` pointer, is
+never the canonical; as a duplicate it is skipped and reported as
+`duplicates_skipped_already_superseded` (also when it is the cluster's only
+other member), unless it is already marked onto this cluster's canonical by an
+earlier run, which is passed over silently.
 
 This is the **S3 fuzzy** layer. It is *not* the S2 content-hash-keyed
 backfill that gates migration 107 (`UNIQUE (content_hash, agent_id)`).
@@ -60,15 +75,15 @@ Different problems, different keys; both are needed eventually.
 # Inspect what would change against a freshly synced snapshot:
 python3 scripts/fuzzy_dedup_claims.py --input /home/jeremy/epigraph-gui/public/semantic-dedup.json --verbose
 
-# Stage a small commit to validate behaviour on production:
-python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute --limit 50
+# Mark a small batch first:
+EPIGRAPH_TOKEN=... python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute --limit 50
 
 # Full run:
-python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute
+EPIGRAPH_TOKEN=... python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute
 ```
 
-Each cluster runs in its own transaction. A failing cluster is rolled
-back and reported in the summary; the rest of the run continues.
+Each duplicate is one request. A refused one is reported in the summary; the
+rest of the run continues.
 
 ## compute_semantic_dedup.py
 

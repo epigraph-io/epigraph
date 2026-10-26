@@ -25,11 +25,17 @@
 //!
 //! Not converted, and NOT merely deferred:
 //!
-//! * `propagate_beliefs` (7 sites) writes through two of them. Converting only
+//! * `propagate_beliefs` (4 sites, all reads; its apply writes on a
+//!   `write_as` transaction since the batch H-a review). Converting only
 //!   its reads is the shape no shard in this series has reviewed — every prior
 //!   shard converted whole handlers — and a half-converted handler here would
 //!   change its own output silently and with a 200, so it is whole-handler work
-//!   or none. Converting the writes too is worse — `read_as` is
+//!   or none. ONE statement is the deliberate exception: the factor load runs
+//!   on [`AppState::read_as`] because atom-level belief's `decomposes_to`
+//!   exclusion (SPEC §6.2) decides its legacy arm by reading `edges`, and that
+//!   read must see the caller's own private edges. `factors` has no row
+//!   security and the load splices no viewer, so the stamp changes nothing
+//!   else it returns. Converting the writes too is worse — `read_as` is
 //!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
 //!   under `SessionGucMode::Transaction` a write routed through it is rolled
 //!   back while still type-checking, because `ScopedRead` is
@@ -72,6 +78,9 @@ pub struct SheafConsistencyQuery {
     pub min_radius: Option<f64>,
     pub limit: Option<i64>,
     pub frame_id: Option<Uuid>,
+    /// Restriction profile: `regulatory`, or `scientific` (the default), as
+    /// for the MCP `check_sheaf_consistency` and `POST /api/v1/sheaf/reconcile`.
+    pub profile: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -117,7 +126,36 @@ pub struct BeliefAtQuery {
 
 // ── Handlers ──
 
+/// A claim's belief interval from its cached scalars: `[bel, pl]` around
+/// BetP, falling back to the point interval at BetP when Bel / Pl are NULL,
+/// with the measured open-world mass when there is one.
+#[cfg(feature = "db")]
+fn sheaf_interval(
+    betp: f64,
+    belief: Option<f64>,
+    plausibility: Option<f64>,
+    open_world: Option<f64>,
+) -> epigraph_engine::EpistemicInterval {
+    let base = epigraph_engine::EpistemicInterval::from_scalar(
+        betp,
+        belief.unwrap_or(betp),
+        plausibility.unwrap_or(betp),
+    );
+    epigraph_engine::EpistemicInterval::new(
+        base.bel,
+        base.pl,
+        open_world.unwrap_or(base.open_world),
+    )
+}
+
 /// GET /api/v1/sheaf/consistency - Check sheaf consistency across claims.
+///
+/// Reads every visible claim's whole in-force neighbourhood (relationships
+/// matched case-insensitively) and scores it with
+/// `epigraph_engine::build_cdst_sections`, as the MCP `check_sheaf_consistency`
+/// does: a directional positive edge constrains only its target, and
+/// `profile` picks the restriction factors. `limit` truncates the OUTPUT
+/// (worst first), never the scan.
 #[cfg(feature = "db")]
 pub async fn sheaf_consistency(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -126,6 +164,10 @@ pub async fn sheaf_consistency(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let min_radius = params.min_radius.unwrap_or(0.1);
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let profile = match params.profile.as_deref() {
+        Some("regulatory") => epigraph_engine::sheaf::RestrictionProfile::regulatory(),
+        _ => epigraph_engine::sheaf::RestrictionProfile::scientific(),
+    };
 
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
@@ -143,7 +185,6 @@ pub async fn sheaf_consistency(
         &mut *read,
         &viewer,
         params.frame_id,
-        limit * 10, // fetch more rows since multiple neighbors per claim
     )
     .await
     .map_err(|e| ApiError::InternalError {
@@ -152,93 +193,53 @@ pub async fn sheaf_consistency(
 
     crate::routes::finish_scoped_read(read, "sheaf_consistency").await?;
 
-    // Group rows by claim_id → (local_interval, neighbors)
-    // neighbor entry: (EpistemicInterval, RestrictionKind)
-    let mut neighbor_map: HashMap<
-        Uuid,
-        (
-            epigraph_engine::EpistemicInterval,
-            Vec<(
-                epigraph_engine::EpistemicInterval,
-                epigraph_engine::RestrictionKind,
-            )>,
-        ),
-    > = HashMap::new();
-
-    for row in &rows {
-        let claim_betp = match row.claim_betp {
-            Some(v) => v,
-            None => continue,
-        };
-        let neighbor_betp = match row.neighbor_betp {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Build the local interval for this claim.
-        let local_iv = epigraph_engine::EpistemicInterval::from_scalar(
-            claim_betp,
-            row.claim_belief.unwrap_or(claim_betp),
-            row.claim_plausibility.unwrap_or(claim_betp),
-        );
-        // Override open_world if the DB has a measured value.
-        let local_iv = epigraph_engine::EpistemicInterval::new(
-            local_iv.bel,
-            local_iv.pl,
-            row.claim_open_world.unwrap_or(local_iv.open_world),
-        );
-
-        // Build the neighbor interval. The consistency query only returns a
-        // scalar neighbor_betp + optional open_world_mass. Use the scalar as
-        // both bel and pl (width=0, i.e. no closed-world ignorance data), then
-        // override open_world from the DB column if present.
-        let neighbor_iv = {
-            let base = epigraph_engine::EpistemicInterval::from_scalar(
-                neighbor_betp,
-                neighbor_betp,
-                neighbor_betp,
-            );
-            epigraph_engine::EpistemicInterval::new(
-                base.bel,
-                base.pl,
-                row.neighbor_open_world.unwrap_or(base.open_world),
-            )
-        };
-
-        let rk = epigraph_engine::restriction_kind(&row.relationship);
-        let entry = neighbor_map
-            .entry(row.claim_id)
-            .or_insert_with(|| (local_iv, Vec::new()));
-        // Always use the first-seen local_iv (consistent per claim_id).
-        entry.1.push((neighbor_iv, rk));
-    }
-
-    // Compute CDST sections.
-    let mut sections: Vec<serde_json::Value> = neighbor_map
-        .into_iter()
-        .map(|(claim_id, (local_interval, neighbors))| {
-            let section =
-                epigraph_engine::compute_cdst_section(claim_id, local_interval, &neighbors);
-            serde_json::json!({
-                "node_id": section.node_id,
-                "local_betp": section.local_betp,
-                "expected_betp": section.expected_betp,
-                "consistency_radius": section.consistency_radius,
-                "neighbor_count": section.neighbor_count,
-                "local_belief": section.local_interval.bel,
-                "local_plausibility": section.local_interval.pl,
-                "open_world_local": section.open_world_local,
-                "open_world_expected": section.open_world_expected,
-                "interval_inconsistency": section.interval_inconsistency,
-                "ignorance_inconsistency": section.ignorance_inconsistency,
+    let neighbor_rows: Vec<epigraph_engine::NeighborRow> = rows
+        .iter()
+        .filter_map(|row| {
+            Some(epigraph_engine::NeighborRow {
+                claim_id: row.claim_id,
+                local: sheaf_interval(
+                    row.claim_betp?,
+                    row.claim_belief,
+                    row.claim_plausibility,
+                    row.claim_open_world,
+                ),
+                neighbor: sheaf_interval(
+                    row.neighbor_betp?,
+                    row.neighbor_belief,
+                    row.neighbor_plausibility,
+                    row.neighbor_open_world,
+                ),
+                relationship: row.relationship.clone(),
+                outgoing: row.direction == "outgoing",
             })
         })
-        .filter(|s| {
-            s["consistency_radius"]
-                .as_f64()
-                .is_some_and(|r| r >= min_radius)
-        })
         .collect();
+
+    let mut sections: Vec<serde_json::Value> =
+        epigraph_engine::build_cdst_sections(&neighbor_rows, &profile)
+            .into_iter()
+            .map(|section| {
+                serde_json::json!({
+                    "node_id": section.node_id,
+                    "local_betp": section.local_betp,
+                    "expected_betp": section.expected_betp,
+                    "consistency_radius": section.consistency_radius,
+                    "neighbor_count": section.neighbor_count,
+                    "local_belief": section.local_interval.bel,
+                    "local_plausibility": section.local_interval.pl,
+                    "open_world_local": section.open_world_local,
+                    "open_world_expected": section.open_world_expected,
+                    "interval_inconsistency": section.interval_inconsistency,
+                    "ignorance_inconsistency": section.ignorance_inconsistency,
+                })
+            })
+            .filter(|s| {
+                s["consistency_radius"]
+                    .as_f64()
+                    .is_some_and(|r| r >= min_radius)
+            })
+            .collect();
 
     // Sort by consistency_radius descending (worst first).
     sections.sort_by(|a, b| {
@@ -592,13 +593,24 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// written. A claim the caller can see but not WRITE is still refused (403),
 /// and the whole apply is rolled back.
 ///
-/// Returns `(written, skipped_not_visible)`.
+/// # A COMPOUND is never written (SPEC §1.3 D4)
+///
+/// Under atom-level belief a compound (a claim with an in-force
+/// `decomposes_to` out-edge, `compound_ids_among_sql`) is a query over its
+/// atoms and has no cache of its own; BP may still compute a value for one
+/// (read-only diagnostics keep the `evidential_support` / `mutual_exclusion`
+/// factors that name compounds), but apply skips it and counts it in
+/// `skipped_compounds`. The role is read on the same stamped transaction, so
+/// it is decided over the edges the caller can see, not structurally; see
+/// `compound_ids_among_sql` for the residual that leaves.
+///
+/// Returns `(written, skipped_not_visible, skipped_compounds)`.
 #[cfg(feature = "db")]
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     updates: &[BpUpdate],
-) -> Result<(usize, usize), ApiError> {
+) -> Result<(usize, usize, usize), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
     let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
     let visible: std::collections::HashSet<Uuid> =
@@ -611,11 +623,26 @@ async fn apply_bp_updates(
             })?
             .into_iter()
             .collect();
+    let compounds: std::collections::HashSet<Uuid> =
+        sqlx::query_scalar::<_, Uuid>(&epigraph_db::repos::factor::compound_ids_among_sql())
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to read the BP variables' roles: {e}"),
+            })?
+            .into_iter()
+            .collect();
     let mut written = 0_usize;
     let mut skipped = 0_usize;
+    let mut skipped_compounds = 0_usize;
     for (claim_id, betp, interval) in updates {
         if !visible.contains(claim_id) {
             skipped += 1;
+            continue;
+        }
+        if compounds.contains(claim_id) {
+            skipped_compounds += 1;
             continue;
         }
         let result = match interval {
@@ -668,17 +695,20 @@ async fn apply_bp_updates(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the belief updates: {e}"),
     })?;
-    Ok((written, skipped))
+    Ok((written, skipped, skipped_compounds))
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
 ///
-/// With `apply_updates: true` the results are written all-or-nothing on a
+/// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
+/// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
+/// When it is on, the results are written all-or-nothing on a
 /// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
 /// the caller can see but not write fails the request (403) and nothing is
 /// written. A BP variable that is not a claim the caller can see (a stale
 /// factor id, or another group's private claim) is skipped. `applied_count` is
-/// the number of claims written and `skipped_not_visible` the number skipped;
+/// the number of claims written, `skipped_not_visible` the number skipped as
+/// not visible and `skipped_compounds` the number skipped as compounds (D4);
 /// `updated_beliefs` lists what BP computed, which is not the same list.
 #[cfg(feature = "db")]
 pub async fn propagate_beliefs(
@@ -693,19 +723,56 @@ pub async fn propagate_beliefs(
     };
     let apply = request.apply_updates.unwrap_or(false);
 
-    // Load factors from DB
-    let factors: Vec<FactorRow> = sqlx::query_as(
-        "SELECT id, factor_type, variable_ids, potential, description \
-         FROM factors \
-         WHERE ($1::uuid IS NULL OR frame_id = $1) \
-         ORDER BY created_at",
-    )
+    // BP apply is retired (SPEC §6.2, hazard H4): refused before anything is
+    // loaded or computed, so no path below (the empty-factor early return, the
+    // scalar branch's empty-result skip) can answer a write request with a 200.
+    // Read-only runs are unaffected.
+    if apply && state.bp_apply != crate::state::BpApply::On {
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "BP apply is retired: apply_updates:true is refused unless the server runs with \
+                 {}=on. Run with apply_updates:false for a read-only BP diagnostic",
+                crate::state::BP_APPLY_ENV
+            ),
+        });
+    }
+
+    // Load factors from DB. This is the one loader that feeds the BP engines
+    // (`run_cdst_bp`, `run_bp`; interval mode runs the scalar track here), so
+    // the `decomposes_to` exclusion (SPEC §6.2, D3) is applied here, once.
+    //
+    // On the caller's viewer-stamped connection, not the raw pool: the
+    // exclusion's legacy arm matches a factor to its `decomposes_to` edge by
+    // reading `edges`, which row security filters. Unstamped, that read sees
+    // only public edges, so a legacy factor on a decomposition private to the
+    // caller's own group would be loaded. `factors` itself has no row security.
+    // The rest of this handler's reads stay where they were.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "propagate_beliefs",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let factors: Vec<FactorRow> = sqlx::query_as(&format!(
+        "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description \
+         FROM factors f \
+         WHERE ($1::uuid IS NULL OR f.frame_id = $1) \
+           AND {} \
+         ORDER BY f.created_at",
+        epigraph_db::repos::factor::bp_readable_factor_sql()
+    ))
     .bind(request.frame_id)
-    .fetch_all(&state.db_pool)
+    .fetch_all(&mut *read)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to load factors: {e}"),
     })?;
+    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
 
     if factors.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -853,7 +920,7 @@ pub async fn propagate_beliefs(
         // its existing readers and is now always 0: a failed apply is an error
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
-        let (mut written, mut skipped) = (0_usize, 0_usize);
+        let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
         if apply {
             let updates: Vec<BpUpdate> = result
                 .updated_betps
@@ -868,7 +935,8 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
-            (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
+            (written, skipped, skipped_compounds) =
+                apply_bp_updates(&state, &viewer, &updates).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -883,6 +951,7 @@ pub async fn propagate_beliefs(
             "applied": apply,
             "applied_count": written,
             "skipped_not_visible": skipped,
+            "skipped_compounds": skipped_compounds,
             "apply_failures": apply_failures,
             "updated_beliefs": result.updated_betps.iter()
                 .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
@@ -893,14 +962,14 @@ pub async fn propagate_beliefs(
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
-    let (mut written, mut skipped) = (0_usize, 0_usize);
+    let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
     if apply && !result.updated_beliefs.is_empty() {
         let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
             .collect();
-        (written, skipped) = apply_bp_updates(&state, &viewer, &updates).await?;
+        (written, skipped, skipped_compounds) = apply_bp_updates(&state, &viewer, &updates).await?;
     }
 
     let updated: Vec<serde_json::Value> = result
@@ -920,6 +989,7 @@ pub async fn propagate_beliefs(
         "applied": apply,
         "applied_count": written,
         "skipped_not_visible": skipped,
+        "skipped_compounds": skipped_compounds,
         "updated_beliefs": updated,
     })))
 }

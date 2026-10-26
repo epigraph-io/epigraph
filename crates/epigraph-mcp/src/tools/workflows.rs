@@ -29,7 +29,7 @@ fn load_evidence_type_weight(evidence_type: &str) -> f64 {
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -383,6 +383,7 @@ pub async fn store_workflow(
             viewer,
             &extraction,
             auth,
+            None,
         )
         .await?;
 
@@ -505,6 +506,29 @@ async fn find_workflow_post_embed(
         } else {
             std::collections::HashMap::new()
         };
+    // Hierarchical outcome reports (U033) are keyed on their `workflows.id`,
+    // which `find_lineage_root` returns unchanged for a hierarchical row. A
+    // SEPARATE query with its own budget: sharing the lineage query's limit
+    // would let hierarchical roots push flat roots out of it. The key spaces
+    // are disjoint (a `workflows.id` is never a claim id), so extending the
+    // map cannot overwrite a flat entry.
+    let mut affinity_map = affinity_map;
+    if let Some(pgvec) = pgvec_opt.as_deref() {
+        match BehavioralExecutionRepository::behavioral_affinity_hierarchical(
+            &server.pool,
+            pgvec,
+            0.5, // min_similarity
+            1,   // min_executions
+            20,  // limit
+        )
+        .await
+        {
+            Ok(rows) => {
+                affinity_map.extend(rows.into_iter().map(|(id, sim, count)| (id, (sim, count))))
+            }
+            Err(e) => tracing::warn!("hierarchical behavioral affinity lookup failed: {e}"),
+        }
+    }
 
     // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
     // `workflows` table and labels its claims `workflow_thesis` / `workflow_step`
@@ -788,6 +812,62 @@ async fn hierarchical_workflow_result(
         None
     };
 
+    // `steps` above is the FROZEN plan (backlog 563165f2): the claims the
+    // `executes` edges named at ingest, never lineage heads, which the
+    // workflow-pin programme relies on. Disclose, additively, which of those
+    // steps have since been evolved and to what, plus the lineage's newest
+    // generation, so a caller following `steps` is not silently running stale
+    // text. Best-effort: a failed lookup leaves the fields absent rather than
+    // dropping the result.
+    let (has_evolved_steps, evolved_steps) =
+        match WorkflowRepository::resolve_steps_to_heads(pool, viewer, row.id).await {
+            Ok(resolved) => {
+                let evolved: Vec<EvolvedStep> = resolved
+                    .into_iter()
+                    .filter_map(|s| {
+                        // The head named is the one name-mode `evolve_step` /
+                        // `update_with_evidence` act on
+                        // (`WorkflowRepository::resolve_step_claim`): the
+                        // newest CURRENT head. Only when no head is current is
+                        // the newest (retired) one shown, flagged
+                        // `is_current=false`, never presented as current.
+                        let head = s
+                            .heads
+                            .iter()
+                            .find(|h| h.is_current)
+                            .or_else(|| s.heads.first())?;
+                        if s.heads.len() == 1 && head.id == s.frozen_claim_id {
+                            return None;
+                        }
+                        Some(EvolvedStep {
+                            step_index: s.step_index,
+                            frozen_claim_id: s.frozen_claim_id.to_string(),
+                            head_claim_id: head.id.to_string(),
+                            head_content: head.content.clone(),
+                            is_current: head.is_current,
+                            pending_resolution: s.pending_resolution,
+                        })
+                    })
+                    .collect();
+                (
+                    Some(!evolved.is_empty()),
+                    (!evolved.is_empty()).then_some(evolved),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(workflow_id = %row.id, "resolve_steps_to_heads failed: {e}");
+                (None, None)
+            }
+        };
+    let latest_generation =
+        match WorkflowRepository::max_generation_by_canonical(pool, &row.canonical_name).await {
+            Ok(max) => max.map(i64::from),
+            Err(e) => {
+                tracing::warn!(workflow_id = %row.id, "max_generation_by_canonical failed: {e}");
+                None
+            }
+        };
+
     Some(FindWorkflowResult {
         workflow_id: row.id.to_string(),
         goal: row.goal.clone(),
@@ -805,6 +885,9 @@ async fn hierarchical_workflow_result(
         // claim's `properties.promotion`; hierarchical rows have no equivalent
         // field, so it stays absent rather than being faked as `false`.
         promotable: None,
+        has_evolved_steps,
+        evolved_steps,
+        latest_generation,
     })
 }
 
@@ -895,6 +978,11 @@ async fn enrich_workflow_result(
         behavioral_success_rate,
         behavioral_execution_count,
         promotable,
+        // Flat workflow claims carry their steps inline; there is no step
+        // lineage to disclose.
+        has_evolved_steps: None,
+        evolved_steps: None,
+        latest_generation: None,
     })
 }
 
@@ -942,8 +1030,12 @@ pub async fn report_workflow_outcome(
                 deviation_reason: s.deviation_reason.clone(),
             })
             .collect();
-        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_via_pool(
-            &server.pool,
+        // Resolved through the caller's viewer on a stamped transaction, so a
+        // member reads its group's private steps (see the callee).
+        return crate::tools::workflow_hierarchical::do_report_hierarchical_outcome_with_embedder(
+            server.scoped.as_ref(),
+            viewer,
+            server.embedder.as_ref(),
             workflow_id,
             params.success,
             &step_executions,
@@ -1103,6 +1195,7 @@ pub async fn report_workflow_outcome(
         params.success,
         Some("observation"),
         Some(evidence.id.as_uuid()), // unique perspective per evidence submission
+        !foreign_claim, // seed the authored truth_value only on a claim this caller writes
     )
     .await
     .map_err(internal_error)?;
@@ -1623,25 +1716,25 @@ async fn deprecate_hierarchical_workflow(
                 row_retired.push(c.id.to_string());
             }
         }
-        if grant.admin {
-            crate::tools::workflow_authority::audit_admin_workflow_write(
-                &mut tx,
-                auth,
-                caller,
-                TOOL,
-                row,
-                grant.owner,
-                serde_json::json!({
-                    "truth_value_after": 0.05,
-                    "workflow_row_changed": row_changed > 0,
-                    "retired_claim_ids": row_retired,
-                    "kept_shared_claim_ids": row_kept,
-                    "cascade": cascade,
-                    "reason": params.reason,
-                }),
-            )
-            .await?;
-        }
+        // From the post-lock grant only (step 3): the admin arm's audit row,
+        // or the provenance row of any other authenticated arm.
+        crate::tools::workflow_authority::record_workflow_write(
+            &mut tx,
+            auth,
+            caller,
+            TOOL,
+            row,
+            *grant,
+            serde_json::json!({
+                "truth_value_after": 0.05,
+                "workflow_row_changed": row_changed > 0,
+                "retired_claim_ids": row_retired,
+                "kept_shared_claim_ids": row_kept,
+                "cascade": cascade,
+                "reason": params.reason,
+            }),
+        )
+        .await?;
         if row_changed > 0 {
             deprecated_ids.push(row.to_string());
         }

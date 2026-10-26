@@ -395,14 +395,26 @@ pub async fn analyze_result(
         message: format!("Failed to create provides_evidence edge: {e}"),
     })?;
 
-    // Submit mass function to hypothesis_assessment frame
-    let frame_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("{e}"),
-            })?;
+    // Submit the mass function to the frame the hypothesis's readers read:
+    // hypothesis_assessment, or research_validity once it is promoted (writers
+    // follow the readers, operator ruling R-8). The status is read as the
+    // caller, on a stamped connection.
+    let evidence_frame = {
+        let mut read = state.read_as(&viewer).await?;
+        epigraph_engine::promotion::hypothesis_evidence_frame(
+            &mut read,
+            &viewer,
+            experiment.hypothesis_id,
+        )
+        .await?
+    };
+    let frame_id: (Uuid,) = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(evidence_frame)
+        .fetch_one(&state.db_pool)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{evidence_frame} frame not found: {e}"),
+        })?;
 
     let masses_json = mass_result.mass_function.masses_to_json();
     epigraph_db::MassFunctionRepository::store(
@@ -413,6 +425,10 @@ pub async fn analyze_result(
         &masses_json,
         None,
         Some("error_derived"),
+        // Untyped on purpose (bc06ec6f): the only type source in scope is the
+        // submitter-declared `data_source`, and typing from it would raise the
+        // row above the 0.5 unknown-type weight.
+        None,
         "unknown", // experiment-derived; no evidence-DOI vs paper comparison (issue #197)
         None,      // error-derived BBA has no evidence row (issue #197 Phase 3)
     )

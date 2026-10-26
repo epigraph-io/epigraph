@@ -493,17 +493,19 @@ async fn a_live_member_can_add_another(pool: PgPool) {
     assert_eq!(live_membership(&pool, row.id, newcomer).await, 1);
 }
 
-/// A community whose projected group has no live members is OPEN — the
-/// bootstrap case.
+/// A community whose projected group has never had a member is open to a
+/// MAINTENANCE session — the bootstrap case.
 ///
 /// Migration 068 projected communities with `created_by_agent_id` NULL and no
-/// admin membership. Refusing the first `add_member` on those would leave every
-/// pre-existing community unmanageable forever, with no in-band way out. The
-/// bootstrap branch is therefore deliberate, and it is exactly why
-/// `create_community` now passes the authenticated creator: a community created
-/// through the route is never in this state.
+/// admin membership. Refusing the first `add_member` on those everywhere would
+/// leave every pre-existing community unmanageable forever, with no in-band way
+/// out, so the bootstrap branch stays; since migration 159 it is the operator's
+/// (`epigraph_bypass()`, which this superuser fixture pool is), and the deployed
+/// role is refused (`community_membership_integrity.rs::a_memberless_legacy_group_does_not_admit_a_first_joiner`).
+/// It is also why `create_community` passes the authenticated creator: a
+/// community created through the route is never in this state.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_memberless_community_group_is_open_for_bootstrap(pool: PgPool) {
+async fn a_memberless_community_group_is_bootstrappable_by_maintenance(pool: PgPool) {
     let (anyone, _) = fixture::seed_agent_with_group(&pool, "anyone").await;
     let row = CommunityRepository::create(&pool, "orphaned", None, None, None, None)
         .await
@@ -517,8 +519,9 @@ async fn a_memberless_community_group_is_open_for_bootstrap(pool: PgPool) {
     assert_eq!(
         outcome,
         MembershipOutcome::Applied,
-        "a group with no live members has nobody who could ever authorize the \
-         first join; refusing would be a permanent dead end, not a control"
+        "a group that never had a member has nobody who could authorize the first \
+         join, so the maintenance session must still be able to seed it; refusing \
+         there too would be a permanent dead end, not a control"
     );
 }
 

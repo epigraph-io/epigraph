@@ -92,12 +92,28 @@ pub struct CrossSourceMatchesResponse {
 /// The existence probe is scoped too: a claim the viewer cannot read must 404
 /// exactly as a nonexistent one does (§8.5), or this endpoint is an existence
 /// oracle for every private claim id.
+///
+/// # Scope
+///
+/// Requires `claims:read`, checked here rather than left to router placement,
+/// for the same reason `list_candidates` below gives. It matches the MCP twin
+/// (`find_cross_source_matches` in `epigraph-mcp/src/scope_map.rs`). The check
+/// runs before the existence probe, so a caller without the scope gets the
+/// same 403 for an absent id as for a present one.
 #[cfg(feature = "db")]
 pub async fn get_cross_source_matches(
     State(state): State<AppState>,
     ViewerExtractor(viewer): ViewerExtractor,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<CrossSourceMatchesResponse>, ApiError> {
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "get_cross_source_matches requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:read"])?;
+
     // 404 if the claim doesn't exist *for this viewer*. Using count(*) so we
     // don't pay for the full row hydration we'd get from
     // ClaimRepository::get_by_id.
@@ -426,9 +442,11 @@ pub async fn decide_candidate(
             );
             trigger.candidate_status = Some(row.status.clone());
             let db_err = |e: String| ApiError::DatabaseError { message: e };
-            let (cascade, outcome) = match state.admin_cascade_session().await {
+            let (cascade, outcome, belief_cascade) = match state.admin_cascade_session().await {
                 Ok(mut session) => {
-                    admin_cascade::apply_match_retire(session.conn(), &viewer, &trigger, id).await
+                    let (conn, admin_viewer) = session.split();
+                    admin_cascade::apply_match_retire(conn, admin_viewer, &viewer, &trigger, id)
+                        .await
                 }
                 // No maintenance connection: nothing about the candidate
                 // changes. The whole retirement is recorded as a deferred
@@ -444,7 +462,7 @@ pub async fn decide_candidate(
                             db_err(format!("Failed to record the deferred retirement: {e}"))
                         })?;
                     tx.commit().await.map_err(|e| db_err(e.to_string()))?;
-                    (status, None)
+                    (status, None, Default::default())
                 }
             };
             // Not retired (deferred, or refused on the maintenance connection):
@@ -468,25 +486,23 @@ pub async fn decide_candidate(
             };
             let previous_status = outcome.previous_status.clone();
 
-            // Deliberately NOT followed by `recompute_claim_belief_binary`.
-            // That entry point recombines `mass_functions`, and a matcher
-            // promotion writes none (it calls
-            // `EdgeRepository::create_symmetric_if_absent`, never
-            // `auto_wire_edge_if_epistemic`), so it would provably return
-            // bit-identical scalars. What a retirement invalidates is the
-            // factor graph, whose consumer —
-            // `routes/computation.rs::propagate_beliefs`, i.e.
-            // `POST /api/v1/bp/propagate` with `apply_updates: true` — reloads
-            // `factors` from the database on every run and is the only writer
-            // of the `claims.pignistic_prob` a deleted factor could have
-            // biased. The affected endpoints are returned so a caller that
-            // cares can drive that pass itself.
+            // When the retirement withdrew anything, the cascade already
+            // re-derived both endpoints' belief from the `mass_functions` that
+            // survive (`belief_cascade`, audited under
+            // `cascade.belief_audit_event_id`). Re-running
+            // `POST /api/v1/bp/propagate` would NOT do that job: it builds its
+            // variables from the surviving `factors` only, so an endpoint whose
+            // only factor was the matcher edge is no longer a variable and keeps
+            // whatever value a past `apply_updates: true` run wrote, and scalar
+            // BP seeds its priors from that stored value. A propagate after the
+            // retirement folds the remaining factors back in; it is optional.
             return Ok(Json(serde_json::json!({
                 "id": id.to_string(),
                 "status": "stale",
                 "previous_status": previous_status,
                 "retired": true,
                 "cascade": cascade,
+                "belief_cascade": belief_cascade,
                 "edges_retracted": outcome.edges_retracted,
                 "factors_deleted": outcome.factors_deleted,
                 "bp_messages_deleted": outcome.bp_messages_deleted,

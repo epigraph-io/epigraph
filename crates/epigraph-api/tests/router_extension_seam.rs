@@ -87,6 +87,7 @@ fn token(state: &AppState, agent: Uuid, scopes: &[&str], elevation: Option<Uuid>
             AccessTokenBinding {
                 family_id: elevation.map(|_| Uuid::new_v4()),
                 elevation_id: elevation,
+                delegated_by: None,
             },
         )
         .expect("mint")

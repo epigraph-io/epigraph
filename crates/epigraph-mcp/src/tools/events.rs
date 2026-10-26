@@ -36,6 +36,7 @@ pub async fn list_events(
         viewer,
         params.event_type.as_deref(),
         actor_id,
+        None, // no cursor: MCP `list_events` is a "recent events" view
         limit,
     )
     .await
@@ -55,7 +56,7 @@ pub async fn list_events(
         })
         .collect();
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "events": results,
             "total": results.len(),
@@ -113,7 +114,7 @@ pub async fn publish_event(
             .await
             .map_err(internal_error)?;
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::json!({
             "event_id": event_id,
             "event_type": params.event_type,

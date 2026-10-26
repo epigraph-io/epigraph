@@ -127,81 +127,11 @@ pub fn parse_batch_response(raw: &str) -> std::collections::BTreeMap<usize, Deco
 // ELIGIBILITY: which undecomposed claims are worth an LLM call
 // =============================================================================
 
-/// Longest claim, in Unicode scalar values, that [`looks_atomic`] may call
-/// atomic. Chosen by the operator brief (2026-09-24): "one sentence and ≤ 160
-/// chars".
-pub const ATOMIC_MAX_CHARS: usize = 160;
-
-/// Number of sentences in `text`, by a deliberately simple rule.
-///
-/// A boundary is either
-/// * a run of `.` `!` `?` (plus any closing quote/bracket), followed by
-///   whitespace, followed by an uppercase letter, a digit, or an opening
-///   quote/bracket; or
-/// * a line break between two non-blank lines (bullet lists, pasted notes).
-///
-/// It errs toward COUNTING a boundary: `"Dr. Smith"` and `"e.g. The"` read as
-/// two sentences. That direction only sends a claim to the LLM that could have
-/// been skipped; the opposite error would silently skip a compound claim.
-/// Decimals (`3.5`) and dotted identifiers (`epigraph.io`) never count, because
-/// no whitespace follows the dot.
-pub fn sentence_count(text: &str) -> usize {
-    let chars: Vec<char> = text.trim().chars().collect();
-    if chars.is_empty() {
-        return 0;
-    }
-    let closing = |c: char| matches!(c, '"' | '\'' | ')' | ']' | '\u{201d}' | '\u{2019}');
-    let opening = |c: char| matches!(c, '"' | '\'' | '(' | '[' | '\u{201c}' | '\u{2018}');
-    let mut n = 1;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if matches!(c, '.' | '!' | '?') {
-            let mut j = i + 1;
-            while j < chars.len() && (matches!(chars[j], '.' | '!' | '?') || closing(chars[j])) {
-                j += 1;
-            }
-            let mut k = j;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
-            if k > j && k < chars.len() {
-                let next = chars[k];
-                if next.is_uppercase() || next.is_ascii_digit() || opening(next) {
-                    n += 1;
-                    // The whitespace run is consumed: a newline inside it must
-                    // not count the same boundary twice.
-                    i = k;
-                    continue;
-                }
-            }
-            i = j;
-        } else if c == '\n' {
-            // A line break between non-blank lines is a boundary.
-            let mut k = i + 1;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
-            if k < chars.len() {
-                n += 1;
-            }
-            i = k;
-        } else {
-            i += 1;
-        }
-    }
-    n
-}
-
-/// Whether `content` is already atomic enough that decomposing it would spend
-/// an LLM call to get the claim back unchanged: exactly one sentence (see
-/// [`sentence_count`]) and at most [`ATOMIC_MAX_CHARS`] characters.
-///
-/// This is the ONE definition of the heuristic; the eligibility filter and its
-/// report both call it.
-pub fn looks_atomic(content: &str) -> bool {
-    sentence_count(content) <= 1 && content.trim().chars().count() <= ATOMIC_MAX_CHARS
-}
+// The heuristic lives in `epigraph-core` so the MCP server, which this crate
+// depends on and so cannot depend back on, can flag the same rows this filter
+// skips. Re-exported so every `epigraph_cli::decompose::looks_atomic` path still
+// resolves to the ONE definition.
+pub use epigraph_core::atomicity::{looks_atomic, sentence_count, ATOMIC_MAX_CHARS};
 
 /// The opt-out eligibility filters. Both default ON (`skip_* = true`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +158,14 @@ pub enum Ineligible {
     Backlog,
     /// [`looks_atomic`] accepted it.
     LooksAtomic { sentences: usize, chars: usize },
+    /// Not `visibility = 'public'`. Atoms are POSTed with `if_not_exists`,
+    /// which the API allows only for the public tier, and their derivation
+    /// evidence copies the parent's text; decomposing a group-private parent
+    /// would republish it. Not overridable.
+    NotPublic { visibility: String },
+    /// The model already answered this exact text with one atom (recorded in
+    /// the [`SingletonLedger`]); asking again would buy the same answer.
+    JudgedAtomic,
 }
 
 impl std::fmt::Display for Ineligible {
@@ -241,6 +179,16 @@ impl std::fmt::Display for Ineligible {
                 f,
                 "looks atomic ({sentences} sentence, {chars} chars <= {ATOMIC_MAX_CHARS}; \
                  pass --include-short to decompose it)"
+            ),
+            Self::NotPublic { visibility } => write!(
+                f,
+                "visibility is `{visibility}`, not `public` (atoms are public and carry the \
+                 parent's text as derivation evidence; never decomposed)"
+            ),
+            Self::JudgedAtomic => write!(
+                f,
+                "the model already judged this text atomic (singleton ledger; pass \
+                 --include-judged-atomic to ask again)"
             ),
         }
     }
@@ -265,6 +213,81 @@ pub fn check_eligibility(
         });
     }
     Ok(())
+}
+
+/// The one eligibility rule no flag overrides: only a `visibility = 'public'`
+/// claim is decomposed.
+///
+/// Selection on the maintenance path runs under a BYPASS viewer and so sees
+/// group-private claims (on the `--as-agent` path only those of the acting
+/// agent's groups), but every atom is POSTed public (`if_not_exists` is public-tier
+/// only) and records the parent's text as its derivation evidence (U041). A
+/// group-private parent would be republished as public atoms, and the API
+/// refuses its `derived_from` — which would abort a normal run. So it is
+/// skipped here and reported.
+///
+/// # Errors
+/// [`Ineligible::NotPublic`] for any other visibility.
+pub fn check_publicly_decomposable(visibility: &str) -> Result<(), Ineligible> {
+    if visibility == "public" {
+        Ok(())
+    } else {
+        Err(Ineligible::NotPublic {
+            visibility: visibility.to_string(),
+        })
+    }
+}
+
+// =============================================================================
+// ATOM CREATE BODY: what `decompose_claims` POSTs to `/api/v1/claims`
+// =============================================================================
+
+/// The parent an atom is being written for, as the submit closure of
+/// `run_decomposition_batches` / `persist_planned` receives it.
+///
+/// A struct rather than two adjacent `Uuid` arguments: the closure needs
+/// both the parent's id (the atom POST names it in `derived_from`, which
+/// records the atom's derivation evidence) and its author (atoms inherit it
+/// as `agent_id`), and a swapped pair of bare `Uuid`s would compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomParent {
+    /// The compound claim being decomposed.
+    pub claim_id: uuid::Uuid,
+    /// Its author, which the atom inherits.
+    pub agent_id: uuid::Uuid,
+}
+
+/// The `derived_from.method` every `decompose_claims` atom names.
+pub const DECOMPOSE_DERIVATION_METHOD: &str = "decompose_claims";
+
+/// The JSON body `decompose_claims` POSTs to `/api/v1/claims` for one atom.
+///
+/// A pure function, so the wire shape is testable: the API's
+/// `CreateClaimRequest` has no `deny_unknown_fields`, so a misspelt key here
+/// (or a swapped parent id / author) is silently dropped with a 200, and the
+/// atom is born with `evidence_ids=[]` again (backlog 3590a2d8).
+///
+/// * `agent_id` is the PARENT's author — atoms inherit it.
+/// * `if_not_exists=true`: an atom whose text already exists for that author
+///   dedups onto the existing claim, and edges are re-wired idempotently.
+/// * methodology/evidence_type belong in `properties` (JSONB); top-level they
+///   were unknown fields and silently dropped.
+/// * `derived_from` names the parent: the API records one `document`
+///   evidence row carrying the parent's text, in the atom's own transaction.
+///   Provenance, not belief: no mass function, truth stays 0.5 (U041).
+pub fn atom_create_body(atom_text: &str, generality: i64, parent: AtomParent) -> Value {
+    serde_json::json!({
+        "content": atom_text,
+        "agent_id": parent.agent_id,
+        "initial_truth": 0.5,
+        "if_not_exists": true,
+        "properties": {
+            "methodology": "inductive_generalization",
+            "evidence_type": "logical"
+        },
+        "labels": ["atom", format!("generality:{generality}")],
+        "derived_from": {"claim_id": parent.claim_id, "method": DECOMPOSE_DERIVATION_METHOD},
+    })
 }
 
 // =============================================================================
@@ -375,6 +398,240 @@ pub fn read_plan_jsonl(
     Ok(out)
 }
 
+// =============================================================================
+// SINGLETON LEDGER: parents the model already judged atomic
+// =============================================================================
+
+/// One `--singleton-ledger` line: the model answered this parent's text with
+/// a single atom ("already atomic"), so nothing was written for it.
+///
+/// [`persist_decomposition`](db_writes::persist_decomposition) deliberately
+/// writes no self-equivalent child and no edge for such a parent, so it stays
+/// in the undecomposed population; without this record every later run would
+/// select it again and spend another LLM call on the same answer (backlog
+/// 68d03c24). The verdict is keyed on the parent's id AND the BLAKE3 of the
+/// exact text the model judged, so a parent whose text changes is asked again.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct JudgedAtomicEntry {
+    /// Always [`SingletonLedger::KIND`], so a plan or retarget manifest
+    /// handed to `--singleton-ledger` by mistake is refused.
+    pub kind: String,
+    pub claim_id: uuid::Uuid,
+    /// Lower-case hex BLAKE3 of the parent text the model judged.
+    pub content_blake3: String,
+    /// `LlmProvider::model_name()` of the provider that judged it.
+    pub model: String,
+    pub decided_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The JSONL file of [`JudgedAtomicEntry`] lines that takes LLM-judged
+/// singletons out of `decompose_claims` selection.
+///
+/// A file, not a DB marker (U040 ruling, 2026-10-14): labelling the parent
+/// would mutate other agents' claims from a maintenance job, and a verdict
+/// table is a migration plus four transcribed predicates. Selection reads it
+/// through [`SingletonLedger::contains`]; the persist path appends to it
+/// (`persist_planned`), so a run records its own verdicts and a `--plan`
+/// records nothing until the plan is applied.
+#[derive(Debug, Default)]
+pub struct SingletonLedger {
+    path: std::path::PathBuf,
+    entries: std::collections::HashSet<(uuid::Uuid, [u8; 32])>,
+    writable: bool,
+}
+
+impl SingletonLedger {
+    pub const KIND: &'static str = "judged_atomic";
+
+    /// Read `path` for selection only. A missing file is an empty ledger and
+    /// is NOT created (`--dry-run` and `--plan` write nothing).
+    ///
+    /// A final line with no newline that does not parse is a TORN append (a
+    /// crash or a full disk mid-write): it is skipped with a warning, so the
+    /// scheduled job does not fail at startup until someone edits the file.
+    /// [`open_for_append`](Self::open_for_append) cuts it off. Any other bad
+    /// line is refused.
+    ///
+    /// # Errors
+    /// I/O failure other than not-found, or a line that is not a
+    /// [`JudgedAtomicEntry`] (reported as `path:line`; nothing is loaded).
+    pub fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let raw = match std::fs::read(path) {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(format!("cannot read singleton ledger {}: {e}", path.display()).into())
+            }
+        };
+        let torn_tail = (!raw.is_empty() && !raw.ends_with('\n'))
+            .then(|| raw.lines().count())
+            .filter(|_| {
+                raw.lines()
+                    .last()
+                    .is_some_and(|l| parse_ledger_line(l).is_err())
+            });
+        let mut entries = std::collections::HashSet::new();
+        for (n, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if torn_tail == Some(n + 1) {
+                eprintln!(
+                    "WARNING: {}:{}: skipping a torn final line (an interrupted append); the \
+                     next recording run removes it",
+                    path.display(),
+                    n + 1
+                );
+                continue;
+            }
+            let (id, digest) = parse_ledger_line(line).map_err(|why| {
+                format!(
+                    "{}:{}: not a singleton-ledger line ({why}); fix or remove the line",
+                    path.display(),
+                    n + 1
+                )
+            })?;
+            entries.insert((id, digest));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+            writable: false,
+        })
+    }
+
+    /// [`load`](Self::load), and also create the file if it is missing, so a
+    /// path that cannot be written fails BEFORE any LLM call rather than after
+    /// the verdicts are paid for.
+    ///
+    /// An unterminated final line is settled first, so the next append starts
+    /// on a line of its own: a torn one (it does not parse) is cut off, a
+    /// complete one gets its newline.
+    ///
+    /// # Errors
+    /// As [`load`](Self::load), or the file cannot be opened for append.
+    pub fn open_for_append(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        use std::io::Write;
+        let cannot = |e: std::io::Error| {
+            format!(
+                "cannot open singleton ledger {} for append: {e}",
+                path.display()
+            )
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(cannot)?;
+        let raw = std::fs::read(path).map_err(cannot)?;
+        if !raw.is_empty() && !raw.ends_with(b"\n") {
+            let start = raw.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            if parse_ledger_line(&String::from_utf8_lossy(&raw[start..])).is_ok() {
+                f.write_all(b"\n").map_err(cannot)?;
+            } else {
+                f.set_len(start as u64).map_err(cannot)?;
+                eprintln!(
+                    "WARNING: {}: removed a torn final line ({} bytes) left by an interrupted \
+                     append",
+                    path.display(),
+                    raw.len() - start
+                );
+            }
+        }
+        let mut ledger = Self::load(path)?;
+        ledger.writable = true;
+        Ok(ledger)
+    }
+
+    /// Whether the model already judged `claim_id`, with exactly this text,
+    /// atomic.
+    pub fn contains(&self, claim_id: uuid::Uuid, content: &str) -> bool {
+        self.entries.contains(&(claim_id, content_digest(content)))
+    }
+
+    /// Number of distinct `(claim, text)` verdicts held.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Append one verdict as a single JSONL line (one `write_all`, so a crash
+    /// cannot interleave two records). A verdict already held is not written
+    /// twice.
+    ///
+    /// # Errors
+    /// The ledger was [`load`](Self::load)ed read-only, or the append failed.
+    pub fn record(
+        &mut self,
+        claim_id: uuid::Uuid,
+        content: &str,
+        model: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::Write;
+        if !self.writable {
+            return Err(format!(
+                "singleton ledger {} was opened read-only",
+                self.path.display()
+            )
+            .into());
+        }
+        let digest = content_digest(content);
+        if self.entries.contains(&(claim_id, digest)) {
+            return Ok(());
+        }
+        let entry = JudgedAtomicEntry {
+            kind: Self::KIND.to_string(),
+            claim_id,
+            content_blake3: hex::encode(digest),
+            model: model.to_string(),
+            decided_at: chrono::Utc::now(),
+        };
+        let mut line = serde_json::to_vec(&entry)?;
+        line.push(b'\n');
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| {
+                format!(
+                    "cannot append to singleton ledger {}: {e}",
+                    self.path.display()
+                )
+            })?;
+        f.write_all(&line)?;
+        f.flush()?;
+        self.entries.insert((claim_id, digest));
+        Ok(())
+    }
+}
+
+/// One ledger line as `(claim id, BLAKE3 of the judged text)`, or why not.
+fn parse_ledger_line(line: &str) -> Result<(uuid::Uuid, [u8; 32]), String> {
+    let e: JudgedAtomicEntry = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if e.kind != SingletonLedger::KIND {
+        return Err(format!(
+            "kind {:?} is not {:?}",
+            e.kind,
+            SingletonLedger::KIND
+        ));
+    }
+    let digest: [u8; 32] = hex::decode(&e.content_blake3)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| "content_blake3 is not 32 hex bytes".to_string())?;
+    Ok((e.claim_id, digest))
+}
+
+fn content_digest(content: &str) -> [u8; 32] {
+    *blake3::hash(content.as_bytes()).as_bytes()
+}
+
 pub(crate) fn strip_code_fence(raw: &str) -> String {
     let t = raw.trim();
     if let Some(start) = t.find("```") {
@@ -391,16 +648,173 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, BatchClaim, BatchTotals, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
+    verify_plan, visible_claim_count, writer_group, BatchClaim, BatchTotals, DecomposeDb,
+    DecomposeRead, DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
 mod db_writes {
-    use super::Decomposition;
-    use epigraph_db::{ClaimRepository, EdgeRepository};
-    use sqlx::PgPool;
+    use super::{AtomParent, Decomposition};
+    use epigraph_db::visibility::Viewer;
+    use epigraph_db::{ClaimRepository, DbError, EdgeRepository};
+    use sqlx::{PgConnection, PgPool};
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// Where a decomposition run's statements go, and as whom.
+    ///
+    /// Two implementations, one per way `decompose_claims` connects:
+    ///
+    /// * [`PgPool`] — the MAINTENANCE path. The pool is a privileged
+    ///   connection (`epigraph_cli::MaintenancePool`, checked at startup) and
+    ///   the viewer a bypass, so statements run on it as they are: row
+    ///   security does not filter them.
+    /// * [`epigraph_db::ScopedPool`] — the `--as-agent` path, on the ordinary
+    ///   application login with NO maintenance privilege (backlog 9a877b7c,
+    ///   operator ruling 2026-10-20). Every read runs on a connection stamped
+    ///   for the viewer ([`epigraph_db::ScopedPool::read_as`]) and every write
+    ///   in a transaction stamped for it ([`epigraph_db::ScopedPool::begin_as`]),
+    ///   so the in-query predicate and row security agree, and a
+    ///   `decomposes_to` edge records the acting agent's group as its writer
+    ///   (migration 120) instead of landing ownerless through the world arm an
+    ///   unstamped insert would take. Both refuse a bypass viewer. The edge
+    ///   dedup probe inside `persist_decomposition`
+    ///   (`EdgeRepository::create_if_absent_including_retracted_conn`, marked
+    ///   VISIBILITY-EXEMPT) is NOT exempt here: on this login row security
+    ///   filters it, so an existing edge the agent cannot see does not stop
+    ///   a second identical one.
+    ///
+    /// The library functions take `&dyn DecomposeDb`, so a caller holding a
+    /// `PgPool` passes `&pool` unchanged.
+    #[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
+    #[async_trait::async_trait]
+    pub trait DecomposeDb: Send + Sync {
+        /// A connection to read on, as `viewer`.
+        async fn read<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError>;
+        /// A transaction to write in, as `viewer`.
+        async fn write<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError>;
+    }
+
+    /// A read connection from a [`DecomposeDb`]; derefs to the connection.
+    pub enum DecomposeRead<'a> {
+        Pool(sqlx::pool::PoolConnection<sqlx::Postgres>),
+        Scoped(epigraph_db::ScopedRead<'a>),
+    }
+
+    impl std::ops::Deref for DecomposeRead<'_> {
+        type Target = PgConnection;
+        fn deref(&self) -> &PgConnection {
+            match self {
+                Self::Pool(c) => c,
+                Self::Scoped(c) => c,
+            }
+        }
+    }
+
+    impl std::ops::DerefMut for DecomposeRead<'_> {
+        fn deref_mut(&mut self) -> &mut PgConnection {
+            match self {
+                Self::Pool(c) => c,
+                Self::Scoped(c) => c,
+            }
+        }
+    }
+
+    /// A write transaction from a [`DecomposeDb`]. Dropped without
+    /// [`Self::commit`], it rolls back.
+    pub enum DecomposeTx<'a> {
+        Pool(sqlx::Transaction<'static, sqlx::Postgres>),
+        Scoped(epigraph_db::ScopedTx<'a>),
+    }
+
+    impl DecomposeTx<'_> {
+        /// The transaction's connection.
+        pub fn conn(&mut self) -> &mut PgConnection {
+            match self {
+                Self::Pool(t) => t,
+                Self::Scoped(t) => t,
+            }
+        }
+
+        /// Commit.
+        ///
+        /// # Errors
+        /// The commit failed.
+        pub async fn commit(self) -> Result<(), DbError> {
+            match self {
+                Self::Pool(t) => t.commit().await.map_err(DbError::from),
+                Self::Scoped(t) => t.commit().await,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DecomposeDb for PgPool {
+        async fn read<'a>(&'a self, _viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError> {
+            Ok(DecomposeRead::Pool(
+                self.acquire()
+                    .await
+                    .map_err(|source| DbError::ConnectionFailed { source })?,
+            ))
+        }
+
+        async fn write<'a>(&'a self, _viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError> {
+            Ok(DecomposeTx::Pool(self.begin().await?))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DecomposeDb for epigraph_db::ScopedPool {
+        async fn read<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeRead<'a>, DbError> {
+            Ok(DecomposeRead::Scoped(self.read_as(viewer).await?))
+        }
+
+        async fn write<'a>(&'a self, viewer: &Viewer) -> Result<DecomposeTx<'a>, DbError> {
+            Ok(DecomposeTx::Scoped(self.begin_as(viewer).await?))
+        }
+    }
+
+    /// How many claims `viewer` sees on `db`, through the same visibility
+    /// predicate (and, on a [`epigraph_db::ScopedPool`], the same row
+    /// security) every selection read uses.
+    ///
+    /// The `--as-agent` zero-visible check for a population narrower than
+    /// "every undecomposed claim" (`--priority conflict`): an empty conflict
+    /// queue is a legitimate result, a session that sees no claim at all is
+    /// not.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn visible_claim_count(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+    ) -> Result<i64, DbError> {
+        ClaimRepository::count_conn(&mut *db.read(viewer).await?, viewer, None).await
+    }
+
+    /// The group a `decomposes_to` edge written as `viewer` on `db` records
+    /// as its writer ([`EdgeRepository::session_writer_group`], the function
+    /// migration 120's edge trigger stamps `writer_group_id` from), evaluated
+    /// in a write transaction stamped exactly like the edge transaction and
+    /// rolled back: nothing is written.
+    ///
+    /// `None` means such an edge would land with no writer group. That is the
+    /// case for an agent with no writable group, and ALSO for one whose
+    /// writable groups include neither its operator's personal group nor its
+    /// own: a count of writable groups answers a different question.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn writer_group(
+        db: &dyn DecomposeDb,
+        viewer: &Viewer,
+    ) -> Result<Option<Uuid>, DbError> {
+        let mut tx = db.write(viewer).await?;
+        let group = EdgeRepository::session_writer_group(tx.conn()).await?;
+        // Dropped without commit: rolled back.
+        drop(tx);
+        Ok(group)
+    }
 
     /// What `persist_decomposition` did, for reporting/tests.
     pub struct PersistOutcome {
@@ -419,7 +833,8 @@ mod db_writes {
     ///
     /// Atom claims are written through `submit_via` — a closure the caller
     /// supplies that goes through the CANONICAL claim-create path so signing,
-    /// provenance, DS auto-wire and embed-on-write are preserved. In the
+    /// derivation provenance and embed-on-write are preserved (that path
+    /// writes no DS mass function for an atom). In the
     /// binary this closure POSTs to the local API `/api/v1/claims` (or calls
     /// the in-process submit helper); in tests it is a fake that inserts a
     /// minimal claim row, letting us verify the edge/label wiring WITHOUT an
@@ -429,7 +844,7 @@ mod db_writes {
     /// exactly itself is already atomic — writing a self-equivalent child +
     /// edge would pollute the graph and is what `is_current`-atoms look like).
     pub async fn persist_decomposition<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         parent_id: Uuid,
         decomp: &Decomposition,
@@ -449,7 +864,9 @@ mod db_writes {
             });
         }
         // Guard: parent must still be current (never wire onto a retired claim).
-        if !ClaimRepository::are_all_current(pool, viewer, &[parent_id]).await? {
+        if !ClaimRepository::are_all_current(&mut *db.read(viewer).await?, viewer, &[parent_id])
+            .await?
+        {
             return Err(format!("parent claim {parent_id} is not current").into());
         }
         // Phase 1: submit EVERY atom before wiring ANY edge. The
@@ -485,12 +902,14 @@ mod db_writes {
             gens.push(gen);
         }
         // Phase 2: every edge in ONE transaction, so the parent goes from
-        // "no decomposition" to "all atoms" with nothing in between.
-        let mut tx = pool.begin().await?;
+        // "no decomposition" to "all atoms" with nothing in between. On the
+        // `--as-agent` path the transaction is stamped for the acting agent,
+        // so each edge records it as the writer (see [`DecomposeDb`]).
+        let mut tx = db.write(viewer).await?;
         let mut edges = 0usize;
         for (&atom_id, &gen) in atom_ids.iter().zip(gens.iter()) {
             let (_row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-                &mut tx,
+                tx.conn(),
                 parent_id,
                 "claim",
                 atom_id,
@@ -549,31 +968,44 @@ mod db_writes {
     /// wired to — is reachable from a test. `main` keeps only credential
     /// resolution and the HTTP submit closure.
     ///
-    /// `submit_via` receives `(atom_text, generality, parent_agent_id)`; atoms
-    /// inherit their parent compound claim's author, and the parent varies
-    /// across a batch, so the author cannot be captured once by the caller.
+    /// `submit_via` receives `(atom_text, generality, parent)`; atoms inherit
+    /// their parent compound claim's author and record it as their derivation
+    /// source, and the parent varies across a batch, so neither can be
+    /// captured once by the caller.
     ///
     /// A batch whose LLM call fails is logged and skipped (the run continues);
-    /// a persist failure aborts the run.
+    /// a persist failure aborts the run. With `ledger`, every parent the model
+    /// answers with one atom is recorded (see [`persist_planned`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_decomposition_batches<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         claims: &[BatchClaim],
         llm: &dyn epigraph_interfaces::LlmProvider,
         batch_size: usize,
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
+        mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
         for chunk in claims.chunks(batch_size.max(1)) {
             let (planned, gaps) = plan_chunk(chunk, llm).await;
             totals.gaps.extend(gaps);
-            let chunk_totals =
-                persist_planned(pool, viewer, &planned, embedder.clone(), &submit_via).await?;
+            // Verdicts are appended per chunk, so a run that aborts later
+            // keeps the ones it already paid for.
+            let chunk_totals = persist_planned(
+                db,
+                viewer,
+                &planned,
+                embedder.clone(),
+                ledger.as_deref_mut(),
+                &submit_via,
+            )
+            .await?;
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
             totals.singletons.extend(chunk_totals.singletons);
@@ -723,29 +1155,40 @@ mod db_writes {
     /// REQUIRED field of CreateClaimRequest (POST /api/v1/claims), and omitting
     /// it returned 422, which silently dropped every decomposition atom.
     ///
+    /// With `ledger`, every line the model answered with one atom is appended
+    /// to it, so the next selection passes the parent over
+    /// ([`super::Ineligible::JudgedAtomic`]). This is where a run records its
+    /// verdicts — not the binary — so `--apply-plan` records them too and
+    /// `--plan` (which never persists) records none. A failed append is a
+    /// failed line in [`BatchTotals::failed`], not an abort.
+    ///
     /// # Errors
     /// None today; the `Result` is kept for callers.
     pub async fn persist_planned<F, Fut>(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         planned: &[super::PlannedDecomposition],
         embedder: Option<Arc<dyn epigraph_embeddings::EmbeddingService>>,
+        mut ledger: Option<&mut super::SingletonLedger>,
         submit_via: &F,
     ) -> Result<BatchTotals, Box<dyn std::error::Error>>
     where
-        F: Fn(String, i64, Uuid) -> Fut,
+        F: Fn(String, i64, AtomParent) -> Fut,
         Fut: std::future::Future<Output = Result<Uuid, Box<dyn std::error::Error>>>,
     {
         let mut totals = BatchTotals::default();
         for plan in planned {
-            let parent_agent_id = plan.agent_id;
+            let parent = AtomParent {
+                claim_id: plan.claim_id,
+                agent_id: plan.agent_id,
+            };
             match persist_decomposition(
-                pool,
+                db,
                 viewer,
                 plan.claim_id,
                 &plan.decomposition(),
                 embedder.clone(),
-                move |atom_text, generality| submit_via(atom_text, generality, parent_agent_id),
+                move |atom_text, generality| submit_via(atom_text, generality, parent),
             )
             .await
             {
@@ -754,6 +1197,22 @@ mod db_writes {
                     totals.edges += outcome.edges_created;
                     if outcome.skipped_singletons > 0 {
                         totals.singletons.push(plan.claim_id);
+                        // The verdict is on the text the model judged, which
+                        // is the plan's `content` (verified equal to the live
+                        // parent before an apply). A failed append fails this
+                        // LINE, like a failed submit: the parent stays
+                        // undecomposed and unrecorded, a re-run records it,
+                        // and the rest of the plan is still applied. Only a
+                        // ONE-atom answer is a verdict that the text is
+                        // atomic: an empty line (hand-edited plan) is not.
+                        if let Some(l) = ledger.as_deref_mut().filter(|_| plan.atoms.len() == 1) {
+                            if let Err(e) = l.record(plan.claim_id, &plan.content, &plan.model) {
+                                totals.failed.push((
+                                    plan.claim_id,
+                                    format!("judged atomic, but not recorded: {e}"),
+                                ));
+                            }
+                        }
                     }
                 }
                 Err(e) => totals.failed.push((plan.claim_id, e.to_string())),
@@ -789,7 +1248,7 @@ mod db_writes {
     /// # Errors
     /// Database failure.
     pub async fn verify_plan(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         planned: Vec<super::PlannedDecomposition>,
     ) -> Result<
@@ -808,7 +1267,9 @@ mod db_writes {
         let ids: Vec<Uuid> = lines_per_parent.keys().copied().collect();
         let mut live = std::collections::HashMap::new();
         for chunk in ids.chunks(1000) {
-            for c in R::list_undecomposed_by_ids(pool, viewer, chunk).await? {
+            for c in
+                R::list_undecomposed_by_ids(&mut *db.read(viewer).await?, viewer, chunk).await?
+            {
                 live.insert(c.id, (c.content, c.agent_id));
             }
         }
@@ -880,22 +1341,39 @@ mod db_writes {
     /// Database failure.
     #[allow(clippy::too_many_arguments)]
     pub async fn select_candidates(
-        pool: &PgPool,
+        db: &dyn DecomposeDb,
         viewer: &epigraph_db::visibility::Viewer,
         priority: Priority,
         ids: Option<&[Uuid]>,
         filters: super::EligibilityFilters,
+        judged_atomic: Option<&super::SingletonLedger>,
         limit: usize,
         max_scan: usize,
     ) -> Result<Selection, Box<dyn std::error::Error>> {
         use epigraph_db::repos::decomposition_priority::{
-            DecompositionPriorityRepository as R, UndecomposedOrder,
+            DecomposeCandidate, DecompositionPriorityRepository as R, UndecomposedOrder,
+        };
+        // Every rule a candidate must pass, in reporting order. The ledger is
+        // consulted last, so `skipped_judged_atomic` counts only parents an
+        // LLM call would otherwise have gone to: up to `limit`, exactly the
+        // calls it saved (with `--count-eligible`, `limit` is the whole scan,
+        // so it counts every judged parent read).
+        let verdict = |r: &DecomposeCandidate| -> Result<(), super::Ineligible> {
+            super::check_publicly_decomposable(&r.visibility)?;
+            super::check_eligibility(&r.content, &r.labels, filters)?;
+            if judged_atomic.is_some_and(|l| l.contains(r.id, &r.content)) {
+                return Err(super::Ineligible::JudgedAtomic);
+            }
+            Ok(())
         };
         let mut sel = Selection::default();
         if let Some(ids) = ids {
             let mut rows = Vec::new();
             for chunk in ids.chunks(1000) {
-                rows.extend(R::list_undecomposed_by_ids(pool, viewer, chunk).await?);
+                rows.extend(
+                    R::list_undecomposed_by_ids(&mut *db.read(viewer).await?, viewer, chunk)
+                        .await?,
+                );
             }
             sel.scanned = rows.len();
             let present: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.id).collect();
@@ -911,7 +1389,7 @@ mod db_writes {
                 if !taken.insert(r.id) {
                     continue;
                 }
-                match super::check_eligibility(&r.content, &r.labels, filters) {
+                match verdict(&r) {
                     // Past `--limit`: named, eligible, and NOT silently dropped.
                     Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
                     Ok(()) => sel.chosen.push(r),
@@ -923,6 +1401,9 @@ mod db_writes {
 
         const PAGE: i64 = 500;
         let mut offset: i64 = 0;
+        // One stamped connection for the whole scan: every page is read as
+        // the same viewer.
+        let mut conn = db.read(viewer).await?;
         loop {
             if sel.chosen.len() >= limit {
                 break;
@@ -933,11 +1414,11 @@ mod db_writes {
             }
             let page = match priority {
                 Priority::Conflict => {
-                    R::list_undecomposed_conflict_targets(pool, viewer, PAGE, offset).await?
+                    R::list_undecomposed_conflict_targets(&mut *conn, viewer, PAGE, offset).await?
                 }
                 Priority::Recent => {
                     R::list_undecomposed_ordered(
-                        pool,
+                        &mut *conn,
                         viewer,
                         UndecomposedOrder::Recent,
                         PAGE,
@@ -947,7 +1428,7 @@ mod db_writes {
                 }
                 Priority::Oldest => {
                     R::list_undecomposed_ordered(
-                        pool,
+                        &mut *conn,
                         viewer,
                         UndecomposedOrder::Oldest,
                         PAGE,
@@ -963,7 +1444,7 @@ mod db_writes {
                 if sel.chosen.len() >= limit {
                     break;
                 }
-                match super::check_eligibility(&r.content, &r.labels, filters) {
+                match verdict(&r) {
                     Ok(()) => sel.chosen.push(r),
                     Err(why) => sel.skipped.push((r.id, why)),
                 }
@@ -1040,77 +1521,6 @@ mod tests {
         let out = parse_batch_response(raw);
         assert!(!out.contains_key(&0), "an atoms array with a non-string element must be dropped entirely (no fabricated decomposition)");
         assert!(out.contains_key(&1), "the valid sibling entry survives");
-    }
-
-    // --- atomic heuristic ---
-
-    #[test]
-    fn one_short_sentence_looks_atomic() {
-        assert_eq!(sentence_count("Water boils at 100 C at sea level."), 1);
-        assert!(looks_atomic("Water boils at 100 C at sea level."));
-        // No terminal punctuation at all is still one sentence.
-        assert!(looks_atomic("Gravity bends light"));
-    }
-
-    #[test]
-    fn two_sentences_are_not_atomic_even_when_short() {
-        let t = "Gravity bends light. Time dilates near mass.";
-        assert_eq!(sentence_count(t), 2);
-        assert!(
-            !looks_atomic(t),
-            "two sentences are compound regardless of length"
-        );
-        assert_eq!(sentence_count("Is it true? Yes! It is."), 3);
-    }
-
-    #[test]
-    fn one_long_sentence_is_not_atomic() {
-        let long = format!("The system {} works.", "really ".repeat(30));
-        assert_eq!(sentence_count(&long), 1);
-        assert!(long.chars().count() > ATOMIC_MAX_CHARS);
-        assert!(
-            !looks_atomic(&long),
-            "over the char cap is compound-suspect"
-        );
-    }
-
-    #[test]
-    fn the_char_cap_is_inclusive_and_counts_chars_not_bytes() {
-        let exact = "a".repeat(ATOMIC_MAX_CHARS);
-        assert!(looks_atomic(&exact), "exactly the cap is still atomic");
-        let over = "a".repeat(ATOMIC_MAX_CHARS + 1);
-        assert!(!looks_atomic(&over));
-        // 160 two-byte chars: 320 bytes, 160 chars -> atomic.
-        let multibyte = "é".repeat(ATOMIC_MAX_CHARS);
-        assert!(multibyte.len() > ATOMIC_MAX_CHARS);
-        assert!(looks_atomic(&multibyte), "cap is in chars, not bytes");
-    }
-
-    #[test]
-    fn decimals_and_dotted_names_are_not_boundaries() {
-        assert_eq!(sentence_count("Version 3.5 of epigraph.io ships in Q3."), 1);
-        assert_eq!(sentence_count("pH was 7.4 in the sample"), 1);
-    }
-
-    #[test]
-    fn lowercase_after_a_period_is_not_a_boundary() {
-        // Conservative in the other direction would be wrong here: "etc. and"
-        // continues the sentence.
-        assert_eq!(sentence_count("apples, pears, etc. are fruit"), 1);
-    }
-
-    #[test]
-    fn line_breaks_between_non_blank_lines_are_boundaries() {
-        assert_eq!(sentence_count("- first point\n- second point"), 2);
-        assert_eq!(sentence_count("First line.\nSecond line."), 2);
-        // A trailing newline adds nothing.
-        assert_eq!(sentence_count("Only line.\n\n"), 1);
-    }
-
-    #[test]
-    fn empty_text_has_no_sentences() {
-        assert_eq!(sentence_count(""), 0);
-        assert_eq!(sentence_count("   "), 0);
     }
 
     // --- eligibility filters ---
@@ -1279,5 +1689,136 @@ mod tests {
             vec![0, -1, -1],
             "only 0/1/2 are valid tiers; others -> -1"
         );
+    }
+
+    // --- singleton ledger ---
+
+    fn temp_ledger_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("judged-atomic-{}.jsonl", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn singleton_ledger_round_trips_and_keys_on_content_hash() {
+        let path = temp_ledger_path();
+        let id = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger
+            .record(id, "Text A. Still text A.", "model-x")
+            .unwrap();
+        // The same verdict again is not appended twice.
+        ledger
+            .record(id, "Text A. Still text A.", "model-x")
+            .unwrap();
+
+        let back = SingletonLedger::load(&path).unwrap();
+        assert!(back.contains(id, "Text A. Still text A."));
+        assert!(
+            !back.contains(id, "Text B. Edited since."),
+            "a changed text is a new question"
+        );
+        assert!(
+            !back.contains(other, "Text A. Still text A."),
+            "the verdict belongs to one claim id"
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 1, "{raw}");
+        let line: JudgedAtomicEntry = serde_json::from_str(raw.trim()).unwrap();
+        assert_eq!(line.kind, SingletonLedger::KIND);
+        assert_eq!(line.model, "model-x");
+        assert_eq!(
+            line.content_blake3,
+            blake3::hash(b"Text A. Still text A.").to_hex().to_string()
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_read_only_ledger_creates_nothing_and_refuses_to_record() {
+        let path = temp_ledger_path();
+        let mut ledger = SingletonLedger::load(&path).unwrap();
+        assert!(ledger.is_empty());
+        assert!(
+            !path.exists(),
+            "--dry-run / --plan must not create the file"
+        );
+        let err = ledger
+            .record(uuid::Uuid::new_v4(), "x", "m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("read-only"), "{err}");
+        assert!(!path.exists());
+    }
+
+    /// A crash or a full disk mid-append can leave a final line with no
+    /// newline. That torn tail must not take the daily job down at startup
+    /// (every later load would refuse the file until someone edits it): the
+    /// reader skips it, and the next recording run cuts it off before it
+    /// appends. A COMPLETE final line that only lacks its newline is kept.
+    #[test]
+    fn a_torn_final_line_is_skipped_and_cut_off_before_the_next_append() {
+        let path = temp_ledger_path();
+        let (a, b, c) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(a, "Text A. More A.", "m").unwrap();
+        let whole = std::fs::read_to_string(&path).unwrap();
+        // Half of a second record, as an interrupted append leaves it.
+        std::fs::write(&path, format!("{whole}{}", &whole[..whole.len() / 2])).unwrap();
+
+        let back = SingletonLedger::load(&path).expect("a torn final line is skipped");
+        assert_eq!(back.len(), 1);
+        assert!(back.contains(a, "Text A. More A."));
+
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(b, "Text B. More B.", "m").unwrap();
+        let back = SingletonLedger::load(&path).expect("the torn tail was cut off");
+        assert_eq!(back.len(), 2);
+        assert!(back.contains(b, "Text B. More B."));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+
+        // A complete last line without its newline (a hand edit) is a verdict.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.trim_end_matches('\n')).unwrap();
+        assert_eq!(SingletonLedger::load(&path).unwrap().len(), 2);
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(c, "Text C. More C.", "m").unwrap();
+        let back = SingletonLedger::load(&path).unwrap();
+        assert_eq!(back.len(), 3, "the unterminated verdict was kept");
+        assert!(back.contains(a, "Text A. More A.") && back.contains(c, "Text C. More C."));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_malformed_or_foreign_ledger_line_is_refused_with_its_line_number() {
+        let path = temp_ledger_path();
+        let mut ledger = SingletonLedger::open_for_append(&path).unwrap();
+        ledger.record(uuid::Uuid::new_v4(), "ok", "m").unwrap();
+        std::fs::write(
+            &path,
+            format!("{}not json\n", std::fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+        let err = SingletonLedger::load(&path).unwrap_err().to_string();
+        assert!(err.contains(&format!("{}:2:", path.display())), "{err}");
+
+        // A decomposition plan line handed over by mistake.
+        let plan = serde_json::json!({
+            "kind": "decomposition",
+            "claim_id": uuid::Uuid::new_v4(),
+            "content_blake3": "00".repeat(32),
+            "model": "m",
+            "decided_at": "2026-10-15T00:00:00Z",
+        });
+        std::fs::write(&path, format!("{plan}\n")).unwrap();
+        let err = SingletonLedger::load(&path).unwrap_err().to_string();
+        assert!(
+            err.contains(":1:") && err.contains("judged_atomic"),
+            "{err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

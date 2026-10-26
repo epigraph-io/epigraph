@@ -14,7 +14,7 @@
 //! `pignistic_prob`, `labels` and claim ids corpus-wide with no `Viewer` in
 //! scope. It is now viewer-scoped on all three claims in a candidate.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,7 +22,7 @@ use crate::errors::{internal_error, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }

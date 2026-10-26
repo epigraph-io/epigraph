@@ -7,10 +7,26 @@
 //! prefers CLAUDE_CODE_OAUTH_TOKEN — NEVER the Anthropic-SDK pay-per-token
 //! variant the V2 `_api.py`/`_openai.py` scripts used), parses with
 //! `epigraph_cli::decompose::parse_batch_response`, and persists atoms through
-//! the canonical API claim path so embedding + DS auto-wire + signing happen
-//! on write.
+//! the canonical API claim path so embedding, author-key signing and the
+//! atom's derivation evidence happen on write. NO DS mass function is written
+//! for an atom: `POST /api/v1/claims` has no DS auto-wire.
 //!
-//! Required: DATABASE_URL, and CLAUDE_CODE_OAUTH_TOKEN.
+//! # Evidence policy for atoms (U041, backlog 3590a2d8)
+//!
+//! Atoms carry derivation PROVENANCE, not derived BELIEF, until
+//! `decomposes_to` propagation exists. Each atom POST names its parent in
+//! `derived_from`, and the API records one `document` evidence row on the atom
+//! (the parent's text, `properties.derived_from_claim` = parent id) in the
+//! atom's own transaction, so `get_provenance` shows where it came from. The
+//! atom's truth stays at 0.5 until INDEPENDENT evidence arrives: its only
+//! warrant at birth is "the parent states it", and when the parent is itself
+//! evidence-free (the legacy 2026-02/03 imports) any belief given to the atom
+//! would be laundered from it. Only `visibility = 'public'` parents are
+//! selected ([`epigraph_cli::decompose::check_publicly_decomposable`]).
+//!
+//! Required: DATABASE_URL (plus MAINTENANCE_DATABASE_URL on the maintenance
+//! path; see "Running as an agent" for the path without it), and
+//! CLAUDE_CODE_OAUTH_TOKEN.
 //! API base: EPIGRAPH_API (primary) or EPIGRAPH_API_URL (container fallback),
 //! default http://127.0.0.1:8080. Auth token: EPIGRAPH_TOKEN if set, otherwise
 //! minted via client_credentials from EPIGRAPH_SERVICE_CLIENT_ID +
@@ -40,6 +56,77 @@
 //! The population is paged so filters never starve a run; `--max-scan` bounds
 //! the rows read.
 //!
+//! `--singleton-ledger <file>` (backlog 68d03c24, U040): a parent the model
+//! answers with ONE atom gets no edge, so it stays undecomposed; without a
+//! record every later run re-selects it and pays for the same answer again.
+//! With the flag, a normal run and `--apply-plan` append each such verdict
+//! (claim id + BLAKE3 of the judged text) to the JSONL file, and selection
+//! skips a parent whose id and exact text the file holds
+//! (`skipped_judged_atomic=` on the `selection:` line; `--include-judged-atomic`
+//! asks again). `--dry-run` and `--plan` only read it. A parent whose text
+//! changes is asked again.
+//!
+//! # Running as an agent (`--as-agent <agent id>`; backlog 9a877b7c)
+//!
+//! Without the flag the binary is a maintenance job: it connects through
+//! `epigraph_cli::MaintenancePool` and refuses to start unless the connection
+//! satisfies `epigraph_bypass()`. An agent container holds only the ordinary
+//! application login in `DATABASE_URL`, which that refusal rejects. A
+//! scheduled run in an agent container therefore takes this path, which
+//! needs no maintenance DSN:
+//!
+//! * the application login in `DATABASE_URL` as a `ScopedPool`; no
+//!   maintenance DSN is read and no privilege is asserted;
+//! * every read on a connection stamped for the acting agent, so selection
+//!   sees what row-level security shows that agent (public rows, plus rows of
+//!   its own groups), and the `decomposes_to` edges in a transaction stamped
+//!   for it, so each edge records the agent's group as its writer (migration
+//!   120) rather than landing ownerless. Atoms still go through
+//!   `POST /api/v1/claims` with the API token;
+//! * a writing run asks the database which group its edges would record
+//!   (`epigraph_writer_group()`, the trigger's own function), prints it on
+//!   the `connection:` line (`writer_group=`), and refuses when there is none
+//!   (`has no writer group`);
+//! * the old refusal's purpose, no silent zero-row run, is kept by the
+//!   result: a `--priority oldest|recent` scan that reads NO undecomposed
+//!   claim fails (`sees no undecomposed claim`); judged-atomic and short
+//!   parents stay in that population, so on a live corpus it is never empty.
+//!   `--priority conflict` reads only the targets of a live conflict edge,
+//!   which may legitimately be none: it fails only when the session sees no
+//!   claim at all (`sees no claim at all`). `chosen=0` over a visible
+//!   population is the steady state and exits 0. `--ids-file` names every id
+//!   it skips, so it is not subject to this;
+//! * `--retarget` stays on the maintenance path, and `--priority conflict`'s
+//!   report of decomposed conflict parents is printed only there.
+//!
+//! Pass the agent the API token acts as (the service client's agent). The
+//! binary does not check that the two match: atoms are created as the
+//! token's agent and edges as `--as-agent`, so a mismatch splits their
+//! attribution. That is an operator check at deploy time, not a privilege
+//! question (the application login can already stamp any agent).
+//!
+//! Coverage against the maintenance view (measured on a fixture in
+//! `tests/decompose_claims_as_agent.rs`):
+//!
+//! 1. a group-private parent outside the agent's groups is not read at all.
+//!    That loses nothing: only public parents are ever decomposed
+//!    (`skipped_not_public` on the maintenance path);
+//! 2. a PUBLIC parent whose only `decomposes_to` edges are hidden from the
+//!    agent (private to a group it is not in) reads as undecomposed, because
+//!    row security also filters the `NOT EXISTS` edge probe. The run
+//!    decomposes it again. Where the hidden edge points at a private atom,
+//!    the result is a second set of public atoms. Where it points at a
+//!    PUBLIC atom and the model returns the same text, `if_not_exists`
+//!    returns that same atom, and the edge dedup probe
+//!    (`EdgeRepository::create_if_absent_including_retracted_conn`) is
+//!    filtered by row security on this login too, so a second, public
+//!    `(parent, atom, decomposes_to)` edge is written next to the hidden
+//!    one (no unique index stops it since migration 018). The second case is
+//!    derived from the code, not measured.
+//!
+//! The `--singleton-ledger` and `--count-eligible` flags behave identically
+//! on both paths.
+//!
 //! # Modes
 //!
 //! * default — select, decompose through the LLM, persist.
@@ -54,7 +141,10 @@
 //!   LLM is called, the mapping printed, a manifest written (`--manifest`),
 //!   nothing else. `--retarget --apply` writes through the API;
 //!   `--retarget --apply-plan <manifest>` applies a reviewed manifest with no
-//!   LLM call.
+//!   LLM call. Both retarget writing modes first check this process's belief
+//!   modes against the API's `/health` and refuse on any difference, before
+//!   the database or the token mint (`epigraph_cli::belief_mode_check`, SPEC
+//!   §10.2); the retarget dry run is exempt.
 //!
 //! Every writing mode resolves API auth BEFORE any LLM call (gh-375).
 //!
@@ -79,12 +169,26 @@
 //!   extracts the filter skips; such a run may read `--max-scan` rows and
 //!   choose few. Point the schedule at `--priority conflict` (then `recent`)
 //!   before redeploying this binary.
+//! * Steady state (U040 ruling, 2026-10-14): a DAILY `--priority recent
+//!   --limit L --singleton-ledger <durable path>` run, with L sized so
+//!   `7 × L ≥ 1.5 ×` the measured weekly inflow (≈410/week on 2026-10-14, so
+//!   L = 100). Keep the ledger next to the durable run logs, never in the
+//!   ephemeral container, and pass the SAME path to `--apply-plan` catch-up
+//!   runs. Add the flag to a schedule only after this binary is deployed: an
+//!   older binary rejects it and the run fails.
+//! * Measuring the drain: `--count-eligible` reads on past `--limit` (up to
+//!   `--max-scan`) and prints `selection: eligible=N` — the parents that pass
+//!   every filter, judged-atomic verdicts included. A scheduled run that
+//!   carries it shows week over week whether the eligible population falls;
+//!   `--dry-run --count-eligible --max-scan <population>` is the one-off
+//!   measurement (OFFSET paging: run it off-hours).
 
 use clap::Parser;
 use epigraph_cli::decompose::{
-    persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
-    run_decomposition_batches, select_candidates, verify_plan, write_plan_jsonl, BatchClaim,
-    EligibilityFilters, PlanGaps, Priority,
+    atom_create_body, persist_planned, plan_decomposition_batches_with_gaps, read_plan_jsonl,
+    run_decomposition_batches, select_candidates, verify_plan, visible_claim_count,
+    write_plan_jsonl, writer_group, AtomParent, BatchClaim, DecomposeDb, EligibilityFilters,
+    PlanGaps, Priority, SingletonLedger,
 };
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, LlmProvider};
 use epigraph_cli::retarget::{
@@ -145,9 +249,36 @@ struct Cli {
     /// Do not skip claims that look atomic (one sentence, <= 160 chars).
     #[arg(long, default_value_t = false)]
     include_short: bool,
+    /// JSONL ledger of parents the model already answered with one atom
+    /// ("already atomic"). A normal run and `--apply-plan` append every such
+    /// verdict to it; selection skips a parent whose id and exact text it
+    /// holds, so the same claim is never re-asked. `--dry-run` and `--plan`
+    /// only read it. Absent: nothing is recorded and nothing is skipped.
+    #[arg(long)]
+    singleton_ledger: Option<PathBuf>,
+    /// With --singleton-ledger: select parents the ledger holds anyway (their
+    /// verdicts are still recorded).
+    #[arg(long, default_value_t = false)]
+    include_judged_atomic: bool,
+    /// Keep reading past --limit (up to --max-scan rows) and print how many
+    /// eligible parents remain (`eligible=`; `>=` when --max-scan stopped the
+    /// count). The parents processed are exactly those a run without it
+    /// chooses, but the `skipped_*` counts then cover every row read, not only
+    /// the rows a plain run would read. Not with --ids-file.
+    #[arg(long, default_value_t = false)]
+    count_eligible: bool,
     /// Stop reading the undecomposed population after this many rows.
     #[arg(long, default_value_t = 20_000)]
     max_scan: usize,
+    /// Run as this agent (an `agents.id`) on the ordinary application login
+    /// in DATABASE_URL, through row-level security, with NO maintenance DSN:
+    /// selection reads what that agent can see, and `decomposes_to` edges are
+    /// written as it. A decomposing run needs the agent to hold a writable
+    /// group. Without the flag the run takes the maintenance path
+    /// (MAINTENANCE_DATABASE_URL, privilege checked at startup). Not with
+    /// --retarget. See the module doc, "Running as an agent".
+    #[arg(long)]
+    as_agent: Option<uuid::Uuid>,
     /// Call the LLM, print the proposed atoms, write this JSONL plan, and
     /// write NOTHING to the graph.
     #[arg(long)]
@@ -166,6 +297,11 @@ struct Cli {
     /// `retarget-manifest-<UTC timestamp>.jsonl`). Refused if it exists.
     #[arg(long)]
     manifest: Option<PathBuf>,
+    /// With --retarget --apply / --apply-plan: proceed although this process's
+    /// belief modes differ from the API's `/health` report (or cannot be
+    /// read). For tests and a deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
     /// With --retarget: also revisit edges already marked `retargeted_to`
     /// (fully wired ones included). An edge that already has atom edges is
     /// resumed from them and re-checked, not re-asked of the LLM.
@@ -205,6 +341,12 @@ impl Mode {
         }
     }
 
+    /// Whether this mode is a retarget WRITE, which runs the belief-mode check
+    /// (SPEC §10.2). Decomposition modes are not wave runs and are not checked.
+    fn is_retarget_write(&self) -> bool {
+        matches!(self, Mode::RetargetApply(_) | Mode::RetargetApplyPlan(_))
+    }
+
     /// The OAuth scope a minted token must carry for this mode's writes.
     ///
     /// Decomposition POSTs `/api/v1/claims` (`claims:write`). Retarget POSTs
@@ -234,6 +376,26 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     }
     if cli.dry_run && (cli.apply || cli.apply_plan.is_some()) {
         return Err("--dry-run cannot be combined with --apply or --apply-plan".into());
+    }
+    if cli.as_agent.is_some() && cli.retarget {
+        return Err(
+            "--retarget runs only on the maintenance path; it does not apply to --as-agent".into(),
+        );
+    }
+    if cli.include_judged_atomic && cli.singleton_ledger.is_none() {
+        return Err("--include-judged-atomic needs --singleton-ledger".into());
+    }
+    if cli.count_eligible && (cli.ids_file.is_some() || cli.apply_plan.is_some() || cli.retarget) {
+        return Err(
+            "--count-eligible counts the paged population; it does not apply to --ids-file, \
+             --apply-plan or --retarget"
+                .into(),
+        );
+    }
+    if cli.retarget && cli.singleton_ledger.is_some() {
+        return Err(
+            "--singleton-ledger records decomposition verdicts; --retarget makes none".into(),
+        );
     }
     if cli.apply_plan.is_some() && cli.ids_file.is_some() {
         return Err(
@@ -284,6 +446,83 @@ fn resolve_mode(cli: &Cli, now: chrono::DateTime<chrono::Utc>) -> Result<Mode, S
     Ok(Mode::Run)
 }
 
+/// The `--as-agent` connection: the application login in DATABASE_URL as a
+/// [`epigraph_db::ScopedPool`], and the acting agent's viewer resolved on it.
+///
+/// No maintenance DSN is read and no privilege is asserted: this path is
+/// unprivileged on purpose. A mode that writes asks the database which group
+/// its `decomposes_to` edges would record as their writer
+/// ([`epigraph_cli::decompose::writer_group`], the very function the edge
+/// trigger uses) and refuses when the answer is none, because those edges
+/// would carry no owner. A read-only mode proceeds as whatever the agent can
+/// see (for an agent with no group, public rows only).
+async fn connect_as_agent(
+    agent: uuid::Uuid,
+    writes: bool,
+) -> Result<(epigraph_db::ScopedPool, epigraph_db::visibility::Viewer), Box<dyn std::error::Error>>
+{
+    let url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set; --as-agent runs on the application login in it")?;
+    let guc_mode = epigraph_db::SessionGucMode::from_env(
+        std::env::var("EPIGRAPH_SESSION_GUC_MODE")
+            .unwrap_or_default()
+            .as_str(),
+    );
+    let scoped = epigraph_db::ScopedPool::connect(&url, guc_mode).await?;
+    if guc_mode == epigraph_db::SessionGucMode::Session {
+        scoped.probe_session_gucs().await?;
+    }
+    let viewer = epigraph_db::visibility::Viewer::resolve(scoped.inner(), agent).await?;
+    let groups = viewer.group_bind().map_or(0, <[uuid::Uuid]>::len);
+    let writable = viewer.writable_groups().len();
+    // Only a writing mode asks: the question opens a write transaction.
+    let writer = if writes {
+        Some(writer_group(&scoped, &viewer).await?)
+    } else {
+        None
+    };
+    let shown = match writer {
+        None => "n/a (read-only mode)".to_string(),
+        Some(None) => "none".to_string(),
+        Some(Some(g)) => g.to_string(),
+    };
+    eprintln!(
+        "connection: --as-agent {agent} on the application login (DATABASE_URL), through \
+         row-level security; no maintenance DSN; groups={groups} writable={writable} \
+         writer_group={shown}"
+    );
+    if writer == Some(None) {
+        return Err(format!(
+            "--as-agent {agent}: the agent has no writer group (epigraph_writer_group() is \
+             NULL for it), so the decomposes_to edges this run writes would carry no owner. \
+             Pass the agent the API token acts as (the service client's agent); it needs a \
+             writable personal group of its own or of its operator."
+        )
+        .into());
+    }
+    Ok((scoped, viewer))
+}
+
+/// The `--as-agent` zero-visible refusal (see its call site).
+fn zero_visible_refusal(agent: uuid::Uuid) -> String {
+    format!(
+        "--as-agent {agent}: this session sees no undecomposed claim at all, so the run would \
+         read zero rows and exit 0. The login in DATABASE_URL reads through row-level \
+         security: check that it is an application login with its table grants, and that the \
+         claims it should decompose are public. Refusing to run."
+    )
+}
+
+/// The `--as-agent` refusal for a population that may legitimately be empty
+/// (`--priority conflict`): the session sees no claim at all.
+fn no_claim_visible_refusal(agent: uuid::Uuid) -> String {
+    format!(
+        "--as-agent {agent}: this session sees no claim at all, so the run would read zero \
+         rows and exit 0. The login in DATABASE_URL reads through row-level security: check \
+         that it is an application login with its table grants. Refusing to run."
+    )
+}
+
 /// Parse an `--ids-file`: one UUID per line, blank lines and `#` comments
 /// ignored. A malformed line is an error naming the line, not a skip.
 fn parse_ids_file(raw: &str) -> Result<Vec<uuid::Uuid>, String> {
@@ -313,18 +552,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
 
-/// API base precedence: `EPIGRAPH_API` (explicit override) first,
-/// `EPIGRAPH_API_URL` (the container-standard name epiclaw-host exposes)
-/// second, `http://127.0.0.1:8080` otherwise. Takes already-read env values
-/// (rather than reading `std::env::var` itself) so it's a pure function —
-/// testable without mutating global process env, which races under
-/// parallel test execution. Set-but-empty values are treated as absent
-/// (see [`non_empty`]).
-fn resolve_api_base(epigraph_api: Option<String>, epigraph_api_url: Option<String>) -> String {
-    non_empty(epigraph_api)
-        .or_else(|| non_empty(epigraph_api_url))
-        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
-}
+// API base precedence (`EPIGRAPH_API`, then `EPIGRAPH_API_URL`, then
+// `http://127.0.0.1:8080`): one spelling, shared with the belief-mode check,
+// so the API a retarget write checks is the API it writes to.
+use epigraph_cli::belief_mode_check::resolve_api_base;
 
 /// OAuth token endpoint precedence: explicit `EPIGRAPH_OAUTH_TOKEN_URL`
 /// first (matches the epiclaw-host `container.rs` convention of constructing
@@ -559,13 +790,14 @@ async fn resolve_token(
     })
 }
 
-/// Canonical atom create via `POST /api/v1/claims`: signing + DS + embed on
-/// write.
+/// Canonical atom create via `POST /api/v1/claims`: author-key signing, embed
+/// on write, and one derivation evidence row naming `parent` (no DS mass; see
+/// the module doc's evidence policy).
 ///
-/// methodology/evidence_type belong in `properties` (JSONB); top-level they
-/// were unknown fields and silently dropped. `if_not_exists=true`: when a
-/// prior run already decomposed the same parent, identical atom text produces
-/// the same content_hash. Without this flag the API returns 409; with it,
+/// The body is [`atom_create_body`] (pure, unit-tested in
+/// `tests/decompose_atom_create_body.rs`). `if_not_exists=true`: when a prior
+/// run already decomposed the same parent, identical atom text produces the
+/// same content_hash. Without this flag the API returns 409; with it,
 /// create_or_get returns the existing claim ID so persist_decomposition can
 /// re-wire edges idempotently.
 async fn submit_atom(
@@ -574,7 +806,7 @@ async fn submit_atom(
     token: String,
     atom_text: String,
     generality: i64,
-    parent_agent_id: uuid::Uuid,
+    parent: AtomParent,
 ) -> Result<uuid::Uuid, Box<dyn std::error::Error>> {
     // Diagnostic-only (backlog a422da87): build+log the URL BEFORE sending, so
     // a RelativeUrlWithoutBase-style construction bug is visible even if the
@@ -584,17 +816,7 @@ async fn submit_atom(
     let resp = match http
         .post(&url)
         .bearer_auth(&token)
-        .json(&serde_json::json!({
-            "content": atom_text,
-            "agent_id": parent_agent_id,
-            "initial_truth": 0.5,
-            "if_not_exists": true,
-            "properties": {
-                "methodology": "inductive_generalization",
-                "evidence_type": "logical"
-            },
-            "labels": ["atom", format!("generality:{generality}")],
-        }))
+        .json(&atom_create_body(&atom_text, generality, parent))
         .send()
         .await
     {
@@ -659,21 +881,57 @@ fn fresh_manifest(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let mode = resolve_mode(&cli, chrono::Utc::now())?;
+    // A retarget write is a wave run: before the database, the ledger and the
+    // token mint, its belief modes must match the API's (SPEC §10.2).
+    if mode.is_retarget_write() {
+        epigraph_cli::belief_mode_check::enforce_or_exit(
+            "decompose_claims --retarget",
+            epigraph_cli::belief_mode_check::RunIntent::Writes,
+            cli.allow_mode_skew,
+        )
+        .await;
+    }
+    // Before the DB, auth and any LLM call: a ledger path a recording mode
+    // cannot write must fail now, not after the verdicts are paid for.
+    let mut ledger = open_singleton_ledger(cli.singleton_ledger.as_deref(), &mode)?;
 
-    // CLI maintenance bin: the operator is the authority and the work is
-    // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a
-    // bypass and a request handler does not.
-    //
     // Built AFTER clap has parsed: an argv error must be reported as an argv
-    // error, not as a connection failure. And `_maint_conn` is held for the
-    // whole run — the lease attests to THAT connection, and the pre-PR-15
-    // template dropped it while the viewer lived on.
-    let maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
-    let session = maint
-        .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
-        .await?;
-    let viewer = session.viewer();
-    let pool = maint.pool();
+    // error, not as a connection failure.
+    //
+    // Two paths. Without --as-agent: the maintenance bin it always was — the
+    // operator is the authority and the work is corpus-wide (see
+    // `epigraph_cli::MaintenancePool` for why that earns a bypass and a
+    // request handler does not), and the session is held for the whole run
+    // because the lease attests to THAT connection. With --as-agent: the
+    // ordinary application login, no bypass, every statement stamped for the
+    // acting agent (see `DecomposeDb`).
+    let maint;
+    let session;
+    let scoped;
+    let acting;
+    let (db, viewer, maint_pool): (
+        &dyn DecomposeDb,
+        &epigraph_db::visibility::Viewer,
+        Option<&sqlx::PgPool>,
+    ) = match cli.as_agent {
+        None => {
+            maint = epigraph_cli::MaintenancePool::connect("decompose_claims").await?;
+            session = maint
+                .viewer(epigraph_db::visibility::SystemReason::TenancyBackfill)
+                .await?;
+            (
+                maint.pool() as &dyn DecomposeDb,
+                session.viewer(),
+                Some(maint.pool()),
+            )
+        }
+        Some(agent) => {
+            let (pool, viewer) = connect_as_agent(agent, mode.writes(&cli.provider)).await?;
+            scoped = pool;
+            acting = viewer;
+            (&scoped as &dyn DecomposeDb, &acting, None)
+        }
+    };
 
     // API base: EPIGRAPH_API takes precedence; EPIGRAPH_API_URL is the
     // container-standard name exposed by epiclaw-host. If neither is set we
@@ -713,6 +971,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 api_base,
                 token,
             });
+            let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let run =
                 run_retarget(pool, viewer, llm.as_ref(), api.as_ref(), &manifest, opts).await?;
             eprintln!(
@@ -752,6 +1011,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Each applied line is appended to the manifest as its entry
             // finishes, not at the end.
+            let pool = maint_pool.ok_or("--retarget needs the maintenance path")?;
             let applied = apply_retarget(pool, viewer, &api, &plan, Some(&manifest)).await?;
             print_applied(&applied);
         }
@@ -762,15 +1022,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 planned.len(),
                 path.display()
             );
-            let (ok, drifted) = verify_plan(pool, viewer, planned).await?;
+            let (ok, drifted) = verify_plan(db, viewer, planned).await?;
             for (p, why) in &drifted {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
             let embedder = epigraph_cli::embedding_service();
-            let submit = move |t: String, g: i64, a: uuid::Uuid| {
-                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a)
+            let submit = move |t: String, g: i64, p: AtomParent| {
+                submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
-            let totals = persist_planned(pool, viewer, &ok, embedder, &submit).await?;
+            let totals =
+                persist_planned(db, viewer, &ok, embedder, ledger.as_mut(), &submit).await?;
             for (id, why) in &totals.failed {
                 eprintln!("FAILED {id}: {why}");
             }
@@ -794,19 +1055,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => None,
             };
             let limit = usize::try_from(cli.limit.max(1)).unwrap_or(1);
-            let sel = select_candidates(
-                pool,
+            let judged_atomic = if cli.include_judged_atomic {
+                None
+            } else {
+                ledger.as_ref()
+            };
+            // `--count-eligible` reads on past `--limit`; the first `limit`
+            // chosen are the same parents, in the same order, either way.
+            let scan_limit = if cli.count_eligible {
+                limit.max(cli.max_scan)
+            } else {
+                limit
+            };
+            let mut sel = select_candidates(
+                db,
                 viewer,
                 cli.priority.into(),
                 ids.as_deref(),
                 filters,
-                limit,
+                judged_atomic,
+                scan_limit,
                 cli.max_scan,
             )
             .await?;
-            report_selection(&sel, ids.is_some(), cli.priority);
+            let eligible = cli
+                .count_eligible
+                .then(|| keep_within_limit(&mut sel, limit, scan_limit));
+            report_selection(&sel, ids.is_some(), cli.priority, eligible);
+            if let Some(agent) = cli.as_agent {
+                // What the maintenance path's startup refusal protected: a
+                // job that cannot see the corpus must not read zero rows and
+                // exit 0. Keyed on rows READ, before any filter: a visible
+                // population with nothing eligible (`chosen=0`) is the steady
+                // state. Not for --ids-file, which names every id it skips.
+                if ids.is_none() && sel.scanned == 0 {
+                    match cli.priority {
+                        // The population is every undecomposed claim the
+                        // session can see; LLM-judged and short parents stay
+                        // in it, so on a live corpus it is never empty.
+                        PriorityArg::Oldest | PriorityArg::Recent => {
+                            return Err(zero_visible_refusal(agent).into());
+                        }
+                        // Only the targets of a live conflict edge: empty is a
+                        // legitimate answer. Fail only if the session sees no
+                        // claim at all.
+                        PriorityArg::Conflict => {
+                            let visible = visible_claim_count(db, viewer).await?;
+                            if visible == 0 {
+                                return Err(no_claim_visible_refusal(agent).into());
+                            }
+                            eprintln!(
+                                "selection: no undecomposed conflict target among the \
+                                 {visible} claims this session sees; nothing to do"
+                            );
+                        }
+                    }
+                }
+            }
             if cli.priority == PriorityArg::Conflict {
-                report_decomposed_conflict_parents(pool, viewer).await?;
+                match maint_pool {
+                    Some(pool) => report_decomposed_conflict_parents(pool, viewer).await?,
+                    None => eprintln!(
+                        "conflict: decomposed parents that are still conflict targets are \
+                         reported only on the maintenance path (they go to --retarget)"
+                    ),
+                }
             }
             let claims: Vec<BatchClaim> = sel
                 .chosen
@@ -864,13 +1177,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let embedder = epigraph_cli::embedding_service();
             let totals = run_decomposition_batches(
-                pool,
+                db,
                 viewer,
                 &claims,
                 llm.as_ref(),
                 cli.batch_size,
                 embedder,
-                move |t, g, a| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, a),
+                ledger.as_mut(),
+                move |t, g, p| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p),
             )
             .await?;
             report_unplanned(&totals.gaps, &totals.singletons);
@@ -881,6 +1195,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Load `--singleton-ledger`. A mode that records verdicts (a normal run,
+/// `--apply-plan`) opens it for append, creating it if missing; every other
+/// mode only reads it and creates nothing.
+fn open_singleton_ledger(
+    path: Option<&Path>,
+    mode: &Mode,
+) -> Result<Option<SingletonLedger>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let ledger = if matches!(mode, Mode::Run | Mode::ApplyPlan(_)) {
+        SingletonLedger::open_for_append(path)?
+    } else {
+        SingletonLedger::load(path)?
+    };
+    eprintln!(
+        "singleton ledger: {} judged-atomic verdicts in {}",
+        ledger.len(),
+        ledger.path().display()
+    );
+    Ok(Some(ledger))
 }
 
 /// Name every chosen claim that was sent to the LLM and produced nothing to
@@ -898,26 +1235,66 @@ fn report_unplanned(gaps: &PlanGaps, singletons: &[uuid::Uuid]) {
     }
 }
 
+/// How many eligible parents a `--count-eligible` scan saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EligibleCount {
+    seen: usize,
+    /// The scan stopped (at `--max-scan`) before the population ran out, so
+    /// `seen` is a lower bound.
+    at_least: bool,
+}
+
+/// `--count-eligible`: `sel` was filled up to `scan_limit`. Keep the first
+/// `limit` chosen — the parents a plain run would process — and return the
+/// count of eligible parents the scan saw.
+fn keep_within_limit(
+    sel: &mut epigraph_cli::decompose::Selection,
+    limit: usize,
+    scan_limit: usize,
+) -> EligibleCount {
+    let seen = sel.chosen.len();
+    sel.chosen.truncate(limit);
+    // Filling `scan_limit` also stops the scan, without setting `scan_capped`.
+    let at_least = sel.scan_capped || seen >= scan_limit;
+    // The capped warning is about not reaching `--limit`; the count reports
+    // its own bound.
+    sel.scan_capped = sel.scan_capped && sel.chosen.len() < limit;
+    EligibleCount { seen, at_least }
+}
+
 /// Summarize what selection chose and passed over. Every explicit
 /// `--ids-file` id that is not decomposed is printed WITH its reason.
 fn report_selection(
     sel: &epigraph_cli::decompose::Selection,
     explicit: bool,
     priority: PriorityArg,
+    eligible: Option<EligibleCount>,
 ) {
-    let backlog = sel
-        .skipped
-        .iter()
-        .filter(|(_, w)| matches!(w, epigraph_cli::decompose::Ineligible::Backlog))
-        .count();
-    let atomic = sel.skipped.len() - backlog;
+    use epigraph_cli::decompose::Ineligible;
+    let count = |f: fn(&Ineligible) -> bool| sel.skipped.iter().filter(|(_, w)| f(w)).count();
+    // Each reason counted by its own variant: a remainder would silently fold
+    // a new reason into another's column.
+    let backlog = count(|w| matches!(w, Ineligible::Backlog));
+    let not_public = count(|w| matches!(w, Ineligible::NotPublic { .. }));
+    let atomic = count(|w| matches!(w, Ineligible::LooksAtomic { .. }));
+    let judged = count(|w| matches!(w, Ineligible::JudgedAtomic));
     eprintln!(
         "selection: priority={priority:?}{} scanned={} chosen={} skipped_backlog={backlog} \
-         skipped_looks_atomic={atomic}",
+         skipped_looks_atomic={atomic} skipped_judged_atomic={judged} \
+         skipped_not_public={not_public}",
         if explicit { " (ids-file order)" } else { "" },
         sel.scanned,
         sel.chosen.len(),
     );
+    if let Some(e) = eligible {
+        eprintln!(
+            "selection: eligible={}{} (parents that pass every filter, in {} rows read; the \
+             skipped_* counts cover the same rows)",
+            if e.at_least { ">=" } else { "" },
+            e.seen,
+            sel.scanned
+        );
+    }
     if sel.scan_capped {
         eprintln!(
             "selection: stopped at --max-scan={} rows before reaching --limit; raise --max-scan \
@@ -1098,6 +1475,33 @@ mod tests {
         resolve_mode(&cli, now)
     }
 
+    /// `--as-agent` accepts every decomposition mode and refuses every
+    /// `--retarget` mode, which stays on the maintenance path.
+    #[test]
+    fn as_agent_takes_the_decomposition_modes_and_refuses_retarget() {
+        let a = "5f1c2d3e-0000-4000-8000-000000000001";
+        assert_eq!(mode_of(&["--as-agent", a]).unwrap(), Mode::Run);
+        assert_eq!(
+            mode_of(&["--as-agent", a, "--dry-run"]).unwrap(),
+            Mode::Enumerate
+        );
+        assert!(matches!(
+            mode_of(&["--as-agent", a, "--apply-plan", "p.jsonl"]).unwrap(),
+            Mode::ApplyPlan(_)
+        ));
+        for retarget in [
+            &["--retarget"][..],
+            &["--retarget", "--apply"][..],
+            &["--retarget", "--apply-plan", "m.jsonl"][..],
+        ] {
+            let mut args = vec!["--as-agent", a];
+            args.extend_from_slice(retarget);
+            let err = mode_of(&args).unwrap_err();
+            assert!(err.contains("--as-agent"), "{retarget:?}: {err}");
+        }
+        assert!(mode_of(&["--as-agent", "not-a-uuid"]).is_err());
+    }
+
     /// No flags = the historical write run, `oldest` order.
     #[test]
     fn no_flags_is_a_normal_run_in_oldest_order() {
@@ -1108,6 +1512,117 @@ mod tests {
             !cli.include_backlog && !cli.include_short,
             "filters default ON"
         );
+    }
+
+    /// `--count-eligible` keeps exactly the parents a plain run chooses (the
+    /// first `--limit`, in order) and reports how many eligible parents the
+    /// scan saw, as a lower bound when the scan was cut off. It counts the
+    /// paged population only.
+    #[test]
+    fn count_eligible_keeps_the_plain_runs_choice_and_bounds_the_count() {
+        use epigraph_db::repos::decomposition_priority::DecomposeCandidate;
+        let cand = |n: u128| DecomposeCandidate {
+            id: uuid::Uuid::from_u128(n),
+            agent_id: uuid::Uuid::from_u128(0),
+            content: format!("Parent {n}. Second sentence."),
+            content_hash: vec![],
+            labels: vec![],
+            created_at: chrono::Utc::now(),
+            visibility: "public".into(),
+            conflict_edges: 0,
+            newest_conflict_at: None,
+        };
+        let sel_of = |n: u128, capped: bool| epigraph_cli::decompose::Selection {
+            chosen: (1..=n).map(cand).collect(),
+            scanned: 9_000,
+            scan_capped: capped,
+            ..Default::default()
+        };
+
+        // Population exhausted: an exact count, and the first `limit` kept.
+        let mut sel = sel_of(5, false);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert_eq!(
+            e,
+            super::EligibleCount {
+                seen: 5,
+                at_least: false
+            }
+        );
+        assert_eq!(
+            sel.chosen.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+        );
+        assert!(!sel.scan_capped);
+
+        // --max-scan stopped the scan: a lower bound, and the "did not reach
+        // --limit" warning is withdrawn once --limit is met.
+        let mut sel = sel_of(5, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && e.seen == 5, "{e:?}");
+        assert!(!sel.scan_capped);
+
+        // Filling the scan limit also stops the scan, without `scan_capped`.
+        let mut sel = sel_of(4, false);
+        let e = super::keep_within_limit(&mut sel, 2, 4);
+        assert!(e.at_least, "{e:?}");
+
+        // Fewer eligible than --limit and capped: the warning stays.
+        let mut sel = sel_of(1, true);
+        let e = super::keep_within_limit(&mut sel, 2, 20_000);
+        assert!(e.at_least && sel.scan_capped, "{e:?}");
+
+        for bad in [
+            &["--count-eligible", "--ids-file", "ids.txt"][..],
+            &["--count-eligible", "--apply-plan", "p.jsonl"][..],
+            &["--count-eligible", "--retarget"][..],
+        ] {
+            let err = mode_of(bad).unwrap_err();
+            assert!(err.contains("--count-eligible"), "{bad:?}: {err}");
+        }
+        assert_eq!(
+            mode_of(&["--dry-run", "--count-eligible"]).unwrap(),
+            Mode::Enumerate
+        );
+    }
+
+    /// `--singleton-ledger` is a decomposition flag: it composes with every
+    /// decomposition mode, `--include-judged-atomic` is meaningless without
+    /// it, and `--retarget` (which makes no decomposition verdict) refuses it.
+    /// A recording mode opens the file for append; the read-only modes do not
+    /// create it.
+    #[test]
+    fn singleton_ledger_flags_compose_only_with_decomposition_modes() {
+        let ledger = std::env::temp_dir().join(format!("ledger-{}.jsonl", uuid::Uuid::new_v4()));
+        let l = ledger.to_str().unwrap();
+        assert_eq!(
+            mode_of(&["--priority", "recent", "--singleton-ledger", l]).unwrap(),
+            Mode::Run
+        );
+        assert_eq!(
+            mode_of(&["--apply-plan", "p.jsonl", "--singleton-ledger", l]).unwrap(),
+            Mode::ApplyPlan(PathBuf::from("p.jsonl"))
+        );
+        let err = mode_of(&["--include-judged-atomic"]).unwrap_err();
+        assert!(err.contains("--singleton-ledger"), "{err}");
+        let err = mode_of(&["--retarget", "--singleton-ledger", l]).unwrap_err();
+        assert!(err.contains("--retarget"), "{err}");
+
+        let r = super::open_singleton_ledger(Some(&ledger), &Mode::Enumerate).unwrap();
+        assert!(r.is_some_and(|l| l.is_empty()));
+        assert!(!ledger.exists(), "--dry-run creates no ledger file");
+        let r = super::open_singleton_ledger(Some(&ledger), &Mode::Plan("p".into())).unwrap();
+        assert!(r.is_some());
+        assert!(!ledger.exists(), "--plan creates no ledger file");
+        super::open_singleton_ledger(Some(&ledger), &Mode::Run).unwrap();
+        assert!(
+            ledger.exists(),
+            "a recording run proves the path writable before any LLM call"
+        );
+        std::fs::remove_file(&ledger).ok();
+        assert!(super::open_singleton_ledger(None, &Mode::Run)
+            .unwrap()
+            .is_none());
     }
 
     /// `--retarget` is a DRY RUN unless `--apply` is given, and neither dry

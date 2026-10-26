@@ -95,6 +95,31 @@ const EXCLUDED: &[(&str, &str)] = &[
         "the admin-act record itself (130): proposed by its definer while the caller IS \
          elevated, confirmed and consumed by definers",
     ),
+    (
+        "agent_prompt_blobs",
+        "agent prompt files (161): written only by the attestor's registration definer, \
+         read only through the prompt-history definer, which has its own admin arm",
+    ),
+    (
+        "agent_prompt_snapshots",
+        "agent prompt snapshots (161): written only by the attestor's registration definer, \
+         read only through the prompt-history definer, which has its own admin arm",
+    ),
+    (
+        "agent_succession",
+        "agent lineage (161): written only by the attestor's registration definer, read \
+         only through the prompt-history definer, which has its own admin arm",
+    ),
+    (
+        "group_role_bindings",
+        "role-to-group bindings (165): maintenance-written governance, read only by the \
+         derivation definers",
+    ),
+    (
+        "role_agents",
+        "role attachments (166): maintenance-written, read only through the role-agent \
+         definers; an attachment confers no read and widens nothing",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (

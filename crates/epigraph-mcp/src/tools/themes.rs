@@ -8,16 +8,20 @@
 //! ## Safety
 //! - `limit` is capped at 500 (per `feedback_memory_limits.md`: VM OOMs at
 //!   ~2000 embeddings).
-//! - `wipe_first` defaults to `true`. Rationale: the `claim_themes` table
-//!   currently has no `UNIQUE(label)` constraint and `ClaimThemeRepository::create`
-//!   has no `ON CONFLICT` clause, so the additive path (`wipe_first=false`)
-//!   silently accumulates duplicate `auto-00`, `auto-01`, ... rows on every
-//!   call. Because this MCP tool is invoked by automated scheduled tasks, the
-//!   safe-by-default behaviour is a clean rebuild on each call. Callers that
-//!   genuinely want additive runs (e.g. with a unique `label_prefix` per call)
-//!   can pass `wipe_first=false` and will receive a warning in the response
-//!   when new themes are created. See backlog: missing UNIQUE constraint on
-//!   `claim_themes.label`.
+//! - `wipe_first` defaults to `false`, as on the HTTP route. A wipe is not
+//!   scoped to `label_prefix`: `ClaimThemeRepository::delete_all` deletes EVERY
+//!   theme and clears every `claims.theme_id`, so the run's output becomes the
+//!   whole live theme set. It used to default to `true` (to stop duplicate
+//!   `auto-NN` rows accumulating, `claim_themes` having no `UNIQUE(label)`), and
+//!   on 2026-09-23 a sweep probe's bare call with `label_prefix="sweep-probe"`
+//!   replaced the production set with probe output (backlog 5abe23de).
+//! - A wipe therefore needs `claims:admin` over HTTP (the scope the HTTP route
+//!   demands for any run; stdio is the local operator and is not gated, as for
+//!   every other tool), and the engine admits it only for the canonical
+//!   `"auto"` family (`epigraph_engine::theme_kmeans::validate_config`).
+//! - An additive run (`wipe_first=false`) that creates themes carries a
+//!   `warning` in the response: repeated additive runs under one prefix
+//!   accumulate duplicate labels.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -31,7 +35,9 @@ use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 
 use epigraph_db::{ClaimThemeRepository, ThemeSummaryRow};
-use epigraph_engine::theme_kmeans::{run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError};
+use epigraph_engine::theme_kmeans::{
+    run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError, CANONICAL_LABEL_PREFIX,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ThemeClusterParams {
@@ -50,11 +56,10 @@ pub struct ThemeClusterParams {
     pub label_prefix: Option<String>,
     /// Embedding dimensionality. Must be 1536 or 3072. Default 1536.
     pub centroid_dim: Option<u32>,
-    /// Whether to wipe existing themes with this `label_prefix` before
-    /// clustering. **Default `true`** — see module docstring. Pass `false`
-    /// only for additive runs with a unique `label_prefix`; otherwise
-    /// duplicate themes accumulate (no UNIQUE constraint on
-    /// `claim_themes.label`).
+    /// Whether to delete EVERY existing theme (whatever its prefix) and clear
+    /// every `claims.theme_id` before clustering. **Default `false`.** `true`
+    /// needs `claims:admin` over HTTP and the canonical `label_prefix` `"auto"`;
+    /// it is refused otherwise, with nothing written. See the module docstring.
     pub wipe_first: Option<bool>,
 }
 
@@ -63,8 +68,22 @@ const MCP_LIMIT_CAP: u32 = 500;
 pub async fn theme_cluster(
     server: &EpiGraphMcpFull,
     params: ThemeClusterParams,
+    auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
-    let wipe_first = params.wipe_first.unwrap_or(true);
+    let wipe_first = params.wipe_first.unwrap_or(false);
+    // A wipe replaces the whole live theme set: admin power, the scope the HTTP
+    // route (`build_themes_from_corpus`) demands for any run. `has_scope` applies the
+    // current admin posture, so an armed token's `claims:admin` counts only as
+    // the dispatch gate would count it. `None` is stdio: the local operator.
+    if wipe_first && auth.is_some_and(|a| !a.has_scope(crate::scope_map::CLAIMS_ADMIN)) {
+        return Err(McpError::invalid_request(
+            "theme_cluster wipe_first=true deletes every theme and replaces the live set, so it \
+             requires claims:admin; nothing was written. Omit wipe_first (default false) for an \
+             additive run"
+                .to_string(),
+            None,
+        ));
+    }
 
     let config = RunThemeKmeansConfig {
         k: params.k,
@@ -72,7 +91,9 @@ pub async fn theme_cluster(
         k_max: params.k_max.unwrap_or(16),
         min_claims_per_theme: params.min_claims_per_theme.unwrap_or(5),
         limit: params.limit.unwrap_or(500).clamp(1, MCP_LIMIT_CAP),
-        label_prefix: params.label_prefix.unwrap_or_else(|| "auto".to_string()),
+        label_prefix: params
+            .label_prefix
+            .unwrap_or_else(|| CANONICAL_LABEL_PREFIX.to_string()),
         wipe_first,
         centroid_dim: params.centroid_dim.unwrap_or(1536),
     };
@@ -106,16 +127,16 @@ pub async fn theme_cluster(
         })
     };
 
-    // Warn callers that opted out of `wipe_first`: with no DB-level UNIQUE
-    // constraint on `claim_themes.label`, repeated calls with the same
+    // An additive run (the default) that created themes: with no DB-level
+    // UNIQUE constraint on `claim_themes.label`, repeated calls with the same
     // `label_prefix` proliferate duplicate rows.
     if !wipe_first && summary.themes_created > 0 {
         body["warning"] = serde_json::json!(
-            "wipe_first=false: created themes are additive. Repeated calls with the same label_prefix will produce duplicate rows. See claim_themes UNIQUE constraint backlog."
+            "wipe_first=false (the default): created themes were added alongside the existing set. Repeated calls with the same label_prefix will produce duplicate rows; use a unique label_prefix, or a claims:admin rebuild of the \"auto\" family with wipe_first=true. See claim_themes UNIQUE constraint backlog."
         );
     }
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
@@ -326,7 +347,7 @@ pub async fn list_themes(
         "has_more": i64::from(offset) + returned < total,
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }
@@ -428,7 +449,7 @@ pub async fn get_theme(
         "members_has_more": i64::from(members_offset) + members_returned < members_total,
     });
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&body).map_err(internal_error)?,
     )]))
 }

@@ -42,6 +42,11 @@ with a transposed head would otherwise silently invert every stance.
   `NLI_STUB=1 uvicorn app:app --port 8000` then `NLI_STUB=1 pytest`.
 - Real model: `uvicorn app:app --port 8000` (needs ~1.5GB RAM + the
   weights; do NOT run on the 2.7GB-free dev box).
+- After changing any pin in `requirements.txt`: `pytest test_requirements_floor.py`
+  (stdlib-only security floor) and, in a venv with the full stack installed,
+  `NLI_REAL_MODEL=1 pytest test_model_smoke.py` (loads the real checkpoint;
+  the stub suite never imports torch/transformers, so it cannot catch a
+  stack bump that breaks the model path).
 - Container: `docker build -t epigraph-nli services/nli` then run with
   `-p 8000:8000`; front with the `Caddyfile.snippet` stanza.
 

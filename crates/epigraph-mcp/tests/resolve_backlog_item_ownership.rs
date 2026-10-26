@@ -306,6 +306,7 @@ fn make_auth(scopes: &[&str], agent: Uuid) -> AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 

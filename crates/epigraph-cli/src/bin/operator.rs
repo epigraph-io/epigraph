@@ -20,7 +20,10 @@
 //! `allow-author-binding-client` exits 3 when the allowance is recorded but
 //! does not bind (ALLOWED-BUT-INEFFECTIVE); `revoke-author-binding-client`
 //! exits 1 when no allowance row names the client (NOT-ALLOWED: nothing to
-//! revoke, usually a mistyped id).
+//! revoke, usually a mistyped id). `delete-frames` exits 3 when it refused at
+//! least one listed frame (nothing is written then, even under `--apply`).
+//! `group-member remove` exits 1 when the agent is not a live member
+//! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -32,6 +35,11 @@
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
 //!     epigraph-operator reown-reverse --manifest hide-1.jsonl [--apply]
+//!     epigraph-operator restrict-claims --claims-file claims.txt --target-group <uuid> \
+//!         --operator <uuid> --manifest-out restrict-1.jsonl [--allow-non-world-owner] \
+//!         [--max-batches N] [--apply --confirm-count N --ruling TEXT --reason TEXT \
+//!         [--accept-unenforced]]
+//!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
@@ -64,11 +72,28 @@
 //!     epigraph-operator allow-author-binding-client --client <uuid> --operator <uuid> \
 //!         --reason TEXT [--revoke-foreign-writes] [--apply]
 //!     epigraph-operator revoke-author-binding-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator delete-frames --ids-file frames.txt [--companion-claims-file claims.txt] \
+//!         --reason TEXT [--apply --confirm-delete N]
+//!     epigraph-operator create-group --kind team --name NAME --admin <uuid> --reason TEXT [--apply]
+//!     epigraph-operator define-group-role --key role:K --description TEXT --group <uuid> \
+//!         --member-role reader|writer [--include-agents] --reason TEXT [--apply]
+//!     epigraph-operator bind-group-role --role role:K --group <uuid> --member-role reader|writer \
+//!         [--include-agents] --reason TEXT [--apply]
+//!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
+//!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
+//!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
+//!         --reason TEXT [--apply]
+//!     epigraph-operator group-member set-role --group <uuid> --agent <uuid> \
+//!         --role reader|writer|admin --reason TEXT [--apply]
+//!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
+//!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
+//!     epigraph-operator list-dcr-clients [--older-than-hours 24]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    elevation, hide, human, legacy, link, passkey, reown, reown_linked, reverse, system_agent,
+    dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey, reown,
+    reown_linked, restrict, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -91,7 +116,8 @@ enum Command {
     /// explicit window. Agents never hold a role (CUS01); once a custodian
     /// exists every grant names a live custodian as --granted-by (CUS03).
     GrantRole {
-        /// `role:platform-custodian` or `role:auditor`.
+        /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
+        /// `define-group-role` added (migration 165).
         #[arg(long)]
         role: String,
         /// The human's own agent id (a registered human operator).
@@ -276,6 +302,109 @@ enum Command {
         #[arg(long)]
         include_ended: bool,
     },
+    /// Create a KEYLESS team group (migration 164) whose admin is a registered
+    /// human operator. Audited. Refused when an active team group already has
+    /// the name (case and surrounding space ignored).
+    CreateGroup {
+        /// The group kind. Only `team` is created here.
+        #[arg(long)]
+        kind: String,
+        /// The group's display name.
+        #[arg(long)]
+        name: String,
+        /// The admin Person: a registered human operator's agent id.
+        #[arg(long)]
+        admin: Uuid,
+        /// Recorded in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the group, its admin row and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Define a NON-ELEVATING catalog role and bind it to a group (migration
+    /// 165): every registered human holding a live assignment of the role
+    /// (`grant-role`) is then a member of the group, and with
+    /// --include-agents every agent registered to such a human. Computed, never
+    /// written: it lapses at the assignment's end. Audited.
+    DefineGroupRole {
+        /// The new role key, `role:<lowercase-key>`; refused if the catalog
+        /// already holds it (bind it with bind-group-role instead).
+        #[arg(long)]
+        key: String,
+        /// The catalog row's description.
+        #[arg(long)]
+        description: String,
+        /// The group whose membership follows the role (not personal, world or seed).
+        #[arg(long)]
+        group: Uuid,
+        /// `reader` or `writer` (a role never confers admin).
+        #[arg(long)]
+        member_role: String,
+        /// Also make every agent registered to a holder (an acting live link
+        /// or a live client allowance) a member.
+        #[arg(long)]
+        include_agents: bool,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the role, its binding and the audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Bind an EXISTING non-elevating catalog role to a group (migration 165).
+    /// A role that elevates or reads the audit trail is refused (GRB01).
+    BindGroupRole {
+        /// The catalog role key.
+        #[arg(long)]
+        role: String,
+        /// The group whose membership follows the role.
+        #[arg(long)]
+        group: Uuid,
+        /// `reader` or `writer`.
+        #[arg(long)]
+        member_role: String,
+        /// Also make every agent registered to a holder a member.
+        #[arg(long)]
+        include_agents: bool,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the binding and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// End a role binding now (migration 165): its members lapse at their
+    /// next resolution. Final; a new binding is a new row. Audited.
+    EndGroupRoleBinding {
+        /// The binding id (as define-group-role / bind-group-role printed it).
+        #[arg(long)]
+        binding: Uuid,
+        /// Recorded on the binding and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the end and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Who holds a group through its role bindings at an instant (migration
+    /// 165): each role holder and each agent registered to one. Read-only.
+    GroupRoster {
+        /// The group.
+        #[arg(long)]
+        group: Uuid,
+        /// The instant (RFC 3339; default now). The binding and the role
+        /// window are read at this instant; links, allowances and
+        /// registrations as they are now.
+        #[arg(long)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// Change a keyless team group's roster (migration 164): add, remove (a
+    /// revoke; the row is kept) or set a member's role. Each act audited.
+    GroupMember {
+        #[command(subcommand)]
+        action: GroupMemberAction,
+    },
     /// Register a HUMAN operator (migration 122's audited registry). Only the
     /// agent of an active human OAuth client can be registered.
     RegisterHumanOperator {
@@ -386,6 +515,11 @@ enum Command {
         /// The lowercase-hex BLAKE3 prompt hash (`EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH`).
         #[arg(long)]
         agent_system_prompt_hash: Option<String>,
+        /// A keyed identity's 32-byte identity public key, as 64 hex chars
+        /// (`EPIGRAPH_AGENT_IDENTITY_PUBKEY`). The agent must already exist
+        /// (the host's registration creates it); it is never created here.
+        #[arg(long)]
+        identity_pubkey: Option<String>,
         /// The human operator's agent id.
         #[arg(long)]
         operator: Uuid,
@@ -543,6 +677,111 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Move listed PUBLIC claims, and every row that follows them, into a
+    /// target group with visibility `group` (the audited admin privatization
+    /// act). Reversed exactly by `reown-reverse --manifest`.
+    RestrictClaims {
+        /// One claim UUID per line; only these claims are ever touched.
+        #[arg(long)]
+        claims_file: PathBuf,
+        /// The group the claims move into: an existing, active group (not
+        /// world or seed) of which `--operator` is a live admin.
+        #[arg(long)]
+        target_group: Uuid,
+        /// The operator (a person's agent id) the act is attributed to in the
+        /// audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Where to write the undo manifest. Must not exist. Written and
+        /// fsynced before any write under `--apply`.
+        #[arg(long)]
+        manifest_out: PathBuf,
+        /// Perform the writes. Without it, every batch runs in its own
+        /// transaction that is rolled back, and no manifest or audit row is
+        /// written.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's eligible claim count, repeated back.
+        #[arg(long)]
+        confirm_count: Option<usize>,
+        /// Proceed although legacy permissive policies mean the restriction is
+        /// not enforced; the run and its audit row then say UNENFORCED.
+        #[arg(long)]
+        accept_unenforced: bool,
+        /// Also move public claims owned by a group other than the world
+        /// group. Off by default: only the world-owned corpus moves.
+        #[arg(long)]
+        allow_non_world_owner: bool,
+        /// The decision this act carries out, recorded in the manifest and the
+        /// audit row. Required under `--apply`.
+        #[arg(long, default_value = "")]
+        ruling: String,
+        /// Why, recorded in the manifest and the audit row. Required under
+        /// `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Claims per transaction.
+        #[arg(long, default_value_t = 200)]
+        batch_size: usize,
+        /// Stop after this many batches (a re-run with a new manifest picks up
+        /// the rest).
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// How many claims the dry run lists row by row.
+        #[arg(long, default_value_t = 3)]
+        sample: usize,
+    },
+    /// Remove an explicit list of `frames` rows (test or probe frames), with
+    /// the rows that cascade from them, refusing any frame a real claim or
+    /// another row still depends on. Audited. Exit 3: at least one listed
+    /// frame was refused (nothing is written under `--apply` then).
+    DeleteFrames {
+        /// One frame UUID per line; only these frames are ever removed.
+        #[arg(long)]
+        ids_file: PathBuf,
+        /// One claim UUID per line: the test claims whose BBAs, frame
+        /// assignments and cached beliefs on the listed frames may be removed
+        /// with them. A frame-keyed row of any other claim refuses its frame.
+        #[arg(long)]
+        companion_claims_file: Option<PathBuf>,
+        /// Remove the frames. Needs `--confirm-delete <N>`.
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the planned frame count, repeated back.
+        #[arg(long)]
+        confirm_delete: Option<usize>,
+        /// Recorded in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// `lock_timeout` for the write (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
+    /// Revoke every dynamically registered (RFC 7591) client that never
+    /// completed an authorization and is older than the floor. Audited, one
+    /// row per client. Without `--apply`, the change is rolled back.
+    SweepDcrClients {
+        /// Only clients registered more than this many hours ago (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u32,
+        /// Recorded in each audit row.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Commit the revocations and their audit rows.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List every dynamically registered client (any status) with its
+    /// authorization-code count and whether `sweep-dcr-clients` would take it.
+    /// Read-only.
+    ListDcrClients {
+        /// The floor the `sweepable` column is computed for (at least 1).
+        #[arg(long, default_value_t = 24)]
+        older_than_hours: u32,
+    },
     /// Arm migration 128's admin-scope switch: from then on every mint strips
     /// the admin-only scopes and every path that hands scopes out refuses
     /// them. Audited. Without `--apply`, the change is rolled back.
@@ -605,11 +844,66 @@ struct ScopeArgs {
     reason: Option<String>,
 }
 
+/// The `group-member` verbs.
+#[derive(Subcommand)]
+enum GroupMemberAction {
+    /// Add an agent: a registered human, or an agent operated by one whose
+    /// operator writes the group (never as admin).
+    Add {
+        #[command(flatten)]
+        target: MemberTarget,
+        /// reader, writer or admin.
+        #[arg(long)]
+        role: String,
+    },
+    /// Remove (revoke) a member. Refused for the last live admin, and for an
+    /// operator whose operated agents are still live members.
+    Remove {
+        #[command(flatten)]
+        target: MemberTarget,
+    },
+    /// Set a live member's role. Refused when it would demote the last live
+    /// admin; a promotion meets add's rules again.
+    SetRole {
+        #[command(flatten)]
+        target: MemberTarget,
+        /// reader, writer or admin.
+        #[arg(long)]
+        role: String,
+    },
+}
+
+/// The arguments every `group-member` verb shares.
+#[derive(clap::Args)]
+struct MemberTarget {
+    /// The keyless team group.
+    #[arg(long)]
+    group: Uuid,
+    /// The member's agent id.
+    #[arg(long)]
+    agent: Uuid,
+    /// Recorded in the audit row.
+    #[arg(long)]
+    reason: String,
+    /// Commit. Without it, the change and its audit row roll back.
+    #[arg(long)]
+    apply: bool,
+}
+
 async fn main_inner() -> anyhow::Result<i32> {
     let cli = Cli::parse();
     // Refuse a blank switch reason before any connection is made.
     if let Command::ArmAdminScopes(a) | Command::DisarmAdminScopes(a) = &cli.command {
         admin_scopes::validate_reason(&a.reason)?;
+    }
+    // Refuse an age floor that could cut off a first authorization, before
+    // any connection is made.
+    if let Command::SweepDcrClients {
+        older_than_hours, ..
+    }
+    | Command::ListDcrClients { older_than_hours } = &cli.command
+    {
+        dcr_sweep::validate_age(*older_than_hours)?;
     }
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
@@ -656,6 +950,46 @@ async fn main_inner() -> anyhow::Result<i32> {
             anyhow::bail!("--batch-size must be at least 1");
         }
     }
+    // restrict-claims' options, refused before any connection when they cannot
+    // describe a valid run (no ruling, reason or confirmed count under --apply).
+    let restrict_opts = if let Command::RestrictClaims {
+        claims_file,
+        target_group,
+        operator: op,
+        manifest_out,
+        apply,
+        confirm_count,
+        accept_unenforced,
+        allow_non_world_owner,
+        ruling,
+        reason,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        sample,
+    } = &cli.command
+    {
+        let o = restrict::Options {
+            claims_file: claims_file.clone(),
+            target: *target_group,
+            operator: *op,
+            manifest_out: manifest_out.clone(),
+            apply: *apply,
+            confirm_count: *confirm_count,
+            accept_unenforced: *accept_unenforced,
+            allow_non_world_owner: *allow_non_world_owner,
+            ruling: ruling.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            sample: *sample,
+        };
+        restrict::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
     // The role vocabulary, before any connection: a typo is refused by this
     // tool with the valid values, not by the table's CHECK.
     let system_role = if let Command::RegisterSystemAgent { role, .. } = &cli.command {
@@ -663,6 +997,53 @@ async fn main_inner() -> anyhow::Result<i32> {
     } else {
         None
     };
+    // Team-group arguments, refused before any connection.
+    match &cli.command {
+        Command::CreateGroup {
+            kind, name, reason, ..
+        } => {
+            team_group::validate_kind(kind)?;
+            team_group::validate_text("--name", name)?;
+            team_group::validate_text("--reason", reason)?;
+        }
+        Command::GroupMember { action } => {
+            let (target, role) = match action {
+                GroupMemberAction::Add { target, role }
+                | GroupMemberAction::SetRole { target, role } => (target, Some(role)),
+                GroupMemberAction::Remove { target } => (target, None),
+            };
+            if let Some(role) = role {
+                team_group::validate_role(role)?;
+            }
+            team_group::validate_text("--reason", &target.reason)?;
+        }
+        Command::DefineGroupRole {
+            key,
+            description,
+            member_role,
+            reason,
+            ..
+        } => {
+            group_role::validate_key("--key", key)?;
+            group_role::validate_member_role(member_role)?;
+            team_group::validate_text("--description", description)?;
+            team_group::validate_text("--reason", reason)?;
+        }
+        Command::BindGroupRole {
+            role,
+            member_role,
+            reason,
+            ..
+        } => {
+            group_role::validate_key("--role", role)?;
+            group_role::validate_member_role(member_role)?;
+            team_group::validate_text("--reason", reason)?;
+        }
+        Command::EndGroupRoleBinding { reason, .. } => {
+            team_group::validate_text("--reason", reason)?;
+        }
+        _ => {}
+    }
     let db = operator::connect().await?;
     eprintln!(
         "epigraph-operator: connected as {} (member of epigraph_maintenance)",
@@ -985,6 +1366,225 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        Command::CreateGroup {
+            kind: _,
+            name,
+            admin,
+            reason,
+            apply,
+        } => {
+            let group = team_group::create(&mut conn, &name, admin, &reason, apply).await?;
+            println!(
+                "{}CREATED\tgroup={group}\tkind={}\tname={}\tadmin={admin}",
+                if apply { "" } else { "WOULD BE " },
+                team_group::KIND_TEAM,
+                name.trim()
+            );
+            if !apply {
+                println!(
+                    "DRY RUN: the group, its admin membership and its audit row were rolled back \
+                     (the id above is not kept)."
+                );
+            }
+            Ok(0)
+        }
+        Command::DefineGroupRole {
+            key,
+            description,
+            group,
+            member_role,
+            include_agents,
+            reason,
+            apply,
+        } => {
+            let binding = group_role::define(
+                &mut conn,
+                &key,
+                &description,
+                group,
+                &member_role,
+                include_agents,
+                &reason,
+                apply,
+            )
+            .await?;
+            println!(
+                "{}DEFINED\trole={key}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            println!(
+                "{}BOUND\tbinding={binding}\trole={key}\tgroup={group}\tmember_role={member_role}\t\
+                 include_agents={include_agents}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            if !apply {
+                println!(
+                    "DRY RUN: the role, its graph node, the binding and its audit row were rolled \
+                     back (the id above is not kept)."
+                );
+            }
+            Ok(0)
+        }
+        Command::BindGroupRole {
+            role,
+            group,
+            member_role,
+            include_agents,
+            reason,
+            apply,
+        } => {
+            let binding = group_role::bind(
+                &mut conn,
+                &role,
+                group,
+                &member_role,
+                include_agents,
+                &reason,
+                apply,
+            )
+            .await?;
+            println!(
+                "{}BOUND\tbinding={binding}\trole={role}\tgroup={group}\tmember_role={member_role}\t\
+                 include_agents={include_agents}",
+                if apply { "" } else { "WOULD BE " }
+            );
+            if !apply {
+                println!("DRY RUN: the binding and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::EndGroupRoleBinding {
+            binding,
+            reason,
+            apply,
+        } => {
+            let ended = group_role::end(&mut conn, binding, &reason, apply).await?;
+            if ended {
+                println!(
+                    "{}ENDED\tbinding={binding}",
+                    if apply { "" } else { "WOULD BE " }
+                );
+                if !apply {
+                    println!("DRY RUN: the end and its audit row were rolled back.");
+                }
+            } else {
+                println!("ALREADY-ENDED\tbinding={binding}\t(or no such binding; nothing changed)");
+            }
+            Ok(0)
+        }
+        Command::GroupRoster { group, at } => {
+            let rows = group_role::roster(&mut conn, group, at).await?;
+            for row in &rows {
+                println!(
+                    "MEMBER\tagent={}\trole={}\tholder={}",
+                    row.agent, row.role, row.holder
+                );
+            }
+            println!(
+                "members={}\tgroup={group}\tat={}",
+                rows.len(),
+                at.map_or_else(|| "now".to_string(), |t| t.to_rfc3339())
+            );
+            Ok(0)
+        }
+        Command::GroupMember { action } => {
+            let prefix = |apply: bool| if apply { "" } else { "WOULD BE " };
+            match action {
+                GroupMemberAction::Add { target, role } => {
+                    let act = team_group::add(
+                        &mut conn,
+                        target.group,
+                        target.agent,
+                        &role,
+                        &target.reason,
+                        target.apply,
+                    )
+                    .await?;
+                    if act.applied {
+                        println!(
+                            "{}ADDED\tgroup={}\tagent={}\trole={role}\tmembership={}",
+                            prefix(target.apply),
+                            target.group,
+                            target.agent,
+                            act.membership.map_or_else(String::new, |m| m.to_string())
+                        );
+                    } else {
+                        println!(
+                            "ALREADY-MEMBER\tgroup={}\tagent={}\trole={role}",
+                            target.group, target.agent
+                        );
+                    }
+                    if !target.apply {
+                        println!("DRY RUN: the membership and its audit row were rolled back.");
+                    }
+                    Ok(0)
+                }
+                GroupMemberAction::SetRole { target, role } => {
+                    let act = team_group::set_role(
+                        &mut conn,
+                        target.group,
+                        target.agent,
+                        &role,
+                        &target.reason,
+                        target.apply,
+                    )
+                    .await?;
+                    println!(
+                        "{}{}\tgroup={}\tagent={}\tprior_role={}\trole={role}",
+                        if act.applied {
+                            prefix(target.apply)
+                        } else {
+                            ""
+                        },
+                        if act.applied { "ROLE-SET" } else { "UNCHANGED" },
+                        target.group,
+                        target.agent,
+                        act.prior_role.as_deref().unwrap_or("")
+                    );
+                    if !target.apply {
+                        println!("DRY RUN: the role change and its audit row were rolled back.");
+                    }
+                    Ok(0)
+                }
+                GroupMemberAction::Remove { target } => {
+                    let act = team_group::remove(
+                        &mut conn,
+                        target.group,
+                        target.agent,
+                        &target.reason,
+                        target.apply,
+                    )
+                    .await?;
+                    if !act.applied {
+                        println!(
+                            "NOT-A-MEMBER\tgroup={}\tagent={}",
+                            target.group, target.agent
+                        );
+                        eprintln!(
+                            "epigraph-operator: agent {} is not a live member of group {}; \
+                             nothing was revoked",
+                            target.agent, target.group
+                        );
+                        return Ok(1);
+                    }
+                    println!(
+                        "{}REMOVED\tgroup={}\tagent={}\tprior_role={}\tmembership={}",
+                        prefix(target.apply),
+                        target.group,
+                        target.agent,
+                        act.prior_role.as_deref().unwrap_or(""),
+                        act.membership.map_or_else(String::new, |m| m.to_string())
+                    );
+                    if !target.apply {
+                        println!(
+                            "DRY RUN: the revoke and its audit row were rolled back (a removal \
+                             keeps the row, revoked)."
+                        );
+                    }
+                    Ok(0)
+                }
+            }
+        }
         Command::RegisterSystemAgent {
             role: _,
             agent,
@@ -1078,11 +1678,17 @@ async fn main_inner() -> anyhow::Result<i32> {
             agent,
             agent_model,
             agent_system_prompt_hash,
+            identity_pubkey,
             operator: op,
             revoke_foreign_writes,
             apply,
         } => {
-            let spec = bind::AgentSpec::from_flags(agent, agent_model, agent_system_prompt_hash)?;
+            let spec = bind::AgentSpec::from_flags(
+                agent,
+                agent_model,
+                agent_system_prompt_hash,
+                identity_pubkey,
+            )?;
             let outcome = bind::run(
                 db.pool(),
                 &mut conn,
@@ -1269,6 +1875,19 @@ async fn main_inner() -> anyhow::Result<i32> {
                 2
             })
         }
+        Command::RestrictClaims { claims_file, .. } => {
+            let opts = restrict_opts.expect("built above");
+            let ids = operator::read_ids_file(&claims_file)?;
+            if ids.is_empty() {
+                anyhow::bail!("no claim ids in {}", claims_file.display());
+            }
+            let report = restrict::run(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(if report.batch_failures.is_empty() {
+                0
+            } else {
+                2
+            })
+        }
         Command::HideEvidence {
             claims_file,
             operator: op,
@@ -1291,6 +1910,56 @@ async fn main_inner() -> anyhow::Result<i32> {
                 lock_timeout,
             };
             hide::run_standalone(&mut conn, &opts, &ids, &mut stdout).await?;
+            Ok(0)
+        }
+        Command::DeleteFrames {
+            ids_file,
+            companion_claims_file,
+            apply,
+            confirm_delete,
+            reason,
+            lock_timeout,
+        } => {
+            let frames = operator::read_ids_file(&ids_file)?;
+            if frames.is_empty() {
+                anyhow::bail!("no frame ids in {}", ids_file.display());
+            }
+            let companions = match &companion_claims_file {
+                Some(p) => operator::read_ids_file(p)?.into_iter().collect(),
+                None => std::collections::BTreeSet::new(),
+            };
+            let opts = delete_frames::Options {
+                frames,
+                companions,
+                apply,
+                confirm_delete,
+                reason,
+                lock_timeout,
+            };
+            let report = delete_frames::run(&mut conn, &opts, &mut stdout).await?;
+            Ok(if report.refused.is_empty() { 0 } else { 3 })
+        }
+        Command::SweepDcrClients {
+            older_than_hours,
+            reason,
+            apply,
+        } => {
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome =
+                dcr_sweep::run(&mut conn, older_than_hours, apply, reason.as_deref(), &who).await?;
+            for line in dcr_sweep::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Command::ListDcrClients { older_than_hours } => {
+            let rows = dcr_sweep::census(&mut conn, older_than_hours).await?;
+            if rows.is_empty() {
+                println!("no DCR clients");
+            }
+            for row in &rows {
+                println!("{}", dcr_sweep::describe_census(row));
+            }
             Ok(0)
         }
         cmd @ (Command::ArmAdminScopes(_) | Command::DisarmAdminScopes(_)) => {

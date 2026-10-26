@@ -27,7 +27,7 @@ use crate::routes::submit::{
     MethodologySubmission, ReasoningTraceSubmission, SubmitPacketResponse, TraceInputSubmission,
 };
 use crate::routes::versioning::{
-    DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse,
+    DedupRequest, DedupResponse, SupersedeRequest, SupersessionResponse, UndedupResponse,
 };
 #[cfg(feature = "db")]
 use crate::routes::workflows::{
@@ -91,6 +91,7 @@ use workflow_schema_stubs::{
         list_challenges,
         supersede_claim_doc,
         mark_duplicate_doc,
+        unmark_duplicate_doc,
         patch_claim_doc,
         update_labels_doc,
         evolve_step_doc,
@@ -129,6 +130,7 @@ use workflow_schema_stubs::{
             SupersessionResponse,
             DedupRequest,
             DedupResponse,
+            UndedupResponse,
             PatchClaimRequest,
             ClaimResponse,
             UpdateLabelsRequest,
@@ -209,7 +211,8 @@ pub struct ErrorResponse {
 
 /// Health check
 ///
-/// Returns service status, version, and current timestamp.
+/// Returns service status, version, current timestamp and `belief_modes`, the
+/// belief-mode flags this process read at startup.
 /// Used for monitoring and load balancer health checks.
 #[utoipa::path(
     get,
@@ -373,6 +376,24 @@ async fn supersede_claim_doc() {}
 )]
 async fn mark_duplicate_doc() {}
 
+/// Un-mark a duplicate (doc stub)
+#[utoipa::path(
+    post,
+    path = "/api/v1/claims/{id}/undedup",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the marked duplicate")),
+    responses(
+        (status = 200, body = UndedupResponse),
+        (status = 400),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+        (status = 409),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn unmark_duplicate_doc() {}
+
 /// Partial update of a claim (doc stub)
 #[utoipa::path(
     patch,
@@ -420,7 +441,9 @@ async fn update_labels_doc() {}
         (status = 200, body = EvolveStepResponse),
         (status = 400),
         (status = 401),
+        (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = []))
 )]
@@ -434,7 +457,8 @@ async fn evolve_step_doc() {}
     params(
         ("q" = String, Query, description = "Search query"),
         ("limit" = Option<i64>, Query, description = "Maximum results (default: 10, max: 50)"),
-        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions"),
+        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions. When true, the lineage head (highest generation) of every matched canonical_name is always returned, and each entry carries is_lineage_head, lineage_head_generation and lineage_head_deprecated (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group. The result can exceed limit by one head per matched lineage."),
+        ("min_truth" = Option<f64>, Query, description = "Minimum truth_value to surface (default: 0.3, so rows deprecated via deprecate_workflow at 0.05 drop out). With resolve_to_latest it also decides which lineage heads are flagged deprecated and sorted after their group's live rows."),
     ),
     responses(
         (status = 200, body = HierarchicalSearchResponse),

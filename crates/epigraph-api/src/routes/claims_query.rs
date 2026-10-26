@@ -206,9 +206,9 @@ pub struct ClaimListResponse {
 /// window — it understated the count, and it returned empty (indistinguishable
 /// from a true zero) for any filter matching only older claims.
 ///
-/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` is owed before the
-/// next WALK-shaped handler. This one is not walk-shaped and does not multiply
-/// it: the handle spans at most FOUR statements — zero to two prefetches, then
+/// `F-PR26-lineage-holds-one-connection-for-n-round-trips` was owed before the
+/// next WALK-shaped handler; it is now closed by the lineage walk's own
+/// projection. This handler was never walk-shaped and did not multiply it: the handle spans at most FOUR statements — zero to two prefetches, then
 /// `count_filtered` and `list_filtered` — with no per-node loop and no unbounded
 /// `N`. Nothing is held after `finish_scoped_read`.
 ///
@@ -455,6 +455,32 @@ pub async fn list_claims_query(
         limit,
         offset,
     }))
+}
+
+/// Query keys `GET /api/v1/claims` receives but has no predicate for: labels.
+/// [`ClaimQueryParams`] has no label field and no `deny_unknown_fields`, so
+/// `?labels=x` used to be dropped and the unfiltered page returned as if
+/// filtered. Label filtering lives at `GET /api/v1/claims/by-labels`.
+#[cfg(feature = "db")]
+const UNHONORED_LABEL_FILTERS: &[&str] = &["label", "labels", "tags", "exclude_labels"];
+
+/// The handler `GET /api/v1/claims` is routed to: [`list_claims_query`]
+/// behind a refusal of the label filters it cannot honour. A wrapper so the
+/// inner handler's signature, which tests call directly, is unchanged.
+#[cfg(feature = "db")]
+pub async fn list_claims_query_route(
+    viewer: crate::middleware::bearer::ViewerExtractor,
+    state: State<AppState>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    params: Query<ClaimQueryParams>,
+) -> Result<Json<ClaimListResponse>, ApiError> {
+    crate::routes::claims::refuse_unhonored_filters(
+        raw_query.as_deref(),
+        UNHONORED_LABEL_FILTERS,
+        "GET /api/v1/claims has no label filter; use GET \
+         /api/v1/claims/by-labels?labels=… instead.",
+    )?;
+    list_claims_query(viewer, state, params).await
 }
 
 /// Log a failed statement on the viewer-stamped connection in full, and answer
@@ -777,6 +803,7 @@ mod tests {
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+                delegated_by: None,
             }))
             .with_state(state)
     }

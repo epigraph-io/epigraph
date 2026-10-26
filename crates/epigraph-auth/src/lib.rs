@@ -79,6 +79,16 @@ pub struct EpiGraphClaims {
     /// means anything. Same N-1 shape as [`Self::fam`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elv: Option<Uuid>,
+    /// The DELEGATOR of a delegated run token: the agent of the OAuth client
+    /// that asked for this token on `agent_id`'s behalf (`sub` is that
+    /// client's row). A CLAIM, not authority: every site that admits it checks,
+    /// per request, that the delegation is still live
+    /// (`epigraph_db::AgentRepository::delegated_principal_pool`), and a site
+    /// that does not know it treats the token as an ordinary token for
+    /// `agent_id`, which is refused when that agent is operated (fails
+    /// closed). Same N-1 shape as [`Self::fam`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlg: Option<Uuid>,
 }
 
 /// What an access token is bound to beyond its client: the refresh family it
@@ -90,6 +100,8 @@ pub struct AccessTokenBinding {
     pub family_id: Option<Uuid>,
     /// Becomes the `elv` claim.
     pub elevation_id: Option<Uuid>,
+    /// Becomes the `dlg` claim.
+    pub delegated_by: Option<Uuid>,
 }
 
 impl AccessTokenBinding {
@@ -97,6 +109,7 @@ impl AccessTokenBinding {
     pub const NONE: Self = Self {
         family_id: None,
         elevation_id: None,
+        delegated_by: None,
     };
 
     /// Bound to one refresh family, with no elevation.
@@ -105,6 +118,7 @@ impl AccessTokenBinding {
         Self {
             family_id: Some(family_id),
             elevation_id: None,
+            delegated_by: None,
         }
     }
 }
@@ -138,6 +152,35 @@ pub const ADMIN_ONLY_SCOPES: &[&str] = &[
     "groups:admin",
     "instance:admin",
 ];
+
+/// The ONLY scopes a DELEGATED run token (an access token carrying `dlg`) may
+/// hold: claim, evidence and edge reads and writes, challenges, and agent
+/// reads. Never group or agent management, webhooks, clients, or any
+/// admin-only or elevated scope. The bearer layers refuse a delegated token
+/// that carries anything else ([`outside_delegated_ceiling`]), and
+/// [`AuthContext::has_scope`] never answers `true` outside it for a delegated
+/// context, so no out-of-ceiling gate (a `claims:admin` arm included) runs for
+/// one even where admission was skipped.
+pub const DELEGATED_SCOPE_CEILING: &[&str] = &[
+    "claims:read",
+    "claims:write",
+    "claims:challenge",
+    "evidence:read",
+    "evidence:submit",
+    "edges:read",
+    "edges:write",
+    "agents:read",
+];
+
+/// The scopes of `scopes` outside [`DELEGATED_SCOPE_CEILING`], in order.
+#[must_use]
+pub fn outside_delegated_ceiling(scopes: &[String]) -> Vec<&str> {
+    scopes
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !DELEGATED_SCOPE_CEILING.contains(s))
+        .collect()
+}
 
 /// Whether `scope` is one of [`ADMIN_ONLY_SCOPES`].
 #[must_use]
@@ -221,6 +264,7 @@ impl JwtConfig {
             agent_id,
             fam: binding.family_id,
             elv: binding.elevation_id,
+            dlg: binding.delegated_by,
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)?;
         Ok((token, jti))
@@ -281,6 +325,12 @@ pub struct AuthContext {
     /// after the database said the session is live (the API's recorder layer,
     /// the MCP server's dispatch). `None` on every other request.
     pub elevation: Option<ElevationRef>,
+    /// The token's `dlg` claim, AS CLAIMED: the delegator agent of a
+    /// delegated run token. Not authority: a site admits such a token only
+    /// after the database says the delegation is live
+    /// (`epigraph_db::AgentRepository::delegated_principal_pool`), on every
+    /// request.
+    pub delegated_by: Option<Uuid>,
     /// The admin-scope switch as the auth layer read it for this request.
     /// [`From<EpiGraphClaims>`] sets [`AdminScopePosture::Armed`] (fail
     /// closed): an auth layer that forgets to read the switch loses admin
@@ -327,8 +377,14 @@ impl AuthContext {
     ///   [`AdminScopePosture::Unarmed`], ABSENT while it is
     ///   [`AdminScopePosture::Armed`].
     /// * Every other scope: as the token says.
+    ///
+    /// Before all of these: a DELEGATED context ([`Self::delegated_by`]) holds
+    /// nothing outside [`DELEGATED_SCOPE_CEILING`], whatever its token carries.
     #[must_use]
     pub fn has_scope(&self, scope: &str) -> bool {
+        if self.delegated_by.is_some() && !DELEGATED_SCOPE_CEILING.contains(&scope) {
+            return false;
+        }
         let carried = self.scopes.iter().any(|s| s == scope);
         let elevated = self.elevation.is_some();
         if scope == ELEVATED_ONLY_SCOPE {
@@ -364,6 +420,7 @@ impl From<EpiGraphClaims> for AuthContext {
             family_id: claims.fam,
             elevation_claim: claims.elv,
             elevation: None,
+            delegated_by: claims.dlg,
             admin_scopes: AdminScopePosture::Armed,
         }
     }
@@ -418,6 +475,7 @@ mod tests {
         let elevated = AccessTokenBinding {
             family_id: Some(fam),
             elevation_id: Some(Uuid::new_v4()),
+            delegated_by: None,
         };
         assert_eq!(mint(elevated), asked);
         assert_eq!(
@@ -495,6 +553,7 @@ mod tests {
                 family_id: Uuid::new_v4(),
             }),
             admin_scopes: posture,
+            delegated_by: None,
         }
     }
 
@@ -654,6 +713,145 @@ mod tests {
         }
     }
 
+    /// The `dlg` claim is N-1 safe in both directions. A binary that predates
+    /// it (modelled by the claim set it decoded, which has no `dlg` and no
+    /// `deny_unknown_fields`) decodes a delegated token as an ordinary token
+    /// for the same agent, so it refuses that agent if it is operated (fail
+    /// closed). A token minted without a delegator carries no `dlg` key at
+    /// all, so this binary's tokens are byte-compatible with the old shape.
+    /// Mutations caught: `dlg` serialised when `None` (the key appears),
+    /// `dlg` not mapped into `AuthContext::delegated_by`, and
+    /// `deny_unknown_fields` on the old shape.
+    #[test]
+    fn a_token_without_dlg_decodes_and_a_dlg_token_decodes_in_the_n_minus_1_struct() {
+        #[derive(Deserialize)]
+        #[allow(
+            dead_code,
+            reason = "decoded only to prove the old shape accepts the token"
+        )]
+        struct PreDelegationClaims {
+            sub: Uuid,
+            iss: String,
+            aud: String,
+            exp: i64,
+            iat: i64,
+            nbf: i64,
+            jti: Uuid,
+            scopes: Vec<String>,
+            client_type: String,
+            owner_id: Option<Uuid>,
+            agent_id: Option<Uuid>,
+            #[serde(default)]
+            fam: Option<Uuid>,
+            #[serde(default)]
+            elv: Option<Uuid>,
+        }
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let agent = Uuid::new_v4();
+        let delegator = Uuid::new_v4();
+        let mint = |delegated_by: Option<Uuid>| {
+            cfg.issue_access_token(
+                Uuid::new_v4(),
+                vec!["claims:read".to_string()],
+                "agent",
+                None,
+                Some(agent),
+                Duration::minutes(5),
+                AccessTokenBinding {
+                    delegated_by,
+                    ..AccessTokenBinding::NONE
+                },
+            )
+            .unwrap()
+            .0
+        };
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_issuer(&["epigraph"]);
+        validation.set_audience(&["epigraph-api"]);
+        let keys = |token: &str| -> std::collections::HashMap<String, serde::de::IgnoredAny> {
+            decode(token, &cfg.decoding_key, &validation)
+                .expect("payload keys")
+                .claims
+        };
+
+        let plain = mint(None);
+        assert!(
+            !keys(&plain).contains_key("dlg"),
+            "a token with no delegator must not carry the key"
+        );
+        let ctx: AuthContext = cfg.validate_token(&plain).unwrap().into();
+        assert_eq!(ctx.delegated_by, None);
+
+        let delegated = mint(Some(delegator));
+        assert!(keys(&delegated).contains_key("dlg"));
+        assert_eq!(cfg.validate_token(&delegated).unwrap().dlg, Some(delegator));
+        let ctx: AuthContext = cfg.validate_token(&delegated).unwrap().into();
+        assert_eq!(ctx.delegated_by, Some(delegator));
+        assert_eq!(ctx.agent_id, Some(agent));
+
+        let old = decode::<PreDelegationClaims>(&delegated, &cfg.decoding_key, &validation)
+            .expect("a binary that predates `dlg` must still decode a delegated token");
+        assert_eq!(
+            old.claims.agent_id,
+            Some(agent),
+            "the old shape reads the token as one for the same agent, which it refuses if \
+             that agent is operated"
+        );
+    }
+
+    /// A DELEGATED context (one carrying `dlg`) holds no scope outside the
+    /// delegated ceiling, whatever its token carries and whatever the
+    /// admin-scope switch says, so no `claims:admin` arm (or any other
+    /// out-of-ceiling gate) can run for it even where the bearer layer's
+    /// admission refusal was skipped. Calibration: the same context without
+    /// `dlg`, switch unarmed, holds every scope it carries.
+    #[test]
+    fn a_delegated_context_holds_no_scope_outside_the_ceiling() {
+        let carried = [
+            "claims:read",
+            "claims:write",
+            "claims:admin",
+            "webhooks:write",
+            "groups:write",
+            "groups:admin",
+            "agents:write",
+            "clients:admin",
+        ];
+        let ctx = |delegated_by: Option<Uuid>| AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(Uuid::new_v4()),
+            owner_id: None,
+            client_type: ClientType::Agent,
+            scopes: carried.iter().map(|s| (*s).to_string()).collect(),
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: AdminScopePosture::Unarmed,
+            delegated_by,
+        };
+        let plain = ctx(None);
+        for scope in carried {
+            assert!(plain.has_scope(scope), "CALIBRATION: {scope}");
+        }
+        let delegated = ctx(Some(Uuid::new_v4()));
+        assert!(delegated.has_scope("claims:read"));
+        assert!(delegated.has_scope("claims:write"));
+        for scope in [
+            "claims:admin",
+            "webhooks:write",
+            "groups:write",
+            "groups:admin",
+            "agents:write",
+            "clients:admin",
+        ] {
+            assert!(
+                !delegated.has_scope(scope),
+                "a delegated context must not hold {scope}"
+            );
+        }
+    }
+
     #[test]
     fn check_scopes_pass_and_fail() {
         let auth = AuthContext {
@@ -667,6 +865,7 @@ mod tests {
             elevation_claim: None,
             elevation: None,
             admin_scopes: AdminScopePosture::Unarmed,
+            delegated_by: None,
         };
         assert!(check_scopes(&auth, &["claims:read"]).is_ok());
         assert!(check_scopes(&auth, &["claims:write"]).is_err());

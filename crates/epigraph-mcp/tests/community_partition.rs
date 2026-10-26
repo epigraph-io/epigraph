@@ -264,6 +264,7 @@ async fn batch_check_mixed_community_and_public(pool: PgPool) {
             // pinning `None` keeps this test about VISIBILITY rather than
             // about `a85ee585`'s current-only default.
             is_current: None,
+            exclude_spine: None,
         },
     )
     .await

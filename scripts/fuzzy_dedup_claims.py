@@ -1,68 +1,65 @@
 #!/usr/bin/env python3
 """Fuzzy / semantic dedup pass over the claims table.
 
-Consumes a precomputed semantic-dedup.json snapshot (cosine ≥ threshold over
+Consumes a precomputed semantic-dedup.json snapshot (cosine >= threshold over
 claim embeddings) produced by the GUI's offline analysis. For each group, picks
-a canonical claim, redirects its high-signal references (mass_functions, edges,
-evidence, reasoning_traces), preserves AUTHORED-edge provenance from each
-duplicate's agent, and RETRACTS the duplicates — `supersedes = canonical`,
-`is_current = false`, `embedding = NULL`, `embedding_3072 = NULL` — while also labelling them `deduped`
-with a `deduped_into` pointer, so the GUI's collapse behaviour and any
-downstream label-aware reader stay coherent.
+a canonical claim and marks every other member a duplicate of it through the
+API, `POST /api/v1/claims/{dup}/dedup {"canonical_id": ...}`: the same act as
+MCP `mark_duplicate`. That act retires the duplicate (`supersedes = canonical`,
+`is_current = false`, both embeddings nulled), writes its `same_as` identity
+edge carrying `properties.dedup` (so `unmark_duplicate` can reverse it and
+`label_dedup_index_view` reads it), and runs the administrative cascade that
+moves its evidence, edges and mass functions onto the canonical with a revert
+record, plus the belief re-derivation.
 
-The retraction is load-bearing, not decoration. Until 2026-09 this script only
-appended the label and the properties, leaving every duplicate `is_current =
-true` with its embedding intact. `recall()` filters `WHERE c.embedding IS NOT
-NULL AND c.is_current` on both its dense and lexical legs, so soft-marked
-duplicates kept coming back as independent rows and a single-origin figure read
-as mutual corroboration across two to four nodes. The retraction columns written
-here are exactly those of the canonical Rust path,
-`ClaimRepository::mark_duplicate_with_repair`.
+The database is READ ONLY here (a read-only session): it picks canonicals and
+skips members already retired. Until 2026-10 the script marked duplicates with
+its own SQL (a raw `UPDATE claims` and hand-written, lossy re-pointing), which
+wrote no identity edge. Those marks are un-markable once an operator's
+`backfill_dedup_identity_edges --apply` (epigraph-cli) has written the edge:
+`unmark_duplicate` then makes the claim current again and restores nothing
+(that SQL kept no repair record; the answer says `legacy_mark`). A legacy mark
+the backfill cannot reconstruct is refused with the reason. Until backfilled,
+the index view does not see them. The backfill is an operator task, not this
+script's.
 
 This is the *S3 fuzzy* layer (cross-agent semantic equivalence). The S2
 content-hash-keyed dedup that gates migration 107 is a separate tool.
 
-Default mode is dry-run; pass --execute to commit. Each cluster runs in its
-own transaction so a single hostile cluster does not abort the whole pass.
+Default mode is dry-run: it reports what it would mark and sends nothing.
+`--execute` needs a bearer token (`--token`, or EPIGRAPH_TOKEN) and refuses to
+start without one. The endpoint needs the `claims:write` scope and write
+authority over both claims, so a cross-agent cluster needs a token that also
+carries `claims:admin`. Each duplicate is one
+request; a refused one (HTTP status and body) is reported, the rest of the run
+continues, and the run exits 1.
 
 Usage:
     python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json
-    python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute
-    python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute --limit 100
+    EPIGRAPH_TOKEN=... python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute
+    EPIGRAPH_TOKEN=... python3 scripts/fuzzy_dedup_claims.py --input semantic-dedup.json --execute --limit 100
 
-Limitations (scope-deferred — see docs/architecture/noun-claims-and-verb-edges.md):
-- Does not redirect FKs in: assessment_queue, assessment_results,
-  behavioral_executions.step_claim_id, challenges, claim_clusters,
-  claim_encryption, claim_frames, claim_neighborhood_membership,
-  claim_signature_revocations, counterfactual_scenarios, countersignatures,
-  ds_bayesian_divergence, entity_mentions, evidence_diversity,
-  experiments.hypothesis_id, learning_events, praxis_access_log.justification_claim_id,
-  praxis_claims, praxis_compliance_requirements, sample_claims, triples.
-  Retraction + label-aware reads cover these for now: the row survives, so
-  every un-redirected FK stays valid, but it no longer answers recall.
-- A duplicate that is ALREADY superseded is skipped, not re-pointed, and
-  counted as `duplicates_skipped_already_superseded`. Overwriting an existing
-  `supersedes` would destroy lineage; `mark_duplicate_with_repair` refuses the
-  same case.
-- `embedding_3072` IS nulled, in the same statement, because
-  `mark_duplicate_act` (behind `mark_duplicate_with_repair`) nulls it too and
-  `chk_deprecated_no_embedding` (migration 144) refuses a retired row that
-  keeps it.
-- Mass-function merge is lossy. Pre-2026-04-08 BBAs all carry
-  perspective_id=NULL, so any same-agent BBA on the duplicate collides
-  with the canonical's BBA on the unique
-  (claim, frame, agent, perspective) and is dropped, not combined.
-  The canonical's pre-existing BBA is the survivor; the duplicate's
-  parallel record is gone. Acceptable when the duplicates are true
-  semantic equivalents (same agent's belief, recorded twice). Run a
-  CDST recombine pass after dedup if you want re-aggregated belief.
+Skips:
+- A member that is not current, or already carries a `supersedes` pointer, is
+  never picked as the canonical; as a duplicate it is skipped and counted as
+  `duplicates_skipped_already_superseded` (the endpoint refuses that case too),
+  unless it is already marked onto this cluster's canonical (an earlier run),
+  which is passed over silently.
+- A request that gets no HTTP answer (refused, reset, timed out) counts as a
+  refusal for that duplicate; the cluster's other marks still count.
+- A member labelled `deduped` (a pre-2026-10 mark by this script) is treated
+  the same way while it is retired. Once un-marked it is current again (the
+  label stays on it) and is an ordinary member.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 
@@ -71,6 +68,7 @@ import psycopg2.extras
 
 from maintenance_dsn import maintenance_dsn
 
+DEFAULT_API_BASE = "http://127.0.0.1:8080"
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph_admin:epigraph_admin@127.0.0.1:5432/epigraph"
 )
@@ -81,15 +79,10 @@ DEFAULT_INPUT_PATH = "/home/jeremy/epigraph-gui/public/semantic-dedup.json"
 class ClusterStats:
     canonical_id: str
     duplicate_count: int = 0
-    duplicates_retracted: int = 0
+    duplicates_marked: int = 0
+    duplicates_refused: int = 0
     duplicates_skipped_already_superseded: int = 0
-    mfs_moved: int = 0
-    mfs_skipped_collision: int = 0
-    edges_redirected: int = 0
-    edges_dropped_collision: int = 0
-    evidence_redirected: int = 0
-    traces_redirected: int = 0
-    authored_edges_added: int = 0
+    refusals: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -98,15 +91,9 @@ class TotalStats:
     clusters_skipped_already_deduped: int = 0
     clusters_failed: int = 0
     duplicates: int = 0
-    duplicates_retracted: int = 0
+    duplicates_marked: int = 0
+    duplicates_refused: int = 0
     duplicates_skipped_already_superseded: int = 0
-    mfs_moved: int = 0
-    mfs_skipped_collision: int = 0
-    edges_redirected: int = 0
-    edges_dropped_collision: int = 0
-    evidence_redirected: int = 0
-    traces_redirected: int = 0
-    authored_edges_added: int = 0
     failures: list[str] = field(default_factory=list)
 
 
@@ -121,10 +108,12 @@ def load_groups(path: str) -> list[dict]:
 def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None:
     """Pick the canonical claim id for a cluster.
 
-    Prefers the rep id from the input snapshot when it still exists and is
-    not already soft-deduped. Otherwise picks by (trace_count, mf_count,
-    edge_count) descending. Returns None if every member is missing or
-    already soft-deduped (idempotent re-run).
+    Only a live member (exists, current) can be the canonical; the `deduped`
+    label of a pre-2026-10 mark counts only while the claim is retired. Prefers the rep id from the input snapshot when it is live;
+    otherwise picks by (trace_count, mf_count, edge_count) descending. Returns
+    None only when no member is live: a cluster with one live member is still
+    handed to `merge_cluster`, which reports the members it skips (a member
+    already superseded by another claim is counted, not hidden).
     """
     cur.execute(
         """
@@ -132,7 +121,8 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
                COALESCE('deduped' = ANY(c.labels), false) AS is_deduped,
                (SELECT count(*) FROM reasoning_traces WHERE claim_id = c.id) AS trace_count,
                (SELECT count(*) FROM mass_functions  WHERE claim_id = c.id) AS mf_count,
-               (SELECT count(*) FROM edges WHERE source_id = c.id OR target_id = c.id) AS edge_count
+               (SELECT count(*) FROM edges WHERE source_id = c.id OR target_id = c.id) AS edge_count,
+               COALESCE(c.is_current, true) AS is_current
         FROM claims c
         WHERE c.id = ANY(%s::uuid[])
         """,
@@ -145,12 +135,16 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
             "trace_count": r[2],
             "mf_count": r[3],
             "edge_count": r[4],
+            "is_current": r[5],
         }
         for r in cur.fetchall()
     ]
-    live = [r for r in rows if not r["is_deduped"]]
-    if len(live) <= 1:
-        return None  # nothing to merge
+    # The `deduped` label a pre-2026-10 mark left counts only while the claim
+    # is retired (so `is_current` alone decides): an un-marked legacy claim
+    # (operator ruling R-7) is current again, label and all, and live.
+    live = [r for r in rows if r["is_current"]]
+    if not live:
+        return None  # no member can be the canonical
     suggested = next((r for r in live if r["id"] == suggested_rep), None)
     if suggested is not None:
         return suggested["id"]
@@ -158,204 +152,86 @@ def pick_canonical(cur, member_ids: list[str], suggested_rep: str) -> str | None
     return live[0]["id"]
 
 
+def post_dedup(
+    api_base: str, token: str, dup_id: str, canonical_id: str, timeout: float = 60.0
+) -> tuple[int, str]:
+    """POST /api/v1/claims/{dup}/dedup. Returns (HTTP status, response body).
+
+    A request that gets no HTTP answer (connection refused or reset, timeout)
+    returns status 0 and the error text, so the caller counts it as a refusal
+    for that duplicate and keeps the marks already made in the cluster.
+    """
+    req = urllib.request.Request(
+        f"{api_base.rstrip('/')}/api/v1/claims/{dup_id}/dedup",
+        data=json.dumps(
+            {"canonical_id": canonical_id, "reason": "fuzzy_dedup_claims semantic cluster"}
+        ).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+    except (urllib.error.URLError, OSError) as e:
+        # URLError covers refused/unresolvable; OSError covers a reset or a
+        # timeout mid-response (http.client raises those unwrapped).
+        return 0, f"no HTTP response: {e}"
+
+
 def merge_cluster(
     cur,
     canonical_id: str,
     member_ids: list[str],
+    api_base: str | None = None,
+    token: str | None = None,
 ) -> ClusterStats:
+    """Mark every live non-canonical member a duplicate of `canonical_id`.
+
+    Reads only. With `token` (execute mode) each duplicate is one POST to the
+    dedup endpoint; without, it is counted as one the run would mark. A member
+    already marked onto this canonical (a re-run) is passed over silently; one
+    superseded by another claim, or otherwise not current, is skipped and
+    counted in `duplicates_skipped_already_superseded`.
+    """
     stats = ClusterStats(canonical_id=canonical_id)
     duplicates = [m for m in member_ids if m != canonical_id]
 
     for dup_id in duplicates:
-        # Skip if already soft-deduped — keeps the script idempotent. Also read
-        # `supersedes`: a dup that already points somewhere has a lineage we
-        # must not clobber (see step 7).
         cur.execute(
-            "SELECT 'deduped' = ANY(labels), supersedes FROM claims WHERE id = %s::uuid",
+            "SELECT 'deduped' = ANY(labels), supersedes::text, "
+            "COALESCE(is_current, true) FROM claims WHERE id = %s::uuid",
             (dup_id,),
         )
         row = cur.fetchone()
         if row is None:
             continue  # claim was hard-deleted between the snapshot and now
-        if row[0]:
-            continue  # already deduped
-        if row[1] is not None:
-            # Already superseded by some other claim. Retracting it INTO this
-            # canonical would overwrite that pointer, so refuse — the same
-            # decision ClaimRepository::mark_duplicate_with_repair makes
-            # ("Claim {id} already superseded; refusing to overwrite"). Left
-            # untouched and reported rather than silently half-merged.
+        is_deduped, supersedes, is_current = row
+        if is_deduped and not is_current:
+            # Still retired by a pre-2026-10 mark of this script. Once un-marked
+            # (current again, the label left on it) it is an ordinary member.
+            continue
+        if supersedes is not None and str(supersedes) == canonical_id:
+            continue  # already marked onto this canonical (an earlier run)
+        if supersedes is not None or not is_current:
+            # Superseded by some other claim, or retired: the endpoint refuses
+            # to overwrite that, so do not ask. Reported, not half-merged.
             stats.duplicates_skipped_already_superseded += 1
             continue
         stats.duplicate_count += 1
-
-        # 1. Mass functions — UNIQUE (claim, frame, agent, perspective). Migrate
-        #    rows that don't collide; drop collisions (canonical already has a BBA
-        #    for that perspective and re-aggregation happens on next CDST pass).
-        cur.execute(
-            """
-            UPDATE mass_functions
-               SET claim_id = %s::uuid
-             WHERE claim_id = %s::uuid
-               AND NOT EXISTS (
-                   SELECT 1 FROM mass_functions m2
-                    WHERE m2.claim_id = %s::uuid
-                      AND m2.frame_id = mass_functions.frame_id
-                      AND m2.source_agent_id IS NOT DISTINCT FROM mass_functions.source_agent_id
-                      AND m2.perspective_id  IS NOT DISTINCT FROM mass_functions.perspective_id
-               )
-            """,
-            (canonical_id, dup_id, canonical_id),
-        )
-        stats.mfs_moved += cur.rowcount
-        cur.execute(
-            "DELETE FROM mass_functions WHERE claim_id = %s::uuid",
-            (dup_id,),
-        )
-        stats.mfs_skipped_collision += cur.rowcount
-
-        # 2. Edges where dup is the source — avoid (source, target, rel) UNIQUE
-        #    collision and self-edges to the canonical.
-        cur.execute(
-            """
-            UPDATE edges SET source_id = %s::uuid
-             WHERE source_id = %s::uuid
-               AND target_id != %s::uuid
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e2
-                    WHERE e2.source_id = %s::uuid
-                      AND e2.target_id = edges.target_id
-                      AND e2.relationship = edges.relationship
-               )
-            """,
-            (canonical_id, dup_id, canonical_id, canonical_id),
-        )
-        stats.edges_redirected += cur.rowcount
-
-        # 3. Edges where dup is the target — same shape, mirrored.
-        cur.execute(
-            """
-            UPDATE edges SET target_id = %s::uuid
-             WHERE target_id = %s::uuid
-               AND source_id != %s::uuid
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e2
-                    WHERE e2.source_id = edges.source_id
-                      AND e2.target_id = %s::uuid
-                      AND e2.relationship = edges.relationship
-               )
-            """,
-            (canonical_id, dup_id, canonical_id, canonical_id),
-        )
-        stats.edges_redirected += cur.rowcount
-
-        # 4. Drop edges that couldn't redirect (would-be self-edge or triple
-        #    collision). Without this they cascade-orphan when the dup's
-        #    label-only soft-mark is later promoted to a hard delete.
-        cur.execute(
-            "DELETE FROM edges WHERE source_id = %s::uuid OR target_id = %s::uuid",
-            (dup_id, dup_id),
-        )
-        stats.edges_dropped_collision += cur.rowcount
-
-        # 5. Evidence and reasoning traces — straight repoint, no UNIQUE
-        #    constraints to dodge.
-        cur.execute(
-            "UPDATE evidence SET claim_id = %s::uuid WHERE claim_id = %s::uuid",
-            (canonical_id, dup_id),
-        )
-        stats.evidence_redirected += cur.rowcount
-        cur.execute(
-            "UPDATE reasoning_traces SET claim_id = %s::uuid WHERE claim_id = %s::uuid",
-            (canonical_id, dup_id),
-        )
-        stats.traces_redirected += cur.rowcount
-
-        # 6. Preserve cross-agent provenance: each dup's authoring agent gets
-        #    an AUTHORED edge to the canonical, idempotently.
-        #
-        #    Idempotence is enforced by NOT EXISTS, not by ON CONFLICT. There is
-        #    no `UNIQUE (source_id, target_id, relationship)` on `edges` to
-        #    conflict against: migration 017 deliberately made AUTHORED edges
-        #    multi-valued, 018 dropped the triple-unique constraint, and 053
-        #    dropped the drifted unique index that had survived it. An
-        #    `ON CONFLICT` naming those columns therefore raises "there is no
-        #    unique or exclusion constraint matching the ON CONFLICT
-        #    specification", which aborts the cluster transaction — every
-        #    cluster, every run.
-        cur.execute(
-            """
-            INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-            SELECT c.agent_id, 'agent', %s::uuid, 'claim', 'AUTHORED',
-                   jsonb_build_object('via', 'fuzzy_dedup_claims', 'merged_from', c.id::text)
-              FROM claims c
-             WHERE c.id = %s::uuid
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                    WHERE e.source_id = c.agent_id
-                      AND e.target_id = %s::uuid
-                      AND e.relationship = 'AUTHORED'
-               )
-            """,
-            (canonical_id, dup_id, canonical_id),
-        )
-        stats.authored_edges_added += cur.rowcount
-
-        # 7. RETRACT the dup, then mark it. Keeping the ROW preserves any FK
-        #    reference we did not redirect (see the Limitations block above);
-        #    keeping it CURRENT does not, and that was the defect: a label-only
-        #    soft-mark left the duplicate with is_current = true and its
-        #    embedding intact, so `recall()` — whose dense and lexical legs both
-        #    filter `WHERE c.embedding IS NOT NULL AND c.is_current`
-        #    (ClaimRepository::search_hybrid_scoped_since) — kept returning it
-        #    alongside its canonical partner. A single-origin figure then reads
-        #    as two to four independently corroborating nodes.
-        #
-        #    The five columns below are exactly what the canonical Rust path
-        #    (`mark_duplicate_act` in crates/epigraph-db/src/repos/claim.rs,
-        #    behind ClaimRepository::mark_duplicate_with_repair) writes,
-        #    deliberately matched so the two implementations cannot diverge.
-        #    That includes `embedding_3072`: recall at centroid_dim=3072 reads
-        #    it with no is_current filter.
-        #
-        #    ONE STATEMENT, NOT TWO. `chk_deprecated_no_embedding` (052, widened
-        #    to both columns by 144) reads `CHECK (is_current OR (embedding IS
-        #    NULL AND embedding_3072 IS NULL))` and is evaluated per row per
-        #    statement: splitting `is_current = false` from either null
-        #    violates it in between and aborts the cluster transaction.
-        #
-        #    Flipping is_current also fires the `claims_deactivate_factors`
-        #    AFTER UPDATE trigger, which runs `DELETE FROM factors WHERE
-        #    NEW.id = ANY(variable_ids)`. That drops factor rows naming the
-        #    DUPLICATE, which is the intent — a retracted claim should leave
-        #    the factor graph. The canonical's own factors reference the
-        #    canonical's id and are untouched.
-        cur.execute(
-            """
-            UPDATE claims
-               SET supersedes = %s::uuid,
-                   is_current = false,
-                   embedding = NULL,
-                   embedding_3072 = NULL,
-                   updated_at = NOW(),
-                   labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'),
-                   properties = COALESCE(properties, '{}'::jsonb)
-                              || jsonb_build_object(
-                                  'deduped_into', %s,
-                                  'deduped_by', 'fuzzy_dedup_claims',
-                                  'deduped_at', now()::text
-                              )
-             WHERE id = %s::uuid
-            """,
-            (canonical_id, canonical_id, dup_id),
-        )
-        stats.duplicates_retracted += cur.rowcount
-
-    # 8. Sweep self-edges that may have arrived during redirect.
-    cur.execute(
-        "DELETE FROM edges WHERE source_id = %s::uuid AND target_id = %s::uuid",
-        (canonical_id, canonical_id),
-    )
+        if token is None:
+            continue
+        status, body = post_dedup(api_base, token, dup_id, canonical_id)
+        if status == 200:
+            stats.duplicates_marked += 1
+        else:
+            stats.duplicates_refused += 1
+            what = f"HTTP {status}" if status else "no response"
+            stats.refusals.append(f"{dup_id} -> {canonical_id}: {what} {body[:300]}")
     return stats
 
 
@@ -369,12 +245,22 @@ def main() -> int:
     parser.add_argument(
         "--database-url",
         default=maintenance_dsn(DEFAULT_DATABASE_URL),
-        help="Postgres connection string (env DATABASE_URL overrides default)",
+        help="Postgres connection string for the READ-ONLY reads (env DATABASE_URL overrides default)",
+    )
+    parser.add_argument(
+        "--api-base",
+        default=os.environ.get("EPIGRAPH_API_BASE", DEFAULT_API_BASE),
+        help=f"EpiGraph API base URL (env EPIGRAPH_API_BASE; default {DEFAULT_API_BASE})",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("EPIGRAPH_TOKEN"),
+        help="Bearer token for the dedup endpoint (env EPIGRAPH_TOKEN); required with --execute",
     )
     parser.add_argument(
         "--execute",
         action="store_true",
-        help="Commit changes. Without this flag, every cluster's transaction is rolled back.",
+        help="Mark through the API. Without this flag nothing is sent.",
     )
     parser.add_argument(
         "--limit",
@@ -394,6 +280,9 @@ def main() -> int:
         help="Print one line per cluster.",
     )
     args = parser.parse_args()
+    if args.execute and not args.token:
+        parser.error("--execute needs a bearer token (--token or EPIGRAPH_TOKEN)")
+    token = args.token if args.execute else None
 
     psycopg2.extras.register_uuid()
     groups = load_groups(args.input)
@@ -403,7 +292,8 @@ def main() -> int:
     )
 
     conn = psycopg2.connect(args.database_url)
-    conn.autocommit = False
+    # Reads only: every write goes through the API.
+    conn.set_session(readonly=True, autocommit=True)
     totals = TotalStats()
 
     processed = 0
@@ -425,46 +315,29 @@ def main() -> int:
             canonical = pick_canonical(cur, members, rep)
             if canonical is None:
                 totals.clusters_skipped_already_deduped += 1
-                conn.rollback()
                 continue
-            stats = merge_cluster(cur, canonical, members)
+            stats = merge_cluster(cur, canonical, members, args.api_base, token)
             # Accumulate the refusal counter BEFORE the early-continue below.
-            # A cluster whose only duplicate was refused for having a prior
+            # A cluster whose only duplicate was skipped for having a prior
             # `supersedes` has duplicate_count == 0, and reporting it purely
-            # as "already deduped" would hide the refusal — the one outcome an
-            # operator needs to see, because it means a real semantic duplicate
-            # was deliberately left current.
+            # as "already deduped" would hide it.
             totals.duplicates_skipped_already_superseded += (
                 stats.duplicates_skipped_already_superseded
             )
             if stats.duplicate_count == 0:
                 totals.clusters_skipped_already_deduped += 1
-                conn.rollback()
                 continue
-            if args.execute:
-                conn.commit()
-            else:
-                conn.rollback()
             totals.clusters_processed += 1
             totals.duplicates += stats.duplicate_count
-            totals.duplicates_retracted += stats.duplicates_retracted
-            totals.mfs_moved += stats.mfs_moved
-            totals.mfs_skipped_collision += stats.mfs_skipped_collision
-            totals.edges_redirected += stats.edges_redirected
-            totals.edges_dropped_collision += stats.edges_dropped_collision
-            totals.evidence_redirected += stats.evidence_redirected
-            totals.traces_redirected += stats.traces_redirected
-            totals.authored_edges_added += stats.authored_edges_added
+            totals.duplicates_marked += stats.duplicates_marked
+            totals.duplicates_refused += stats.duplicates_refused
+            totals.failures.extend(stats.refusals)
             if args.verbose:
                 print(
                     f"  [{stats.duplicate_count:>3} dups -> {canonical[:8]}] "
-                    f"mfs={stats.mfs_moved}+{stats.mfs_skipped_collision}coll "
-                    f"edges={stats.edges_redirected}redir+{stats.edges_dropped_collision}drop "
-                    f"ev={stats.evidence_redirected} trace={stats.traces_redirected} "
-                    f"authored={stats.authored_edges_added}"
+                    f"marked={stats.duplicates_marked} refused={stats.duplicates_refused}"
                 )
         except Exception as e:
-            conn.rollback()
             totals.clusters_failed += 1
             totals.failures.append(f"cluster rep={rep}: {e}")
             if args.verbose:
@@ -482,26 +355,22 @@ def main() -> int:
     print(f"clusters_processed:              {totals.clusters_processed}")
     print(f"clusters_skipped_already_deduped: {totals.clusters_skipped_already_deduped}")
     print(f"clusters_failed:                 {totals.clusters_failed}")
-    print(f"duplicates_merged:               {totals.duplicates}")
-    print(f"duplicates_retracted:            {totals.duplicates_retracted}")
+    if args.execute:
+        print(f"duplicates_marked:               {totals.duplicates_marked}")
+        print(f"duplicates_refused:              {totals.duplicates_refused}")
+    else:
+        print(f"duplicates_would_mark:           {totals.duplicates}")
     print(
         "duplicates_skipped_already_superseded: "
         f"{totals.duplicates_skipped_already_superseded}"
     )
-    print(f"mass_functions_moved:            {totals.mfs_moved}")
-    print(f"mass_functions_dropped_collision: {totals.mfs_skipped_collision}")
-    print(f"edges_redirected:                {totals.edges_redirected}")
-    print(f"edges_dropped_collision:         {totals.edges_dropped_collision}")
-    print(f"evidence_redirected:             {totals.evidence_redirected}")
-    print(f"reasoning_traces_redirected:     {totals.traces_redirected}")
-    print(f"authored_edges_added:            {totals.authored_edges_added}")
     if totals.failures:
         print(f"\n{len(totals.failures)} failures (first 10):")
         for f in totals.failures[:10]:
             print(f"  {f}")
     if not args.execute:
-        print("\nDRY-RUN — pass --execute to commit.")
-    return 1 if totals.clusters_failed else 0
+        print("\nDRY-RUN — pass --execute (with a token) to mark through the API.")
+    return 1 if (totals.clusters_failed or totals.duplicates_refused) else 0
 
 
 if __name__ == "__main__":

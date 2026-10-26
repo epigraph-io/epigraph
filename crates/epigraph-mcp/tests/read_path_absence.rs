@@ -209,6 +209,7 @@ async fn query_claims_hides_only_unauthorized_rows(pool: PgPool) {
             // `None` keeps this test about VISIBILITY rather than about
             // `a85ee585`'s current-only default.
             is_current: None,
+            exclude_spine: None,
         },
     )
     .await

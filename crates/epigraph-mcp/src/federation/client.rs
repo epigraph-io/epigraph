@@ -1,6 +1,6 @@
 //! rmcp streamable-HTTP client wrappers for the federation gateway.
 //!
-//! Two distinct session shapes, driven by rmcp 0.15's transport model where
+//! Two distinct session shapes, driven by rmcp's transport model where
 //! `auth_header` is **per-transport** (cloned into every request) — there is no
 //! per-call token slot:
 //!
@@ -131,14 +131,11 @@ pub async fn invoke_once(
     arguments: Option<rmcp::model::JsonObject>,
 ) -> Result<CallToolResult, FederationError> {
     let client = connect(addr, Some(caller_token)).await?;
+    let mut params = CallToolRequestParams::new(name.to_string());
+    params.arguments = arguments;
     let result = client
         .peer()
-        .call_tool(CallToolRequestParams {
-            meta: None,
-            name: std::borrow::Cow::Owned(name.to_string()),
-            arguments,
-            task: None,
-        })
+        .call_tool(params)
         .await
         .map_err(|e| FederationError::Request(e.to_string()));
     // Explicit drop: releasing the session (and its downstream `delete_session`)
@@ -160,7 +157,11 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
         // downstream receives `Authorization: Bearer <token>`.
         config.auth_header = Some(token.to_string());
     }
-    let transport = StreamableHttpClientTransport::<reqwest::Client>::from_config(config);
+    // rmcp implements its client transport for the reqwest it links (0.13),
+    // not this crate's reqwest; leaving the type parameter to inference keeps
+    // that version choice inside rmcp instead of adding a second direct
+    // reqwest dependency here.
+    let transport = StreamableHttpClientTransport::from_config(config);
 
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, serve_client((), transport)).await {
         Ok(Ok(client)) => Ok(client),

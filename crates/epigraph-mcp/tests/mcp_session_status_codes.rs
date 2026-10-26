@@ -32,7 +32,6 @@ use epigraph_mcp::session_status::{
 use rmcp::transport::streamable_http_server::session::local::{
     create_local_session, LocalSessionManager, SessionConfig,
 };
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use uuid::Uuid;
 
 // Valid tokens on a deliberately DEAD pool: the production DB-backed
@@ -74,8 +73,9 @@ struct Server {
 }
 
 /// Build the listener exactly as `main.rs` does for a `--jwt-secret` TCP
-/// listener: rmcp service → `nest_mcp_service` (session-status rewrite,
-/// innermost) → bearer auth → Host/Origin guard (outermost).
+/// listener: `http_listener::mcp_http_listener` → `nest_mcp_service`
+/// (session-status rewrite, innermost) → bearer auth → Host/Origin guard
+/// (outermost).
 async fn spawn_server() -> Server {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(100))
@@ -83,25 +83,25 @@ async fn spawn_server() -> Server {
         .expect("connect_lazy never errors");
     let signer = Arc::new(epigraph_crypto::AgentSigner::generate());
     let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
-    let sessions = Arc::new(LocalSessionManager::default());
-
-    let service = StreamableHttpService::new(
-        move || {
-            Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
-                pool.clone(),
-                signer.clone(),
-                embedder.clone(),
-                false,
-            ))
-        },
-        sessions.clone(),
-        StreamableHttpServerConfig::default(),
-    );
-
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let router = epigraph_mcp::session_status::nest_mcp_service(service)
+    // The production seam: the same rmcp config, session manager and Host
+    // allowlist `main.rs` builds for `--listen <addr>`.
+    let built = epigraph_mcp::http_listener::mcp_http_listener(&addr.to_string(), &[], move || {
+        Ok(epigraph_mcp::EpiGraphMcpFull::new_shared(
+            pool.clone(),
+            signer.clone(),
+            embedder.clone(),
+            false,
+        ))
+    });
+    let sessions = built.sessions;
+    let allowlist = built
+        .tcp_allowlist
+        .expect("a TCP listener always has a Host allowlist");
+
+    let router = epigraph_mcp::session_status::nest_mcp_service(built.service)
         .layer(axum::middleware::from_fn_with_state(
             McpAuthState {
                 jwt_config: Arc::new(JwtConfig::from_secret(SECRET)),
@@ -111,7 +111,7 @@ async fn spawn_server() -> Server {
             bearer_auth_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            epigraph_mcp::host_guard::HostAllowlist::for_tcp_listener(&addr.to_string(), &[]),
+            allowlist,
             epigraph_mcp::host_guard::host_guard_middleware,
         ));
 

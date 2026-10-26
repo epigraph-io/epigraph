@@ -81,6 +81,7 @@ async fn app(pool: PgPool) -> Router {
                 elevation_claim: None,
                 elevation: None,
                 admin_scopes: epigraph_api::middleware::bearer::AdminScopePosture::Unarmed,
+                delegated_by: None,
             }
         }))
         .with_state(state)

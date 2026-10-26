@@ -6,12 +6,18 @@
 //! use `revises` for a concurrent branch sharing a common ancestor. The new
 //! claim shares the same `step_lineage_id` as the parent.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::errors::{internal_error, invalid_params, parse_uuid, McpError};
 use crate::server::EpiGraphMcpFull;
+use crate::tools::workflow_authority::{
+    record_workflow_write, require_workflow_authority, WorkflowGrant,
+};
+use crate::write_identity::WriteIdentity;
+use epigraph_engine::admin_cascade::{self, CascadeCause, CascadeStatus, CascadeTrigger};
+use epigraph_engine::retraction_cascade::CascadeReport;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EvolveStepParams {
@@ -48,6 +54,35 @@ pub struct EvolveStepResponse {
     pub claim_id: Uuid,
     pub step_lineage_id: Uuid,
     pub edge_id: Uuid,
+    /// `supersedes` only: the Supersede admin cascade that carried the retired
+    /// step's edges onto this one (applied, or deferred for the replay), as
+    /// `supersede_claim` reports it. Absent for `revises`, which supersedes
+    /// nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<CascadeStatus>,
+    /// `supersedes` only: the belief re-derivation that cascade ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub belief_cascade: Option<CascadeReport>,
+}
+
+/// `evolve_step_conn`'s refusals for the caller (backlog 769989ae): its
+/// `Conflict` (superseding a step that is no longer current) is the caller's
+/// to fix, INVALID_PARAMS as name-mode's retired-head refusal is, rather than
+/// the INTERNAL_ERROR [`crate::errors::db_caller_error`] gives a variant it
+/// does not know. So is its `NotFound`: the parent's `FOR UPDATE` read finds
+/// no row both for a `parent_id` that names no claim and for one the caller
+/// cannot see, and the two get the same wording (naming only the id the
+/// caller sent), so the refusal does not tell them apart, as the HTTP route's
+/// 404 does not. Everything else, including `InvalidData` (an edge_type
+/// outside the vocabulary), maps as `db_caller_error` maps it.
+fn evolve_caller_error(e: epigraph_db::DbError) -> McpError {
+    match e {
+        epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
+        epigraph_db::DbError::NotFound { id, .. } => {
+            invalid_params(format!("parent step {id} not found"))
+        }
+        other => crate::errors::db_caller_error(other),
+    }
 }
 
 pub async fn evolve_step(
@@ -79,7 +114,9 @@ pub async fn evolve_step(
     } else if let (Some(name), Some(idx)) = (params.canonical_name.as_deref(), params.step_index) {
         epigraph_db::WorkflowRepository::resolve_step_claim(&server.pool, viewer, name, idx, true)
             .await
-            .map_err(internal_error)?
+            // `InvalidData` (every head of the step's lineage is retired) is
+            // the caller's to fix, not an internal error.
+            .map_err(crate::errors::db_caller_error)?
             .ok_or_else(|| {
                 invalid_params(format!(
                     "no step at index {idx} of workflow '{name}' (unknown workflow or index out of range)"
@@ -93,6 +130,15 @@ pub async fn evolve_step(
     let identity = server.write_identity(auth, viewer).await?;
     let agent_id = identity.agent_id();
     let parent = epigraph_core::ClaimId::from_uuid(parent_uuid);
+    let write_details = |r: &epigraph_db::EvolveStepResult| {
+        serde_json::json!({
+            "parent_claim_id": parent_uuid,
+            "claim_id": r.new_claim_id,
+            "step_lineage_id": r.step_lineage_id,
+            "edge_type": r.edge_type,
+            "level": level,
+        })
+    };
 
     // The step claim is written on a transaction STAMPED with its author's
     // viewer, so migration 122's claims trigger sees the writing principal:
@@ -101,9 +147,11 @@ pub async fn evolve_step(
     // form remains only for a server built without a ScopedPool (test
     // fixtures); on such a process's application role the database refuses the
     // write once armed, so it cannot fail open.
-    let result = if server.scoped.is_some() {
+    let (result, cascade, belief_cascade) = if server.scoped.is_some() {
         let mut tx =
             crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
+        let grants =
+            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
             parent,
@@ -114,12 +162,63 @@ pub async fn evolve_step(
             agent_id,
         )
         .await
-        .map_err(crate::errors::db_caller_error)?;
-        tx.commit().await.map_err(internal_error)?;
-        r
+        .map_err(evolve_caller_error)?;
+        record_lineage_writes(&mut tx, auth, identity, &grants, write_details(&r)).await?;
+        if params.edge_type != "supersedes" {
+            tx.commit().await.map_err(internal_error)?;
+            (r, None, None)
+        } else {
+            // A `supersedes` step is a supersession (`claims.supersedes` names
+            // the parent), so it runs `supersede_claim`'s cascade: the act
+            // above moved no edge, and the retired step's decomposition,
+            // argument and support edges belong to other writers, which only
+            // the administrative cascade re-points (backlog 8d3b4527). The
+            // step-lineage rule in `migrate_superseded_edges` leaves the
+            // workflow's `executes` and its `step_follows` / `phase_follows`
+            // chain, the lineage's `revises` history and agents' authorship
+            // edges on the retired step. The maintenance session is acquired
+            // before the act commits; without one the deferral commits with
+            // the act, attributed to the principal this transaction is
+            // stamped with.
+            let trigger = CascadeTrigger::new(
+                CascadeCause::Supersede,
+                Some(agent_id),
+                crate::tools::supersede::oauth_principal(auth),
+                parent_uuid,
+                Some(r.new_claim_id),
+            );
+            let (mut session, deferred) =
+                crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &trigger)
+                    .await?;
+            tx.commit().await.map_err(internal_error)?;
+            // Best-effort, as in `supersede_claim`: the act has committed.
+            let (cascade, belief) = match (session.as_mut(), deferred) {
+                (Some(session), _) => {
+                    let (conn, v) = session.split();
+                    admin_cascade::apply_after_supersede(
+                        conn,
+                        v,
+                        viewer,
+                        &trigger,
+                        parent_uuid,
+                        r.new_claim_id,
+                    )
+                    .await
+                }
+                (None, status) => (status, CascadeReport::default()),
+            };
+            (r, Some(cascade), Some(belief))
+        }
     } else {
-        epigraph_db::ClaimRepository::evolve_step(
-            &server.pool,
+        // No ScopedPool (test fixtures): the act only, as before; there is no
+        // maintenance session to run the cascade on. The authority gate runs
+        // here too, on the act's own transaction, so a server built without a
+        // ScopedPool is not a way around it.
+        let mut tx = server.pool.begin().await.map_err(internal_error)?;
+        let grants =
+            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
+        let r = epigraph_db::ClaimRepository::evolve_step_conn(
+            &mut tx,
             parent,
             &params.content,
             &params.edge_type,
@@ -128,18 +227,96 @@ pub async fn evolve_step(
             agent_id,
         )
         .await
-        .map_err(crate::errors::db_caller_error)?
+        .map_err(evolve_caller_error)?;
+        record_lineage_writes(&mut tx, auth, identity, &grants, write_details(&r)).await?;
+        tx.commit().await.map_err(internal_error)?;
+        (r, None, None)
     };
 
     success_json(&EvolveStepResponse {
         claim_id: result.new_claim_id,
         step_lineage_id: result.step_lineage_id,
         edge_id: result.edge_id,
+        cascade,
+        belief_cascade,
     })
 }
 
+/// Lineage-wide authority: refuse the caller unless it has workflow authority
+/// ([`require_workflow_authority`]: the submitter, its operator, or the
+/// audited admin arm) over EVERY workflow that executes the parent's step
+/// lineage (`WorkflowRepository::workflows_executing_step_lineage`: the
+/// parent and every claim sharing its `step_lineage_id`, retracted `executes`
+/// edges included). Evolving a step changes the heads of a lineage those
+/// workflows run, so it needs what `add_step` and `delete_step` need, over
+/// each of them: a step two workflows execute needs authority over both.
+///
+/// Runs on the act's own transaction, BEFORE the act, so a refusal writes
+/// nothing. Returns each workflow with the grant that admitted the caller, for
+/// [`record_lineage_writes`]. A lineage no workflow executes returns none and
+/// is unaffected.
+///
+/// stdio (no token) is unchanged, as for every workflow tool (the batch H-b
+/// bar; see `workflow_authority.rs`): the lineage is not even read.
+async fn require_lineage_authority(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: WriteIdentity,
+    parent: Uuid,
+) -> Result<Vec<(Uuid, WorkflowGrant)>, McpError> {
+    if auth.is_none() {
+        return Ok(Vec::new());
+    }
+    let workflows =
+        epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut *conn, parent)
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    "evolve_step: could not read the workflows executing the step's lineage",
+                    e,
+                )
+            })?;
+    let mut grants = Vec::with_capacity(workflows.len());
+    for workflow in workflows {
+        let grant =
+            require_workflow_authority(server, &mut *conn, auth, caller, workflow, "evolve_step")
+                .await?;
+        grants.push((workflow, grant));
+    }
+    Ok(grants)
+}
+
+/// Record the write once per workflow [`require_lineage_authority`] admitted
+/// the caller over, on the act's own transaction: `workflows.caller_write` for
+/// the submitter and operator arms, `workflows.admin_write` for the audited
+/// admin arm (`record_workflow_write`). The rows are attributed to the
+/// session principal, which here is the caller itself: the step claim is the
+/// caller's, written on its own stamp.
+async fn record_lineage_writes(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: WriteIdentity,
+    grants: &[(Uuid, WorkflowGrant)],
+    details: serde_json::Value,
+) -> Result<(), McpError> {
+    for (workflow, grant) in grants {
+        record_workflow_write(
+            &mut *conn,
+            auth,
+            caller,
+            "evolve_step",
+            *workflow,
+            *grant,
+            details.clone(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn success_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }

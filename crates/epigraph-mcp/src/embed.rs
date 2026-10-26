@@ -73,11 +73,18 @@ pub enum StorePath {
     PrivilegedPool(&'static str),
 }
 
+/// A replacement for the embedding provider behind [`McpEmbedder::generate`]:
+/// given the (truncated) input text, the vector to store. See
+/// [`McpEmbedder::with_generator`].
+pub type EmbeddingGenerator =
+    std::sync::Arc<dyn Fn(&str) -> Result<Vec<f32>, String> + Send + Sync>;
+
 pub struct McpEmbedder {
     api_key: Option<String>,
     pool: PgPool,
     store_path: StorePath,
     http: reqwest::Client,
+    generator: Option<EmbeddingGenerator>,
 }
 
 /// Whether an OpenAI API key string is unusable for embedding generation:
@@ -117,7 +124,25 @@ impl McpEmbedder {
             pool,
             store_path: StorePath::Undeclared,
             http: reqwest::Client::new(),
+            generator: None,
         }
+    }
+
+    /// Replace the embedding provider behind [`generate`](Self::generate) with
+    /// `generator`, whatever the API key: no request leaves the process.
+    ///
+    /// The seam an integration test needs to observe a tool's embedding calls
+    /// (how many, on which text) and to store real vectors without a provider.
+    /// Without it a keyless test embedder refuses every `generate`, so "this
+    /// call sent no text to the provider" and "this call embedded every claim"
+    /// are indistinguishable. Public rather than `#[cfg(test)]` because the
+    /// callers are `tests/` integration tests of this and other crates; no
+    /// production construction site calls it. [`generate_at_dim`](Self::generate_at_dim)
+    /// is not affected.
+    #[must_use]
+    pub fn with_generator(mut self, generator: EmbeddingGenerator) -> Self {
+        self.generator = Some(generator);
+        self
     }
 
     /// Declare that stores run on a connection stamped from the claim's author,
@@ -163,7 +188,7 @@ impl McpEmbedder {
     /// which only catches the `None` case.
     #[must_use]
     pub fn embeddings_disabled(&self) -> bool {
-        key_disabled(self.api_key.as_deref())
+        self.generator.is_none() && key_disabled(self.api_key.as_deref())
     }
 
     /// Generate an embedding vector without storing it.
@@ -171,6 +196,9 @@ impl McpEmbedder {
     /// Returns the raw `Vec<f32>` from OpenAI. Callers can format it
     /// with `format_pgvector()` for SQL queries.
     pub async fn generate(&self, text: &str) -> Result<Vec<f32>, String> {
+        if let Some(generator) = &self.generator {
+            return generator(&truncate_embedding_input(text));
+        }
         let api_key = self
             .api_key
             .as_deref()

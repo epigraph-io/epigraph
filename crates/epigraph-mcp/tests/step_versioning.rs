@@ -277,7 +277,75 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
         None,
     )
     .await;
-    assert!(result.is_err(), "BOGUS edge_type must error");
+    // The caller's error, not a server fault (backlog 769989ae): before the
+    // fix the repo refused with `QueryFailed`, which reached the caller as
+    // INTERNAL_ERROR.
+    let err = result.expect_err("BOGUS edge_type must error");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "an unknown edge_type is the caller's error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("supersedes") && err.message.contains("revises"),
+        "the refusal names the accepted edge types: {}",
+        err.message
+    );
+}
+
+/// Id-mode `supersedes` on a step that is no longer current is refused as the
+/// caller's error (INVALID_PARAMS, the code name-mode already returns for a
+/// retired head), not INTERNAL_ERROR (backlog 769989ae). Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_id_mode_supersede_of_a_non_current_step_is_invalid_params(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let agent = insert_seed_agent(&pool).await;
+    let lineage = Uuid::new_v4();
+    let v1 = seed_versioned_step(&pool, agent, lineage, "retired v1").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(v1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = evolve_step(
+        &server,
+        &viewer,
+        EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
+            step_lineage_id: String::new(),
+            parent_id: v1.to_string(),
+            content: "supersede a retired step".to_string(),
+            edge_type: "supersedes".to_string(),
+            rationale: None,
+            level: Some(2),
+        },
+        None,
+    )
+    .await
+    .expect_err("a non-current step cannot be superseded");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "a non-current parent is the caller's error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("non-current"),
+        "the refusal says why: {}",
+        err.message
+    );
+    let children: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(v1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(children, 0, "a refused evolve writes nothing");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -662,4 +730,535 @@ async fn find_workflow_hierarchical_filters_deprecated_via_min_truth(pool: PgPoo
         ids.contains(&live_id.to_string()) && ids.contains(&dead_id.to_string()),
         "min_truth=0.0 must include both live and deprecated; got {ids:?}"
     );
+}
+
+// ── resolve_to_latest must surface the TRUE lineage head ────────────────
+//
+// Bridge 37d65fe0 / 00132b1d / 8e78eb29, backlog ed6a953e / 21574bd2: with
+// resolve_to_latest=true the tool returned a max generation below the one
+// `improve_workflow_hierarchy` resolves (`max_generation_by_canonical`, no
+// filter), and different phrasings of one query surfaced disjoint generation
+// subsets. Both searches filter on each row's OWN goal text / embedding before
+// ordering, so a head whose goal diverged from the query never reaches the
+// `ORDER BY generation DESC`. Seeded here: gens 0-2 share a goal phrase, the
+// head (gen 3) was reworded, and the query is the old phrase.
+async fn seed_generation(
+    pool: &PgPool,
+    canonical: &str,
+    generation: i32,
+    goal: &str,
+    truth: f64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value) \
+         VALUES ($1, $2, $3, $4, NULL, '{}', NOW(), $5)",
+    )
+    .bind(id)
+    .bind(canonical)
+    .bind(generation)
+    .bind(goal)
+    .bind(truth)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn search(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    query: &str,
+    resolve_to_latest: Option<bool>,
+    min_truth: Option<f64>,
+) -> serde_json::Value {
+    let result = find_workflow_hierarchical(
+        server,
+        viewer,
+        FindWorkflowHierarchicalParams {
+            query: query.to_string(),
+            limit: Some(10),
+            resolve_to_latest,
+            min_truth,
+        },
+    )
+    .await
+    .expect("find_workflow_hierarchical");
+    parse_body(&result)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_to_latest_returns_true_lineage_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let canonical = "design-or-improve-a-workflow";
+    let old_phrase = "consider all available tools";
+    let mut ids = Vec::new();
+    for g in 0..3 {
+        ids.push(seed_generation(&pool, canonical, g, old_phrase, 1.0).await);
+    }
+    let head = seed_generation(&pool, canonical, 3, "rewrite the plan from scratch", 1.0).await;
+    let max = epigraph_db::WorkflowRepository::max_generation_by_canonical(&pool, canonical)
+        .await
+        .unwrap();
+    assert_eq!(
+        max,
+        Some(3),
+        "precondition: improve's head definition says 3"
+    );
+
+    let body = search(&server, &viewer, "available tools", Some(true), Some(0.0)).await;
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let head_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&head.to_string()))
+        .unwrap_or_else(|| {
+            panic!("resolve_to_latest=true must include the true lineage head (gen 3); got {body}")
+        });
+    assert_eq!(head_entry["generation"], serde_json::json!(3));
+    assert_eq!(head_entry["is_lineage_head"], serde_json::json!(true));
+    assert_eq!(
+        workflows[0]["workflow_id"].as_str(),
+        Some(head.to_string().as_str()),
+        "the head leads its canonical group"
+    );
+    assert!(
+        head_entry["resolved_steps"].is_array(),
+        "the injected head gets step resolution like every other entry"
+    );
+    for w in workflows {
+        assert_eq!(
+            w["lineage_head_generation"],
+            serde_json::json!(3),
+            "every entry of the lineage names the head generation: {w}"
+        );
+        assert_eq!(w["lineage_head_deprecated"], serde_json::json!(false));
+        if w["workflow_id"].as_str() != Some(&head.to_string()) {
+            assert_eq!(
+                w["is_lineage_head"],
+                serde_json::json!(false),
+                "only the head is flagged: {w}"
+            );
+        }
+    }
+    for id in &ids {
+        assert!(
+            workflows
+                .iter()
+                .any(|w| w["workflow_id"].as_str() == Some(&id.to_string())),
+            "the matched generations are still returned"
+        );
+    }
+
+    // Default (frozen) mode is unchanged: no head injection, no annotations.
+    let body = search(&server, &viewer, "available tools", None, Some(0.0)).await;
+    let workflows = body["workflows"].as_array().unwrap();
+    assert_eq!(workflows.len(), 3, "default mode returns only matched rows");
+    assert!(workflows.iter().all(|w| w.get("is_lineage_head").is_none()));
+}
+
+/// A deprecated head (truth 0.05, below the default min_truth 0.3) is still
+/// the head `improve_workflow_hierarchy` builds on, so hiding it would make
+/// the guard and improve disagree again. It is disclosed and flagged instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolve_to_latest_discloses_a_deprecated_head(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let canonical = "deprecated-head-probe";
+    let live = seed_generation(&pool, canonical, 0, "send the weekly digest", 1.0).await;
+    let dead = seed_generation(&pool, canonical, 1, "send the weekly digest v2", 0.05).await;
+
+    let body = search(&server, &viewer, "weekly digest", Some(true), None).await;
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    let dead_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&dead.to_string()))
+        .unwrap_or_else(|| panic!("the deprecated head must be disclosed; got {body}"));
+    assert_eq!(dead_entry["is_lineage_head"], serde_json::json!(true));
+    let live_entry = workflows
+        .iter()
+        .find(|w| w["workflow_id"].as_str() == Some(&live.to_string()))
+        .expect("live gen 0 still returned");
+    assert_eq!(live_entry["is_lineage_head"], serde_json::json!(false));
+    assert_eq!(live_entry["lineage_head_generation"], serde_json::json!(1));
+    assert_eq!(
+        live_entry["lineage_head_deprecated"],
+        serde_json::json!(true),
+        "the head's truth is below min_truth, and every entry says so"
+    );
+}
+
+// ── A retired step head must be flagged, and name-mode must not hit it ──
+//
+// Bridge 00132b1d: `evolve_step(canonical_name, step_index, 'supersedes')`
+// failed with the opaque "cannot supersede a non-current step" on a step that
+// `find_workflow_hierarchical(resolve_to_latest=true)` had just reported as
+// its head. A lineage head is defined structurally (no incoming `supersedes`
+// edge) while the guard reads `claims.is_current`; a claim retired without a
+// supersedes edge (deprecate_workflow's retirement, reused by a later
+// generation with identical text; mark_duplicate) is both. Seeded directly in
+// that shape: a sole lineage member with is_current=false and no edge.
+async fn seed_retired_step_workflow(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+    let agent = insert_seed_agent(pool).await;
+    let healthy = seed_versioned_step(pool, agent, Uuid::new_v4(), "healthy step").await;
+    let retired = seed_versioned_step(pool, agent, Uuid::new_v4(), "retired step").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired)
+        .execute(pool)
+        .await
+        .unwrap();
+    // Step 2: a lineage whose NEWEST head is retired while an older head (a
+    // concurrent branch, no supersedes edge between them) is current.
+    let branch_lineage = Uuid::new_v4();
+    let branch_current = seed_versioned_step(pool, agent, branch_lineage, "branch v1").await;
+    let branch_retired = seed_versioned_step(pool, agent, branch_lineage, "branch v2").await;
+    sqlx::query(
+        "UPDATE claims SET is_current = false, created_at = NOW() + INTERVAL '1 minute' WHERE id = $1",
+    )
+    .bind(branch_retired)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, metadata) \
+         VALUES ($1, 'retired-step-wf', 0, 'retired step probe', '{}'::jsonb)",
+    )
+    .bind(wf)
+    .execute(pool)
+    .await
+    .unwrap();
+    for (i, s) in [healthy, retired, branch_current].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', NOW() + make_interval(secs => $3::int))",
+        )
+        .bind(wf)
+        .bind(*s)
+        .bind(i as i32)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    (healthy, retired, branch_current, branch_retired)
+}
+
+fn name_mode(idx: usize, content: &str) -> EvolveStepParams {
+    EvolveStepParams {
+        canonical_name: Some("retired-step-wf".to_string()),
+        step_index: Some(idx),
+        step_lineage_id: String::new(),
+        parent_id: String::new(),
+        content: content.to_string(),
+        edge_type: "supersedes".to_string(),
+        rationale: None,
+        level: Some(2),
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn retired_step_head_is_flagged_and_evolve_step_names_the_retirement(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let (healthy, retired, branch_current, branch_retired) =
+        seed_retired_step_workflow(&pool).await;
+
+    let body = search(&server, &viewer, "retired step probe", Some(true), None).await;
+    let steps = body["workflows"][0]["resolved_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resolved_steps expected; got {body}"));
+    assert_eq!(steps.len(), 3);
+    assert_eq!(
+        steps[0]["heads"][0]["id"].as_str(),
+        Some(healthy.to_string().as_str())
+    );
+    assert_eq!(
+        steps[0]["heads"][0]["is_current"],
+        serde_json::json!(true),
+        "a healthy head reports is_current=true, so the flag is not a constant"
+    );
+    assert_eq!(
+        steps[1]["heads"][0]["id"].as_str(),
+        Some(retired.to_string().as_str())
+    );
+    assert_eq!(
+        steps[1]["heads"][0]["is_current"],
+        serde_json::json!(false),
+        "the retired head is still listed (a sole member must not vanish) but flagged: {body}"
+    );
+
+    // Name-mode on the retired step: refused with a message that names the
+    // retired head and the retirement, as a caller error.
+    let err = evolve_step(&server, &viewer, name_mode(1, "retired step v2"), None)
+        .await
+        .expect_err("a retired head cannot be superseded");
+    let msg = err.message.to_string();
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{msg}");
+    assert!(
+        msg.contains(&retired.to_string())
+            && msg.contains("is_current=false")
+            && msg.contains("revive or re-ingest"),
+        "the error must name the retired head and the retirement; got {msg}"
+    );
+    assert!(
+        !msg.contains("cannot supersede a non-current step"),
+        "the opaque guard message must not be what the caller sees; got {msg}"
+    );
+
+    // Same resolution for update_with_evidence's name mode.
+    let params: epigraph_mcp::types::UpdateWithEvidenceParams =
+        serde_json::from_value(serde_json::json!({
+            "claim_id": "",
+            "canonical_name": "retired-step-wf",
+            "step_index": 1,
+            "evidence_data": "observed",
+            "evidence_type": "observation",
+            "supports": true,
+            "strength": 0.5
+        }))
+        .expect("params");
+    let err = epigraph_mcp::tools::claims::update_with_evidence(&server, &viewer, params, None)
+        .await
+        .expect_err("evidence must not silently land on a retired head");
+    let msg = err.message.to_string();
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "a retired step head is the caller's error: {msg}"
+    );
+    assert!(
+        msg.contains(&retired.to_string())
+            && msg.contains("is_current=false")
+            && msg.contains("revive or re-ingest"),
+        "update_with_evidence must name the retired head and the retirement; got {msg}"
+    );
+    assert!(
+        !msg.contains("cannot supersede a non-current step"),
+        "the opaque guard message must not be what the caller sees; got {msg}"
+    );
+
+    // A lineage whose newest head is retired but an older head is current:
+    // name-mode branches from the CURRENT head and succeeds.
+    evolve_step(&server, &viewer, name_mode(2, "branch v3"), None)
+        .await
+        .expect("name-mode must pick the current head of a lineage");
+    let (branch_current_now,): (bool,) =
+        sqlx::query_as("SELECT is_current FROM claims WHERE id = $1")
+            .bind(branch_current)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !branch_current_now,
+        "the current head was the one superseded"
+    );
+    let (retired_untouched,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(branch_retired)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retired_untouched, 0, "the retired head was not the parent");
+
+    // Control: the healthy step evolves normally.
+    evolve_step(&server, &viewer, name_mode(0, "healthy step v2"), None)
+        .await
+        .expect("a healthy head evolves");
+}
+
+// ── find_workflow's evolved_steps must name the CURRENT head ────────────
+//
+// `find_workflow` discloses, per hierarchical result, the steps whose lineage
+// head differs from the frozen claim (backlog 563165f2). That head must be
+// chosen the way name-mode `evolve_step` / `update_with_evidence` choose it
+// (the newest head with is_current=true), or the result names a claim those
+// tools then refuse (bridge 00132b1d's mismatch on a second surface). A
+// lineage whose only head is retired is disclosed with `is_current=false`
+// rather than presented as current.
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_workflow_evolved_steps_name_the_current_head_and_flag_retirement(pool: PgPool) {
+    use epigraph_mcp::tools::workflows::__test_only::find_workflow_with_pgvec;
+    use epigraph_mcp::types::FindWorkflowParams;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let (_healthy, _retired, branch_current, branch_retired) =
+        seed_retired_step_workflow(&pool).await;
+    let (wf,): (Uuid,) =
+        sqlx::query_as("SELECT id FROM workflows WHERE canonical_name = 'retired-step-wf'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let agent = insert_seed_agent(&pool).await;
+
+    // Step 3: evolved (supersedes), and the evolved claim then retired with no
+    // further supersedes edge, so the lineage's only head is retired.
+    let evolving = seed_versioned_step(&pool, agent, Uuid::new_v4(), "evolving step").await;
+    // Step 4: a concurrent `revises` branch, both heads current.
+    let revised = seed_versioned_step(&pool, agent, Uuid::new_v4(), "revised step").await;
+    for (offset, s) in [(3_i32, evolving), (4, revised)] {
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, created_at) \
+             VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes', NOW() + make_interval(secs => $3::int))",
+        )
+        .bind(wf)
+        .bind(s)
+        .bind(offset)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let id_mode = |parent: Uuid, content: &str, edge_type: &str| EvolveStepParams {
+        canonical_name: None,
+        step_index: None,
+        step_lineage_id: String::new(),
+        parent_id: parent.to_string(),
+        content: content.to_string(),
+        edge_type: edge_type.to_string(),
+        rationale: None,
+        level: Some(2),
+    };
+    let evolved_body = parse_body(
+        &evolve_step(
+            &server,
+            &viewer,
+            id_mode(evolving, "evolving step v2", "supersedes"),
+            None,
+        )
+        .await
+        .expect("evolve step 3"),
+    );
+    let evolved_then_retired: Uuid = evolved_body["claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("claim_id expected; got {evolved_body}"));
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(evolved_then_retired)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let revised_body = parse_body(
+        &evolve_step(
+            &server,
+            &viewer,
+            id_mode(revised, "revised step v2", "revises"),
+            None,
+        )
+        .await
+        .expect("revise step 4"),
+    );
+    let revision: Uuid = revised_body["claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("claim_id expected; got {revised_body}"));
+
+    let result = find_workflow_with_pgvec(
+        &server,
+        &viewer,
+        FindWorkflowParams {
+            goal: "retired step probe".to_string(),
+            min_truth: Some(0.0),
+            limit: Some(5),
+        },
+        None,
+    )
+    .await
+    .expect("find_workflow text leg");
+    let body = parse_body(&result);
+    let hit = body
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|r| r["workflow_id"].as_str() == Some(&wf.to_string()))
+        })
+        .unwrap_or_else(|| panic!("the seeded workflow must be returned; got {body}"));
+    assert_eq!(hit["has_evolved_steps"], serde_json::json!(true), "{hit}");
+    let evolved = hit["evolved_steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("evolved_steps expected; got {hit}"));
+    let by_index = |i: usize| {
+        evolved
+            .iter()
+            .find(|e| e["step_index"] == serde_json::json!(i))
+            .unwrap_or_else(|| panic!("step {i} must be listed in evolved_steps; got {hit}"))
+    };
+    let indices: Vec<u64> = evolved
+        .iter()
+        .filter_map(|e| e["step_index"].as_u64())
+        .collect();
+    assert_eq!(
+        indices,
+        vec![2, 3, 4],
+        "a never-evolved step is not listed, even when its sole head is retired \
+         (step 1); the healthy step 0 is not listed either: {hit}"
+    );
+
+    // Step 2: the newest head is retired, an older head is current. The
+    // current one is named, as evolve_step name-mode would pick it.
+    let s2 = by_index(2);
+    assert_eq!(
+        s2["head_claim_id"].as_str(),
+        Some(branch_current.to_string().as_str()),
+        "the CURRENT head, not the newer retired {branch_retired}: {s2}"
+    );
+    assert_eq!(s2["is_current"], serde_json::json!(true), "{s2}");
+    assert_eq!(s2["pending_resolution"], serde_json::json!(true), "{s2}");
+
+    // Step 3: the only head is retired; disclosed, flagged, never presented
+    // as current.
+    let s3 = by_index(3);
+    assert_eq!(
+        s3["head_claim_id"].as_str(),
+        Some(evolved_then_retired.to_string().as_str()),
+        "{s3}"
+    );
+    assert_eq!(
+        s3["is_current"],
+        serde_json::json!(false),
+        "a retired-only head must be flagged: {s3}"
+    );
+    assert_eq!(s3["pending_resolution"], serde_json::json!(false), "{s3}");
+
+    // Step 4: concurrent current heads: the newest is named, pending.
+    let s4 = by_index(4);
+    assert_eq!(
+        s4["head_claim_id"].as_str(),
+        Some(revision.to_string().as_str()),
+        "{s4}"
+    );
+    assert_eq!(s4["head_content"].as_str(), Some("revised step v2"));
+    assert_eq!(s4["is_current"], serde_json::json!(true), "{s4}");
+    assert_eq!(
+        s4["pending_resolution"],
+        serde_json::json!(true),
+        "concurrent revises heads must be flagged pending: {s4}"
+    );
+}
+
+/// With resolve_to_latest=true a lineage head below min_truth is returned
+/// (flagged), so the min_truth contract an agent reads must state that
+/// exception instead of promising deprecated rows are always hidden.
+#[test]
+fn min_truth_description_states_the_lineage_head_exception() {
+    let tools = EpiGraphMcpFull::all_tools_json();
+    let d = tools
+        .as_array()
+        .expect("all_tools_json returns an array")
+        .iter()
+        .find(|t| t["name"] == "find_workflow_hierarchical")
+        .and_then(|t| t["inputSchema"]["properties"]["min_truth"]["description"].as_str())
+        .expect("find_workflow_hierarchical.min_truth carries a description")
+        .to_string();
+    for needle in [
+        "with resolve_to_latest=true the lineage head",
+        "always returned",
+        "lineage_head_deprecated",
+    ] {
+        assert!(
+            d.contains(needle),
+            "min_truth must say {needle:?}; got: {d}"
+        );
+    }
 }

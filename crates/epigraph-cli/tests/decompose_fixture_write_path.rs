@@ -20,7 +20,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_cli::decompose::{run_decomposition_batches, BatchClaim};
+use epigraph_cli::decompose::{run_decomposition_batches, AtomParent, BatchClaim};
 use epigraph_cli::enrichment::llm_client::{FixtureLlmClient, MockLlmClient};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -115,9 +115,10 @@ async fn fixture_provider_writes_atoms_and_decomposes_to_edges(pool: PgPool) {
         &llm,
         10,
         None,
-        move |atom_text, _generality, parent_agent_id| {
+        None,
+        move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
-            async move { Ok(insert_min_claim(&pool_c, parent_agent_id, &atom_text).await) }
+            async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
         },
     )
     .await
@@ -184,9 +185,10 @@ async fn atoms_follow_claim_text_not_batch_position(pool: PgPool) {
         &llm,
         10,
         None,
-        move |atom_text, _generality, parent_agent_id| {
+        None,
+        move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
-            async move { Ok(insert_min_claim(&pool_c, parent_agent_id, &atom_text).await) }
+            async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
         },
     )
     .await
@@ -237,9 +239,10 @@ async fn claims_missing_from_the_fixture_are_left_untouched(pool: PgPool) {
         &llm,
         10,
         None,
-        move |atom_text, _generality, parent_agent_id| {
+        None,
+        move |atom_text, _generality, parent: AtomParent| {
             let pool_c = pool_c.clone();
-            async move { Ok(insert_min_claim(&pool_c, parent_agent_id, &atom_text).await) }
+            async move { Ok(insert_min_claim(&pool_c, parent.agent_id, &atom_text).await) }
         },
     )
     .await
@@ -279,6 +282,7 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
         &llm,
         10,
         None,
+        None,
         move |_t, _g, _a| {
             submitted_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move { Ok(Uuid::new_v4()) }
@@ -295,4 +299,95 @@ async fn mock_provider_writes_nothing(pool: PgPool) {
         "mock must not submit any claim"
     );
     assert!(atoms_of(&pool, parent).await.is_empty());
+}
+
+/// The submit closure is told WHICH parent each atom belongs to, by id, so the
+/// binary's atom POST can name it in `derived_from` and the API can record the
+/// atom's derivation evidence (backlog 3590a2d8, U041). Two parents in one
+/// batch, reversed input order: every atom must be submitted with the id of
+/// the parent its `decomposes_to` edge comes from — never a neighbour's, and
+/// never a placeholder. The edge graph is the oracle, so a mapping bug in the
+/// closure argument cannot hide behind a mapping bug in the edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn submit_closure_receives_each_atoms_own_parent_id(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // Two DISTINCT authors (`seed_agent` reuses one public key, and
+    // `agents_public_key_unique` admits it once), so a closure handed the
+    // wrong parent's author is caught too.
+    let agent_a = seed_agent(&pool).await;
+    let agent_b = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2,'hex'))")
+        .bind(agent_b)
+        .bind("dd".repeat(32))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let parent_a = insert_min_claim(&pool, agent_a, COMPOUND_A).await;
+    let parent_b = insert_min_claim(&pool, agent_b, COMPOUND_B).await;
+
+    let llm = FixtureLlmClient::from_json(&fixture_json()).unwrap();
+    let claims = vec![
+        BatchClaim {
+            claim_id: parent_b,
+            agent_id: agent_b,
+            content: COMPOUND_B.to_string(),
+        },
+        BatchClaim {
+            claim_id: parent_a,
+            agent_id: agent_a,
+            content: COMPOUND_A.to_string(),
+        },
+    ];
+
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<(Uuid, AtomParent)>>> = Default::default();
+    let seen_c = seen.clone();
+    let pool_c = pool.clone();
+    let totals = run_decomposition_batches(
+        &pool,
+        &viewer,
+        &claims,
+        &llm,
+        10,
+        None,
+        None,
+        move |atom_text, _generality, parent: AtomParent| {
+            let pool_c = pool_c.clone();
+            let seen_c = seen_c.clone();
+            async move {
+                let id = insert_min_claim(&pool_c, parent.agent_id, &atom_text).await;
+                seen_c.lock().unwrap().push((id, parent));
+                Ok(id)
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(totals.atoms, 4);
+    assert_eq!(totals.edges, 4);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 4, "one submit per atom");
+    for (atom, parent) in &seen {
+        let edge_parent: Uuid = sqlx::query_scalar(
+            "SELECT source_id FROM edges WHERE target_id = $1 AND relationship = 'decomposes_to'",
+        )
+        .bind(atom)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            parent.claim_id, edge_parent,
+            "atom {atom} was submitted naming parent {} but is wired under {edge_parent}",
+            parent.claim_id
+        );
+        let author = if edge_parent == parent_a {
+            agent_a
+        } else {
+            agent_b
+        };
+        assert_eq!(
+            parent.agent_id, author,
+            "atom {atom} must inherit its own parent's author"
+        );
+    }
 }

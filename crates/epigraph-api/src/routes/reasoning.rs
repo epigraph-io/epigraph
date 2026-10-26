@@ -1,16 +1,23 @@
 //! Reasoning analysis endpoint for the epistemic knowledge graph.
 //!
 //! Exposes the Ascent-based reasoning engine via `POST /api/v1/reasoning/analyze`.
-//! The endpoint is **read-only** — it consumes graph data (claims from the in-memory
-//! store plus caller-supplied edges) and returns analytical insights: transitive
+//! The endpoint is **read-only** — it consumes graph data (persisted claims read
+//! as the caller, plus caller-supplied or auto-loaded edges) and returns
+//! analytical insights: transitive
 //! support chains, contradictions, support clusters, connected components, and
 //! unsupported claims.
 //!
-//! The endpoint is public (no signature required) because it performs no mutations.
+//! The endpoint performs no mutations, so it needs no request signature. It is
+//! a READ, and it reads as its caller: the token must carry
+//! `analysis:reasoning`, and the auto-loaded edge set is the caller's own view
+//! of the graph (`EdgeRepository::claim_edges_for_reasoning`, on a
+//! viewer-stamped connection). Every derived result names the endpoint claim
+//! ids of the edges it came from, so the edge read must be the caller's own.
 
 use crate::errors::ApiError;
+use crate::middleware::bearer::{AuthContext, ViewerExtractor};
 use crate::state::AppState;
-use axum::{extract::State, Json};
+use axum::{extract::State, Extension, Json};
 use epigraph_engine::{ReasoningClaim, ReasoningEdge, ReasoningEngine};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -26,8 +33,9 @@ use uuid::Uuid;
 /// claims via `claim_ids`. Parameter overrides tune engine thresholds.
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
-    /// Optional subset of claim IDs to include. When absent, all claims
-    /// from the in-memory store are loaded.
+    /// Optional subset of claim IDs to include. When absent (or empty), the
+    /// endpoints of the analysed edges are loaded; without the `db` feature,
+    /// all claims from the in-memory store.
     pub claim_ids: Option<Vec<Uuid>>,
     /// Edges to analyze. When empty (the default), edges are auto-loaded
     /// from the database — all claim-to-claim edges whose source or target
@@ -117,16 +125,32 @@ pub struct StatsDto {
 
 /// `POST /api/v1/reasoning/analyze`
 ///
-/// Loads claims from the in-memory claim store (optionally filtered by
-/// `claim_ids`), combines them with caller-supplied edges, and delegates
-/// to `ReasoningEngine::analyze()` for Datalog-based graph analysis.
+/// Loads the claims the caller can read (the request's `claim_ids`, or the
+/// endpoints of the analysed edges when it names none) with their effective
+/// belief, combines them with caller-supplied or auto-loaded edges, and
+/// delegates to `ReasoningEngine::analyze()` for Datalog-based graph analysis.
+/// Without the `db` feature, claims come from the in-memory claim store.
 ///
 /// Returns transitive supports, contradictions, support clusters, connected
 /// components, indirect challenges, and unsupported claims.
+///
+/// Requires `analysis:reasoning`. Auto-loaded edges are those the caller's
+/// viewer can read.
 pub async fn analyze(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<Extension<AuthContext>>,
     Json(request): Json<AnalyzeRequest>,
 ) -> Result<Json<AnalyzeResponse>, ApiError> {
+    // Unconditional: a request with no AuthContext is refused here on its own
+    // terms, not by whichever extractor happens to run first.
+    let Some(Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["analysis:reasoning"])?;
+
     // Validate input bounds to prevent DoS
     const MAX_CLAIM_IDS: usize = 5_000;
     const MAX_EDGES: usize = 10_000;
@@ -165,47 +189,94 @@ pub async fn analyze(
         }
     }
 
-    // Load claims from the in-memory store
-    let store = state.claim_store.read().await;
-    let reasoning_claims: Vec<ReasoningClaim> = match &request.claim_ids {
-        Some(ids) => {
-            let mut claims = Vec::with_capacity(ids.len());
-            for id in ids {
-                if let Some(claim) = store.get(id) {
-                    claims.push(ReasoningClaim {
-                        id: claim.id.as_uuid(),
-                        truth_value: claim.truth_value.value(),
-                    });
-                }
-                // Silently skip missing IDs — partial analysis is acceptable
-            }
-            claims
-        }
-        None => store
-            .values()
-            .map(|claim| ReasoningClaim {
-                id: claim.id.as_uuid(),
-                truth_value: claim.truth_value.value(),
-            })
-            .collect(),
-    };
-    // Release the read lock before doing computation
-    drop(store);
-
-    // If no edges were supplied, auto-load claim-to-claim edges from the DB.
+    // Both reads below run on ONE viewer-stamped connection.
     //
-    // Rationale: callers should not have to pre-fetch edges to get useful
-    // results from the reasoning engine.  The fallback is behind `#[cfg(feature = "db")]`
-    // so the non-DB build path is unaffected.
+    // 1. If no edges were supplied, claim-to-claim edges are auto-loaded, so
+    //    callers need not pre-fetch them.
+    // 2. The claims analysed are PERSISTED claims, read as the caller: the
+    //    request's `claim_ids`, or, when it names none, the endpoints of the
+    //    edges being analysed. Each enters with its effective belief
+    //    (`ClaimRepository::effective_belief_batch`: the pignistic probability
+    //    when the DS state is complete, the truth value otherwise). A claim the
+    //    caller cannot read, or an id naming no `claims` row, is absent from
+    //    that read and so contributes neither its id nor its score.
+    //
+    // The in-memory `claim_store` is written by nothing in a database build,
+    // so it is read only by the non-DB arm below.
     #[cfg(feature = "db")]
-    let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
-        load_edges_from_db(&state, &request.claim_ids).await?
-    } else {
-        request.edges
+    let (reasoning_claims, request_edges) = {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "reasoning_analyze",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+
+        let request_edges: Vec<EdgeInput> = if request.edges.is_empty() {
+            load_edges_from_db(&mut read, &viewer, &request.claim_ids).await?
+        } else {
+            request.edges
+        };
+
+        let claim_ids: Vec<Uuid> = match request.claim_ids.as_deref() {
+            Some(ids) if !ids.is_empty() => ids.to_vec(),
+            _ => request_edges
+                .iter()
+                .flat_map(|e| [e.source_id, e.target_id])
+                .collect(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        let claim_ids: Vec<Uuid> = claim_ids
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .collect();
+
+        let scores =
+            epigraph_db::ClaimRepository::effective_belief_batch(&mut *read, &viewer, &claim_ids)
+                .await?;
+        let reasoning_claims: Vec<ReasoningClaim> = claim_ids
+            .into_iter()
+            .filter_map(|id| {
+                scores
+                    .get(&id)
+                    .map(|&truth_value| ReasoningClaim { id, truth_value })
+            })
+            .collect();
+        (reasoning_claims, request_edges)
     };
 
     #[cfg(not(feature = "db"))]
-    let request_edges: Vec<EdgeInput> = request.edges;
+    let (reasoning_claims, request_edges) = {
+        // No database, so no tenancy-bearing read: the viewer has nothing to
+        // filter. Its extraction still enforced authentication. Claims come
+        // from the in-memory store (optionally filtered by `claim_ids`).
+        let _ = &viewer;
+        let store = state.claim_store.read().await;
+        let reasoning_claims: Vec<ReasoningClaim> = match &request.claim_ids {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| store.get(id))
+                .map(|claim| ReasoningClaim {
+                    id: claim.id.as_uuid(),
+                    truth_value: claim.truth_value.value(),
+                })
+                .collect(),
+            None => store
+                .values()
+                .map(|claim| ReasoningClaim {
+                    id: claim.id.as_uuid(),
+                    truth_value: claim.truth_value.value(),
+                })
+                .collect(),
+        };
+        drop(store);
+        (reasoning_claims, request.edges)
+    };
 
     // Convert input edges to engine types
     let reasoning_edges: Vec<ReasoningEdge> = request_edges
@@ -335,83 +406,55 @@ pub async fn analyze(
 // DB EDGE LOADER
 // =============================================================================
 
-/// Load claim-to-claim edges from the database.
+/// Load the claim-to-claim edges `viewer` can read.
 ///
-/// When `claim_ids` is `Some`, only edges whose source **or** target is in
-/// that set are returned (scoped query).  When `None`, all claim-to-claim
-/// edges are returned up to the 10 000-row safety cap to prevent OOM on
-/// large graphs.
+/// When `claim_ids` is a non-empty `Some`, only edges whose source **and**
+/// target are in that set are returned. Otherwise every readable
+/// claim-to-claim edge, capped at 10 000 rows to prevent OOM on large graphs.
+///
+/// `conn` is the caller's viewer-stamped connection (`AppState::read_as`) and
+/// the statement carries the edge-visibility predicate and the claim predicate
+/// on both endpoints, so the row-level policies and the in-query predicate
+/// agree about which edges the caller may see, and no edge brings in an
+/// endpoint claim the caller cannot read.
 ///
 /// The edge `strength` field is stored inside the `properties` JSONB column
 /// (key `"strength"`).  If absent or non-numeric the edge defaults to 0.5.
 #[cfg(feature = "db")]
 async fn load_edges_from_db(
-    state: &AppState,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
     claim_ids: &Option<Vec<Uuid>>,
 ) -> Result<Vec<EdgeInput>, ApiError> {
-    /// Row type for sqlx — mirrors the columns we SELECT.
-    #[derive(sqlx::FromRow)]
-    struct EdgeRow {
-        source_id: Uuid,
-        target_id: Uuid,
-        relationship: String,
-        properties: sqlx::types::Json<serde_json::Value>,
-    }
+    /// Row cap on the unscoped arm.
+    const UNSCOPED_EDGE_CAP: i64 = 10_000;
 
-    let pool = &state.db_pool;
-
-    let rows: Vec<EdgeRow> = match claim_ids {
-        Some(ids) if !ids.is_empty() => {
-            // Scoped: edges where BOTH source AND target are in the requested set.
-            // `= ANY($1)` binds a Rust slice as a Postgres array — no format!
-            // string interpolation, so no SQL-injection risk.
-            sqlx::query_as(
-                r#"
-                SELECT source_id, target_id, relationship, properties
-                FROM   edges
-                WHERE  source_type = 'claim'
-                  AND  target_type = 'claim'
-                  AND  source_id = ANY($1) AND target_id = ANY($1)
-                "#,
-            )
-            .bind(ids.as_slice())
-            .fetch_all(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to load edges for reasoning: {e}"),
-            })?
-        }
-        _ => {
-            // Unscoped: all claim-to-claim edges, capped for safety.
-            sqlx::query_as(
-                r#"
-                SELECT source_id, target_id, relationship, properties
-                FROM   edges
-                WHERE  source_type = 'claim'
-                  AND  target_type = 'claim'
-                LIMIT  10000
-                "#,
-            )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to load edges for reasoning: {e}"),
-            })?
-        }
+    // A present-but-empty `claim_ids` takes the unscoped arm, as it always has.
+    let among = claim_ids.as_deref().filter(|ids| !ids.is_empty());
+    let limit = if among.is_some() {
+        None
+    } else {
+        Some(UNSCOPED_EDGE_CAP)
     };
+
+    let rows =
+        epigraph_db::EdgeRepository::claim_edges_for_reasoning(&mut *conn, viewer, among, limit)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to load edges for reasoning: {e}"),
+            })?;
 
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let strength = r
-                .properties
+        .map(|(source_id, target_id, relationship, properties)| {
+            let strength = properties
                 .get("strength")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.5);
             EdgeInput {
-                source_id: r.source_id,
-                target_id: r.target_id,
-                relationship: r.relationship,
+                source_id,
+                target_id,
+                relationship,
                 strength,
             }
         })
@@ -432,6 +475,39 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    /// Helper: an `AuthContext` holding `scopes`, for a direct handler call.
+    fn auth_with(scopes: &[&str]) -> AuthContext {
+        let principal = uuid::Uuid::new_v4();
+        AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: crate::middleware::ClientType::Service,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        }
+    }
+
+    /// Helper: call the handler as an authenticated caller holding
+    /// `analysis:reasoning`.
+    async fn run(
+        state: AppState,
+        request: AnalyzeRequest,
+    ) -> Result<Json<AnalyzeResponse>, ApiError> {
+        analyze(
+            ViewerExtractor(crate::middleware::bearer::NoDbViewer),
+            State(state),
+            Some(Extension(auth_with(&["analysis:reasoning"]))),
+            Json(request),
+        )
+        .await
+    }
 
     /// Helper: build an AppState with the given claims pre-loaded.
     fn state_with_claims(claims: Vec<Claim>) -> AppState {
@@ -491,7 +567,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert!(resp.transitive_supports.is_empty());
@@ -520,7 +596,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(
@@ -556,7 +632,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(
@@ -590,7 +666,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(
@@ -629,7 +705,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         // Claims 1 and 3 have no incoming support edges
@@ -663,7 +739,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await;
+        let result = run(state, request).await;
         assert!(result.is_err(), "Should reject edge strength > 1.0");
     }
 
@@ -683,7 +759,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await;
+        let result = run(state, request).await;
         assert!(result.is_err(), "Should reject empty relationship");
     }
 
@@ -707,7 +783,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         // Find the transitive support from claim 1 to claim 3
@@ -746,7 +822,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(resp.stats.claims_loaded, 2, "Should only load 2 claims");
@@ -777,7 +853,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(
@@ -810,7 +886,7 @@ mod tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await.unwrap();
+        let result = run(state, request).await.unwrap();
         let resp = result.0;
 
         assert_eq!(resp.connected_components.len(), 1);
@@ -873,6 +949,57 @@ mod db_tests {
                 }
             }
         }};
+    }
+
+    /// An `AppState` over a viewer-stamping `ScopedPool` on the test database,
+    /// which `AppState::read_as` requires.
+    async fn scoped_state() -> AppState {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is set when a pool exists");
+        let scoped = epigraph_db::ScopedPool::connect_with_options(
+            &url,
+            epigraph_db::SessionGucMode::Session,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect scoped pool");
+        AppState::with_scoped_pool(scoped, ApiConfig::default())
+    }
+
+    /// Call the handler as the public viewer (the nil principal, no groups)
+    /// with `analysis:reasoning`. The fixtures below write no tenancy columns,
+    /// so their claims and edges are public and this viewer reads them.
+    async fn run(
+        state: AppState,
+        pool: &PgPool,
+        request: AnalyzeRequest,
+    ) -> Result<Json<AnalyzeResponse>, ApiError> {
+        let viewer = epigraph_db::Viewer::resolve(pool, Uuid::nil())
+            .await
+            .expect("resolve the public viewer");
+        let principal = Uuid::new_v4();
+        let auth = AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: crate::middleware::ClientType::Service,
+            scopes: vec!["analysis:reasoning".to_string()],
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        };
+        analyze(
+            ViewerExtractor(viewer),
+            State(state),
+            Some(Extension(auth)),
+            Json(request),
+        )
+        .await
     }
 
     /// Insert a minimal claim row directly into the DB for test setup.
@@ -961,8 +1088,8 @@ mod db_tests {
         insert_claim(&pool, tgt_id, 0.7).await;
         insert_edge(&pool, src_id, tgt_id, "supports", 0.9).await;
 
-        // Build AppState with the real DB pool.
-        let state = AppState::with_db(pool.clone(), ApiConfig::default());
+        // Build AppState with a viewer-stamping pool on the real DB.
+        let state = scoped_state().await;
 
         let request = AnalyzeRequest {
             claim_ids: Some(vec![src_id, tgt_id]),
@@ -975,7 +1102,7 @@ mod db_tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await;
+        let result = run(state, &pool, request).await;
         cleanup(&pool, &[src_id, tgt_id]).await;
 
         let resp = result.expect("analyze should succeed").0;
@@ -1019,26 +1146,7 @@ mod db_tests {
         // DB has src → other, but caller will supply src → tgt explicitly.
         insert_edge(&pool, src_id, other_id, "supports", 0.9).await;
 
-        let mut store = std::collections::HashMap::new();
-        for (id, truth) in [(src_id, 0.8_f64), (tgt_id, 0.7), (other_id, 0.6)] {
-            let claim_id = epigraph_core::ClaimId::from_uuid(id);
-            let now = chrono::Utc::now();
-            let claim = epigraph_core::Claim::with_id(
-                claim_id,
-                format!("claim {id}"),
-                epigraph_core::AgentId::new(),
-                [0u8; 32],
-                [0u8; 32],
-                None,
-                None,
-                epigraph_core::TruthValue::new(truth).unwrap(),
-                now,
-                now,
-            );
-            store.insert(id, claim);
-        }
-        let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
-        state.claim_store = std::sync::Arc::new(tokio::sync::RwLock::new(store));
+        let state = scoped_state().await;
 
         let request = AnalyzeRequest {
             claim_ids: None,
@@ -1056,7 +1164,7 @@ mod db_tests {
             contradiction_threshold: None,
         };
 
-        let result = analyze(State(state), Json(request)).await;
+        let result = run(state, &pool, request).await;
         cleanup(&pool, &[src_id, tgt_id, other_id]).await;
 
         let resp = result.expect("analyze should succeed").0;

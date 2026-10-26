@@ -1489,3 +1489,316 @@ async fn verify_checks_the_operator_function_grants_to_the_app_role(pool: PgPool
         "and it must NAME the function; stderr:\n{stderr}"
     );
 }
+
+// ── F-089-D: seed-owned harvester fragments already on disk ──
+
+// Migration 074's seed group: the crate's own spelling, the one the binary
+// binds, so the test cannot seed rows the binary does not treat as seed.
+use epigraph_cli::operator::SEED as SEED_GROUP;
+
+/// A `('public', SEED)` claim: what 074's seed arm leaves for an undeclared
+/// insert on a seed-member session.
+async fn seed_seed_owned_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, sha256(convert_to($2, 'UTF8')), 0.8, $3, true, 'public', $4)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(agent)
+    .bind(SEED_GROUP)
+    .execute(pool)
+    .await
+    .expect("seed seed-owned claim");
+    id
+}
+
+/// A fragment declared `('public', owner)`, linked to `claim` by a provenance
+/// row inserted with migration 089's fragment-stamping trigger DISABLED, so
+/// the fragment keeps the pre-089 shape: an on-disk row the trigger never saw.
+/// Without the bypass the trigger would stamp the fragment itself and the
+/// backfill would have nothing to do, on fixed and unfixed code alike.
+async fn seed_unstamped_fragment(pool: &PgPool, owner: Uuid, claim: Uuid) -> Uuid {
+    let frag: Uuid = sqlx::query_scalar(
+        "WITH s AS (INSERT INTO harvester_sources (content_hash, modality) \
+                    VALUES (sha256(convert_to(gen_random_uuid()::text, 'UTF8')), 'text') \
+                    RETURNING id) \
+         INSERT INTO harvester_fragments (source_id, content_hash, content_text, \
+                                          owner_group_id, visibility) \
+         SELECT s.id, sha256(convert_to(gen_random_uuid()::text, 'UTF8')), 'fragment', $1, \
+                'public' FROM s RETURNING id",
+    )
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("seed fragment");
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(
+        "ALTER TABLE harvester_claim_provenance \
+         DISABLE TRIGGER harvester_claim_provenance_fragment_inherit_tenancy",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("disable 089 trigger");
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(claim)
+        .bind(frag)
+        .execute(&mut *tx)
+        .await
+        .expect("seed provenance");
+    sqlx::query(
+        "ALTER TABLE harvester_claim_provenance \
+         ENABLE TRIGGER harvester_claim_provenance_fragment_inherit_tenancy",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("re-enable 089 trigger");
+    tx.commit().await.expect("commit");
+    frag
+}
+
+async fn fragment_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as("SELECT owner_group_id, visibility::text FROM harvester_fragments WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read fragment tenancy")
+}
+
+/// The `verify` line for `harvester_fragments`, if any.
+fn fragment_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|l| l.contains("FAIL") && l.contains("in harvester_fragments"))
+}
+
+/// F-089-D. A seed-owned fragment linked to a group-private claim is repaired
+/// by `run --entity harvester-fragments` and counted by `verify` (strict and
+/// `--legacy-owner platform`), mirroring migration 089's predicate: target
+/// either sentinel, source any non-world claim, and only where the tenancy
+/// actually differs. Controls: a world fragment on a SEED claim is still
+/// counted and moved, as it was before; a seed fragment on a seed claim
+/// already carries its claim's tenancy, so it is neither counted (or `verify`
+/// would stay red with nothing to run) nor rewritten in place (or `rows_done`
+/// would over-report).
+#[sqlx::test(migrations = "../../migrations")]
+async fn seed_owned_fragment_on_a_group_claim_is_repaired_and_counted(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "fragment author").await;
+    let private = seed_group_private_claim(&pool, agent, group, "group claim").await;
+    let seed_claim = seed_seed_owned_claim(&pool, agent, "seed claim").await;
+
+    let repairable = seed_unstamped_fragment(&pool, SEED_GROUP, private).await;
+    let world_on_seed = seed_unstamped_fragment(&pool, WORLD, seed_claim).await;
+    let seed_on_seed = seed_unstamped_fragment(&pool, SEED_GROUP, seed_claim).await;
+
+    // CALIBRATION: the bypass held, so the fragment is still in its pre-089
+    // shape, and the trigger is armed again afterwards.
+    assert_eq!(
+        fragment_tenancy(&pool, repairable).await,
+        (SEED_GROUP, "public".to_string()),
+        "CALIBRATION: the 089 trigger must not have stamped the fragment"
+    );
+    let armed: bool = sqlx::query_scalar(
+        "SELECT tgenabled <> 'D' FROM pg_trigger \
+          WHERE tgname = 'harvester_claim_provenance_fragment_inherit_tenancy'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read trigger state");
+    assert!(armed, "CALIBRATION: the 089 trigger must be re-enabled");
+
+    for args in [
+        &["verify"][..],
+        &["verify", "--legacy-owner", "platform"][..],
+    ] {
+        let (_code, stderr) = run_backfill(&pool, args).await;
+        let line = fragment_line(&stderr).unwrap_or_else(|| {
+            panic!("{args:?}: verify must report harvester_fragments: {stderr}")
+        });
+        assert!(
+            line.contains("FAIL: 2 row(s) in harvester_fragments"),
+            "{args:?}: verify must count the seed fragment on a group claim as well as the \
+             world fragment on a seed claim (2): not the world one alone, and not the seed \
+             fragment on a seed claim, which has nothing to move; got: {line}"
+        );
+        if args.len() == 1 {
+            // Strict verify lists offenders: the ids must be the rows it counted.
+            for (id, what) in [
+                (repairable, "seed-on-group"),
+                (world_on_seed, "world-on-seed"),
+            ] {
+                assert!(
+                    stderr.contains(&format!("harvester_fragments.id = {id}")),
+                    "strict verify must list the counted {what} fragment {id}: {stderr}"
+                );
+            }
+            assert!(
+                !stderr.contains(&format!("harvester_fragments.id = {seed_on_seed}")),
+                "strict verify must not list the uncounted seed-on-seed fragment: {stderr}"
+            );
+        }
+    }
+
+    let (code, stderr) = run_backfill(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "harvester-fragments",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "the fragment arm must succeed; stderr: {stderr}");
+
+    assert_eq!(
+        fragment_tenancy(&pool, repairable).await,
+        (group, "group".to_string()),
+        "a seed-owned fragment on a group-private claim must take the claim's tenancy"
+    );
+    assert_eq!(
+        fragment_tenancy(&pool, world_on_seed).await,
+        (SEED_GROUP, "public".to_string()),
+        "control: a world fragment on a seed claim is still moved, as before"
+    );
+    assert_eq!(
+        fragment_tenancy(&pool, seed_on_seed).await,
+        (SEED_GROUP, "public".to_string()),
+        "control: a seed fragment on a seed claim keeps its (already equal) tenancy"
+    );
+    let rows_done: i64 = sqlx::query_scalar(
+        "SELECT rows_done FROM tenancy_backfill_progress WHERE entity = 'harvester_fragments'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read fragment progress");
+    assert_eq!(
+        rows_done, 2,
+        "the fragment arm moves the two differing rows only; a seed-on-seed fragment \
+         rewritten to its own values must not be counted as done"
+    );
+
+    for args in [
+        &["verify"][..],
+        &["verify", "--legacy-owner", "platform"][..],
+    ] {
+        let (_code, stderr) = run_backfill(&pool, args).await;
+        assert_eq!(
+            fragment_line(&stderr),
+            None,
+            "{args:?}: after the repair no harvester_fragments row is residual: {stderr}"
+        );
+    }
+}
+
+/// F-089-D's other boundary: a seed fragment on a WORLD claim has no real owner
+/// to inherit, so the repair leaves it alone and `verify` never counts it.
+/// Checked under `--legacy-owner platform` (strict `verify` also fails on the
+/// world-owned claim and its provenance row, which is not this test's subject).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_fragment_on_a_world_claim_is_neither_moved_nor_counted(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "fragment author 2").await;
+    let private = seed_group_private_claim(&pool, agent, group, "group claim 2").await;
+    let world_claim = seed_undeclared_claim(&pool, agent, "world claim").await;
+
+    let repairable = seed_unstamped_fragment(&pool, SEED_GROUP, private).await;
+    let on_world = seed_unstamped_fragment(&pool, SEED_GROUP, world_claim).await;
+
+    let platform = &["verify", "--legacy-owner", "platform"][..];
+    let (_code, stderr) = run_backfill(&pool, platform).await;
+    let line = fragment_line(&stderr)
+        .unwrap_or_else(|| panic!("verify must report harvester_fragments: {stderr}"));
+    assert!(
+        line.contains("FAIL: 1 row(s) in harvester_fragments"),
+        "only the fragment on the group claim is repairable (1); got: {line}"
+    );
+
+    let (code, stderr) = run_backfill(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "platform",
+            "--entity",
+            "harvester-fragments",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "the fragment arm must succeed; stderr: {stderr}");
+    assert_eq!(
+        fragment_tenancy(&pool, repairable).await,
+        (group, "group".to_string()),
+        "non-vacuity: the repairable fragment in the same run IS moved"
+    );
+    assert_eq!(
+        fragment_tenancy(&pool, on_world).await,
+        (SEED_GROUP, "public".to_string()),
+        "a seed fragment on a world claim must not be stamped with the world sentinel"
+    );
+    let (_code, stderr) = run_backfill(&pool, platform).await;
+    assert_eq!(
+        fragment_line(&stderr),
+        None,
+        "the seed fragment on a world claim is never residual: {stderr}"
+    );
+}
+
+// ── strict verify lists harvester_claim_provenance offenders (d5e6575c) ──
+
+/// Backlog d5e6575c. `harvester_claim_provenance` has no `id` column (its key
+/// is `(claim_id, fragment_id)`), so strict `verify`'s offender listing, which
+/// selected `id`, aborted on `column "id" does not exist` the moment that table
+/// held a world-owned row: the remaining FAIL lines and the exit status were
+/// lost to the error. Strict verify must instead name the row by its real key
+/// and carry on to the tables after it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn strict_verify_lists_world_owned_provenance_rows_by_their_key(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "provenance author").await;
+    let claim = seed_undeclared_claim(&pool, agent, "world claim with provenance").await;
+    let fragment = seed_unstamped_fragment(&pool, WORLD, claim).await;
+
+    // CALIBRATION: the provenance row inherited its claim's world tenancy, so
+    // verify has a provenance offender to list.
+    let owner: Uuid = sqlx::query_scalar(
+        "SELECT owner_group_id FROM harvester_claim_provenance \
+          WHERE claim_id = $1 AND fragment_id = $2",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .fetch_one(&pool)
+    .await
+    .expect("read provenance tenancy");
+    assert_eq!(
+        owner, WORLD,
+        "CALIBRATION: the provenance row is world-owned"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert!(
+        !stderr.contains("does not exist"),
+        "strict verify must not abort on a missing column; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("FAIL: 1 row(s) in harvester_claim_provenance"),
+        "strict verify must count the provenance row; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "harvester_claim_provenance.(claim_id, fragment_id) = ({claim}, {fragment})"
+        )),
+        "strict verify must list the provenance row by its key; stderr:\n{stderr}"
+    );
+    // The listing runs to completion: the table after it in the tier-A order
+    // is still reported (the fragment inherits the same world tenancy).
+    assert!(
+        stderr.contains(&format!("harvester_fragments.id = {fragment}")),
+        "verify must carry on past the provenance listing; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        code, 1,
+        "verify FAILS on world-owned rows; stderr:\n{stderr}"
+    );
+}

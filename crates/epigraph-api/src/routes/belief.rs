@@ -29,7 +29,12 @@
 //!
 //! **Three handlers are deliberately NOT converted, and the reason is not
 //! caution.** `create_frame`, `submit_evidence` and `refine_frame` each write
-//! through their alias. `read_as` is documented read-only: `ScopedRead::commit`
+//! through their alias. (`submit_evidence`'s own tier-A writes, the BBA, the
+//! frame assignment, the claim's cached belief, its Beta parameters, its
+//! global scoped belief and its edges, now go through ONE [`AppState::write_as`]
+//! transaction, and its best-effort derived rows after the commit through a
+//! second; its alias remains for unstamped reads only.) `read_as` is documented
+//! read-only: `ScopedRead::commit`
 //! is not called by `Drop`, so under `SessionGucMode::Transaction` a write
 //! routed through it is rolled back on drop — a 200 with nothing persisted.
 //! `DerefMut<Target = PgConnection>` means that mistake COMPILES, so the
@@ -155,23 +160,152 @@ pub struct SubmitEvidenceRequest {
     /// `epigraph_engine::belief_query::get_perspective_belief`.
     #[serde(default)]
     pub evidence_type: Option<String>,
-    /// Conflict threshold for adaptive combination
+    /// Conflict K at or above which a `conflict.detected` event is emitted.
+    /// Since U025 it no longer selects a combination rule: `combine_multiple`
+    /// folds with Dempster at every step. It does not affect the claim's
+    /// belief, which is the shared recompute's
+    /// (`edge_factor::recompute_claim_belief_on_frame`).
     #[serde(default = "default_conflict_threshold")]
     pub conflict_threshold: f64,
     /// Mass assignments: keys are comma-separated hypothesis indices, values are mass.
     /// Prefix key with `~` for CDST complement (negative) elements.
     pub masses: std::collections::BTreeMap<String, f64>,
-    /// Override combination method: "conjunctive", "dempster", "yager_open",
-    /// "yager_closed", "dubois_prade", "inagaki". If omitted, uses adaptive.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). The
+    /// claim's belief is computed by the shared recompute, the one
+    /// `recompute_beliefs` and MCP `submit_ds_evidence` use. Sending it earns a
+    /// `warnings` entry.
     #[serde(default)]
     pub combination_method: Option<String>,
-    /// Inagaki gamma parameter [0, 1]. Only used when combination_method = "inagaki".
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It was
+    /// the Inagaki gamma for `combination_method = "inagaki"`. Sending it earns
+    /// a `warnings` entry.
     #[serde(default)]
     pub gamma: Option<f64>,
-    /// If true, skip independence checking. Caller asserts provenance independence.
-    /// Logged for audit purposes.
+    /// DEPRECATED: accepted, no effect on the belief (backlog 82dcff9d). It
+    /// skipped an independence analysis the shared recompute does not run.
+    /// Sending `true` earns a `warnings` entry.
     #[serde(default)]
     pub assume_independent: Option<bool>,
+}
+
+/// One warning per deprecated `SubmitEvidenceRequest` field the caller sent
+/// (backlog 82dcff9d, the REST twin of MCP `submit_ds_evidence`'s
+/// `deprecated_parameter_warnings`). They are accepted, not refused, for
+/// parity with MCP.
+#[cfg(feature = "db")]
+fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String> {
+    const WHY: &str = "The claim's belief is always recomputed by the shared Dempster fold \
+                       (the one recompute_beliefs uses).";
+    let mut out = Vec::new();
+    if let Some(method) = &request.combination_method {
+        out.push(format!(
+            "combination_method={method} is deprecated: it did not change the returned belief. \
+             {WHY}"
+        ));
+    }
+    if let Some(gamma) = request.gamma {
+        out.push(format!(
+            "gamma={gamma} is deprecated: it did not change the returned belief. {WHY}"
+        ));
+    }
+    if request.assume_independent == Some(true) {
+        out.push(format!(
+            "assume_independent=true is deprecated: it did not change the returned belief, \
+             since no independence analysis runs. {WHY}"
+        ));
+    }
+    out
+}
+
+/// One of `submit_evidence`'s best-effort edges, written on its viewer-stamped
+/// transaction under a SAVEPOINT.
+///
+/// Stamped, the edges trigger records the caller's writer group, and row
+/// security decides the INSERT against the caller's writable set. A refused
+/// INSERT (row security, or `trigger_validate_edge_refs` on an endpoint that
+/// is not a row of its declared type) is logged and rolled back to the
+/// savepoint, so it neither fails the request nor aborts the transaction and
+/// silently rolls the BBA back at the COMMIT.
+///
+/// # Errors
+/// `ApiError::DatabaseError` only when the savepoint itself cannot be opened
+/// or closed.
+#[cfg(feature = "db")]
+async fn create_edge_under_savepoint(
+    conn: &mut sqlx::PgConnection,
+    source_id: Uuid,
+    source_type: &str,
+    target_id: Uuid,
+    target_type: &str,
+    relationship: &str,
+    properties: Option<serde_json::Value>,
+) -> Result<(), ApiError> {
+    use sqlx::Acquire as _;
+    let mut sp = conn.begin().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to open a savepoint: {e}"),
+    })?;
+    let created = epigraph_db::EdgeRepository::create(
+        &mut *sp,
+        source_id,
+        source_type,
+        target_id,
+        target_type,
+        relationship,
+        properties,
+        None,
+        None,
+    )
+    .await;
+    match created {
+        Ok(_) => sp.commit().await,
+        Err(e) => {
+            tracing::warn!("submit_evidence: {relationship} edge refused: {e}");
+            sp.rollback().await
+        }
+    }
+    .map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to close a savepoint: {e}"),
+    })
+}
+
+/// A scoped belief `submit_evidence` derives after its commit (step 17) and
+/// writes on a stamped transaction (step 20).
+#[cfg(feature = "db")]
+struct ScopedBeliefWrite {
+    scope_type: &'static str,
+    scope_id: Uuid,
+    belief: f64,
+    plausibility: f64,
+    mass_on_empty: f64,
+    mass_on_missing: f64,
+    conflict_k: Option<f64>,
+    strategy: Option<String>,
+    pignistic_prob: f64,
+}
+
+/// Close a best-effort write's SAVEPOINT: release it when the write landed,
+/// roll back to it (logging `what`) when it was refused.
+///
+/// # Errors
+/// The savepoint's own RELEASE / ROLLBACK error (logged here too); the
+/// enclosing transaction is then unusable.
+#[cfg(feature = "db")]
+async fn finish_savepoint<T>(
+    sp: sqlx::Transaction<'_, sqlx::Postgres>,
+    result: Result<T, epigraph_db::DbError>,
+    what: &str,
+) -> Result<(), sqlx::Error> {
+    let closed = match result {
+        Ok(_) => sp.commit().await,
+        Err(e) => {
+            tracing::warn!("submit_evidence: {what} refused: {e}");
+            sp.rollback().await
+        }
+    };
+    if let Err(e) = &closed {
+        tracing::warn!("submit_evidence: could not close the {what} savepoint: {e}");
+    }
+    closed
 }
 
 fn default_reliability() -> f64 {
@@ -196,6 +330,23 @@ pub struct EvidenceSubmissionResponse {
     pub pignistic_prob: Option<f64>,
     pub bayesian_posterior: f64,
     pub total_sources: i64,
+    /// What this write did to the caller's BBA for its key (claim, frame,
+    /// agent, perspective_id), decided before the store by the probe MCP
+    /// `submit_ds_evidence` shares (`epigraph_db::bba_write_outcome`):
+    /// `inserted`, `unchanged` (an identical resubmission: the stored values
+    /// stay the same, though the upsert still refreshes the row's
+    /// `created_at`) or `replaced` (a different BBA overwrote it, same
+    /// `mass_function_id`). Backlog 6f82db4f.
+    pub write_outcome: String,
+    /// True exactly when `write_outcome` is `unchanged`.
+    pub deduplicated: bool,
+    /// What the caller should know about this submission's effect: a
+    /// deprecated request field it sent (`combination_method`, `gamma`,
+    /// `assume_independent`), that the claim's cache was not updated (it
+    /// carries another frame), or that the write was `unchanged` or
+    /// `replaced`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Simplified combination report for API response
@@ -915,7 +1066,12 @@ pub async fn create_frame(
 
 /// Submit mass function evidence for a claim in a frame
 ///
-/// Pipeline: discount → store → retrieve all → combine → update claim → emit events → compute divergence
+/// Pipeline: discount → (one stamped transaction: store → recompute the
+/// claim's belief on this frame with the shared pipeline
+/// `edge_factor::recompute_claim_belief_on_frame` → Beta update → global
+/// scoped belief → edges) → emit events → compute divergence. The belief this returns is the one a later
+/// `recompute_beliefs` with no new evidence leaves (backlogs 2bffdfdc,
+/// 82dcff9d), and no derived "combined" BBA is stored beside the input.
 ///
 /// `POST /api/v1/frames/:id/evidence`
 #[cfg(feature = "db")]
@@ -929,6 +1085,65 @@ pub async fn submit_evidence(
     use std::collections::BTreeSet;
 
     let pool = &state.db_pool;
+
+    // 0. Every BBA has an author, and it is the caller (operator ruling
+    //    2026-10-22). The body's `agent_id` is the BBA's author and half its
+    //    upsert key `(claim, frame, source_agent_id, perspective)`. Naming
+    //    another agent would attribute evidence to it and, where row security
+    //    lets the caller write that agent's row, overwrite its BBA, so it is
+    //    refused. An omitted `agent_id` is the caller's own: an agent-less BBA
+    //    shared one row per (claim, frame, perspective) under the `NULLS NOT
+    //    DISTINCT` key, so one caller's replaced another's (backlog 5a3ba157).
+    //    MCP `submit_ds_evidence` takes the author from the authenticated
+    //    identity for the same reason.
+    let Some(caller) = viewer.principal() else {
+        return Err(ApiError::Forbidden {
+            reason: "evidence needs an authenticated author".to_string(),
+        });
+    };
+    let named = request.agent_id;
+    let mut request = request;
+    request.agent_id = Some(caller);
+
+    // An owner's assessment slot (`/claims/:id/assess`, ruling Q-U027F-2) is
+    // addressable only through assess: a row keyed (agent, that agent's slot
+    // perspective) would overwrite or forge that owner's one assessment. It is
+    // checked against the NAMED author first, so naming a slot stays a 400.
+    if epigraph_db::repos::mass_function::is_assessment_slot(
+        named.or(Some(caller)),
+        request.perspective_id,
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "perspective_id".to_string(),
+            reason: "this is the agent's assessment slot, written only by \
+                     POST /api/v1/claims/:id/assess"
+                .to_string(),
+        });
+    }
+
+    if named.is_some_and(|n| n != caller) {
+        return Err(ApiError::Forbidden {
+            reason: "agent_id must be the authenticated caller's own agent id, or omitted"
+                .to_string(),
+        });
+    }
+
+    // 0b. Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis
+    //     goes to the frame its readers read, `research_validity` (writers
+    //     follow the readers, operator ruling R-8; MCP `submit_ds_evidence`
+    //     does the same). Read as the caller, before anything is written.
+    let named_frame = frame_id;
+    let redirected = {
+        let mut read = state.read_as(&viewer).await?;
+        epigraph_engine::promotion::promoted_hypothesis_evidence_frame(
+            &mut read,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+    };
+    let frame_id = redirected.as_ref().map_or(frame_id, |f| f.id);
 
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
@@ -1002,6 +1217,9 @@ pub async fn submit_evidence(
         .await
         .unwrap_or_default();
     let now = chrono::Utc::now();
+    // The contexts whose modifier applied, for the SCOPED_BY edges step 14
+    // writes on the stamped transaction.
+    let mut scoped_by: Vec<(Uuid, String)> = Vec::new();
     for ctx in &active_contexts {
         // Check temporal validity
         if let Some(from) = ctx.valid_from {
@@ -1019,19 +1237,7 @@ pub async fn submit_evidence(
             match combination::apply_context_modifier(&modified, modifier_type, &params) {
                 Ok(m) => {
                     modified = m;
-                    // Create SCOPED_BY edge from claim to context (best-effort)
-                    let _ = epigraph_db::EdgeRepository::create(
-                        pool,
-                        request.claim_id,
-                        "claim",
-                        ctx.id,
-                        "context",
-                        "SCOPED_BY",
-                        Some(serde_json::json!({"modifier_type": modifier_type})),
-                        None,
-                        None,
-                    )
-                    .await;
+                    scoped_by.push((ctx.id, modifier_type.clone()));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1044,25 +1250,38 @@ pub async fn submit_evidence(
         }
     }
 
-    // 4c. Apply perspective confidence_calibration as additional discount
+    // 4c. Apply perspective confidence_calibration as additional discount.
+    //     The perspective is read AS THE CALLER, and one it cannot read is a
+    //     404 before anything is written. On the raw pool this read saw no
+    //     group-private perspective, and a miss (or an error) went ahead:
+    //     the BBA was filed under a perspective the caller cannot see (the
+    //     foreign key ignores row security), its CONTRIBUTES_TO edge and
+    //     scoped belief followed, and the calibration was skipped.
     if let Some(perspective_id) = request.perspective_id {
-        if let Ok(Some(perspective)) =
-            epigraph_db::PerspectiveRepository::get_by_id(pool, &viewer, perspective_id).await
-        {
-            if let Some(calibration) = perspective.confidence_calibration {
-                if (0.0..1.0).contains(&calibration) {
-                    match combination::discount(&modified, calibration) {
-                        Ok(m) => {
-                            tracing::debug!(
-                                "Applied confidence_calibration={calibration} for perspective {perspective_id}"
-                            );
-                            modified = m;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Confidence calibration discount failed for perspective {perspective_id}: {e}"
-                            );
-                        }
+        let perspective = {
+            let mut read = state.read_as(&viewer).await?;
+            epigraph_db::PerspectiveRepository::get_by_id(&mut *read, &viewer, perspective_id)
+                .await?
+        };
+        let Some(perspective) = perspective else {
+            return Err(ApiError::NotFound {
+                entity: "perspective".to_string(),
+                id: perspective_id.to_string(),
+            });
+        };
+        if let Some(calibration) = perspective.confidence_calibration {
+            if (0.0..1.0).contains(&calibration) {
+                match combination::discount(&modified, calibration) {
+                    Ok(m) => {
+                        tracing::debug!(
+                            "Applied confidence_calibration={calibration} for perspective {perspective_id}"
+                        );
+                        modified = m;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Confidence calibration discount failed for perspective {perspective_id}: {e}"
+                        );
                     }
                 }
             }
@@ -1208,10 +1427,105 @@ pub async fn submit_evidence(
         }
     }
 
-    // 5. Store the individual BBA (with optional perspective)
+    // 5. ONE viewer-stamped transaction for this submission's own writes: the
+    //    BBA, the frame assignment, the claim's cached belief, its Beta
+    //    parameters and its global scoped belief (backlogs 2bffdfdc / I075 and
+    //    82dcff9d / I228, the REST twins of `submit_ds_evidence`'s #317 and
+    //    #513).
+    //
+    //    The combine and the cache write are DELEGATED to the shared pipeline,
+    //    `edge_factor::recompute_claim_belief_on_frame`, the same function
+    //    `recompute_beliefs`, the framed `get_belief` and MCP
+    //    `submit_ds_evidence` use. This handler used to run its own combine
+    //    (only `'discount'` rows, an independence analysis with cautious
+    //    combine, the caller's threshold), wrote the cache with no
+    //    `belief_frame_id`, stored the masses with `source_strength =
+    //    reliability` (which the shared pipeline discounts AGAIN), and then
+    //    stored the combined result back as a NULL-agent "system" BBA that every
+    //    later recompute folded in as one more independent source. A submit and
+    //    a recompute with no new evidence then disagreed (0.60 vs 0.72 for one
+    //    BBA), and a submission with no `agent_id` was overwritten by that
+    //    combined row (same unique key).
+    //
+    //    The submission's edges (WITHIN_FRAME, SCOPED_BY and the DS
+    //    relationships) are on this transaction too, so they carry the
+    //    caller's writer group.
+    //
+    //    The derived rows computed after the commit (the perspective and
+    //    community scoped beliefs, the divergence record) are written on a
+    //    SECOND stamped transaction in step 20, never on the raw pool, and only
+    //    AFTER this one commits: once the recompute has updated the `claims`
+    //    row on `tx`, a write that touches that row on another connection
+    //    would wait on this transaction forever.
+    let mut tx = state.write_as(&viewer, "submit_evidence").await?;
+
+    // 5a. The claim, read as the caller. An unreadable claim gets the same 404
+    //     as a nonexistent one, so the route is no existence oracle.
+    {
+        let sql = viewer.splice(
+            "SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(request.claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        if q.fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .is_none()
+        {
+            return Err(ApiError::NotFound {
+                entity: "claim".to_string(),
+                id: request.claim_id.to_string(),
+            });
+        }
+    }
+
+    // 5b. Store the individual BBA (with optional perspective).
+    //     The masses are the reliability-discounted ones (step 4), which the
+    //     REST readers of `'discount'` rows (`get_pignistic`, 18b's velocity
+    //     check, step 17's perspective scope) consume directly. So the row's
+    //     `source_strength` is 1.0: `effective_source_strength` (tier 1 when
+    //     untyped, tier 4 for an uncalibrated type) must not apply
+    //     `reliability` a second time.
     let masses_json = modified.masses_to_json();
+    // Canonical key, or the caller's own key lowercased (bc06ec6f).
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+
+    // 5a'. What the store below does to the caller's row for its key (backlog
+    //      6f82db4f, the REST twin of bcbe34b2): the upsert returns only the
+    //      id, so read the row first, on this transaction, and compare it with
+    //      exactly what 5b stores. The caller's row has an agent, so the
+    //      cached-combination exclusion never hides it.
+    let write_outcome = {
+        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite};
+        let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?;
+        classify(
+            prior_for(&rows, request.agent_id, request.perspective_id),
+            &BbaWrite {
+                masses: &masses_json,
+                combination_method: "discount",
+                evidence_type: stored_evidence_type.as_deref(),
+                locality_tag: "unknown",
+                source_strength: Some(1.0),
+                conflict_k: None,
+                evidence_id: None,
+            },
+        )
+    };
+
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
-        pool,
+        &mut *tx,
         request.claim_id,
         frame_id,
         request.agent_id,
@@ -1219,111 +1533,46 @@ pub async fn submit_evidence(
         &masses_json,
         None,
         Some("discount"),
-        Some(request.reliability),
-        request.evidence_type.as_deref(),
+        Some(1.0), // `reliability` is already in the masses; see 5b
+        stored_evidence_type.as_deref(),
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
     .await?;
 
-    // 6. Ensure claim is assigned to frame + create WITHIN_FRAME edge (best-effort)
-    //    Use ON CONFLICT DO NOTHING to preserve any existing hypothesis_index assignment.
-    //    assign_claim() uses DO UPDATE which would overwrite hypothesis_index with NULL.
-    let _ = sqlx::query(
-        "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(request.claim_id)
-    .bind(frame_id)
-    .execute(pool)
-    .await;
-    let _ = epigraph_db::EdgeRepository::create(
-        pool,
-        request.claim_id,
-        "claim",
-        frame_id,
-        "frame",
-        "WITHIN_FRAME",
-        None,
-        None,
-        None,
-    )
-    .await;
-
-    // 7. Retrieve all BBAs for this (claim, frame), excluding system-combined results.
-    //    Only include user-submitted BBAs (combination_method = "discount") to avoid
-    //    double-counting derived artifacts (violates TBM independence assumption).
-    let all_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-        pool,
-        &viewer,
-        request.claim_id,
-        frame_id,
-    )
-    .await?;
-
-    // 8. Sort mass functions by row ID for canonical combination ordering.
-    //    This ensures identical results regardless of evidence submission order.
-    let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, row.source_agent_id, m))
-        })
-        .collect();
-    indexed_rows.sort_by_key(|(id, _, _)| *id);
-
-    // 9. Independence analysis (G1, G11)
-    let analysis = if request.assume_independent.unwrap_or(false) || indexed_rows.len() <= 1 {
-        super::independence::IndependenceAnalysis::all_independent(
-            indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
+    // 6. Ensure the claim is assigned to the frame (best-effort, under a
+    //    SAVEPOINT: unsavepointed, a refused INSERT would abort the transaction
+    //    and the COMMIT would silently roll the BBA back).
+    //    ON CONFLICT DO NOTHING preserves an existing hypothesis_index;
+    //    `FrameRepository::assign_claim` would overwrite it with NULL.
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let assigned = sqlx::query(
+            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
         )
-    } else {
-        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
-    };
-
-    // 10a. Cautious-combine within each dependent group
-    let mut group_results = Vec::new();
-    for group in &analysis.dependent_groups {
-        if group.is_empty() {
-            continue;
+        .bind(request.claim_id)
+        .bind(frame_id)
+        .execute(&mut *sp)
+        .await;
+        match assigned {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: claim_frames assignment refused: {e}");
+                sp.rollback().await
+            }
         }
-        let combined_group = group
-            .iter()
-            .skip(1)
-            .try_fold(group[0].clone(), |acc, m| {
-                combination::cautious_combine(&acc, m)
-            })
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Cautious combine failed: {e}"),
-            })?;
-        group_results.push(combined_group);
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
     }
 
-    // 10b. Merge independent BBAs + group results
-    let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
-    for_combination.extend(group_results);
-
-    // 10c. Standard adaptive combination on the now-independent set
-    let (combined, reports) = if for_combination.len() <= 1 {
-        (
-            for_combination
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| indexed_rows[0].2.clone()),
-            vec![],
-        )
-    } else {
-        combination::combine_multiple(&for_combination, request.conflict_threshold).map_err(
-            |e| ApiError::InternalError {
-                message: format!("Combination failed: {e}"),
-            },
-        )?
-    };
-
-    // 11. Look up claim's hypothesis_index in claim_frames for correct Bel/Pl
+    // 11. Look up claim's hypothesis_index in claim_frames (Beta update, the
+    //     perspective scope and the velocity check below)
     let claim_assignment = epigraph_db::FrameRepository::get_claim_assignment(
-        pool,
+        &mut *tx,
         &viewer,
         request.claim_id,
         frame_id,
@@ -1331,35 +1580,320 @@ pub async fn submit_evidence(
     .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
 
-    let (final_bel, final_pl, final_betp, m_missing) =
-        compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-    let m_empty = combined.mass_of_empty();
-
     // 12. Read old belief/plausibility before updating (for event payload)
     let old_row: Option<(Option<f64>, Option<f64>)> =
         sqlx::query_as("SELECT belief, plausibility FROM claims WHERE id = $1")
             .bind(request.claim_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: e.to_string(),
             })?;
     let (old_belief, old_plausibility) = old_row.unwrap_or((None, None));
 
-    // 13. Update claim's belief, plausibility, and pignistic probability
-    epigraph_db::MassFunctionRepository::update_claim_belief(
-        pool,
+    // 13. Combine every BBA on (claim, frame) and write the claim's cache with
+    //     `belief_frame_id = frame_id`, through the shared pipeline. A
+    //     non-owner's write follows migration 114: it refreshes the cache only
+    //     on the frame the cache already carries (or seeds `binary_truth`).
+    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+        &mut tx,
+        &viewer,
         request.claim_id,
-        epigraph_db::CachedBelief {
-            belief: final_bel,
-            plausibility: final_pl,
-            mass_on_empty: m_empty,
-            pignistic_prob: Some(final_betp),
-            mass_on_missing: m_missing,
-            belief_frame_id: None,
-        },
+        frame_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Belief recompute failed: {e}"),
+    })?;
+
+    // 13a. This frame's combination, by the same pipeline, for the response
+    //      and the events. When the cache now carries another frame (a
+    //      non-owner may not re-point it), say so instead of implying that the
+    //      claim's belief moved.
+    let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut tx,
+        &viewer,
+        request.claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Belief preview failed: {e}"),
+    })?
+    .ok_or_else(|| ApiError::InternalError {
+        message: "no BBA on this frame after storing one".to_string(),
+    })?;
+    let cache_frame: Option<Uuid> =
+        sqlx::query_scalar("SELECT belief_frame_id FROM claims WHERE id = $1")
+            .bind(request.claim_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: e.to_string(),
+            })?
+            .flatten();
+    let mut warnings = deprecated_parameter_warnings(&request);
+    if redirected.is_some() {
+        warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
+            request.claim_id,
+            named_frame,
+            frame_id,
+        ));
+    }
+    match write_outcome {
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged => warnings.push(
+            "this BBA is identical to the one this agent already stored for this claim, frame \
+             and perspective_id; its stored values are unchanged (the row's created_at is \
+             refreshed), so the claim's Dempster-Shafer belief did not move on its account \
+             (bayesian_posterior still applies this submission's Beta update)."
+                .to_string(),
+        ),
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(
+            "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
+             perspective_id (same mass_function_id); it was not added beside it. To add \
+             independent evidence, submit it under a distinct perspective_id."
+                .to_string(),
+        ),
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
+    }
+    if cache_frame != Some(frame_id) {
+        warnings.push(format!(
+            "claim {}'s cached belief was NOT updated by this call: it carries another frame \
+             (or an older cache with no recorded frame, or none on a frame other than \
+             binary_truth), which a non-owner does not re-point or seed. updated_belief, \
+             updated_plausibility and pignistic_prob here are this frame's combination, not \
+             the claim's cache.",
+            request.claim_id
+        ));
+    }
+
+    // 13b. Parallel Beta-Bernoulli update
+    //      Compute likelihood ratio from evidence mass function and update Beta parameters.
+    //      The evidence's mass on the singleton {h_i} indicates support strength.
+    //      Best-effort, under a SAVEPOINT (the read included: a failed statement
+    //      aborts the enclosing transaction whether it read or wrote).
+    let bayesian_posterior = {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let beta_row: Result<Option<(f64, f64)>, sqlx::Error> =
+            sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
+                .bind(request.claim_id)
+                .fetch_optional(&mut *sp)
+                .await;
+
+        let (mut alpha, mut beta_param) = beta_row
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .unwrap_or((1.0, 1.0));
+
+        // Use the submitted evidence's singleton mass as the evidence strength
+        if let Some(h_i) = h_idx {
+            let singleton =
+                epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
+            let m_support = modified.mass_of(&singleton);
+            // Evidence strength: mass on the singleton hypothesis vs complement
+            // Higher m_support → stronger evidence for the hypothesis
+            if m_support > 0.0 {
+                alpha += m_support;
+            }
+            let m_complement = 1.0 - m_support - modified.mass_of_empty();
+            if m_complement > 0.0 {
+                beta_param += m_complement;
+            }
+        }
+
+        // Store updated Beta parameters
+        let stored = match beta_row {
+            Ok(_) => sqlx::query(
+                "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
+            )
+            .bind(request.claim_id)
+            .bind(alpha)
+            .bind(beta_param)
+            .execute(&mut *sp)
+            .await
+            .map(|_| ()),
+            Err(e) => Err(e),
+        };
+        match stored {
+            Ok(()) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: Beta update refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+
+        // Compute posterior: E[Beta(alpha, beta)] = alpha / (alpha + beta)
+        alpha / (alpha + beta_param)
+    };
+
+    // The BBAs the shared pipeline just combined, read through the same
+    // combine-input reader it uses. `count_for_claim_frame` would also count a
+    // legacy cached combination row (an agent-less, perspective-less row the
+    // writers stored before U024, ~15.5k of them on prod), which the reader
+    // excludes (backlog b5cb3efb): one real input beside such a row would then
+    // report two sources and a Dempster fold that never happened.
+    let total_sources = i64::try_from(
+        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+        .len(),
+    )
+    .unwrap_or(i64::MAX);
+
+    // The values the rest of the handler reports and emits: this frame's
+    // combination by the shared pipeline. `combine_multiple` folds with
+    // Dempster at every step since U025; a single BBA is not folded, so it has
+    // no combination step and no fold conflict to report as one. `total_sources`
+    // is the number of BBAs that fold combined (see above).
+    let final_bel = preview.belief;
+    let final_pl = preview.plausibility;
+    let final_betp = preview.pignistic_prob;
+    let m_empty = preview.conflict_k;
+    let m_missing = preview.missing_mass;
+    let folded = total_sources > 1;
+    let final_k = folded.then_some(preview.conflict_k);
+    let final_method = folded.then_some("Dempster");
+    let report_responses: Vec<CombinationReportResponse> = if folded {
+        vec![CombinationReportResponse {
+            method_used: "Dempster".to_string(),
+            conflict_k: preview.conflict_k,
+            mass_on_conflict: preview.conflict_k,
+            mass_on_missing: preview.missing_mass,
+        }]
+    } else {
+        vec![]
+    };
+
+    // 15. The global scoped belief cache, on the stamped transaction
+    //     (best-effort, under a SAVEPOINT like steps 6 and 13b). On the raw
+    //     pool this write was refused under FORCE without an error, and with
+    //     it the only record of a REST fold's conflict K now that no derived
+    //     BBA is stored beside the inputs.
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let stored = epigraph_db::ScopedBeliefRepository::upsert(
+            &mut *sp,
+            frame_id,
+            request.claim_id,
+            "global",
+            None,
+            final_bel,
+            final_pl,
+            m_empty,
+            m_missing,
+            final_k,
+            final_method,
+            Some(final_betp),
+        )
+        .await;
+        match stored {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("submit_evidence: global scoped belief refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+    }
+
+    // 14 / 16. The edges this submission records, on the stamped transaction
+    //     (each best-effort, under a SAVEPOINT like steps 6, 13b and 15). On
+    //     the raw pool after the commit they were written UNSTAMPED: the edges
+    //     trigger records the writer from the session, so every one landed
+    //     with no writer group, a public claim's WITHIN_FRAME edge owned by
+    //     the world group, and a group claim's refused outright by row
+    //     security.
+    create_edge_under_savepoint(
+        &mut tx,
+        request.claim_id,
+        "claim",
+        frame_id,
+        "frame",
+        "WITHIN_FRAME",
+        None,
     )
     .await?;
+    //     SCOPED_BY, claim -> each context whose modifier step 4b applied.
+    for (context_id, modifier_type) in &scoped_by {
+        create_edge_under_savepoint(
+            &mut tx,
+            request.claim_id,
+            "claim",
+            *context_id,
+            "context",
+            "SCOPED_BY",
+            Some(serde_json::json!({"modifier_type": modifier_type})),
+        )
+        .await?;
+    }
+    //     DS relationships. "evidence" is the entity type for mass functions
+    //     (constraint-compatible).
+    if final_bel > 0.5 {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            request.claim_id,
+            "claim",
+            "SUPPORTS",
+            Some(serde_json::json!({"belief": final_bel})),
+        )
+        .await?;
+    } else if final_bel < 0.3 {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            request.claim_id,
+            "claim",
+            "CONTRADICTS",
+            Some(serde_json::json!({"belief": final_bel})),
+        )
+        .await?;
+    }
+    if let Some(agent_id) = request.agent_id {
+        create_edge_under_savepoint(
+            &mut tx,
+            mf_id,
+            "evidence",
+            agent_id,
+            "agent",
+            "GENERATED_BY",
+            None,
+        )
+        .await?;
+    }
+    if let Some(perspective_id) = request.perspective_id {
+        create_edge_under_savepoint(
+            &mut tx,
+            perspective_id,
+            "perspective",
+            request.claim_id,
+            "claim",
+            "CONTRIBUTES_TO",
+            None,
+        )
+        .await?;
+    }
+
+    tx.commit().await?;
 
     // 13c. CDST residual mass analysis
     {
@@ -1396,181 +1930,27 @@ pub async fn submit_evidence(
         }
     }
 
-    // 13b. Parallel Beta-Bernoulli update
-    //      Compute likelihood ratio from evidence mass function and update Beta parameters.
-    //      The evidence's mass on the singleton {h_i} indicates support strength.
-    let bayesian_posterior = {
-        let beta_row: Option<(f64, f64)> =
-            sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
-                .bind(request.claim_id)
-                .fetch_optional(pool)
-                .await
-                .ok()
-                .flatten();
-
-        let (mut alpha, mut beta_param) = beta_row.unwrap_or((1.0, 1.0));
-
-        // Use the submitted evidence's singleton mass as the evidence strength
-        if let Some(h_i) = h_idx {
-            let singleton =
-                epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
-            let m_support = modified.mass_of(&singleton);
-            // Evidence strength: mass on the singleton hypothesis vs complement
-            // Higher m_support → stronger evidence for the hypothesis
-            if m_support > 0.0 {
-                alpha += m_support;
+    // 17. Compute perspective-scoped and community-scoped beliefs.
+    //     The BBAs are read as the caller (an unstamped read sees no group
+    //     row), and the scoped beliefs are collected here and written in step
+    //     20 on a stamped transaction, never on the raw pool: there, FORCE'd
+    //     row security refused them without an error.
+    let mut scoped_beliefs: Vec<ScopedBeliefWrite> = Vec::new();
+    let mut scoped_read = match request.perspective_id {
+        Some(_) => match state.read_as(&viewer).await {
+            Ok(read) => Some(read),
+            Err(e) => {
+                tracing::warn!("submit_evidence: no stamped read for the scoped beliefs: {e}");
+                None
             }
-            let m_complement = 1.0 - m_support - modified.mass_of_empty();
-            if m_complement > 0.0 {
-                beta_param += m_complement;
-            }
-        }
-
-        // Store updated Beta parameters
-        let _ = sqlx::query(
-            "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
-        )
-        .bind(request.claim_id)
-        .bind(alpha)
-        .bind(beta_param)
-        .execute(pool)
-        .await;
-
-        // Compute posterior: E[Beta(alpha, beta)] = alpha / (alpha + beta)
-        alpha / (alpha + beta_param)
+        },
+        None => None,
     };
-
-    // 14. Update the combined mass function's conflict in DB (G16: record actual method)
-    let final_k = reports.last().map(|r| r.conflict_k);
-    let used_cautious = !analysis.dependent_groups.is_empty();
-    let final_method_str = if used_cautious {
-        // Independence analysis detected shared provenance → cautious + adaptive
-        let adaptive = reports
-            .last()
-            .map(|r| format!("{:?}", r.method_used))
-            .unwrap_or_else(|| "none".to_string());
-        Some(format!("cautious+{adaptive}"))
-    } else {
-        reports.last().map(|r| format!("{:?}", r.method_used))
-    };
-    let final_method = final_method_str.as_deref();
-
-    // Store the combined result as a system mass function (agent_id = None)
-    let combined_json = combined.masses_to_json();
-    let _ = epigraph_db::MassFunctionRepository::store(
-        pool,
-        request.claim_id,
-        frame_id,
-        None, // system-generated combined result
-        &combined_json,
-        final_k,
-        final_method,
-        "unknown", // combined result; locality is per-input, not aggregate (issue #197)
-        None, // combined system row aggregates multiple evidence rows; no single FK (issue #197 Phase 3)
-    )
-    .await;
-
-    let report_responses: Vec<CombinationReportResponse> = reports
-        .iter()
-        .map(|r| CombinationReportResponse {
-            method_used: format!("{:?}", r.method_used),
-            conflict_k: r.conflict_k,
-            mass_on_conflict: r.mass_on_conflict,
-            mass_on_missing: r.mass_on_missing,
-        })
-        .collect();
-
-    let total_sources = epigraph_db::MassFunctionRepository::count_for_claim_frame(
-        pool,
-        &viewer,
-        request.claim_id,
-        frame_id,
-    )
-    .await?;
-
-    // 15. Store global scoped belief cache
-    let _ = epigraph_db::ScopedBeliefRepository::upsert(
-        pool,
-        frame_id,
-        request.claim_id,
-        "global",
-        None,
-        final_bel,
-        final_pl,
-        m_empty,
-        m_missing,
-        final_k,
-        final_method,
-        Some(final_betp),
-    )
-    .await;
-
-    // 16. Create edges reflecting DS relationships (best-effort)
-    //     Use "evidence" as entity type for mass functions (constraint-compatible)
-    if final_bel > 0.5 {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            request.claim_id,
-            "claim",
-            "SUPPORTS",
-            Some(serde_json::json!({"belief": final_bel})),
-            None,
-            None,
-        )
-        .await;
-    } else if final_bel < 0.3 {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            request.claim_id,
-            "claim",
-            "CONTRADICTS",
-            Some(serde_json::json!({"belief": final_bel})),
-            None,
-            None,
-        )
-        .await;
-    }
-
-    if let Some(agent_id) = request.agent_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            mf_id,
-            "evidence",
-            agent_id,
-            "agent",
-            "GENERATED_BY",
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
-
-    if let Some(perspective_id) = request.perspective_id {
-        let _ = epigraph_db::EdgeRepository::create(
-            pool,
-            perspective_id,
-            "perspective",
-            request.claim_id,
-            "claim",
-            "CONTRIBUTES_TO",
-            None,
-            None,
-            None,
-        )
-        .await;
-    }
-
-    // 17. Compute perspective-scoped and community-scoped beliefs
-    if let Some(perspective_id) = request.perspective_id {
+    if let (Some(perspective_id), Some(read)) = (request.perspective_id, scoped_read.as_mut()) {
         // Perspective scope: combine only BBAs from this perspective
         let perspective_rows =
             epigraph_db::MassFunctionRepository::get_for_claim_frame_perspective(
-                pool,
+                &mut **read,
                 &viewer,
                 request.claim_id,
                 frame_id,
@@ -1596,47 +1976,38 @@ pub async fn submit_evidence(
             {
                 let (p_bel, p_pl, p_betp, p_m_missing) =
                     compute_hypothesis_belief(&p_combined, &ds_frame, h_idx);
-                let p_m_empty = p_combined.mass_of_empty();
+                let p_m_empty = combination::fold_conflict(&p_combined, &p_reports);
                 let p_k = p_reports.last().map(|r| r.conflict_k);
                 let p_method_str = p_reports.last().map(|r| format!("{:?}", r.method_used));
-                let p_method = p_method_str.as_deref();
 
-                let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                    pool,
-                    frame_id,
-                    request.claim_id,
-                    "perspective",
-                    Some(perspective_id),
-                    p_bel,
-                    p_pl,
-                    p_m_empty,
-                    p_m_missing,
-                    p_k,
-                    p_method,
-                    Some(p_betp),
-                )
-                .await;
+                scoped_beliefs.push(ScopedBeliefWrite {
+                    scope_type: "perspective",
+                    scope_id: perspective_id,
+                    belief: p_bel,
+                    plausibility: p_pl,
+                    mass_on_empty: p_m_empty,
+                    mass_on_missing: p_m_missing,
+                    conflict_k: p_k,
+                    strategy: p_method_str,
+                    pignistic_prob: p_betp,
+                });
             }
         } else if perspective_masses.len() == 1 {
             let (p_bel, p_pl, p_betp, p_m_missing) =
                 compute_hypothesis_belief(&perspective_masses[0], &ds_frame, h_idx);
             let p_m_empty = perspective_masses[0].mass_of_empty();
 
-            let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                pool,
-                frame_id,
-                request.claim_id,
-                "perspective",
-                Some(perspective_id),
-                p_bel,
-                p_pl,
-                p_m_empty,
-                p_m_missing,
-                None,
-                None,
-                Some(p_betp),
-            )
-            .await;
+            scoped_beliefs.push(ScopedBeliefWrite {
+                scope_type: "perspective",
+                scope_id: perspective_id,
+                belief: p_bel,
+                plausibility: p_pl,
+                mass_on_empty: p_m_empty,
+                mass_on_missing: p_m_missing,
+                conflict_k: None,
+                strategy: None,
+                pignistic_prob: p_betp,
+            });
         }
 
         // Community scope: for each community this perspective belongs to
@@ -1647,7 +2018,8 @@ pub async fn submit_evidence(
             for community_id in community_ids {
                 // Check for community mass_override before combining member BBAs
                 let use_override = if let Ok(Some(comm)) =
-                    epigraph_db::CommunityRepository::get_by_id(pool, &viewer, community_id).await
+                    epigraph_db::CommunityRepository::get_by_id(&mut **read, &viewer, community_id)
+                        .await
                 {
                     if let Some(ref overrides) = comm.mass_override {
                         // Look up override for this specific frame
@@ -1660,21 +2032,17 @@ pub async fn submit_evidence(
                                     compute_hypothesis_belief(&override_mf, &ds_frame, h_idx);
                                 let o_m_empty = override_mf.mass_of_empty();
 
-                                let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                                    pool,
-                                    frame_id,
-                                    request.claim_id,
-                                    "community",
-                                    Some(community_id),
-                                    o_bel,
-                                    o_pl,
-                                    o_m_empty,
-                                    o_m_missing,
-                                    None,
-                                    Some("override"),
-                                    Some(o_betp),
-                                )
-                                .await;
+                                scoped_beliefs.push(ScopedBeliefWrite {
+                                    scope_type: "community",
+                                    scope_id: community_id,
+                                    belief: o_bel,
+                                    plausibility: o_pl,
+                                    mass_on_empty: o_m_empty,
+                                    mass_on_missing: o_m_missing,
+                                    conflict_k: None,
+                                    strategy: Some("override".to_string()),
+                                    pignistic_prob: o_betp,
+                                });
                                 true
                             } else {
                                 false
@@ -1699,7 +2067,7 @@ pub async fn submit_evidence(
                 {
                     let community_rows =
                         epigraph_db::MassFunctionRepository::get_for_claim_frame_perspectives(
-                            pool,
+                            &mut **read,
                             &viewer,
                             request.claim_id,
                             frame_id,
@@ -1727,53 +2095,46 @@ pub async fn submit_evidence(
                         ) {
                             let (c_bel, c_pl, c_betp, c_m_missing) =
                                 compute_hypothesis_belief(&c_combined, &ds_frame, h_idx);
-                            let c_m_empty = c_combined.mass_of_empty();
+                            let c_m_empty = combination::fold_conflict(&c_combined, &c_reports);
                             let c_k = c_reports.last().map(|r| r.conflict_k);
                             let c_method_str =
                                 c_reports.last().map(|r| format!("{:?}", r.method_used));
-                            let c_method = c_method_str.as_deref();
 
-                            let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                                pool,
-                                frame_id,
-                                request.claim_id,
-                                "community",
-                                Some(community_id),
-                                c_bel,
-                                c_pl,
-                                c_m_empty,
-                                c_m_missing,
-                                c_k,
-                                c_method,
-                                Some(c_betp),
-                            )
-                            .await;
+                            scoped_beliefs.push(ScopedBeliefWrite {
+                                scope_type: "community",
+                                scope_id: community_id,
+                                belief: c_bel,
+                                plausibility: c_pl,
+                                mass_on_empty: c_m_empty,
+                                mass_on_missing: c_m_missing,
+                                conflict_k: c_k,
+                                strategy: c_method_str,
+                                pignistic_prob: c_betp,
+                            });
                         }
                     } else if community_masses.len() == 1 {
                         let (c_bel, c_pl, c_betp, c_m_missing) =
                             compute_hypothesis_belief(&community_masses[0], &ds_frame, h_idx);
                         let c_m_empty = community_masses[0].mass_of_empty();
 
-                        let _ = epigraph_db::ScopedBeliefRepository::upsert(
-                            pool,
-                            frame_id,
-                            request.claim_id,
-                            "community",
-                            Some(community_id),
-                            c_bel,
-                            c_pl,
-                            c_m_empty,
-                            c_m_missing,
-                            None,
-                            None,
-                            Some(c_betp),
-                        )
-                        .await;
+                        scoped_beliefs.push(ScopedBeliefWrite {
+                            scope_type: "community",
+                            scope_id: community_id,
+                            belief: c_bel,
+                            plausibility: c_pl,
+                            mass_on_empty: c_m_empty,
+                            mass_on_missing: c_m_missing,
+                            conflict_k: None,
+                            strategy: None,
+                            pignistic_prob: c_betp,
+                        });
                     }
                 }
             }
         }
     }
+
+    drop(scoped_read);
 
     // 17b. Emit evidence.submitted event
     let event_store = super::events::global_event_store();
@@ -1937,20 +2298,72 @@ pub async fn submit_evidence(
     }
 
     // 20. Compute and store DS vs Bayesian divergence (using live Beta posterior)
+    //     and step 17's scoped beliefs: derived rows, best-effort, on ONE
+    //     stamped transaction after the main COMMIT, each under a SAVEPOINT so
+    //     one refusal does not discard the others. On the raw pool, FORCE'd row
+    //     security refused every one of them without an error. Nothing here may
+    //     fail the request: the submission is already committed.
     {
+        use sqlx::Acquire as _;
         let kl = kl_divergence_bernoulli(final_betp, bayesian_posterior);
 
-        // Store divergence record (best-effort; don't fail the whole request)
-        let _ = epigraph_db::DivergenceRepository::store(
-            pool,
-            request.claim_id,
-            frame_id,
-            final_betp,
-            bayesian_posterior,
-            kl,
-            Some(frame_row.version),
-        )
-        .await;
+        match state
+            .write_as(&viewer, "submit_evidence.derived_rows")
+            .await
+        {
+            Ok(mut side) => {
+                for w in &scoped_beliefs {
+                    let mut sp = match side.begin().await {
+                        Ok(sp) => sp,
+                        Err(e) => {
+                            tracing::warn!(
+                                "submit_evidence: no savepoint for a scoped belief: {e}"
+                            );
+                            break;
+                        }
+                    };
+                    let stored = epigraph_db::ScopedBeliefRepository::upsert(
+                        &mut *sp,
+                        frame_id,
+                        request.claim_id,
+                        w.scope_type,
+                        Some(w.scope_id),
+                        w.belief,
+                        w.plausibility,
+                        w.mass_on_empty,
+                        w.mass_on_missing,
+                        w.conflict_k,
+                        w.strategy.as_deref(),
+                        Some(w.pignistic_prob),
+                    )
+                    .await;
+                    if finish_savepoint(sp, stored, "scoped belief").await.is_err() {
+                        break;
+                    }
+                }
+                if let Ok(mut sp) = side.begin().await {
+                    let stored = epigraph_db::DivergenceRepository::store(
+                        &mut *sp,
+                        request.claim_id,
+                        frame_id,
+                        final_betp,
+                        bayesian_posterior,
+                        kl,
+                        Some(frame_row.version),
+                    )
+                    .await;
+                    let _ = finish_savepoint(sp, stored, "divergence record").await;
+                }
+                if let Err(e) = side.commit().await {
+                    tracing::warn!("submit_evidence: derived rows not committed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "submit_evidence: no stamped transaction for the derived rows: {e:?}"
+                );
+            }
+        }
 
         // Emit divergence.spike if KL exceeds threshold
         if kl >= DIVERGENCE_SPIKE_THRESHOLD {
@@ -1982,6 +2395,9 @@ pub async fn submit_evidence(
             pignistic_prob: Some(final_betp),
             bayesian_posterior,
             total_sources,
+            write_outcome: write_outcome.as_str().to_string(),
+            deduplicated: write_outcome.deduplicated(),
+            warnings,
         }),
     ))
 }
@@ -2405,7 +2821,7 @@ pub async fn get_pignistic(
     }
 
     // Combine (or use single BBA if only one)
-    let (combined, _) = if masses.len() == 1 {
+    let (combined, reports) = if masses.len() == 1 {
         (masses.into_iter().next().unwrap(), vec![])
     } else {
         combination::combine_multiple(&masses, 0.3).map_err(|e| ApiError::InternalError {
@@ -2413,7 +2829,8 @@ pub async fn get_pignistic(
         })?
     };
 
-    let m_empty = combined.mass_of_empty();
+    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
+    let m_empty = combination::fold_conflict(&combined, &reports);
     let m_missing = combined.mass_of_missing();
 
     let hypotheses = frame_row
@@ -2924,6 +3341,9 @@ mod tests {
             pignistic_prob: Some(0.85),
             bayesian_posterior: 0.5,
             total_sources: 3,
+            write_outcome: "inserted".to_string(),
+            deduplicated: false,
+            warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pignistic_prob"));
@@ -3098,6 +3518,9 @@ mod tests {
             pignistic_prob: Some(0.76),
             bayesian_posterior: 0.71,
             total_sources: 5,
+            write_outcome: "inserted".to_string(),
+            deduplicated: false,
+            warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(

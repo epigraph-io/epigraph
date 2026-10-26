@@ -94,6 +94,9 @@ pub struct TableSpec {
     pub writer: Option<String>,
     /// How rows are reached from a claim.
     pub kind: Kind,
+    /// The table carries migration 114's `writer_owned` flag. Read from the
+    /// catalog, never assumed.
+    pub writer_owned: bool,
 }
 
 impl TableSpec {
@@ -238,6 +241,17 @@ async fn require_columns(
     Ok(())
 }
 
+async fn has_column(conn: &mut PgConnection, table: &str, col: &str) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2)",
+    )
+    .bind(table)
+    .bind(col)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// Every table a claim's re-own touches: `claims`, the trigger's `derived[]`
 /// tables, `harvester_fragments` and `edges`.
 ///
@@ -280,6 +294,7 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
         pk: pk_columns(conn, "claims").await?,
         writer: None,
         kind: Kind::Claims,
+        writer_owned: false,
     }];
     for t in derived {
         let Some((_, writer)) = WRITER_COLUMNS.iter().find(|(n, _)| *n == t) else {
@@ -294,11 +309,13 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
             need.push(w);
         }
         require_columns(conn, &t, &need).await?;
+        let writer_owned = has_column(conn, &t, "writer_owned").await?;
         specs.push(TableSpec {
             pk: pk_columns(conn, &t).await?,
             name: t,
             writer: writer.map(str::to_string),
             kind: Kind::Derived,
+            writer_owned,
         });
     }
     require_columns(
@@ -312,6 +329,7 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
         pk: pk_columns(conn, "harvester_fragments").await?,
         writer: None,
         kind: Kind::Fragments,
+        writer_owned: false,
     });
     require_columns(
         conn,
@@ -330,6 +348,7 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
         pk: pk_columns(conn, "edges").await?,
         writer: Some(EDGE_WRITER.into()),
         kind: Kind::Edges,
+        writer_owned: false,
     });
     for s in &specs {
         if !is_plain_ident(&s.name) {
@@ -373,6 +392,10 @@ pub struct Attached {
     /// also hangs off — the fragment's other provenance claims, the edge's
     /// other claim endpoint.
     pub neighbours: BTreeSet<Uuid>,
+    /// Migration 114's `writer_owned`, on a table that carries it; `None`
+    /// elsewhere. Read by `restrict-claims` (a narrowing clears it), ignored
+    /// by the re-own.
+    pub writer_owned: Option<bool>,
     /// Evidence only: `evidence_type`, `labels` and the first 80 characters of
     /// `raw_content`, for the hide selectors and their preview.
     pub evidence_type: Option<String>,
@@ -461,8 +484,14 @@ pub async fn fetch_attached(
                 } else {
                     "NULL::text, ARRAY[]::text[], NULL::text"
                 };
+                let wo = if s.writer_owned {
+                    "t.writer_owned"
+                } else {
+                    "NULL::boolean"
+                };
                 let sql = format!(
-                    "SELECT {pk}, t.claim_id, t.owner_group_id, t.visibility::text, {writer}, {ev} \
+                    "SELECT {pk}, t.claim_id, t.owner_group_id, t.visibility::text, {writer}, {ev}, \
+                            {wo} \
                        FROM \"{name}\" t WHERE t.claim_id = ANY($1)",
                     pk = s.pk_expr("t"),
                     name = s.name
@@ -484,6 +513,7 @@ pub async fn fetch_attached(
                             endpoints_public: None,
                             shared_outside: false,
                             neighbours: BTreeSet::new(),
+                            writer_owned: r.get(8),
                             evidence_type: r.get(5),
                             labels: r.get(6),
                             preview: r.get(7),
@@ -519,6 +549,7 @@ pub async fn fetch_attached(
                             endpoints_public: None,
                             shared_outside: !others.is_empty(),
                             neighbours: others.into_iter().collect(),
+                            writer_owned: None,
                             evidence_type: None,
                             labels: Vec::new(),
                             preview: None,
@@ -565,6 +596,7 @@ pub async fn fetch_attached(
                             endpoints_public: Some(r.get(6)),
                             shared_outside: false,
                             neighbours: others.into_iter().collect(),
+                            writer_owned: None,
                             evidence_type: None,
                             labels: Vec::new(),
                             preview: None,
@@ -933,6 +965,7 @@ mod tests {
             pk: vec!["claim_id".into(), "frame_id".into()],
             writer: None,
             kind: Kind::Derived,
+            writer_owned: false,
         };
         let pk = "a1,b2";
         let j = s.id_json(pk);

@@ -61,15 +61,18 @@ use std::path::{Path, PathBuf};
 /// Four groups, all reviewed:
 ///
 /// * **`recall.rs` (12, all production).** `fetch_batched_context`'s ten
-///   statements plus `paragraph_3072_population` and `compute_corpus_scope`.
+///   statements plus `embedded_3072_population` and `compute_corpus_scope`.
 ///   All twelve are viewer-filtered as of PR-09 — they carry the static
 ///   three-bind `visibility = 'public' OR owner_group_id = ANY(...)` form,
 ///   because `sqlx::query!` needs a compile-time literal of fixed arity and so
 ///   cannot take a `Viewer::splice` result. Relocation to the repo layer is
 ///   outstanding; the leak is not.
-/// * **`workflow_hierarchical.rs` (3 production).** One read, one `UPDATE
-///   workflows`, one `edges ⨝ claims` read on the
-///   `report_hierarchical_outcome` write path. Write paths are PR-16's, so
+/// * **`workflow_hierarchical.rs` (2 production).** One read and one `UPDATE
+///   workflows` on the `report_hierarchical_outcome` write path, both on a
+///   table with no row security. (Was 3: the `edges ⨝ claims` step lookup
+///   moved to `WorkflowRepository::plan_step_claim_ids`, with its viewer
+///   predicates, when the report moved onto a transaction stamped with the
+///   caller's viewer.) Write paths are PR-16's, so
 ///   PR-09 left them alone rather than half-converting a write. (PR-16
 ///   correction: the parenthetical here used to read "`viewer.writable_bind()`,
 ///   which does not exist yet". It has existed since PR-04 and is consumed by
@@ -79,7 +82,7 @@ use std::path::{Path, PathBuf};
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
-///   `workflow_hierarchical.rs` 3).** Fixture assertions inside
+///   `workflow_hierarchical.rs` 14).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds.rs", 1, 0),
@@ -99,7 +102,19 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // same commit. Moving it to the repo layer is filed as follow-up work; doing it
     // inside a merge resolution would bury a refactor in a conflict fix.
     ("recall.rs", 13, 0),
-    ("workflow_hierarchical.rs", 3, 3),
+    // Test sites 3 -> 9 (U033, 2026-10-13): the all-or-nothing test's
+    // failure-injection trigger (CREATE FUNCTION + CREATE TRIGGER), the shared
+    // counters-and-rows read-back (2), and the two goal-embedding row counts.
+    // All fixture SQL inside `mod tests`; the 3 production statements are
+    // unchanged in number and now run on one transaction.
+    // 9 -> 12 (U033 finalize): the row-lock test's holder transaction (the
+    // `FOR UPDATE` read and the `use_count = 5` write) and its
+    // `pg_stat_activity` lock-wait poll. Fixture SQL again.
+    // 12 -> 14 (backlog 49863d2c): the all-or-nothing test now ties its
+    // failure to the injected trigger through a sequence the trigger advances
+    // (CREATE SEQUENCE, and one read-back), because the driver text it used to
+    // read from the error message no longer reaches the caller. Fixture SQL.
+    ("workflow_hierarchical.rs", 2, 14),
     ("workflow_ingest.rs", 0, 10),
     ("workflows.rs", 2, 0),
 ];

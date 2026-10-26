@@ -69,9 +69,15 @@ const WRITE_CALLEES: &[&str] = &[
 /// Lower a row when a conversion propagates an error; delete it at zero. Never
 /// raise one: convert the write instead.
 const REGISTER: &[(&str, usize)] = &[
-    ("assess.rs", 6),
-    ("belief.rs", 16),
-    ("challenge.rs", 1),
+    // 6 before U027 deleted assess's discarded "combined result" store, which
+    // sat on the input BBA's key and overwrote it.
+    ("assess.rs", 5),
+    // `belief.rs` (16, then 12 after U024) is gone: `submit_evidence`'s edges,
+    // perspective/community scoped beliefs and divergence record moved onto
+    // stamped transactions, each under a logged SAVEPOINT (fb9cff66).
+    // `challenge.rs` (1) is gone: `submit_challenge`'s `claim.challenged`
+    // event moved into the challenge's stamped transaction through
+    // `EventRepository::publish_or_log_conn` (backlog 2f2eeaea).
     ("claims.rs", 3),
     ("community.rs", 1),
     ("conflicts.rs", 2),
@@ -93,7 +99,8 @@ const REGISTER: &[(&str, usize)] = &[
 
 /// Ceiling on the total, so growth fails structurally even if a row and the
 /// total were raised together.
-const HIGH_WATER: usize = 46;
+/// 46 until U024 removed four of `belief.rs`'s rows.
+const HIGH_WATER: usize = 42;
 
 fn routes_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes")

@@ -84,10 +84,14 @@
 //! both writers reach it:
 //!
 //! * **adding** requires the acting agent to hold a LIVE membership of the
-//!   community's projected group — unless that group has NEVER had a membership
-//!   row of any state (the bootstrap case: 068 left projected groups
-//!   memberless, and refusing would freeze them). A group whose members were all
-//!   removed has had rows, so it does NOT re-open (batch F, F4b);
+//!   community's projected group. The one exception is a group that has NEVER
+//!   had a membership row of any state (the bootstrap case: 068 left projected
+//!   groups memberless), and since migration 159 only a MAINTENANCE session
+//!   (`epigraph_bypass()`) may bootstrap it: before 159 any actor could, so the
+//!   first `groups:admin` principal to arrive claimed a legacy community and
+//!   could then admit anyone (backlog 7cdea6f1). A group whose members were all
+//!   removed has had rows, so it does NOT re-open, not even to a maintenance
+//!   session (batch F, F4b);
 //! * **removing** requires the acting agent to own the perspective (leaving) or
 //!   to hold a LIVE `admin` membership (evicting), and never removes the group's
 //!   LAST live admin (batch F, F4a) — the guard
@@ -96,7 +100,7 @@
 //! Adding is deliberately weaker than "only an admin may add members": most
 //! community groups have no admins (068), and the admin backfill for them is an
 //! operator task (PR-18). It is fail-closed in the direction that matters (a
-//! stranger cannot let itself in).
+//! stranger cannot let itself in, including into a never-populated group).
 //!
 //! ## Where the rule runs (batch F)
 //!
@@ -122,8 +126,10 @@
 //! What this repo layer owns is unchanged: it is still the membership rule, and
 //! it is still the rule both writers reach.
 //!
-//! The bootstrap case above is a residual, not a closed question. It is tracked
-//! in `docs/tenancy/progress.json`; location
+//! The bootstrap case above is closed to app sessions by migration 159 (drain
+//! X14); what remains is the operator task of giving 068's legacy groups an
+//! admin (or a first member, from a maintenance session). It is tracked in
+//! `docs/tenancy/progress.json`; location
 //! `migrations/068_communities_to_groups.sql` and this file; owner PR-18.
 //! Analysis held outside this repository, as
 //! `2026-09-12-F-PR12-projected-community-groups.md` in the operator's private
@@ -397,8 +403,9 @@ impl CommunityRepository {
     /// # Authorization
     ///
     /// Closed membership — see the module docs. The decision and the write are
-    /// ONE statement, `epigraph_community_add_member` (migration 106), under
-    /// the roster lock. `acting_agent` is the authenticated principal
+    /// ONE statement, `epigraph_community_add_member` (migration 106; re-stated
+    /// by 159, which closes the never-populated-group bootstrap to every
+    /// session but a maintenance one), under the roster lock. `acting_agent` is the authenticated principal
     /// (`Viewer::principal()`); on a non-maintenance connection it must equal the
     /// principal the connection was stamped with, or the call is denied, so
     /// pass a transaction from `ScopedPool::begin_as` for that viewer.

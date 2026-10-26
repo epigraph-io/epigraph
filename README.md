@@ -58,7 +58,6 @@ If that works, head to the [full quickstart](docs/intro/01-quickstart.md) for ex
 
 - [`docs/intro/01-quickstart.md`](docs/intro/01-quickstart.md) — six-step setup, prereqs, troubleshooting
 - [`docs/intro/02-concepts.md`](docs/intro/02-concepts.md) — noun-claims/verb-edges, agents and signing, DST beliefs, perspectives, hierarchical extraction, backlog discipline
-- [`docs/intro/03-walkthroughs.md`](docs/intro/03-walkthroughs.md) — four end-to-end Claude Code transcripts (coming soon — captured live)
 - [`docs/intro/04-glossary.md`](docs/intro/04-glossary.md) — vocabulary
 - [`docs/intro/05-next-steps.md`](docs/intro/05-next-steps.md) — contributor, deploy, and downstream pointers
 

@@ -219,6 +219,113 @@ async fn update_with_evidence_attaches_writer_owned_rows_to_a_world_claim(pool: 
     assert_eq!(n, 1, "the refused labelled call wrote nothing");
 }
 
+/// The truth_value seed (backlog fc55465b, drain U026) on the application
+/// role. A claim in the server agent's own group, AUTHORED BY ANOTHER AGENT,
+/// with truth 0.85 and no BBA: the seed row is attributed to the claim's author
+/// while the session's principal is the server agent, so this pins that
+/// `mass_functions`' policies and `epigraph_attach_writer_owner` admit it (they
+/// key on the owning group, not on `source_agent_id`). The row inherits the
+/// claim's group, and the combine sees it: {T 0.7} ⊕ {T e} leaves
+/// m(Θ) = 0.3(1-e), so BetP = 1 - 0.15(1-e).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_seeds_a_writable_claim_by_another_author(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let claim = seed_claim(&pool, "a team claim a colleague wrote", 0.85).await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the claim into the server agent's group");
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("author");
+    assert_ne!(
+        author, agent,
+        "fixture: the claim's author is not the caller"
+    );
+
+    let res = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(
+            claim,
+            "an observation supporting a colleague's claim",
+            vec![],
+        ),
+        None,
+    )
+    .await
+    .expect("a group writer adds evidence to a colleague's claim on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], true);
+
+    let seeds: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, source_agent_id FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_all(&pool)
+    .await
+    .expect("seed rows");
+    assert_eq!(seeds.len(), 1, "one seed row: {seeds:?}");
+    assert_eq!(seeds[0].1, Some(author), "attributed to the claim's author");
+    assert_eq!(
+        tenancy(&pool, "mass_functions", seeds[0].0).await,
+        (group, "public".into(), false),
+        "the seed is a claim-owned row, not a writer-owned one"
+    );
+    let ev = parse_uuid_field(&body, "evidence_id");
+    let masses: serde_json::Value =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE evidence_id = $1")
+            .bind(ev)
+            .fetch_one(&pool)
+            .await
+            .expect("the evidence's BBA");
+    let e = masses["0"].as_f64().expect("a supporting evidence BBA");
+    let betp = body["pignistic_prob"].as_f64().expect("pignistic_prob");
+    assert!(
+        (betp - (1.0 - 0.15 * (1.0 - e))).abs() < 1e-9,
+        "the seed participates in the combine: BetP {betp}, evidence mass {e}"
+    );
+}
+
+/// A non-owner attaching to a PUBLIC claim does not seed it (scope Q2): the
+/// seed would be a row attributed to the claim's author but written, and
+/// owned, by the caller's group. The clamp's `truth_value` fallback still
+/// applies to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_does_not_seed_a_world_claim_it_does_not_own(pool: PgPool) {
+    let (server, _agent, _group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let claim = seed_claim(&pool, "a world claim with an authored truth", 0.85).await;
+    memberless_owner(&pool, claim).await;
+
+    let res = epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        uwe(claim, "an observation on someone else's claim", vec![]),
+        None,
+    )
+    .await
+    .expect("a non-owner attaches evidence on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], false);
+
+    let seeds: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count seeds");
+    assert_eq!(seeds, 0, "a foreign attach writes no seed");
+}
+
 /// W11: on a world claim whose cache carries an older frameless value, the
 /// evidence lands but the cache is not overwritten, and the response says so
 /// instead of presenting the call's combination as the claim's cache.
@@ -468,6 +575,103 @@ async fn report_workflow_outcome_on_a_world_workflow_claim_leaves_its_truth_alon
     );
 }
 
+/// A clean successful outcome report, as the two seed cases below send it.
+fn clean_outcome(wf: Uuid) -> ReportWorkflowOutcomeParams {
+    ReportWorkflowOutcomeParams {
+        workflow_id: wf.to_string(),
+        success: true,
+        execution_log: vec![StepExecution {
+            step_index: 0,
+            planned: "build".into(),
+            actual: "build".into(),
+            deviated: false,
+            deviation_reason: None,
+        }],
+        outcome_details: "ran clean".into(),
+        quality: Some(0.9),
+        goal_text: None,
+    }
+}
+
+/// A legacy flat workflow claim with an authored truth_value of 0.85 and no
+/// BBA (`seed_workflow_claim` writes 0.5, the vacuous seed, which would make
+/// both cases below pass whether or not the gate exists).
+async fn workflow_claim_with_truth(pool: &PgPool, goal: &str) -> Uuid {
+    let wf = seed_workflow_claim(pool, goal, &["build", "test"]).await;
+    sqlx::query("UPDATE claims SET truth_value = 0.85 WHERE id = $1")
+        .bind(wf)
+        .execute(pool)
+        .await
+        .expect("author a truth_value");
+    wf
+}
+
+async fn seed_count(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND combination_method = 'truth_value_seed'",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count seeds")
+}
+
+/// The truth_value seed (backlog fc55465b, drain U026) through
+/// report_workflow_outcome: a workflow claim in the server agent's own group,
+/// authored by another agent, with truth 0.85 and no BBA, gets exactly one
+/// seed row before its outcome evidence is combined.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_seeds_a_writable_workflow_claim(pool: PgPool) {
+    let (server, _agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "ship a team workflow").await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the workflow claim into the server agent's group");
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("reporting on a team workflow lands on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], true, "{body}");
+    assert_eq!(seed_count(&pool, wf).await, 1, "one seed row: {body}");
+}
+
+/// A non-owner reporting on a SHARED workflow claim does not seed it (scope
+/// Q2), exactly as update_with_evidence's foreign attach does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_does_not_seed_a_world_workflow_claim(pool: PgPool) {
+    let (server, _agent, _group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "ship a shared workflow").await;
+    memberless_owner(&pool, wf).await;
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("reporting on a shared workflow lands on the app role");
+    let body = first_text(&res);
+    assert_eq!(body["truth_written"], false, "{body}");
+    assert_eq!(
+        seed_count(&pool, wf).await,
+        0,
+        "a foreign report writes no seed"
+    );
+}
+
 async fn set_frameless_cache(pool: &PgPool, claim: Uuid) {
     sqlx::query(
         "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85, \
@@ -653,7 +857,7 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
         "another writer's edge into the duplicate now points at the canonical"
     );
 
-    let (_, who, details) = applied_row(&pool, "dedup", f.dup).await;
+    let (applied_id, who, details) = applied_row(&pool, "dedup", f.dup).await;
     assert_eq!(who, Some(agent), "attributed to the caller's stamped agent");
     assert_eq!(
         details["replay_of"]["deferred_event_id"], body["cascade"]["audit_event_id"],
@@ -664,16 +868,20 @@ async fn mark_duplicate_tool_lands_on_the_app_role_for_the_agents_own_duplicate(
         serde_json::json!(agent),
         "and to the OAuth principal behind the call: {details}"
     );
+    // The applied row names the caller, so it counts; the ids are on its
+    // agent-less companion row (backlog 2587cb67).
+    assert_eq!(details["touched"]["edges_retracted"], 1, "{details}");
+    let (_, ids) = applied_ids_row(&pool, applied_id).await;
     assert_eq!(
-        details["touched"]["edges_retracted"],
+        ids["touched"]["edges_retracted"],
         serde_json::json!([f.dup_edge]),
-        "{details}"
+        "{ids}"
     );
     assert!(
-        details["touched"]["edges_retargeted"]
+        ids["touched"]["edges_retargeted"]
             .as_array()
             .is_some_and(|a| a.contains(&serde_json::json!(f.other_writers_edge))),
-        "{details}"
+        "{ids}"
     );
     let definer_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM security_events WHERE event_type = 'derived.cascade_bba_delete'",
@@ -760,6 +968,7 @@ fn non_admin_owner(owner: Uuid) -> epigraph_auth::AuthContext {
         elevation_claim: None,
         elevation: None,
         admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
     }
 }
 
@@ -1051,10 +1260,12 @@ async fn supersede_tool_on_the_app_role_runs_its_cascade_with_admin_authority(po
         details["trigger"]["oauth"]["owner_id"],
         serde_json::json!(agent)
     );
+    assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
+    let (_, ids) = applied_ids_row(&pool, event_id).await;
     assert_eq!(
-        details["touched"]["edges_retargeted"],
+        ids["touched"]["edges_retargeted"],
         serde_json::json!([f.incoming]),
-        "{details}"
+        "the companion row keeps the ids: {ids}"
     );
 }
 
@@ -1244,28 +1455,54 @@ async fn the_supersede_result_names_no_row_the_caller_cannot_read(pool: PgPool) 
         );
     }
 
-    let (event, _, details) = applied_row(&pool, "supersede", f.old).await;
-    let touched = &details["touched"];
+    // Nor does any cascade row the CALLER can read: `security_events_read`
+    // admits the rows naming it (its deferral, the applied row, the belief
+    // row), so those carry counts and the ids live on agent-less rows.
+    let readable = cascade_rows_readable_by(&pool, agent).await;
+    assert!(
+        readable
+            .iter()
+            .any(|(t, _)| t == "cascade.belief_rederived"),
+        "the caller reads its own belief row: {readable:?}"
+    );
+    for (event_type, d) in &readable {
+        for (id, what) in [
+            (hp1, "H's private claim"),
+            (hp2, "H's private downstream claim"),
+            (into_old, "the private edge into the retired claim"),
+            (out_of_old, "the private edge out of it"),
+        ] {
+            assert!(
+                !mentions(d, id),
+                "a `{event_type}` row the caller can read names {what} ({id}): {d}"
+            );
+        }
+    }
+
+    let (event, _, _) = applied_row(&pool, "supersede", f.old).await;
+    let (_, ids) = applied_ids_row(&pool, event).await;
+    let touched = &ids["touched"];
     assert!(
         mentions(touched, into_old) && mentions(touched, out_of_old),
-        "the audit row keeps the ids: {touched}"
+        "the agent-less companion row keeps the ids: {touched}"
     );
-    let belief: serde_json::Value = sqlx::query_scalar(
-        "SELECT details->'belief' FROM security_events \
-          WHERE event_type = 'cascade.belief_rederived' \
+    let (belief_owner, belief): (Option<Uuid>, serde_json::Value) = sqlx::query_as(
+        "SELECT agent_id, details->'belief' FROM security_events \
+          WHERE event_type = 'cascade.belief_rederived_ids' \
             AND details->>'applied_event_id' = $1::text",
     )
     .bind(event)
     .fetch_one(&pool)
     .await
-    .expect("belief row");
+    .expect("the belief row's agent-less companion");
+    assert_eq!(belief_owner, None, "the belief companion row is agent-less");
     assert!(
         mentions(&belief, t),
         "the downstream claim the caller can read was re-derived: {belief}"
     );
     assert!(
         mentions(&belief, hp2),
-        "the belief audit row keeps it: {belief}"
+        "the belief companion row keeps it: {belief}"
     );
 }
 
@@ -2019,5 +2256,227 @@ async fn the_admin_cascade_keeps_another_writers_edge_its_writers(pool: PgPool) 
         (bba_claim, bba_owner, bba_writer_owned),
         (canonical, x_group, true),
         "X's edge-keyed BBA moved to the canonical and is still X's"
+    );
+}
+
+// ===========================================================================
+// What the triggering agent can read of an applied cascade (backlog 2587cb67).
+// `security_events_read` (129) admits a row whose `agent_id` is the session's
+// principal, and the applied row names the triggering agent, so its `touched`
+// must carry COUNTS, never the ids of the edges the cascade moved (most of them
+// other writers'). The ids are kept on an agent-less companion row
+// (`cascade.admin_applied_ids`) that privileged and admin sessions read.
+// ===========================================================================
+
+/// Every `cascade.*` row `principal` can read, as the application role stamped
+/// with that principal and nothing else (no bypass, no admin): `(event_type,
+/// details)`.
+async fn cascade_rows_readable_by(
+    pool: &PgPool,
+    principal: Uuid,
+) -> Vec<(String, serde_json::Value)> {
+    let app = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut conn = app.acquire().await.expect("acquire");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+        .bind(principal.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the principal");
+    sqlx::query_as(
+        "SELECT event_type::text, details FROM security_events \
+          WHERE event_type LIKE 'cascade.%' ORDER BY created_at, id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .expect("read as the principal")
+}
+
+/// The agent-less companion row keeping the ids of applied row `applied`, read
+/// on the superuser pool: `(agent_id, details)`.
+async fn applied_ids_row(pool: &PgPool, applied: Uuid) -> (Option<Uuid>, serde_json::Value) {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' \
+            AND details->>'applied_event_id' = $1::text",
+    )
+    .bind(applied)
+    .fetch_one(pool)
+    .await
+    .expect("exactly one companion row for the applied row")
+}
+
+/// The triggering agent reads its applied row for `cause` (so the check below
+/// is not vacuous), and no cascade row it can read names any of `edges`; its
+/// `touched` holds no array; it cannot read the companion row.
+fn assert_trigger_reads_no_edge_ids(
+    rows: &[(String, serde_json::Value)],
+    cause: &str,
+    edges: &[(Uuid, &str)],
+) {
+    let applied: Vec<_> = rows
+        .iter()
+        .filter(|(t, d)| t == "cascade.admin_applied" && d["cause"] == cause)
+        .collect();
+    assert_eq!(
+        applied.len(),
+        1,
+        "the triggering agent reads its own applied row: {rows:?}"
+    );
+    for (id, what) in edges {
+        for (t, d) in rows {
+            assert!(
+                !mentions(d, *id),
+                "a `{t}` row the triggering agent can read names {what} ({id}): {d}"
+            );
+        }
+    }
+    let touched = &applied[0].1["touched"];
+    assert!(
+        touched
+            .as_object()
+            .is_some_and(|o| !o.is_empty() && o.values().all(|v| !v.is_array())),
+        "the agent-visible `touched` carries counts only: {touched}"
+    );
+    assert!(
+        rows.iter().all(|(t, _)| t != "cascade.admin_applied_ids"),
+        "the triggering agent cannot read the companion row: {rows:?}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let f = dedup_fixture(&pool, agent, group).await;
+    let r = epigraph_mcp::tools::supersede::mark_duplicate(
+        &server,
+        &viewer,
+        epigraph_mcp::types::MarkDuplicateParams {
+            claim_id: f.dup.to_string(),
+            canonical_id: f.canonical.to_string(),
+            reason: None,
+        },
+        Some(&dedup_owner(agent)),
+    )
+    .await
+    .expect("the dedup lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "applied-ids-dedup").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+
+    let rows = cascade_rows_readable_by(&pool, agent).await;
+    assert_trigger_reads_no_edge_ids(
+        &rows,
+        "dedup",
+        &[
+            (f.other_writers_edge, "another writer's re-pointed edge"),
+            (f.dup_edge, "the retracted collision edge"),
+        ],
+    );
+
+    let (applied_id, _, details) = applied_row(&pool, "dedup", f.dup).await;
+    assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
+    assert_eq!(details["touched"]["edges_retracted"], 1, "{details}");
+    let (who, ids) = applied_ids_row(&pool, applied_id).await;
+    assert_eq!(who, None, "the companion row is agent-less");
+    assert_eq!(ids["cause"], "dedup", "{ids}");
+    assert_eq!(ids["subject_id"], serde_json::json!(f.dup), "{ids}");
+    assert_eq!(
+        ids["touched"]["edges_retracted"],
+        serde_json::json!([f.dup_edge]),
+        "{ids}"
+    );
+    assert_eq!(
+        ids["touched"]["edges_retargeted"],
+        serde_json::json!([f.other_writers_edge]),
+        "{ids}"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_supersede_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let f = supersede_fixture(&pool, agent, group).await;
+    let r = epigraph_mcp::tools::supersede::supersede_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SupersedeClaimParams {
+            claim_id: f.old.to_string(),
+            content: "my claim, corrected".to_string(),
+            truth_value: 0.6,
+            reason: "a correction".to_string(),
+        },
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the owner's supersede lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "applied-ids-supersede").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+
+    let rows = cascade_rows_readable_by(&pool, agent).await;
+    assert_trigger_reads_no_edge_ids(
+        &rows,
+        "supersede",
+        &[
+            (f.incoming, "another writer's re-pointed edge"),
+            (f.outgoing, "the re-sourced edge"),
+        ],
+    );
+
+    let (applied_id, _, details) = applied_row(&pool, "supersede", f.old).await;
+    assert_eq!(details["touched"]["edges_retargeted"], 1, "{details}");
+    let (who, ids) = applied_ids_row(&pool, applied_id).await;
+    assert_eq!(who, None, "the companion row is agent-less");
+    assert_eq!(
+        ids["touched"]["edges_retargeted"],
+        serde_json::json!([f.incoming]),
+        "{ids}"
+    );
+    assert!(mentions(&ids["touched"], f.outgoing), "{ids}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_consolidate_applied_row_names_no_edge_ids_to_its_trigger(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool).await;
+    let s1 = public_claim_of(&pool, agent, group, "my source one").await;
+    let s2 = public_claim_of(&pool, agent, group, "my source two").await;
+    let (x, x_group) = fixture::seed_agent_with_group(&pool, "writer-x").await;
+    let xc = public_claim_of(&pool, x, x_group, "X's claim").await;
+    let into_s1 = edge_between(&pool, xc, s1).await;
+    let out_of_s2 = edge_between(&pool, s2, xc).await;
+    let r = epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &viewer,
+        consolidate_params(&[s1, s2], "my merged claim"),
+        Some(&non_admin_owner(agent)),
+    )
+    .await
+    .expect("the owner's consolidation lands on the app role");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    let report = replay_now(&pool, "applied-ids-consolidate").await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    let merged = parse_uuid_field(&body, "merged_claim_id");
+
+    let rows = cascade_rows_readable_by(&pool, agent).await;
+    assert_trigger_reads_no_edge_ids(
+        &rows,
+        "consolidate",
+        &[
+            (into_s1, "another writer's edge into a source"),
+            (out_of_s2, "an edge out of a source"),
+        ],
+    );
+
+    let (applied_id, _, details) = applied_row(&pool, "consolidate", merged).await;
+    assert_eq!(details["touched"]["edges_migrated"], 2, "{details}");
+    let (who, ids) = applied_ids_row(&pool, applied_id).await;
+    assert_eq!(who, None, "the companion row is agent-less");
+    assert!(
+        mentions(&ids["touched"]["edges_migrated"], into_s1)
+            && mentions(&ids["touched"]["edges_migrated"], out_of_s2),
+        "{ids}"
     );
 }

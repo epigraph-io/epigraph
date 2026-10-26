@@ -7,7 +7,7 @@
 //! `recall` → `get_neighborhood` per node → `get_claim` per neighbour to
 //! reconstruct a chain.
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 
 use crate::errors::{internal_error, parse_uuid, McpError};
@@ -95,7 +95,7 @@ pub async fn get_provenance_chain(
             .collect(),
     };
 
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))
 }

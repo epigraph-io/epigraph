@@ -52,7 +52,7 @@
 
 use std::collections::HashMap;
 
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -61,7 +61,7 @@ use crate::types::SweepSemanticDuplicatesParams;
 
 use epigraph_core::ClaimId;
 use epigraph_db::repos::maintenance_lock;
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, DuplicateProvenance};
 use epigraph_engine::admin_cascade::{
     apply_after_dedup, record_deferral, CascadeCause, CascadeState, CascadeTrigger, ReplayOrigin,
 };
@@ -100,11 +100,19 @@ pub async fn collapse_pair_act(
 ) -> Result<(CascadeTrigger, Uuid), epigraph_db::DbError> {
     use sqlx::Acquire;
     let mut tx = conn.begin().await?;
-    // Its own transaction nests as a savepoint inside this one.
-    ClaimRepository::mark_duplicate_act_conn(
+    // Its own transaction nests as a savepoint inside this one. The sweep
+    // collapses exact restatements only (same content hash), so that is the
+    // rule its identity edge records.
+    let provenance = DuplicateProvenance::new(
+        "sweep_semantic_duplicates",
+        DuplicateProvenance::RULE_EXACT_RESTATEMENT,
+    )
+    .marked_by(Some(acting_agent));
+    ClaimRepository::mark_duplicate_act_attributed_conn(
         &mut tx,
         ClaimId::from_uuid(dup),
         ClaimId::from_uuid(survivor),
+        &provenance,
     )
     .await?;
     let trigger = CascadeTrigger::new(
@@ -454,7 +462,7 @@ pub async fn sweep_semantic_duplicates(
     let response = sweep(session, &params, acting_agent)
         .await
         .map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&response).map_err(internal_error)?,
     )]))
 }

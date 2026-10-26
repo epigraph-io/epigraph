@@ -18,15 +18,20 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
 pub mod belief_gate;
+pub mod belief_modes;
+pub mod belief_profile;
 pub mod belief_query;
+pub mod belief_view;
 pub mod bp;
 pub mod calibration;
 pub mod cdst_bp;
 pub mod cdst_sheaf;
 pub mod classifier;
+pub mod compound_belief;
 pub mod confidence;
 pub mod cospan;
 pub mod counterfactual;
@@ -42,6 +47,7 @@ pub mod errors;
 pub mod evidence;
 pub mod export;
 pub mod interval_bp;
+pub mod label_dedup;
 pub mod lifecycle;
 pub mod matching;
 pub mod promotion;
@@ -56,6 +62,7 @@ pub mod retraction_cascade;
 pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
+pub mod source_dependence;
 pub mod theme_cluster;
 pub mod theme_kmeans;
 pub mod triple_extractor;
@@ -69,9 +76,10 @@ pub use bayesian::BayesianUpdater;
 pub use belief_query::{get_belief, BeliefInterval, BeliefQueryError};
 pub use bp::{run_bp, BpConfig, BpResult, FactorPotential};
 pub use cdst_sheaf::{
-    classify_obstruction, compute_cdst_cohomology, compute_cdst_edge_inconsistency,
-    compute_cdst_expected, compute_cdst_section, CdstSheafCohomology, CdstSheafObstruction,
-    CdstSheafSection, FrameEvidenceProposal, ObstructionKind,
+    build_cdst_sections, classify_obstruction, compute_cdst_cohomology,
+    compute_cdst_edge_inconsistency, compute_cdst_expected, compute_cdst_section,
+    CdstSheafCohomology, CdstSheafObstruction, CdstSheafSection, FrameEvidenceProposal,
+    NeighborRow, ObstructionKind,
 };
 pub use cospan::{
     compose_cdst_cospans, compose_cospans, BoundaryDetail, CdstCompositionResult,

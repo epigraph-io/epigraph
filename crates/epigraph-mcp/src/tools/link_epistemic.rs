@@ -9,7 +9,9 @@
 //! emits the `edge.added` durable event.
 //!
 //! Direction convention: `source -> target` means "source `relationship`
-//! target" (a `supports` edge: source is evidence for / strengthens target),
+//! target" (a `supports` edge: source is evidence for target, transmitting
+//! its belief toward it; it can still lower the target's belief, see the
+//! tool description),
 //! matching `epigraph_engine::sheaf::restriction_kind_with_profile`.
 //!
 //! Tight contract:
@@ -18,11 +20,11 @@
 //! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
 //!   [`STRUCTURAL_RELATIONSHIPS`] (lowercase canonical strings; `supersedes`
 //!   is intentionally excluded — it has dedicated semantics in
-//!   `supersede_claim`). The structural set (currently just `cites`) is kept
+//!   `supersede_claim`). The structural set (`cites`, `qualifies`) is kept
 //!   separate because its members map to `RestrictionKind::Neutral` by
 //!   design — belief-wiring already no-ops on Neutral, so accepting them
-//!   here just lets citation/provenance edges be created MCP-natively
-//!   without a doomed detour through the raw HTTP edges route.
+//!   here just lets citation/provenance links and scope caveats be created
+//!   MCP-natively without a doomed detour through the raw HTTP edges route.
 //! - idempotent on `(source, target, relationship)` — and for the SYMMETRIC
 //!   relationships (`contradicts`, `corroborates`, see
 //!   [`SYMMETRIC_RELATIONSHIPS`]) on the UNORDERED pair, so filing one in both
@@ -52,7 +54,7 @@ use crate::server::EpiGraphMcpFull;
 use crate::types::{LinkEpistemicBelief, LinkEpistemicParams, LinkEpistemicResponse};
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository};
+use epigraph_db::{ClaimRepository, EdgeRepository, EventRepository, MassFunctionRepository};
 use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcome};
 
 /// Allowed epistemic relationship strings — the engine's non-neutral relations
@@ -97,7 +99,17 @@ fn is_epistemic_relationship(s: &str) -> bool {
 /// allow-list instead. `auto_wire_edge_if_epistemic` already no-ops safely on
 /// `Neutral` relationships (see `epigraph_engine::edge_factor`'s
 /// short-circuit), so no changes are needed to the belief-wiring path itself.
-pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites"];
+///
+/// `qualifies` (backlog 99582af7) is a SCOPE CAVEAT: `A qualifies B` says A
+/// bounds the conditions under which B applies (a salt regime, a geometry, a
+/// population), not whether B is true. Before it existed the only way to wire
+/// such a caveat was `contradicts`/`refutes`, which depresses B's belief for a
+/// reason that is not about B's truth. It is directional (deliberately absent
+/// from [`SYMMETRIC_RELATIONSHIPS`]), lower-case only (the U014 casing
+/// ruling), and an optional condition can ride in the edge's `properties`.
+/// `get_neighborhood` returns every relationship unfiltered, so a claim's
+/// qualifiers already travel with it there.
+pub const STRUCTURAL_RELATIONSHIPS: &[&str] = &["cites", "qualifies"];
 
 fn is_structural_relationship(s: &str) -> bool {
     STRUCTURAL_RELATIONSHIPS.contains(&s)
@@ -144,7 +156,7 @@ fn is_symmetric_relationship(s: &str) -> bool {
 }
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![Content::text(
+    Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
     )]))
 }
@@ -171,7 +183,7 @@ pub async fn do_link_epistemic(
     let target_id = parse_uuid(&params.target_claim_id)?;
 
     // Tight allow-list — lowercase canonical epistemic relations, plus the
-    // separate structural set (currently just `cites`; see
+    // separate structural set (`cites`, `qualifies`; see
     // STRUCTURAL_RELATIONSHIPS doc comment for why it isn't folded into
     // EPISTEMIC_RELATIONSHIPS).
     if !is_epistemic_relationship(&params.relationship)
@@ -310,6 +322,12 @@ pub async fn do_link_epistemic(
     // `trigger_edge_ds_recomputation` does. Resolved here via a runtime query
     // (no `query!` macro → zero .sqlx offline-data churn).
     let mut belief_wired = false;
+    // Overwritten below when the wire is attempted. It stays this when the
+    // source's author cannot be resolved and the wire is skipped. Defensive:
+    // `claims.agent_id` is NOT NULL and both endpoints were viewer-checked
+    // above, so the visibility-spliced author read finds no row only when the
+    // source is removed or hidden concurrently.
+    let mut belief_wired_reason: Option<&'static str> = Some("source_author_unresolved");
     let source_agent_id: Option<uuid::Uuid> = {
         // PR-09: an authorship oracle over a uuid that derives from caller
         // input — it names the `agents.id` behind any claim. Filtered rather
@@ -351,6 +369,30 @@ pub async fn do_link_epistemic(
         // (`update_with_evidence`) carry the same residual, and
         // `epigraph-db/tests/tool_write_tables_require_a_stamp.rs` pins the pair.
         use sqlx::Acquire as _;
+        // Backlog 0a996437: `auto_wire_edge_if_epistemic` answers `None` for
+        // three different reasons (edge out of force, edge already wired, a
+        // refused or failed wiring). Read the first two here, in the engine's
+        // own order and with its `was_created` short-cut, under a savepoint
+        // that is rolled back, so `belief_wired_reason` can name them. A failed
+        // read leaves both unknown, which reports `refused_or_failed`.
+        // `edge_retracted` is defensive: the edge was just looked up or written
+        // in force on this transaction, so it reads false only under a
+        // concurrent retraction. Under READ COMMITTED a concurrent wire of the
+        // same edge between this probe and the engine's read reports
+        // `refused_or_failed` rather than `already_wired` (cosmetic).
+        let (in_force, already_wired) = {
+            let mut probe = tx.begin().await.map_err(internal_error)?;
+            let in_force = EdgeRepository::is_in_force(&mut *probe, edge_id).await.ok();
+            let already_wired = if was_created {
+                Some(false)
+            } else {
+                MassFunctionRepository::exists_for_perspective(&mut *probe, viewer, edge_id)
+                    .await
+                    .ok()
+            };
+            probe.rollback().await.map_err(internal_error)?;
+            (in_force, already_wired)
+        };
         let mut sp = tx.begin().await.map_err(internal_error)?;
         let outcome = auto_wire_edge_if_epistemic(
             &mut sp,
@@ -375,6 +417,15 @@ pub async fn do_link_epistemic(
         } else {
             sp.rollback().await.map_err(internal_error)?;
         }
+        belief_wired_reason = match outcome {
+            Some(EdgeFactorOutcome::Wired) => None,
+            Some(EdgeFactorOutcome::SourceFactorless) => Some("source_has_no_belief"),
+            Some(EdgeFactorOutcome::NonEpistemic) => Some("structural_relationship"),
+            Some(EdgeFactorOutcome::Vacuous) => Some("vacuous_source_mass"),
+            None if in_force == Some(false) => Some("edge_retracted"),
+            None if already_wired == Some(true) => Some("already_wired"),
+            None => Some("refused_or_failed"),
+        };
     }
 
     if was_created {
@@ -460,6 +511,7 @@ pub async fn do_link_epistemic(
         owned_by_caller,
         relationship: params.relationship,
         belief_wired,
+        belief_wired_reason,
         belief_target_claim_id: wire_target.to_string(),
         target_belief,
     })
@@ -497,6 +549,24 @@ mod tests {
         }
     }
 
+    /// The mirror of the guard above, for the whole structural set:
+    /// `link_epistemic` advertises every `STRUCTURAL_RELATIONSHIPS` member as
+    /// moving no belief, and `auto_wire_edge_if_epistemic` only no-ops on
+    /// `Neutral`. A structural entry the engine maps to `Positive` or
+    /// `Negative` would be advertised as inert and still wire belief.
+    #[test]
+    fn every_structural_relationship_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        for rel in STRUCTURAL_RELATIONSHIPS {
+            let kind = restriction_kind_with_profile(rel, &profile);
+            assert!(
+                matches!(kind, RestrictionKind::Neutral),
+                "structural relationship '{rel}' maps to {kind:?}, not Neutral — it would \
+                 move belief while link_epistemic advertises it as belief-neutral"
+            );
+        }
+    }
+
     /// `cites` is a citation/provenance link, not an epistemic claim about the
     /// relationship between two nodes — it is DELIBERATELY `Neutral` (does not
     /// move belief). This is the mirror image of the coverage guard above:
@@ -525,6 +595,39 @@ mod tests {
             ),
             "'cites' must map to RestrictionKind::Neutral — a citation link is not an \
              epistemic claim and must not move belief"
+        );
+    }
+
+    /// `qualifies` is a SCOPE CAVEAT ("A bounds the conditions under which B
+    /// applies"), not a verdict on B's truth (backlog 99582af7). It is accepted
+    /// through the structural, belief-neutral set — never the epistemic one, or
+    /// a caveat would be wired like a refutation. It is directional (it is not
+    /// in the symmetric set) and lower-case only, per the U014 casing ruling.
+    #[test]
+    fn qualifies_is_structural_directional_and_maps_to_neutral() {
+        let profile = RestrictionProfile::scientific();
+        assert!(
+            is_structural_relationship("qualifies"),
+            "'qualifies' must be accepted via STRUCTURAL_RELATIONSHIPS"
+        );
+        assert!(
+            !is_epistemic_relationship("qualifies"),
+            "'qualifies' must NOT be in EPISTEMIC_RELATIONSHIPS (it moves no belief)"
+        );
+        assert!(
+            matches!(
+                restriction_kind_with_profile("qualifies", &profile),
+                RestrictionKind::Neutral
+            ),
+            "'qualifies' must map to RestrictionKind::Neutral — a scope caveat must not move belief"
+        );
+        assert!(
+            !is_symmetric_relationship("qualifies"),
+            "'A qualifies B' is not 'B qualifies A'"
+        );
+        assert!(
+            !is_structural_relationship("QUALIFIES"),
+            "lower-case canonical spelling only"
         );
     }
 

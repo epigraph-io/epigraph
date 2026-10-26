@@ -39,8 +39,8 @@
 mod viewer_fixture;
 
 use epigraph_db::repos::privatization::{
-    PrivatizationRepository, SealCommitEvidence, SealCommitItem, SealCommitVersion,
-    UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
+    seal_manifest_evidence_properties, PrivatizationRepository, SealCommitEvidence, SealCommitItem,
+    SealCommitVersion, UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
 };
 use epigraph_privacy::{encryptor::FieldTag, pad, unpad};
 use sqlx::PgPool;
@@ -160,10 +160,11 @@ async fn seed_sealable_claim(pool: &PgPool, world: &World, content: &str) -> Uui
 
 /// [`seed_sealable_claim`] with an explicit author.
 ///
-/// Needed because `uq_claims_content_hash_agent` is unique on
-/// `(content_hash, agent_id)`: two claims with IDENTICAL plaintext — the
-/// fixture the `[private]` collision regression requires — cannot share an
-/// author before they are sealed.
+/// Needed because `(content_hash, agent_id)` is a dedup key: two claims with
+/// IDENTICAL plaintext — the fixture the `[private]` collision regression
+/// requires — must not share an author before they are sealed. Through
+/// migration 149 `uq_claims_content_hash_agent` enforced that in the
+/// database; from 150 the app-layer dedup lock does.
 async fn seed_sealable_claim_as(pool: &PgPool, world: &World, author: Uuid, content: &str) -> Uuid {
     let claim = viewer_fixture::seed_group_claim(pool, author, world.group, content).await;
 
@@ -383,13 +384,26 @@ async fn seal_payload(pool: &PgPool, claim: Uuid) -> SealCommitItem {
             .await
             .expect("read versions");
 
-    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, raw_content, properties FROM evidence WHERE claim_id = $1 ORDER BY id",
-    )
-    .bind(claim)
-    .fetch_all(pool)
-    .await
-    .expect("read evidence");
+    // `source_url` is folded into the properties the CLI encrypts, as the seal
+    // manifest serves them.
+    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> =
+        sqlx::query_as::<_, (Uuid, Option<String>, serde_json::Value, Option<String>)>(
+            "SELECT id, raw_content, properties, source_url FROM evidence \
+              WHERE claim_id = $1 ORDER BY id",
+        )
+        .bind(claim)
+        .fetch_all(pool)
+        .await
+        .expect("read evidence")
+        .into_iter()
+        .map(|(id, raw, props, url)| {
+            (
+                id,
+                raw,
+                seal_manifest_evidence_properties(&props, url.as_deref()),
+            )
+        })
+        .collect();
 
     SealCommitItem {
         claim_id: claim,
@@ -474,6 +488,27 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
         assert_eq!(n, 1, "the fixture must seed a {table} row before the seal");
     }
 
+    // `evidence.source_url` is plaintext the seal must take too. The fixture's
+    // evidence has none, so give it one, and CALIBRATE it like the tables above.
+    sqlx::query(
+        "UPDATE evidence SET source_url = 'https://example.org/sealed' WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("give the evidence a URL");
+    let urls_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE claim_id = $1 AND source_url IS NOT NULL",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("calibrate evidence URLs");
+    assert!(
+        urls_before > 0,
+        "the fixture must carry an evidence URL before the seal"
+    );
+
     let payload = seal_payload(&pool, claim).await;
     let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
     assert_eq!(sealed, vec![claim], "the seal reported the claim it sealed");
@@ -539,21 +574,30 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
         assert_eq!(v, &format!("[sealed:x{}]", claim.simple()));
     }
 
-    // Evidence, on both vector columns.
-    let evidence: Vec<(Option<String>, bool, bool, serde_json::Value)> = sqlx::query_as(
-        "SELECT raw_content, embedding IS NOT NULL, embedding_3072 IS NOT NULL, properties \
-           FROM evidence WHERE claim_id = $1",
+    // Evidence, on both vector columns and the URL column.
+    type SealedEvidenceRow = (
+        Option<String>,
+        bool,
+        bool,
+        serde_json::Value,
+        Option<String>,
+    );
+    let evidence: Vec<SealedEvidenceRow> = sqlx::query_as(
+        "SELECT raw_content, embedding IS NOT NULL, embedding_3072 IS NOT NULL, properties, \
+                    source_url \
+               FROM evidence WHERE claim_id = $1",
     )
     .bind(claim)
     .fetch_all(&pool)
     .await
     .expect("read evidence");
     assert!(!evidence.is_empty(), "the fixture seeded an evidence row");
-    for (raw, emb, emb3072, props) in &evidence {
+    for (raw, emb, emb3072, props, url) in &evidence {
         assert_eq!(raw.as_deref(), Some("[sealed]"));
         assert!(!emb, "sealed evidence keeps no ANN vector");
         assert!(!emb3072, "sealed evidence keeps no 3072-d ANN vector");
         assert_eq!(props, &serde_json::json!({}));
+        assert_eq!(url, &None, "sealed evidence keeps no plaintext source_url");
     }
 
     // The derived extractions are gone, INCLUDING the table §6.5.4's list omits.
@@ -646,8 +690,9 @@ async fn ciphertext_length_and_content_hash_leak_nothing_about_the_plaintext(poo
 
     // Two claims of wildly different length, and two whose plaintext is
     // IDENTICAL. The identical pair is the `[private]` collision regression:
-    // a hash taken over a fixed sentinel would make them collide on
-    // `uq_claims_content_hash_agent`.
+    // a hash taken over a fixed sentinel would make them collide on the
+    // `(content_hash, agent_id)` dedup key (`uq_claims_content_hash_agent`
+    // through migration 149, the app-layer dedup lock from 150).
     let short = seed_sealable_claim(&pool, &world, "x").await;
     let long = seed_sealable_claim(&pool, &world, &"y".repeat(200)).await;
     let (twin_author, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-twin").await;
@@ -726,8 +771,25 @@ async fn no_trace_of_a_sealed_claim_survives_a_full_data_dump(pool: PgPool) {
     let control_nonce = format!("nonce{}", Uuid::new_v4().simple());
     let sealed_claim =
         seed_sealable_claim(&pool, &world, &format!("secret text {sealed_nonce} ends")).await;
-    let _control =
+    let control =
         seed_sealable_claim(&pool, &world, &format!("public text {control_nonce} ends")).await;
+
+    // `evidence.source_url` is a separate column with separate nonces, so the
+    // control proves the dump reaches THIS column: the content nonces above are
+    // in every other plaintext column already.
+    let sealed_url_nonce = format!("nonce{}", Uuid::new_v4().simple());
+    let control_url_nonce = format!("nonce{}", Uuid::new_v4().simple());
+    for (claim, nonce) in [
+        (sealed_claim, &sealed_url_nonce),
+        (control, &control_url_nonce),
+    ] {
+        sqlx::query("UPDATE evidence SET source_url = $2 WHERE claim_id = $1")
+            .bind(claim)
+            .bind(format!("https://example.org/{nonce}"))
+            .execute(&pool)
+            .await
+            .expect("give the evidence a URL");
+    }
 
     let payload = seal_payload(&pool, sealed_claim).await;
     commit_seal(&pool, &world, &[payload]).await;
@@ -766,6 +828,15 @@ async fn no_trace_of_a_sealed_claim_survives_a_full_data_dump(pool: PgPool) {
         dump.matches(&sealed_nonce).count(),
         0,
         "the sealed claim's plaintext survives somewhere in the dump"
+    );
+    assert!(
+        dump.matches(&control_url_nonce).count() > 0,
+        "the POSITIVE CONTROL for evidence.source_url is missing from the dump"
+    );
+    assert_eq!(
+        dump.matches(&sealed_url_nonce).count(),
+        0,
+        "the sealed claim's evidence URL survives in plaintext in the dump"
     );
 }
 
@@ -1471,6 +1542,325 @@ async fn the_restore_write_refuses_a_claim_superseded_since_the_text_was_read(po
         after,
         Some(true),
         "every claim with is_current = false should have embedding = NULL"
+    );
+}
+
+/// Stamp `conn` for `agent` exactly as `ScopedPool::begin_as` would.
+async fn stamp_as(conn: &mut sqlx::PgConnection, pool: &PgPool, agent: Uuid) {
+    let v = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve viewer");
+    let csv = |ids: &[Uuid]| {
+        ids.iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(groups)
+    .bind(writable)
+    .bind(agent.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp session gucs");
+}
+
+/// Operator ruling R-5: sealing a claim KEEPS an outsider-owned challenge
+/// (`writer_owned`, migration 168) instead of deleting it, and deletes an
+/// insider's (inherited) challenge as before.
+///
+/// The flow is the real one: the claim starts PUBLIC in the seal target's
+/// group, an outsider challenges it as the non-bypassing application role
+/// (168's attach rule makes the row the outsider's), an insider challenge
+/// inherits the claim's tenancy, the claim is RESTRICTED (081 refuses to seal
+/// a public claim), then sealed. The outsider's row is byte-identical after
+/// the seal, the insider's is gone, and the kept row stays hidden from every
+/// non-reader of the claim by 168's `challenges_claim_readable` (the stranger
+/// and the outsider itself read nothing; a member of the claim's group, the
+/// positive control, reads it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seal_keeps_an_outsiders_challenge_and_deletes_an_insiders(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let (outsider, outsider_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "seal-outsider").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-stranger").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a public finding, later sealed', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(world.author)
+    .bind(world.group)
+    .execute(&pool)
+    .await
+    .expect("seed a public claim in the seal target's group");
+
+    let p = pool.clone();
+    let theirs: Uuid = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, outsider).await;
+        let id = epigraph_db::ChallengeRepository::create(
+            &mut *conn,
+            claim,
+            Some(outsider),
+            "factual_error",
+            "the outsider's own objection",
+        )
+        .await;
+        (conn, id)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    let insiders: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
+         VALUES ($1, $2, 'factual_error', 'an insider objection', 'pending') RETURNING id",
+    )
+    .bind(claim)
+    .bind(world.author)
+    .fetch_one(&pool)
+    .await
+    .expect("an insider's challenge inherits the claim's tenancy");
+
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("restrict the claim before sealing it");
+
+    let row = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT to_jsonb(ch) FROM challenges ch WHERE ch.id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&pool)
+            .await
+            .expect("read a challenge")
+        }
+    };
+    // CALIBRATION, BEFORE THE SEAL: both rows exist, the outsider's is
+    // writer-owned and public, the insider's followed the claim.
+    let before = row(theirs).await.expect("the outsider's row exists");
+    assert_eq!(before["writer_owned"], true);
+    assert_eq!(before["owner_group_id"], outsider_group.to_string());
+    assert_eq!(before["visibility"], "public");
+    let insider_before = row(insiders).await.expect("the insider's row exists");
+    assert_eq!(insider_before["writer_owned"], false);
+    assert_eq!(insider_before["owner_group_id"], world.group.to_string());
+
+    let payload = seal_payload(&pool, claim).await;
+    let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+    assert_eq!(sealed, vec![claim], "CALIBRATION: the claim was sealed");
+
+    assert_eq!(
+        row(theirs).await,
+        Some(before),
+        "the seal must KEEP the outsider's challenge, unchanged (R-5)"
+    );
+    assert_eq!(
+        row(insiders).await,
+        None,
+        "the insider's inherited challenge is deleted as before"
+    );
+
+    let p = pool.clone();
+    let author = world.author;
+    let seen = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let mut out = Vec::new();
+        for (who, agent) in [
+            ("stranger", stranger),
+            ("outsider", outsider),
+            ("claim group member", author),
+        ] {
+            stamp_as(&mut conn, &p, agent).await;
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM challenges WHERE id = $1")
+                .bind(theirs)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read the kept challenge");
+            out.push((who, n));
+        }
+        (conn, out)
+    })
+    .await;
+    assert_eq!(
+        seen,
+        vec![("stranger", 0), ("outsider", 0), ("claim group member", 1)],
+        "the kept row is read only with the sealed claim"
+    );
+}
+
+/// Rulings R-3 x R-5: after a seal, the challenge the seal KEPT (an
+/// outsider's public, writer-owned row on a now sealed claim) is still
+/// resolvable by the claim's owner, and by nobody else, and it is no existence
+/// oracle for the sealed claim through the resolution definer either.
+///
+/// A stranger and the outsider itself (neither can read the sealed claim)
+/// get exactly the `(sqlstate, text)` a random id gets, and nothing is
+/// written or audited; a writer of the claim's group then sets the status,
+/// which lands with an audit row naming it, and every non-resolution column
+/// of the kept row is unchanged. A definer that judged readability by the
+/// CHALLENGE row (public) instead of its claim would answer the stranger with
+/// the owner refusal (42501) instead of "not found".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_claims_kept_challenge_is_resolved_only_by_the_claims_owner(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-res-outsider").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "seal-res-stranger").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'a public finding, sealed, then its challenge resolved', $2, 0.5, $3, \
+                 true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(world.author)
+    .bind(world.group)
+    .execute(&pool)
+    .await
+    .expect("seed a public claim in the seal target's group");
+    let p = pool.clone();
+    let theirs: Uuid = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, outsider).await;
+        let id = epigraph_db::ChallengeRepository::create(
+            &mut *conn,
+            claim,
+            Some(outsider),
+            "factual_error",
+            "the outsider's objection, kept by the seal",
+        )
+        .await;
+        (conn, id)
+    })
+    .await
+    .expect("the outsider's challenge lands");
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("restrict the claim before sealing it");
+    let payload = seal_payload(&pool, claim).await;
+    let sealed = commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+    assert_eq!(sealed, vec![claim], "CALIBRATION: the claim was sealed");
+
+    let row = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT to_jsonb(ch) FROM challenges ch WHERE ch.id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("read a challenge")
+        }
+    };
+    let audit = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT agent_id FROM security_events \
+                  WHERE event_type = 'challenges.claim_owner_resolution' \
+                    AND details->>'challenge_id' = $1::text",
+            )
+            .bind(id)
+            .fetch_all(&pool)
+            .await
+            .expect("read the resolution audit")
+        }
+    };
+    let before = row(theirs).await;
+    assert_eq!(
+        (before["writer_owned"].clone(), before["visibility"].clone()),
+        (serde_json::json!(true), serde_json::json!("public")),
+        "CALIBRATION: the seal kept the outsider's public, writer-owned row"
+    );
+
+    let sqlstate = |e: &sqlx::Error| {
+        e.as_database_error()
+            .and_then(|d| d.code())
+            .map(|c| c.into_owned())
+    };
+    let missing = Uuid::new_v4();
+    let p = pool.clone();
+    let answers = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let mut out = Vec::new();
+        for (who, agent) in [("stranger", stranger), ("outsider", outsider)] {
+            stamp_as(&mut conn, &p, agent).await;
+            let hidden = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn, theirs, "accepted", None,
+            )
+            .await;
+            let random = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+                &mut *conn, missing, "accepted", None,
+            )
+            .await;
+            out.push((who, hidden, random));
+        }
+        (conn, out)
+    })
+    .await;
+    for (who, hidden, random) in &answers {
+        let hidden = hidden.as_ref().expect_err("a non-reader resolves nothing");
+        let random = random.as_ref().expect_err("a random id resolves nothing");
+        assert_eq!(
+            (sqlstate(hidden), hidden.to_string()),
+            (sqlstate(random), random.to_string()),
+            "{who}: the sealed claim's kept challenge answers exactly as a random id"
+        );
+    }
+    assert_eq!(row(theirs).await, before, "the refusals wrote nothing");
+    assert!(
+        audit(theirs).await.is_empty(),
+        "the refusals audited nothing"
+    );
+
+    let p = pool.clone();
+    let author = world.author;
+    let landed = viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp_as(&mut conn, &p, author).await;
+        let r = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+            &mut *conn,
+            theirs,
+            "accepted",
+            Some(&serde_json::json!({ "reason": "sealed, still answered" })),
+        )
+        .await;
+        (conn, r)
+    })
+    .await;
+    landed.expect("a writer of the sealed claim's group sets the kept challenge's status");
+    let after = row(theirs).await;
+    assert_eq!(after["state"], "accepted");
+    assert_eq!(after["resolved_by"], author.to_string());
+    assert_eq!(
+        audit(theirs).await,
+        vec![Some(author)],
+        "one audit row naming the resolver"
+    );
+    let strip = |mut v: serde_json::Value| {
+        for col in ["state", "resolved_by", "resolved_at", "resolution_details"] {
+            v.as_object_mut().expect("a row object").remove(col);
+        }
+        v
+    };
+    assert_eq!(
+        strip(after),
+        strip(before),
+        "every non-resolution column of the kept row is unchanged"
     );
 }
 
