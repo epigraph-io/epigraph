@@ -1493,3 +1493,170 @@ async fn only_the_challenger_withdraws_its_challenge(pool: PgPool) {
     );
     assert_eq!(resolution(&pool, theirs).await.0, "withdrawn");
 }
+
+// =========================================================================
+// Migration 170, DELETE: no application session deletes a challenge.
+// =========================================================================
+
+/// The text the DELETE refusal carries (migration 170's guard).
+const CR09: &str = "CR09";
+
+/// Make `agent` a writer member of `group`.
+async fn add_writer(pool: &PgPool, group: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("writer membership");
+}
+
+/// No application session deletes a challenge. 115's restrictive DELETE
+/// policy admits every writer of the row's owning group, and since 168 the
+/// OUTSIDER owns its challenge row, so without a DELETE rule the outsider
+/// could remove its own challenge after the claim's owner ruled on it (which
+/// goes around R-13: withdrawal is the challenger's one way to retract), and a
+/// writer of the claim's group could remove a colleague's insider challenge;
+/// neither is audited. No binary path deletes a challenge on an application
+/// session: the seal ceremony deletes an insider's challenge on a maintenance
+/// connection, and `challenges.claim_id`'s foreign key has no `ON DELETE`
+/// action, so there is no cascade to keep working.
+///
+/// Every arm runs as the non-bypassing `epigraph_app`, stamped as a request
+/// is, and is refused with CR09 (42501); every row survives byte-identical:
+/// * the outsider deletes its own SETTLED (rejected) challenge;
+/// * the outsider deletes its own PENDING challenge;
+/// * the claim's owner deletes a colleague's insider challenge;
+/// * the colleague deletes its own insider challenge.
+///
+/// Calibrations: each deleter READS the row on the same stamped session (so a
+/// refusal is the guard, not row security filtering the row out), and the
+/// privileged harness connection still deletes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_application_session_deletes_a_challenge(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-del-owner").await;
+    let (outsider, outsider_group) = fixture::seed_agent_with_group(&pool, "ch-del-out").await;
+    let (colleague, _) = fixture::seed_agent_with_group(&pool, "ch-del-colleague").await;
+    add_writer(&pool, owner_group, colleague).await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "delete").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (settled, pending) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let s = challenge(&mut conn, claim, outsider, "delete: settled later")
+            .await
+            .expect("the outsider's first challenge lands");
+        let q = challenge(&mut conn, claim, outsider, "delete: stays pending")
+            .await
+            .expect("the outsider's second challenge lands");
+        (conn, (s, q))
+    })
+    .await;
+    let p = pool.clone();
+    let insiders = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, colleague).await;
+        let i = challenge(&mut conn, claim, colleague, "delete: a colleague's").await;
+        (conn, i)
+    })
+    .await
+    .expect("the colleague's insider challenge lands");
+    let p = pool.clone();
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = ChallengeRepository::resolve_as_claim_owner(&mut *conn, settled, "rejected", None)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect("the claim's owner rules on the outsider's challenge");
+    assert_eq!(
+        resolution(&pool, settled).await.0,
+        "rejected",
+        "CALIBRATION: the first challenge is settled"
+    );
+    assert_eq!(
+        tenancy(&pool, settled).await,
+        (outsider_group, "public".to_string(), true),
+        "CALIBRATION: the outsider owns its rows, so 115 admits its DELETEs of them"
+    );
+    assert_eq!(
+        tenancy(&pool, insiders).await,
+        (owner_group, "public".to_string(), false),
+        "CALIBRATION: the insider's row is the claim group's, so 115 admits the owner's DELETE"
+    );
+    let mut before = Vec::new();
+    for id in [settled, pending, insiders] {
+        before.push((id, whole_row(&pool, id).await));
+    }
+
+    for (agent, id, what) in [
+        (
+            outsider,
+            settled,
+            "the outsider deletes its own settled challenge",
+        ),
+        (
+            outsider,
+            pending,
+            "the outsider deletes its own pending challenge",
+        ),
+        (
+            owner,
+            insiders,
+            "the claim's owner deletes a colleague's insider challenge",
+        ),
+        (
+            colleague,
+            insiders,
+            "the challenger deletes its own insider challenge",
+        ),
+    ] {
+        let p = pool.clone();
+        let (visible, deleted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, agent).await;
+            let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM challenges WHERE id = $1")
+                .bind(id)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read the challenge as the app role");
+            let deleted = sqlx::query("DELETE FROM challenges WHERE id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await
+                .map(|d| d.rows_affected());
+            (conn, (visible, deleted))
+        })
+        .await;
+        assert_eq!(
+            visible, 1,
+            "CALIBRATION ({what}): the deleter reads the row, so row security does not hide it"
+        );
+        let e = deleted.expect_err(&format!("{what}: refused, not deleted"));
+        assert_eq!(sqlstate(&e).as_deref(), Some("42501"), "{what}: {e}");
+        assert!(
+            format!("{e:?}").contains(CR09),
+            "{what}: refused by migration 170's delete guard, not another check: {e:?}"
+        );
+    }
+    for (id, row) in before {
+        assert_eq!(
+            whole_row(&pool, id).await,
+            row,
+            "challenge {id} survives byte-identical"
+        );
+    }
+
+    // CALIBRATION: a privileged connection (the harness superuser; the seal
+    // ceremony's maintenance connection is privileged the same way) deletes.
+    let n = sqlx::query("DELETE FROM challenges WHERE id = $1")
+        .bind(pending)
+        .execute(&pool)
+        .await
+        .expect("a privileged delete of a challenge")
+        .rows_affected();
+    assert_eq!(n, 1, "the privileged connection deletes the row");
+}

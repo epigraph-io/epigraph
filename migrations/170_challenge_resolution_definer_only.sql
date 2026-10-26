@@ -28,8 +28,8 @@
 -- 1. THE RULE
 -- ===================================================================
 --
--- One guard function, `epigraph_challenge_resolution_guard()`, on two BEFORE
--- ROW triggers. For an application session (anything 114's
+-- One guard function, `epigraph_challenge_resolution_guard()`, on three
+-- BEFORE ROW triggers. For an application session (anything 114's
 -- `epigraph_session_is_privileged_writer()` says is NOT privileged):
 --
 --   * UPDATE: the only change of the four resolution columns it may make is
@@ -40,6 +40,21 @@
 --     refused, CR07 (42501).
 --   * INSERT: a challenge is born unresolved: `state = 'pending'` and the three
 --     other columns NULL, else CR07 (42501).
+--   * DELETE: refused, CR09 (42501). A challenge is never removed by an
+--     application session; the challenger retracts it by withdrawing it.
+--
+-- WHY DELETE IS REFUSED OUTRIGHT. 077 grants `epigraph_app` DELETE, and 115's
+-- restrictive DELETE policy admits every writer of the row's owning group. So
+-- without this arm the outsider, which owns its row since 168, could remove its
+-- own challenge after the claim's owner ruled on it (going around the
+-- withdrawn-only rule above), and a writer of the claim's group could remove a
+-- colleague's insider challenge; neither leaves a trace on the challenge. No
+-- binary path deletes a challenge on an application session: the seal
+-- ceremony's derived-row DELETE of an insider's challenge runs on a
+-- maintenance connection, which is privileged. `challenges.claim_id`'s foreign
+-- key (001) has no `ON DELETE` action, so no cascade reaches this trigger.
+-- Refusing every application DELETE, rather than some states of it, keeps
+-- this arm independent of how the withdrawal rule is ruled.
 --
 -- WHY THE CHALLENGER CHECK. Row security alone admits every writer of the
 -- row's owning group, and an INSIDER's challenge is owned by the claim's
@@ -75,6 +90,8 @@
 -- ===================================================================
 --
 --   * It changes no row and no policy, and not 168's definer.
+--   * It does not narrow a PRIVILEGED session's DELETE (the seal ceremony, the
+--     operator CLI, the migrator).
 --   * It does not change who reads a challenge, or who may edit its text.
 --   * `ChallengeRepository::update_state` (a plain UPDATE of all four columns)
 --     keeps working only on a privileged connection.
@@ -84,14 +101,15 @@
 -- ===================================================================
 --
 -- Depends on 114 (`epigraph_session_is_privileged_writer`) and 168 (the
--- definer). Two `CREATE TRIGGER`s take a short lock on `challenges`, under
+-- definer). Three `CREATE TRIGGER`s take a short lock on `challenges`, under
 -- `lock_timeout`. Independent of the binaries: no binary path plain-UPDATEs a
 -- resolution column on an application session (the resolve routes call the
 -- definer), and a binary without the resolve routes against a database with
 -- this file loses nothing it had.
 --
--- UNDO: DROP TRIGGER challenges_resolution_guard_update and
--- challenges_resolution_guard_insert ON public.challenges, then DROP FUNCTION
+-- UNDO: DROP TRIGGER challenges_resolution_guard_update,
+-- challenges_resolution_guard_insert and challenges_resolution_guard_delete ON
+-- public.challenges, then DROP FUNCTION
 -- public.epigraph_challenge_resolution_guard().
 --
 -- Checked before claiming: no `origin/main` migration and no open PR carries a
@@ -103,6 +121,15 @@ CREATE OR REPLACE FUNCTION public.epigraph_challenge_resolution_guard() RETURNS 
 LANGUAGE plpgsql SECURITY INVOKER
 SET search_path = public, pg_temp AS $$
 BEGIN
+    -- DELETE first: NEW is NULL there, and a BEFORE ROW trigger that returns
+    -- NULL silently skips the row, so a privileged DELETE must get OLD back.
+    IF TG_OP = 'DELETE' THEN
+        IF public.epigraph_session_is_privileged_writer() THEN RETURN OLD; END IF;
+        RAISE EXCEPTION 'CR09: challenge % is not deleted by an application session; '
+            'the challenger withdraws it instead (state withdrawn); nothing was written',
+            OLD.id
+            USING ERRCODE = '42501';
+    END IF;
     IF public.epigraph_session_is_privileged_writer() THEN RETURN NEW; END IF;
     IF TG_OP = 'INSERT' THEN
         IF NEW.state = 'pending'
@@ -152,6 +179,12 @@ CREATE TRIGGER challenges_resolution_guard_insert
           OR NEW.resolved_by IS NOT NULL
           OR NEW.resolved_at IS NOT NULL
           OR NEW.resolution_details IS NOT NULL)
+    EXECUTE FUNCTION public.epigraph_challenge_resolution_guard();
+
+DROP TRIGGER IF EXISTS challenges_resolution_guard_delete ON public.challenges;
+CREATE TRIGGER challenges_resolution_guard_delete
+    BEFORE DELETE ON public.challenges
+    FOR EACH ROW
     EXECUTE FUNCTION public.epigraph_challenge_resolution_guard();
 
 -- Ownership, as 114 re-owns its invoker guards: the owner changes no answer
