@@ -3552,6 +3552,8 @@ mod db_tests {
     async fn create_edge_accepts_and_canonicalises_mixed_case(pool: PgPool) {
         let agent_id = ensure_system_agent(&pool).await;
         let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+        // The event store is a process-wide singleton; read only this test's window.
+        let since = chrono::Utc::now();
 
         for (asked, stored, if_not_exists) in [
             ("Contradicts", "contradicts", false),
@@ -3570,10 +3572,31 @@ mod db_tests {
                 body["relationship"], stored,
                 "{asked}: the response says what is stored"
             );
+            let id = body_id(&body, "id");
             assert_eq!(
-                stored_relationship(&pool, body_id(&body, "id")).await,
+                stored_relationship(&pool, id).await,
                 stored,
                 "{asked} (if_not_exists={if_not_exists}) must be stored as {stored}"
+            );
+            // The `edge.added` staleness event names the stored spelling too:
+            // a subscriber filtering on `supports` must see a `SUPPORTS` POST.
+            let events = crate::routes::events::global_event_store()
+                .list(&crate::routes::events::EventFilter {
+                    since: Some(since),
+                    after_id: None,
+                    event_type: Some("edge.added".to_string()),
+                    limit: Some(1000),
+                    offset: None,
+                })
+                .await
+                .0;
+            let event = events
+                .iter()
+                .find(|e| e.payload["edge_id"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("{asked}: no edge.added event for {id}"));
+            assert_eq!(
+                event.payload["relationship"], stored,
+                "{asked}: the edge.added event says what is stored"
             );
         }
         // Still refused: not a relationship in any spelling.
@@ -3623,6 +3646,59 @@ mod db_tests {
             unordered_pair_count_all(&pool, a, b, "contradicts").await,
             1
         );
+    }
+
+    /// `GET /api/v1/edges?relationship=` returns a legacy upper-case row and a
+    /// canonical lower-case row whichever spelling the filter names (backlog
+    /// 3ce5e00c), through the route rather than only at the repository.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_edges_relationship_filter_matches_both_spellings(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "list spelling A").await;
+        let b = seed_claim(&pool, agent_id, "list spelling B").await;
+        let c = seed_claim(&pool, agent_id, "list spelling C").await;
+        let mut want = Vec::new();
+        for (tgt, rel) in [(b, "SUPPORTS"), (c, "supports"), (c, "elaborates")] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                    relationship) \
+                 VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+            )
+            .bind(a)
+            .bind(tgt)
+            .bind(rel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if rel != "elaborates" {
+                want.push(id);
+            }
+        }
+        want.sort();
+        let state = test_state(pool.clone()).await;
+
+        for asked in ["supports", "SUPPORTS"] {
+            let router = edges_router_with_auth(state.clone(), auth_ctx(agent_id));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/edges?source_id={a}&relationship={asked}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{asked}");
+            let body: serde_json::Value = parse_body(response).await;
+            let mut got: Vec<Uuid> = body
+                .as_array()
+                .expect("response is an array")
+                .iter()
+                .map(|e| body_id(e, "id"))
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "relationship={asked} must return both spellings");
+        }
     }
 
     /// Shared body of the reverse-direction tests: `A <relationship> B`, then
