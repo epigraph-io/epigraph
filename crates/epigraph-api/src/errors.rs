@@ -782,6 +782,25 @@ impl From<DbError> for ApiError {
                     ),
                 }
             }
+            // Migration 176 (backlog e2c22c7c): a designed refusal whose
+            // message opens with a code 176 introduced
+            // (`epigraph_db::CALLER_REFUSAL_CODES`). Each of those messages was
+            // reviewed for what it discloses, so it is the caller's to read;
+            // the class follows the SQLSTATE, which 176 kept. Keyed on the
+            // listed codes, not on the code SHAPE: an older coded refusal, and
+            // any uncoded database text, still takes the redacted `QueryFailed`
+            // arm below.
+            DbError::QueryFailed {
+                source: sqlx::Error::Database(db),
+            } if epigraph_db::caller_refusal_code(db.message()).is_some() => {
+                let message = db.message().to_string();
+                tracing::warn!(detail = %message, "the database refused the request");
+                match db.code().as_deref() {
+                    Some("42501") => ApiError::Forbidden { reason: message },
+                    Some("55000") => ApiError::Conflict { reason: message },
+                    _ => ApiError::BadRequest { message },
+                }
+            }
             DbError::ConnectionFailed { source } => {
                 tracing::error!(error = %source, "Database connection failed");
                 ApiError::DatabaseError {
