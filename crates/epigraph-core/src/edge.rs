@@ -266,10 +266,10 @@ pub mod relationships {
     ///
     /// Listed in the lower-case canonical spelling; use
     /// [`is_symmetric_claim_relationship`] to test membership, which ignores
-    /// ASCII case so the upper-case `CONTRADICTS` / `CORROBORATES` the HTTP
-    /// allow-list admits are recognised too. Recognising a spelling does not
-    /// unify spellings: the writers' dedup probe still compares
-    /// `relationship` byte-exactly.
+    /// ASCII case so a legacy upper-case `CONTRADICTS` / `CORROBORATES` is
+    /// recognised too. The writers store [`canonical_relationship`] and their
+    /// dedup probes match every [`relationship_spellings`] entry, so a legacy
+    /// upper-case row and a new lower-case one over the same pair are one edge.
     ///
     /// The other epistemic relations (`supports`, `refutes`, `elaborates`,
     /// `generalizes`, `specializes`) are directional and MUST NOT be added:
