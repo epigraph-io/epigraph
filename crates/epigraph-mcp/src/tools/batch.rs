@@ -225,6 +225,17 @@ pub async fn system_stats(
         stats["triples"] = serde_json::json!(index.triples);
         stats["entities"] = serde_json::json!(index.entities);
         stats["entity_mentions"] = serde_json::json!(index.entity_mentions);
+
+        // The unsigned-edge metric (backlog dae795f8): how many readable edges
+        // carry an attestation, so the edge-signing gap is visible, not tacit.
+        let edge_signing = epigraph_db::repos::edge_signature::EdgeSignatureRepository::coverage(
+            &server.pool,
+            viewer,
+        )
+        .await
+        .map_err(internal_error)?;
+        stats["edges_signed"] = serde_json::json!(edge_signing.signed);
+        stats["edges_unsigned"] = serde_json::json!(edge_signing.unsigned);
     }
 
     Ok(CallToolResult::success(vec![ContentBlock::text(

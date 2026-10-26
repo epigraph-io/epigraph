@@ -2259,7 +2259,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Get aggregate system statistics — claim, evidence, edge, agent, and frame counts. Set detailed=true for breakdowns."
+        description = "Get aggregate system statistics — claim, evidence, edge, agent, and frame counts. Set detailed=true for breakdowns, including edges_signed / edges_unsigned (readable edges with and without a signature)."
     )]
     async fn system_stats(
         &self,

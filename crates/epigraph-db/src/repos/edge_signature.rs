@@ -125,7 +125,7 @@ pub struct EdgeSignatureCheck {
     pub signer_id: Option<Uuid>,
 }
 
-/// Signed / unsigned edge counts, as the session can see them.
+/// Signed / unsigned edge counts, over the edges a viewer may read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct EdgeSigningCoverage {
     pub total: i64,
@@ -271,20 +271,34 @@ impl EdgeSignatureRepository {
         }))
     }
 
-    /// The unsigned-edge metric: how many of the edges this session can see
-    /// carry a signature, and how many do not.
+    /// The unsigned-edge metric: how many of the edges `viewer` may read carry
+    /// a signature, and how many do not.
+    ///
+    /// Viewer-scoped with the EDGE predicate, like every cardinality
+    /// `system_stats` reports (PR-09): a corpus-wide count would tell any
+    /// caller the size of every group's private edges.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    pub async fn coverage<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    pub async fn coverage(
+        pool: &sqlx::PgPool,
+        viewer: &crate::visibility::Viewer,
     ) -> Result<EdgeSigningCoverage, DbError> {
-        let (total, signed): (i64, i64) = sqlx::query_as(
-            "SELECT count(*)::bigint, count(*) FILTER (WHERE signature IS NOT NULL)::bigint \
-               FROM edges",
-        )
-        .fetch_one(executor)
-        .await?;
+        // `WHERE true` gives the marker a predicate to append ` AND (...)` to.
+        let sql = viewer.splice(
+            r"
+            SELECT count(*)::bigint,
+                   count(*) FILTER (WHERE eg.signature IS NOT NULL)::bigint
+              FROM edges eg
+             WHERE true /* {EDGE_VISIBILITY:eg} */
+            ",
+            1,
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64)>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let (total, signed) = q.fetch_one(pool).await?;
         Ok(EdgeSigningCoverage {
             total,
             signed,

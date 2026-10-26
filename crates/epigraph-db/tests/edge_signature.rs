@@ -293,7 +293,8 @@ async fn a_stranger_cannot_sign_and_a_signature_is_never_overwritten(pool: PgPoo
 async fn coverage_counts_signed_and_unsigned_edges(pool: PgPool) {
     let signer = AgentSigner::from_bytes(&[0x76; 32]).expect("signer");
     let w = seed_signing_writer(&pool, "edge-metric", &signer).await;
-    let before = EdgeSignatureRepository::coverage(&pool)
+    let viewer = fixture::public_viewer(&pool).await;
+    let before = EdgeSignatureRepository::coverage(&pool, &viewer)
         .await
         .expect("coverage");
     let a = fixture::seed_public_claim(&pool, w, "metric A").await;
@@ -312,13 +313,45 @@ async fn coverage_counts_signed_and_unsigned_edges(pool: PgPool) {
         .unwrap();
     drop(conn);
 
-    let after = EdgeSignatureRepository::coverage(&pool)
+    let after = EdgeSignatureRepository::coverage(&pool, &viewer)
         .await
         .expect("coverage");
     assert_eq!(after.total - before.total, 2);
     assert_eq!(after.signed - before.signed, 1);
     assert_eq!(after.unsigned - before.unsigned, 1);
     assert_eq!(after.total, after.signed + after.unsigned);
+
+    // Viewer-scoped: an edge onto W's group-private claim (the tenancy trigger
+    // gives it the meet) is counted for W and not for the public reader.
+    let w_group: Uuid = sqlx::query_scalar(
+        "SELECT id FROM groups WHERE kind = 'personal' AND created_by_agent_id = $1",
+    )
+    .bind(w)
+    .fetch_one(&pool)
+    .await
+    .expect("W's personal group");
+    let private = fixture::seed_group_claim(&pool, w, w_group, "metric private").await;
+    EdgeRepository::create(
+        &pool, a, "claim", private, "claim", "supports", None, None, None,
+    )
+    .await
+    .unwrap();
+    let public_again = EdgeSignatureRepository::coverage(&pool, &viewer)
+        .await
+        .expect("coverage");
+    assert_eq!(
+        public_again, after,
+        "a group-private edge leaked into the public count"
+    );
+    let w_viewer = Viewer::resolve(&pool, w).await.expect("W's viewer");
+    let w_sees = EdgeSignatureRepository::coverage(&pool, &w_viewer)
+        .await
+        .expect("coverage");
+    assert_eq!(
+        w_sees.unsigned,
+        after.unsigned + 1,
+        "{w_sees:?} vs {after:?}"
+    );
 
     // And the digest the repository stored is the public function's.
     let row: (Vec<u8>,) = sqlx::query_as("SELECT content_hash FROM edges WHERE id = $1")
