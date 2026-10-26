@@ -23,6 +23,16 @@ pub fn content_security_policy(
     ))
 }
 
+/// Default `Cache-Control` for anything that is not a static asset.
+///
+/// Every page the Explorer renders is per-viewer: the API filters each read
+/// by the signed-in viewer, so the same URL is a different document for two
+/// readers, and a claim page carries claim text verbatim. `private` keeps it
+/// out of any shared cache; `no-store` keeps it off disk, out of a Back-
+/// Forward cache replay after sign-out, and out of a proxy that ignores
+/// `private`. The `/bff/*` JSON already sends its own value.
+pub const PAGE_CACHE_CONTROL: &str = "private, no-store";
+
 pub async fn security_headers(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
@@ -35,6 +45,12 @@ pub async fn security_headers(State(state): State<AppState>, req: Request, next:
         header::REFERRER_POLICY,
         HeaderValue::from_static("same-origin"),
     );
+    // Only where the handler said nothing. `assets::serve` sets its own
+    // `public, max-age=…` (static files hold no viewer data and must stay
+    // cacheable), and the auth routes and the BFF set theirs; a handler's
+    // choice is never overridden.
+    h.entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static(PAGE_CACHE_CONTROL));
     resp
 }
 

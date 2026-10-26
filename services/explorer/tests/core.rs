@@ -292,6 +292,81 @@ async fn core_routes_are_mounted_and_built() {
     assert_eq!(res.json()["results"]["status"], "unavailable");
 }
 
+/// Item 3 of the review: a signed-in HTML page carries claim text verbatim
+/// and is per-viewer, so it must not be cached anywhere. The security layer
+/// supplies `private, no-store` for every response whose handler said
+/// nothing; static assets hold no viewer data and keep their own caching.
+#[tokio::test]
+async fn signed_in_pages_are_never_cached_while_static_assets_still_are() {
+    let app = spawn().await;
+    // No call-count expectations: this test renders the same claim through
+    // both the page and the BFF.
+    for (p, body) in [
+        ("", claim_json(CONTENT, &[])),
+        ("/belief", belief_json()),
+        ("/ego", ego_json()),
+        ("/evidence", evidence_json()),
+        ("/supporting-evidence", edge_evidence_json("SUPPORTS", None)),
+        (
+            "/contradicting-evidence",
+            edge_evidence_json("CONTRADICTS", None),
+        ),
+        ("/challenges", challenges_json()),
+        ("/provenance", provenance_json()),
+        ("/placement", placement_json()),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(claim_path(p)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&app.upstream)
+            .await;
+    }
+    let sid = app.sign_in("tok");
+
+    let res = app.get_as(&format!("/explorer/claim/{CLAIM}"), &sid).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert!(res.body.contains(CONTENT), "the page carries claim text");
+    assert_eq!(
+        res.header("cache-control"),
+        Some("private, no-store"),
+        "a signed-in claim page must not be cached"
+    );
+
+    // Every other page the handlers render, too.
+    for uri in ["/explorer/", "/explorer/search?q=x"] {
+        let res = app.get_as(uri, &sid).await;
+        assert_eq!(
+            res.header("cache-control"),
+            Some("private, no-store"),
+            "{uri} ({})",
+            res.status
+        );
+    }
+    // The error and auth pages already chose `no-store`, which forbids
+    // storage in every cache; the layer leaves their choice alone.
+    let res = app.get_as("/explorer/no/such/page", &sid).await;
+    assert_eq!(res.header("cache-control"), Some("no-store"));
+
+    // Static assets are untouched: no viewer data, and the versioned URLs
+    // the templates emit must stay immutable.
+    let res = app.get_as("/explorer/static/app.css", &sid).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.header("cache-control"), Some("public, max-age=300"));
+    let res = app
+        .get_as(&app.state.links.static_asset("app.css"), &sid)
+        .await;
+    assert_eq!(
+        res.header("cache-control"),
+        Some("public, max-age=31536000, immutable")
+    );
+
+    // And a handler that chose its own value keeps it.
+    let res = app
+        .get_as(&format!("/explorer/bff/claim/{CLAIM}"), &sid)
+        .await;
+    assert_eq!(res.header("cache-control"), Some("private, no-cache"));
+}
+
 // ---- /claim/:id -----------------------------------------------------------------------
 
 #[tokio::test]

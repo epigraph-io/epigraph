@@ -452,7 +452,18 @@ Then sign in through the browser and open a claim.
     frame-ancestors <EPIGRAPH_EXPLORER_FRAME_ANCESTORS>
   X-Content-Type-Options: nosniff
   Referrer-Policy: same-origin
+  Cache-Control: private, no-store
   ```
+
+  `Cache-Control: private, no-store` is supplied by `security::security_headers`
+  for every response whose handler did not choose a value of its own. Every
+  page is per-viewer (the API filters each read by the signed-in viewer) and a
+  claim page carries claim text verbatim, so none of it may be stored by a
+  shared cache, on disk, or replayed from a Back-Forward cache after
+  sign-out. `/static/*` keeps its own `public, max-age=…` — static files hold
+  no viewer data and the versioned URLs must stay immutable — and the auth
+  routes, the error pages and `/bff/*` keep theirs (`no-store`, `no-store`
+  and `private, no-cache` / `private, no-store`).
 
   There are no inline scripts or styles, so no nonces are needed. There is
   deliberately no `X-Frame-Options`, because `frame-ancestors` governs
