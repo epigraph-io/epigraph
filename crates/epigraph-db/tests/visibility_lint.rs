@@ -2422,6 +2422,15 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch B1 (ruling R-36): same-human owners.
+    (
+        "agent.rs",
+        "humans_of",
+        "READ through migration 149's definer `epigraph_human_of(agent, live)` over a list of \
+         agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
+         itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
+         `agents` and the binding tables are identity data, not tenant content.",
+    ),
     (
         "admin_scope_enforcement.rs",
         "read",
