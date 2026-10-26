@@ -358,12 +358,13 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
         "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
                            embedding_3072 = NULL, \
                            labels = COALESCE(labels, ARRAY[]::text[]) \
-                                    || ARRAY['r18-kept', 'deduped'], \
+                                    || ARRAY['r18-kept', 'deduped', 'deduped-x'], \
                            properties = COALESCE(properties, '{}'::jsonb) \
                              || jsonb_build_object('deduped_into', $1::text, \
                                                    'deduped_by', 'fuzzy_dedup_claims', \
                                                    'deduped_at', now()::text, \
-                                                   'r18_kept', true) \
+                                                   'r18_kept', true, \
+                                                   'dedupedness', 'near miss') \
           WHERE id = $2",
     )
     .bind(canonical)
@@ -437,6 +438,10 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
         labels.iter().any(|l| l == "r18-kept"),
         "CALIBRATION: other labels stay: {labels:?}"
     );
+    assert!(
+        labels.iter().any(|l| l == "deduped-x"),
+        "a label that only starts with 'deduped' is not the legacy marker and stays: {labels:?}"
+    );
     let left: Vec<&String> = properties
         .as_object()
         .map(|o| o.keys().filter(|k| k.starts_with("deduped_")).collect())
@@ -449,6 +454,12 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
         properties["r18_kept"],
         serde_json::json!(true),
         "CALIBRATION: other properties stay: {properties}"
+    );
+    assert_eq!(
+        properties["dedupedness"],
+        serde_json::json!("near miss"),
+        "a key that starts with 'deduped' but not 'deduped_' is not a legacy property and \
+         stays: {properties}"
     );
     let stripped = &undedup["legacy_stripped"];
     assert_eq!(
@@ -469,6 +480,97 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
     assert!(
         stripped["properties"]["deduped_at"].is_string(),
         "{undedup}"
+    );
+    let mut stripped_keys: Vec<&String> = stripped["properties"]
+        .as_object()
+        .map(|o| o.keys().collect())
+        .unwrap_or_default();
+    stripped_keys.sort();
+    assert_eq!(
+        stripped_keys,
+        vec!["deduped_at", "deduped_by", "deduped_into"],
+        "the audit row records exactly the stripped properties, not the near miss: {undedup}"
+    );
+}
+
+/// The R-18 strip is for a backfilled LEGACY mark only. An ordinary mark (the
+/// act, with its applied repair record) whose duplicate happens to carry a
+/// `deduped` label and a `deduped_*` property, the claim's own patchable data,
+/// keeps both through the un-mark, and its audit row records no strip.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_ordinary_unmark_keeps_a_deduped_label_and_deduped_properties(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let author = new_agent(&pool).await;
+    let canonical = new_claim(&pool, author, "ordinary canonical").await;
+    let dup = new_claim(&pool, author, "ordinary duplicate").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut conn,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("act");
+    let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
+    let (status, _) = apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
+    assert!(
+        status.audit_event_id.is_some(),
+        "CALIBRATION: the mark kept an applied record"
+    );
+    sqlx::query(
+        "UPDATE claims SET labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_note', 'the author''s own note') \
+          WHERE id = $1",
+    )
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("the duplicate's own label and property");
+    let carries: bool = sqlx::query_scalar(
+        "SELECT 'deduped' = ANY(labels) AND properties ? 'deduped_note' FROM claims WHERE id = $1",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("the duplicate");
+    assert!(
+        carries,
+        "CALIBRATION: the duplicate carries both before the un-mark"
+    );
+
+    let ut = trigger(CascadeCause::Undedup, author, dup, None);
+    let (outcome, report) = apply_unmark(&mut conn, &viewer, &viewer, &ut, dup, canonical)
+        .await
+        .expect("an ordinary mark un-marks");
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(current(&pool, dup).await, (None, true), "current again");
+    let (labels, properties): (Vec<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT COALESCE(labels, ARRAY[]::text[]), properties FROM claims WHERE id = $1",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("the restored claim");
+    assert!(
+        labels.iter().any(|l| l == "deduped"),
+        "an ordinary un-mark leaves the claim's own 'deduped' label: {labels:?}"
+    );
+    assert_eq!(
+        properties["deduped_note"],
+        serde_json::json!("the author's own note"),
+        "an ordinary un-mark leaves the claim's own deduped_* property: {properties}"
+    );
+    let undedup: serde_json::Value =
+        sqlx::query_scalar("SELECT details FROM security_events WHERE id = $1")
+            .bind(outcome.cascade.audit_event_id.expect("undedup row"))
+            .fetch_one(&pool)
+            .await
+            .expect("undedup row");
+    assert_eq!(undedup["outcome"], "applied", "CALIBRATION: {undedup}");
+    assert!(
+        undedup.get("legacy_stripped").is_none(),
+        "an ordinary un-mark records no strip: {undedup}"
     );
 }
 
