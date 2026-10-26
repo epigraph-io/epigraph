@@ -432,6 +432,18 @@ jobs:
         # test targets link Postgres regardless of the feature flag and cannot
         # pass under --no-default-features today.
         run: cargo check -p epigraph-api --no-default-features --locked
+      - name: Genai feature build check
+        # `genai` is off by default and no other step compiles it, so its code
+        # had no compile-time signal: epigraph-api's POST
+        # /api/v1/analyze/unconstrained handler (whose provider errors must go
+        # through llm_unavailable) was pinned only by a source-scan test, and
+        # epigraph-cli's genai-gated bins and tests were never built (backlog
+        # e0f0cb68). One invocation per package, NOT `-p a -p b`: api's `genai`
+        # does not enable epigraph-cli's, so a combined run would unify
+        # features and could hide a break that only api-alone shows.
+        run: |
+          cargo clippy -p epigraph-api --features genai --all-targets --locked -- -D warnings
+          cargo clippy -p epigraph-cli --features genai --all-targets --locked -- -D warnings
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
