@@ -124,9 +124,13 @@ async fn a_legacy_evidence_signature_on_a_same_content_claim_reports_legacy(pool
 }
 
 /// The write side: `create_strict_signed` stores a signature only when it
-/// verifies as a CLAIM signature. A v1 claim signature is stored (RED before:
-/// it checked the bare digest and silently dropped it), an evidence-tagged one
-/// over the same digest is not.
+/// verifies as a v1 CLAIM signature. A v1 claim signature is stored (RED
+/// before the versioned check: it checked the bare digest and silently dropped
+/// it); a legacy bare-digest one is not, so a NEW row never carries a
+/// signature without a type binding (RED before the write gate went v1-only;
+/// legacy acceptance stays in the verifiers, for old rows). The evidence- and
+/// edge-tagged arms are regression guards: no tagged signature verified as a
+/// claim signature on the base either.
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_strict_signed_stores_only_claim_signatures(pool: PgPool) {
     let signer = AgentSigner::from_bytes(&[0x64u8; 32]).expect("signer");
@@ -134,13 +138,22 @@ async fn create_strict_signed_stores_only_claim_signatures(pool: PgPool) {
     let group = common::personal_group_of(&pool, author).await;
 
     for (content, kind, stored) in [
-        ("R-34: stored, claim-tagged.", SignedEntity::Claim, true),
+        (
+            "R-34: stored, claim-tagged.",
+            Some(SignedEntity::Claim),
+            true,
+        ),
         (
             "R-34: dropped, evidence-tagged.",
-            SignedEntity::Evidence,
+            Some(SignedEntity::Evidence),
             false,
         ),
-        ("R-34: dropped, edge-tagged.", SignedEntity::Edge, false),
+        (
+            "R-34: dropped, edge-tagged.",
+            Some(SignedEntity::Edge),
+            false,
+        ),
+        ("R-34: dropped, legacy bare digest.", None, false),
     ] {
         let mut claim = Claim::new(
             content.to_string(),
@@ -149,7 +162,10 @@ async fn create_strict_signed_stores_only_claim_signatures(pool: PgPool) {
             TruthValue::clamped(0.5),
         );
         claim.content_hash = ContentHasher::hash(content.as_bytes());
-        claim.signature = Some(signer.sign_entity(kind, &claim.content_hash));
+        claim.signature = Some(match kind {
+            Some(kind) => signer.sign_entity(kind, &claim.content_hash),
+            None => signer.sign(&claim.content_hash),
+        });
         let mut conn = pool.acquire().await.expect("acquire");
         ClaimRepository::create_strict_signed(
             &mut conn,
@@ -169,7 +185,7 @@ async fn create_strict_signed_stores_only_claim_signatures(pool: PgPool) {
         assert_eq!(
             (sig.is_some(), signer_id.is_some()),
             (stored, stored),
-            "{kind:?}-tagged signature stored = {stored} expected"
+            "{content}: signature stored = {stored} expected"
         );
     }
 }

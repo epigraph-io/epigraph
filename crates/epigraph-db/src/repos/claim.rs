@@ -6608,8 +6608,9 @@ impl ClaimRepository {
     ///
     /// The signature and `signer_id` are written together or not at all (the
     /// `claims_signature_requires_signer` CHECK), and ONLY when the signature
-    /// verifies under `claim.public_key` over the digest this INSERT stores
-    /// (`blake3(content)`). A signature over a different digest (the ingest
+    /// is a v1 claim signature (ruling R-34: the claim-tagged message, never a
+    /// legacy bare digest) that verifies under `claim.public_key` over the
+    /// digest this INSERT stores (`blake3(content)`). A signature over a different digest (the ingest
     /// planner's seed-scoped compound hash) or one that does not verify is not
     /// stored: an unverifiable signature on a row would read as tampering. The
     /// caller vouches that `signer_id` is the agent whose registered key is
@@ -6638,9 +6639,13 @@ impl ClaimRepository {
 
         let (signature, signer_id): (Option<Vec<u8>>, Option<Uuid>) =
             match (signer_id, claim.signature) {
-                // Versioned (ruling R-34): a v1 claim-tagged signature or a
-                // legacy bare-digest one. A signature tagged for another
-                // entity kind (evidence, edge) is not a claim signature.
+                // Ruling R-34: a NEW row stores only a v1 claim-tagged
+                // signature. A signature tagged for another entity kind
+                // (evidence, edge) is not a claim signature, and a legacy
+                // bare-digest one binds no entity type; every in-tree signer
+                // signs v1, so admitting legacy here would only keep a
+                // downgrade open for new rows. Legacy acceptance stays in the
+                // verifiers, for rows written before v1.
                 (Some(signer), Some(sig))
                     if matches!(
                         epigraph_crypto::SignatureVerifier::verify_entity(
@@ -6649,7 +6654,7 @@ impl ClaimRepository {
                             &content_hash,
                             &sig,
                         ),
-                        Ok(Some(_))
+                        Ok(Some(epigraph_crypto::SignatureScheme::V1))
                     ) =>
                 {
                     (Some(sig.to_vec()), Some(signer))
