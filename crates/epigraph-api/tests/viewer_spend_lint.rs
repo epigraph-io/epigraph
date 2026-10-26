@@ -476,9 +476,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EntityRepository::find_by_name_and_type",
         ],
     ),
-    // DEFECT, measured here and fixed by the next commit: untenanted reads
-    // (experiments, experiment_results, frames by name) and writes against the
-    // hypothesis, which nothing reads through the viewer first.
+    // gated (the hypothesis is read through the viewer, `visible_claim_ids`,
+    // before anything is written; until backlog 4815dcf7 nothing read it) then
+    // untenanted reads (experiments, experiment_results, frames by name) and
+    // writes against it.
     (
         "experiment_loop.rs",
         "analyze_result",

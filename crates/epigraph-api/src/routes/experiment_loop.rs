@@ -239,6 +239,27 @@ pub async fn analyze_result(
             id: experiment_id.to_string(),
         })?;
 
+    // The hypothesis this analysis files evidence on, read as the caller. Every
+    // write below (the analysis, its `provides_evidence` edge, the BBA) lands on
+    // it, so one the caller cannot read is 404, exactly like a missing one, and
+    // nothing is written (backlog 4815dcf7: the viewer was spent only on the
+    // grounding check and the frame choice).
+    {
+        let mut read = state.read_as(&viewer).await?;
+        let visible = epigraph_db::ClaimRepository::visible_claim_ids(
+            &mut *read,
+            &viewer,
+            &[experiment.hypothesis_id],
+        )
+        .await?;
+        if !visible.contains(&experiment.hypothesis_id) {
+            return Err(ApiError::NotFound {
+                entity: "hypothesis".into(),
+                id: experiment.hypothesis_id.to_string(),
+            });
+        }
+    }
+
     // ── Circularity guard ──
     // Reject if the hypothesis claim itself lacks grounded evidence AND
     // the measurements reference claim truth values (not raw experimental data).
