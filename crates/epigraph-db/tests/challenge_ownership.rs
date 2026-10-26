@@ -1415,3 +1415,81 @@ async fn resolution_columns_change_only_through_the_definer(pool: PgPool) {
         "the verdict stands"
     );
 }
+
+/// R-13's one exception is the CHALLENGER withdrawing ITS OWN challenge. An
+/// insider's challenge is owned by the claim's group, so row security admits
+/// every writer of that group to UPDATE it; without the challenger check the
+/// claim's owner could plain-UPDATE a colleague's challenge to `withdrawn`,
+/// unaudited, and 168's CR06 would then refuse every resolution of it. Here a
+/// second writer of the owner's group files a challenge; the owner's
+/// withdrawal of it is refused (CR07) and the row is untouched, and the
+/// colleague's own withdrawal lands (the calibration).
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_challenger_withdraws_its_challenge(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-wd2-owner").await;
+    let (colleague, _) = fixture::seed_agent_with_group(&pool, "ch-wd2-colleague").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(owner_group)
+    .bind(colleague)
+    .execute(&pool)
+    .await
+    .expect("writer membership");
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "withdraw own").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, colleague).await;
+        let t = challenge(&mut conn, claim, colleague, "a colleague's challenge").await;
+        (conn, t)
+    })
+    .await
+    .expect("the colleague's challenge lands");
+    assert_eq!(
+        tenancy(&pool, theirs).await,
+        (owner_group, "public".to_string(), false),
+        "CALIBRATION: an insider's row is the claim group's, so row security admits the owner"
+    );
+    let before = whole_row(&pool, theirs).await;
+
+    let p = pool.clone();
+    let by_owner = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(theirs)
+            .execute(&mut *conn)
+            .await;
+        (conn, r.map(|d| d.rows_affected()))
+    })
+    .await;
+    let e = by_owner.expect_err("the claim's owner does not withdraw a colleague's challenge");
+    assert_eq!(sqlstate(&e).as_deref(), Some("42501"), "{e}");
+    assert!(
+        format!("{e:?}").contains(CR07),
+        "refused by the guard: {e:?}"
+    );
+    assert_eq!(
+        whole_row(&pool, theirs).await,
+        before,
+        "the row is untouched"
+    );
+
+    let p = pool.clone();
+    let by_challenger = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, colleague).await;
+        let r = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(theirs)
+            .execute(&mut *conn)
+            .await;
+        (conn, r.map(|d| d.rows_affected()))
+    })
+    .await;
+    assert_eq!(
+        by_challenger.expect("the challenger withdraws its own challenge"),
+        1
+    );
+    assert_eq!(resolution(&pool, theirs).await.0, "withdrawn");
+}

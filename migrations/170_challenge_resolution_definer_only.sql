@@ -33,16 +33,21 @@
 -- `epigraph_session_is_privileged_writer()` says is NOT privileged):
 --
 --   * UPDATE: the only change of the four resolution columns it may make is
---     `state` to `withdrawn`, from an UNRESOLVED state (`pending`,
---     `under_review`), with `resolved_by`, `resolved_at` and
---     `resolution_details` unchanged. Anything else is refused, CR07 (42501).
+--     the CHALLENGER's own withdrawal: `state` to `withdrawn`, from an
+--     UNRESOLVED state (`pending`, `under_review`), on a row whose
+--     `challenger_id` is the session principal, with `resolved_by`,
+--     `resolved_at` and `resolution_details` unchanged. Anything else is
+--     refused, CR07 (42501).
 --   * INSERT: a challenge is born unresolved: `state = 'pending'` and the three
 --     other columns NULL, else CR07 (42501).
 --
--- Who may withdraw is left to row security: 077's `WITH CHECK` admits only a
--- writer of the row's owning group (the outsider's own group for its
--- writer-owned row; the claim's group for an insider's), and 126 refuses an
--- elevated session every UPDATE.
+-- WHY THE CHALLENGER CHECK. Row security alone admits every writer of the
+-- row's owning group, and an INSIDER's challenge is owned by the claim's
+-- group: without the check the claim's owner could plain-UPDATE a colleague's
+-- challenge to `withdrawn`, unaudited, after which 168's CR06 refuses every
+-- resolution of it. 077's `WITH CHECK` still applies on top (the challenger
+-- must write the row's group), and 126 refuses an elevated session every
+-- UPDATE.
 --
 -- WHY A SETTLED CHALLENGE IS NOT WITHDRAWN. 168's definer refuses to resolve a
 -- withdrawn row (CR06: a withdrawal is the challenger's act and a resolution
@@ -111,8 +116,10 @@ BEGIN
             'epigraph_resolve_challenge; nothing was written'
             USING ERRCODE = '42501';
     END IF;
+    -- Plain `=`: a NULL challenger or a NULL principal never matches.
     IF NEW.state = 'withdrawn'
        AND OLD.state IN ('pending', 'under_review')
+       AND OLD.challenger_id = public.epigraph_principal_id()
        AND NEW.resolved_by IS NOT DISTINCT FROM OLD.resolved_by
        AND NEW.resolved_at IS NOT DISTINCT FROM OLD.resolved_at
        AND NEW.resolution_details IS NOT DISTINCT FROM OLD.resolution_details THEN
@@ -120,8 +127,9 @@ BEGIN
     END IF;
     RAISE EXCEPTION 'CR07: challenge % resolution columns (state, resolved_by, resolved_at, '
         'resolution_details) change only through epigraph_resolve_challenge; an '
-        'application session may only withdraw an unresolved challenge (state pending or '
-        'under_review -> withdrawn, nothing else changed); nothing was written', OLD.id
+        'application session may only withdraw an unresolved challenge it filed (state '
+        'pending or under_review -> withdrawn, nothing else changed); nothing was written',
+        OLD.id
         USING ERRCODE = '42501';
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_challenge_resolution_guard() FROM PUBLIC;

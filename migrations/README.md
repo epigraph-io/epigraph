@@ -1705,9 +1705,10 @@ restart.
   guard `epigraph_challenge_resolution_guard()` (re-owned to
   `epigraph_maintenance`, registered in `tenancy_backfill.rs`'s invoker
   exemptions) on two BEFORE ROW triggers: for an application session (not
-  114's `epigraph_session_is_privileged_writer()`), an UPDATE may only
-  withdraw an UNRESOLVED challenge (`pending` / `under_review` ->
-  `withdrawn`, the other three columns unchanged), and an INSERT is born
+  114's `epigraph_session_is_privileged_writer()`), an UPDATE may only be the
+  CHALLENGER withdrawing its own UNRESOLVED challenge (`pending` /
+  `under_review` -> `withdrawn`, `challenger_id` = the session principal, the
+  other three columns unchanged), and an INSERT is born
   `pending` with no resolver, time or details; anything else is refused
   `CR07` (42501). Closes the forged-`resolved_by` gap 168 left: the outsider
   owns its row, so 077 let it plain-UPDATE its own resolution columns. 168's
