@@ -390,6 +390,134 @@ async fn a_pre_attestation_signature_is_refused_and_reported_as_such(pool: PgPoo
     );
 }
 
+/// The key window is evaluated at the edge's `created_at`, not at
+/// verification time (security review finding 1). The edge is dated three
+/// hours back: a key that was valid then and has since rotated out still
+/// verifies it, and a key registered after it (active from an hour ago) does
+/// not, although "now" would admit it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_key_window_is_judged_at_the_edges_creation_not_at_verification(pool: PgPool) {
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    use chrono::{Duration, Utc};
+    let hour = Duration::hours(1);
+    let now = Utc::now();
+    for (label, status, from, until, want) in [
+        (
+            "rotated-since",
+            "rotated",
+            now - hour * 4,
+            Some(now - hour * 2),
+            true,
+        ),
+        ("registered-after", "active", now - hour, None, false),
+    ] {
+        let key = AgentSigner::from_bytes(&[if want { 0xA1 } else { 0xA2 }; 32]).expect("key");
+        let (w, _) = fixture::seed_agent_with_group(&pool, &format!("edge-at-{label}")).await;
+        sqlx::query(
+            "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, valid_until) \
+             VALUES ($1, $2, 'signing', $3, $4, $5)",
+        )
+        .bind(w)
+        .bind(key.public_key().as_slice())
+        .bind(status)
+        .bind(from)
+        .bind(until)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{label}: seed agent key: {e}"));
+        let a = fixture::seed_public_claim(&pool, w, &format!("{label} A")).await;
+        let b = fixture::seed_public_claim(&pool, w, &format!("{label} B")).await;
+        let id =
+            EdgeRepository::create(&pool, a, "claim", b, "claim", "supports", None, None, None)
+                .await
+                .expect("edge");
+        sqlx::query("UPDATE edges SET created_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(now - hour * 3)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: backdate the edge: {e}"));
+        // Signed from the STORED row, so the digest carries the backdated
+        // created_at.
+        let mut conn = pool.acquire().await.expect("acquire");
+        let out = EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &bypass, id, &key, w)
+            .await
+            .expect("sign");
+        assert!(
+            matches!(out, EdgeSignOutcome::Signed { .. }),
+            "{label}: {out:?}"
+        );
+        drop(conn);
+
+        let check = verify(&pool, id).await;
+        assert_eq!(check.content_matches, Some(true), "{label}: {check:?}");
+        assert!(!check.pre_attestation, "{label}: {check:?}");
+        assert_eq!(check.signature_valid, want, "{label}: {check:?}");
+    }
+}
+
+/// The `{WRITABLE:e}` predicate in `sign_created_edge_conn` refuses on its
+/// own. The session here is the harness superuser, which row security never
+/// restricts, stamped as the writer W: the edge is W's (its owner group is
+/// W's), a viewer of the stranger Z gets `NotSignable` from the predicate
+/// alone, and W's viewer on the same session signs (so the session itself
+/// would have allowed the write).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_write_predicate_alone_refuses_a_viewer_that_cannot_write_the_edge(pool: PgPool) {
+    let w_key = AgentSigner::from_bytes(&[0x79; 32]).expect("w");
+    let z_key = AgentSigner::from_bytes(&[0x7A; 32]).expect("z");
+    let w = seed_signing_writer(&pool, "edge-pred-w", &w_key).await;
+    let z = seed_signing_writer(&pool, "edge-pred-z", &z_key).await;
+    let a = fixture::seed_public_claim(&pool, w, "pred A").await;
+    let b = fixture::seed_public_claim(&pool, w, "pred B").await;
+    let w_viewer = Viewer::resolve(&pool, w).await.expect("W's viewer");
+    let z_viewer = Viewer::resolve(&pool, z).await.expect("Z's viewer");
+
+    let mut conn = pool.acquire().await.expect("acquire").detach();
+    let is_super: bool =
+        sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(&mut conn)
+            .await
+            .expect("role");
+    assert!(
+        is_super,
+        "the arm needs a session row security does not restrict"
+    );
+    stamp(&mut conn, &pool, w).await;
+    let id = EdgeRepository::create(
+        &mut conn, a, "claim", b, "claim", "supports", None, None, None,
+    )
+    .await
+    .expect("W writes");
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM edges WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("owner");
+    assert!(
+        w_viewer.writable_groups().contains(&owner) && !z_viewer.writable_groups().contains(&owner),
+        "fixture: the edge must be W's to write and not Z's"
+    );
+
+    let z_try =
+        EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &z_viewer, id, &z_key, z)
+            .await
+            .expect("Z's attempt runs");
+    assert_eq!(
+        z_try,
+        EdgeSignOutcome::NotSignable,
+        "a viewer that cannot write the edge attested it"
+    );
+    let w_sign =
+        EdgeSignatureRepository::sign_created_edge_conn(&mut conn, &w_viewer, id, &w_key, w)
+            .await
+            .expect("W signs");
+    assert!(
+        matches!(w_sign, EdgeSignOutcome::Signed { .. }),
+        "{w_sign:?}"
+    );
+}
+
 /// The signer's key must be ADMITTED when the edge was created, by the rule
 /// the claim verifier uses (`key_window_admits`): an active or closed-window
 /// rotated key verifies; a revoked, pending, not-yet-valid or expired one does
