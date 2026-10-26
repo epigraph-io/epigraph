@@ -411,30 +411,31 @@ pub async fn assess_claim(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &indexed_rows).await?
     };
 
-    // Cautious-combine within each dependent group
-    let mut group_results = Vec::new();
-    for group in &analysis.dependent_groups {
-        if group.is_empty() {
-            continue;
-        }
-        let combined_group = group
-            .iter()
-            .skip(1)
-            .try_fold(group[0].clone(), |acc, m| {
-                combination::cautious_combine(&acc, m)
-            })
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Cautious combine failed: {e}"),
-            })?;
-        group_results.push(combined_group);
-    }
-
-    // Merge independent BBAs + group results
+    // Reduce each dependent group (sibling agents of one owner, ruling R-36)
+    // by Denoeux's cautious rule, the reduction the engine fold applies
+    // (`source_dependence::cautious_reduce`), so this response and the cache
+    // agree on what siblings are worth. The min-commonality
+    // `combination::cautious_combine` used here before drops open-world mass,
+    // which every default-shaped assessment carries. A group the rule is not
+    // defined on folds as independent, as before.
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
-    for_combination.extend(group_results);
+    let mut used_cautious = false;
+    for group in &analysis.dependent_groups {
+        match epigraph_engine::source_dependence::cautious_reduce(group).map_err(|e| {
+            ApiError::InternalError {
+                message: format!("Cautious combine failed: {e}"),
+            }
+        })? {
+            Some((reduced, _)) => {
+                used_cautious = true;
+                for_combination.push(reduced);
+            }
+            None => for_combination.extend(group.iter().cloned()),
+        }
+    }
 
     // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
@@ -511,7 +512,7 @@ pub async fn assess_claim(
     // Conflict/method summary of this frame's fold, for the scoped-belief
     // cache below (no combined mass_functions row is stored).
     let final_k = reports.last().map(|r| r.conflict_k);
-    let used_cautious = !analysis.dependent_groups.is_empty();
+
     let final_method_str = if used_cautious {
         let adaptive = reports
             .last()

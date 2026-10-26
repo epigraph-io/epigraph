@@ -283,6 +283,65 @@ struct ScopedBeliefWrite {
     pignistic_prob: f64,
 }
 
+/// A stored scoped belief (`ds_combined_beliefs`) of one scope: the scope's
+/// stored BBAs, as this handler always folded them (raw masses, no discount),
+/// folded by the engine's owner-aware rule (ruling R-36: sibling agents of one
+/// human are reduced cautiously, never multiplied). `None` when no row is left
+/// or the fold fails (best-effort, as before).
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+async fn scoped_belief_write(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ds_frame: &epigraph_ds::FrameOfDiscernment,
+    h_idx: Option<i32>,
+    mut rows: Vec<epigraph_db::MassFunctionRow>,
+    conflict_threshold: f64,
+    scope_type: &'static str,
+    scope_id: Uuid,
+) -> Option<ScopedBeliefWrite> {
+    rows.sort_by_key(|r| r.id);
+    let rows: Vec<(epigraph_db::MassFunctionRow, epigraph_ds::MassFunction)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            epigraph_ds::MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
+                .ok()
+                .map(|m| (row, m))
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let stored: Vec<epigraph_db::MassFunctionRow> = rows.iter().map(|(r, _)| r.clone()).collect();
+    let sources = epigraph_engine::source_dependence::bba_sources_for_rows(conn, viewer, &stored)
+        .await
+        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope sources: {e}"))
+        .ok()?;
+    let folded = rows.len() >= 2;
+    let items = sources
+        .into_iter()
+        .zip(rows.into_iter().map(|(_, m)| m))
+        .collect();
+    let (combined, k) = epigraph_engine::source_dependence::combine_with_owner_dependence(
+        items,
+        conflict_threshold,
+    )
+    .ok()?;
+    let (belief, plausibility, pignistic_prob, mass_on_missing) =
+        compute_hypothesis_belief(&combined, ds_frame, h_idx);
+    Some(ScopedBeliefWrite {
+        scope_type,
+        scope_id,
+        belief,
+        plausibility,
+        mass_on_empty: k,
+        mass_on_missing,
+        conflict_k: folded.then_some(k),
+        strategy: folded.then(|| "Dempster".to_string()),
+        pignistic_prob,
+    })
+}
+
 /// Close a best-effort write's SAVEPOINT: release it when the write landed,
 /// roll back to it (logging `what`) when it was refused.
 ///
@@ -1958,56 +2017,19 @@ pub async fn submit_evidence(
             )
             .await
             .unwrap_or_default();
-
-        let mut p_indexed: Vec<(Uuid, MassFunction)> = perspective_rows
-            .iter()
-            .filter_map(|row| {
-                MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                    .ok()
-                    .map(|m| (row.id, m))
-            })
-            .collect();
-        p_indexed.sort_by_key(|(id, _)| *id);
-        let perspective_masses: Vec<MassFunction> = p_indexed.into_iter().map(|(_, m)| m).collect();
-
-        if perspective_masses.len() >= 2 {
-            if let Ok((p_combined, p_reports)) =
-                combination::combine_multiple(&perspective_masses, request.conflict_threshold)
-            {
-                let (p_bel, p_pl, p_betp, p_m_missing) =
-                    compute_hypothesis_belief(&p_combined, &ds_frame, h_idx);
-                let p_m_empty = combination::fold_conflict(&p_combined, &p_reports);
-                let p_k = p_reports.last().map(|r| r.conflict_k);
-                let p_method_str = p_reports.last().map(|r| format!("{:?}", r.method_used));
-
-                scoped_beliefs.push(ScopedBeliefWrite {
-                    scope_type: "perspective",
-                    scope_id: perspective_id,
-                    belief: p_bel,
-                    plausibility: p_pl,
-                    mass_on_empty: p_m_empty,
-                    mass_on_missing: p_m_missing,
-                    conflict_k: p_k,
-                    strategy: p_method_str,
-                    pignistic_prob: p_betp,
-                });
-            }
-        } else if perspective_masses.len() == 1 {
-            let (p_bel, p_pl, p_betp, p_m_missing) =
-                compute_hypothesis_belief(&perspective_masses[0], &ds_frame, h_idx);
-            let p_m_empty = perspective_masses[0].mass_of_empty();
-
-            scoped_beliefs.push(ScopedBeliefWrite {
-                scope_type: "perspective",
-                scope_id: perspective_id,
-                belief: p_bel,
-                plausibility: p_pl,
-                mass_on_empty: p_m_empty,
-                mass_on_missing: p_m_missing,
-                conflict_k: None,
-                strategy: None,
-                pignistic_prob: p_betp,
-            });
+        if let Some(write) = scoped_belief_write(
+            read,
+            &viewer,
+            &ds_frame,
+            h_idx,
+            perspective_rows,
+            request.conflict_threshold,
+            "perspective",
+            perspective_id,
+        )
+        .await
+        {
+            scoped_beliefs.push(write);
         }
 
         // Community scope: for each community this perspective belongs to
@@ -2075,59 +2097,19 @@ pub async fn submit_evidence(
                         )
                         .await
                         .unwrap_or_default();
-
-                    let mut c_indexed: Vec<(Uuid, MassFunction)> = community_rows
-                        .iter()
-                        .filter_map(|row| {
-                            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                                .ok()
-                                .map(|m| (row.id, m))
-                        })
-                        .collect();
-                    c_indexed.sort_by_key(|(id, _)| *id);
-                    let community_masses: Vec<MassFunction> =
-                        c_indexed.into_iter().map(|(_, m)| m).collect();
-
-                    if community_masses.len() >= 2 {
-                        if let Ok((c_combined, c_reports)) = combination::combine_multiple(
-                            &community_masses,
-                            request.conflict_threshold,
-                        ) {
-                            let (c_bel, c_pl, c_betp, c_m_missing) =
-                                compute_hypothesis_belief(&c_combined, &ds_frame, h_idx);
-                            let c_m_empty = combination::fold_conflict(&c_combined, &c_reports);
-                            let c_k = c_reports.last().map(|r| r.conflict_k);
-                            let c_method_str =
-                                c_reports.last().map(|r| format!("{:?}", r.method_used));
-
-                            scoped_beliefs.push(ScopedBeliefWrite {
-                                scope_type: "community",
-                                scope_id: community_id,
-                                belief: c_bel,
-                                plausibility: c_pl,
-                                mass_on_empty: c_m_empty,
-                                mass_on_missing: c_m_missing,
-                                conflict_k: c_k,
-                                strategy: c_method_str,
-                                pignistic_prob: c_betp,
-                            });
-                        }
-                    } else if community_masses.len() == 1 {
-                        let (c_bel, c_pl, c_betp, c_m_missing) =
-                            compute_hypothesis_belief(&community_masses[0], &ds_frame, h_idx);
-                        let c_m_empty = community_masses[0].mass_of_empty();
-
-                        scoped_beliefs.push(ScopedBeliefWrite {
-                            scope_type: "community",
-                            scope_id: community_id,
-                            belief: c_bel,
-                            plausibility: c_pl,
-                            mass_on_empty: c_m_empty,
-                            mass_on_missing: c_m_missing,
-                            conflict_k: None,
-                            strategy: None,
-                            pignistic_prob: c_betp,
-                        });
+                    if let Some(write) = scoped_belief_write(
+                        read,
+                        &viewer,
+                        &ds_frame,
+                        h_idx,
+                        community_rows,
+                        request.conflict_threshold,
+                        "community",
+                        community_id,
+                    )
+                    .await
+                    {
+                        scoped_beliefs.push(write);
                     }
                 }
             }
@@ -2738,7 +2720,7 @@ pub async fn get_pignistic(
     Path(claim_id): Path<Uuid>,
     Query(params): Query<PignisticQuery>,
 ) -> Result<Json<PignisticResponse>, ApiError> {
-    use epigraph_ds::{combination, measures, FrameOfDiscernment, MassFunction};
+    use epigraph_ds::{measures, FrameOfDiscernment, MassFunction};
 
     let frame_id = params.frame_id;
 
@@ -2775,22 +2757,28 @@ pub async fn get_pignistic(
     )
     .await?;
 
+    // The BBAs with their writers' owners, for the same-human rule (ruling
+    // R-36).
+    let mut rows: Vec<epigraph_db::MassFunctionRow> = all_rows
+        .into_iter()
+        .filter(|row| row.combination_method.as_deref() == Some("discount"))
+        .collect();
+    rows.sort_by_key(|r| r.id);
+    let (rows, masses): (Vec<epigraph_db::MassFunctionRow>, Vec<MassFunction>) = rows
+        .into_iter()
+        .filter_map(|row| {
+            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
+                .ok()
+                .map(|m| (row, m))
+        })
+        .unzip();
+    let sources =
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, &viewer, &rows).await?;
+
     // Finished here rather than at the end of the handler: this is the last
     // statement, and the `masses.is_empty()` branch below returns early. Every
     // path after this point is pure computation over rows already held.
     crate::routes::finish_scoped_read(read, "get_pignistic").await?;
-
-    let mut indexed: Vec<(Uuid, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, m))
-        })
-        .collect();
-    indexed.sort_by_key(|(id, _)| *id);
-    let masses: Vec<MassFunction> = indexed.into_iter().map(|(_, m)| m).collect();
 
     if masses.is_empty() {
         // No evidence — return uniform pignistic
@@ -2820,17 +2808,17 @@ pub async fn get_pignistic(
         }));
     }
 
-    // Combine (or use single BBA if only one)
-    let (combined, reports) = if masses.len() == 1 {
-        (masses.into_iter().next().unwrap(), vec![])
-    } else {
-        combination::combine_multiple(&masses, 0.3).map_err(|e| ApiError::InternalError {
-            message: format!("Combination failed: {e}"),
-        })?
-    };
-
-    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
-    let m_empty = combination::fold_conflict(&combined, &reports);
+    // Combine (a single BBA is returned as-is), by the engine's owner-aware
+    // fold: sibling agents of one human never multiply (ruling R-36). The
+    // second value is the conflict the fold saw (U025: Dempster normalises it
+    // out of `combined`).
+    let (combined, m_empty) = epigraph_engine::source_dependence::combine_with_owner_dependence(
+        sources.into_iter().zip(masses).collect(),
+        0.3,
+    )
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Combination failed: {e}"),
+    })?;
     let m_missing = combined.mass_of_missing();
 
     let hypotheses = frame_row

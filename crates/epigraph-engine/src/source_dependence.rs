@@ -244,46 +244,96 @@ fn same_source_slots(
 //   evidence, workflow trials, edges from distinct source claims) reinforce
 //   by Dempster, as before.
 // - ACROSS distinct agents of ONE owner (the live human they resolve to,
-//   `epigraph_human_of(agent, true)`, else the agent itself), BBAs that say
-//   the same thing (one-sided on one focal element, see [`one_sided_focus`])
-//   never multiply: each agent's own fold of its rows on that focal element
-//   is one input, and the group keeps the STRONGEST input (the largest mass on
-//   the focal element). For classical simple supports on one focal set that
-//   is exactly Denoeux's cautious rule ([`combination::cautious_combine`] is
-//   min-commonality, which there keeps the larger weight); for the open-world
-//   one-sided BBAs `submit_ds_evidence` callers write (`{"0": x, "~": y}`),
-//   which `cautious_combine` does not model, it is the same strongest-wins
-//   rule SPEC §3.3's within-group partition ([`item_partition`]) uses. A
-//   second agent of the same human agreeing therefore adds nothing.
-// - A sibling that says the OPPOSITE (another focal element) is a contest:
-//   its BBA stays a separate Dempster input, so the disagreement shows up as
-//   conflict rather than being normalised away by the min-commonality rule.
+//   `epigraph_human_of(agent, true)`, else the agent itself), BBAs never
+//   multiply: each agent's own fold of its rows is one input, and the inputs
+//   are combined with Denoeux's cautious rule ([`combination::cautious_rule`],
+//   the rule for non-distinct sources), whatever their shape. It is
+//   idempotent (a sibling restating the owner adds nothing), keeps the
+//   stronger of two supports for one hypothesis, and on a support and a
+//   refutation it equals the conjunctive rule, so a CONTEST still shows as
+//   conflict exactly as Dempster's rule shows it. The group's result is
+//   normalised like a Dempster step and its conflict counted with the fold's.
+// - The cautious rule needs non-dogmatic inputs. A closed-world (classical)
+//   BBA beside an open-world one is dogmatic about the truth lying outside
+//   the frame, so such a pair is regularised: each input keeps
+//   `1 - CAUTIOUS_REGULARIZATION` of its masses and moves the rest to total
+//   ignorance (Denoeux's own remedy), which moves no value by more than that
+//   fraction. A frame above [`MAX_CAUTIOUS_HYPOTHESES`] folds as independent,
+//   as before.
 // - An agent bound to no human is its own owner and has no sibling, so its
-//   rows fold exactly as before. So does a row with no `source_agent_id`, and
-//   a BBA that is not one-sided (mass on both a hypothesis and its rival, as
-//   `/claims/:id/assess`'s directed BBAs carry, a complement focal element,
-//   or conflict mass): no reduction that keeps both sides is defined here, so
-//   those fold as independent. Known limit, recorded with the ruling.
+//   rows fold exactly as before. So does a row with no `source_agent_id`.
 
-/// The one focal element a ONE-SIDED BBA commits mass to: exactly one
-/// positive focal element other than Θ carries mass, besides closed- and
-/// open-world ignorance. `None` for anything else (vacuous, conflict mass,
-/// another complement element, or mass on two non-Θ elements).
-fn one_sided_focus(m: &MassFunction) -> Option<FocalElement> {
+/// The share of a dogmatic BBA moved to total ignorance before the cautious
+/// rule, which is undefined on dogmatic inputs. A numerical regularisation,
+/// not a belief parameter: it bounds how far any value can move.
+// belief-profile: allow-literal (numerical regularisation of the cautious rule, Denoeux 2008)
+const CAUTIOUS_REGULARIZATION: f64 = 1e-9;
+
+/// `m` with `CAUTIOUS_REGULARIZATION` of its mass moved to total ignorance:
+/// open-world `(∅, true)` when `open`, else Θ.
+fn regularized(m: &MassFunction, open: bool) -> MassFunction {
     let frame = m.frame();
-    let mut focus: Option<&FocalElement> = None;
-    for (fe, _) in m.focal_elements() {
-        // Ignorance, closed (Θ) or open-world (`~`, which the JSON form
-        // parses to the vacuous complement element, and the missing element).
-        if fe.is_theta(frame) || fe.is_missing(frame) || fe.is_vacuous_element() {
-            continue;
-        }
-        if fe.is_conflict() || fe.complement || focus.is_some() {
-            return None;
-        }
-        focus = Some(fe);
+    let ignorance = if open {
+        FocalElement::vacuous()
+    } else {
+        FocalElement::theta(frame)
+    };
+    let keep = 1.0 - CAUTIOUS_REGULARIZATION;
+    let mut masses: std::collections::BTreeMap<FocalElement, f64> = m
+        .focal_elements()
+        .map(|(fe, v)| (fe.clone(), v * keep))
+        .collect();
+    *masses.entry(ignorance).or_insert(0.0) += CAUTIOUS_REGULARIZATION;
+    MassFunction::from_raw(frame.clone(), masses)
+}
+
+/// One cautious step, regularising the inputs when the rule is undefined on
+/// them as given. `None` when it stays undefined (a frame too large).
+fn cautious_step(a: &MassFunction, b: &MassFunction) -> Result<Option<MassFunction>, DsError> {
+    if a.frame().hypothesis_count() > MAX_CAUTIOUS_HYPOTHESES {
+        return Ok(None);
     }
-    focus.cloned()
+    if let Some(c) = combination::cautious_rule(a, b)? {
+        return Ok(Some(c));
+    }
+    let open = !(a.is_classical() && b.is_classical());
+    combination::cautious_rule(&regularized(a, open), &regularized(b, open))
+}
+
+/// Reduce BBAs of NON-DISTINCT sources (sibling agents of one owner) to one,
+/// by Denoeux's cautious rule, normalised like a Dempster step. Returns the
+/// reduced BBA and the conflict the reduction saw (its empty-set mass before
+/// normalisation), or `None` when the rule is not defined on them (a frame
+/// above [`MAX_CAUTIOUS_HYPOTHESES`], or total conflict), in which case the
+/// caller folds them as independent, as before.
+///
+/// Shared by the engine fold ([`combine_with_owner_dependence`]) and the REST
+/// `/claims/:id/assess` dependent groups, so the two agree.
+///
+/// # Errors
+/// Propagates `DsError` from the cautious rule.
+pub fn cautious_reduce(members: &[MassFunction]) -> Result<Option<(MassFunction, f64)>, DsError> {
+    let Some((first, rest)) = members.split_first() else {
+        return Ok(None);
+    };
+    let mut acc = first.clone();
+    for m in rest {
+        match cautious_step(&acc, m)? {
+            Some(c) => acc = c,
+            None => return Ok(None),
+        }
+    }
+    let k = acc.mass_of_conflict();
+    if k >= 1.0 {
+        return Ok(None);
+    }
+    let frame = acc.frame().clone();
+    let masses: std::collections::BTreeMap<FocalElement, f64> = acc
+        .focal_elements()
+        .filter(|(fe, _)| !fe.is_conflict())
+        .map(|(fe, v)| (fe.clone(), v / (1.0 - k)))
+        .collect();
+    Ok(Some((MassFunction::from_raw(frame, masses), k)))
 }
 
 /// Who a stored BBA speaks for: its writing agent, the owner that agent
@@ -353,11 +403,10 @@ struct OwnerPartition {
     /// BBAs that fold as independent evidence: everything outside a sibling
     /// group, already reduced by the same-source rule.
     independent: Vec<MassFunction>,
-    /// One group per (owner, focal element) that at least two distinct agents
-    /// of that owner speak to, in first-appearance order: the focal element
-    /// and, per agent, that agent's own fold of its rows on it (same-source
-    /// rule, then Dempster).
-    sibling_groups: Vec<(FocalElement, Vec<MassFunction>)>,
+    /// One group per owner that at least two distinct agents speak for, in
+    /// first-appearance order: per agent, that agent's own fold of its rows
+    /// (same-source rule, then Dempster).
+    sibling_groups: Vec<Vec<MassFunction>>,
 }
 
 /// Split already-discounted BBAs into independent inputs and same-owner
@@ -366,36 +415,32 @@ fn owner_partition(
     items: Vec<(BbaSource, MassFunction)>,
     conflict_threshold: f64,
 ) -> Result<OwnerPartition, DsError> {
-    type OwnerKey = (Uuid, FocalElement);
-    let owner_key = |src: &BbaSource, mf: &MassFunction| -> Option<(OwnerKey, Uuid)> {
-        let agent = src.agent_id?;
-        let owner = src.owner_id?;
-        one_sided_focus(mf).map(|f| ((owner, f), agent))
-    };
+    let owner_key =
+        |src: &BbaSource| -> Option<(Uuid, Uuid)> { Some((src.owner_id?, src.agent_id?)) };
 
-    // Which (owner, focal element) keys have at least two distinct agents.
-    let mut agents_per_key: HashMap<OwnerKey, Vec<Uuid>> = HashMap::new();
-    for (src, mf) in &items {
-        if let Some((k, agent)) = owner_key(src, mf) {
-            let agents = agents_per_key.entry(k).or_default();
+    // Which owners have at least two distinct agents among the rows.
+    let mut agents_per_owner: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (src, _) in &items {
+        if let Some((owner, agent)) = owner_key(src) {
+            let agents = agents_per_owner.entry(owner).or_default();
             if !agents.contains(&agent) {
                 agents.push(agent);
             }
         }
     }
 
-    // Per sibling key, per agent (both in first-appearance order), that
-    // agent's rows on the key; everything else stays on the legacy path.
-    let mut group_order: Vec<OwnerKey> = Vec::new();
+    // Per sibling owner, per agent (both in first-appearance order), that
+    // agent's rows; everything else stays on the legacy path.
+    let mut group_order: Vec<Uuid> = Vec::new();
     #[allow(clippy::type_complexity)]
-    let mut groups: HashMap<OwnerKey, Vec<(Uuid, Vec<(Option<SourceKey>, MassFunction)>)>> =
+    let mut groups: HashMap<Uuid, Vec<(Uuid, Vec<(Option<SourceKey>, MassFunction)>)>> =
         HashMap::new();
     let mut rest: Vec<(Option<SourceKey>, MassFunction)> = Vec::new();
     for (src, mf) in items {
-        match owner_key(&src, &mf) {
-            Some((k, agent)) if agents_per_key.get(&k).is_some_and(|a| a.len() > 1) => {
-                let per_agent = groups.entry(k.clone()).or_insert_with(|| {
-                    group_order.push(k);
+        match owner_key(&src) {
+            Some((owner, agent)) if agents_per_owner.get(&owner).is_some_and(|a| a.len() > 1) => {
+                let per_agent = groups.entry(owner).or_insert_with(|| {
+                    group_order.push(owner);
                     Vec::new()
                 });
                 match per_agent.iter_mut().find(|(a, _)| *a == agent) {
@@ -408,15 +453,15 @@ fn owner_partition(
     }
 
     let mut sibling_groups = Vec::with_capacity(group_order.len());
-    for k in group_order {
-        let per_agent = groups.remove(&k).unwrap_or_default();
+    for owner in group_order {
+        let per_agent = groups.remove(&owner).unwrap_or_default();
         let mut members = Vec::with_capacity(per_agent.len());
         for (_, rows) in per_agent {
             let (agent_fold, _) =
                 dempster_across_items(same_source_slots(rows)?, conflict_threshold)?;
             members.push(agent_fold);
         }
-        sibling_groups.push((k.1, members));
+        sibling_groups.push(members);
     }
 
     Ok(OwnerPartition {
@@ -426,13 +471,14 @@ fn owner_partition(
 }
 
 /// [`combine_with_source_dependence`] with the same-human rule (R-36): the
-/// fold every combine of stored BBAs uses. Each sibling group keeps its
-/// strongest member (the largest mass on the group's focal element; the
-/// first such member on a tie), then everything is Dempster-folded. Same
-/// return shape: the combined BBA and the conflict the fold saw.
+/// fold every combine of stored BBAs uses. Each sibling group is reduced by
+/// [`cautious_reduce`] (a group the rule is not defined on folds as
+/// independent), then everything is Dempster-folded. Same return shape: the
+/// combined BBA and the conflict the fold saw, which includes the conflict
+/// the sibling reductions saw (`1 - prod(1 - k)` over all steps).
 ///
 /// # Errors
-/// Propagates `DsError` from the Dempster folds, including
+/// Propagates `DsError` from the cautious or Dempster folds, including
 /// `combine_multiple`'s error when `items` is empty.
 pub fn combine_with_owner_dependence(
     items: Vec<(BbaSource, MassFunction)>,
@@ -442,19 +488,18 @@ pub fn combine_with_owner_dependence(
         mut independent,
         sibling_groups,
     } = owner_partition(items, conflict_threshold)?;
-    for (focus, members) in sibling_groups {
-        let mut strongest: Option<MassFunction> = None;
-        for m in members {
-            if strongest
-                .as_ref()
-                .is_none_or(|s| m.mass_of(&focus) > s.mass_of(&focus))
-            {
-                strongest = Some(m);
+    let mut survived: Option<f64> = None;
+    for members in sibling_groups {
+        match cautious_reduce(&members)? {
+            Some((reduced, k)) => {
+                survived = Some(survived.unwrap_or(1.0) * (1.0 - k));
+                independent.push(reduced);
             }
+            None => independent.extend(members),
         }
-        independent.extend(strongest);
     }
-    dempster_across_items(independent, conflict_threshold)
+    let (combined, k) = dempster_across_items(independent, conflict_threshold)?;
+    Ok((combined, survived.map_or(k, |s| 1.0 - (1.0 - k) * s)))
 }
 
 // ── Canonical item key (atom-level belief, SPEC §3.3) ──────────────────────
@@ -1261,15 +1306,29 @@ mod tests {
         assert!((m_true(&c) - 0.88).abs() < 1e-9, "got {}", m_true(&c));
     }
 
+    fn assert_close(a: &MassFunction, b: &MassFunction) {
+        let keys: std::collections::BTreeSet<&FocalElement> =
+            a.masses().keys().chain(b.masses().keys()).collect();
+        for k in keys {
+            let (x, y) = (a.mass_of(k), b.mass_of(k));
+            assert!((x - y).abs() < 1e-9, "{k:?}: {x} vs {y}\n{a:?}\n{b:?}");
+        }
+    }
+
     #[test]
     fn a_siblings_refutation_is_a_contest_not_collapsed() {
+        // On a support and a refutation the cautious rule IS the conjunctive
+        // rule, so after normalisation the siblings' contest reads exactly as
+        // Dempster's fold of the two, conflict included.
         let sup = support(0, 0.8, 1.0);
         let refute = support(1, 0.5, 1.0);
-        let (dempster, _) =
+        let (dempster, reports) =
             combination::combine_multiple(&[sup.clone(), refute.clone()], 0.9).unwrap();
+        let dk = combination::fold_conflict(&dempster, &reports);
         let (c, k) =
             combine_with_owner_dependence(vec![(by(1, 9), sup), (by(2, 9), refute)], 0.9).unwrap();
-        assert_eq!(c.masses(), dempster.masses());
+        assert_close(&c, &dempster);
+        assert!((k - dk).abs() < 1e-9, "conflict {k} vs Dempster's {dk}");
         assert!(k > 0.3, "the contest must show as conflict, got {k}");
     }
 
@@ -1319,34 +1378,46 @@ mod tests {
         let (c, _) =
             combine_with_owner_dependence(vec![(by(1, 9), ow(0.6)), (by(2, 9), ow(0.7))], 0.9)
                 .unwrap();
-        assert_eq!(c.masses(), ow(0.7).masses());
-        assert_ne!(c.masses(), dempster.masses());
+        assert_close(&c, &ow(0.7));
+        assert!((m_true(&dempster) - m_true(&c)).abs() > 1e-3);
     }
 
     #[test]
-    fn two_sided_sibling_bbas_fold_independently() {
-        // A documented limit: a BBA with mass on both a hypothesis and its
-        // rival (an assess-built directed BBA) has no one-sided reduction, so
-        // siblings' two-sided BBAs fold as before.
+    fn two_sided_siblings_do_not_aggregate() {
+        // The shape `/claims/:id/assess` writes (mass on a hypothesis and its
+        // rival, plus open-world ignorance): a sibling restating it adds
+        // nothing, and a sibling that is weaker on every count adds nothing.
         let mixed = |t: f64, f: f64| {
             MassFunction::from_json_masses(
                 frame(),
-                &serde_json::json!({"0": t, "1": f, "0,1": 1.0 - t - f}),
+                &serde_json::json!({"0": t, "1": f, "0,1": 0.95 - t - f, "~": 0.05}),
             )
             .unwrap()
         };
-        let legacy = combine_with_source_dependence(
-            vec![(None, mixed(0.6, 0.1)), (None, mixed(0.5, 0.2))],
-            0.9,
-        )
-        .unwrap()
-        .0;
+        let slot = mixed(0.6, 0.1);
         let (c, _) = combine_with_owner_dependence(
-            vec![(by(1, 9), mixed(0.6, 0.1)), (by(2, 9), mixed(0.5, 0.2))],
+            vec![(by(1, 9), slot.clone()), (by(2, 9), slot.clone())],
             0.9,
         )
         .unwrap();
-        assert_eq!(c.masses(), legacy.masses());
+        assert_close(&c, &slot);
+        let (independent, _) =
+            combination::combine_multiple(&[slot.clone(), slot.clone()], 0.9).unwrap();
+        assert!(m_true(&independent) > m_true(&c) + 1e-3);
+    }
+
+    #[test]
+    fn a_closed_world_sibling_beside_an_open_world_one_is_regularised_not_multiplied() {
+        // update_with_evidence writes classical BBAs, submit_ds_evidence often
+        // open-world ones; the cautious rule needs a regularisation there, and
+        // still keeps the stronger support (to within it).
+        let closed = support(0, 0.7, 1.0);
+        let open =
+            MassFunction::from_json_masses(frame(), &serde_json::json!({"0": 0.6, "~": 0.4}))
+                .unwrap();
+        let (c, _) =
+            combine_with_owner_dependence(vec![(by(1, 9), closed), (by(2, 9), open)], 0.9).unwrap();
+        assert!((m_true(&c) - 0.7).abs() < 1e-6, "got {}", m_true(&c));
     }
 
     #[test]

@@ -57,7 +57,7 @@ async fn submit(state: &AppState, pool: &PgPool, caller: Uuid, claim: Uuid, fram
         "masses": {"0": t, "0,1": 1.0 - t},
     }))
     .expect("request");
-    submit_evidence(
+    let _created = submit_evidence(
         ViewerExtractor(viewer),
         State(state.clone()),
         Path(frame),

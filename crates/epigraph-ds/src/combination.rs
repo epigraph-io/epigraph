@@ -783,6 +783,163 @@ pub fn cautious_combine(m1: &MassFunction, m2: &MassFunction) -> Result<MassFunc
     Ok(MassFunction::from_raw(frame.clone(), masses))
 }
 
+/// Frames above this many hypotheses are refused by [`cautious_rule`]: it
+/// walks the power set of the frame plus one open-world element, `2^(n+1)`
+/// subsets, several times.
+pub const CAUTIOUS_RULE_MAX_HYPOTHESES: usize = 10;
+
+/// Denoeux's cautious conjunctive rule (Denoeux 2008, "Conjunctive and
+/// disjunctive combination of belief functions induced by nondistinct bodies
+/// of evidence"), on CDST mass functions.
+///
+/// The rule for NON-DISTINCT sources: each BBA is decomposed into its
+/// canonical conjunctive weights `w(A)` (from the commonality function,
+/// `ln w(A) = -sum_{B >= A} (-1)^{|B \ A|} ln q(B)`), the two weight functions
+/// are combined by `min`, and the result is rebuilt by the conjunctive rule.
+/// Unlike [`cautious_combine`] (min-commonality), it is the genuine rule: it is
+/// commutative, associative and IDEMPOTENT for every non-dogmatic BBA (a BBA
+/// combined with itself is itself), it keeps the stronger of two simple
+/// supports on one focal set, and on BBAs whose weights bear on disjoint sets
+/// (a support and a refutation) it equals the conjunctive rule.
+///
+/// Open-world mass is handled by one extra element `ω` (the truth outside the
+/// frame) whenever either input carries a complement element: a positive
+/// element `S` is the set `S`, a complement element `(S, true)` is
+/// `(Θ ∪ {ω}) \ S`. That is the algebra [`cdst_intersect`] uses, so the result
+/// composes with [`conjunctive_combine`] and the Dempster fold. Two classical
+/// inputs are combined on `Θ` itself.
+///
+/// The result is UNNORMALISED (the `∧` form): conflict is left on the empty
+/// set, as [`conjunctive_combine`] leaves it.
+///
+/// Returns `Ok(None)` when the rule is not defined on the inputs: a DOGMATIC
+/// input (no mass on total ignorance, `Θ` for two classical inputs and
+/// open-world `(∅, true)` otherwise, so its commonality vanishes there and its
+/// weights do not exist; a classical BBA beside an open-world one is dogmatic
+/// about `ω`), or a frame above [`CAUTIOUS_RULE_MAX_HYPOTHESES`]. Callers fall
+/// back to treating the inputs as independent.
+///
+/// # Errors
+/// `DsError::IncompatibleFrames` if the frames differ; `DsError::NegativeMass`
+/// if rounding left a materially negative mass (not expected: the rule maps
+/// two valid non-dogmatic BBAs to a valid BBA).
+pub fn cautious_rule(
+    m1: &MassFunction,
+    m2: &MassFunction,
+) -> Result<Option<MassFunction>, DsError> {
+    check_frame_compat(m1, m2)?;
+    let frame = m1.frame();
+    let n = frame.hypothesis_count();
+    if n > CAUTIOUS_RULE_MAX_HYPOTHESES {
+        return Ok(None);
+    }
+    let open = !(m1.is_classical() && m2.is_classical());
+    let bits = if open { n + 1 } else { n };
+    let (Some(w1), Some(w2)) = (log_weights(m1, n, open), log_weights(m2, n, open)) else {
+        return Ok(None);
+    };
+    let size = 1_usize << bits;
+    let full = size - 1;
+    let lw: Vec<f64> = (0..size)
+        .map(|a| if a == full { 0.0 } else { w1[a].min(w2[a]) })
+        .collect();
+
+    // ln q(B) = sum over A != full with B not a subset of A of ln w(A)
+    //         = total - (sum over A >= B, A != full, of ln w(A)).
+    let total: f64 = lw.iter().sum();
+    let mut sup = lw;
+    superset_sum(&mut sup, bits);
+    let mut q: Vec<f64> = sup.iter().map(|s| (total - s).exp()).collect();
+    superset_mobius(&mut q, bits);
+
+    let mut masses: BTreeMap<FocalElement, f64> = BTreeMap::new();
+    for (a, &v) in q.iter().enumerate() {
+        if v < -1e-9 {
+            return Err(DsError::NegativeMass { value: v });
+        }
+        if v > 1e-12 {
+            masses.insert(mask_to_element(a, n, open), v);
+        }
+    }
+    Ok(Some(MassFunction::from_raw(frame.clone(), masses)))
+}
+
+/// The canonical log-weights `ln w(A)` of `m` over the subsets of `Θ` (or of
+/// `Θ ∪ {ω}` when `open`, bit `n` being `ω`), indexed by bitmask; the entry
+/// for the full set is 0. `None` for a dogmatic `m` (zero commonality on the
+/// full set).
+fn log_weights(m: &MassFunction, n: usize, open: bool) -> Option<Vec<f64>> {
+    let bits = if open { n + 1 } else { n };
+    let size = 1_usize << bits;
+    let full = size - 1;
+    let mut q = vec![0.0_f64; size];
+    for (fe, &v) in m.masses() {
+        if v > 0.0 {
+            q[element_to_mask(fe, n, open)] += v;
+        }
+    }
+    superset_sum(&mut q, bits);
+    if q[full] <= 0.0 {
+        return None;
+    }
+    // q is non-increasing towards the full set, so every q(A) >= q(full) > 0.
+    let mut f: Vec<f64> = q.iter().map(|x| x.ln()).collect();
+    superset_mobius(&mut f, bits);
+    Some(
+        (0..size)
+            .map(|a| if a == full { 0.0 } else { -f[a] })
+            .collect(),
+    )
+}
+
+/// Bitmask of a focal element over `Θ` (or `Θ ∪ {ω}` when `open`). Only
+/// called with `open` set when an input has a complement element.
+fn element_to_mask(fe: &FocalElement, n: usize, open: bool) -> usize {
+    let bits: usize = fe.subset.iter().filter(|&&i| i < n).map(|&i| 1 << i).sum();
+    if fe.complement && open {
+        ((1_usize << (n + 1)) - 1) & !bits
+    } else {
+        bits
+    }
+}
+
+/// The focal element of a bitmask over `Θ` (or `Θ ∪ {ω}` when `open`).
+fn mask_to_element(a: usize, n: usize, open: bool) -> FocalElement {
+    if a == 0 {
+        return FocalElement::conflict();
+    }
+    let omega = 1_usize << n;
+    if !open || a & omega == 0 {
+        FocalElement::positive((0..n).filter(|i| a & (1 << i) != 0).collect())
+    } else {
+        FocalElement::negative((0..n).filter(|i| a & (1 << i) == 0).collect())
+    }
+}
+
+/// In place: `v[A] <- sum over B >= A of v[B]` (superset zeta transform).
+fn superset_sum(v: &mut [f64], bits: usize) {
+    for i in 0..bits {
+        let bit = 1_usize << i;
+        for a in 0..v.len() {
+            if a & bit == 0 {
+                v[a] += v[a | bit];
+            }
+        }
+    }
+}
+
+/// In place: the inverse of [`superset_sum`] (superset Möbius transform).
+fn superset_mobius(v: &mut [f64], bits: usize) {
+    for i in 0..bits {
+        let bit = 1_usize << i;
+        for a in 0..v.len() {
+            if a & bit == 0 {
+                v[a] -= v[a | bit];
+            }
+        }
+    }
+}
+
 /// Cross-frame combination
 ///
 /// Builds the union frame from both mass functions' frames, reindexes both
@@ -2268,5 +2425,118 @@ mod combine_alternative_set_tests {
             mixed_bel < pure_bel,
             "max-Pl reduction should yield lower combined Bel than pure Dempster"
         );
+    }
+}
+
+#[cfg(test)]
+mod cautious_rule_tests {
+    use super::{cautious_rule, conjunctive_combine};
+    use crate::frame::FrameOfDiscernment;
+    use crate::mass::{FocalElement, MassFunction};
+
+    fn binary() -> FrameOfDiscernment {
+        FrameOfDiscernment::new("binary", vec!["T".into(), "F".into()]).unwrap()
+    }
+
+    fn ternary() -> FrameOfDiscernment {
+        FrameOfDiscernment::new("ternary", vec!["s".into(), "r".into(), "u".into()]).unwrap()
+    }
+
+    fn m(frame: FrameOfDiscernment, json: serde_json::Value) -> MassFunction {
+        MassFunction::from_json_masses(frame, &json).unwrap()
+    }
+
+    fn assert_same(a: &MassFunction, b: &MassFunction) {
+        let keys: std::collections::BTreeSet<&FocalElement> =
+            a.masses().keys().chain(b.masses().keys()).collect();
+        for k in keys {
+            let (x, y) = (a.mass_of(k), b.mass_of(k));
+            assert!((x - y).abs() < 1e-9, "{k:?}: {x} vs {y}\n{a:?}\n{b:?}");
+        }
+    }
+
+    fn total(a: &MassFunction) -> f64 {
+        a.masses().values().sum()
+    }
+
+    #[test]
+    fn idempotent_on_a_two_sided_open_world_bba() {
+        // The shape /claims/:id/assess builds: mass on a hypothesis, its
+        // rival, closed-world ignorance and open-world ignorance.
+        let x = m(
+            ternary(),
+            serde_json::json!({"0": 0.55, "1": 0.12, "0,1,2": 0.28, "~": 0.05}),
+        );
+        let c = cautious_rule(&x, &x).unwrap().expect("non-dogmatic");
+        assert_same(&c, &x);
+    }
+
+    #[test]
+    fn two_simple_supports_on_one_set_keep_the_stronger() {
+        for (a, b) in [(0.6, 0.7), (0.7, 0.6)] {
+            let x = m(binary(), serde_json::json!({"0": a, "~": 1.0 - a}));
+            let y = m(binary(), serde_json::json!({"0": b, "~": 1.0 - b}));
+            let c = cautious_rule(&x, &y).unwrap().unwrap();
+            assert_same(&c, &m(binary(), serde_json::json!({"0": 0.7, "~": 0.3})));
+        }
+    }
+
+    #[test]
+    fn a_support_and_a_refutation_combine_conjunctively() {
+        let x = m(binary(), serde_json::json!({"0": 0.8, "~": 0.2}));
+        let y = m(binary(), serde_json::json!({"1": 0.5, "~": 0.5}));
+        let c = cautious_rule(&x, &y).unwrap().unwrap();
+        assert_same(&c, &conjunctive_combine(&x, &y).unwrap());
+    }
+
+    #[test]
+    fn commutative_associative_and_a_valid_bba() {
+        let f = ternary;
+        let a = m(
+            f(),
+            serde_json::json!({"0": 0.5, "1": 0.1, "0,1,2": 0.3, "~": 0.1}),
+        );
+        let b = m(
+            f(),
+            serde_json::json!({"0": 0.3, "2": 0.2, "0,1,2": 0.4, "~": 0.1}),
+        );
+        let c = m(f(), serde_json::json!({"0,1": 0.4, "0,1,2": 0.5, "~": 0.1}));
+        let ab = cautious_rule(&a, &b).unwrap().unwrap();
+        let ba = cautious_rule(&b, &a).unwrap().unwrap();
+        assert_same(&ab, &ba);
+        let left = cautious_rule(&ab, &c).unwrap().unwrap();
+        let right = cautious_rule(&a, &cautious_rule(&b, &c).unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_same(&left, &right);
+        for r in [&ab, &left] {
+            assert!((total(r) - 1.0).abs() < 1e-9, "{r:?}");
+            assert!(r.masses().values().all(|v| *v >= 0.0), "{r:?}");
+        }
+    }
+
+    #[test]
+    fn classical_inputs_combine_on_the_frame_itself() {
+        let x = m(binary(), serde_json::json!({"0": 0.6, "0,1": 0.4}));
+        let y = m(binary(), serde_json::json!({"0": 0.7, "0,1": 0.3}));
+        let c = cautious_rule(&x, &y).unwrap().expect("non-dogmatic on Θ");
+        assert_same(&c, &y);
+        let mixed = m(
+            binary(),
+            serde_json::json!({"0": 0.5, "1": 0.2, "0,1": 0.3}),
+        );
+        assert_same(&cautious_rule(&mixed, &mixed).unwrap().unwrap(), &mixed);
+    }
+
+    #[test]
+    fn a_dogmatic_input_has_no_cautious_combination() {
+        // Dogmatic on Θ.
+        let dogmatic = m(binary(), serde_json::json!({"0": 0.6, "1": 0.4}));
+        let other = m(binary(), serde_json::json!({"0": 0.5, "0,1": 0.5}));
+        assert!(cautious_rule(&dogmatic, &other).unwrap().is_none());
+        // A classical BBA beside an open-world one is dogmatic about ω.
+        let closed = m(binary(), serde_json::json!({"0": 0.6, "0,1": 0.4}));
+        let open = m(binary(), serde_json::json!({"0": 0.5, "~": 0.5}));
+        assert!(cautious_rule(&closed, &open).unwrap().is_none());
     }
 }
