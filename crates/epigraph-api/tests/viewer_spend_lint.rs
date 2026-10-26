@@ -2381,3 +2381,38 @@ async fn not_a_viewer(pool: &PgPool, viewers: &[Viewer], f: impl Fn(u8) -> u8) -
         "a slice of viewers is not a viewer parameter"
     );
 }
+
+/// A stamped connection is NOT a spend (see the module doc): a read on
+/// `read_as(&viewer)` that does not pass the viewer is measured unviewed, while
+/// the `let` binding that names the viewer DOES count for a `sqlx` chain that
+/// reads it (the spliced SQL). The two rules sit side by side, so both are
+/// pinned in one fixture.
+#[test]
+fn the_scanner_does_not_count_a_stamped_connection_as_a_spend() {
+    let src = r##"
+pub async fn stamped(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    // Row security on the stamped connection, and no in-query predicate.
+    let mut read = state.read_as(&viewer).await?;
+    let row = Repo::get(&mut *read, id).await?;
+    let raw = sqlx::query_scalar::<_, Uuid>("SELECT id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *read)
+        .await?;
+    // The spliced statement on the same connection IS a spend.
+    let sql = viewer.splice("SELECT c.id FROM claims c WHERE c.id = $1 /* {VISIBILITY:c} */", 2);
+    let spliced = sqlx::query_scalar::<_, Uuid>(&sql).bind(id).fetch_optional(&mut *read).await?;
+    Ok((row, raw, spliced))
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "stamped"),
+        vec!["Repo::get", "sqlx::query_scalar(SELECT).fetch_optional"],
+        "reads on a connection stamped with the viewer are measured unviewed unless \
+         the viewer reaches the statement; stamping is row security only"
+    );
+}
