@@ -158,7 +158,7 @@ impl PageCtx {
 /// the API is transient and must not sign every user out. Falls back to the
 /// dev bearer, then to anonymous.
 pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth {
-    if let Some(id) = read_session_cookie(headers) {
+    if let Some(id) = read_session_cookie(&state.config, headers) {
         if let Some(session) = state.sessions.get(&id) {
             let now = Utc::now();
             if session.expires_at - now > PROACTIVE_REFRESH_WINDOW {

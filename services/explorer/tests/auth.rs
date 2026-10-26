@@ -19,7 +19,7 @@ use chrono::{Duration, Utc};
 use common::{spawn, spawn_with, TestApp, TestResponse};
 use epigraph_explorer::auth::flow::{Handoff, PendingLogin, MAX_PENDING_LOGINS};
 use epigraph_explorer::auth::{oauth, RefreshError, SessionId, SignedIn};
-use epigraph_explorer::config::{ENV_CLIENT_ID, ENV_OAUTH_BASE_URL};
+use epigraph_explorer::config::{ENV_CLIENT_ID, ENV_OAUTH_BASE_URL, ENV_PUBLIC_BASE_URL};
 use epigraph_explorer::{app as explorer_app, AppError, AppState};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -242,15 +242,141 @@ async fn pre_auth_cookie_binds_the_login_to_this_browser() {
         assert!(line.contains(attr), "{attr} missing from {line}");
     }
 
-    // A browser that already has a binding keeps it, so two tabs signing in
-    // at once do not invalidate each other.
+    // A presented binding is NEVER adopted: `/auth/login` mints a fresh one
+    // and stores THAT on the pending login. Adopting the presented value
+    // would be a login-CSRF primitive wherever another page can write this
+    // cookie (a sibling subdomain under a non-PSL wildcard-DNS parent,
+    // where `__Host-` is unavailable): the attacker plants a binding it
+    // knows, starts a login in its own browser bound to the same value, and
+    // the victim's callback then passes the binding check.
+    let planted = epigraph_explorer::auth::random_token(32);
     let res = app
         .get_with(
             "/explorer/auth/login",
-            &[("cookie", &format!("epx_login={binding}"))],
+            &[("cookie", &format!("epx_login={planted}"))],
         )
         .await;
-    assert_eq!(set_cookie(&res, "epx_login").unwrap().0, binding);
+    let (minted, _) = set_cookie(&res, "epx_login").expect("a binding is always set");
+    assert_ne!(minted, planted, "the presented binding must not be adopted");
+    assert_ne!(minted, binding, "nor any earlier one");
+    let oauth_state = Url::parse(res.location().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .expect("state in the authorize URL")
+        .1
+        .into_owned();
+    let pending = app.state.auth_flow.pending.get(&oauth_state).unwrap();
+    assert_eq!(
+        pending.binding, minted,
+        "the pending login is bound to the value the server issued"
+    );
+    assert_ne!(pending.binding, planted);
+
+    // So a callback that presents the planted value is refused.
+    let res = app
+        .get_with(
+            &format!("/explorer/auth/callback?code=c&state={oauth_state}"),
+            &[("cookie", &format!("epx_login={planted}"))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST, "{}", res.body);
+    assert!(res.body.contains("started in this browser"), "{}", res.body);
+    assert_eq!(app.state.sessions.len(), 0);
+}
+
+/// Item 1 of the review: on a dedicated origin (secure cookies, root base
+/// path) both cookies take the `__Host-` prefix, which a browser honours
+/// only for `Secure; Path=/` with no `Domain` — so no sibling subdomain can
+/// set them. The unprefixed names are the fallback, covered by
+/// `pre_auth_cookie_binds_the_login_to_this_browser` and
+/// `page_mode_sign_in_end_to_end` at the `/explorer` base path.
+#[tokio::test]
+async fn a_dedicated_origin_at_the_root_uses_host_prefixed_cookie_names() {
+    let app = spawn_with(
+        &[
+            (ENV_CLIENT_ID, CLIENT_ID),
+            (ENV_OAUTH_BASE_URL, OAUTH_BASE),
+            (ENV_PUBLIC_BASE_URL, ORIGIN),
+        ],
+        Router::new().route("/probe", get(probe)),
+    )
+    .await;
+
+    let res = app.get("/auth/login").await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (binding, line) = set_cookie(&res, "__Host-epx_login").expect("__Host- pre-auth cookie");
+    assert!(
+        set_cookie(&res, "epx_login").is_none(),
+        "the unprefixed name must not be set too: {:?}",
+        res.header_all("set-cookie")
+    );
+    for attr in [
+        "HttpOnly",
+        "SameSite=Lax",
+        "Secure",
+        "Path=/",
+        "Max-Age=600",
+    ] {
+        assert!(line.contains(attr), "{attr} missing from {line}");
+    }
+    assert!(!line.contains("Domain"), "{line}");
+
+    let oauth_state = Url::parse(res.location().unwrap())
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .expect("state in the authorize URL")
+        .1
+        .into_owned();
+    let verifier = app
+        .state
+        .auth_flow
+        .pending
+        .get(&oauth_state)
+        .unwrap()
+        .pkce_verifier
+        .clone();
+    token_call(&[
+        ("grant_type", "authorization_code"),
+        ("code", "c0de"),
+        ("code_verifier", &verifier),
+        ("redirect_uri", &format!("{ORIGIN}/auth/callback")),
+        ("client_id", CLIENT_ID),
+    ])
+    .respond_with(ResponseTemplate::new(200).set_body_json(token_json("access-1", "refresh-1")))
+    .expect(1)
+    .mount(&app.upstream)
+    .await;
+    mount_probe(&app, "access-1", 200, 1).await;
+
+    let res = app
+        .get_with(
+            &format!("/auth/callback?code=c0de&state={oauth_state}"),
+            &[("cookie", &format!("__Host-epx_login={binding}"))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::SEE_OTHER, "{}", res.body);
+    let (sid, line) = set_cookie(&res, "__Host-epx_session").expect("__Host- session cookie");
+    assert!(
+        set_cookie(&res, "epx_session").is_none(),
+        "the unprefixed name must not be set too: {:?}",
+        res.header_all("set-cookie")
+    );
+    for attr in ["HttpOnly", "SameSite=Lax", "Secure", "Path=/"] {
+        assert!(line.contains(attr), "{attr} missing from {line}");
+    }
+    assert!(!line.contains("Domain"), "{line}");
+
+    // And the prefixed cookie is the one the server reads back.
+    let res = app
+        .get_with(
+            "/probe",
+            &[("cookie", &format!("__Host-epx_session={sid}"))],
+        )
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    assert_eq!(res.json()["token_seen"], "access-1");
 }
 
 #[tokio::test]

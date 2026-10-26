@@ -9,7 +9,7 @@
 //!
 //! - `GET /auth/login?return_to=&mode=page|popup` stores a pending login
 //!   (PKCE verifier, `return_to`, mode) under a random `state`, binds it to
-//!   this browser with the `epx_login` cookie, and 303s to
+//!   this browser with a freshly minted `epx_login` cookie, and 303s to
 //!   `{oauth_base}/oauth/authorize`. A navigation inside an iframe
 //!   (`Sec-Fetch-Dest: iframe`, i.e. the Notion embed) gets a page with a
 //!   button that opens the popup instead, because the AS cannot be framed.
@@ -46,6 +46,7 @@ pub use refresh::{refresh_session, RefreshError};
 pub use session::{
     clear_embed_session_cookie, clear_session_cookie, embed_session_cookie, random_token,
     read_session_cookie, session_cookie, Session, SessionId, SessionStore, SESSION_COOKIE,
+    SESSION_COOKIE_HOST_PREFIXED,
 };
 
 use flow::{Handoff, PendingLogin, HANDOFF_TTL, MAX_PENDING_LOGINS, PENDING_LOGIN_TTL};
@@ -108,8 +109,8 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 /// and `state`, which must not be reflected into `og:url` or the header's
 /// sign-in link.
 fn page_ctx(state: &AppState, headers: &HeaderMap, current_path: String) -> PageCtx {
-    let signed_in =
-        read_session_cookie(headers).is_some_and(|id| state.sessions.get(&id).is_some());
+    let signed_in = read_session_cookie(&state.config, headers)
+        .is_some_and(|id| state.sessions.get(&id).is_some());
     PageCtx::new(state.links.clone(), current_path, signed_in)
 }
 
@@ -214,9 +215,19 @@ async fn login(
         }
     }
 
-    // Reuse this browser's binding if it has one, so two tabs signing in at
-    // once do not invalidate each other.
-    let binding = flow::read_pre_auth_cookie(&headers).unwrap_or_else(|| random_token(32));
+    // ALWAYS a freshly minted binding, never the one the request presented.
+    // Adopting a presented value is a login-CSRF primitive: a page that can
+    // write this cookie (a sibling subdomain under a wildcard-DNS parent
+    // that is not on the Public Suffix List, where the `__Host-` prefix is
+    // unavailable — see `Config::host_prefixed_cookies`) could plant a
+    // binding it knows, start a login in its own browser with that same
+    // binding, and hand the victim a callback URL that now passes the
+    // binding check. The victim ends up signed in as the attacker.
+    //
+    // The cost is that a second tab's `/auth/login` replaces the first
+    // tab's binding, so the first tab's callback is refused and it has to
+    // start again. A refused sign-in that retries is the cheaper failure.
+    let binding = random_token(32);
     let pkce_verifier = random_token(32);
     let code_challenge = oauth::pkce_challenge_s256(&pkce_verifier);
     let oauth_state = random_token(32);
@@ -269,7 +280,7 @@ async fn callback(
         );
     };
 
-    let bound = flow::read_pre_auth_cookie(&headers)
+    let bound = flow::read_pre_auth_cookie(&state.config, &headers)
         .is_some_and(|c| bool::from(c.as_bytes().ct_eq(pending.binding.as_bytes())));
     if !bound {
         tracing::warn!(
@@ -356,7 +367,7 @@ async fn callback(
 
     // A fresh id on every sign-in (no fixation); the browser's previous
     // session, if any, is replaced rather than left in the store.
-    if let Some(old) = read_session_cookie(&headers) {
+    if let Some(old) = read_session_cookie(&state.config, &headers) {
         state.sessions.remove(&old);
     }
     see_other(
@@ -438,7 +449,7 @@ async fn redeem(
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, AppError> {
     require_same_origin(&state, &headers)?;
 
-    if let Some(id) = read_session_cookie(&headers) {
+    if let Some(id) = read_session_cookie(&state.config, &headers) {
         // Wait out an in-flight refresh so the token revoked below is the
         // latest rotation, not one that was replaced a moment later.
         let lock = state.sessions.refresh_lock(&id);

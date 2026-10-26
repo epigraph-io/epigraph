@@ -223,6 +223,45 @@ impl Config {
         !self.insecure_cookies
     }
 
+    /// Whether this deployment can name its cookies with the `__Host-`
+    /// prefix.
+    ///
+    /// A browser accepts a `__Host-` cookie only from a `Secure`
+    /// `Set-Cookie` that carries `Path=/` and no `Domain`. We never set
+    /// `Domain`, so the two remaining conditions are a secure cookie and a
+    /// root base path — i.e. the Explorer has an origin to itself.
+    ///
+    /// The prefix is what stops a sibling subdomain from writing these
+    /// cookies: under a wildcard-DNS parent domain that is not on the Public
+    /// Suffix List, `evil.wildcard.example` can `Set-Cookie` with
+    /// `Domain=wildcard.example`, and the victim's browser would send that
+    /// cookie to the Explorer. An unprefixed name is therefore only as
+    /// trustworthy as every other host under that parent; the prefixed one
+    /// cannot be set that way at all.
+    pub fn host_prefixed_cookies(&self) -> bool {
+        self.cookie_secure() && self.base_path.is_empty()
+    }
+
+    /// Name of the session cookie: `__Host-epx_session` where the
+    /// deployment permits it, else `epx_session`.
+    pub fn session_cookie_name(&self) -> &'static str {
+        if self.host_prefixed_cookies() {
+            crate::auth::session::SESSION_COOKIE_HOST_PREFIXED
+        } else {
+            crate::auth::session::SESSION_COOKIE
+        }
+    }
+
+    /// Name of the pre-auth binding cookie: `__Host-epx_login` where the
+    /// deployment permits it, else `epx_login`.
+    pub fn pre_auth_cookie_name(&self) -> &'static str {
+        if self.host_prefixed_cookies() {
+            crate::auth::flow::PRE_AUTH_COOKIE_HOST_PREFIXED
+        } else {
+            crate::auth::flow::PRE_AUTH_COOKIE
+        }
+    }
+
     /// The exact OAuth `redirect_uri` registered upstream.
     pub fn redirect_uri(&self) -> String {
         format!("{}{}/auth/callback", self.public_origin, self.base_path)

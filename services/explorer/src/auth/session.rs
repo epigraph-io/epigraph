@@ -18,6 +18,12 @@ use rand::RngCore;
 use crate::config::Config;
 
 pub const SESSION_COOKIE: &str = "epx_session";
+/// The session cookie's `__Host-`-prefixed name, used when the deployment
+/// permits it (see [`Config::host_prefixed_cookies`]). A browser accepts a
+/// `__Host-` cookie only from a `Secure` `Set-Cookie` with `Path=/` and no
+/// `Domain`, which is exactly what stops a sibling subdomain of a non-PSL
+/// parent domain from overwriting it.
+pub const SESSION_COOKIE_HOST_PREFIXED: &str = "__Host-epx_session";
 /// Cookie lifetime; matches the upstream refresh token's 30 days.
 pub const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
@@ -191,7 +197,7 @@ fn to_header(c: &Cookie<'_>) -> HeaderValue {
 }
 
 fn base_cookie<'c>(config: &Config, value: String) -> Cookie<'c> {
-    let mut c = Cookie::new(SESSION_COOKIE, value);
+    let mut c = Cookie::new(config.session_cookie_name(), value);
     c.set_path(config.cookie_path().to_string());
     c.set_http_only(true);
     c
@@ -251,10 +257,14 @@ pub fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
-/// The session id from `epx_session`, if well-formed. Does not check the
-/// store.
-pub fn read_session_cookie(headers: &HeaderMap) -> Option<SessionId> {
-    read_cookie(headers, SESSION_COOKIE).and_then(|v| SessionId::parse(&v))
+/// The session id from this deployment's session cookie, if well-formed.
+/// Does not check the store.
+///
+/// Only the configured name is read: on a deployment that can use
+/// `__Host-epx_session`, a plain `epx_session` a sibling subdomain managed
+/// to set is simply not a session cookie here.
+pub fn read_session_cookie(config: &Config, headers: &HeaderMap) -> Option<SessionId> {
+    read_cookie(headers, config.session_cookie_name()).and_then(|v| SessionId::parse(&v))
 }
 
 #[cfg(test)]
@@ -377,6 +387,7 @@ mod tests {
 
     #[test]
     fn reads_cookie_from_any_header() {
+        let c = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]);
         let id = SessionId::generate();
         let mut h = HeaderMap::new();
         h.append(header::COOKIE, HeaderValue::from_static("a=1; b=2"));
@@ -385,13 +396,82 @@ mod tests {
             HeaderValue::from_str(&format!("x=y; epx_session={}", id.as_str())).unwrap(),
         );
         assert_eq!(read_cookie(&h, "b").as_deref(), Some("2"));
-        assert_eq!(read_session_cookie(&h), Some(id));
+        assert_eq!(read_session_cookie(&c, &h), Some(id));
 
         let mut junk = HeaderMap::new();
         junk.insert(
             header::COOKIE,
             HeaderValue::from_static("epx_session=../../etc"),
         );
-        assert_eq!(read_session_cookie(&junk), None);
+        assert_eq!(read_session_cookie(&c, &junk), None);
+    }
+
+    /// On a deployment that can use `__Host-`, both the cookie it sets and
+    /// the cookie it reads back carry the prefix — a plain `epx_session`
+    /// (the one a sibling subdomain could set) is not a session cookie
+    /// there. Everywhere else the unprefixed name is used.
+    #[test]
+    fn host_prefixed_session_cookie_on_a_secure_root_deployment() {
+        let dedicated = config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com")]);
+        assert!(dedicated.host_prefixed_cookies());
+        assert_eq!(
+            dedicated.session_cookie_name(),
+            SESSION_COOKIE_HOST_PREFIXED
+        );
+
+        let id = SessionId::generate();
+        let v = session_cookie(&dedicated, &id)
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            v.starts_with(&format!("__Host-epx_session={}", id.as_str())),
+            "{v}"
+        );
+        // `__Host-` is honoured only with Secure, Path=/ and no Domain.
+        for attr in ["HttpOnly", "Secure", "Path=/"] {
+            assert!(v.contains(attr), "{attr} missing from {v}");
+        }
+        assert!(!v.contains("Domain"), "{v}");
+        for v in [
+            clear_session_cookie(&dedicated),
+            embed_session_cookie(&dedicated, &id),
+            clear_embed_session_cookie(&dedicated),
+        ] {
+            assert!(
+                v.to_str().unwrap().starts_with("__Host-epx_session="),
+                "{v:?}"
+            );
+        }
+
+        let mut prefixed = HeaderMap::new();
+        prefixed.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("__Host-epx_session={}", id.as_str())).unwrap(),
+        );
+        assert_eq!(read_session_cookie(&dedicated, &prefixed), Some(id.clone()));
+        let mut plain = HeaderMap::new();
+        plain.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("epx_session={}", id.as_str())).unwrap(),
+        );
+        assert_eq!(read_session_cookie(&dedicated, &plain), None);
+
+        // A base path, or cookies without `Secure`, rule the prefix out.
+        for shared in [
+            config(&[(ENV_PUBLIC_BASE_URL, "https://explorer.example.com/explorer")]),
+            config(&[
+                (ENV_PUBLIC_BASE_URL, "http://localhost:8096"),
+                (ENV_INSECURE_COOKIES, "true"),
+            ]),
+        ] {
+            assert!(!shared.host_prefixed_cookies());
+            assert_eq!(shared.session_cookie_name(), SESSION_COOKIE);
+            assert!(session_cookie(&shared, &id)
+                .to_str()
+                .unwrap()
+                .starts_with("epx_session="));
+            assert_eq!(read_session_cookie(&shared, &plain), Some(id.clone()));
+        }
     }
 }

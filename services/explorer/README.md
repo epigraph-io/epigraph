@@ -415,6 +415,31 @@ Then sign in through the browser and open a claim.
 - **Session cookie** `epx_session` has `HttpOnly`, `Secure`, `SameSite=Lax`,
   `Path={base path}` and a 30-day `Max-Age`. It holds only a random 256-bit
   session id. The tokens stay server-side in memory.
+- **`__Host-` cookie names on a dedicated origin.** When the cookies are
+  `Secure` *and* the base path is the root — i.e. the Explorer has an origin
+  to itself — the two cookies are named `__Host-epx_session` and
+  `__Host-epx_login` and are set with `Path=/` and no `Domain`. A browser
+  honours a `__Host-` cookie only in exactly that shape, which is what makes
+  it unwritable from anywhere but this origin. With a base path, or with
+  `EPIGRAPH_EXPLORER_INSECURE_COOKIES`, the prefix is impossible and the
+  plain `epx_session` / `epx_login` names are used instead. Only the
+  configured name is ever read, and the process logs which pair is in use at
+  startup (a warning when it is the unprefixed one).
+
+  This matters because cookies are not origin-scoped: under a wildcard-DNS
+  parent domain that is **not** on the [Public Suffix
+  List](https://publicsuffix.org/), any sibling host can `Set-Cookie` with
+  `Domain=<parent>` and the victim's browser will send it here. Do not deploy
+  the Explorer under such a parent domain.
+- **The sign-in binding is always freshly minted.** `GET /auth/login` mints a
+  new `epx_login` value and binds the pending login to **that**; it never
+  adopts the value the request presented, however well-formed. Adopting one
+  is a login-CSRF primitive: a page that can write the cookie plants a
+  binding it knows, starts a login in its own browser bound to the same
+  value, and hands the victim a callback URL that then passes the binding
+  check — the victim ends up signed in as the attacker. The cost is that a
+  second tab's `/auth/login` replaces the first tab's binding, so the first
+  tab's callback is refused and it has to start again.
 - **Logout** is a `POST /auth/logout`, checked against Origin. It revokes the
   refresh token upstream and drops the session. An already-issued access token
   stays valid upstream until it expires (at most 1 hour), because the API's

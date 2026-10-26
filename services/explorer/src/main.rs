@@ -43,6 +43,26 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if config.insecure_cookies {
         tracing::warn!("EPIGRAPH_EXPLORER_INSECURE_COOKIES is set: session cookies lack Secure");
     }
+    // Which cookie names this deployment uses, and why. `__Host-` needs
+    // Secure cookies and a root base path; without it a sibling subdomain
+    // under a wildcard-DNS parent domain that is not on the Public Suffix
+    // List can write cookies of these names.
+    if config.host_prefixed_cookies() {
+        tracing::info!(
+            session_cookie = config.session_cookie_name(),
+            login_cookie = config.pre_auth_cookie_name(),
+            "using __Host--prefixed cookies"
+        );
+    } else {
+        tracing::warn!(
+            session_cookie = config.session_cookie_name(),
+            login_cookie = config.pre_auth_cookie_name(),
+            cookie_secure = config.cookie_secure(),
+            base_path = %config.base_path,
+            "__Host- cookie prefix unavailable: it needs Secure cookies and a root base path. \
+             Serve the Explorer from an origin of its own to get it"
+        );
+    }
 
     // Loopback only: the reverse proxy is the public edge.
     let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
