@@ -1699,6 +1699,24 @@ restart.
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
+- **174**: public `refresh_chain_issuing_app` (backlog 7a2111e6, U002
+  follow-up). Adds `refresh_tokens.issued_to_client_id` (the connector app an
+  authorization-code chain was issued to; no foreign key, read as "not
+  active" when the app cannot be found), granted to `epigraph_app` as a
+  column SELECT. Redefines `epigraph_refresh_token_rotate` (140's body, `CREATE
+  OR REPLACE`, same signature; owner and grant re-asserted) so the successor
+  carries the binding. Adds `epigraph_refresh_token_revoke_client_app(uuid,
+  uuid)`, a SECURITY INVOKER operator revoke keyed by (per-user client, app),
+  EXECUTE for `epigraph_maintenance` only. Pinned by
+  `epigraph-api/tests/oauth_refresh_hardening.rs` (app role end to end; the
+  revoke run as the maintenance role) and, for the rotate definer's owner,
+  ACL and search_path,
+  `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`.
+  Existing chains stay unbound (NULL). Undo is in the file's header.
+  **Deploy order:** before the API binary built against it (that binary
+  reads and writes the column). **Applied to throwaway databases only, NOT
+  to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

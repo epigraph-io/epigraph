@@ -2579,7 +2579,7 @@ narrowing `scope`) widened the chain to everything the client is granted.
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
 
-## Refresh-grant hardening — confidential clients authenticate on refresh
+## Refresh-grant hardening (migration 174) — confidential clients authenticate on refresh; a chain is bound to its connector app
 
 1. **BREAKING — an agent or service refresh carries the client's credential.**
    RFC 6749 section 6: a confidential client authenticates on the
@@ -2597,6 +2597,33 @@ narrowing `scope`) widened the chain to everything the client is granted.
    consumer that does must add its credential before this binary ships, or
    switch to re-running `client_credentials`. Human (connector) chains are
    unchanged. Rollback: the previous API binary.
+2. **Migration 174 BEFORE the API binary.** 174 adds
+   `refresh_tokens.issued_to_client_id` (the connector app that obtained an
+   authorization-code chain; no foreign key), redefines
+   `epigraph_refresh_token_rotate` to carry it into every successor (140's
+   body otherwise, owner and ACL re-asserted), and adds the operator revoke
+   below. The new binary reads and writes the column on every refresh and
+   every code exchange, so it fails on an unmigrated database; the previous
+   binary runs unchanged on a migrated one.
+3. **BEHAVIOUR — suspending a connector app cuts that app's sessions only.**
+   A code exchange binds the new chain to the app that obtained the code, and
+   refuses (`403`) when that app is no longer active. A refresh of a bound
+   chain whose app is suspended, revoked or gone is refused (`403`) and burns
+   the presented token; the same person's chains through other apps keep
+   refreshing. Chains minted before 174 store no app and are not bound until
+   their person re-connects (nothing is backfilled).
+4. **Operator revoke keyed by (person, app)**, on the maintenance DSN:
+   `SELECT public.epigraph_refresh_token_revoke_client_app('<per-user oauth_clients.id>', '<app oauth_clients.id>');`
+   revokes that person's live chains issued to that app and returns how many
+   (reason `client`). Migration 125's trigger ends the elevation sessions of
+   those families, as for any revoke. It is `SECURITY INVOKER` and EXECUTE is
+   the maintenance role's alone. The coarse per-person lever,
+   `epigraph_refresh_token_revoke_client`, still logs the person out of every
+   connector. Chains minted before 174 carry no app, so only the coarse lever
+   reaches them.
+5. **Rollback:** roll the API binary back first, then 174's UNDO (its header):
+   re-run 140's rotate block, drop `epigraph_refresh_token_revoke_client_app`,
+   and drop the column.
 
 ## A lineage stays in its owner group (migration 153) — deploy order and rollback
 

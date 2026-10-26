@@ -781,10 +781,12 @@ async fn handle_refresh_token(
             id,
             client_id,
             scopes,
+            issued_to_client_id,
         } => StoredRefresh {
             id,
             client_id,
             scopes,
+            issued_to_client_id,
         },
         RefreshCheck::Grace => {
             tracing::info!(
@@ -844,6 +846,29 @@ async fn handle_refresh_token(
         return Err(ApiError::Forbidden {
             reason: "Client has been suspended or revoked".to_string(),
         });
+    }
+
+    // Migration 174: a chain from the authorization-code exchange is bound to
+    // the connector app that obtained it. Suspending (or deleting) that app
+    // cuts its chains, and only its chains: the same person's chains through
+    // another app are untouched. A DENIAL, so the token is burned; an app row
+    // that cannot be found reads as not active (fail closed). A failure to
+    // READ the app is not a denial and leaves the token intact.
+    if let Some(app_id) = stored.issued_to_client_id.filter(|app| *app != client.id) {
+        let app_active = OAuthClientRepository::get_by_id(&state.db_pool, app_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+            .is_some_and(|app| app.status == "active");
+        if !app_active {
+            burn_refresh_token(state, stored.id).await?;
+            return Err(ApiError::Forbidden {
+                reason: "The client application this refresh token was issued to has been \
+                         suspended or revoked"
+                    .to_string(),
+            });
+        }
     }
 
     // Re-run the provider email allowlist for external (`{provider}:{subject}`)
@@ -1044,6 +1069,8 @@ struct StoredRefresh {
     client_id: uuid::Uuid,
     /// The scopes the presented token was minted with.
     scopes: Vec<String>,
+    /// The connector app the chain was issued to (migration 174), if any.
+    issued_to_client_id: Option<uuid::Uuid>,
 }
 
 /// The scopes a refresh issues: the presented token's `stored` scopes that the
@@ -1192,6 +1219,23 @@ async fn handle_authorization_code(
         });
     }
 
+    // The connector app that obtained the code (`row.client_id`, checked
+    // against the request above). The chain is bound to it (migration 174), so
+    // suspending the app cuts this chain at its next refresh; an app that is
+    // already not active, or cannot be found, gets no chain at all (fail
+    // closed). Checked after the per-user client's own status, which answers
+    // first when the two are one row.
+    let issuing_app =
+        OAuthClientRepository::get_by_client_id_any_status(&state.db_pool, &row.client_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+            .filter(|app| app.status == "active")
+            .ok_or(ApiError::Forbidden {
+                reason: "The client application that obtained this code is not active".to_string(),
+            })?;
+
     // Re-run the provider email allowlist before issuing tokens, mirroring
     // handle_refresh_token, so the SAME invariant holds on every token-issuance
     // path: an identity de-listed between consent (when the provision gate ran and
@@ -1266,17 +1310,19 @@ async fn handle_authorization_code(
             "service" => Duration::days(90),
             _ => Duration::hours(24),
         };
-        let refresh_id = epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
-            &state.db_pool,
-            hash.as_bytes(),
-            client.id,
-            &chain_scopes,
-            Utc::now() + refresh_ttl,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
+        let refresh_id =
+            epigraph_db::repos::refresh_token::RefreshTokenRepository::create_issued_to(
+                &state.db_pool,
+                hash.as_bytes(),
+                client.id,
+                &chain_scopes,
+                Utc::now() + refresh_ttl,
+                Some(issuing_app.id),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?;
         (token_str, refresh_id)
     };
 

@@ -603,3 +603,163 @@ async fn an_agent_refresh_requires_an_assertion_under_the_agents_key(pool: PgPoo
         "the refused requests left the chain intact: {body}"
     );
 }
+
+// ── 7a2111e6: an authorization-code chain is bound to its connector app ──────
+
+/// A connector app (a DCR client, `human`-typed) and a per-user human client:
+/// two rows, so suspending the APP is not the per-user status check.
+async fn app_and_human(pool: &PgPool) -> (String, Uuid, Uuid) {
+    let app_client_id = format!("a11_dcr_{}", Uuid::new_v4().simple());
+    let app = client_row(pool, &app_client_id, "human", &v(&["claims:read"])).await;
+    let human = client_row(
+        pool,
+        &format!("a11_person_{}", Uuid::new_v4().simple()),
+        "human",
+        &v(&["claims:read"]),
+    )
+    .await;
+    (app_client_id, app, human)
+}
+
+async fn set_status(pool: &PgPool, id: Uuid, status: &str) {
+    sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("set client status");
+}
+
+/// The code exchange for one connector app, returning the refresh token.
+async fn connect(pool: &PgPool, app: &axum::Router, app_client_id: &str, human: Uuid) -> String {
+    let code = code_for(pool, app_client_id, human, &v(&["claims:read"])).await;
+    let (status, body) = post_token(app, code_grant(&code, app_client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    refresh_token_of(&body)
+}
+
+/// Suspending the connector app that obtained a chain stops that chain at its
+/// next refresh (refused, and the token burned: it does not come back when
+/// the app is reactivated), including after the chain has rotated.
+///
+/// Catches: the refresh grant never consulting the issuing app (only the
+/// per-user human client), and a rotation that drops the binding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_suspended_connector_app_keeps_no_live_chain(pool: PgPool) {
+    let (app_client_id, app_row, human) = app_and_human(&pool).await;
+    let router = create_router(state(&pool).await);
+    let r0 = connect(&pool, &router, &app_client_id, human).await;
+
+    // One rotation while the app is active: the successor must carry the
+    // binding.
+    let (status, body) = post_token(&router, refresh_grant(&r0)).await;
+    assert_eq!(status, StatusCode::OK, "refresh while active: {body}");
+    let r1 = refresh_token_of(&body);
+
+    set_status(&pool, app_row, "suspended").await;
+    let (status, body) = post_token(&router, refresh_grant(&r1)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a suspended connector's chain refreshed: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+
+    set_status(&pool, app_row, "active").await;
+    let (status, body) = post_token(&router, refresh_grant(&r1)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the denied refresh burned the presented token: {body}"
+    );
+}
+
+/// Suspending one connector leaves the same person's chain through another
+/// connector live.
+///
+/// Catches: a fix that cuts the person (the human client) instead of the app.
+#[sqlx::test(migrations = "../../migrations")]
+async fn suspending_one_connector_leaves_the_persons_other_connector_live(pool: PgPool) {
+    let (app_a, app_a_row, human) = app_and_human(&pool).await;
+    let app_b = format!("a11_dcr_b_{}", Uuid::new_v4().simple());
+    client_row(&pool, &app_b, "human", &v(&["claims:read"])).await;
+    let router = create_router(state(&pool).await);
+    let ra = connect(&pool, &router, &app_a, human).await;
+    let rb = connect(&pool, &router, &app_b, human).await;
+
+    set_status(&pool, app_a_row, "suspended").await;
+    let (status, body) = post_token(&router, refresh_grant(&ra)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "app A suspended: {body}");
+    let (status, body) = post_token(&router, refresh_grant(&rb)).await;
+    assert_eq!(status, StatusCode::OK, "app B's chain is untouched: {body}");
+}
+
+/// A code obtained by a connector app that is suspended before the exchange
+/// mints nothing.
+///
+/// Catches: the exchange binding a fresh chain to an app that is no longer
+/// active.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_code_exchange_for_a_suspended_connector_app_is_refused(pool: PgPool) {
+    let (app_client_id, app_row, human) = app_and_human(&pool).await;
+    let router = create_router(state(&pool).await);
+    let code = code_for(&pool, &app_client_id, human, &v(&["claims:read"])).await;
+    set_status(&pool, app_row, "suspended").await;
+    let (status, body) = post_token(&router, code_grant(&code, &app_client_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a suspended connector app exchanged a code: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+}
+
+/// The operator revoke keyed by (person, app), run as the maintenance role,
+/// revokes that app's live chains of that person and nothing else.
+///
+/// Catches: the only lever being the per-person revoke, which logs the person
+/// out of every connector.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operator_revoke_for_one_app_leaves_the_persons_other_app_live(pool: PgPool) {
+    let (app_a, app_a_row, human) = app_and_human(&pool).await;
+    let app_b = format!("a11_dcr_b_{}", Uuid::new_v4().simple());
+    client_row(&pool, &app_b, "human", &v(&["claims:read"])).await;
+    let router = create_router(state(&pool).await);
+    let ra = connect(&pool, &router, &app_a, human).await;
+    let rb = connect(&pool, &router, &app_b, human).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL ROLE epigraph_maintenance")
+        .execute(&mut *tx)
+        .await
+        .expect("act as the maintenance role");
+    let n: i64 =
+        sqlx::query_scalar("SELECT public.epigraph_refresh_token_revoke_client_app($1, $2)")
+            .bind(human)
+            .bind(app_a_row)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the operator revoke");
+    tx.commit().await.expect("commit");
+    assert_eq!(n, 1, "app A's one live chain of the person");
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", false),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_function_privilege($1, \
+                    'public.epigraph_refresh_token_revoke_client_app(uuid, uuid)', 'EXECUTE')",
+        )
+        .bind(role)
+        .fetch_one(&pool)
+        .await
+        .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on the per-app revoke");
+    }
+
+    let (status, body) = post_token(&router, refresh_grant(&ra)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "app A revoked: {body}");
+    let (status, body) = post_token(&router, refresh_grant(&rb)).await;
+    assert_eq!(status, StatusCode::OK, "app B untouched: {body}");
+}
