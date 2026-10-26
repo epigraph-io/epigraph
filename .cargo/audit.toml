@@ -37,6 +37,26 @@ ignore = [
                          #   (Datalog engine) — not removable by us.
     "RUSTSEC-2024-0436", # paste: unmaintained. Transitive via `ascent`.
 
+    # ── Fix needs a major bump — dismissed until needed ─────────────────────
+    "RUSTSEC-2026-0387", # crypto-bigint 0.5.5: timing variability in
+                         #   operations meant to be constant-time; fixed in
+                         #   >=0.7.6. 2026-10-26 operator ruling R-26:
+                         #   accepted, not bumped. Chain: jsonwebtoken's
+                         #   `rust_crypto` backend -> p256 / p384 ->
+                         #   elliptic-curve 0.13 -> crypto-bigint 0.5 (NOT
+                         #   via rsa, which uses num-bigint-dig). The fix
+                         #   needs elliptic-curve 0.14, i.e. a jsonwebtoken
+                         #   major. Unreachable with secret inputs: no crate
+                         #   constructs an EC key (no EncodingKey/DecodingKey
+                         #   ::from_ec_*, no from_jwk), and every Validation
+                         #   pins RS256 (Google / Cloudflare Access public
+                         #   keys) or HS256 (epigraph-auth), so the ES256 /
+                         #   ES384 code paths never run, and an EC VERIFY
+                         #   would handle public data only. An EC private key
+                         #   or an ES* algorithm in production re-opens this
+                         #   entry. Revisit on the next jsonwebtoken /
+                         #   elliptic-curve (or rsa) major.
+
     # ── FIXED, not suppressed (issue #287) ──────────────────────────────────
     # RUSTSEC-2024-0363 (sqlx 0.7.4 binary-protocol cast),
     # RUSTSEC-2026-0098 / -0099 (rustls-webpki 0.101.7 name-constraint),
@@ -50,13 +70,20 @@ ignore = [
     # reappearance means a dependency regressed onto the old TLS/DB stack and
     # `cargo audit` should say so.
     #
-    # RUSTSEC-2025-0134 is NOT cleared. The advisory marks the whole
-    # rustls-pemfile crate unmaintained, so it also covers the rustls-pemfile
-    # 2.2.0 that Cargo.lock resolves today. `cargo audit` reports it as a
-    # non-failing "unmaintained" warning, and it stays visible there on
-    # purpose: it is untriaged (no ignore entry), pending a move off
-    # rustls-pemfile (rustls-pki-types' PEM parser is the upstream
-    # replacement).
+    # RUSTSEC-2025-0134 (rustls-pemfile unmaintained) is CLEARED, not
+    # suppressed (2026-10-26, operator ruling R-26): epigraph-api's TLS loader
+    # (src/tls.rs) parses PEM with rustls-pki-types' PemObject API, and
+    # axum-server 0.8 dropped its own rustls-pemfile dependency, so Cargo.lock
+    # no longer contains the crate. `cargo audit` would report a return only
+    # as a non-failing warning, so the ratchet is
+    # crates/epigraph-api/tests/tls_dependency_boundary.rs. Do not add an
+    # ignore entry for it.
+    #
+    # rustls 0.23.45 (RUSTSEC-2026-0346 / -0347 / -0348 / -0349),
+    # rustls-webpki 0.103.15 (RUSTSEC-2026-0382) and webpki-roots 1.0.8
+    # (RUSTSEC-2026-0381) were cleared by semver-compatible lockfile bumps
+    # (rustls 0.23.46, rustls-webpki 0.103.16, webpki-roots 1.0.11). They
+    # were never suppressed; do not add them.
     #
     # RUSTSEC-2026-0097 (rand unsound with a custom logger; GHSA-cq8v-f236-94qc)
     # was suppressed here while Cargo.lock resolved rand 0.8.5 and 0.9.2. The
@@ -79,7 +106,10 @@ ignore = [
 # dependency alert.
 #
 # GHSA-w9wp-h8wv-79jx / CVE-2026-48504, opentelemetry_sdk <=0.32.0 (Cargo.lock:
-#   0.27.1). Unbounded allocation in `BaggagePropagator::extract_with_context`
+#   0.27.1; Dependabot alerts #13 on Cargo.lock and #16 on
+#   crates/epigraph-api/Cargo.toml). 2026-10-26 operator ruling R-26:
+#   DISMISSED UNTIL NEEDED, not bumped, for the reasons below; revisit on the
+#   next otel major or when the `otel` pipeline is wired up. Unbounded allocation in `BaggagePropagator::extract_with_context`
 #   on an oversized inbound `baggage` header (availability only). NOT REACHABLE:
 #   - opentelemetry_sdk is pulled only by epigraph-api's optional `otel`
 #     feature, which is not a default feature. `cargo tree -i opentelemetry_sdk
