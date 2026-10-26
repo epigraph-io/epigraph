@@ -211,6 +211,16 @@ async fn edges_between(pool: &sqlx::PgPool, src: uuid::Uuid, tgt: uuid::Uuid) ->
         .unwrap()
 }
 
+/// The stored relationship of the one edge `src -> tgt`.
+async fn relationship_between(pool: &sqlx::PgPool, src: uuid::Uuid, tgt: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT relationship FROM edges WHERE source_id = $1 AND target_id = $2")
+        .bind(src)
+        .bind(tgt)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn staging_status(pool: &sqlx::PgPool, id: uuid::Uuid) -> String {
     sqlx::query_scalar("SELECT review_status::text FROM edges_staging WHERE id = $1")
         .bind(id)
@@ -295,6 +305,12 @@ async fn promote_staged_edges_refuses_a_reserved_dedup_key() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "clean promote: {status}: {body}");
     assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+    // A staged `CORROBORATES` is promoted in the canonical lower-case
+    // spelling every edge writer stores (backlog 3ce5e00c).
+    assert_eq!(
+        relationship_between(&pool, c_src, c_tgt).await,
+        "corroborates"
+    );
     assert_eq!(staging_status(&pool, clean).await, "promoted");
 
     sqlx::query("DELETE FROM edges_staging WHERE id = $1")
@@ -370,6 +386,11 @@ async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "clean promote-all: {status}: {body}");
     assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+    assert_eq!(
+        relationship_between(&pool, c_src, c_tgt).await,
+        "corroborates",
+        "the promote-all branch stores the canonical spelling too"
+    );
     assert_eq!(staging_status(&pool, clean).await, "promoted");
 }
 

@@ -1083,6 +1083,11 @@ pub async fn promote_staged_edges(
     // the act writes (create and patch refuse it too); a staged row is copied
     // verbatim, so promoting it would publish a forged dedup record. The whole
     // request is refused rather than silently promoting the rest.
+    //
+    // The one column NOT copied verbatim is a case-folded relationship
+    // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
+    // lower-case canonical spelling, as every edge writer stores it (backlog
+    // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
     let (promoted_count, reserved): (i64, Vec<Uuid>) = if let Some(ref ids) = request.edge_ids {
         if ids.is_empty() {
             return Err(ApiError::ValidationError {
@@ -1107,7 +1112,10 @@ pub async fn promote_staged_edges(
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type, relationship, properties
+                SELECT source_id, source_type, target_id, target_type,
+                       CASE WHEN lower(relationship) = ANY($3::text[])
+                            THEN lower(relationship) ELSE relationship END,
+                       properties
                 FROM to_promote
                 ON CONFLICT DO NOTHING
                 RETURNING id
@@ -1122,6 +1130,7 @@ pub async fn promote_staged_edges(
         )
         .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
         .bind(ids)
+        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
@@ -1144,7 +1153,10 @@ pub async fn promote_staged_edges(
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type, relationship, properties
+                SELECT source_id, source_type, target_id, target_type,
+                       CASE WHEN lower(relationship) = ANY($2::text[])
+                            THEN lower(relationship) ELSE relationship END,
+                       properties
                 FROM to_promote
                 ON CONFLICT DO NOTHING
                 RETURNING id
@@ -1158,6 +1170,7 @@ pub async fn promote_staged_edges(
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
         .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
+        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
