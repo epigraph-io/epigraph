@@ -857,6 +857,73 @@ async fn rotation_successor_keeps_the_presented_tokens_scope_order(pool: PgPool)
     );
 }
 
+/// Migration 172 (backlog 1228c284): the rotation definer's built-ins resolve
+/// in `pg_catalog`, whatever `public` holds. A `public.unnest(text[])` is an
+/// EXACT argument-type match, so PostgreSQL picks it over
+/// `pg_catalog.unnest(anyarray)` wherever `public` sits in the path; under
+/// 140's `search_path = pg_catalog, public` and unqualified call the body ran
+/// it, and the successor took the scopes it returned instead of the presented
+/// token's. The overload is created AFTER the fixtures are seeded, on the
+/// superuser connection (CREATE on `public` is what the hazard presupposes),
+/// so nothing but the rotation can reach it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotation_ignores_a_public_overload_of_the_builtins_it_calls(pool: PgPool) {
+    let read = "claims:read".to_string();
+    let write = "claims:write".to_string();
+    let client = OAuthClientRepository::create(
+        &pool,
+        &format!("w11_{}", Uuid::new_v4().simple()),
+        None,
+        "1228c284 public overload",
+        "human",
+        &[read.clone(), write.clone()],
+        &[read.clone(), write.clone()],
+        "active",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed client granted read+write");
+    let app = app_pool(&pool, 2).await;
+    let exp = chrono::Utc::now() + chrono::Duration::hours(1);
+    let t0 = h("overload0");
+    RefreshTokenRepository::create(&app, &t0, client, std::slice::from_ref(&read), exp)
+        .await
+        .unwrap();
+
+    // Returns a scope the client holds but the presented token does not.
+    sqlx::query(
+        "CREATE FUNCTION public.unnest(text[]) RETURNS SETOF text \
+         LANGUAGE sql AS $$ SELECT 'claims:write'::text $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the public overload");
+
+    let t1 = h("overload1");
+    assert!(matches!(
+        RefreshTokenRepository::rotate(&app, &t0, &t1, exp)
+            .await
+            .unwrap(),
+        RefreshRotateOutcome::Rotated { .. }
+    ));
+    let scopes: Vec<String> =
+        sqlx::query_scalar("SELECT scopes FROM refresh_tokens WHERE token_hash = $1")
+            .bind(&t1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        scopes,
+        vec![read],
+        "the successor keeps the presented scopes; a public overload of unnest must not decide \
+         them"
+    );
+}
+
 /// The rotation's expiry cap is the client type's refresh TTL, row by row: the
 /// same table as `oauth/token.rs::handle_refresh_token`'s `refresh_ttl` (agent
 /// 24 h, human 30 d, service 90 d). A 100-year successor must land in a

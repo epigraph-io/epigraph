@@ -1698,6 +1698,23 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
+  Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
+  pg_catalog, pg_temp` (was `pg_catalog, public`) and its `unnest(` and
+  `now()` calls written `pg_catalog.`-qualified; nothing else changes. A
+  `public.unnest(text[])` is an exact argument-type match and wins over
+  `pg_catalog.unnest(anyarray)` whatever the path order, so 140's pin did not
+  keep the call in `pg_catalog`. Owner and grant re-asserted as 140 does.
+  Pinned by `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`
+  (reads the body at head) and
+  `app_role_table_lockdown.rs::rotation_ignores_a_public_overload_of_the_builtins_it_calls`.
+  A later re-statement of this function must start from 172's body. The other
+  definers that call unqualified built-ins under a path including `public`
+  are the same class and are not changed here. Undo: re-run 140's `CREATE OR
+  REPLACE FUNCTION` block. Slot: 172 and 173 are assigned to this batch and
+  are free on `main` and in every open PR. **Deploy order:** after 140; no
+  binary change. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 
