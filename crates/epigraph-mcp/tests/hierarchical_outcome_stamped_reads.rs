@@ -1042,3 +1042,52 @@ async fn a_root_with_no_executes_edge_is_refused_like_an_unknown_id(pool: PgPool
         "a refused report moves no counter and writes no row"
     );
 }
+
+/// Backlog c0ab097a (2), MCP twin of the REST route's
+/// `a_shared_public_atom_does_not_admit_a_non_member`: a public level-3 atom
+/// reused by a group-private plan gives a non-member one visible `executes`
+/// edge. Both MCP entry points must still refuse it as for an unknown id, and
+/// nothing is written; a member's report is recorded (positive control).
+///
+/// RED before the fix: `refusals` panicked, the stranger's report was accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_private_workflow(&pool, "stamped-outcome-public-atom").await;
+
+    let atom = fixture::seed_public_claim(
+        &pool,
+        w.stranger_id,
+        &format!("a shared operation atom {}", w.workflow_id),
+    )
+    .await;
+    set_level(&pool, atom, 3).await;
+    executes(&pool, w.workflow_id, atom, Some(2)).await;
+    let atom_edge: String = sqlx::query_scalar(
+        "SELECT visibility::text FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+    )
+    .bind(w.workflow_id)
+    .bind(atom)
+    .fetch_one(&pool)
+    .await
+    .expect("atom edge read-back");
+    assert_eq!(
+        atom_edge, "public",
+        "fixture shape: the atom's executes edge is public"
+    );
+
+    let refused = refusals(&server, &w.stranger, w.workflow_id).await;
+    let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
+    assert_eq!(refused[0], unknown[0], "refused as for an unknown id");
+    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        written(&pool, w.workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
+
+    let json = report(&server, &w.member, w.workflow_id, &[0, 1]).await;
+    assert!(unresolved(&json).is_empty(), "{json}");
+    assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
+}

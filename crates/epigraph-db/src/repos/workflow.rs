@@ -1008,8 +1008,9 @@ impl WorkflowRepository {
     }
 
     /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
-    /// edges (any level: thesis, phase, step or operation), through the same
-    /// edge and claim predicates as [`Self::plan_step_claim_ids`].
+    /// edges into the plan's OWN structure (a level 0, 1 or 2 claim: thesis,
+    /// phase or step), through the same edge and claim predicates as
+    /// [`Self::plan_step_claim_ids`].
     ///
     /// This is the outcome reports' authority predicate. `workflows` has no
     /// row security, so a report's counter write cannot be scoped by the
@@ -1020,12 +1021,23 @@ impl WorkflowRepository {
     /// resolvable step prefix: a member whose first ordinal edge was
     /// re-owned still reads the rest of the plan and may report.
     ///
+    /// # Level-3 atoms do not count (backlog c0ab097a)
+    ///
+    /// An operation atom's id is content-addressed in the namespace documents
+    /// share (`atom_id`), so one atom is executed by many workflows, and the
+    /// executor links a PUBLIC atom into a group-private plan. Its `executes`
+    /// edge is then public: counting it let a non-member that reads nothing of
+    /// the plan itself move the plan's counters. Thesis, phase and step ids are
+    /// scoped to the workflow's `canonical_name`, so reading one of those is
+    /// reading the plan. A step-less plan (the generation-0 thesis scaffold
+    /// `add_step` fills) is still reportable by a reader of its thesis.
+    ///
     /// Run it on the caller's STAMPED transaction, as
     /// [`Self::plan_step_claim_ids`] must be.
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.
-    pub async fn viewer_reads_any_executes_edge(
+    pub async fn viewer_reads_plan_structure(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
@@ -1035,6 +1047,7 @@ impl WorkflowRepository {
                SELECT 1 FROM edges e \
                JOIN claims c ON c.id = e.target_id \
                WHERE e.source_id = $1 AND e.relationship = 'executes' \
+                 AND c.properties->>'level' IN ('0', '1', '2') \
                  /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
              )",
             2,

@@ -1344,8 +1344,9 @@ pub async fn find_workflow_hierarchical(
 /// reads of `claims` and `edges`. On the plain transaction this used to run
 /// on, row security admitted only public rows, so a group's own member got
 /// every row of a group-private workflow written with a NULL `step_claim_id`,
-/// silently. A caller that reads NONE of the plan's `executes` edges
-/// (`WorkflowRepository::viewer_reads_any_executes_edge`) is refused with the
+/// silently. A caller that reads NONE of the plan's own `executes` edges
+/// (thesis, phase or step; a shared level-3 atom does not count:
+/// `WorkflowRepository::viewer_reads_plan_structure`) is refused with the
 /// missing-id 404 before anything is written: `workflows` has no row security,
 /// so without that check any `claims:write` holder could move the counters of
 /// a workflow it cannot read. A reader of the plan resolves its steps, and any
@@ -1452,18 +1453,16 @@ pub async fn report_hierarchical_outcome(
         Some((m,)) => m,
         None => return Err(not_found()),
     };
-    // A caller that reads none of the plan's `executes` edges cannot read this
-    // workflow (`workflows` has no row security; its plan does): 404 exactly
-    // like a missing id, before any write. Shared with MCP.
-    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
-        &mut tx,
-        &viewer,
-        workflow_id,
-    )
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("workflow visibility check failed: {e}"),
-    })? {
+    // A caller that reads none of the plan's own `executes` edges (a shared
+    // level-3 atom does not count) cannot read this workflow (`workflows` has
+    // no row security; its plan does): 404 exactly like a missing id, before
+    // any write. Shared with MCP.
+    if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, &viewer, workflow_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("workflow visibility check failed: {e}"),
+        })?
+    {
         return Err(not_found());
     }
 
