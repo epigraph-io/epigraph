@@ -628,8 +628,48 @@ pub async fn auto_wire_ds_update(
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
     seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
+    auto_wire_ds_update_filed_on(
+        conn,
+        viewer,
+        claim_id,
+        agent_id,
+        confidence,
+        weight,
+        supports,
+        evidence_type_str,
+        evidence_id,
+        seed_truth_prior,
+        None,
+    )
+    .await
+}
+
+/// [`auto_wire_ds_update`], with the evidence BBA filed on `file_on` instead
+/// of `binary_truth` when it is `Some`: a two-hypothesis frame the claim's
+/// readers read (a promoted hypothesis's `research_validity`, operator ruling
+/// R-17; `epigraph_engine::promotion::promoted_hypothesis_filing_frame`), whose
+/// index 0 is the claim's own hypothesis, as on `binary_truth`. The claim is
+/// bound to it at index 0. Only the row's frame changes: the truth_value seed,
+/// the frame-scoped calibration and the cache (`belief_frame_id`) stay on
+/// `binary_truth`, and the fold below reads every two-hypothesis frame, so the
+/// evidence is combined exactly once either way.
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_wire_ds_update_filed_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    agent_id: Uuid,
+    confidence: f64,
+    weight: f64,
+    supports: bool,
+    evidence_type_str: Option<&str>,
+    evidence_id: Option<Uuid>,
+    seed_truth_prior: bool,
+    file_on: Option<Uuid>,
+) -> Result<DsAutoResult, String> {
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
+    let store_frame_id = file_on.unwrap_or(frame_id);
 
     // Build BBA for this evidence
     let bba = build_binary_bba(&frame, confidence, weight, supports)?;
@@ -639,6 +679,11 @@ pub async fn auto_wire_ds_update(
     FrameRepository::assign_claim(&mut *conn, claim_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
+    if store_frame_id != frame_id {
+        FrameRepository::assign_claim(&mut *conn, claim_id, store_frame_id, Some(0))
+            .await
+            .map_err(|e| format!("assign_claim: {e}"))?;
+    }
 
     // Materialize a synthetic perspective with id=evidence_id so the
     // mass_functions.perspective_id FK is satisfied. Without this, every
@@ -731,7 +776,7 @@ pub async fn auto_wire_ds_update(
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
         claim_id,
-        frame_id,
+        store_frame_id, // binary_truth, or the frame the caller files on (R-17)
         Some(agent_id),
         evidence_id, // C-1: unique perspective per evidence prevents overwrite
         &masses_json,

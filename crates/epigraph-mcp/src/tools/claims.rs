@@ -1538,7 +1538,21 @@ pub async fn update_with_evidence(
     // the same unit as its BBA.
     //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    let ds = ds_auto::auto_wire_ds_update(
+    // A promoted hypothesis's readers read `research_validity`, never
+    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
+    // R-17), instead of on `binary_truth`, never on both: the fold reads every
+    // two-hypothesis frame and would count it twice. A missing or non-binary
+    // `research_validity` is the caller's refusal, with nothing written.
+    let file_on =
+        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, claim_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { .. }
+                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+                other => internal_error(other),
+            })?
+            .map(|frame| frame.id);
+    let ds = ds_auto::auto_wire_ds_update_filed_on(
         &mut tx,
         viewer,
         claim_id,
@@ -1549,6 +1563,7 @@ pub async fn update_with_evidence(
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
         !foreign_claim, // seed the authored truth_value only on a claim this caller writes
+        file_on,
     )
     .await
     .map_err(|e| {

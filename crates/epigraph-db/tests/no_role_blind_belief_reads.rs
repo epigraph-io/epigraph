@@ -224,7 +224,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-mcp/src/tools/ds.rs", "get_divergence", Tag::Todo { pr: "PR-R1b", why: "MCP divergence serves BetP; SPEC §7.2" }),
     ("crates/epigraph-mcp/src/tools/ds.rs", "scoped_belief", Tag::Todo { pr: "PR-R1b", why: "MCP scoped_belief serves scoped rows; SPEC §7.2" }),
     ("crates/epigraph-mcp/src/tools/ds.rs", "submit_ds_evidence", Tag::Todo { pr: "PR-W1a", why: "reads and reports the cache around a textless BBA write; SPEC §4.1 W3" }),
-    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update", Tag::Todo { pr: "PR-5b1", why: "reads the cached BetP as the clamp's prior; SPEC §4.1 W1" }),
+    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", Tag::Todo { pr: "PR-5b1", why: "reads the cached BetP as the clamp's prior; SPEC §4.1 W1" }),
     ("crates/epigraph-mcp/src/tools/link_epistemic.rs", "do_link_epistemic", Tag::Todo { pr: "PR-W1b", why: "reads the source's cache to wire an edge and reports the target's; SPEC §4.1 W7" }),
     ("crates/epigraph-mcp/src/tools/recall.rs", "fetch_batched_context", Tag::Todo { pr: "PR-R2", why: "recall_with_context context rows gated on truth_value; SPEC §7.2" }),
     // --- scripts ------------------------------------------------------------
