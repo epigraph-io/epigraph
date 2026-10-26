@@ -786,6 +786,15 @@ async fn extract_viewer(
 /// It deliberately carries no authority and exposes no accessor. Anything that
 /// would consume a real `Viewer` is inside a `#[cfg(feature = "db")]` block by
 /// construction, because the repo layer it would call only exists there.
+///
+/// # Check-only (operator ruling R-39)
+///
+/// The `not(db)` build is a COMPILE target, never a runnable one: the `server`
+/// binary declares `required-features = ["db"]`, so no request ever reaches a
+/// handler built with this type. It keeps the two builds' handler signatures
+/// identical so the `not(db)` check compiles; it is not a security boundary,
+/// and the `not(db)` arms of split handlers are not held to extractor parity
+/// with their `db` arms (see the header of `routes/mod.rs`).
 #[cfg(not(feature = "db"))]
 #[derive(Debug, Clone, Copy)]
 pub struct NoDbViewer;

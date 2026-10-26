@@ -430,7 +430,9 @@ jobs:
         # Scope is deliberately lib+bins, NOT --all-targets: the crate's
         # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
         # test targets link Postgres regardless of the feature flag and cannot
-        # pass under --no-default-features today.
+        # pass under --no-default-features today. Every bin, `server`
+        # included, declares required-features = ["db"] (ruling R-39: not(db)
+        # is check-only), so in practice this checks the library.
         run: cargo check -p epigraph-api --no-default-features --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
