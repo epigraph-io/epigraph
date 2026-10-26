@@ -1235,6 +1235,7 @@ pub async fn do_ingest_document(
             &claim,
             planned,
             agent_id,
+            signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
         )
@@ -1835,11 +1836,16 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 ///   hash(text))`. Convergence across papers IS the feature (it is how
 ///   cross-source corroboration finds agreement), so these stay on the
 ///   content-hash path unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn persist_planned_claim(
     conn: &mut sqlx::PgConnection,
     claim: &Claim,
     planned: &PlannedClaim,
     agent_id: Uuid,
+    // The server's signer agent: `claims.signer_id` of a row this call
+    // INSERTS, next to the claim's signature (backlog 4ff87716). A row the
+    // walk resolves to is never written.
+    signer_id: Uuid,
     truth: TruthValue,
     // Tenancy declaration (PR-16): the owner group `IngestTx::owner_decl`
     // resolves (the ingesting agent's own personal group, or its operator's
@@ -1853,7 +1859,7 @@ async fn persist_planned_claim(
     decl: epigraph_core::TenancyDecl,
 ) -> Result<(Uuid, bool, Option<Uuid>), McpError> {
     if planned.id_is_document_scoped() {
-        let was_new = ClaimRepository::create_with_id_if_absent_conn(
+        let was_new = ClaimRepository::create_with_id_if_absent_signed_conn(
             &mut *conn,
             planned.id,
             &planned.content,
@@ -1862,6 +1868,9 @@ async fn persist_planned_claim(
             truth,
             &[],
             decl,
+            claim
+                .signature
+                .map(|signature| (claim.public_key, signature, signer_id)),
         )
         .await
         .map_err(internal_error)?;
@@ -1891,7 +1900,7 @@ async fn persist_planned_claim(
     // a cleanly-migrated schema: a document whose atom converged onto a workflow
     // operation atom wrote nothing (`processed_by=0 doc_claims=0`). Another
     // author's claim is resolved to, never rewritten.
-    let persisted = ClaimRepository::create_conn(&mut *conn, claim, decl)
+    let persisted = ClaimRepository::create_signed_conn(&mut *conn, claim, decl, Some(signer_id))
         .await
         .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
@@ -2199,6 +2208,7 @@ pub async fn do_ingest_document_spine(
             &claim,
             planned,
             agent_id,
+            signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
         )

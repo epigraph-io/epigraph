@@ -1183,6 +1183,60 @@ pub struct PatchClaimDiff {
     pub after_trace: Option<Uuid>,
 }
 
+/// The `(signature, signer_id)` a NEW claim row stores: both, or neither (the
+/// `claims_signature_requires_signer` CHECK).
+///
+/// Ruling R-34: a new row stores only a v1 claim-tagged signature that
+/// verifies under `public_key` over `digest`, the digest the INSERT stores. A
+/// signature tagged for another entity kind (evidence, edge) is not a claim
+/// signature, and a legacy bare-digest one binds no entity type; every
+/// in-tree signer signs v1, so admitting legacy here would only keep a
+/// downgrade open for new rows. Legacy acceptance stays in the verifiers, for
+/// rows written before v1. A signature over another digest, or one that does
+/// not verify, is not stored either: an unverifiable signature on a row would
+/// read as tampering.
+///
+/// The ONE gate every claim INSERT that stores a signature applies
+/// ([`ClaimRepository::create_strict_signed`],
+/// [`ClaimRepository::create_signed_conn`],
+/// [`ClaimRepository::create_with_id_if_absent_signed_conn`]). The caller
+/// vouches that `signer_id` is the agent whose registered key is
+/// `public_key`; `verify_claim` re-checks that pairing on every read.
+fn v1_claim_signature_to_store(
+    public_key: &[u8; 32],
+    digest: &[u8; 32],
+    signature: Option<[u8; 64]>,
+    signer_id: Option<Uuid>,
+) -> (Option<Vec<u8>>, Option<Uuid>) {
+    match (signer_id, signature) {
+        (Some(signer), Some(sig))
+            if matches!(
+                epigraph_crypto::SignatureVerifier::verify_entity(
+                    public_key,
+                    epigraph_crypto::SignedEntity::Claim,
+                    digest,
+                    &sig,
+                ),
+                Ok(Some(epigraph_crypto::SignatureScheme::V1))
+            ) =>
+        {
+            (Some(sig.to_vec()), Some(signer))
+        }
+        _ => (None, None),
+    }
+}
+
+/// The columns [`ClaimRepository::create_signed_conn`]'s INSERT returns.
+struct CreatedClaimRow {
+    id: Uuid,
+    content: String,
+    truth_value: f64,
+    agent_id: Uuid,
+    trace_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Build a Claim from database row data.
 ///
 /// # The crypto fields are PLACEHOLDERS, not data
@@ -1814,6 +1868,29 @@ impl ClaimRepository {
         claim: &Claim,
         decl: TenancyDecl,
     ) -> Result<Claim, DbError> {
+        Self::create_signed_conn(conn, claim, decl, None).await
+    }
+
+    /// [`Self::create_conn`], additionally storing the claim's signature with
+    /// `signer_id` as its SIGNER when this call INSERTS the row (backlog
+    /// `4ff87716`: `ingest_document`'s atoms were signed and the signature
+    /// dropped here).
+    ///
+    /// The signature is stored by the gate [`Self::create_strict_signed`]
+    /// applies ([`v1_claim_signature_to_store`]): only a v1 claim signature
+    /// that verifies under `claim.public_key` over the digest this INSERT
+    /// stores (`blake3(content)`), else nothing. A dedup HIT returns the
+    /// existing row and writes nothing onto it: that row is another write's,
+    /// and its signature (or its absence) is that write's.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        claim: &Claim,
+        decl: TenancyDecl,
+        signer_id: Option<Uuid>,
+    ) -> Result<Claim, DbError> {
         use sqlx::Acquire;
 
         // A dedup HIT on an already-committed row is answered here, unlocked
@@ -1840,7 +1917,7 @@ impl ClaimRepository {
             .begin()
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
-        match Self::create_conn_serialized(&mut scope, claim, decl).await {
+        match Self::create_conn_serialized(&mut scope, claim, decl, signer_id).await {
             Ok(out) => {
                 scope
                     .commit()
@@ -1898,7 +1975,10 @@ impl ClaimRepository {
         conn: &mut sqlx::PgConnection,
         claim: &Claim,
         decl: TenancyDecl,
+        signer_id: Option<Uuid>,
     ) -> Result<Claim, DbError> {
+        use sqlx::Row;
+
         let id: Uuid = claim.id.into();
         let agent_id: Uuid = claim.agent_id.into();
         let trace_id: Option<Uuid> = claim.trace_id.map(Into::into);
@@ -1928,28 +2008,45 @@ impl ClaimRepository {
             return Ok(existing);
         }
 
-        let row = sqlx::query!(
+        let (signature, signer_id) = v1_claim_signature_to_store(
+            &claim.public_key,
+            &content_hash,
+            claim.signature,
+            signer_id,
+        );
+        let row = sqlx::query(
             r#"
             INSERT INTO claims (
                 id, content, content_hash, truth_value, agent_id, trace_id,
-                created_at, updated_at, visibility, owner_group_id
+                created_at, updated_at, visibility, owner_group_id, signature, signer_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING id, content, truth_value, agent_id, trace_id, created_at, updated_at
             "#,
-            id,
-            claim.content,
-            content_hash.as_slice(),
-            truth_value,
-            agent_id,
-            trace_id,
-            created_at,
-            updated_at,
-            decl.visibility_bind(),
-            decl.owner_group_bind()
         )
+        .bind(id)
+        .bind(&claim.content)
+        .bind(content_hash.as_slice())
+        .bind(truth_value)
+        .bind(agent_id)
+        .bind(trace_id)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
+        .bind(signature)
+        .bind(signer_id)
         .fetch_one(&mut *conn)
         .await?;
+        let row = CreatedClaimRow {
+            id: row.get("id"),
+            content: row.get("content"),
+            truth_value: row.get("truth_value"),
+            agent_id: row.get("agent_id"),
+            trace_id: row.get("trace_id"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        };
 
         // Fire-and-forget claim.created event (closes #61). This is the
         // central emit for ALL writers that go through ClaimRepository::create
@@ -6637,30 +6734,12 @@ impl ClaimRepository {
         let updated_at = claim.updated_at;
         let content_hash = ContentHasher::hash(claim.content.as_bytes());
 
-        let (signature, signer_id): (Option<Vec<u8>>, Option<Uuid>) =
-            match (signer_id, claim.signature) {
-                // Ruling R-34: a NEW row stores only a v1 claim-tagged
-                // signature. A signature tagged for another entity kind
-                // (evidence, edge) is not a claim signature, and a legacy
-                // bare-digest one binds no entity type; every in-tree signer
-                // signs v1, so admitting legacy here would only keep a
-                // downgrade open for new rows. Legacy acceptance stays in the
-                // verifiers, for rows written before v1.
-                (Some(signer), Some(sig))
-                    if matches!(
-                        epigraph_crypto::SignatureVerifier::verify_entity(
-                            &claim.public_key,
-                            epigraph_crypto::SignedEntity::Claim,
-                            &content_hash,
-                            &sig,
-                        ),
-                        Ok(Some(epigraph_crypto::SignatureScheme::V1))
-                    ) =>
-                {
-                    (Some(sig.to_vec()), Some(signer))
-                }
-                _ => (None, None),
-            };
+        let (signature, signer_id) = v1_claim_signature_to_store(
+            &claim.public_key,
+            &content_hash,
+            claim.signature,
+            signer_id,
+        );
 
         let row = sqlx::query(
             r#"INSERT INTO claims (id, content, content_hash, truth_value, agent_id, trace_id, created_at, updated_at, visibility, owner_group_id, signature, signer_id)
@@ -6992,6 +7071,56 @@ impl ClaimRepository {
         labels: &[String],
         decl: TenancyDecl,
     ) -> Result<bool, DbError> {
+        Self::create_with_id_if_absent_signed_conn(
+            conn,
+            id,
+            content,
+            content_hash,
+            agent_id,
+            truth,
+            labels,
+            decl,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::create_with_id_if_absent_conn`], additionally storing a claim
+    /// signature when this call INSERTS the row (backlog `4ff87716`: the
+    /// document walk's thesis, section and paragraph nodes were signed and the
+    /// signature dropped here).
+    ///
+    /// `signed` is `(public key, signature, signer_id)`. It is stored by the
+    /// gate every claim INSERT applies ([`v1_claim_signature_to_store`]): only
+    /// a v1 claim signature that verifies under that key over the digest this
+    /// INSERT stores (`content_hash`, the caller's, which for a document node
+    /// is the seed-scoped compound digest), else nothing. On the conflict
+    /// path (`ON CONFLICT (id) DO NOTHING`) nothing is written onto the
+    /// existing row.
+    ///
+    /// # Errors
+    /// As [`Self::create_with_id_if_absent`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_id_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        content: &str,
+        content_hash: &[u8; 32],
+        agent_id: Uuid,
+        truth: TruthValue,
+        labels: &[String],
+        decl: TenancyDecl,
+        signed: Option<([u8; 32], [u8; 64], Uuid)>,
+    ) -> Result<bool, DbError> {
+        let (signature, signer_id) = match signed {
+            Some((public_key, signature, signer_id)) => v1_claim_signature_to_store(
+                &public_key,
+                content_hash,
+                Some(signature),
+                Some(signer_id),
+            ),
+            None => (None, None),
+        };
         // Labels-at-creation is the second caller-supplied label surface (the
         // ingest paths); same predicate, refused before the INSERT so a bad
         // label never reaches a row.
@@ -6999,8 +7128,8 @@ impl ClaimRepository {
 
         let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                                 visibility, owner_group_id, signature, signer_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (id) DO NOTHING \
              RETURNING (xmax = 0) AS was_inserted",
         )
@@ -7012,6 +7141,8 @@ impl ClaimRepository {
         .bind(labels)
         .bind(decl.visibility_bind())
         .bind(decl.owner_group_bind())
+        .bind(signature)
+        .bind(signer_id)
         .fetch_optional(&mut *conn)
         .await?;
         // RETURNING is empty when the conflict path is taken, so None == not new.
