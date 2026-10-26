@@ -3353,3 +3353,167 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
         }
     }
 }
+
+/// `(prosecdef, owner, provolatile, proacl, proconfig)` of one function.
+type DefinerCatalogRow = (bool, String, String, Option<String>, Option<Vec<String>>);
+
+/// Migration 179 (a role binding that admits the holder and the role's
+/// ATTACHED agents only): the two mode-taking verb overloads are maintenance
+/// SECURITY DEFINERs with an explicit ACL that neither PUBLIC nor the
+/// application role can execute, beside 165's boolean signatures (kept); the
+/// three functions it re-states (the derivation, the binding's update guard
+/// and its audit) keep their owner, volatility and grants; the new
+/// `attached_agents` column is NOT NULL, defaults to false (an existing
+/// binding keeps 165's meaning), is not updatable by maintenance, and cannot
+/// be set together with `include_agents`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_179_attached_mode_definers_are_owned_and_granted(pool: PgPool) {
+    for (signature, volatility, app_may_execute) in [
+        (
+            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+            "s",
+            false,
+        ),
+        (
+            "public.epigraph_group_role_bindings_guard_update()",
+            "v",
+            false,
+        ),
+        ("public.epigraph_group_role_bindings_audit()", "v", false),
+        ("public.epigraph_live_memberships(uuid)", "s", true),
+        (
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+    ] {
+        let meta: Option<DefinerCatalogRow> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text, \
+                        p.proconfig \
+                   FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(signature)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl, config) =
+            meta.unwrap_or_else(|| panic!("{signature} must exist (migration 179)"));
+        assert!(secdef, "{signature} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        assert_eq!(vol, volatility, "{signature} volatility");
+        assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+        assert!(
+            config
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.starts_with("search_path=")),
+            "{signature} must pin its search_path"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+        }
+    }
+
+    let column: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT a.attnotnull, pg_get_expr(d.adbin, d.adrelid) \
+           FROM pg_attribute a \
+           LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+          WHERE a.attrelid = 'public.group_role_bindings'::regclass \
+            AND a.attname = 'attached_agents' AND NOT a.attisdropped",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("column lookup");
+    assert_eq!(
+        column,
+        Some((true, Some("false".to_string()))),
+        "attached_agents must be NOT NULL DEFAULT false"
+    );
+    let updatable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege('epigraph_maintenance', 'public.group_role_bindings', \
+                                     'attached_agents', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column privilege");
+    assert!(!updatable, "maintenance must not UPDATE attached_agents");
+    let check: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c \
+          WHERE c.conrelid = 'public.group_role_bindings'::regclass \
+            AND c.conname = 'group_role_bindings_one_agent_mode'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("constraint lookup");
+    let check = check.expect("the one-agent-mode CHECK must exist");
+    assert!(
+        check.contains("include_agents") && check.contains("attached_agents"),
+        "{check}"
+    );
+}
+
+/// Migration 179's attached arm survives AT HEAD. The derivation is the one
+/// rule the viewer's group set, the claims-path writer scope and the roster
+/// all ask; a later re-statement from 165's body would silently turn every
+/// `attached_agents` binding into a holder-only one (fail-closed, but quiet:
+/// the role's attached agents lose the group). Keep these fragments when
+/// re-stating it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p \
+          WHERE p.oid = to_regprocedure('public.epigraph_role_derived_memberships(uuid, \
+                                         timestamp with time zone)')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let body = body.expect("the derivation must exist");
+    for fragment in [
+        // 165's arms.
+        "b.include_agents",
+        "public.epigraph_live_role_assignment(c.human, b.role, p_at) IS NOT NULL",
+        // 179's attached arm: a live attachment of THIS agent to THE BOUND role.
+        "b.attached_agents",
+        "FROM public.role_agents ra",
+        "ra.agent_id = p_agent AND ra.role = b.role",
+        "ra.detached_at IS NULL",
+    ] {
+        assert!(
+            body.contains(fragment),
+            "epigraph_role_derived_memberships at head lost {fragment:?} (re-state it from the \
+             head body, keeping every delta)"
+        );
+    }
+}

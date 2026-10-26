@@ -2061,3 +2061,422 @@ async fn armed_the_head_writer_scope_keeps_the_derived_arm_beside_the_role_holde
         .await
         .expect("POSITIVE CONTROL: the agent still writes where its human writes directly");
 }
+
+// =====================================================================
+// Migration 179: a binding that admits the holder and the role's ATTACHED
+// agents only.
+// =====================================================================
+
+/// 179's agent modes, as the mode-taking verbs spell them.
+const HOLDER_ONLY: &str = "holder_only";
+const REGISTERED_AGENTS: &str = "registered_agents";
+const ATTACHED_AGENTS: &str = "attached_agents";
+
+/// `epigraph_bind_group_role` with 179's agent MODE (the text overload) on a
+/// maintenance session.
+async fn bind_mode(
+    pool: &PgPool,
+    role: &str,
+    group: Uuid,
+    member_role: &str,
+    mode: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let mut c = maint(pool).await;
+    // `::text` on the mode: the SQL text differs from 165's call, so sqlx's
+    // per-connection statement cache (keyed by the SQL text) never hands the
+    // boolean call a statement prepared for the text overload, or back.
+    let r = sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4::text, $5)")
+        .bind(role)
+        .bind(group)
+        .bind(member_role)
+        .bind(mode)
+        .bind("role membership test (mode)")
+        .fetch_one(&mut *c)
+        .await;
+    reset(c).await;
+    r
+}
+
+/// `epigraph_define_group_role` with 179's agent MODE on a maintenance
+/// session.
+async fn define_mode(
+    pool: &PgPool,
+    key: &str,
+    group: Uuid,
+    member_role: &str,
+    mode: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let mut c = maint(pool).await;
+    let r = sqlx::query_scalar(
+        "SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5::text, $6)",
+    )
+    .bind(key)
+    .bind("synthetic team role (mode)")
+    .bind(group)
+    .bind(member_role)
+    .bind(mode)
+    .bind("role membership test (mode)")
+    .fetch_one(&mut *c)
+    .await;
+    reset(c).await;
+    r
+}
+
+/// One team group with `ROLE` DEFINED and bound to it at `member_role` in
+/// 179's `attached_agents` mode. Returns `(group, binding)`.
+async fn attached_group(pool: &PgPool, name: &str, member_role: &str) -> (Uuid, Uuid) {
+    let (owner, _) = human(pool, &format!("{name}-owner")).await;
+    let group = team_group(pool, name, owner).await;
+    let binding = define_mode(pool, ROLE, group, member_role, ATTACHED_AGENTS)
+        .await
+        .expect("define the role and bind it, attached agents only");
+    (group, binding)
+}
+
+/// Attach `agent` to `role` with a window that closes `to_s` seconds from now.
+async fn attach_until(pool: &PgPool, role: &str, agent: Uuid, to_s: i32) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                    now() + make_interval(secs => $3), 'role membership test windowed attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .bind(to_s)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches with a window");
+        (conn, ())
+    })
+    .await;
+}
+
+/// Detach `agent` from `role` (166's verb) on a maintenance session.
+async fn detach_from_role(pool: &PgPool, role: &str, agent: Uuid) -> i32 {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role($1, $2, 'role membership test detach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role detaches");
+        (conn, n)
+    })
+    .await
+}
+
+/// `(include_agents, attached_agents)` of one binding row.
+async fn binding_flags(pool: &PgPool, binding: Uuid) -> (bool, bool) {
+    sqlx::query_as("SELECT include_agents, attached_agents FROM group_role_bindings WHERE id = $1")
+        .bind(binding)
+        .fetch_one(pool)
+        .await
+        .expect("binding flags")
+}
+
+/// The roster of `group` now, on a maintenance session: `(agent, role)`.
+async fn roster_now(pool: &PgPool, group: Uuid) -> Vec<(Uuid, String)> {
+    let mut c = maint(pool).await;
+    let mut rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT out_agent_id, out_role FROM public.epigraph_group_role_roster($1, now())",
+    )
+    .bind(group)
+    .fetch_all(&mut *c)
+    .await
+    .expect("roster");
+    reset(c).await;
+    rows.sort();
+    rows
+}
+
+/// THE MODE. A binding in `attached_agents` mode admits the role HOLDER and
+/// an agent ATTACHED to the role (166's `role_agents`) whose own live-linked
+/// human is that holder, and NOT:
+///
+/// * an agent registered to (live-linked to) the holder that is not attached,
+///   although the very same agent reads a group bound to the same role in
+///   165's `include_agents` mode (positive control: it IS registered to the
+///   holder, so the mode is what leaves it out);
+/// * an agent attached to the role whose human is someone else while the role
+///   IS held (by the holder): the attachment alone, with "some live holder",
+///   admits nothing.
+///
+/// Armed, the writer scope asks the same derivation: the attached agent's
+/// honest write lands, the unattached one's write stamped (forged) with the
+/// group is refused OPL02. The roster names the holder and the attached agent
+/// only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agents_binding_admits_the_holder_and_its_attached_agents_only(pool: PgPool) {
+    let (h, _) = human(&pool, "att-h").await;
+    let attached = operated(&pool, h, "att-attached").await;
+    let unattached = operated(&pool, h, "att-unattached").await;
+    let (other, _) = human(&pool, "att-other").await;
+    let others_attached = operated(&pool, other, "att-others-attached").await;
+    let (group, binding) = attached_group(&pool, "Synthetic Attached Team", "writer").await;
+    assert_eq!(
+        binding_flags(&pool, binding).await,
+        (false, true),
+        "PREMISE: the binding is recorded in the attached mode"
+    );
+    // A second group bound to the SAME role in 165's include_agents mode,
+    // through the OLD boolean signature.
+    let (owner2, _) = human(&pool, "att-owner2").await;
+    let registered_group = team_group(&pool, "Synthetic Registered Team", owner2).await;
+    let old = bind(&pool, ROLE, registered_group, "reader", true)
+        .await
+        .expect("the old boolean signature still binds");
+    assert_eq!(binding_flags(&pool, old).await, (true, false));
+    attach_to_role(&pool, ROLE, attached).await;
+    attach_to_role(&pool, ROLE, others_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+
+    assert_eq!(resolves(&pool, h, group).await, (true, true), "the holder");
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (true, true),
+        "an agent attached to the role, linked to the holder"
+    );
+    assert_eq!(
+        resolves(&pool, unattached, group).await,
+        (false, false),
+        "an agent registered to the holder but NOT attached"
+    );
+    assert!(live_roles(&pool, unattached, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, others_attached, group).await,
+        (false, false),
+        "an agent attached to the held role whose own human is not the holder"
+    );
+    assert_eq!(
+        resolves(&pool, unattached, registered_group).await,
+        (true, false),
+        "POSITIVE CONTROL: the unattached agent IS registered to the holder (165's mode admits it)"
+    );
+    assert_eq!(
+        resolves(&pool, attached, registered_group).await,
+        (true, false),
+        "POSITIVE CONTROL: 165's mode is unchanged for an attached agent too"
+    );
+
+    write_honest(&pool, h, group)
+        .await
+        .expect("POSITIVE CONTROL: the holder writes");
+    write_honest(&pool, attached, group)
+        .await
+        .expect("the attached agent writes through the derived writer arm");
+    assert_refused(
+        &write_forged(&pool, unattached, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the unattached agent, forged stamp",
+    );
+
+    let w = |id: Uuid| (id, "writer".to_string());
+    let mut expected = vec![w(h), w(attached)];
+    expected.sort();
+    assert_eq!(roster_now(&pool, group).await, expected, "the roster");
+}
+
+/// An attached member lapses with its HOLDER: ending the holder's assignment
+/// takes the group from the holder and the attached agent at once, and a NEW
+/// holder of the role (another human) does not bring the previous holder's
+/// attached agent back (its own human must hold the role), while the new
+/// holder itself is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_member_lapses_when_the_holders_assignment_ends(pool: PgPool) {
+    let (h, _) = human(&pool, "attend-h").await;
+    let attached = operated(&pool, h, "attend-attached").await;
+    let (next, _) = human(&pool, "attend-next").await;
+    let (group, _) = attached_group(&pool, "Synthetic Attached End Team", "reader").await;
+    attach_to_role(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, 0, Some(3600)).await;
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (true, false),
+        "PREMISE: the attached agent reads while its human holds the role"
+    );
+
+    assert!(end_role(&pool, assignment).await, "the assignment ends");
+    assert_eq!(resolves(&pool, h, group).await, (false, false), "holder");
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (false, false),
+        "the attached agent, no holder"
+    );
+
+    grant(&pool, ROLE, next, 0, None).await;
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (true, false),
+        "POSITIVE CONTROL: the new holder reads"
+    );
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (false, false),
+        "the previous holder's attached agent, while another human holds the role"
+    );
+}
+
+/// An attached member lapses with its ATTACHMENT: a detach takes the group
+/// from the agent at once and leaves the holder; an attachment whose window
+/// closes lapses at its `valid_to` with no job.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_member_lapses_when_its_attachment_ends(pool: PgPool) {
+    let (h, _) = human(&pool, "attdet-h").await;
+    let detached = operated(&pool, h, "attdet-detached").await;
+    let windowed = operated(&pool, h, "attdet-windowed").await;
+    let (group, _) = attached_group(&pool, "Synthetic Attached Detach Team", "writer").await;
+    attach_to_role(&pool, ROLE, detached).await;
+    attach_until(&pool, ROLE, windowed, 5).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, detached, group).await,
+        (true, true),
+        "PREMISE"
+    );
+    assert_eq!(
+        resolves(&pool, windowed, group).await,
+        (true, true),
+        "PREMISE"
+    );
+
+    assert_eq!(detach_from_role(&pool, ROLE, detached).await, 1, "detached");
+    assert_eq!(
+        resolves(&pool, detached, group).await,
+        (false, false),
+        "the detached agent"
+    );
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder stays"
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, windowed, group).await,
+        (false, false),
+        "the attachment's window closed"
+    );
+    assert_eq!(resolves(&pool, h, group).await, (true, true), "holder");
+}
+
+/// The verbs keep 165's boolean signatures (`true` = registered agents,
+/// `false` = the holder only) and add a MODE overload: `holder_only`,
+/// `registered_agents`, `attached_agents`, recorded as the two flags and
+/// named in the bind audit row; any other mode is refused 22023 and writes
+/// nothing. The `holder_only` mode admits no agent, an attached one included
+/// (165's `include_agents = false`, unchanged). A row with both flags is
+/// refused by the table (23514), and a binding's mode never changes: an end
+/// that also flips `attached_agents` is refused (55000) on any session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_mode_verbs_keep_the_old_signatures_and_a_mode_never_changes(pool: PgPool) {
+    let (h, _) = human(&pool, "mode-h").await;
+    let attached = operated(&pool, h, "mode-attached").await;
+    let (owner, _) = human(&pool, "mode-owner").await;
+    let mut groups = Vec::new();
+    for i in 0..5 {
+        groups.push(team_group(&pool, &format!("Synthetic Mode Team {i}"), owner).await);
+    }
+    let holder_only = define_mode(&pool, ROLE, groups[0], "reader", HOLDER_ONLY)
+        .await
+        .expect("define, holder only");
+    let registered = bind_mode(&pool, ROLE, groups[1], "reader", REGISTERED_AGENTS)
+        .await
+        .expect("bind, registered agents");
+    let attached_b = bind_mode(&pool, ROLE, groups[2], "reader", ATTACHED_AGENTS)
+        .await
+        .expect("bind, attached agents");
+    let old_true = bind(&pool, ROLE, groups[3], "reader", true)
+        .await
+        .expect("the old signature, true");
+    let old_false = bind(&pool, ROLE, groups[4], "reader", false)
+        .await
+        .expect("the old signature, false");
+    assert_eq!(binding_flags(&pool, holder_only).await, (false, false));
+    assert_eq!(binding_flags(&pool, registered).await, (true, false));
+    assert_eq!(binding_flags(&pool, attached_b).await, (false, true));
+    assert_eq!(binding_flags(&pool, old_true).await, (true, false));
+    assert_eq!(binding_flags(&pool, old_false).await, (false, false));
+    for (binding, mode) in [
+        (holder_only, HOLDER_ONLY),
+        (registered, REGISTERED_AGENTS),
+        (attached_b, ATTACHED_AGENTS),
+        (old_true, REGISTERED_AGENTS),
+        (old_false, HOLDER_ONLY),
+    ] {
+        let named: Option<String> = sqlx::query_scalar(
+            "SELECT details->>'agent_mode' FROM security_events \
+              WHERE event_type = 'platform.group_role_bound' AND details->>'binding_id' = $1",
+        )
+        .bind(binding.to_string())
+        .fetch_optional(&pool)
+        .await
+        .expect("bind audit row");
+        assert_eq!(named.as_deref(), Some(mode), "audit of {binding}");
+    }
+
+    attach_to_role(&pool, ROLE, attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    for (i, expected) in [false, true, true, true, false].into_iter().enumerate() {
+        assert_eq!(
+            resolves(&pool, attached, groups[i]).await,
+            (expected, false),
+            "the attached agent in group {i}"
+        );
+        assert_eq!(
+            resolves(&pool, h, groups[i]).await,
+            (true, false),
+            "the holder in group {i}"
+        );
+    }
+
+    let (owner6, _) = human(&pool, "mode-owner6").await;
+    let spare = team_group(&pool, "Synthetic Mode Spare Team", owner6).await;
+    let unknown = bind_mode(&pool, ROLE, spare, "reader", "everyone").await;
+    assert_eq!(code_of(&unknown).as_deref(), Some("22023"), "{unknown:?}");
+    let both = sqlx::query(
+        "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, \
+                                          attached_agents, reason) \
+         VALUES ($1, $2, 'reader', true, true, 'both modes')",
+    )
+    .bind(spare)
+    .bind(ROLE)
+    .execute(&pool)
+    .await;
+    assert_eq!(code_of(&both).as_deref(), Some("23514"), "{both:?}");
+    let spare_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_role_bindings WHERE group_id = $1")
+            .bind(spare)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(spare_rows, 0, "nothing was bound to the spare group");
+
+    // The harness superuser passes the guard's session gate, so what refuses
+    // is the guard's immutable tuple, not a privilege; and the holder-only
+    // binding flipped to attached would satisfy the CHECK, so the CHECK is
+    // not what refuses either.
+    let flip = sqlx::query(
+        "UPDATE group_role_bindings SET revoked_at = now(), revoked_by = 'x', \
+                revoked_reason = 'end and flip', attached_agents = true WHERE id = $1",
+    )
+    .bind(holder_only)
+    .execute(&pool)
+    .await;
+    assert_eq!(code_of(&flip).as_deref(), Some("55000"), "{flip:?}");
+    assert_eq!(
+        binding_flags(&pool, holder_only).await,
+        (false, false),
+        "the binding is unchanged"
+    );
+    assert!(
+        end_binding(&pool, holder_only).await.expect("end"),
+        "POSITIVE CONTROL: a plain end still lands"
+    );
+}
