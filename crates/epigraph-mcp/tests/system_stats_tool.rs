@@ -14,7 +14,7 @@
 
 use epigraph_mcp::tools::batch::system_stats;
 use epigraph_mcp::types::SystemStatsParams;
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -27,8 +27,8 @@ mod viewer_fixture;
 
 fn parse(result: &CallToolResult) -> Value {
     let content = result.content.first().expect("one content block");
-    match &content.raw {
-        RawContent::Text(text) => {
+    match content {
+        ContentBlock::Text(text) => {
             serde_json::from_str(&text.text).expect("system_stats emits JSON text")
         }
         other => panic!("expected text content, got {other:?}"),
