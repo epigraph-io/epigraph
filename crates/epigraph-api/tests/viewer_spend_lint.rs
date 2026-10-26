@@ -257,7 +257,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (community and perspective) then write.
     ("community.rs", "add_member", &["EdgeRepository::create"]),
-    // open finding: F-SHARD4-A2 (factor and belief reads of the BP diagnostic).
+    // open finding: F-SHARD4-A2.
     (
         "computation.rs",
         "propagate_beliefs",
