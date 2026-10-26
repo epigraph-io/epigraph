@@ -209,17 +209,19 @@ async fn evolve_step_supersedes_rejects_non_current_parent(pool: PgPool) {
 /// refuses must be refused with nothing written, leaving the lineage with
 /// exactly one current head (backlog d34f5096).
 ///
-/// Row security that refuses an UPDATE through its USING clause does not
-/// raise: the statement matches zero rows and reports success. Before the fix
-/// `evolve_step_conn` ignored the retire's row count, so it inserted the
-/// successor next to a predecessor that was still current: two live heads on
-/// a lineage that `supersedes` keeps linear. A `BEFORE UPDATE` trigger that
-/// skips only the predecessor's `is_current` change stands in for that policy
-/// deterministically (it would let the lineage back-fill, which leaves
-/// `is_current` alone, through), named to fire before every other `BEFORE UPDATE`
-/// trigger on `claims`. The caller's transaction is committed whatever the
-/// call left on it, so the assertions see what a caller that ignored the error
-/// would have persisted.
+/// An UPDATE that changes no row does not raise: it reports success. Before
+/// the fix `evolve_step_conn` ignored the retire's row count, so it inserted
+/// the successor next to a predecessor that was still current: two live heads
+/// on a lineage that `supersedes` keeps linear. A `BEFORE UPDATE` trigger that
+/// skips only the predecessor's `is_current` change produces that zero-row
+/// retire deterministically (it would let the lineage back-fill, which leaves
+/// `is_current` alone, through), named to fire before every other `BEFORE
+/// UPDATE` trigger on `claims`. The claims tenancy policy refuses an
+/// unwritable parent by raising at its WITH CHECK instead (pinned in
+/// `epigraph-api/tests/evolve_step_not_visible_404.rs`), so the check is
+/// defensive against any zero-row retire. The
+/// caller's transaction is committed whatever the call left on it, so the
+/// assertions see what a caller that ignored the error would have persisted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(pool: PgPool) {
     let agent = seed_agent(&pool).await;
@@ -248,28 +250,18 @@ async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(p
     .await;
     tx.commit().await.expect("commit");
 
-    let err = r.expect_err("a step whose predecessor this session cannot retire must not evolve");
-    assert!(
-        matches!(&err, epigraph_db::DbError::WriteRefused { id, .. } if *id == parent),
-        "a readable, current predecessor the session cannot retire is WriteRefused; got: {err:?}"
-    );
-    let (still_current, lineage): (bool, Option<Uuid>) =
-        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
-            .bind(parent)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(still_current, "the predecessor is untouched");
-    assert_eq!(
-        lineage, None,
-        "the refusal wrote nothing, not even the lineage back-fill"
-    );
+    // The lineage's current heads, counted without its lineage id (the
+    // refusal must leave the parent without one): the parent itself plus
+    // anything written as its successor, by column or by edge. Checked before
+    // the error, so the item's headline fails first when the retire is
+    // ignored.
     let heads: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM claims \
-         WHERE (id = $1 OR step_lineage_id = $2) AND COALESCE(is_current, true)",
+         WHERE (id = $1 OR supersedes = $1 \
+                OR id IN (SELECT source_id FROM edges WHERE target_id = $1)) \
+           AND COALESCE(is_current, true)",
     )
     .bind(parent)
-    .bind(lineage)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -286,6 +278,23 @@ async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(p
         .await
         .unwrap();
     assert_eq!(edges, 0, "no supersedes edge was inserted");
+
+    let err = r.expect_err("a step whose predecessor this session cannot retire must not evolve");
+    assert!(
+        matches!(&err, epigraph_db::DbError::WriteRefused { id, .. } if *id == parent),
+        "a readable, current predecessor the session cannot retire is WriteRefused; got: {err:?}"
+    );
+    let (still_current, lineage): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(still_current, "the predecessor is untouched");
+    assert_eq!(
+        lineage, None,
+        "the refusal wrote nothing, not even the lineage back-fill"
+    );
 }
 
 // ── evolve_step(supersedes) and the supersede edge cascade (backlog 8d3b4527) ──
