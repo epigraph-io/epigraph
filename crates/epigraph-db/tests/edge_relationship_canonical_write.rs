@@ -231,10 +231,39 @@ async fn matcher_symmetric_write_dedups_across_spellings_and_stores_lower_case(p
     assert_eq!(rel, "corroborates");
 }
 
-/// The factor `edges_auto_factor` materialised for edge `id`, if any.
-async fn factor_type_for(pool: &PgPool, id: Uuid) -> Option<String> {
-    sqlx::query_scalar(
-        "SELECT factor_type::text FROM factors WHERE properties->>'source_edge_id' = $1::text",
+/// The matcher's symmetric write dedups against a legacy reverse
+/// `CORROBORATES` row WITHOUT the matcher marker. The unique index's predicate
+/// requires `properties->>'source' = 'cross_source_matcher'`, so here only the
+/// `NOT EXISTS` guard (`relationship = ANY(relationship_spellings(..))`) can
+/// answer: a byte-exact guard would insert a second row for the pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn matcher_symmetric_write_dedups_against_an_unmarked_legacy_row(pool: PgPool) {
+    let c = claims(&pool, "canon-matcher-unmarked", 2).await;
+    legacy_edge(&pool, c[0], c[1], "CORROBORATES", serde_json::json!({})).await;
+
+    let created = EdgeRepository::create_symmetric_if_absent(
+        &pool,
+        c[1],
+        c[0],
+        "corroborates",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !created,
+        "`corroborates` over a pair holding an unmarked legacy reverse `CORROBORATES` is a \
+         dedup hit"
+    );
+    assert_eq!(pair_rows(&pool, c[0], c[1], "corroborates").await, 1);
+}
+
+/// The factor `edges_auto_factor` materialised for edge `id`, if any, as
+/// `(factor_type, potential)`.
+async fn factor_for(pool: &PgPool, id: Uuid) -> Option<(String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT factor_type::text, potential FROM factors \
+          WHERE properties->>'source_edge_id' = $1::text",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -245,18 +274,30 @@ async fn factor_type_for(pool: &PgPool, id: Uuid) -> Option<String> {
 #[sqlx::test(migrations = "../../migrations")]
 async fn lower_case_corroborates_and_refutes_get_the_upper_case_factor(pool: PgPool) {
     let c = claims(&pool, "canon-factor", 8).await;
+    // Each lower-case spelling must get exactly its upper-case twin's factor:
+    // the same type AND the same potential (`corroborates` 0.85 strength,
+    // `refutes` the empty mutual-exclusion potential).
     let pairs = [
-        ("CORROBORATES", "evidential_support"),
-        ("corroborates", "evidential_support"),
-        ("REFUTES", "mutual_exclusion"),
-        ("refutes", "mutual_exclusion"),
+        (
+            "CORROBORATES",
+            "evidential_support",
+            serde_json::json!({"strength": 0.85}),
+        ),
+        (
+            "corroborates",
+            "evidential_support",
+            serde_json::json!({"strength": 0.85}),
+        ),
+        ("REFUTES", "mutual_exclusion", serde_json::json!({})),
+        ("refutes", "mutual_exclusion", serde_json::json!({})),
     ];
-    for (i, (rel, want)) in pairs.iter().enumerate() {
+    for (i, (rel, want_type, want_potential)) in pairs.iter().enumerate() {
         let id = legacy_edge(&pool, c[2 * i], c[2 * i + 1], rel, serde_json::json!({})).await;
         assert_eq!(
-            factor_type_for(&pool, id).await.as_deref(),
-            Some(*want),
-            "a claim/claim `{rel}` edge must get a {want} factor"
+            factor_for(&pool, id).await,
+            Some(((*want_type).to_string(), want_potential.clone())),
+            "a claim/claim `{rel}` edge must get a {want_type} factor with potential \
+             {want_potential}"
         );
     }
 }
@@ -288,6 +329,20 @@ async fn matcher_unique_index_covers_both_spellings_of_one_pair(pool: PgPool) {
         "a second in-force matcher corroboration of one pair, in the other spelling, must \
          violate edges_symmetric_relationship_uniq; got {second:?}"
     );
+
+    // Negative control: the re-keyed index still exempts an operator-authored
+    // (unmarked) `corroborates` over the same pair, as its COMMENT promises.
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'corroborates', '{}'::jsonb)",
+    )
+    .bind(c[1])
+    .bind(c[0])
+    .execute(&pool)
+    .await
+    .expect("an unmarked corroborates over a matcher pair is outside the index predicate");
+    assert_eq!(pair_rows(&pool, c[0], c[1], "corroborates").await, 2);
 }
 
 /// `EdgeRepository::list_filtered` (behind `GET /api/v1/edges?relationship=`)
@@ -325,6 +380,52 @@ async fn list_filtered_matches_every_spelling_of_a_folded_relationship(pool: PgP
         want.sort();
         assert_eq!(got, want, "relationship={asked} must return both spellings");
     }
+}
+
+/// `EdgeRepository::get_by_relationship` returns a legacy upper-case row and a
+/// canonical lower-case row for either spelling of a case-folded relationship,
+/// and keeps an unfolded relationship exact (`REFINES` is not `refines`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_by_relationship_matches_every_spelling_of_a_folded_relationship(pool: PgPool) {
+    let c = claims(&pool, "canon-by-rel", 3).await;
+    let legacy = legacy_edge(&pool, c[0], c[1], "CONTRADICTS", serde_json::json!({})).await;
+    let canonical = legacy_edge(&pool, c[1], c[2], "contradicts", serde_json::json!({})).await;
+    let upper_refines = legacy_edge(&pool, c[0], c[2], "REFINES", serde_json::json!({})).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+
+    let ours = |rows: Vec<epigraph_db::EdgeRow>| {
+        let mut ids: Vec<Uuid> = rows
+            .into_iter()
+            .filter(|r| c.contains(&r.source_id))
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        ids
+    };
+    let mut want = vec![legacy, canonical];
+    want.sort();
+    for asked in ["contradicts", "CONTRADICTS"] {
+        let got = ours(
+            EdgeRepository::get_by_relationship(&pool, &viewer, asked)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got, want, "relationship={asked} must return both spellings");
+    }
+    assert_eq!(
+        ours(
+            EdgeRepository::get_by_relationship(&pool, &viewer, "REFINES")
+                .await
+                .unwrap()
+        ),
+        vec![upper_refines]
+    );
+    assert!(ours(
+        EdgeRepository::get_by_relationship(&pool, &viewer, "refines")
+            .await
+            .unwrap()
+    )
+    .is_empty());
 }
 
 fn runbook(name: &str) -> String {
