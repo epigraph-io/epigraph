@@ -2490,6 +2490,39 @@ mod cautious_rule_tests {
     }
 
     #[test]
+    fn neither_input_dominates_a_hand_computed_denoeux_result() {
+        // Open-world binary frame, Ω' = Θ ∪ {ω}: "0" = {T}, "0,1" = Θ,
+        // "~" = Ω'. Each input is the conjunctive combination of two simple
+        // supports, so its canonical weights are read off directly:
+        //   x = {T} at weight 0.4 (mass 0.6) ∩ Θ at weight 0.5 (mass 0.5)
+        //     = {T}: 0.6, Θ: 0.4·0.5 = 0.2, Ω': 0.4·0.5 = 0.2
+        //   y = {T} at weight 0.7 (mass 0.3) ∩ Θ at weight 0.2 (mass 0.8)
+        //     = {T}: 0.3, Θ: 0.7·0.8 = 0.56, Ω': 0.7·0.2 = 0.14
+        // x is stronger on {T}, y on Θ: neither dominates. Denoeux's rule
+        // takes the minimum weight per set, w({T}) = 0.4 and w(Θ) = 0.2,
+        // and rebuilds: {T}: 0.6, Θ: 0.4·0.8 = 0.32, Ω': 0.4·0.2 = 0.08.
+        let x = m(
+            binary(),
+            serde_json::json!({"0": 0.6, "0,1": 0.2, "~": 0.2}),
+        );
+        let y = m(
+            binary(),
+            serde_json::json!({"0": 0.3, "0,1": 0.56, "~": 0.14}),
+        );
+        let want = m(
+            binary(),
+            serde_json::json!({"0": 0.6, "0,1": 0.32, "~": 0.08}),
+        );
+        let c = cautious_rule(&x, &y).unwrap().expect("non-dogmatic");
+        assert_same(&c, &want);
+        // Not the conjunctive rule ({T}: 1 - 0.4·0.7 = 0.72), which would
+        // count the shared support twice.
+        let conj = conjunctive_combine(&x, &y).unwrap();
+        let t = FocalElement::positive(std::collections::BTreeSet::from([0]));
+        assert!(conj.mass_of(&t) > c.mass_of(&t) + 0.1, "{conj:?} vs {c:?}");
+    }
+
+    #[test]
     fn commutative_associative_and_a_valid_bba() {
         let f = ternary;
         let a = m(
