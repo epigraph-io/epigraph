@@ -483,3 +483,92 @@ async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
 }
+
+/// Backlog ca30e645 / ruling R-38, REST twin of
+/// `epigraph-mcp/tests/add_step_plan_position.rs`: after `add_step(position =
+/// 1)` the inserted step's `executes` edge carries no `plan_index`, and the
+/// `step_follows` chain is `s0 -> inserted -> s1`. A report against
+/// `step_index` 1 must attach to the inserted step, and the old slot-1 step to
+/// index 2: plan order is the chain, not the ordinal.
+///
+/// RED before the fix: `plan_step_claim_ids` sorted the unindexed step last, so
+/// index 1 was attributed to `s1` and index 2 to the inserted step.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_report_resolves_step_index_through_the_step_follows_chain(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let w = seed_private_workflow(&pool, "outcome-route-chain-order").await;
+    let group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.steps[0])
+        .fetch_one(&pool)
+        .await
+        .expect("group");
+
+    // What `add_step(position = 1)` writes: an unindexed level-2 `executes`
+    // edge, and the chain rewired around the new step.
+    let inserted = viewer_fixture::seed_group_claim(
+        &pool,
+        w.member,
+        group,
+        &format!("inserted between the two steps {}", w.workflow_id),
+    )
+    .await;
+    sqlx::query("UPDATE claims SET properties = jsonb_build_object('level', 2) WHERE id = $1")
+        .bind(inserted)
+        .execute(&pool)
+        .await
+        .expect("level 2");
+    for (source, source_type, target, relationship, props) in [
+        (
+            w.workflow_id,
+            "workflow",
+            inserted,
+            "executes",
+            serde_json::json!({"level": 2}),
+        ),
+        (
+            w.steps[0],
+            "claim",
+            inserted,
+            "step_follows",
+            serde_json::json!({}),
+        ),
+        (
+            inserted,
+            "claim",
+            w.steps[1],
+            "step_follows",
+            serde_json::json!({}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, $2, $3, 'claim', $4, $5)",
+        )
+        .bind(source)
+        .bind(source_type)
+        .bind(target)
+        .bind(relationship)
+        .bind(props)
+        .execute(&pool)
+        .await
+        .expect("edge");
+    }
+
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.member, &["claims:write"])),
+        body(&[0, 1, 2]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        step_rows(&pool, w.workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(w.steps[0])),
+            ("planned 1".to_string(), Some(inserted)),
+            ("planned 2".to_string(), Some(w.steps[1])),
+        ],
+        "step_index follows the step_follows chain: {text}"
+    );
+}

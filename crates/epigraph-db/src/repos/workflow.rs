@@ -871,7 +871,8 @@ impl WorkflowRepository {
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
-        // step_lineage_id, in PLAN ORDER.
+        // step_lineage_id, in PLAN ORDER: the `plan_index` order below, then
+        // reordered by the `step_follows` chain (`in_chain_order`, ruling R-38).
         //
         // The order key is the `plan_index` ordinal that
         // `epigraph_ingest_executor::execute_workflow_ingest_plan` records on the
@@ -899,6 +900,11 @@ impl WorkflowRepository {
         }
         let step_rows: Vec<(Uuid, Option<Uuid>)> =
             sq.fetch_all(pool).await.map_err(DbError::from)?;
+        // Plan order is the `step_follows` chain (ruling R-38): `add_step`
+        // leaves a middle insert unindexed, so `plan_index` alone lists it last.
+        let step_rows = in_chain_order(pool, viewer, step_rows, |r| r.0)
+            .await
+            .map_err(DbError::from)?;
 
         let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
             if let Some(lineage_id) = *step_lineage_id {
@@ -936,9 +942,10 @@ impl WorkflowRepository {
     /// position the viewer cannot establish is not listed, and neither is any
     /// step after it.
     ///
-    /// Same order key as [`Self::resolve_steps_to_heads`] (`plan_index` first,
-    /// `created_at` only for edges that carry none), and the same two
-    /// predicates, on the edge and on the claim.
+    /// Same order as [`Self::resolve_steps_to_heads`] (the `step_follows`
+    /// chain, over the `plan_index` order, `created_at` only for edges that
+    /// carry none: ruling R-38), and the same two predicates, on the edge and
+    /// on the claim.
     ///
     /// # Run it on the caller's STAMPED transaction
     ///
@@ -1004,7 +1011,26 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
-        Ok(provable_plan_steps(&rows))
+        let provable = provable_plan_steps(&rows);
+        // Ruling R-38: slot N is the N-th step of the `step_follows` chain. The
+        // chain is walked over EVERY visible step, and the list stops at the
+        // first step whose position the rule above does not prove, so an
+        // unindexed step a caller sees after a hidden one cannot pull a
+        // provable step onto the wrong slot.
+        let visible: Vec<Uuid> = rows
+            .iter()
+            .filter(|(_, lvl, _)| {
+                lvl.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) == Some(2)
+            })
+            .map(|(id, _, _)| *id)
+            .collect();
+        let follows = step_follows_among(&mut *conn, viewer, &visible).await?;
+        let chain = Self::order_by_step_follows(&visible, &follows);
+        let provable: std::collections::HashSet<Uuid> = provable.into_iter().collect();
+        Ok(chain
+            .into_iter()
+            .take_while(|id| provable.contains(id))
+            .collect())
     }
 
     /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
@@ -1194,6 +1220,34 @@ impl WorkflowRepository {
             sq = sq.bind(g);
         }
         let seed_rows: Vec<StepSeedRow> = sq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
+
+        // Plan order is each workflow's `step_follows` chain (ruling R-38), as
+        // in the single-workflow function: one more round trip for every
+        // workflow's chain pairs, then a per-workflow reorder (a pair whose
+        // ends are in different workflows' sets is ignored by the walk).
+        let all_ids: Vec<Uuid> = seed_rows.iter().map(|r| r.frozen_claim_id).collect();
+        let follows = step_follows_among(&mut *conn, viewer, &all_ids)
+            .await
+            .map_err(DbError::from)?;
+        let mut workflow_order: Vec<Uuid> = Vec::new();
+        let mut seeds_by_workflow: HashMap<Uuid, Vec<StepSeedRow>> = HashMap::new();
+        for row in seed_rows {
+            if !seeds_by_workflow.contains_key(&row.workflow_id) {
+                workflow_order.push(row.workflow_id);
+            }
+            seeds_by_workflow
+                .entry(row.workflow_id)
+                .or_default()
+                .push(row);
+        }
+        let seed_rows: Vec<StepSeedRow> = workflow_order
+            .iter()
+            .filter_map(|w| seeds_by_workflow.remove(w))
+            .flat_map(|rows| {
+                let ids: Vec<Uuid> = rows.iter().map(|r| r.frozen_claim_id).collect();
+                reorder_rows(rows, &ids, &follows, |r| r.frozen_claim_id)
+            })
+            .collect();
 
         // Initialise the result map with an empty Vec for every requested workflow
         // so callers get a deterministic entry even for step-less workflows.
@@ -1663,7 +1717,8 @@ impl WorkflowRepository {
     /// steps" received `[]`, fell back to a bare `theme_cluster` with
     /// `wipe_first=true`, and destroyed 76 themes.
     ///
-    /// Ordering is the `executes` edge's `plan_index` ordinal, falling back to
+    /// Ordering is the steps' `step_follows` chain (ruling R-38) over the
+    /// `executes` edge's `plan_index` ordinal, falling back to
     /// `(edge created_at ASC, claim id ASC)` for edges that predate it — the
     /// same plan order [`Self::resolve_steps_to_heads`],
     /// [`Self::resolve_steps_to_heads_batched`] and both
@@ -1695,7 +1750,7 @@ impl WorkflowRepository {
         // JOIN-vs-WHERE reasoning and belongs to the tracked open finding
         // `F-edges-unfiltered`, not to this merge.
         let sql = viewer.splice(
-            "SELECT e.source_id, c.content \
+            "SELECT e.source_id, c.id, c.content \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = ANY($1) \
@@ -1712,13 +1767,28 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid, String)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(pool).await?;
 
-        let mut out: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for (workflow_id, content) in rows {
-            out.entry(workflow_id).or_default().push(content);
+        // Then each workflow's `step_follows` chain (ruling R-38), as in
+        // `resolve_steps_to_heads`. The chain read DOES carry the edge
+        // predicate: it is new, and has no prior shape to preserve.
+        let all_ids: Vec<Uuid> = rows.iter().map(|(_, id, _)| *id).collect();
+        let follows = step_follows_among(pool, viewer, &all_ids).await?;
+        let mut by_workflow: HashMap<Uuid, Vec<(Uuid, String)>> = HashMap::new();
+        for (workflow_id, id, content) in rows {
+            by_workflow
+                .entry(workflow_id)
+                .or_default()
+                .push((id, content));
         }
-        Ok(out)
+        Ok(by_workflow
+            .into_iter()
+            .map(|(workflow_id, steps)| {
+                let ids: Vec<Uuid> = steps.iter().map(|(id, _)| *id).collect();
+                let steps = reorder_rows(steps, &ids, &follows, |(id, _)| *id);
+                (workflow_id, steps.into_iter().map(|(_, c)| c).collect())
+            })
+            .collect())
     }
 
     /// Write the embedding vector for a hierarchical workflow's goal text.
@@ -2183,6 +2253,144 @@ fn provable_plan_steps(rows: &[(Uuid, Option<String>, Option<i32>)]) -> Vec<Uuid
     steps
 }
 
+/// The `step_follows` pairs `(source, target)` with BOTH ends in `ids` that
+/// `viewer` can see, retracted rows included: the edge set
+/// [`WorkflowRepository::order_by_step_follows`] walks. Retracted rows count
+/// for the same reason `add_step`'s rewire counts them (a surviving retracted
+/// pair still describes a second successor), and any such fork sends the walk
+/// back to plan order.
+async fn step_follows_among<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    viewer: &crate::visibility::Viewer,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = viewer.splice(
+        "SELECT e.source_id, e.target_id FROM edges e \
+         WHERE e.relationship = 'step_follows' \
+           AND e.source_id = ANY($1) AND e.target_id = ANY($1) \
+           /* {EDGE_VISIBILITY:e} */",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql).bind(ids);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    q.fetch_all(executor).await
+}
+
+/// `rows` (one workflow's steps, in `plan_index` order) reordered by their
+/// `step_follows` chain as `viewer` reads it; see
+/// [`WorkflowRepository::order_by_step_follows`].
+async fn in_chain_order<'e, E: sqlx::PgExecutor<'e>, T>(
+    executor: E,
+    viewer: &crate::visibility::Viewer,
+    rows: Vec<T>,
+    id: impl Fn(&T) -> Uuid,
+) -> Result<Vec<T>, sqlx::Error> {
+    let ids: Vec<Uuid> = rows.iter().map(&id).collect();
+    let follows = step_follows_among(executor, viewer, &ids).await?;
+    Ok(reorder_rows(rows, &ids, &follows, id))
+}
+
+/// `rows` permuted into [`WorkflowRepository::order_by_step_follows`] order.
+fn reorder_rows<T>(
+    rows: Vec<T>,
+    ids: &[Uuid],
+    follows: &[(Uuid, Uuid)],
+    id: impl Fn(&T) -> Uuid,
+) -> Vec<T> {
+    let order = WorkflowRepository::order_by_step_follows(ids, follows);
+    if order.as_slice() == ids {
+        return rows;
+    }
+    // `order` is a permutation of distinct `ids` (duplicates return `ids`).
+    let mut by_id: HashMap<Uuid, T> = rows.into_iter().map(|r| (id(&r), r)).collect();
+    order.iter().filter_map(|i| by_id.remove(i)).collect()
+}
+
+impl WorkflowRepository {
+    /// Reorder a plan's steps by their `step_follows` chain (operator ruling
+    /// R-38, backlog ca30e645).
+    ///
+    /// `plan_order` is the steps in `plan_index` order (the order every reader
+    /// used to return); `follows` is the `(source, target)` `step_follows`
+    /// pairs read for them. `add_step` places a step by rewiring the chain and
+    /// leaves a middle insert's `executes` edge without a `plan_index`, so the
+    /// chain, not the ordinal, is the plan order.
+    ///
+    /// * Pairs with an end outside `plan_order`, self-pairs and duplicates are
+    ///   ignored.
+    /// * The chain decomposes into paths (the ingest executor chains steps
+    ///   within each phase; a hidden step splits a path in two). Each path is
+    ///   walked from its head, and the paths are concatenated in the plan
+    ///   order of their EARLIEST member, so a phase's chain stays in its
+    ///   phase's place even when `add_step` put an unindexed step at its head.
+    /// * When the pairs do not describe disjoint simple paths over the set (a
+    ///   step with two successors or two predecessors, or a cycle), there is
+    ///   no single chain to follow, and `plan_order` is returned unchanged.
+    ///   That is the shape two generations of one `canonical_name` produce
+    ///   when they keep the same step texts in a different order: their step
+    ///   claims, and so their `step_follows` edges, are shared.
+    #[must_use]
+    pub fn order_by_step_follows(plan_order: &[Uuid], follows: &[(Uuid, Uuid)]) -> Vec<Uuid> {
+        let rank: HashMap<Uuid, usize> = plan_order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        if rank.len() != plan_order.len() {
+            // One claim on two `executes` edges: no single position to give it.
+            return plan_order.to_vec();
+        }
+        let mut next: HashMap<Uuid, Uuid> = HashMap::new();
+        let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
+        for (a, b) in follows {
+            if a == b || !rank.contains_key(a) || !rank.contains_key(b) {
+                continue;
+            }
+            match next.get(a) {
+                Some(existing) if existing != b => return plan_order.to_vec(),
+                _ => {}
+            }
+            match prev.get(b) {
+                Some(existing) if existing != a => return plan_order.to_vec(),
+                _ => {}
+            }
+            next.insert(*a, *b);
+            prev.insert(*b, *a);
+        }
+        if next.is_empty() {
+            return plan_order.to_vec();
+        }
+
+        let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        let mut paths: Vec<(usize, Vec<Uuid>)> = Vec::new();
+        for head in plan_order.iter().filter(|id| !prev.contains_key(*id)) {
+            seen.insert(*head);
+            let mut path = vec![*head];
+            let mut cur = *head;
+            while let Some(n) = next.get(&cur) {
+                if !seen.insert(*n) {
+                    return plan_order.to_vec();
+                }
+                path.push(*n);
+                cur = *n;
+            }
+            let earliest = path.iter().map(|id| rank[id]).min().unwrap_or(usize::MAX);
+            paths.push((earliest, path));
+        }
+        if plan_order.iter().any(|id| !seen.contains(id)) {
+            // Unreached from every head: a cycle.
+            return plan_order.to_vec();
+        }
+        paths.sort_by_key(|(earliest, _)| *earliest);
+        paths.into_iter().flat_map(|(_, path)| path).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2237,6 +2445,77 @@ mod tests {
 
         let legacy = vec![row("1", None), row("2", None), row("2", None)];
         assert_eq!(provable_plan_steps(&legacy), vec![legacy[1].0, legacy[2].0]);
+    }
+
+    fn ids(n: usize) -> Vec<Uuid> {
+        (0..n).map(|_| Uuid::new_v4()).collect()
+    }
+
+    /// `add_step(position = 1)` into `[a, b, c]`: the insert `x` is unindexed,
+    /// so plan_index order lists it last, and the chain puts it second.
+    #[test]
+    fn a_middle_insert_takes_its_chain_position() {
+        let v = ids(4);
+        let (a, b, c, x) = (v[0], v[1], v[2], v[3]);
+        let got =
+            WorkflowRepository::order_by_step_follows(&[a, b, c, x], &[(a, x), (x, b), (b, c)]);
+        assert_eq!(got, vec![a, x, b, c]);
+    }
+
+    /// Two phases chain separately; an unindexed step inserted at the HEAD of
+    /// the first phase's chain keeps that chain ahead of the second phase's.
+    #[test]
+    fn paths_are_ordered_by_their_earliest_member() {
+        let v = ids(5);
+        let (a, b, c, d, x) = (v[0], v[1], v[2], v[3], v[4]);
+        let got =
+            WorkflowRepository::order_by_step_follows(&[a, b, c, d, x], &[(x, a), (a, b), (c, d)]);
+        assert_eq!(got, vec![x, a, b, c, d]);
+    }
+
+    /// No pairs at all (a plan written before `step_follows`): plan order.
+    /// A step with no chain edge keeps its own plan position among the paths.
+    #[test]
+    fn steps_without_a_chain_keep_plan_order() {
+        let v = ids(3);
+        assert_eq!(WorkflowRepository::order_by_step_follows(&v, &[]), v);
+        let got = WorkflowRepository::order_by_step_follows(&v, &[(v[1], v[2])]);
+        assert_eq!(got, v);
+    }
+
+    /// A fork (two successors, or two predecessors) or a cycle is not a chain:
+    /// plan order, unchanged. Two generations sharing reordered steps produce
+    /// exactly such a cycle.
+    #[test]
+    fn a_fork_or_a_cycle_falls_back_to_plan_order() {
+        let v = ids(3);
+        let (a, b, c) = (v[0], v[1], v[2]);
+        let plan = vec![a, b, c];
+        for follows in [
+            vec![(a, b), (a, c)],
+            vec![(a, c), (b, c)],
+            vec![(a, b), (b, c), (c, a)],
+        ] {
+            assert_eq!(
+                WorkflowRepository::order_by_step_follows(&plan, &follows),
+                plan,
+                "{follows:?}"
+            );
+        }
+    }
+
+    /// Pairs naming a step outside the set (a hidden step, another
+    /// generation's) are ignored: the visible steps either side of a hidden
+    /// one form two paths, still in plan order.
+    #[test]
+    fn pairs_outside_the_set_are_ignored() {
+        let v = ids(4);
+        let (a, b, hidden, d) = (v[0], v[1], v[2], v[3]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[a, b, d],
+            &[(a, b), (b, hidden), (hidden, d)],
+        );
+        assert_eq!(got, vec![a, b, d]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]

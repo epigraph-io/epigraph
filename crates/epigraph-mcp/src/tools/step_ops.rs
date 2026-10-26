@@ -21,7 +21,8 @@ pub struct AddStepParams {
     /// largest `plan_index` it can read. Every other add (an insert, or an
     /// append to a plan with a non-public `executes` edge or with no integer
     /// `plan_index`) is left unindexed (`plan_index: null` in the response),
-    /// and plan order lists it after every indexed step.
+    /// and every plan-order reader still lists it at slot `position`: they
+    /// walk the `step_follows` chain, not `plan_index` (ruling R-38).
     #[serde(default)]
     pub position: Option<u32>,
 }
@@ -119,8 +120,8 @@ async fn require_authority_over(
 /// atomic. `add_step` writes the claim, an `executes` edge, a `decomposes_to`
 /// edge and up to three `step_follows` rewires including a `DELETE`; on separate
 /// checkouts a refusal at the last of those left a step spliced into a broken
-/// chain, which `ordered_steps` then reports by appending the orphan in
-/// `created_at` order — a silent reordering rather than an error. Retrying is
+/// chain, which `ordered_steps` then reported by appending the orphan in
+/// plan order — a silent reordering rather than an error. Retrying is
 /// safe because the claim id is `compound_claim_id(step_hash, canonical_name)`
 /// and the INSERT carries `ON CONFLICT (id) DO NOTHING`.
 pub async fn add_step(
