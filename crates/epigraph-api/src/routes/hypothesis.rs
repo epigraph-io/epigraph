@@ -338,13 +338,21 @@ pub async fn hypothesis_status(
     // to its own owner, with a 200. Stamping admits the viewer's own groups, so
     // the frame resolves for a caller entitled to it. No leak was closed here;
     // a fail-closed degradation was. Same shape as `F-SHARD4-A5`.
-    let frame_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_optional(&mut *read)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("{e}"),
-            })?;
+    //
+    // A PROMOTED hypothesis reads `research_validity` instead: the promotion
+    // moved its evidence there and retired the source (backlog 090221d9).
+    let belief_frame = epigraph_engine::promotion::status_belief_frame(
+        claim_properties
+            .get("hypothesis_status")
+            .and_then(serde_json::Value::as_str),
+    );
+    let frame_id: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(belief_frame)
+        .fetch_optional(&mut *read)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{e}"),
+        })?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
         // Propagated for the same reason as the two reads below: this is the
@@ -496,6 +504,15 @@ pub async fn promote_hypothesis(
     )
     .await?;
     let status_json = status_response.0;
+
+    // Promoted once: the status now reads the promoted evidence, so the gate
+    // would pass again and move whatever `hypothesis_assessment` BBA was filed
+    // since onto `research_validity` beside (or over) it.
+    if status_json["status"].as_str() == Some(epigraph_engine::promotion::PROMOTED_STATUS) {
+        return Err(ApiError::Conflict {
+            reason: format!("hypothesis {id} is already promoted; nothing was written"),
+        });
+    }
 
     let ready = status_json["promotion"]["ready"].as_bool().unwrap_or(false);
     if !ready {

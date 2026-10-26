@@ -65,6 +65,9 @@ use epigraph_ds::{combination, DsError, FocalElement, MassFunction};
 /// Frames larger than this are folded without the cautious pass: the rule
 /// walks the power set twice (`O(4^n)`), and every BBA that can carry a
 /// [`SourceKey`] today is written on the two-hypothesis `binary_truth` frame.
+/// A computational guard, not a belief parameter: below it the result is the
+/// cautious fold, above it the cost bound applies.
+// belief-profile: allow-literal (O(4^n) complexity guard, never binds on keyed BBAs today)
 const MAX_CAUTIOUS_HYPOTHESES: usize = 8;
 
 /// Identity of an evidence source for the dependence test: the agent that
@@ -299,6 +302,7 @@ pub struct ItemEvidence {
 /// those) and writes no `source_url` for literature; `source_url` holds what
 /// other writers passed, which may be a doi.org link, a `doi:<id>` label (the
 /// spelling ingest uses for a paper's label), any other link, or free text.
+// belief-profile: allow-literal (array length of a fixed prefix list)
 const DOI_PREFIXES: [&str; 7] = [
     "https://www.doi.org/",
     "http://www.doi.org/",
@@ -388,6 +392,7 @@ fn is_bare_doi(t: &str) -> bool {
         return false;
     };
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    // belief-profile: allow-literal (DOI syntax: a 4-9 digit registrant code)
     (4..=9).contains(&digits)
         && rest[digits..]
             .strip_prefix('/')
@@ -571,6 +576,7 @@ impl KeyedItem {
 ///   size: the row is its own item, with its exact BBA.
 fn within_group_side(row_id: Uuid, m: &MassFunction) -> (ItemSide, f64) {
     let frame = m.frame();
+    // belief-profile: allow-literal (the binary frame's hypothesis count)
     if frame.hypothesis_count() != 2 {
         return (ItemSide::Own(row_id), 0.0);
     }

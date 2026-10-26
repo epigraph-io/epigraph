@@ -165,6 +165,31 @@ async fn deny_the_cached_belief_write(pool: &PgPool) {
     .expect("install the late-step failure injector");
 }
 
+/// A `logs_assert` predicate: the withheld cause reaches the server log ON THE
+/// CALL-SITE WARN'S LINE, i.e. one "ds auto-wire failed" line carries the
+/// driver's violation text for `constraint`.
+///
+/// Both halves are needed. The constraint's NAME alone also appears in the
+/// `ALTER TABLE ... ADD CONSTRAINT` statement that installed the injector, and
+/// sqlx logs every statement it runs into this traced test's capture, so a bare
+/// `logs_contain(constraint)` holds even when the warn drops its cause. Only
+/// the driver's error says "violates check constraint".
+fn cause_on_the_ds_wire_warn(constraint: &'static str) -> impl Fn(&[&str]) -> Result<(), String> {
+    move |lines: &[&str]| {
+        lines
+            .iter()
+            .any(|l| {
+                l.contains("ds auto-wire failed")
+                    && l.contains("violates check constraint")
+                    && l.contains(constraint)
+            })
+            .then_some(())
+            .ok_or_else(|| {
+                format!("no ds auto-wire warn line carries the cause naming {constraint}")
+            })
+    }
+}
+
 /// A first-step drop is an ERROR naming the step, and writes nothing.
 #[traced_test]
 #[sqlx::test(migrations = "../../migrations")]
@@ -200,16 +225,25 @@ async fn a_first_step_ds_failure_is_an_error_and_commits_nothing(pool: PgPool) {
         err.message.starts_with("assign_claim:"),
         "the error must carry the failing step as its prefix; got {err:?}"
     );
+    // ...and nothing of the cause: the driver's text names the constraint
+    // (backlog 49863d2c).
+    assert!(
+        !err.message.contains("ds_wiring_denied_for_test")
+            && !err.message.contains("violates check constraint"),
+        "the driver's error text reached the caller: {err:?}"
+    );
 
-    // And visible to the operator, not only the caller: `internal_error` does
-    // not log, so the warn at the `auto_wire_ds_update` call site is the only
-    // server-log record of this dropped wire. #497 added it so one log query
-    // ("ds auto-wire failed") finds every dropped wire across tools; the suffix
-    // asserted here is unique to this site.
+    // And visible to the operator, not only the caller: the reply is designed
+    // text (`internal_error_text`, which does not log), so the warn at the
+    // `auto_wire_ds_update` call site is the only server-log record of this
+    // dropped wire, and the only place its cause goes. #497 added it so one
+    // log query ("ds auto-wire failed") finds every dropped wire across tools;
+    // the suffix asserted here is unique to this site.
     assert!(
         logs_contain("Rolled back; nothing from this submission was stored"),
         "a dropped DS wire in update_with_evidence must be logged as well as returned"
     );
+    logs_assert(cause_on_the_ds_wire_warn("ds_wiring_denied_for_test"));
 
     // And the atomicity half: nothing at all landed — no evidence row, no BBA,
     // no truth write, no label merge.
@@ -296,6 +330,7 @@ async fn a_successful_ds_wire_reports_belief_wired_true_with_its_measures(pool: 
 /// A LATE-step drop: the BBA is written, then the cached-belief write fails.
 /// Under #497 the BBA stayed persisted (`bba_stored: true`); under D2 it is in
 /// the same transaction and must be rolled back with everything else.
+#[traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_late_step_ds_failure_rolls_back_the_bba_it_had_already_written(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -335,6 +370,12 @@ async fn a_late_step_ds_failure_rolls_back_the_bba_it_had_already_written(pool: 
         "the error must name the LATE step — proving the BBA write before it was reached; got \
          {err:?}"
     );
+    assert!(
+        !err.message.contains("cached_belief_denied_for_test")
+            && !err.message.contains("violates check constraint"),
+        "the driver's error text reached the caller: {err:?}"
+    );
+    logs_assert(cause_on_the_ds_wire_warn("cached_belief_denied_for_test"));
     assert_eq!(
         state_of(&pool, claim_id).await,
         before,

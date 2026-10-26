@@ -248,7 +248,8 @@ pub struct RecallWithContextParams {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     /// When `true`, REPLACE the flat `results` array with an
     /// `epistemic_partition` object grouping the same hits into `confirmed`
-    /// (`belief_score >= 0.75` and not contested), `open_question`
+    /// (`belief_score` at or above the served belief profile's
+    /// `gates.confirmed_score`, default 0.75, and not contested), `open_question`
     /// (`is_contested` — any live `contradicts`/`refutes`), and `uncertain`
     /// (everything else). The score is each hit's `belief_score`, the same
     /// value `min_truth` gates on, not its authored `truth_value`. Contest is

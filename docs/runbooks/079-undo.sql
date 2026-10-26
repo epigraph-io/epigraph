@@ -125,7 +125,10 @@ DECLARE t text;
           'pending_admin_acts',
           -- ---- agent identity lineage (161) -----------------------------
           -- FORCEd by 161 at creation, same precedent and reason.
-          'agent_prompt_blobs','agent_prompt_snapshots','agent_succession'];
+          'agent_prompt_blobs','agent_prompt_snapshots','agent_succession',
+          -- ---- role-to-group bindings (165) ------------------------------
+          -- FORCEd by 165 at creation, same precedent and reason.
+          'group_role_bindings'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

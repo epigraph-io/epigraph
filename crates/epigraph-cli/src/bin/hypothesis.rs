@@ -301,11 +301,17 @@ async fn status(
             .await
             .unwrap_or(0);
 
-    // Mass functions
-    let frame_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_optional(pool)
-            .await?;
+    // Mass functions: on `research_validity` once promoted, where the
+    // promotion moved them (backlog 090221d9).
+    let belief_frame = epigraph_engine::promotion::status_belief_frame(
+        properties
+            .get("hypothesis_status")
+            .and_then(serde_json::Value::as_str),
+    );
+    let frame_id: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(belief_frame)
+        .fetch_optional(pool)
+        .await?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
         let mass_rows =

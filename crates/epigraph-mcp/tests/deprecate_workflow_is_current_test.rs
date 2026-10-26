@@ -230,6 +230,7 @@ async fn deprecate_workflow_cascade_walks_supersedes_and_variant_of(pool: PgPool
 /// bypass (the relation is GONE) and asserts that the caller is TOLD. Reverting
 /// the `?` to `.unwrap_or_default()` fails this arm on any role, at the
 /// `expect_err` — MEASURED, not predicted.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn deprecate_workflow_cascade_read_failure_reports_its_real_cause(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -256,12 +257,22 @@ async fn deprecate_workflow_cascade_read_failure_reports_its_real_cause(pool: Pg
     .await
     .expect_err("a cascade that cannot enumerate its children has not completed");
 
+    // The real cause is recorded in the server log; the caller gets a fixed
+    // message without the database's text (backlog 49863d2c). A log carrying
+    // only an aborted transaction (25P02) means the read was swallowed again
+    // and the loop kept issuing statements into a dead transaction.
+    assert!(
+        logs_contain("relation \"edges\" does not exist"),
+        "the cascade read's real cause must be the recorded one"
+    );
+    assert!(
+        !logs_contain("current transaction is aborted"),
+        "the SECONDARY failure must not be what was recorded"
+    );
     let msg = err.message.to_lowercase();
     assert!(
-        msg.contains("edges"),
-        "the cascade read's real cause must reach the caller; got {:?}. A message \
-         mentioning only an aborted transaction (25P02) means the read was swallowed \
-         again and the loop kept issuing statements into a dead transaction.",
+        !msg.contains("does not exist"),
+        "the database's error text must not reach the caller; got {:?}",
         err.message
     );
     assert!(

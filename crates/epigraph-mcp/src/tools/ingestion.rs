@@ -813,7 +813,7 @@ impl IngestTx<'_> {
                 author = %agent_id,
                 "{why}"
             );
-            internal_error(format!("{tool_name}: {why}"))
+            crate::errors::internal_error_text(format!("{tool_name}: {why}"))
         };
         // 1. The claims trigger's first question, asked of EVERY author: is it
         //    bound to a registered human operator? OPL01 by name once armed.
@@ -1709,97 +1709,24 @@ fn ingest_claim_labels(
     Ok(labels)
 }
 
-/// Resolver prefixes a caller may put in front of a DOI. Matched
-/// case-insensitively; `doi:` also tolerates whitespace before the DOI.
-const DOI_KEY_PREFIXES: [&str; 7] = [
-    "https://doi.org/",
-    "http://doi.org/",
-    "https://dx.doi.org/",
-    "http://dx.doi.org/",
-    "https://www.doi.org/",
-    "http://www.doi.org/",
-    "doi:",
-];
+// The document-key normalizer is shared with the REST paper routes
+// (`epigraph-api` `routes/papers.rs`), so both transports key `papers.doi`
+// identically (backlog 90756d26). See `epigraph_db::repos::paper`.
+pub(crate) use epigraph_db::repos::paper::canonical_document_key;
 
-/// True for a bare DOI: `10.` + a 4-9 digit registrant + `/` + a non-empty
-/// suffix.
-fn is_bare_doi(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix("10.") else {
-        return false;
-    };
-    let Some((registrant, suffix)) = rest.split_once('/') else {
-        return false;
-    };
-    (4..=9).contains(&registrant.len())
-        && registrant.bytes().all(|b| b.is_ascii_digit())
-        && !suffix.trim().is_empty()
-}
-
-/// The canonical spelling of a document identity key: trimmed, with a DOI
-/// resolver prefix (`https://doi.org/`, `dx.doi.org`, `doi:`, ...) removed
-/// when what follows is a bare DOI. Anything else is returned trimmed and
-/// otherwise unchanged.
-///
-/// Without it, `https://doi.org/10.1021/acsnano.9b05650` was stored verbatim
-/// as `papers.doi`, so the same DOI could be keyed twice and a `query_paper`
-/// on the bare DOI found nothing. NOT lowercased: DOIs are case-insensitive,
-/// but existing rows and their `doi:<key>` labels carry the caller's case, and
-/// folding it would re-key them.
-///
-/// TODO: consolidate with the engine's `normalize_doi` (belief source keys)
-/// once that lands; kept local so the `papers` key does not depend on it.
-pub(crate) fn canonical_document_key(raw: &str) -> String {
-    let t = raw.trim();
-    for prefix in DOI_KEY_PREFIXES {
-        let Some(head) = t.get(..prefix.len()) else {
-            continue;
-        };
-        if head.eq_ignore_ascii_case(prefix) {
-            let rest = t[prefix.len()..].trim_start();
-            if is_bare_doi(rest) {
-                return rest.to_string();
-            }
-        }
-    }
-    t.to_string()
-}
-
-/// Find the `papers` row a caller-supplied document key names: the
+/// Find the `papers` row a caller-supplied document key names, trying each of
+/// [`epigraph_db::repos::paper::document_key_spellings`] in order: the
 /// [`canonical_document_key`] first, then the key as given (trimmed), then,
-/// for a bare DOI, each [`DOI_KEY_PREFIXES`] spelling of it. A row written
+/// for a bare DOI, each legacy resolver-prefix spelling of it. A row written
 /// under a resolver-URL spelling before keys were canonicalized is thus found
 /// by that spelling AND by the bare DOI, which is what the monitor's dedup
-/// probe asks with. The legacy spellings are exact-match: a row keyed on a
-/// case variant of a prefix (`HTTPS://DOI.ORG/...`) is found only as given.
+/// probe asks with.
 pub(crate) async fn find_paper_by_document_key(
     pool: &sqlx::PgPool,
     raw: &str,
 ) -> Result<Option<epigraph_db::PaperRow>, McpError> {
-    let canonical = canonical_document_key(raw);
-    if let Some(row) = PaperRepository::find_by_doi(pool, &canonical)
-        .await
-        .map_err(internal_error)?
-    {
-        return Ok(Some(row));
-    }
-    let as_given = raw.trim();
-    if as_given != canonical {
-        if let Some(row) = PaperRepository::find_by_doi(pool, as_given)
-            .await
-            .map_err(internal_error)?
-        {
-            return Ok(Some(row));
-        }
-    }
-    if !is_bare_doi(&canonical) {
-        return Ok(None);
-    }
-    for prefix in DOI_KEY_PREFIXES {
-        let legacy = format!("{prefix}{canonical}");
-        if legacy == as_given {
-            continue;
-        }
-        if let Some(row) = PaperRepository::find_by_doi(pool, &legacy)
+    for spelling in epigraph_db::repos::paper::document_key_spellings(raw) {
+        if let Some(row) = PaperRepository::find_by_doi(pool, &spelling)
             .await
             .map_err(internal_error)?
         {

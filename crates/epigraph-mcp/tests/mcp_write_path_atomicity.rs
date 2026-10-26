@@ -190,7 +190,10 @@ async fn refuse_every_trace_insert(pool: &PgPool) {
         "CREATE OR REPLACE FUNCTION refuse_trace_for_test() RETURNS trigger
          LANGUAGE plpgsql AS $$
          BEGIN
-             RAISE EXCEPTION 'refused reasoning_traces insert (test trigger)'
+             -- The table name comes from TG_TABLE_NAME, so the refusal's text
+             -- appears only in the raised error and never in this statement,
+             -- which the test's captured log also records.
+             RAISE EXCEPTION 'refused % insert (test trigger)', TG_TABLE_NAME
                  USING ERRCODE = '42501';
          END $$",
     )
@@ -271,6 +274,7 @@ async fn memorize_without_a_scoped_pool_refuses_and_writes_nothing(pool: PgPool)
 /// semantics, not row visibility: before the change the claim was committed by
 /// `create_claim_idempotent` before the trace was attempted, so this arm found a
 /// row; after it, claim and trace share one transaction and the row is gone.
+#[tracing_test::traced_test]
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_refused_trace_rolls_the_claim_back_in_submit_claim(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -281,10 +285,20 @@ async fn a_refused_trace_rolls_the_claim_back_in_submit_claim(pool: PgPool) {
     let err = tools::claims::submit_claim(&server, &viewer, submit_params(&content), None)
         .await
         .expect_err("the refused trace must surface as an error");
+    // The underlying cause is the one recorded, not a commit-time `current
+    // transaction is aborted`. It is recorded in the server log: the caller
+    // gets a fixed message, without the database's text (backlog 49863d2c).
     assert!(
-        err.message.contains("refused reasoning_traces insert"),
-        "the underlying cause must reach the caller rather than being replaced by a \
-         commit-time `current transaction is aborted`; got: {}",
+        logs_contain("refused reasoning_traces insert"),
+        "the trace refusal must be the recorded cause"
+    );
+    assert!(
+        !logs_contain("current transaction is aborted"),
+        "the refusal must not be replaced by a commit-time abort"
+    );
+    assert!(
+        !err.message.contains("refused reasoning_traces insert"),
+        "the database's error text must not reach the caller; got: {}",
         err.message
     );
 

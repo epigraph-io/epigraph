@@ -187,7 +187,7 @@ pub async fn request_viewer(
     if auth.is_none() {
         return Viewer::resolve(&server.pool, principal)
             .await
-            .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None));
+            .map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e));
     }
     // HTTP: an OPERATED principal gets no viewer. Operated agents are
     // stdio-only (migration 107); token issuance refuses them, but a token
@@ -239,13 +239,13 @@ pub async fn request_viewer(
             ))
         }
         Err(e) => {
-            return Err(McpError::internal_error(
-                format!("could not check whether agent {principal} is operated: {e}"),
-                None,
+            return Err(crate::errors::internal_error_logged(
+                format!("could not check whether agent {principal} is operated"),
+                e,
             ))
         }
     }
-    viewer.map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+    viewer.map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e))
 }
 
 /// The refusal of a delegated run token whose delegation is not live: one

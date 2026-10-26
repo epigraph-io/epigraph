@@ -1,0 +1,231 @@
+# EpiGraph CDST Calibration Constants
+# Ported from scripts/lib/cdst_bba.py (SciFact-calibrated, 0.948 F1)
+#
+# Mass function triplets are [base_support, base_against, base_ignorance].
+
+default_journal_reliability = 0.78
+
+# ── Methodology Profiles ────────────────────────────────────────────────────
+# Canonical profiles only. Aliases are in [methodology_aliases].
+# Each value is [base_support, base_against, base_ignorance].
+
+[methodology_profiles]
+legal_document_review    = [0.90, 0.02, 0.08]
+deductive_logic          = [0.85, 0.05, 0.10]
+meta_analysis            = [0.80, 0.05, 0.15]
+theoretical_derivation   = [0.80, 0.05, 0.15]
+statistical_analysis     = [0.75, 0.05, 0.20]
+bayesian_inference       = [0.70, 0.05, 0.25]
+computational            = [0.72, 0.05, 0.23]
+instrumental             = [0.80, 0.05, 0.15]
+inductive_generalization = [0.60, 0.08, 0.32]
+visual_inspection        = [0.55, 0.08, 0.37]
+observational            = [0.60, 0.08, 0.32]
+expert_elicitation       = [0.45, 0.10, 0.45]
+extraction               = [0.58, 0.07, 0.35]
+textbook_assertion       = [0.78, 0.04, 0.18]
+negative_result          = [0.70, 0.05, 0.25]
+default                  = [0.50, 0.08, 0.42]
+
+# ── Methodology Aliases ─────────────────────────────────────────────────────
+# Maps alternate names to canonical profile keys above.
+
+[methodology_aliases]
+deductive                = "deductive_logic"
+deductive_reasoning      = "deductive_logic"
+"meta-analysis"          = "meta_analysis"
+statistical              = "statistical_analysis"
+statistical_inference    = "statistical_analysis"
+bayesian                 = "bayesian_inference"
+computational_simulation = "computational"
+instrumental_measurement = "instrumental"
+experimental_observation = "instrumental"
+inductive                = "inductive_generalization"
+expert                   = "expert_elicitation"
+testimonial              = "expert_elicitation"
+llm_extraction           = "extraction"
+literature_synthesis     = "extraction"
+
+# ── Evidence Type Weights ───────────────────────────────────────────────────
+
+[evidence_type_weights]
+regulatory      = 1.0
+empirical       = 1.0
+statistical     = 0.9
+logical         = 0.85
+testimonial     = 0.6
+circumstantial  = 0.4
+conversational  = 0.3
+
+# Phase 2 (issue #197): canonical keys for BBAs written from epistemic
+# edges. `auto_wire_ds_for_edge` resolves the raw `relationship` string
+# (`supports`, `refutes`, …) through `evidence_type_aliases` below and
+# stores the canonical key in `mass_functions.evidence_type`, so the
+# Phase 2 helper resolves a real calibrated weight instead of falling
+# through to the 0.5 unknown-type fallback.
+#
+# Placeholder values mirror the existing `RestrictionProfile::scientific`
+# transmission factors (0.7 for support/refute/frame, 0.65 for elaborate,
+# 0.5 for generalize/inform, 0.7 for supersede). Retune is filed as
+# backlog claim 7e7932bf-0cad-430d-a772-ef023d3827a1.
+derived_support        = 0.7
+derived_refute         = 0.7
+derived_supersession   = 0.7
+derived_elaboration    = 0.65
+derived_generalization = 0.5
+derived_informational  = 0.5
+derived_frame_evidence = 0.7
+
+# ── Evidence Type Aliases ───────────────────────────────────────────────────
+# Maps the DB's `evidence.evidence_type` enum values to the canonical
+# SciFact-calibration keys above. Without these aliases every lookup against
+# DB-stored evidence falls through to the 0.5 unknown-type default —
+# leaves any legacy NULL-source_strength BBAs effectively undiscounted under
+# the auto_wire_ds path.
+
+[evidence_type_aliases]
+observation = "empirical"      # direct empirical observation
+computation = "statistical"    # computational / statistical analysis
+document    = "logical"        # claim asserted in a document
+reference   = "logical"        # citation to another claim/source
+testimony   = "testimonial"    # explicit agent testimony
+
+# Phase 2 (issue #197): Relationship → canonical evidence_type. These
+# are written by `auto_wire_ds_for_edge` and now go through the
+# calibrated path instead of the 0.5 unknown-type fallback. Keys must
+# be lowercase to match `CalibrationConfig::get_evidence_type_weight`'s
+# `to_lowercase()` normalization on read.
+supports        = "derived_support"
+corroborates    = "derived_support"
+refutes         = "derived_refute"
+contradicts     = "derived_refute"
+supersedes      = "derived_supersession"
+elaborates      = "derived_elaboration"
+specializes     = "derived_elaboration"
+generalizes     = "derived_generalization"
+informs         = "derived_informational"
+frame_validates = "derived_frame_evidence"
+
+# ── Section Tier Weights ────────────────────────────────────────────────────
+# Fraction of informative mass retained (rest shifted to theta).
+
+[section_tier_weights]
+primary_provision = 1.0
+results      = 1.0
+methods      = 0.90
+discussion   = 0.70
+conclusion   = 0.65
+introduction = 0.50
+abstract     = 0.80
+other        = 0.75
+
+# ── Journal Reliability ─────────────────────────────────────────────────────
+
+[journal_reliability]
+"Nature"                  = 0.92
+"Science"                 = 0.92
+"Cell"                    = 0.90
+"The Lancet"              = 0.90
+"Nature Communications"   = 0.88
+"Physical Review Letters" = 0.88
+"PNAS"                    = 0.87
+"JACS"                    = 0.87
+"ACS Nano"                = 0.86
+"Chemical Reviews"        = 0.88
+"iScience"                = 0.82
+"Chemical Science"        = 0.84
+"MRS Bulletin"            = 0.83
+"Nanophotonics"           = 0.82
+"Annual Review"           = 0.88
+"arXiv preprint"          = 0.70
+"bioRxiv"                 = 0.70
+"chemRxiv"                = 0.70
+"medRxiv"                 = 0.70
+
+# ── Classifier Thresholds ───────────────────────────────────────────────────
+# Holdout sweep: 5-fold CV on 80% train, 0.940 F1 on 20% held-out test.
+
+[classifier_thresholds]
+nei_threshold          = 0.85
+support_threshold      = 0.15
+conflict_threshold     = 0.05
+has_opposing_threshold = 0.1
+
+# ── Cross-Source Matcher ────────────────────────────────────────────────────
+# See docs/superpowers/specs/2026-05-21-cross-source-matching-design.md
+[matcher.weights]
+embed_cosine     = 0.35
+triple_overlap   = 0.15
+entity_jaccard   = 0.10
+method_match     = 0.05
+nbhd_overlap     = 0.05
+citation_overlap = 0.05
+graph_overlap    = 0.10
+belief_alignment = 0.10
+theme_proximity  = 0.05
+
+[matcher.bands]
+# Provisional bootstrap bands for the renormalized (≈cosine) cross-source score
+# (backlog 27bc9754). mid is grounded in resolved item 4a715300 ("real
+# corroboration clusters >0.85 cosine; 0.70–0.79 is topical noise"); high is set
+# unreachable so EVERY candidate routes to the LLM verifier (the precision gate)
+# rather than auto-promoting. Final calibrated values → #239 precision sweep.
+high = 1.01
+mid  = 0.80
+
+[matcher.embedding]
+model_version = "v1"
+
+[matcher.filter]
+include_agent_id = false
+
+# Candidate hygiene: claims carrying ANY of these labels (or a host-provenance
+# `properties->>'event'` marker) are dropped from candidate generation before
+# scoring. `workflow_step` artifacts (e.g. content "Body") dominate the
+# high-cosine candidate pool on prod (806/838 of embed_cosine>=0.90 pairs)
+# without being substantive cross-source claims; `telemetry` is host noise.
+# 2026-06-15: extended with EpiClaw/scheduled-task self-narration labels. A prod
+# dry-run staged 31/44 pending candidates from operational self-logs (daily
+# journals, graph-integrity/theme/data-integrity maintenance runs, ingest-session
+# logs) — they share heavy boilerplate, score >0.80 cosine, and evade
+# workflow_step/telemetry because they carry date-stamps + ops tags instead.
+# Set `exclude_labels = []` to disable.
+[matcher.eligibility]
+exclude_labels = ["workflow_step", "telemetry", "maintenance", "graph-integrity", "maintenance-log", "theme-maintenance", "data-integrity", "system-health", "journal", "daily-journal", "digest", "nightly-digest", "session-log", "scheduled-task", "reconciliation-complete", "conflict-resolution", "research-ingest"]
+
+[matcher.fan_out]
+max_per_claim = 32
+
+# ── Evidence Locality Discounting ───────────────────────────────────────────
+# Multiplicative Shafer reliability factor applied to per-BBA source_strength
+# when the supporting evidence is intra-source (cites the paper that asserts
+# the target claim). Composes with the per-BBA evidence_type weight rather
+# than replacing it: a logical/intra BBA becomes 0.85 * 0.3 = 0.255, an
+# empirical/intra BBA becomes 1.0 * 0.3 = 0.30, etc.
+#
+# Cross-source (or no detectable intra-source evidence) leaves the BBA's
+# source_strength unchanged — no multiplicative factor needed (i.e. 1.0
+# implicit). Intra-source detection lives in the evidence table:
+# `evidence.properties->>'doi'` matching the paper that asserts the BBA's
+# target claim via the `asserts` edge.
+#
+# Default tuned against the synthetic 19-supporter NEMS regression with
+# logical-tier supporters: target BetP lands in [0.70, 0.85] (replacing the
+# un-discounted 0.997 inflation).
+
+[evidence_locality]
+intra_evidence_locality_factor = 0.3
+
+# ── Split-Conformal Prediction Sets ────────────────
+# Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py
+# over 1189 labelled SciFact fixtures (split-conformal, alpha=0.1,
+# seed=42). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
+# class c is in the prediction set iff score_c <= q_c. Calibration n per class:
+# supported=508 contradicted=265 not_enough_info=416.
+[conformal]
+alpha = 0.1
+
+[conformal.quantiles]
+supported        = 0.414726
+contradicted     = 0.367560
+not_enough_info  = 0.117009

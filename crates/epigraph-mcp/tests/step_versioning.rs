@@ -277,7 +277,75 @@ async fn evolve_step_rejects_bad_edge_type(pool: PgPool) {
         None,
     )
     .await;
-    assert!(result.is_err(), "BOGUS edge_type must error");
+    // The caller's error, not a server fault (backlog 769989ae): before the
+    // fix the repo refused with `QueryFailed`, which reached the caller as
+    // INTERNAL_ERROR.
+    let err = result.expect_err("BOGUS edge_type must error");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "an unknown edge_type is the caller's error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("supersedes") && err.message.contains("revises"),
+        "the refusal names the accepted edge types: {}",
+        err.message
+    );
+}
+
+/// Id-mode `supersedes` on a step that is no longer current is refused as the
+/// caller's error (INVALID_PARAMS, the code name-mode already returns for a
+/// retired head), not INTERNAL_ERROR (backlog 769989ae). Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_id_mode_supersede_of_a_non_current_step_is_invalid_params(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_server(pool.clone());
+    let agent = insert_seed_agent(&pool).await;
+    let lineage = Uuid::new_v4();
+    let v1 = seed_versioned_step(&pool, agent, lineage, "retired v1").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(v1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = evolve_step(
+        &server,
+        &viewer,
+        EvolveStepParams {
+            canonical_name: None,
+            step_index: None,
+            step_lineage_id: String::new(),
+            parent_id: v1.to_string(),
+            content: "supersede a retired step".to_string(),
+            edge_type: "supersedes".to_string(),
+            rationale: None,
+            level: Some(2),
+        },
+        None,
+    )
+    .await
+    .expect_err("a non-current step cannot be superseded");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "a non-current parent is the caller's error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("non-current"),
+        "the refusal says why: {}",
+        err.message
+    );
+    let children: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edges WHERE target_id = $1 AND relationship = 'supersedes'",
+    )
+    .bind(v1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(children, 0, "a refused evolve writes nothing");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

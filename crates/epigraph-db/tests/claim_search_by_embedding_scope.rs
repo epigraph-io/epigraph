@@ -397,3 +397,68 @@ async fn doi_filter_returns_every_claim_the_paper_asserts_in_all_claims_scope(po
         "DOI + Paragraphs: the paper's level-2 paragraph only"
     );
 }
+
+/// The DOI filter matches every spelling of the paper's document key (backlog
+/// 90756d26), through the same normalizer the paper writers use: a bare
+/// filter finds a paper an older writer keyed on the resolver URL, and a
+/// `doi:` / URL filter finds a bare-keyed paper. Before, `p.doi = $4` matched
+/// the filter's spelling only, so both returned nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn doi_filter_matches_every_spelling_of_the_document_key(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let q = vec_angle(0.0);
+
+    async fn seed_paper_asserting(pool: &PgPool, doi: &str, claim: Uuid) {
+        let paper = Uuid::new_v4();
+        sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'spelling test')")
+            .bind(paper)
+            .bind(doi)
+            .execute(pool)
+            .await
+            .expect("seed paper");
+        sqlx::query(
+            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+             VALUES (gen_random_uuid(), $1, 'paper', $2, 'claim', 'asserts')",
+        )
+        .bind(paper)
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("seed paper asserts edge");
+    }
+
+    let legacy_claim = seed_claim(&pool, agent, 1, "{}", Some(&vec_angle(1.0))).await;
+    let bare_claim = seed_claim(&pool, agent, 2, "{}", Some(&vec_angle(2.0))).await;
+    seed_paper_asserting(
+        &pool,
+        "https://doi.org/10.5555/doi-scope-legacy",
+        legacy_claim,
+    )
+    .await;
+    seed_paper_asserting(&pool, "10.5555/doi-scope-bare", bare_claim).await;
+
+    for (filter, expected) in [
+        ("10.5555/doi-scope-legacy", legacy_claim),
+        ("doi:10.5555/doi-scope-legacy", legacy_claim),
+        ("doi:10.5555/doi-scope-bare", bare_claim),
+        ("https://dx.doi.org/10.5555/doi-scope-bare", bare_claim),
+    ] {
+        let hits: Vec<Uuid> = ClaimRepository::search_by_embedding_since(
+            &pool,
+            &viewer,
+            &q,
+            1536,
+            10,
+            Some(filter),
+            None,
+            EmbeddingSeedScope::AllClaims,
+        )
+        .await
+        .expect("search_by_embedding_since with a DOI")
+        .into_iter()
+        .map(|h| h.claim_id)
+        .collect();
+        assert_eq!(hits, vec![expected], "filter {filter:?}");
+    }
+}

@@ -244,7 +244,7 @@ pub(crate) async fn maintenance_viewer(
     let mut session = scoped
         .maintenance_session(reason)
         .await
-        .map_err(|e| McpError::internal_error(format!("maintenance acquire failed: {e}"), None))?;
+        .map_err(|e| crate::errors::internal_error_logged("maintenance acquire failed", e))?;
     session.assert_privileged().await.map_err(|e| {
         tracing::error!(
             target: "tenancy.maintenance",
@@ -252,12 +252,10 @@ pub(crate) async fn maintenance_viewer(
             error = %e,
             "maintenance tool refused: the leased maintenance connection cannot bypass RLS"
         );
-        McpError::internal_error(
-            format!(
-                "this MCP tool's maintenance connection cannot bypass row-level security, so \
-                 its statements would read and write ZERO rows with no error. Refusing. ({e})"
-            ),
-            None,
+        crate::errors::internal_error_logged(
+            "this MCP tool's maintenance connection cannot bypass row-level security, so its \
+             statements would read and write ZERO rows with no error. Refusing.",
+            e,
         )
     })?;
     Ok(session)

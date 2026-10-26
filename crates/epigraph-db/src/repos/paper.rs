@@ -24,10 +24,20 @@ pub struct PaperRow {
 pub struct PaperRepository;
 
 impl PaperRepository {
-    /// Insert a paper, or return the existing id if the DOI already exists.
+    /// Insert a paper, or return the existing id if the document key already
+    /// exists under any of its spellings.
     ///
-    /// On conflict (UNIQUE doi), updates `title` and `journal` to the
-    /// provided values when non-null. Idempotent for repeat ingestion.
+    /// The key is matched through [`document_key_spellings`], canonical
+    /// first, so a row an older writer stored under a resolver URL
+    /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
+    /// ingest (backlog 90756d26). The row found has `title` and `journal`
+    /// updated to the provided values when non-null. A new row is stored
+    /// under the [`canonical_document_key`]. Idempotent for repeat ingestion.
+    ///
+    /// One statement: when no spelling exists yet, the insert falls through
+    /// to `ON CONFLICT (doi)` on the canonical key, so a concurrent writer
+    /// that inserted the same document under another spelling makes this
+    /// call wait and then return that writer's row, not a unique violation.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -38,22 +48,48 @@ impl PaperRepository {
         title: Option<&str>,
         journal: Option<&str>,
     ) -> Result<Uuid, DbError> {
-        let row = sqlx::query!(
+        let canonical = canonical_document_key(doi);
+        let spellings = document_key_spellings(doi);
+        // Runtime-checked, not `query!`: CI's migration runner is built
+        // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
+        // before the schema it is checked against exists.
+        let id: Uuid = sqlx::query_scalar(
             r#"
-            INSERT INTO papers (doi, title, journal)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (doi) DO UPDATE SET
-                title = COALESCE(EXCLUDED.title, papers.title),
-                journal = COALESCE(EXCLUDED.journal, papers.journal)
-            RETURNING id
+            WITH found AS (
+                SELECT id FROM papers
+                WHERE doi = ANY($1::text[])
+                ORDER BY array_position($1::text[], doi)
+                LIMIT 1
+            ),
+            updated AS (
+                UPDATE papers p SET
+                    title = COALESCE($3::text, p.title),
+                    journal = COALESCE($4::text, p.journal)
+                FROM found
+                WHERE p.id = found.id
+                RETURNING p.id
+            ),
+            inserted AS (
+                INSERT INTO papers (doi, title, journal)
+                SELECT $2::text, $3::text, $4::text
+                WHERE NOT EXISTS (SELECT 1 FROM found)
+                ON CONFLICT (doi) DO UPDATE SET
+                    title = COALESCE(EXCLUDED.title, papers.title),
+                    journal = COALESCE(EXCLUDED.journal, papers.journal)
+                RETURNING id
+            )
+            SELECT id FROM updated
+            UNION ALL
+            SELECT id FROM inserted
             "#,
-            doi,
-            title,
-            journal,
         )
+        .bind(&spellings)
+        .bind(&canonical)
+        .bind(title)
+        .bind(journal)
         .fetch_one(pool)
         .await?;
-        Ok(row.id)
+        Ok(id)
     }
 
     /// Find a paper by DOI. Returns `None` if no paper has this DOI.
@@ -424,4 +460,185 @@ pub struct AssertedClaimRow {
     pub is_current: bool,
     /// The claim this one superseded, if any.
     pub supersedes: Option<Uuid>,
+}
+
+// =============================================================================
+// THE PAPER DOCUMENT KEY (backlog 90756d26)
+// =============================================================================
+//
+// `papers.doi` is the document identity key. Every writer and every reader of
+// it, on every transport, goes through the two functions below: the MCP
+// ingestion and paper-query tools (`epigraph-mcp` `tools/ingestion.rs`) and the
+// REST paper routes (`epigraph-api` `routes/papers.rs`). Before they were
+// shared, the REST routes stored and matched the caller's spelling verbatim, so
+// `https://doi.org/10.x/y`, `doi:10.x/y` and `10.x/y` were three keys there and
+// one key over MCP.
+//
+// Pure functions, no SQL: they live here because this module owns the column
+// they key, and both transports already depend on this crate.
+//
+// Deliberately NOT the belief engine's `normalize_doi`
+// (`epigraph-engine` `source_dependence.rs`): that one lowercases, which is
+// right for a belief source key and wrong for this one (see
+// [`canonical_document_key`]).
+
+/// Resolver prefixes a caller may put in front of a DOI. Matched
+/// case-insensitively; `doi:` also tolerates whitespace before the DOI.
+pub const DOI_KEY_PREFIXES: [&str; 10] = [
+    "https://doi.org/",
+    "http://doi.org/",
+    "https://dx.doi.org/",
+    "http://dx.doi.org/",
+    "https://www.doi.org/",
+    "http://www.doi.org/",
+    // Scheme-less resolver spellings: the key class this normalizer owns is
+    // `^(https?://)?(dx\.|www\.)?doi\.org/`, with the scheme optional.
+    "doi.org/",
+    "dx.doi.org/",
+    "www.doi.org/",
+    "doi:",
+];
+
+/// True for a bare DOI: `10.` + a 4-9 digit registrant + `/` + a non-empty
+/// suffix.
+#[must_use]
+pub fn is_bare_doi(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("10.") else {
+        return false;
+    };
+    let Some((registrant, suffix)) = rest.split_once('/') else {
+        return false;
+    };
+    (4..=9).contains(&registrant.len())
+        && registrant.bytes().all(|b| b.is_ascii_digit())
+        && !suffix.trim().is_empty()
+}
+
+/// The canonical spelling of a document identity key: trimmed, with a DOI
+/// resolver prefix (`https://doi.org/`, `dx.doi.org`, `doi:`, ...) removed
+/// when what follows is a bare DOI. Anything else is returned trimmed and
+/// otherwise unchanged. This is the spelling every writer stores.
+///
+/// NOT lowercased: DOIs are case-insensitive, but existing rows and their
+/// `doi:<key>` labels carry the caller's case, and folding it would re-key
+/// them.
+#[must_use]
+pub fn canonical_document_key(raw: &str) -> String {
+    let t = raw.trim();
+    for prefix in DOI_KEY_PREFIXES {
+        let Some(head) = t.get(..prefix.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(prefix) {
+            let rest = t[prefix.len()..].trim_start();
+            if is_bare_doi(rest) {
+                return rest.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+/// Every stored spelling a lookup for `raw` must match, most preferred first:
+/// the [`canonical_document_key`], then the key as given (trimmed), then, for
+/// a bare DOI, each [`DOI_KEY_PREFIXES`] spelling of it. Distinct, in that
+/// order.
+///
+/// The legacy spellings are what make a row written under a resolver URL
+/// before keys were canonicalized findable by the bare DOI. They are
+/// exact-match: a row keyed on a case variant of a prefix
+/// (`HTTPS://DOI.ORG/...`) is found only as given.
+#[must_use]
+pub fn document_key_spellings(raw: &str) -> Vec<String> {
+    let canonical = canonical_document_key(raw);
+    let as_given = raw.trim().to_string();
+    let bare = is_bare_doi(&canonical);
+    let mut out = vec![canonical.clone()];
+    if as_given != canonical {
+        out.push(as_given);
+    }
+    if bare {
+        for prefix in DOI_KEY_PREFIXES {
+            let legacy = format!("{prefix}{canonical}");
+            if !out.contains(&legacy) {
+                out.push(legacy);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod document_key_tests {
+    use super::*;
+
+    const BARE: &str = "10.1021/acsnano.9b05650";
+
+    #[test]
+    fn every_resolver_spelling_canonicalizes_to_the_bare_doi() {
+        for raw in [
+            "https://doi.org/10.1021/acsnano.9b05650",
+            "http://dx.doi.org/10.1021/acsnano.9b05650",
+            "HTTPS://WWW.DOI.ORG/10.1021/acsnano.9b05650",
+            "doi:10.1021/acsnano.9b05650",
+            "doi: 10.1021/acsnano.9b05650",
+            "  10.1021/acsnano.9b05650  ",
+            // Scheme-less resolver spellings (the reconcile count's regex
+            // makes the scheme optional, so the normalizer must too).
+            "doi.org/10.1021/acsnano.9b05650",
+            "dx.doi.org/10.1021/acsnano.9b05650",
+            "WWW.DOI.ORG/10.1021/acsnano.9b05650",
+        ] {
+            assert_eq!(canonical_document_key(raw), BARE, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn non_doi_keys_are_kept_verbatim_but_trimmed() {
+        for raw in [
+            "https://doi.org/about",
+            "https://doi.org/10.1021",
+            "https://doi.org/10.12/short-registrant",
+            "https://example.org/paper.pdf",
+            "urn:epigraph:doc:some-title-abc",
+        ] {
+            assert_eq!(canonical_document_key(&format!(" {raw} ")), raw);
+        }
+    }
+
+    #[test]
+    fn spellings_put_the_canonical_key_first_and_cover_every_legacy_prefix() {
+        let s = document_key_spellings("https://doi.org/10.1021/acsnano.9b05650");
+        assert_eq!(s[0], BARE);
+        for prefix in DOI_KEY_PREFIXES {
+            let legacy = format!("{prefix}{BARE}");
+            assert_eq!(
+                s.iter().filter(|x| **x == legacy).count(),
+                1,
+                "{legacy} exactly once in {s:?}"
+            );
+        }
+        assert_eq!(s.len(), 1 + DOI_KEY_PREFIXES.len(), "{s:?}");
+        // Named, not only through the array: a lookup by the bare DOI must
+        // reach a row an older writer stored scheme-less.
+        for legacy in ["doi.org/", "dx.doi.org/", "www.doi.org/"] {
+            assert!(s.contains(&format!("{legacy}{BARE}")), "{legacy} in {s:?}");
+        }
+    }
+
+    #[test]
+    fn a_case_variant_prefix_is_matched_as_given_too() {
+        let raw = "HTTPS://DOI.ORG/10.1021/acsnano.9b05650";
+        let s = document_key_spellings(raw);
+        assert_eq!(s[0], BARE);
+        assert_eq!(s[1], raw);
+    }
+
+    #[test]
+    fn a_non_doi_key_has_exactly_one_spelling() {
+        assert_eq!(
+            document_key_spellings("https://doi.org/about"),
+            vec!["https://doi.org/about".to_string()]
+        );
+    }
 }

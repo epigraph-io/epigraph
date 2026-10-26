@@ -831,10 +831,13 @@ const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-
 /// The sentinel `evidence.raw_content` carries once its claim is sealed.
 ///
 /// Not id-suffixed, and it does not need to be: `evidence` has no generated
-/// tsvector, no uniqueness constraint over its content and no content hash, so
-/// the three reasons the claim sentinel carries an id do not apply. One fixed
-/// token is the smaller side channel.
-const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+/// tsvector and its `content_hash` is left as the ORIGINAL body's digest (it is
+/// not recomputed from the sentinel), so the reasons the claim sentinel carries
+/// an id do not apply. One fixed token is the smaller side channel.
+///
+/// `pub(crate)` for `EvidenceRepository::update_raw_content`, which refuses to
+/// rewrite a row holding it.
+pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
 
 /// The key under which a seal manifest carries an evidence row's
 /// `evidence.source_url` inside that row's `properties`.
@@ -921,6 +924,18 @@ pub const SEAL_DELETE_TABLES: &[&str] = &[
     "challenges",
     "experiment_triples",
 ];
+
+/// The [`SEAL_DELETE_TABLES`] whose WRITER-OWNED rows a seal KEEPS.
+///
+/// Operator ruling R-5 (2026-10-25): an OUTSIDER's challenge (migration 168,
+/// `challenges.writer_owned = true`) is not a derived extraction of the
+/// claim's plaintext but the outsider's own objection, owned by the
+/// outsider's group, so sealing the claim keeps it rather than deleting it.
+/// It stays hidden from every session that cannot read the claim by 168's
+/// `challenges_claim_readable` policy (and the repo's in-query claim
+/// predicate). An insider's (inherited) challenge is still deleted, so
+/// `challenges` stays in [`SEAL_DELETE_TABLES`].
+pub const SEAL_KEEPS_WRITER_OWNED: &[&str] = &["challenges"];
 
 /// One claim's plaintext trusted computing base, as the seal manifest serves it.
 ///
@@ -3204,7 +3219,8 @@ impl PrivatizationRepository {
     ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
     ///    this table omits and the applied schema requires.
     /// 7. The derived-extraction DELETEs, over
-    ///    [`SEAL_DELETE_TABLES`].
+    ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
+    ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
     /// 8. `harvester_fragments`, through the provenance join. Not recoverable
     ///    on unseal, which the preview states.
     ///
@@ -3377,10 +3393,16 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 7. The derived extractions. Deleted, not encrypted.
+        // 7. The derived extractions. Deleted, not encrypted. EXCEPT an
+        //    outsider's challenge (ruling R-5): see [`SEAL_KEEPS_WRITER_OWNED`].
         for table in SEAL_DELETE_TABLES {
+            let keep = if SEAL_KEEPS_WRITER_OWNED.contains(table) {
+                " AND NOT writer_owned"
+            } else {
+                ""
+            };
             sqlx::query(&format!(
-                "DELETE FROM public.{table} WHERE claim_id = ANY($1)"
+                "DELETE FROM public.{table} WHERE claim_id = ANY($1){keep}"
             ))
             .bind(&sealed)
             .execute(&mut *conn)

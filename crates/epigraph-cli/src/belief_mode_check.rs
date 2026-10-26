@@ -183,12 +183,14 @@ pub async fn enforce_or_exit(bin: &str, intent: RunIntent, allow_skew: bool) {
 /// The decision for a WRITING run of a bin whose writes fold atom caches, given
 /// this process's modes. Pure.
 ///
-/// The cache writers in this build implement only the legacy fold. The mode
+/// The cache writers these bins call implement only the legacy fold. The mode
 /// check compares flag VALUES with the API's, not what either build can do,
 /// so a binary older than the server's fold would pass it and write
 /// legacy-fold caches while another fold is in force. That is refused here,
 /// whatever the server reports. The change that adds a fold to these writers
-/// widens this check.
+/// widens this check. `recompute_betp` no longer calls it: since cohort v2 it
+/// writes through the single atom-cache writer, which implements every fold,
+/// and it refuses instead a wave whose fold does not cover its role.
 ///
 /// # Errors
 /// The refusal text, when `ours.atom_fold` is not the legacy fold.

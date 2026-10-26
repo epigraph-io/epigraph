@@ -532,25 +532,36 @@ pub async fn retirement_for_caller(
     out
 }
 
+/// The `details.reason_code` of every [`EVENT_FAILED`] row.
+pub const FAILED_REASON_CODE: &str = "repair_failed";
+
 /// Record a repair that failed (and rolled back), on the maintenance
-/// connection, and build the caller's status: the reason it gets is generic,
-/// the audit row carries the error.
+/// connection, and build the caller's status: the reason it gets is generic.
+///
+/// The audit row carries a static reason ([`FAILED_REASON_CODE`] and the step
+/// that failed), never the error: the row names the triggering agent, who can
+/// read it, and the error is a driver error that can spell SQL, a constraint
+/// or another writer's row (backlog 9d6f21c5). The error goes to the server
+/// log. `step` is `&'static str` so only a literal can reach the row.
 async fn failed(
     admin: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
-    step: &str,
+    step: &'static str,
     e: impl std::fmt::Display,
 ) -> CascadeStatus {
-    let reason = format!("{step} failed on the maintenance connection: {e}");
+    let reason = format!("{step} failed on the maintenance connection");
     tracing::warn!(
         target: "tenancy.admin_cascade",
         cause = trigger.cause.as_str(),
         subject = %trigger.subject_id,
+        error = %e,
         "{reason}"
     );
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("failed");
-    details["reason"] = serde_json::Value::String(reason);
+    details["reason_code"] = serde_json::json!(FAILED_REASON_CODE);
+    details["reason"] =
+        serde_json::Value::String(format!("{reason}; the detail is in the server log"));
     let (audit_event_id, audit_error) =
         match audit::record(&mut *admin, EVENT_FAILED, trigger.agent_id, false, &details).await {
             Ok(id) => (Some(id), None),
@@ -835,6 +846,10 @@ pub async fn apply_after_dedup(
 pub struct UnmarkOutcome {
     /// The canonical the claim had been marked a duplicate of.
     pub canonical_id: Uuid,
+    /// The canonical the duplicate was restored against: `canonical_id`, or
+    /// the claim that replaced it since (supersession or consolidation,
+    /// followed to the current one; operator ruling R-11).
+    pub current_canonical_id: Uuid,
     /// The administrative cascade's status (`touched` holds counts only).
     pub cascade: CascadeStatus,
 }
@@ -844,7 +859,8 @@ pub struct UnmarkOutcome {
 pub enum UnmarkRefusal {
     /// The act refused: not a dedup-marked duplicate, or not writable.
     Act(String),
-    /// No applied repair record and no open cascade for this mark: there is
+    /// No applied repair record and no open cascade for this mark, and it is
+    /// not a legacy mark the operator backfill gave its identity edge: there is
     /// nothing to reverse it from.
     NoRecord,
     /// Any other failure of the reversal or its audit row.
@@ -883,6 +899,11 @@ impl std::fmt::Display for UnmarkRefusal {
 /// write authority FIRST, by running the same act on the caller's stamped
 /// transaction and rolling it back.
 ///
+/// A canonical superseded or consolidated since the mark is followed to the
+/// current one, and the duplicate is restored against it (operator ruling
+/// R-11): the reversal takes each repaired row back from wherever along that
+/// chain it now is.
+///
 /// # Errors
 /// [`UnmarkRefusal`]: nothing was changed. `expected_canonical` is the
 /// canonical the caller's authority was checked against; a duplicate marked
@@ -895,14 +916,48 @@ pub async fn apply_unmark(
     dup_id: Uuid,
     expected_canonical: Uuid,
 ) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
+    apply_unmark_authorized(
+        admin,
+        admin_viewer,
+        caller,
+        trigger,
+        dup_id,
+        expected_canonical,
+        None,
+    )
+    .await
+}
+
+/// [`apply_unmark`] for a request path that checked the caller's authority
+/// over every claim of the canonical's chain
+/// ([`ClaimRepository::unmark_chain_conn`], read on the caller's own
+/// transaction): `authorized_chain` is that chain, and an act that resolves
+/// any other (the canonical was replaced again since) is refused as
+/// [`UnmarkRefusal::Act`], as a different canonical is.
+///
+/// # Errors
+/// As [`apply_unmark`].
+pub async fn apply_unmark_authorized(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    dup_id: Uuid,
+    expected_canonical: Uuid,
+    authorized_chain: Option<&[Uuid]>,
+) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
     use epigraph_core::ClaimId;
     let mut tx = sqlx::Acquire::begin(&mut *admin)
         .await
         .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
-    let unmarked = ClaimRepository::unmark_duplicate_act_conn(
+    // The act re-reads the canonical's chain and refuses one other than
+    // `authorized_chain` (the canonical was replaced again since the caller
+    // was checked) without naming what it read under the admin viewer.
+    let unmarked = ClaimRepository::unmark_duplicate_act_authorized_conn(
         &mut tx,
         admin_viewer,
         ClaimId::from_uuid(dup_id),
+        authorized_chain,
     )
     .await
     .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
@@ -916,6 +971,7 @@ pub async fn apply_unmark(
              nothing was changed"
         )));
     }
+    let current_canonical_id = unmarked.current_canonical();
     let failed = |e: String| UnmarkRefusal::Failed(e);
     let record = audit::dedup_revert_record(&mut *tx, dup_id, unmarked.identity_edge)
         .await
@@ -930,19 +986,39 @@ pub async fn apply_unmark(
             let reversal = ClaimRepository::reverse_marked_duplicate_conn(
                 &mut tx,
                 ClaimId::from_uuid(dup_id),
-                ClaimId::from_uuid(canonical_id),
+                &unmarked.chain,
                 &rec,
             )
             .await
             .map_err(|e| failed(e.to_string()))?;
             (Some(event_id), reversal)
         }
+        // A legacy `fuzzy_dedup_claims` mark whose identity edge the operator
+        // backfill reconstructed is an ordinary dedup record (operator ruling
+        // R-7). Its raw-SQL repair kept no record, so the reversal has nothing
+        // to put back; it still runs, with the empty record, so the duplicate's
+        // own edges get their BP factors back as on every un-mark.
+        None if unmarked.legacy_backfill => {
+            let rec = epigraph_db::DedupRevert {
+                identity_edge: Some(unmarked.identity_edge),
+                ..Default::default()
+            };
+            let reversal = ClaimRepository::reverse_marked_duplicate_conn(
+                &mut tx,
+                ClaimId::from_uuid(dup_id),
+                &unmarked.chain,
+                &rec,
+            )
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+            (None, reversal)
+        }
         // The mark's repair never ran (its cascade is still deferred or
         // failed): there is nothing to put back, only the cascade to retire.
         None if !open.is_empty() => (
             None,
             epigraph_db::DedupReversal {
-                stale_claims: vec![dup_id, canonical_id],
+                stale_claims: vec![dup_id, current_canonical_id],
                 ..Default::default()
             },
         ),
@@ -960,7 +1036,7 @@ pub async fn apply_unmark(
     }
     // Counts only: this row names the caller (`agent_id`), who may read it,
     // and the reversal's ids are other writers' rows.
-    let touched = serde_json::json!({
+    let mut touched = serde_json::json!({
         "edges_resourced_back": reversal.resourced_back.len(),
         "edges_retargeted_back": reversal.retargeted_back.len(),
         "edges_unretracted": reversal.unretracted_edges.len(),
@@ -971,8 +1047,21 @@ pub async fn apply_unmark(
         "drifted": reversal.drifted.len(),
         "cascades_retired": open.len(),
     });
+    let legacy_mark = reversed_event_id.is_none() && unmarked.legacy_backfill;
+    if legacy_mark {
+        // Said, not left to read as an exact reversal: the legacy script moved
+        // or deleted the duplicate's rows and recorded none of it.
+        touched["legacy_mark"] = serde_json::json!(true);
+    }
     let mut details = trigger.audit_details();
     details["outcome"] = serde_json::json!("applied");
+    if legacy_mark {
+        details["legacy_mark"] = serde_json::json!(true);
+    }
+    if current_canonical_id != canonical_id {
+        // Restored against the canonical's current replacement (R-11).
+        details["canonical_chain"] = serde_json::json!(unmarked.chain);
+    }
     details["identity_edge"] = serde_json::json!(unmarked.identity_edge);
     details["reversed_event_id"] = serde_json::json!(reversed_event_id);
     details["touched"] = touched.clone();
@@ -988,6 +1077,7 @@ pub async fn apply_unmark(
     Ok((
         UnmarkOutcome {
             canonical_id,
+            current_canonical_id,
             cascade,
         },
         report_for_caller(admin, caller, &report).await,
