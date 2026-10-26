@@ -96,6 +96,25 @@ async fn submit(server: &EpiGraphMcpFull, pool: &PgPool, claim: Uuid, frame: Uui
     .expect("submit_ds_evidence");
 }
 
+/// Stored BBA rows of (claim, frame), counted per writing agent.
+async fn rows_by_agent(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+) -> std::collections::BTreeMap<Uuid, i64> {
+    let rows: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT source_agent_id, count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id IS NOT NULL \
+          GROUP BY source_agent_id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .fetch_all(pool)
+    .await
+    .expect("count rows");
+    rows.into_iter().collect()
+}
+
 async fn binary_frame(pool: &PgPool) -> Uuid {
     let viewer = fixture::public_viewer(pool).await;
     ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &viewer)
@@ -117,10 +136,19 @@ async fn submit_ds_evidence_by_two_agents_of_one_human_does_not_aggregate(pool: 
     submit(&two, &pool, baseline_claim, frame, 0.7).await;
     let baseline = cached_betp(&pool, baseline_claim).await;
 
+    // The STRONGER sibling first: if the second write replaced the first
+    // ("the latest owner row wins"), the cache would read 0.6's value, not
+    // the stronger sibling's.
     let claim = fresh_claim(&pool, "same-human ds siblings").await;
-    submit(&one, &pool, claim, frame, 0.6).await;
     submit(&two, &pool, claim, frame, 0.7).await;
+    submit(&one, &pool, claim, frame, 0.6).await;
     let siblings = cached_betp(&pool, claim).await;
+    let stored = rows_by_agent(&pool, claim, frame).await;
+    assert_eq!(
+        (stored.get(&a1).copied(), stored.get(&a2).copied()),
+        (Some(1), Some(1)),
+        "history kept: one stored row per sibling agent, none replaced"
+    );
     assert!(
         (siblings - baseline).abs() < 1e-9,
         "two agents of one human must keep the stronger BBA ({baseline}), not aggregate: \

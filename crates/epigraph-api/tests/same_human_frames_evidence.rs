@@ -99,10 +99,29 @@ async fn frames_evidence_by_two_agents_of_one_human_does_not_aggregate(pool: PgP
     submit(&state, &pool, two, baseline_claim, frame, 0.7).await;
     let baseline = cached_betp(&pool, baseline_claim).await;
 
+    // The STRONGER sibling first, so "the latest owner row wins" cannot pass
+    // for the rule; and both rows stay stored (history kept).
     let claim = fresh_claim(&pool, "same-human frames siblings").await;
-    submit(&state, &pool, one, claim, frame, 0.6).await;
     submit(&state, &pool, two, claim, frame, 0.7).await;
+    submit(&state, &pool, one, claim, frame, 0.6).await;
     let siblings = cached_betp(&pool, claim).await;
+    let stored: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT source_agent_id, count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id = ANY($3) \
+          GROUP BY source_agent_id ORDER BY 1",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(vec![one, two])
+    .fetch_all(&pool)
+    .await
+    .expect("count rows");
+    let mut want = vec![(one, 1_i64), (two, 1_i64)];
+    want.sort();
+    assert_eq!(
+        stored, want,
+        "one stored row per sibling agent, none replaced"
+    );
     assert!(
         (siblings - baseline).abs() < 1e-9,
         "two agents of one human must keep the stronger BBA ({baseline}), not aggregate: \
