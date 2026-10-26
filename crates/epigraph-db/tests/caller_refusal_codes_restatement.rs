@@ -3,9 +3,11 @@
 //! NOTHING ELSE: a database migrated to 175 and the same database after 176
 //! hold the same owner, ACL, SECURITY mode, `proconfig` (search_path) and
 //! volatility for each function, and the same body once every
-//! `RAISE EXCEPTION` statement is masked out. Each RAISE that does differ now
-//! opens with a refusal code it did not have, keeps its SQLSTATE, and the
-//! codes introduced are exactly `epigraph_db::CALLER_REFUSAL_CODES`.
+//! `RAISE EXCEPTION` statement is masked out. Each RAISE that does differ is
+//! the old statement with a refusal code prefixed to its message and nothing
+//! else changed (AGK01, which moves the role to DETAIL, is the one declared
+//! exception), keeps its SQLSTATE, and the codes introduced are exactly
+//! `epigraph_db::CALLER_REFUSAL_CODES`.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is not
 //! extended for one test.
@@ -186,6 +188,42 @@ fn errcode_of(raise: &str) -> Option<&str> {
     Some(&rest[q..q + rest[q..].find('\'')?])
 }
 
+/// The one declared exception to "a code prefix and nothing else": AGK01
+/// moves the system agent's role out of the message into DETAIL.
+const AGK01: &str = "AGK01";
+
+/// `raise` with `<code>: ` inserted after the opening quote of its message.
+fn with_code(raise: &str, code: &str) -> String {
+    let q = raise.find('\'').expect("a RAISE with a message") + 1;
+    format!("{}{code}: {}", &raise[..q], &raise[q..])
+}
+
+/// AGK01's old RAISE interpolated the role (`the % system agent`, `v_role`);
+/// the new one names no role in its message, keeps the rest of the sentence,
+/// and carries the role in DETAIL.
+fn assert_agk01_moves_only_the_role_to_detail(old: &str, new: &str) {
+    assert!(
+        old.contains("registered for the % system agent") && old.contains(", v_role"),
+        "PREMISE: 148's message interpolated the role: {old}"
+    );
+    let message_end = new.find("USING").expect("AGK01 has a USING clause");
+    let message = &new[..message_end];
+    assert!(
+        !message.contains('%') && !message.contains("v_role"),
+        "AGK01's message interpolates nothing: {new}"
+    );
+    for kept in [
+        "this public key was registered for a system agent",
+        "(migration 148); no other agent may hold it. Nothing was written",
+    ] {
+        assert!(message.contains(kept), "AGK01 keeps {kept:?}: {new}");
+    }
+    assert!(
+        new.contains("DETAIL = format('system agent role: %s', v_role)"),
+        "AGK01 carries the role in DETAIL: {new}"
+    );
+}
+
 #[test]
 fn the_raise_scanner_masks_whole_statements_and_only_them() {
     let body = "BEGIN\n  -- RAISE EXCEPTION 'in a comment';\n  x := 'raise exception';\n  \
@@ -223,7 +261,10 @@ async fn migration_176_changes_only_raise_statements(pool: PgPool) {
     migrate(&pool, &up_to(175)).await;
     let before = facts(&pool).await;
     assert_eq!(before.len(), RESTATED.len(), "every function exists at 175");
-    migrate(&pool, &MIGRATOR).await;
+    // Up to 176, not head: this pins what 176 itself did, so a later
+    // migration that restates one of these functions (from 176's body, as the
+    // README asks) is judged by its own test, not by this one.
+    migrate(&pool, &up_to(176)).await;
     let after = facts(&pool).await;
     assert_eq!(after.len(), RESTATED.len());
 
@@ -260,6 +301,16 @@ async fn migration_176_changes_only_raise_statements(pool: PgPool) {
                 errcode_of(n),
                 "{sig}: the SQLSTATE of a coded refusal changed: {n}"
             );
+            if code == AGK01 {
+                assert_agk01_moves_only_the_role_to_detail(o, n);
+            } else {
+                assert_eq!(
+                    *n,
+                    with_code(o, code),
+                    "{sig}: a changed RAISE is the old one with `{code}: ` prefixed and \
+                     nothing else changed (wording, arguments, HINT, DETAIL)"
+                );
+            }
             introduced.push(code.to_string());
         }
     }
