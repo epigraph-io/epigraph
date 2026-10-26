@@ -484,6 +484,93 @@ async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
     assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
 }
 
+/// Backlog c0ab097a (2), as ruled: a report is refused "when the caller can
+/// see no step of a workflow that has steps". Fixture: a group-private plan
+/// that executes a PUBLIC thesis (level 0) or phase (level 1) through a
+/// public edge. A non-member reads that thesis or phase and none of the
+/// plan's steps. That must not admit it: 404 as for an
+/// unknown id, and nothing written. Positive control per level: a member of
+/// the owning group still records the report.
+///
+/// RED before the fix: the gate counted level 0, 1 and 2 edges, so the
+/// stranger got a 200 and moved `use_count` to 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_visible_public_thesis_or_phase_does_not_admit_a_non_member(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    for (level, what) in [(0, "thesis"), (1, "phase")] {
+        let w = seed_private_workflow(&pool, &format!("outcome-route-public-{what}")).await;
+        let shared = viewer_fixture::seed_public_claim(
+            &pool,
+            w.member,
+            &format!(
+                "a {what} an earlier public generation wrote {}",
+                w.workflow_id
+            ),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE claims SET properties = jsonb_build_object('level', $2::int) WHERE id = $1",
+        )
+        .bind(shared)
+        .bind(level)
+        .execute(&pool)
+        .await
+        .expect("set level");
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', \
+                     jsonb_build_object('level', $3::int, 'plan_index', 2))",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .bind(level)
+        .execute(&pool)
+        .await
+        .expect("executes edge to the shared claim");
+        let edge: String = sqlx::query_scalar(
+            "SELECT visibility::text FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .fetch_one(&pool)
+        .await
+        .expect("edge read-back");
+        assert_eq!(
+            edge, "public",
+            "fixture shape: the {what}'s executes edge is public"
+        );
+
+        let (status, text) = post(
+            &state,
+            w.workflow_id,
+            Some(token(w.stranger, &["claims:read", "claims:write"])),
+            body(&[0, 1]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a caller that reads the {what} but no step must be refused: {text}"
+        );
+        assert_eq!(
+            written(&pool, w.workflow_id).await,
+            (None, 0),
+            "a refused report moves no counter and writes no row ({what})"
+        );
+
+        let (status, text) = post(
+            &state,
+            w.workflow_id,
+            Some(token(w.member, &["claims:write"])),
+            body(&[0, 1]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{what}: {text}");
+        assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2), "{what}");
+    }
+}
+
 /// Backlog ca30e645 / ruling R-38, REST twin of
 /// `epigraph-mcp/tests/add_step_plan_position.rs`: after `add_step(position =
 /// 1)` the inserted step's `executes` edge carries no `plan_index`, and the

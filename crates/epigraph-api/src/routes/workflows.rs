@@ -1344,8 +1344,9 @@ pub async fn find_workflow_hierarchical(
 /// reads of `claims` and `edges`. On the plain transaction this used to run
 /// on, row security admitted only public rows, so a group's own member got
 /// every row of a group-private workflow written with a NULL `step_claim_id`,
-/// silently. A caller that reads NONE of the plan's own `executes` edges
-/// (thesis, phase or step; a shared level-3 atom does not count:
+/// silently. A caller that reads NONE of the plan's STEP `executes` edges (a
+/// visible thesis, phase or shared level-3 atom does not count, so a step-less
+/// plan is refused to every caller:
 /// `WorkflowRepository::viewer_reads_plan_structure`) is refused with the
 /// missing-id 404 before anything is written: `workflows` has no row security,
 /// so without that check any `claims:write` holder could move the counters of
@@ -1366,7 +1367,7 @@ pub async fn find_workflow_hierarchical(
         (status = 400, description = "quality outside [0, 1]"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write"),
-        (status = 404, description = "no such workflow, or the caller reads none of its plan"),
+        (status = 404, description = "no such workflow, or the caller reads none of its steps"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1453,10 +1454,10 @@ pub async fn report_hierarchical_outcome(
         Some((m,)) => m,
         None => return Err(not_found()),
     };
-    // A caller that reads none of the plan's own `executes` edges (a shared
-    // level-3 atom does not count) cannot read this workflow (`workflows` has
-    // no row security; its plan does): 404 exactly like a missing id, before
-    // any write. Shared with MCP.
+    // A caller that reads none of the plan's STEP `executes` edges (a visible
+    // thesis, phase or shared atom does not count) is answered 404 exactly
+    // like a missing id, before any write (`workflows` has no row security;
+    // its plan does). Shared with MCP.
     if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, &viewer, workflow_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -3958,7 +3959,7 @@ mod tests {
         )
         .await
         .unwrap();
-        attach_public_thesis(&pool, workflow_id).await;
+        attach_public_step(&pool, workflow_id).await;
 
         // Build a minimal axum app with just the outcome route, on a state
         // that can stamp the report's transaction (the route refuses to run
@@ -4004,18 +4005,22 @@ mod tests {
     }
 
     /// Give a bare test root the one thing the outcome route requires of a
-    /// workflow besides its row: a plan claim the reporter can read. One public
-    /// level-0 (thesis) claim at `plan_index` 0, so no `step_index` resolves
-    /// and the row counts these tests assert are unchanged.
-    async fn attach_public_thesis(pool: &PgPool, workflow_id: uuid::Uuid) {
+    /// workflow besides its row: a STEP the reporter can read. One public
+    /// level-2 claim at `plan_index` 0. These tests pin counters, atomicity
+    /// and embedding, so they assert row counts, never step attribution.
+    ///
+    /// It used to attach a level-0 thesis; backlog c0ab097a (2) made a
+    /// visible thesis no longer admit a reporter (only a step does), so a
+    /// thesis-only root is now refused 404 to everyone.
+    async fn attach_public_step(pool: &PgPool, workflow_id: uuid::Uuid) {
         // Inserted with its level rather than updated afterwards: the
         // route-layer write ratchet (`tests/viewer_route_table_lint.rs`) counts
         // an `UPDATE` of `claims` anywhere in this file.
-        let content = format!("outcome test thesis {workflow_id}");
+        let content = format!("outcome test step {workflow_id}");
         let content_hash = epigraph_crypto::ContentHasher::hash(content.as_bytes());
-        let thesis = sqlx::query_scalar::<_, Uuid>(
+        let step = sqlx::query_scalar::<_, Uuid>(
             "INSERT INTO claims (content, content_hash, agent_id, truth_value, properties) \
-             VALUES ($1, $2, $3, 0.5, jsonb_build_object('level', 0)) RETURNING id",
+             VALUES ($1, $2, $3, 0.5, jsonb_build_object('level', 2)) RETURNING id",
         )
         .bind(&content)
         .bind(content_hash.as_slice())
@@ -4028,7 +4033,7 @@ mod tests {
              VALUES ($1, 'workflow', $2, 'claim', 'executes', jsonb_build_object('plan_index', 0))",
         )
         .bind(workflow_id)
-        .bind(thesis)
+        .bind(step)
         .execute(pool)
         .await
         .unwrap();
@@ -4070,7 +4075,7 @@ mod tests {
         )
         .await
         .unwrap();
-        attach_public_thesis(pool, workflow_id).await;
+        attach_public_step(pool, workflow_id).await;
         let state = scoped_test_state(pool).await;
         let app = axum::Router::new()
             .route(
@@ -4311,7 +4316,7 @@ mod tests {
         )
         .await
         .unwrap();
-        attach_public_thesis(pool, workflow_id).await;
+        attach_public_step(pool, workflow_id).await;
         let state = scoped_test_state(pool)
             .await
             .with_embedding_service(std::sync::Arc::new(MockProvider::new(

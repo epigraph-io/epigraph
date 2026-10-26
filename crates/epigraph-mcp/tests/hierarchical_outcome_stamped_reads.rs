@@ -1091,3 +1091,103 @@ async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
     assert!(unresolved(&json).is_empty(), "{json}");
     assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
 }
+
+/// Backlog c0ab097a (2), MCP twin of the REST route's
+/// `a_visible_public_thesis_or_phase_does_not_admit_a_non_member`: a
+/// group-private plan that executes a PUBLIC thesis (level 0) or phase
+/// (level 1) through a public edge. A non-member reads that edge and none of
+/// the plan's steps. Both MCP entry points must refuse it as for an unknown id,
+/// and nothing is written; a member's report is recorded (positive control).
+///
+/// RED before the fix: `refusals` panicked, the stranger's report was accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_visible_public_thesis_or_phase_does_not_admit_a_non_member(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    for (level, what) in [(0, "thesis"), (1, "phase")] {
+        let w = seed_private_workflow(&pool, &format!("stamped-outcome-public-{what}")).await;
+        let shared = fixture::seed_public_claim(
+            &pool,
+            w.member_id,
+            &format!(
+                "a {what} an earlier public generation wrote {}",
+                w.workflow_id
+            ),
+        )
+        .await;
+        set_level(&pool, shared, level).await;
+        executes(&pool, w.workflow_id, shared, Some(2)).await;
+        let edge: String = sqlx::query_scalar(
+            "SELECT visibility::text FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .fetch_one(&pool)
+        .await
+        .expect("edge read-back");
+        assert_eq!(
+            edge, "public",
+            "fixture shape: the {what}'s executes edge is public"
+        );
+
+        let refused = refusals(&server, &w.stranger, w.workflow_id).await;
+        let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
+        assert_eq!(
+            refused[0], unknown[0],
+            "{what}: refused as for an unknown id"
+        );
+        assert_eq!(refused[1], refused[0], "{what}: both tools refuse alike");
+        assert_eq!(
+            written(&pool, w.workflow_id).await,
+            (None, 0),
+            "{what}: a refused report moves no counter and writes no row"
+        );
+
+        let json = report(&server, &w.member, w.workflow_id, &[0, 1]).await;
+        assert!(unresolved(&json).is_empty(), "{what}: {json}");
+        assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2), "{what}");
+    }
+}
+
+/// The ruled gate cannot tell a plan with no steps from one whose steps the
+/// caller cannot read (row security hides both alike), so a step-less plan,
+/// here a generation-0 thesis scaffold before its first `add_step`, is refused
+/// to EVERY reporter, a reader of its public thesis included, and nothing is
+/// written. Pinned so the consequence is visible; reporting on a step-less
+/// plan is an operator question (see `viewer_reads_plan_structure`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_step_less_plan_is_refused_to_every_reporter(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-stepless").await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("viewer");
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-stepless",
+        0,
+        "A thesis scaffold with no steps yet.",
+        None,
+        serde_json::json!({}),
+    )
+    .await
+    .expect("insert workflow root");
+    let thesis = fixture::seed_public_claim(
+        &pool,
+        agent,
+        &format!("a public thesis scaffold {workflow_id}"),
+    )
+    .await;
+    set_level(&pool, thesis, 0).await;
+    executes(&pool, workflow_id, thesis, Some(0)).await;
+
+    let refused = refusals(&server, &viewer, workflow_id).await;
+    let unknown = refusals(&server, &viewer, Uuid::new_v4()).await;
+    assert_eq!(refused[0], unknown[0], "refused as for an unknown id");
+    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        written(&pool, workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
+}

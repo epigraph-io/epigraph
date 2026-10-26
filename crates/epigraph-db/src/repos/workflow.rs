@@ -1033,30 +1033,41 @@ impl WorkflowRepository {
             .collect())
     }
 
-    /// Whether `viewer` reads at least one of `workflow_id`'s `executes`
-    /// edges into the plan's OWN structure (a level 0, 1 or 2 claim: thesis,
-    /// phase or step), through the same edge and claim predicates as
-    /// [`Self::plan_step_claim_ids`].
+    /// Whether `viewer` reads at least one STEP of `workflow_id`: an
+    /// `executes` edge into a level-2 claim, through the same edge and claim
+    /// predicates as [`Self::plan_step_claim_ids`].
     ///
     /// This is the outcome reports' authority predicate. `workflows` has no
     /// row security, so a report's counter write cannot be scoped by the
-    /// database; the plan's claims and edges can. The ingest executor gives
-    /// every plan claim an `executes` edge, so a caller that reads none of
-    /// them cannot read the workflow at all, and the reports answer it as
-    /// for an id that does not exist. It deliberately does NOT require a
-    /// resolvable step prefix: a member whose first ordinal edge was
-    /// re-owned still reads the rest of the plan and may report.
+    /// database; the plan's claims and edges can. Backlog c0ab097a (2), as
+    /// ruled: a report is refused, with the same 404 as an unknown id, "when
+    /// the caller can see no step of a workflow that has steps". It
+    /// deliberately does NOT require a resolvable step prefix: a member whose
+    /// first ordinal edge was re-owned still reads the rest of the plan and
+    /// may report.
     ///
-    /// # Level-3 atoms do not count (backlog c0ab097a)
+    /// # Only steps count
     ///
-    /// An operation atom's id is content-addressed in the namespace documents
-    /// share (`atom_id`), so one atom is executed by many workflows, and the
-    /// executor links a PUBLIC atom into a group-private plan. Its `executes`
-    /// edge is then public: counting it let a non-member that reads nothing of
-    /// the plan itself move the plan's counters. Thesis, phase and step ids are
-    /// scoped to the workflow's `canonical_name`, so reading one of those is
-    /// reading the plan. A step-less plan (the generation-0 thesis scaffold
-    /// `add_step` fills) is still reportable by a reader of its thesis.
+    /// A readable thesis (level 0), phase (level 1) or operation atom
+    /// (level 3) `executes` edge does not admit a reporter: those claims can
+    /// be public in a plan whose steps are group-private. (An operation atom
+    /// is content-addressed in the namespace documents share, `atom_id`, and
+    /// the executor links a public atom into a group-private plan.)
+    ///
+    /// # A step-less plan is refused to every caller
+    ///
+    /// Whether a plan "has steps" is not readable on the caller's transaction:
+    /// row security hides a group's steps from a non-member exactly as if they
+    /// did not exist, and an unstamped session reads only public rows. So a
+    /// plan with no step at all (a generation-0 thesis scaffold before its
+    /// first `add_step`, or a root with no `executes` edge) is answered 404 to
+    /// every reporter: the refusal the ruling requires cannot be made for
+    /// stepped plans without also being made for these. Reporting a run of a
+    /// plan with no steps attributes nothing either way.
+    ///
+    /// The level match is the readers' (`(level)::int = 2`, whitespace and a
+    /// leading `+` or zeros allowed) without the cast, so a non-numeric level
+    /// on some other target cannot fail the check.
     ///
     /// Run it on the caller's STAMPED transaction, as
     /// [`Self::plan_step_claim_ids`] must be.
@@ -1073,7 +1084,7 @@ impl WorkflowRepository {
                SELECT 1 FROM edges e \
                JOIN claims c ON c.id = e.target_id \
                WHERE e.source_id = $1 AND e.relationship = 'executes' \
-                 AND c.properties->>'level' IN ('0', '1', '2') \
+                 AND btrim(c.properties->>'level') ~ '^[+]?0*2$' \
                  /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
              )",
             2,

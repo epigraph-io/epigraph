@@ -81,9 +81,9 @@ fn report_hierarchical_outcome_describes_the_unreadable_plan_refusal() {
     let d = description(&tool("report_hierarchical_outcome"));
     assert!(
         d.contains(
-            "a caller that can read none of its plan (none of its thesis, phase or step executes \
-             edges; a shared operation atom does not count) gets the same not-found error as an \
-             unknown id, and nothing is written"
+            "a caller that can read none of its steps (no step executes edge; a visible thesis, \
+             phase or shared operation atom does not count, so a plan with no steps is refused to \
+             every caller) gets the same not-found error as an unknown id, and nothing is written"
         ),
         "got: {d}"
     );

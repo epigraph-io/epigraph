@@ -320,8 +320,9 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
 /// # A reporter that reads none of the plan is refused
 ///
 /// `workflows` has no row security, so the counter write cannot be scoped by
-/// the database. A reporter that reads none of the workflow's own `executes`
-/// edges (thesis, phase or step; a shared level-3 atom does not count:
+/// the database. A reporter that reads none of the workflow's STEP
+/// `executes` edges (a visible thesis, phase or shared level-3 atom does not
+/// count, so a step-less plan is refused to every reporter:
 /// `WorkflowRepository::viewer_reads_plan_structure`, on the stamped
 /// transaction) gets the same [`not_found`] error as an unknown id,
 /// and nothing is written. It used to record the run with every step NULL,
@@ -375,7 +376,7 @@ pub async fn do_report_hierarchical_outcome_as(
     // for them (same category as `workflows.rs::report_workflow_outcome`'s
     // routing probe). The viewer IS spent where there is something to filter:
     // the plan reads below (`viewer_reads_plan_structure`, which refuses a
-    // reporter that reads none of the plan, and `plan_step_claim_ids`) splice
+    // reporter that reads none of the plan's steps, and `plan_step_claim_ids`) splice
     // the edge and claim predicates, on this transaction stamped with the viewer.
     let row: Option<(serde_json::Value,)> =
         sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
@@ -387,8 +388,8 @@ pub async fn do_report_hierarchical_outcome_as(
         Some((m,)) => m,
         None => return Err(not_found(workflow_id)),
     };
-    // A reporter that reads none of the plan's `executes` edges cannot read
-    // this workflow: refused exactly like a missing id, before any write.
+    // A reporter that reads none of the plan's STEP `executes` edges is
+    // refused exactly like a missing id, before any write.
     if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, viewer, workflow_id)
         .await
         .map_err(internal_error)?
