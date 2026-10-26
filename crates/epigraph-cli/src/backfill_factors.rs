@@ -21,12 +21,18 @@
 //! edge was wired moves its target too.
 
 /// Edge-phase eligibility: factorless target claim, claim-to-claim edge with
-/// epistemic relationship. Uses `signer_id` when present, otherwise falls back
-/// to the source claim's `agent_id` (always populated) — the edge factor is
-/// attributable to the source claim's author since they're asserting the
+/// epistemic relationship. The edge factor is wired under the SOURCE claim's
+/// author (`agent_id`, always populated): they assert the
 /// support/contradiction via the edge.
+///
+/// Not `edges.signer_id` (ruling R-49): that is the agent whose key ATTESTED
+/// the edge, and every edge an MCP server or the API writes is attested by
+/// that server's own signer agent, whoever asserted it; on legacy rows it is,
+/// where set, a bulk attestation key. Since migration 120 an edge's author
+/// record is its writer group, and the agent behind what it asserts is its
+/// source claim's author.
 pub const EDGE_QUERY: &str = r#"
-SELECT e.id, COALESCE(e.signer_id, src.agent_id) AS agent_id,
+SELECT e.id, src.agent_id AS agent_id,
        e.source_id, e.target_id, e.relationship
 FROM edges e
 JOIN claims tgt ON tgt.id = e.target_id
@@ -90,8 +96,8 @@ pub struct RewireSummary {
 /// Rewire-phase selection: every in-force claim-to-claim edge that already
 /// holds an `edge_factor` BBA on its target, one row per edge.
 ///
-/// - Keyed on the STORED row's `source_agent_id`, not on
-///   `COALESCE(e.signer_id, src.agent_id)` as [`EDGE_QUERY`] is: the live
+/// - Keyed on the STORED row's `source_agent_id`, not on the source claim's
+///   author as [`EDGE_QUERY`] is: the live
 ///   `link_epistemic` path and migration 114's writer-owned rows store other
 ///   agents, and the upsert key is `(claim, frame, source_agent, perspective)`,
 ///   so re-wiring under a different agent would add a second BBA for the edge
@@ -119,6 +125,13 @@ pub struct RewireSummary {
 /// reaches 0: repeating offset 0 alone stalls once N persisting rows lead the
 /// order. Plain `--offset N, 2N, ...` paging skips rows, because rewritten
 /// rows leave the selection.
+///
+/// The `e.signer_id` fallback is reached only when the stored row's
+/// `source_agent_id` is NULL (the column is nullable). It is kept, unlike in
+/// [`EDGE_QUERY`] (ruling R-49), because this selection must re-key the row it
+/// REWRITES, not choose an author: a legacy row without a recorded agent was
+/// wired under the old `COALESCE(e.signer_id, src.agent_id)`, and keying its
+/// rewrite under another agent would add a second BBA for the edge.
 pub const REWIRE_EDGE_QUERY: &str = r#"
 SELECT DISTINCT ON (e.id)
        e.id,
