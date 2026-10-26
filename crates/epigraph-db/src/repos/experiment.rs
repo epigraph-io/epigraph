@@ -101,6 +101,53 @@ impl ExperimentRepository {
         Ok(rows)
     }
 
+    /// The hypothesis an experiment tests, read through `viewer`: its id and
+    /// the group that owns it (`claims.owner_group_id`), the two facts the
+    /// experiment routes' hypothesis gate decides on (operator ruling R-51).
+    ///
+    /// `experiments` and `experiment_results` carry no tenancy columns; what
+    /// an experiment belongs to is its hypothesis claim, so the claim is the
+    /// row the viewer's predicate filters. With `result_id`, the result must
+    /// also belong to this experiment.
+    ///
+    /// `None` when the experiment does not exist, when its hypothesis is not
+    /// readable by the viewer, or when `result_id` names no result of this
+    /// experiment. The three are deliberately indistinguishable, so a caller
+    /// that answers `None` with one 404 leaks nothing about experiments on
+    /// hypotheses it cannot read. Whether the caller may WRITE is the caller's
+    /// decision, from the returned owning group.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a database failure.
+    #[instrument(skip(executor, viewer))]
+    pub async fn hypothesis_target_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        experiment_id: Uuid,
+        result_id: Option<Uuid>,
+    ) -> Result<Option<(Uuid, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT e.hypothesis_id, c.owner_group_id
+            FROM experiments e
+            JOIN claims c ON c.id = e.hypothesis_id
+            WHERE e.id = $1
+              AND ($2::uuid IS NULL OR EXISTS (
+                    SELECT 1 FROM experiment_results r
+                     WHERE r.id = $2 AND r.experiment_id = e.id))
+              /* {VISIBILITY:c} */
+            "#,
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql)
+            .bind(experiment_id)
+            .bind(result_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
     #[instrument(skip(pool))]
     pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<(), DbError> {
         let now = if status == "running" {

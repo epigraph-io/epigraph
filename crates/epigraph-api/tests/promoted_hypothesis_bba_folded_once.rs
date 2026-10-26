@@ -286,11 +286,31 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         .connect_with(conn_opts.clone())
         .await
         .expect("seeding pool");
-    // A public (world-owned) claim: readable by the promoter, so the gate
-    // passes, but outside its writable set.
+    // A claim owned by the ANALYST's group, which the promoter reads as a
+    // `reader` member: readable by the promoter, so the gate passes, but
+    // outside its writable set. The analyst files the evidence, because the
+    // analyze route writes only onto a hypothesis its caller may write
+    // (operator ruling R-51); the promoter could not have filed it.
+    let (analyst, analyst_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "846b808e-analyst").await;
     let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-outsider").await;
-    let claim = viewer_fixture::seed_public_claim(&pool, agent, "846b808e public hypothesis").await;
-    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(analyst_group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("promoter reads the analyst's group");
+    let claim = viewer_fixture::seed_group_claim(
+        &pool,
+        analyst,
+        analyst_group,
+        "846b808e hypothesis the promoter only reads",
+    )
+    .await;
+    let r = make_promotable(&pool, &conn_opts, analyst, claim).await;
     let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
 
     // CALIBRATION: the premise of this arm is that the source BBA lies

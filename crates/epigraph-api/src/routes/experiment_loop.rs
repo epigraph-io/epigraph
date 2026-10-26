@@ -5,6 +5,11 @@
 //! - POST /api/v1/experiments/:id/results — Submit results with measurements
 //! - POST /api/v1/experiments/:eid/results/:rid/measurements — Add more measurements
 //! - POST /api/v1/experiments/:eid/results/:rid/analyze — Trigger analysis
+//! - GET  /api/v1/experiments?hypothesis_id= — List experiments for a hypothesis
+//!
+//! Every route gates on the HYPOTHESIS claim through the caller's viewer
+//! (operator ruling R-51): reads need it readable, writes need it writable,
+//! and a hypothesis the caller cannot read is the same 404 as a missing one.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -55,12 +60,141 @@ pub struct AnalyzeRequest {
     pub expected_value: Option<f64>,
 }
 
+// ── The hypothesis gate (operator ruling R-51) ──
+//
+// An experiment, its results and their analyses carry no tenancy of their
+// own: what they belong to is the hypothesis claim they test. Every route here
+// therefore reads that hypothesis through the caller's viewer before it reads
+// or writes anything else. A read needs the hypothesis readable; a write needs
+// it writable (its owning group in the caller's writable set). A hypothesis the
+// caller cannot read is the same 404 as a missing one, on every route.
+
+/// What a route does with the hypothesis it reaches.
+#[cfg(feature = "db")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HypothesisAccess {
+    Read,
+    Write,
+}
+
+/// Refuse a WRITE to a hypothesis the caller can read but whose owning group
+/// is not in its writable set: `403 not_owner`, as `entities.rs` answers for a
+/// claim it may not attach to.
+#[cfg(feature = "db")]
+fn admit(
+    writable_groups: &[Uuid],
+    hypothesis_id: Uuid,
+    owner_group: Uuid,
+    access: HypothesisAccess,
+    action: &str,
+) -> Result<(), ApiError> {
+    if access == HypothesisAccess::Write && !writable_groups.contains(&owner_group) {
+        return Err(ApiError::ClaimNotWritable {
+            claim_id: hypothesis_id,
+            message: format!(
+                "cannot {action}: the caller holds no admin or writer membership in the \
+                 group that owns hypothesis {hypothesis_id}; nothing was written"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Read the hypothesis `hypothesis_id` through `viewer` and admit `access`.
+///
+/// A missing or unreadable hypothesis is one `404` (`hypothesis`).
+#[cfg(feature = "db")]
+async fn require_hypothesis(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    hypothesis_id: Uuid,
+    access: HypothesisAccess,
+    action: &str,
+) -> Result<(), ApiError> {
+    let target = {
+        let mut read = state.read_as(viewer).await?;
+        epigraph_db::ClaimRepository::write_target_of(&mut *read, viewer, hypothesis_id).await?
+    };
+    let Some((_author, owner_group)) = target else {
+        return Err(ApiError::NotFound {
+            entity: "hypothesis".into(),
+            id: hypothesis_id.to_string(),
+        });
+    };
+    admit(
+        viewer.writable_groups(),
+        hypothesis_id,
+        owner_group,
+        access,
+        action,
+    )
+}
+
+/// Read the hypothesis of experiment `experiment_id` through `viewer` and admit
+/// `access`; returns the hypothesis id. With `result_id`, the result must
+/// belong to that experiment.
+///
+/// A missing experiment, an experiment on an unreadable hypothesis and (with
+/// `result_id`) a result that is missing or belongs to another experiment are
+/// one `404`, naming the result when one was named and the experiment
+/// otherwise.
+#[cfg(feature = "db")]
+async fn require_experiment_hypothesis(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    experiment_id: Uuid,
+    result_id: Option<Uuid>,
+    access: HypothesisAccess,
+    action: &str,
+) -> Result<Uuid, ApiError> {
+    let target = {
+        let mut read = state.read_as(viewer).await?;
+        epigraph_db::ExperimentRepository::hypothesis_target_of(
+            &mut *read,
+            viewer,
+            experiment_id,
+            result_id,
+        )
+        .await?
+    };
+    let Some((hypothesis_id, owner_group)) = target else {
+        return Err(match result_id {
+            Some(rid) => ApiError::NotFound {
+                entity: "result".into(),
+                id: rid.to_string(),
+            },
+            None => ApiError::NotFound {
+                entity: "experiment".into(),
+                id: experiment_id.to_string(),
+            },
+        });
+    };
+    admit(
+        viewer.writable_groups(),
+        hypothesis_id,
+        owner_group,
+        access,
+        action,
+    )?;
+    Ok(hypothesis_id)
+}
+
 /// POST /api/v1/experiments
 #[cfg(feature = "db")]
 pub async fn create_experiment(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<CreateExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_hypothesis(
+        &state,
+        &viewer,
+        req.hypothesis_id,
+        HypothesisAccess::Write,
+        "create an experiment on this hypothesis",
+    )
+    .await?;
+
     let id = epigraph_db::ExperimentRepository::create(
         &state.db_pool,
         req.hypothesis_id,
@@ -95,9 +229,19 @@ pub async fn create_experiment(
 /// POST /api/v1/experiments/:id/start
 #[cfg(feature = "db")]
 pub async fn start_experiment(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_experiment_hypothesis(
+        &state,
+        &viewer,
+        id,
+        None,
+        HypothesisAccess::Write,
+        "start this experiment",
+    )
+    .await?;
     epigraph_db::ExperimentRepository::update_status(&state.db_pool, id, "running")
         .await
         .map_err(|e| ApiError::InternalError {
@@ -111,10 +255,21 @@ pub async fn start_experiment(
 /// POST /api/v1/experiments/:id/results
 #[cfg(feature = "db")]
 pub async fn submit_results(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     Path(experiment_id): Path<Uuid>,
     Json(req): Json<SubmitResultsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_experiment_hypothesis(
+        &state,
+        &viewer,
+        experiment_id,
+        None,
+        HypothesisAccess::Write,
+        "submit results to this experiment",
+    )
+    .await?;
+
     let measurements_json =
         serde_json::to_value(&req.measurements).map_err(|e| ApiError::BadRequest {
             message: format!("Invalid measurements: {e}"),
@@ -162,10 +317,23 @@ pub async fn submit_results(
 /// POST /api/v1/experiments/:eid/results/:rid/measurements
 #[cfg(feature = "db")]
 pub async fn add_measurements(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
-    Path((_, result_id)): Path<(Uuid, Uuid)>,
+    Path((experiment_id, result_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<AddMeasurementsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The two path segments name ONE resource: a result of another experiment
+    // is the same 404 as a missing result (R-51), checked with the hypothesis.
+    require_experiment_hypothesis(
+        &state,
+        &viewer,
+        experiment_id,
+        Some(result_id),
+        HypothesisAccess::Write,
+        "add measurements to this result",
+    )
+    .await?;
+
     let new_json = serde_json::to_value(&req.measurements).map_err(|e| ApiError::BadRequest {
         message: format!("{e}"),
     })?;
@@ -251,24 +419,18 @@ pub async fn analyze_result(
 
     // The hypothesis this analysis files evidence on, read as the caller. Every
     // write below (the analysis, its `provides_evidence` edge, the BBA) lands on
-    // it, so one the caller cannot read is 404, exactly like a missing one, and
-    // nothing is written (backlog 4815dcf7: the viewer was spent only on the
-    // grounding check and the frame choice).
-    {
-        let mut read = state.read_as(&viewer).await?;
-        let visible = epigraph_db::ClaimRepository::visible_claim_ids(
-            &mut *read,
-            &viewer,
-            &[experiment.hypothesis_id],
-        )
-        .await?;
-        if !visible.contains(&experiment.hypothesis_id) {
-            return Err(ApiError::NotFound {
-                entity: "hypothesis".into(),
-                id: experiment.hypothesis_id.to_string(),
-            });
-        }
-    }
+    // it, so one the caller cannot read is 404, exactly like a missing one
+    // (backlog 4815dcf7: the viewer was spent only on the grounding check and
+    // the frame choice), and one it can read but not write is 403 (R-51).
+    // Nothing is written in either case.
+    require_hypothesis(
+        &state,
+        &viewer,
+        experiment.hypothesis_id,
+        HypothesisAccess::Write,
+        "analyze a result onto this hypothesis",
+    )
+    .await?;
 
     // ── Circularity guard ──
     // Reject if the hypothesis claim itself lacks grounded evidence AND
@@ -492,9 +654,19 @@ pub async fn analyze_result(
 /// GET /api/v1/experiments?hypothesis_id=:id — List experiments for a hypothesis.
 #[cfg(feature = "db")]
 pub async fn list_experiments(
+    ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<ListExperimentsParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_hypothesis(
+        &state,
+        &viewer,
+        params.hypothesis_id,
+        HypothesisAccess::Read,
+        "list the experiments of this hypothesis",
+    )
+    .await?;
+
     let experiments =
         epigraph_db::ExperimentRepository::get_for_hypothesis(&state.db_pool, params.hypothesis_id)
             .await

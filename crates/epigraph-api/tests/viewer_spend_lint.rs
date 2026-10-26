@@ -515,11 +515,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EntityRepository::find_by_name_and_type",
         ],
     ),
+    // gated (operator ruling R-51: `require_experiment_hypothesis` reads the
+    // experiment's hypothesis through the viewer, requires it writable and the
+    // result to belong to `:eid`) then the untenanted result row it named.
+    (
+        "experiment_loop.rs",
+        "add_measurements",
+        &[
+            "ExperimentResultRepository::add_measurements",
+            "ExperimentResultRepository::get",
+        ],
+    ),
     // gated (the result must belong to the named experiment, and that
-    // experiment's hypothesis is read through the viewer, `visible_claim_ids`,
-    // before anything is written; until backlog 4815dcf7 neither held) then
-    // untenanted reads (experiments, experiment_results, frames by name) and
-    // writes against it.
+    // experiment's hypothesis is read through the viewer and required
+    // writable, `require_hypothesis`, before anything is written; until
+    // backlog 4815dcf7 and ruling R-51 neither held) then untenanted reads
+    // (experiments, experiment_results, frames by name) and writes against it.
     (
         "experiment_loop.rs",
         "analyze_result",
@@ -534,6 +545,44 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(INSERT).execute",
             "sqlx::query_as(INSERT).fetch_one",
             "sqlx::query_as(SELECT).fetch_one",
+        ],
+    ),
+    // gated (R-51: `require_hypothesis` reads the body's hypothesis through
+    // the viewer and requires it writable) then write: the untenanted
+    // experiment row and its `tests_hypothesis` edge onto that hypothesis.
+    (
+        "experiment_loop.rs",
+        "create_experiment",
+        &[
+            "ExperimentRepository::create",
+            "sqlx::query(INSERT).execute",
+        ],
+    ),
+    // gated (R-51: `require_hypothesis`, read access) then untenanted:
+    // experiments carry no tenancy columns; the hypothesis they list under was
+    // read through the viewer first.
+    (
+        "experiment_loop.rs",
+        "list_experiments",
+        &["ExperimentRepository::get_for_hypothesis"],
+    ),
+    // gated (R-51: `require_experiment_hypothesis`, write access) then write
+    // on the untenanted experiment row.
+    (
+        "experiment_loop.rs",
+        "start_experiment",
+        &["ExperimentRepository::update_status"],
+    ),
+    // gated (R-51: `require_experiment_hypothesis`, write access) then writes
+    // on untenanted rows: the result, its `result_of` edge to the experiment,
+    // and the experiment's status.
+    (
+        "experiment_loop.rs",
+        "submit_results",
+        &[
+            "ExperimentRepository::update_status",
+            "ExperimentResultRepository::create",
+            "sqlx::query(INSERT).execute",
         ],
     ),
     // untenanted: methods.
