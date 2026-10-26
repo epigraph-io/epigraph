@@ -735,10 +735,16 @@ pub struct QueryClaimsByLabelParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "Skip the first N matching claims (default 0). Combine with `limit` to page through large result sets — results are ordered by `created_at DESC`."
+        description = "Skip the first N matching claims (default 0). Kept for compatibility; prefer `after`, whose page boundaries do not drift under concurrent writes. Results are ordered by `(created_at DESC, id DESC)`."
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opaque keyset cursor. When present, the response is an object {claims: [...], next_cursor: string|null} instead of a bare array: pass \"\" for the first page, then each response's next_cursor unchanged; next_cursor is null once the set is exhausted. Omit it for the legacy bare-array response. Cannot be combined with a non-zero `offset`."
+    )]
+    #[serde(default)]
+    pub after: Option<String>,
 
     #[schemars(
         description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
