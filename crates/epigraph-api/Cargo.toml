@@ -68,7 +68,7 @@ sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chr
 
 axum = { workspace = true }  # Web framework
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
-rustls = { version = "0.23", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs)
+rustls = { version = "0.23.46", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs); floor = RUSTSEC-2026-0346..0349 fix
 tokio = { workspace = true }  # Async runtime
 tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
 tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
@@ -155,10 +155,11 @@ ciborium = "0.2"
 rmcp = { workspace = true }
 axum08 = { package = "axum", version = "0.8" }
 # `tests/tls_pem_loading.rs` only (`tls` feature): a TLS client that handshakes
-# against the config the PEM loader built. Both are already in the graph
-# through axum-server's `tls-rustls`; dev-only, no new package.
-rustls = "0.23"
-tokio-rustls = "0.26"
+# against the config the PEM loader built. Already in the graph (axum-server's
+# `tls-rustls`, reqwest): no new package. `default-features = false` so the
+# dev graph enables no rustls crypto provider of its own: aws-lc-rs stays a
+# `tls`-only build (the tests get rustls itself through the optional normal dep).
+tokio-rustls = { version = "0.26", default-features = false }
 
 [[test]]
 name = "boot_secret_gate_test"
