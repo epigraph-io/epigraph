@@ -30,6 +30,22 @@ async fn set_embedding_3072(pool: &PgPool, claim: Uuid) {
         .expect("set embedding_3072");
 }
 
+async fn clear_embedding_3072(pool: &PgPool, claim: Uuid) {
+    sqlx::query("UPDATE claims SET embedding_3072 = NULL WHERE id = $1")
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("clear embedding_3072");
+}
+
+/// What a count taken NOW returns for `viewer`: a zero-TTL cache never stands.
+async fn fresh_count(pool: &PgPool, viewer: &epigraph_db::Viewer) -> f64 {
+    CentroidPopulationCache::with_ttl(Duration::ZERO)
+        .fraction(pool, viewer)
+        .await
+        .expect("fresh count")
+}
+
 /// A public claim with only the 1536-d vector (the `submit_claim` shape).
 async fn seed_embedded_public(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
     let id = fixture::seed_public_claim(pool, agent, content).await;
@@ -118,12 +134,14 @@ async fn a_read_for_one_scope_never_answers_for_another(pool: PgPool) {
     assert_eq!(cache.cached(&member), Some(0.5));
 }
 
-/// `recall_with_context`'s auto-detect goes through the SERVER's cache.
+/// `recall_with_context`'s auto-detect is served from the SERVER's cache: a
+/// second recall in the TTL does not count again.
 ///
-/// The test server has no embedding key, so the call fails at the query
-/// embedding (stage 2), after stage 1 has read the fraction. What matters is
-/// that the read now stands on the server for this viewer's scope; before the
-/// fix the server held no cache and the next recall counted again.
+/// The test server has no embedding key, so each call fails at the query
+/// embedding (stage 2), after stage 1 has read the fraction. Between the two
+/// calls the corpus changes so that a count would return a different value; the
+/// server must still hold the first read. A path that counted on every call and
+/// merely refilled the cache would leave the NEW value standing here.
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_with_context_auto_detect_reads_through_the_server_cache(pool: PgPool) {
     use epigraph_crypto::AgentSigner;
@@ -146,9 +164,80 @@ async fn recall_with_context_auto_detect_reads_through_the_server_cache(pool: Pg
         "precondition: a new server holds no read"
     );
 
+    let params = || -> RecallWithContextParams {
+        serde_json::from_value(serde_json::json!({ "query": "pop cache server" })).expect("params")
+    };
+    let err = recall_with_context(&server, &viewer, params())
+        .await
+        .expect_err("no embedding key: the call stops at the query embedding");
+    assert!(
+        !err.message.contains("auto-detect"),
+        "stage 1 must have succeeded; got {}",
+        err.message
+    );
+    assert_eq!(
+        cached_centroid_population(&server, &viewer),
+        Some(1.0),
+        "the first auto-detect read stands on the server for this scope"
+    );
+
+    // A count taken now would differ from the standing read.
+    clear_embedding_3072(&pool, claim).await;
+    assert_eq!(
+        fresh_count(&pool, &viewer).await,
+        0.0,
+        "precondition: the corpus really changed under the standing read"
+    );
+
+    let err = recall_with_context(&server, &viewer, params())
+        .await
+        .expect_err("no embedding key: the call stops at the query embedding");
+    assert!(
+        !err.message.contains("auto-detect"),
+        "stage 1 must have succeeded; got {}",
+        err.message
+    );
+    assert_eq!(
+        cached_centroid_population(&server, &viewer),
+        Some(1.0),
+        "the second recall must be served from the standing read; 0.0 here means it ran \
+         the full-table count again (backlog be28f3d2, ~1.25 s per recall)"
+    );
+}
+
+/// The cache is shared by every session the HTTP listener's factory clones.
+///
+/// The slow statement was measured on the MCP listener, where each session is
+/// `SessionFactory::session()`, a clone of one template. A per-session cache
+/// would still count once per session, i.e. on nearly every recall.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sessions_of_one_factory_share_the_standing_read(pool: PgPool) {
+    use epigraph_crypto::AgentSigner;
+    use epigraph_mcp::embed::McpEmbedder;
+    use epigraph_mcp::tools::recall::__test_only::cached_centroid_population;
+    use epigraph_mcp::tools::recall::{recall_with_context, RecallWithContextParams};
+    use epigraph_mcp::{EpiGraphMcpFull, SessionFactory};
+
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "pop-cache-sessions").await;
+    let claim = seed_embedded_public(&pool, agent, "pop cache sessions").await;
+    set_embedding_3072(&pool, claim).await;
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
+    let embedder = McpEmbedder::new(pool.clone(), None);
+    let factory = SessionFactory::new(EpiGraphMcpFull::new(pool.clone(), signer, embedder, false));
+    let session_a = factory.session();
+    let session_b = factory.session();
+    assert_eq!(
+        cached_centroid_population(&session_b, &viewer),
+        None,
+        "precondition: no read stands yet"
+    );
+
     let params: RecallWithContextParams =
-        serde_json::from_value(serde_json::json!({ "query": "pop cache server" })).expect("params");
-    let err = recall_with_context(&server, &viewer, params)
+        serde_json::from_value(serde_json::json!({ "query": "pop cache sessions" }))
+            .expect("params");
+    let err = recall_with_context(&session_a, &viewer, params)
         .await
         .expect_err("no embedding key: the call stops at the query embedding");
     assert!(
@@ -158,11 +247,48 @@ async fn recall_with_context_auto_detect_reads_through_the_server_cache(pool: Pg
     );
 
     assert_eq!(
-        cached_centroid_population(&server, &viewer),
+        cached_centroid_population(&session_b, &viewer),
         Some(1.0),
-        "the auto-detect read must stand on the server for this scope, so the next \
-         recall does not run the full-table count again"
+        "session A's read must stand for session B: a cache reset per session counts \
+         again on every new HTTP session"
     );
+    assert_eq!(
+        cached_centroid_population(&factory.session(), &viewer),
+        Some(1.0),
+        "and for a session created after the read"
+    );
+}
+
+/// A failed read is not cached: the next call reads again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_read_leaves_nothing_standing(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "pop-cache-error").await;
+    seed_embedded_public(&pool, agent, "pop cache error").await;
+    let viewer = fixture::public_viewer(&pool).await;
+
+    // Nothing listens on port 1: every acquire fails fast.
+    let dead = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(2))
+        .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+        .expect("lazy pool");
+
+    let cache = CentroidPopulationCache::with_ttl(Duration::from_secs(3600));
+    assert!(
+        cache.fraction(&dead, &viewer).await.is_err(),
+        "precondition: the read fails"
+    );
+    assert_eq!(
+        cache.cached(&viewer),
+        None,
+        "a failed read must not stand: caching a default would pin auto-detect (or refuse \
+         explicit 3072) for the whole TTL on one transient error"
+    );
+    assert_eq!(
+        cache.fraction(&pool, &viewer).await.expect("the next read"),
+        0.0,
+        "the next call reads again"
+    );
+    assert_eq!(cache.cached(&viewer), Some(0.0));
 }
 
 /// An explicit `centroid_dim=3072` is never refused on a STALE zero.
@@ -220,5 +346,28 @@ async fn explicit_3072_re_measures_a_cached_zero_before_refusing(pool: PgPool) {
         cached_centroid_population(&server, &viewer),
         Some(1.0),
         "the re-measured value replaces the stale zero"
+    );
+
+    // A standing POSITIVE read is trusted: the explicit guard does not count
+    // again while it stands, even though a count now would refuse.
+    clear_embedding_3072(&pool, claim).await;
+    assert_eq!(
+        fresh_count(&pool, &viewer).await,
+        0.0,
+        "precondition: a count taken now would refuse explicit 3072"
+    );
+    let err = recall_with_context(&server, &viewer, params(Some(3072)))
+        .await
+        .expect_err("no embedding key: the call stops at the query embedding");
+    assert!(
+        !err.message.contains("no populated rows"),
+        "a standing positive read must be served, not re-counted: refusing here means the \
+         explicit-3072 guard ran the full-table count again. got {}",
+        err.message
+    );
+    assert_eq!(
+        cached_centroid_population(&server, &viewer),
+        Some(1.0),
+        "the standing read is untouched"
     );
 }
