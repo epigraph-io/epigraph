@@ -24,22 +24,33 @@ fn src() -> PathBuf {
 /// Files allowed to keep the pattern, how many sites each, and why.
 ///
 /// `errors.rs` defines the helper, and its own redaction test calls it with a
-/// `format!` on purpose. `tools/recall.rs` belongs to another session's open
-/// work and is grandfathered at its count on 2026-10-26. Lower its number as
-/// its sites are converted. The test fails if the count changes in either
-/// direction, so the ratchet stays tight.
-const ALLOWED: &[(&str, usize, &str)] = &[
+/// `format!` on purpose; its count is exact. `tools/recall.rs` belongs to
+/// another session's work and is grandfathered at its count on 2026-10-26 as
+/// a CEILING: work in that file may remove sites without editing this test,
+/// but may not add one. Lower the number as its sites are converted.
+const ALLOWED: &[(&str, usize, Bound, &str)] = &[
     (
         "errors.rs",
         1,
+        Bound::Exact,
         "the helper's own test of its redaction (internal_error_withholds_the_error_text_and_logs_it)",
     ),
     (
         "tools/recall.rs",
         12,
+        Bound::AtMost,
         "grandfathered: owned by another session's open work; convert, then lower this",
     ),
 ];
+
+/// How an allowlisted file's count is held.
+#[derive(Clone, Copy, Debug)]
+enum Bound {
+    /// Exactly this many: a change in either direction fails.
+    Exact,
+    /// No more than this many.
+    AtMost,
+}
 
 fn strip_line_comments(text: &str) -> String {
     text.lines()
@@ -114,7 +125,7 @@ fn no_internal_error_is_handed_a_formatted_string() {
             .replace('\\', "/");
         let text = strip_line_comments(&std::fs::read_to_string(path).expect("read source"));
         let found = sites(&text);
-        if let Some((_, allowed, _)) = ALLOWED.iter().find(|(f, _, _)| *f == rel) {
+        if let Some((_, allowed, _, _)) = ALLOWED.iter().find(|(f, _, _, _)| *f == rel) {
             allowed_seen.insert(rel.clone(), (found.len(), *allowed));
             continue;
         }
@@ -129,15 +140,20 @@ fn no_internal_error_is_handed_a_formatted_string() {
          .map_err(internal_error) to keep a designed refusal. Sites:\n  {}",
         offenders.join("\n  ")
     );
-    for (file, allowed, why) in ALLOWED {
+    for (file, allowed, bound, why) in ALLOWED {
         let (found, _) = allowed_seen
             .get(*file)
             .copied()
             .unwrap_or_else(|| panic!("allowlisted file {file} was not scanned"));
-        assert_eq!(
-            found, *allowed,
-            "{file} has {found} internal_error(format!(..)) sites, the ratchet allows exactly \
-             {allowed} ({why}). Fewer: lower the number. More: convert the new one."
+        let holds = match bound {
+            Bound::Exact => found == *allowed,
+            Bound::AtMost => found <= *allowed,
+        };
+        assert!(
+            holds,
+            "{file} has {found} internal_error(format!(..)) sites; the ratchet allows {bound:?} \
+             {allowed} ({why}). Convert the new site with internal_error_logged, or lower the \
+             number."
         );
     }
 }

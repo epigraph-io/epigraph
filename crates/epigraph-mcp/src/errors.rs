@@ -22,9 +22,12 @@ pub const INTERNAL_ERROR_MESSAGE: &str = "internal error; the detail is in the s
 ///
 /// `e` is logged (`tracing::error!`, target `mcp.internal_error`) and the
 /// JSON-RPC message is [`INTERNAL_ERROR_MESSAGE`]: call sites hand this a
-/// driver, upstream or provider error (`.map_err(internal_error)`,
-/// `internal_error(format!("...: {e}"))`), whose text can name SQL, internal
-/// hosts or another tenant's rows, so it never reaches the caller. The MCP
+/// driver, upstream or provider error (`.map_err(internal_error)`), whose
+/// text can name SQL, internal hosts or another tenant's rows, so it never
+/// reaches the caller. A site with context to add uses
+/// [`internal_error_logged`] instead: `internal_error(format!("ctx: {e}"))`
+/// would discard the context too (tests/internal_error_format_ratchet.rs
+/// refuses new ones). The MCP
 /// twin of the HTTP layer's `ApiError::InternalError` redaction (PR #667).
 ///
 /// One exception: a refusal the codebase itself authored
