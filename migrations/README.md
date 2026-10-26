@@ -1698,6 +1698,28 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **176**: public `caller_refusal_codes` (backlog e2c22c7c, operator ruling
+  R-25). Re-states twelve functions from their latest definitions so that the
+  designed refusals an API or MCP caller can reach open with a refusal code,
+  which PR #686's fail-closed MCP `internal_error` passes and the HTTP layer
+  maps (`epigraph_db::CALLER_REFUSAL_CODES`) to a 4xx carrying the message:
+  `AAR01`-`AAR11` (`epigraph_admin_act_args`), `AAR12`
+  (`epigraph_propose_admin_act`), `TEN01` (`epigraph_owner_immutable_guard`),
+  `TEN02` (`epigraph_writer_owner_guard`), `GRM01`-`GRM06` (108, 109 and 164's
+  guards on `groups` and `group_memberships`), `PRV01`
+  (`epigraph_no_public_sealed`) and `AGK01`
+  (`epigraph_agents_refuse_registered_system_key`, whose system role moves to
+  DETAIL). Only RAISE statements change, each keeping its SQLSTATE; owner,
+  ACL, SECURITY mode, search_path and volatility are kept by CREATE OR
+  REPLACE. Pinned by `epigraph-db/tests/caller_refusal_codes_restatement.rs`
+  (a database at 175 against the same database after 176) and the refusal
+  tests `epigraph-api/tests/caller_refusal_codes_http.rs` and
+  `epigraph-mcp/tests/caller_refusal_codes_mcp.rs`. The header lists what is
+  deliberately NOT coded and why. Undo: re-run each function's latest prior
+  definition (named in the file). **Deploy order:** after 168 (every body it
+  starts from is at or below 168). A LATER migration that re-states one of
+  these functions must start from 176's body or it drops the code. **Applied
+  to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
