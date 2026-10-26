@@ -11,7 +11,7 @@ db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigra
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
-tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
+tls = ["axum-server", "dep:rustls"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 # Episcience features: structural isomorphism detection.
 # Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
@@ -68,6 +68,7 @@ sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chr
 
 axum = { workspace = true }  # Web framework
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
+rustls = { version = "0.23", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs)
 tokio = { workspace = true }  # Async runtime
 tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
 tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
