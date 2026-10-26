@@ -15,13 +15,25 @@ TEST_DSN = os.environ.get(
 )
 REQUIRED = ["claims", "claim_themes", "claim_clusters", "cluster_centroids", "cluster_labels"]
 
+# CI (.github/workflows/ci.yml, job `python`) provisions a migrated test database
+# and sets this, so a DB-backed arm that cannot reach it FAILS there instead of
+# skipping (a job whose DB arms all skip would pass while running none of them).
+# Unset, they skip as before.
+REQUIRE_DB = os.environ.get("EPIGRAPH_PYTEST_REQUIRE_DB") == "1"
+
+
+def _unavailable(reason):
+    if REQUIRE_DB:
+        pytest.fail(f"EPIGRAPH_PYTEST_REQUIRE_DB=1 but {reason}", pytrace=False)
+    pytest.skip(reason)
+
 
 @pytest.fixture
 def db():
     try:
         conn = psycopg2.connect(TEST_DSN)
     except Exception as e:  # noqa: BLE001
-        pytest.skip(f"test DB unavailable ({TEST_DSN}): {e}")
+        _unavailable(f"test DB unavailable ({TEST_DSN}): {e}")
     with conn.cursor() as cur:
         cur.execute(
             "SELECT count(*) FROM information_schema.tables "
@@ -30,7 +42,7 @@ def db():
         )
         if cur.fetchone()[0] < len(REQUIRED):
             conn.close()
-            pytest.skip("required tables missing — run `cargo sqlx migrate run` on the test DB")
+            _unavailable("required tables missing — run `cargo sqlx migrate run` on the test DB")
     # Clean slate for the clustering tables.
     with conn.cursor() as cur:
         cur.execute("UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL")

@@ -455,9 +455,10 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
   # The Python suites: scripts/tests (the operator scripts' unit tests, incl.
-  # test_fuzzy_dedup_claims.py) and tests/dedup (fuzzy_dedup_claims.py driven end
-  # to end against a migrated database). Before this job they ran only at author
-  # time (backlog d5781a48). They need a database migrated like the deployed
+  # test_fuzzy_dedup_claims.py), tests/dedup (fuzzy_dedup_claims.py driven end
+  # to end against a migrated database), tests/theme, and the SciFact
+  # calibration fixtures in tests/scifact_calibration. Before this job they ran
+  # only at author time (backlogs d5781a48, 733df577). They need a database migrated like the deployed
   # schema, so the job builds `epigraph-migrate` and migrates a separate
   # `epigraph_py_test` database: tests/dedup refuses any database whose name does
   # not end in `_test`. It also builds `ingest_git`, which
@@ -530,6 +531,20 @@ jobs:
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export EPIGRAPH_PYTEST_REQUIRE_DB=1
           python3 -m pytest -rs scripts/tests tests/dedup
+      - name: Python tests (tests/theme)
+        # The theme pipeline's pytest files. Their DB fixture wipes the
+        # clustering tables of the database it is given, which here is the
+        # job's own epigraph_py_test.
+        run: |
+          export THEME_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export EPIGRAPH_PYTEST_REQUIRE_DB=1
+          python3 -m pytest -rs tests/theme
+      - name: SciFact conformal calibration check
+        # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
+        # coverage and efficiency, plus --check, which fails when the shipped
+        # calibration.toml [conformal] quantiles (or the comment stating their
+        # calibration n) disagree with a refit of the fixtures (backlog 733df577).
+        run: python3 tests/scifact_calibration/test_conformal_coverage.py --check
 
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every
