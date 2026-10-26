@@ -528,7 +528,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (the result must belong to the named experiment, and that
     // experiment's hypothesis is read through the viewer and required
-    // writable, `require_hypothesis`, before anything is written; until
+    // writable, `require_experiment_hypothesis` with the result, so a hidden
+    // hypothesis is the same `result` 404 as a missing result, before
+    // anything is written; until
     // backlog 4815dcf7 and ruling R-51 neither held) then untenanted reads
     // (experiments, experiment_results, frames by name) and writes against it.
     (

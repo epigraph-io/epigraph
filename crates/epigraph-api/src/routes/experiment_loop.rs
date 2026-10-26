@@ -431,14 +431,17 @@ pub async fn analyze_result(
 
     // The hypothesis this analysis files evidence on, read as the caller. Every
     // write below (the analysis, its `provides_evidence` edge, the BBA) lands on
-    // it, so one the caller cannot read is 404, exactly like a missing one
-    // (backlog 4815dcf7: the viewer was spent only on the grounding check and
-    // the frame choice), and one it can read but not write is 403 (R-51).
-    // Nothing is written in either case.
-    require_hypothesis(
+    // it, so one the caller cannot read is 404 (backlog 4815dcf7: the viewer was
+    // spent only on the grounding check and the frame choice), and one it can
+    // read but not write is 403 (R-51). Nothing is written in either case.
+    // The unreadable case is the SAME `result` 404 as a missing or mismatched
+    // result: a `hypothesis` 404 would confirm the pair exists and name the
+    // private hypothesis.
+    require_experiment_hypothesis(
         &state,
         &viewer,
-        experiment.hypothesis_id,
+        experiment_id,
+        Some(result_id),
         HypothesisAccess::Write,
         "analyze a result onto this hypothesis",
     )
