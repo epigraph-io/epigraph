@@ -2612,7 +2612,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
+        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — corroborates for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,
