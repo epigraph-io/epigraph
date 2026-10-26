@@ -476,8 +476,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EntityRepository::find_by_name_and_type",
         ],
     ),
-    // gated (the hypothesis is read through the viewer, `visible_claim_ids`,
-    // before anything is written; until backlog 4815dcf7 nothing read it) then
+    // gated (the result must belong to the named experiment, and that
+    // experiment's hypothesis is read through the viewer, `visible_claim_ids`,
+    // before anything is written; until backlog 4815dcf7 neither held) then
     // untenanted reads (experiments, experiment_results, frames by name) and
     // writes against it.
     (

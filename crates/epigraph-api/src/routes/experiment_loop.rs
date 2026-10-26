@@ -227,6 +227,16 @@ pub async fn analyze_result(
             entity: "result".into(),
             id: result_id.to_string(),
         })?;
+    // The two path segments name ONE resource: a result of another experiment
+    // is the same 404 as a missing result. Without this the hypothesis gate
+    // below covers the named experiment only, and another experiment's result
+    // would be analyzed, linked and marked complete under it.
+    if result.experiment_id != experiment_id {
+        return Err(ApiError::NotFound {
+            entity: "result".into(),
+            id: result_id.to_string(),
+        });
+    }
 
     // Load experiment to get hypothesis_id
     let experiment = epigraph_db::ExperimentRepository::get(&state.db_pool, experiment_id)

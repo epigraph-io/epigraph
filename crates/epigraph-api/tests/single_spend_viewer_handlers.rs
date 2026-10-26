@@ -169,6 +169,117 @@ async fn analyze_on_a_hypothesis_the_caller_cannot_read_is_404_and_writes_nothin
     );
 }
 
+/// The analyze route takes the experiment and the result from two path
+/// segments and loaded each on its own, so the hypothesis gate above covered
+/// the EXPERIMENT only. A caller who owns one experiment could name another
+/// group's result under it: the hidden result's measurements were analyzed onto
+/// the caller's own hypothesis (the response's masses are derived from them)
+/// and the hidden result was linked and marked complete. A result that does not
+/// belong to the named experiment is now the same 404 as a missing one, before
+/// the hypothesis gate and before any write.
+#[tokio::test(flavor = "multi_thread")]
+async fn analyze_refuses_a_result_that_belongs_to_another_experiment() {
+    let (url, pool) = shared_pool().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('hypothesis_assessment', \
+         ARRAY['true','false']::text[]) ON CONFLICT (name) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed hypothesis_assessment frame");
+
+    // The caller's own experiment, on a hypothesis it can read.
+    let (caller, caller_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "a12-idor-caller").await;
+    let own_hypothesis = viewer_fixture::seed_group_claim(
+        &pool,
+        caller,
+        caller_group,
+        &format!("a12 idor own hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    let (own_experiment, own_result) = seed_experiment(&pool, own_hypothesis, caller).await;
+    // Another group's experiment and result, on a hypothesis the caller cannot read.
+    let (other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "a12-idor-other").await;
+    let hidden_hypothesis = viewer_fixture::seed_group_claim(
+        &pool,
+        other,
+        other_group,
+        &format!("a12 idor hidden hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    let (_hidden_experiment, hidden_result) =
+        seed_experiment(&pool, hidden_hypothesis, other).await;
+
+    let result_footprint = |result: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM experiment_results WHERE id = $1")
+                    .bind(result)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read result status");
+            let analyzed: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'analyzes'",
+            )
+            .bind(result)
+            .fetch_one(&pool)
+            .await
+            .expect("count analyzes edges");
+            (status, analyzed)
+        }
+    };
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], caller);
+    let http = reqwest::Client::new();
+    let analyze = |experiment: Uuid, result: Uuid| {
+        let (http, token) = (http.clone(), token.clone());
+        async move {
+            http.post(format!(
+                "http://{addr}/api/v1/experiments/{experiment}/results/{result}/analyze"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "agent_id": caller,
+                "direction": "supports",
+                "scope_limitations": [],
+                "expected_value": 0.0,
+            }))
+            .send()
+            .await
+            .expect("analyze request")
+            .status()
+            .as_u16()
+        }
+    };
+
+    let before_hidden = result_footprint(hidden_result).await;
+    let before_own = analyze_footprint(&pool, own_hypothesis, own_experiment).await;
+    let status = analyze(own_experiment, hidden_result).await;
+    assert_eq!(
+        status, 404,
+        "a result named under an experiment it does not belong to must be 404, got {status}"
+    );
+    assert_eq!(
+        result_footprint(hidden_result).await,
+        before_hidden,
+        "the other experiment's result must be neither linked nor marked complete"
+    );
+    assert_eq!(
+        analyze_footprint(&pool, own_hypothesis, own_experiment).await,
+        before_own,
+        "nothing derived from the other result may land on the caller's hypothesis"
+    );
+
+    // CALIBRATION: the caller's own result under its own experiment.
+    assert_eq!(
+        analyze(own_experiment, own_result).await,
+        200,
+        "calibration: the matching pair must succeed"
+    );
+}
+
 // ── POST /api/v1/clusters and POST /api/v1/frames/:id/assign-claim ─────────
 
 async fn frame_rows(pool: &PgPool, claim: Uuid) -> i64 {
