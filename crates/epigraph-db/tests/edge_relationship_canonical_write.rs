@@ -326,3 +326,158 @@ async fn list_filtered_matches_every_spelling_of_a_folded_relationship(pool: PgP
         assert_eq!(got, want, "relationship={asked} must return both spellings");
     }
 }
+
+fn runbook(name: &str) -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/runbooks")
+            .join(name),
+    )
+    .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The operator case-fold (`docs/runbooks/edge-relationship-casefold.sql`)
+/// rewrites legacy upper- and mixed-case rows of the four case-folded
+/// relationships to lower case, records each in its backup table, leaves a
+/// distinct relationship (`REFINES`), a SIGNED row and a row with a dangling
+/// endpoint alone, is a no-op on a second run, and its undo restores the
+/// original spellings byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn casefold_runbook_folds_legacy_rows_and_its_undo_restores_them(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "canon-runbook").await;
+    let mut c = Vec::new();
+    for i in 0..12 {
+        c.push(fixture::seed_public_claim(&pool, agent, &format!("runbook claim {i}")).await);
+    }
+    let none = serde_json::json!({});
+    let supports = legacy_edge(&pool, c[0], c[1], "SUPPORTS", none.clone()).await;
+    let matcher = legacy_edge(
+        &pool,
+        c[2],
+        c[3],
+        "CORROBORATES",
+        serde_json::json!({"source": "cross_source_matcher"}),
+    )
+    .await;
+    let mixed = legacy_edge(&pool, c[4], c[5], "Contradicts", none.clone()).await;
+    let refutes = legacy_edge(&pool, c[6], c[7], "REFUTES", none.clone()).await;
+    let already = legacy_edge(&pool, c[1], c[2], "supports", none.clone()).await;
+    let refines = legacy_edge(&pool, c[8], c[9], "REFINES", none.clone()).await;
+    let signed = legacy_edge(&pool, c[10], c[11], "SUPPORTS", none.clone()).await;
+    sqlx::query("UPDATE edges SET signature = $2, signer_id = $3 WHERE id = $1")
+        .bind(signed)
+        .bind(vec![7u8; 64])
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A row whose target no longer exists: planted with the reference check
+    // off, exactly the state an UPDATE-time `edges_validate_refs` would abort on.
+    sqlx::query("ALTER TABLE edges DISABLE TRIGGER edges_validate_refs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let dangling = legacy_edge(&pool, c[0], Uuid::new_v4(), "SUPPORTS", none.clone()).await;
+    sqlx::query("ALTER TABLE edges ENABLE TRIGGER edges_validate_refs")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let all = [
+        supports, matcher, mixed, refutes, already, refines, signed, dangling,
+    ];
+    let snapshot = |pool: PgPool| async move {
+        let mut out = Vec::new();
+        for id in all {
+            out.push(stored_relationship(&pool, id).await);
+        }
+        out
+    };
+    let before = snapshot(pool.clone()).await;
+
+    let apply = runbook("edge-relationship-casefold.sql");
+    sqlx::raw_sql(&apply).execute(&pool).await.expect("fold");
+    let after = snapshot(pool.clone()).await;
+    assert_eq!(
+        after,
+        [
+            "supports",
+            "corroborates",
+            "contradicts",
+            "refutes",
+            "supports",
+            "REFINES",
+            "SUPPORTS",
+            "SUPPORTS"
+        ],
+        "folded: the four legacy spellings; untouched: canonical, REFINES, signed, dangling"
+    );
+    let mut recorded: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT edge_id, old_relationship FROM ops_backup.edges_relationship_casefold",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    recorded.sort();
+    let mut want = vec![
+        (supports, "SUPPORTS".to_string()),
+        (matcher, "CORROBORATES".to_string()),
+        (mixed, "Contradicts".to_string()),
+        (refutes, "REFUTES".to_string()),
+    ];
+    want.sort();
+    assert_eq!(recorded, want, "the backup holds exactly the folded rows");
+
+    // Idempotent.
+    sqlx::raw_sql(&apply)
+        .execute(&pool)
+        .await
+        .expect("fold again");
+    assert_eq!(snapshot(pool.clone()).await, after);
+
+    // Undo restores every original spelling.
+    sqlx::raw_sql(&runbook("edge-relationship-casefold-undo.sql"))
+        .execute(&pool)
+        .await
+        .expect("undo");
+    assert_eq!(snapshot(pool.clone()).await, before);
+}
+
+/// Both runbook files refuse to run on a role that row-level security applies
+/// to: `edges` is FORCE RLS, so on such a role the fold would silently cover
+/// only the rows that role can read and still report success. Nothing is
+/// folded and no backup table is created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn casefold_runbooks_refuse_a_role_subject_to_row_level_security(pool: PgPool) {
+    let c = claims(&pool, "canon-runbook-rls", 2).await;
+    let legacy = legacy_edge(&pool, c[0], c[1], "SUPPORTS", serde_json::json!({})).await;
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+
+    for name in [
+        "edge-relationship-casefold.sql",
+        "edge-relationship-casefold-undo.sql",
+    ] {
+        let err = sqlx::raw_sql(&runbook(name))
+            .execute(&app)
+            .await
+            .expect_err("an RLS-subject role must be refused");
+        let code = err
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.into_owned()));
+        assert_eq!(code.as_deref(), Some("42501"), "{name}: {err}");
+        assert!(
+            err.to_string()
+                .contains("run on the migration (superuser) DSN"),
+            "{name}: refused by the runbook's own guard, not by a later privilege error: {err}"
+        );
+    }
+    app.close().await;
+
+    let backup: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('ops_backup.edges_relationship_casefold')::text")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(backup, None, "the refused fold created no backup table");
+    assert_eq!(stored_relationship(&pool, legacy).await, "SUPPORTS");
+}
