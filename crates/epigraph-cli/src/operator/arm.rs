@@ -22,7 +22,7 @@
 //! except a supersession's successor (backlog 73085534, ruling R-23): the
 //! successor inherits the RETIRED claim's author, so it is attributed to the
 //! agent that performed the act, which the act records as the successor's
-//! `AUTHORED` edge in its own transaction ([`CENSUS_WRITES`]). Counting the
+//! `AUTHORED` edge in its own transaction ([`census_writes`]). Counting the
 //! inherited author would list a long-quiet author as a live writer, and miss
 //! the agent that actually wrote.
 //!
@@ -106,28 +106,43 @@ pub async fn unregistered_system_roles(
 /// the claim's author, except a supersession's successor, whose writer is the
 /// agent that performed the act (backlog 73085534, ruling R-23).
 ///
-/// The act writes that agent's `AUTHORED` edge to the successor in the SAME
-/// transaction as the successor, so the edge's `created_at` equals the
-/// claim's (both are the transaction's `now()`). That equality is what picks
-/// the act's edge out: the supersede cascade (and the custodial verb) moves the
-/// retired claim's own `AUTHORED` edges onto the successor, and those carry
-/// the retired claim's older timestamp; an `AUTHORED` edge added later by any
-/// other write carries a later one. A successor with no such edge (one written
-/// before the act recorded it) keeps its author, as before.
-pub const CENSUS_WRITES: &str = "SELECT COALESCE(act.source_id, c.agent_id) AS writer, \
-            c.owner_group_id \
-       FROM claims c \
-       LEFT JOIN LATERAL ( \
-            SELECT e.source_id FROM edges e \
-             WHERE c.supersedes IS NOT NULL \
-               AND e.target_id = c.id AND e.target_type = 'claim' \
-               AND e.source_type = 'agent' AND e.relationship = 'AUTHORED' \
-               AND e.created_at = c.created_at \
-             ORDER BY e.id LIMIT 1) act ON true \
-      WHERE c.created_at > now() - make_interval(days => $1)";
+/// The act's OWN edge is picked out by two facts together:
+/// * its `tool` property is one of the supersession write paths
+///   (`epigraph_db::SUPERSEDE_ACT_TOOLS`), so a claim that merely gained a
+///   `supersedes` pointer (a marked duplicate, a consolidated source) keeps
+///   its author even when it carries some other agent's `AUTHORED` edge (the
+///   #600 caller-authorship shape);
+/// * its `created_at` equals the claim's: the act writes it in the SAME
+///   transaction as the successor (both are that transaction's `now()`), so an
+///   `AUTHORED` edge added later, whatever properties it spells, is not it.
+///
+/// A later supersession leaves the act's edge on the claim it records (the
+/// edge migration exempts it), so every claim of a chain keeps its own actor. A
+/// successor with no such edge (one written before the act recorded it) keeps
+/// its author, as before. The tool literals are constants, never caller data.
+fn census_writes() -> String {
+    let act_tools = epigraph_db::SUPERSEDE_ACT_TOOLS
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT COALESCE(act.source_id, c.agent_id) AS writer, \
+                c.owner_group_id \
+           FROM claims c \
+           LEFT JOIN LATERAL ( \
+                SELECT e.source_id FROM edges e \
+                 WHERE e.target_id = c.id AND e.target_type = 'claim' \
+                   AND e.source_type = 'agent' AND e.relationship = 'AUTHORED' \
+                   AND e.properties->>'tool' IN ({act_tools}) \
+                   AND e.created_at = c.created_at \
+                 ORDER BY e.created_at, e.id LIMIT 1) act ON true \
+          WHERE c.created_at > now() - make_interval(days => $1)"
+    )
+}
 
 /// The census: unbound agents that wrote claims in the last `days` days
-/// (attributed as [`CENSUS_WRITES`] says).
+/// (attributed as [`census_writes`] says).
 ///
 /// # Errors
 /// The read fails (e.g. migration 122 is not applied).
@@ -135,9 +150,10 @@ pub async fn unbound_recent_writers(
     conn: &mut PgConnection,
     days: i32,
 ) -> anyhow::Result<Vec<(Uuid, i64)>> {
+    let writes = census_writes();
     Ok(sqlx::query_as(&format!(
         "SELECT w.writer, count(*)::bigint \
-           FROM ({CENSUS_WRITES}) w \
+           FROM ({writes}) w \
           GROUP BY w.writer \
          HAVING public.epigraph_author_binding(w.writer) IS NULL \
           ORDER BY 2 DESC, 1"
@@ -148,7 +164,7 @@ pub async fn unbound_recent_writers(
 }
 
 /// The allowlist census (migration 149): allowlisted agents that wrote claims
-/// in the last `days` days (attributed as [`CENSUS_WRITES`] says) in a group
+/// in the last `days` days (attributed as [`census_writes`] says) in a group
 /// their operator does not write, per group.
 ///
 /// # Errors
@@ -158,9 +174,10 @@ pub async fn out_of_scope_allowlisted_writers(
     conn: &mut PgConnection,
     days: i32,
 ) -> anyhow::Result<Vec<(Uuid, Option<Uuid>, i64)>> {
+    let writes = census_writes();
     Ok(sqlx::query_as(&format!(
         "SELECT w.writer, w.owner_group_id, count(*)::bigint \
-           FROM ({CENSUS_WRITES}) w \
+           FROM ({writes}) w \
           GROUP BY w.writer, w.owner_group_id \
          HAVING public.epigraph_author_binding(w.writer) = $2 \
             AND NOT COALESCE(public.epigraph_operator_writes_group( \
