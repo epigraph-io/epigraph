@@ -185,8 +185,9 @@ pub async fn set_provenance(
             "position": author.position,
             "is_corresponding": author.is_corresponding,
         });
-        EdgeRepository::create(
+        EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             claim_id,
             "claim",
             agent_id,
@@ -207,8 +208,9 @@ pub async fn set_provenance(
             "prov": "authored",
             "position": author.position,
         });
-        if EdgeRepository::create(
+        if EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             agent_id,
             "agent",
             claim_id,
@@ -253,8 +255,9 @@ pub async fn set_provenance(
             let aff_props = serde_json::json!({
                 "prov": "affiliation",
             });
-            if EdgeRepository::create(
+            if EdgeRepository::create_signed(
                 pool,
+                state.edge_signing_key(),
                 author_id,
                 "agent",
                 org_agent_id,
@@ -284,8 +287,9 @@ pub async fn set_provenance(
             "prov": "wasAssociatedWith",
             "role": "ingestion_agent",
         });
-        if EdgeRepository::create(
+        if EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             claim_id,
             "claim",
             ingestion_id,

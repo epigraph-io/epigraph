@@ -75,15 +75,18 @@ pub async fn create_experiment(
     })?;
 
     // Create tests_hypothesis edge
-    sqlx::query(
-        r#"
-        INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-        VALUES ($1, 'experiment', $2, 'claim', 'tests_hypothesis', '{}')
-        "#,
+    epigraph_db::EdgeRepository::create_signed(
+        &state.db_pool,
+        state.edge_signing_key(),
+        id,
+        "experiment",
+        req.hypothesis_id,
+        "claim",
+        "tests_hypothesis",
+        None,
+        None,
+        None,
     )
-    .bind(id)
-    .bind(req.hypothesis_id)
-    .execute(&state.db_pool)
     .await
     .ok();
 
@@ -135,16 +138,18 @@ pub async fn submit_results(
     })?;
 
     // Create result_of edge
-    sqlx::query(
-        r#"
-        INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-        VALUES ($1, 'experiment_result', $2, 'experiment', 'result_of', $3)
-        "#,
+    epigraph_db::EdgeRepository::create_signed(
+        &state.db_pool,
+        state.edge_signing_key(),
+        result_id,
+        "experiment_result",
+        experiment_id,
+        "experiment",
+        "result_of",
+        Some(serde_json::json!({"data_source": req.data_source})),
+        None,
+        None,
     )
-    .bind(result_id)
-    .bind(experiment_id)
-    .bind(serde_json::json!({"data_source": req.data_source}))
-    .execute(&state.db_pool)
     .await
     .ok();
 
@@ -360,15 +365,18 @@ pub async fn analyze_result(
     .map_err(|e| ApiError::InternalError { message: format!("Failed to create analysis: {e}") })?;
 
     // Create analyzes edge (analysis → result)
-    sqlx::query(
-        r#"
-        INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-        VALUES ($1, 'analysis', $2, 'experiment_result', 'analyzes', '{}')
-        "#,
+    epigraph_db::EdgeRepository::create_signed(
+        &state.db_pool,
+        state.edge_signing_key(),
+        analysis_id.0,
+        "analysis",
+        result_id,
+        "experiment_result",
+        "analyzes",
+        None,
+        None,
+        None,
     )
-    .bind(analysis_id.0)
-    .bind(result_id)
-    .execute(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to create analyzes edge: {e}"),
@@ -376,20 +384,22 @@ pub async fn analyze_result(
 
     // Create provides_evidence edge (analysis → hypothesis)
     // CRITICAL: This triggers the shared_evidence factor creation if multi-hypothesis.
-    sqlx::query(
-        r#"
-        INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-        VALUES ($1, 'analysis', $2, 'claim', 'provides_evidence', $3)
-        "#,
+    epigraph_db::EdgeRepository::create_signed(
+        &state.db_pool,
+        state.edge_signing_key(),
+        analysis_id.0,
+        "analysis",
+        experiment.hypothesis_id,
+        "claim",
+        "provides_evidence",
+        Some(serde_json::json!({
+            "direction": req.direction,
+            "precision_ratio": mass_result.precision_ratio,
+            "evidence_strength": mass_result.evidence_strength,
+        })),
+        None,
+        None,
     )
-    .bind(analysis_id.0)
-    .bind(experiment.hypothesis_id)
-    .bind(serde_json::json!({
-        "direction": req.direction,
-        "precision_ratio": mass_result.precision_ratio,
-        "evidence_strength": mass_result.evidence_strength,
-    }))
-    .execute(&state.db_pool)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to create provides_evidence edge: {e}"),

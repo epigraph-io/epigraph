@@ -1381,53 +1381,74 @@ async fn persist_packet(
         })?;
 
         // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(agent_uuid)
-    .bind(claim_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create AUTHORED edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            agent_uuid,
+            "agent",
+            claim_uuid,
+            "claim",
+            "AUTHORED",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create AUTHORED edge: {}", e),
+                ),
+            )
+        })?;
 
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'claim', $2, 'trace', 'HAS_TRACE', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(claim_uuid)
-    .bind(trace_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create HAS_TRACE edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            claim_uuid,
+            "claim",
+            trace_uuid,
+            "trace",
+            "HAS_TRACE",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create HAS_TRACE edge: {}", e),
+                ),
+            )
+        })?;
 
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'trace', $2, 'claim', 'TRACES', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(trace_uuid)
-    .bind(claim_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create TRACES edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            trace_uuid,
+            "trace",
+            claim_uuid,
+            "claim",
+            "TRACES",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create TRACES edge: {}", e),
+                ),
+            )
+        })?;
 
         // 6. Insert evidence records
         for (i, evidence_submission) in packet.evidence.iter().enumerate() {
@@ -1507,38 +1528,52 @@ async fn persist_packet(
         })?;
 
             // Materialize graph edges: evidence --SUPPORTS--> claim
-            sqlx::query_scalar::<_, i32>(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
-             RETURNING 1"
-        )
-        .bind(evidence_uuid)
-        .bind(claim_uuid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to create SUPPORTS edge: {}", e)),
+            epigraph_db::EdgeRepository::create_signed_conn(
+                &mut tx,
+                state.edge_signing_key(),
+                evidence_uuid,
+                "evidence",
+                claim_uuid,
+                "claim",
+                "SUPPORTS",
+                None,
+                None,
+                None,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to create SUPPORTS edge: {}", e),
+                    ),
+                )
+            })?;
 
             // Materialize graph edges: trace --USES_EVIDENCE--> evidence
-            sqlx::query_scalar::<_, i32>(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'trace', $2, 'evidence', 'USES_EVIDENCE', '{}'::jsonb) \
-             RETURNING 1"
-        )
-        .bind(trace_uuid)
-        .bind(evidence_uuid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to create USES_EVIDENCE edge: {}", e)),
+            epigraph_db::EdgeRepository::create_signed_conn(
+                &mut tx,
+                state.edge_signing_key(),
+                trace_uuid,
+                "trace",
+                evidence_uuid,
+                "evidence",
+                "USES_EVIDENCE",
+                None,
+                None,
+                None,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to create USES_EVIDENCE edge: {}", e),
+                    ),
+                )
+            })?;
         }
     } // end `if was_created`
 

@@ -361,8 +361,9 @@ pub async fn create_evidence(
     let evidence_id: Uuid = created.id.into();
 
     // Materialize claim --DERIVED_FROM--> evidence edge
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         &state.db_pool,
+        state.edge_signing_key(),
         request.claim_id,
         "claim",
         evidence_id,
@@ -660,8 +661,9 @@ pub async fn create_reasoning_trace(
     let trace_id: Uuid = created.id.into();
 
     // Materialize claim --HAS_TRACE--> trace edge
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         &state.db_pool,
+        state.edge_signing_key(),
         request.claim_id,
         "claim",
         trace_id,

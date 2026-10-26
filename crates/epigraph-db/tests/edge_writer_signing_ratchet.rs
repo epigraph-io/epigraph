@@ -89,6 +89,7 @@ const CALLS: &[&str] = &[
     "EdgeRepository::create_processed_by_stamp_if_absent_conn(",
     // The INSERT-time signed twins (ruling R-50); the symmetric family's
     // `_signed_conn` forms match the prefix above.
+    "EdgeRepository::create_signed(",
     "EdgeRepository::create_signed_conn(",
     "EdgeRepository::create_if_not_exists_signed_conn(",
     "EdgeRepository::create_if_absent_including_retracted_signed_conn(",
@@ -99,9 +100,9 @@ const CALLS: &[&str] = &[
 const SIGN_CALL: &str = "sign_created_edge_conn";
 
 /// The INSERT-time way (ruling R-50): a signed twin called with a key the
-/// writer holds. A [`Signed`] function must name both a `_signed_conn`
-/// primitive and the key (`edge_signing_key()` / an `EdgeSigningKey`).
-const SIGNED_TWIN: &str = "_signed_conn(";
+/// writer holds. A [`Signed`] function must name both a signed twin
+/// (`*_signed_conn`, or `create_signed` on a pool) and the key (`edge_signing_key()` / an `EdgeSigningKey`).
+const SIGNED_TWINS: &[&str] = &["_signed_conn(", "EdgeRepository::create_signed("];
 const KEY_MARKERS: &[&str] = &["edge_signing_key", "EdgeSigningKey"];
 
 /// The attested INSERT itself (`edge_signature::insert_attested_conn`): it
@@ -113,13 +114,15 @@ const SIGN_AT_INSERT: &str = "sign_entity(SignedEntity::Edge";
 fn signs(body: &str) -> bool {
     body.contains(SIGN_CALL)
         || body.contains(SIGN_AT_INSERT)
-        || (body.contains(SIGNED_TWIN) && KEY_MARKERS.iter().any(|k| body.contains(k)))
+        || (SIGNED_TWINS.iter().any(|t| body.contains(t))
+            && KEY_MARKERS.iter().any(|k| body.contains(k)))
 }
 
 /// Why an unsigned site does not sign. Each is a measured property of the
 /// tree, not a preference.
-const NO_KEY_API: &str = "epigraph-api holds no entity signing key: HTTP claims are signed by \
-     their client in the packet, and giving the API server a key is a deployment decision";
+const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every approved \
+     edges_staging row (claims:admin); attesting each copy needs a per-row INSERT through the \
+     signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
 const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key";
 const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no key; its MCP \
@@ -161,7 +164,7 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 
 /// The exact number of unsigned edge-emitting sites, Rust ([`REGISTER`]) plus
 /// database ([`DB_REGISTER`]). Should only go down; see the module docs.
-const UNSIGNED_SITES_HIGH_WATER: usize = 85;
+const UNSIGNED_SITES_HIGH_WATER: usize = 46;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -215,127 +218,127 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-api/src/routes/assess.rs",
         "assess_claim",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/belief.rs",
         "create_edge_under_savepoint",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/claims.rs",
         "create_claim_core",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/community.rs",
         "add_member",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
         4,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "forget_convention",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "share_skill",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "create_evidence",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "create_reasoning_trace",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "promote_staged_edges",
         2,
-        Unsigned(NO_KEY_API),
+        Unsigned(BULK_STAGING_COPY),
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "create_edge",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "create_hierarchical_edge",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "relate_claims",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "create_experiment",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "submit_results",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "analyze_result",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/perspective.rs",
         "create_perspective",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/provenance.rs",
         "set_provenance",
         4,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/spans.rs",
         "create_span",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/spans.rs",
         "close_span",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/submit.rs",
         "persist_packet",
         5,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-cli/src/decompose.rs",

@@ -422,12 +422,16 @@ async fn main() {
             "epigraph-api",
             epigraph_api::passkey_boot::running_stop(allows_software),
         );
+        // The API's own edge signing key (ruling R-50): unset = unsigned edges,
+        // logged once; set but unusable = refuse to start.
+        let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
             .with_bp_apply(bp_apply_from_env())
-            .with_passkeys(passkeys);
+            .with_passkeys(passkeys)
+            .with_edge_signer(edge_signer);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

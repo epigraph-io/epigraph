@@ -304,6 +304,41 @@ impl EdgeRepository {
         Ok(row.id)
     }
 
+    /// [`Self::create_signed_conn`] on a connection of `pool`, for a writer
+    /// that writes on the pool itself (as [`Self::create`] on a pool does).
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`], and `DbError::QueryFailed` if no
+    /// connection can be acquired.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_signed(
+        pool: &PgPool,
+        key: Option<EdgeSigningKey<'_>>,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_signed_conn(
+            &mut conn,
+            key,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
     /// [`Self::create`] ATTESTED AT INSERT when `key` is given (ruling R-50):
     /// the row carries its attestation digest, the v1 edge signature over it
     /// and `signer_id = key.signer_id` (see
