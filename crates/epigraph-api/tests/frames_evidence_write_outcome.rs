@@ -364,13 +364,18 @@ async fn an_unchanged_resubmission_leaves_bayesian_posterior_where_it_was(
         "the unchanged warning says the posterior did not move: {again}"
     );
 
-    // A replacement is a different BBA: it is counted.
+    // CALIBRATION, NOT A REQUIREMENT: a replacement stores a different BBA,
+    // and today it applies its own Beta update without withdrawing the
+    // replaced BBA's earlier increment. This pins only that the fix above is
+    // scoped to `unchanged`. Whether a replacement should apply just the delta
+    // is an open follow-up; a fix there should change this assertion.
     let mut replaced = body;
     replaced["reliability"] = serde_json::json!(0.5);
     let replaced = post(&w, &token_a, replaced).await;
     assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
     assert!(
         beta(&w.pool, w.claim).await.0 > after_first.0,
-        "a replaced BBA still applies its Beta update"
+        "CALIBRATION (current behaviour, not a requirement): a replaced BBA applies its Beta \
+         update"
     );
 }
