@@ -10,6 +10,10 @@
 //! fix rewrote, so a later arm that sends `NotFound` (or anything an invisible
 //! parent produces) to 500 or 403 fails here.
 //!
+//! The same module pins the route's answer to a parent the caller CAN see but
+//! whose retirement the database refuses (backlog d34f5096): 403 with nothing
+//! written, not 500.
+//!
 //! No orphan permissive policy is installed (unlike
 //! `claim_routes_bind_the_caller.rs`): `FOR ALL USING (true)` would make every
 //! claim visible and this test vacuous.
@@ -61,6 +65,7 @@ async fn evolve_as(
     caller: Uuid,
     parent: Uuid,
     content: &str,
+    edge_type: &str,
 ) -> (StatusCode, String) {
     let viewer = Viewer::resolve(pool, caller).await.expect("viewer");
     let auth = AuthContext {
@@ -78,7 +83,7 @@ async fn evolve_as(
     };
     let req: epigraph_api::routes::workflows::EvolveStepRequest =
         serde_json::from_value(serde_json::json!({
-            "parent_id": parent, "content": content, "edge_type": "revises"
+            "parent_id": parent, "content": content, "edge_type": edge_type
         }))
         .expect("request");
     let resp = epigraph_api::routes::workflows::evolve_step(
@@ -117,7 +122,7 @@ async fn evolve_step_on_a_parent_the_caller_cannot_see_returns_404(pool: PgPool)
     let state = app_role_state(&pool).await;
 
     let content = format!("evolved by an outsider {}", Uuid::new_v4());
-    let (status, body) = evolve_as(&pool, &state, b, parent, &content).await;
+    let (status, body) = evolve_as(&pool, &state, b, parent, &content, "revises").await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
@@ -132,11 +137,64 @@ async fn evolve_step_on_a_parent_the_caller_cannot_see_returns_404(pool: PgPool)
     // Control: the owner, who can see the parent, evolves it on the same
     // state, so the 404 above is the visibility and not the harness.
     let content = format!("evolved by the owner {}", Uuid::new_v4());
-    let (status, body) = evolve_as(&pool, &state, a, parent, &content).await;
+    let (status, body) = evolve_as(&pool, &state, a, parent, &content, "revises").await;
     assert_eq!(
         status,
         StatusCode::OK,
         "the owner evolves its own step: {body}"
     );
     assert_eq!(claims_with_content(&pool, &content).await, 1);
+}
+
+/// `supersedes` on a parent the caller can see and evolve, whose retirement
+/// the database refuses, answers 403 with nothing written (backlog d34f5096).
+///
+/// Row security that refuses an UPDATE through its USING clause matches zero
+/// rows without raising; `ClaimRepository::evolve_step_conn` turns that into
+/// `DbError::WriteRefused`, a denial the route must render as 403 (as
+/// `From<DbError>` does everywhere else), not fold into its 500 arm. A
+/// `BEFORE UPDATE` trigger that skips only the parent's `is_current` change
+/// stands in for the refusing policy deterministically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_nothing(
+    pool: PgPool,
+) {
+    let (a, a_group) = seed_agent_with_group(&pool, "owner-a").await;
+    let parent = seed_group_claim(
+        &pool,
+        a,
+        a_group,
+        &format!("A's unretirable step {}", Uuid::new_v4()),
+    )
+    .await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_step_retire() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_step_retire BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{parent}'::uuid AND NEW.is_current IS DISTINCT FROM OLD.is_current) \
+         EXECUTE FUNCTION aaa_test_skip_step_retire();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the retirement stand-in");
+    let state = app_role_state(&pool).await;
+
+    let content = format!("successor of an unretirable step {}", Uuid::new_v4());
+    let (status, body) = evolve_as(&pool, &state, a, parent, &content, "supersedes").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a refused retirement is a write refusal, not a server fault: {body}"
+    );
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        0,
+        "no successor"
+    );
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("parent");
+    assert!(still_current, "the parent is untouched");
 }
