@@ -60,13 +60,10 @@ pub const KEY_VALID_FROM_SKEW_SECS: i64 = 60;
 /// treated as compromised from the start. `status` is in the SQL spelling
 /// (`lower(btrim(..))`).
 ///
-/// The ONE window rule: `epigraph-mcp`'s claim verifier and boot verdict and
-/// the edge verifier (`repos::edge_signature`) all call it, so they cannot
-/// disagree about a key's WINDOW. They do not yet share the whole admission
-/// rule: the edge verifier admits only keys this function admits (and the bare
-/// `agents.public_key` only when no `agent_keys` row carries it), while the
-/// claim verifier's `signature_valid` still admits any attested key and the
-/// bare agent key, applying this window only to `key_bound`.
+/// The ONE window rule: `epigraph-mcp`'s boot verdict calls it, and so does
+/// [`admitted_signature_keys`], the one admission rule the claim verifier and
+/// the edge verifier (`repos::edge_signature`) share, so none of them can
+/// disagree about a key's WINDOW.
 #[must_use]
 pub fn key_window_admits(
     status: &str,
@@ -83,6 +80,83 @@ pub fn key_window_admits(
         "rotated" | "expired" => valid_until.is_some(),
         _ => false,
     }
+}
+
+/// One `agent_keys` row as [`admitted_signature_keys`] reads it: the key's
+/// bytes, its type and status in the SQL spelling (`lower(btrim(..))`), and
+/// its recorded window.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyLifecycle<'a> {
+    pub public_key: &'a [u8],
+    pub key_type: &'a str,
+    pub status: &'a str,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+}
+
+/// A key [`admitted_signature_keys`] admits for a row dated `at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedKey {
+    pub key: [u8; 32],
+    /// `signing` / `identity-legacy` (an attested row) or `unattested` (the
+    /// bare `agents.public_key`).
+    pub kind: &'static str,
+    /// The index in the caller's rows of the attested row that admitted the
+    /// key; `None` for the bare agent key.
+    pub row: Option<usize>,
+}
+
+/// The keys that may verify a signature on a row dated `at` (backlog
+/// `06a50a30`): the ONE admission rule of the claim verifier
+/// (`epigraph-mcp`'s `signing_identity::bind_signature`) and the edge verifier
+/// (`repos::edge_signature`).
+///
+/// * Each ATTESTED row (`signing`, `identity-legacy`) whose status and window
+///   admit `at` ([`key_window_admits`]). Any other key type is application-
+///   insertable (migration 161's guard covers these two only) and admits
+///   nothing.
+/// * The signer's bare `agents.public_key` ("unattested") only when NO row in
+///   `rows` carries those bytes: a key with a recorded lifecycle is governed by
+///   it, so a revoked, pending or out-of-window key cannot come back in as the
+///   bare agent key.
+///
+/// Which MESSAGE a key must have signed is the caller's rule, not this one's:
+/// claims accept the v1 claim message then the legacy bare digest, edges the
+/// v1 edge message only.
+#[must_use]
+pub fn admitted_signature_keys(
+    rows: &[KeyLifecycle<'_>],
+    agent_key: Option<&[u8]>,
+    at: DateTime<Utc>,
+) -> Vec<AdmittedKey> {
+    let mut out = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let kind = match row.key_type {
+            "signing" => "signing",
+            "identity-legacy" => "identity-legacy",
+            _ => continue,
+        };
+        if key_window_admits(row.status, row.valid_from, row.valid_until, at) {
+            if let Ok(key) = <[u8; 32]>::try_from(row.public_key) {
+                out.push(AdmittedKey {
+                    key,
+                    kind,
+                    row: Some(i),
+                });
+            }
+        }
+    }
+    if let Some(key) = agent_key
+        .filter(|k| !rows.iter().any(|r| r.public_key == *k))
+        .and_then(|k| <[u8; 32]>::try_from(k).ok())
+    {
+        out.push(AdmittedKey {
+            key,
+            kind: "unattested",
+            row: None,
+        });
+    }
+    out
 }
 
 /// One ATTESTED key (`signing` or `identity-legacy`) of a claim's author or

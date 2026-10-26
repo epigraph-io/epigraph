@@ -178,9 +178,10 @@ async fn a_claim_signed_by_the_authors_active_signing_key_is_bound(pool: PgPool)
 }
 
 /// A REVOKED signing key binds nothing (revocation carries no timestamp, so a
-/// revoked key is treated as compromised), though its signature still verifies.
+/// revoked key is treated as compromised), and since backlog 06a50a30 (the
+/// shared admission rule) its signature verifies nothing either.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_revoked_signing_key_verifies_but_is_not_bound(pool: PgPool) {
+async fn a_revoked_signing_key_neither_verifies_nor_binds(pool: PgPool) {
     let t0 = Utc::now() - Duration::days(10);
     let identity = signer(0x21);
     let signing = signer(0x22);
@@ -206,16 +207,16 @@ async fn a_revoked_signing_key_verifies_but_is_not_bound(pool: PgPool) {
     .await;
 
     let resp = verify(&pool, claim).await;
-    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
-    assert_eq!(resp["key_bound"], Value::Bool(false), "{resp}");
+    assert_eq!(resp["signed"], Value::Bool(true), "{resp}");
     assert_eq!(
-        resp["key_kind"],
-        Value::from("signing"),
-        "an unbound signature still names the key that verified it: {resp}"
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a revoked key is admitted for nothing: {resp}"
     );
 }
 
-/// A claim created BEFORE the signing key's `valid_from` is not bound by it.
+/// A claim created BEFORE the signing key's `valid_from` is not bound by it,
+/// and (backlog 06a50a30) not verified by it: the key was not admitted then.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_claim_older_than_the_signing_key_is_not_bound(pool: PgPool) {
     let t0 = Utc::now() - Duration::days(10);
@@ -243,14 +244,18 @@ async fn a_claim_older_than_the_signing_key_is_not_bound(pool: PgPool) {
     .await;
 
     let resp = verify(&pool, claim).await;
-    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
-    assert_eq!(resp["key_bound"], Value::Bool(false), "{resp}");
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "{resp}"
+    );
 }
 
 /// The legacy identity key (161's backfill: `identity-legacy`, valid from the
 /// agent's creation, `valid_until` set at cut-over). A claim signed with it
 /// BEFORE the cut-over is bound and says so (`identity-legacy`); the same key
-/// AFTER the cut-over still verifies but is no longer bound.
+/// AFTER the cut-over is neither bound nor (backlog 06a50a30) verifying: its
+/// row governs it, so it does not come back in as the bare agent key.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_legacy_identity_key_is_bound_before_the_cut_over_only(pool: PgPool) {
     let t0 = Utc::now() - Duration::days(30);
@@ -298,12 +303,10 @@ async fn a_legacy_identity_key_is_bound_before_the_cut_over_only(pool: PgPool) {
         "{resp}"
     );
     let resp = verify(&pool, after).await;
-    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
-    assert_eq!(resp["key_bound"], Value::Bool(false), "{resp}");
     assert_eq!(
-        resp["key_kind"],
-        Value::from("identity-legacy"),
-        "after the cut-over the report still says the key is the forgeable legacy one: {resp}"
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "after the cut-over the legacy key is admitted for nothing: {resp}"
     );
 }
 
@@ -427,10 +430,10 @@ fn whole_second(t: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 /// The window's END is exclusive and exact: a claim dated exactly at
-/// `valid_until` is not bound, one millisecond before it is. Kinds and
-/// statuses beyond active/revoked: an EXPIRED key with a recorded window binds
-/// inside it; a PENDING key binds nothing, though its signature verifies and
-/// is reported as a `signing` key.
+/// `valid_until` is not bound (nor, backlog 06a50a30, verified), one
+/// millisecond before it is. Kinds and statuses beyond active/revoked: an
+/// EXPIRED key with a recorded window binds inside it; a PENDING key binds and
+/// verifies nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let t0 = whole_second(Utc::now() - Duration::days(10));
@@ -462,11 +465,7 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let resp = verify(&pool, at_end).await;
     assert_eq!(
         bound(&resp),
-        (
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::from("signing")
-        ),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
         "valid_until is exclusive: {resp}"
     );
     let resp = verify(&pool, before_end).await;
@@ -526,12 +525,8 @@ async fn window_ends_and_the_other_statuses(pool: PgPool) {
     let resp = verify(&pool, by_pending).await;
     assert_eq!(
         bound(&resp),
-        (
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::from("signing")
-        ),
-        "a pending key binds nothing: {resp}"
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a pending key is admitted for nothing: {resp}"
     );
 }
 
@@ -606,12 +601,8 @@ async fn a_rotated_signing_key_still_binds_what_it_signed_before_the_rotation(po
     let resp = verify(&pool, after).await;
     assert_eq!(
         bound(&resp),
-        (
-            Value::Bool(true),
-            Value::Bool(false),
-            Value::from("signing")
-        ),
-        "a claim signed after the rotation is not bound: {resp}"
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a claim signed after the rotation is neither bound nor verified: {resp}"
     );
 }
 
@@ -696,5 +687,163 @@ async fn the_new_reads_work_on_the_application_role(pool: PgPool) {
         bound(&resp),
         (Value::Bool(true), Value::Bool(true), Value::from("signing")),
         "{resp}"
+    );
+}
+
+/// Backlog 06a50a30: the claim verifier admits a key only inside its recorded
+/// lifecycle, the rule the edge verifier applies. A signer whose
+/// `agents.public_key` is ALSO carried by a REVOKED `agent_keys` row: that key
+/// has a recorded lifecycle and is governed by it, so it cannot come back in
+/// as the bare agent key. Paired with an agent of the same shape whose row is
+/// ACTIVE, which verifies, so the refusal is a function of the row's status.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_key_does_not_verify_as_the_bare_agent_key(pool: PgPool) {
+    let t0 = Utc::now() - Duration::days(10);
+    let revoked = signer(0xB1);
+    let agent = seed_agent(&pool, &revoked.public_key(), t0).await;
+    seed_key(
+        &pool,
+        agent,
+        &revoked.public_key(),
+        "identity-legacy",
+        "revoked",
+        t0,
+        None,
+    )
+    .await;
+    let claim = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &revoked,
+        "06a50a30: signed by an agent key whose agent_keys row is revoked",
+        t0 + Duration::days(1),
+    )
+    .await;
+
+    let active = signer(0xB2);
+    let calibration_agent = seed_agent(&pool, &active.public_key(), t0).await;
+    seed_key(
+        &pool,
+        calibration_agent,
+        &active.public_key(),
+        "identity-legacy",
+        "active",
+        t0,
+        None,
+    )
+    .await;
+    let calibration = seed_signed_claim(
+        &pool,
+        calibration_agent,
+        calibration_agent,
+        &active,
+        "06a50a30: signed by an agent key whose agent_keys row is active",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, calibration).await;
+    assert_eq!(
+        resp["signature_valid"],
+        Value::Bool(true),
+        "calibration: {resp}"
+    );
+
+    let resp = verify(&pool, claim).await;
+    assert_eq!(resp["signed"], Value::Bool(true), "{resp}");
+    assert_eq!(
+        (
+            resp["signature_valid"].clone(),
+            resp["key_bound"].clone(),
+            resp["key_kind"].clone(),
+            resp["signature_scheme"].clone(),
+        ),
+        (
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Null,
+            Value::Null
+        ),
+        "a revoked key came back in as the bare agent key: {resp}"
+    );
+}
+
+/// Backlog 06a50a30: an attested signing key verifies a claim only when its
+/// status and window admit the claim's `created_at`. A key whose recorded
+/// window closed before the claim, and a revoked key, verify nothing; the
+/// same key inside its window does (calibration).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signing_key_outside_its_window_does_not_verify(pool: PgPool) {
+    let t0 = whole_second(Utc::now() - Duration::days(10));
+    let identity = signer(0xB3);
+    let agent = seed_agent(&pool, &identity.public_key(), t0).await;
+
+    let expired = signer(0xB4);
+    seed_key(
+        &pool,
+        agent,
+        &expired.public_key(),
+        "signing",
+        "expired",
+        t0,
+        Some(t0 + Duration::days(2)),
+    )
+    .await;
+    let inside = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &expired,
+        "06a50a30: inside the expired key's window",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let after = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &expired,
+        "06a50a30: after the expired key's window closed",
+        t0 + Duration::days(5),
+    )
+    .await;
+    let resp = verify(&pool, inside).await;
+    assert_eq!(
+        resp["signature_valid"],
+        Value::Bool(true),
+        "calibration: {resp}"
+    );
+    let resp = verify(&pool, after).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a key outside its window verified: {resp}"
+    );
+
+    let revoked = signer(0xB5);
+    seed_key(
+        &pool,
+        agent,
+        &revoked.public_key(),
+        "signing",
+        "revoked",
+        t0,
+        None,
+    )
+    .await;
+    let by_revoked = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &revoked,
+        "06a50a30: by a revoked signing key",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, by_revoked).await;
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a revoked signing key verified: {resp}"
     );
 }

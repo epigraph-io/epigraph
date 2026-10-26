@@ -212,40 +212,30 @@ type KeyRow = (
     Option<DateTime<Utc>>,
 );
 
-/// The signer's keys that may verify a signature on a row dated `at`:
-///
-/// * each attested `agent_keys` row (`signing`, `identity-legacy`) whose
-///   status and window admit `at` ([`crate::repos::agent_key::key_window_admits`],
-///   the rule the claim verifier uses), and
-/// * the signer's `agents.public_key` ("unattested") only when NO `agent_keys`
-///   row of the signer carries those bytes: a key with a recorded lifecycle is
-///   governed by it, so a revoked, pending or out-of-window key cannot come
-///   back in as the bare agent key.
+/// The signer's keys that may verify a signature on a row dated `at`: the
+/// shared admission rule ([`crate::repos::agent_key::admitted_signature_keys`],
+/// backlog `06a50a30`), the one the claim verifier applies too.
 fn admitted_keys(
     rows: &[KeyRow],
     agent_key: Option<Vec<u8>>,
     at: DateTime<Utc>,
 ) -> Vec<([u8; 32], &'static str)> {
-    let mut out = Vec::new();
-    for (key, key_type, status, from, until) in rows {
-        let kind = match key_type.as_str() {
-            "signing" => "signing",
-            "identity-legacy" => "identity-legacy",
-            _ => continue,
-        };
-        if crate::repos::agent_key::key_window_admits(status, *from, *until, at) {
-            if let Ok(k) = <[u8; 32]>::try_from(key.as_slice()) {
-                out.push((k, kind));
-            }
-        }
-    }
-    if let Some(k) = agent_key
-        .filter(|k| !rows.iter().any(|(key, ..)| key == k))
-        .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
-    {
-        out.push((k, "unattested"));
-    }
-    out
+    let lifecycle: Vec<crate::repos::agent_key::KeyLifecycle<'_>> = rows
+        .iter()
+        .map(
+            |(key, key_type, status, from, until)| crate::repos::agent_key::KeyLifecycle {
+                public_key: key,
+                key_type,
+                status,
+                valid_from: *from,
+                valid_until: *until,
+            },
+        )
+        .collect();
+    crate::repos::agent_key::admitted_signature_keys(&lifecycle, agent_key.as_deref(), at)
+        .into_iter()
+        .map(|a| (a.key, a.kind))
+        .collect()
 }
 
 impl EdgeSignatureRepository {
