@@ -197,7 +197,13 @@
 //!   §2.4 protected set under both of `tenancy_coverage.rs::protected_set`'s
 //!   generators, carries neither `visibility` nor `owner_group_id`, and gets no
 //!   `tenancy_exempt` row (the registry is for relations the generators DO
-//!   find; `migration_068_and_069_apply_twice` pins its cardinality at 12).
+//!   find; `migration_068_and_069_apply_twice` pinned its cardinality at 12).
+//!   AMENDED by migration 173 (backlog 154efca2): the registry now also holds
+//!   the two FK neighbours of the manual tier-A addition `harvester_fragments`
+//!   (`harvester_sources`, `harvester_audit_reports`), which no generator
+//!   finds; the cardinality pin is 14 and
+//!   `tenancy_coverage.rs::the_registry_is_exactly_the_fourteen_measured_rows`
+//!   pins the membership. `webhook_subscriptions` is still not in it.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
@@ -402,7 +408,8 @@
 //!   almost certainly a leak being annotated rather than fixed.
 //! * **No tenancy column.** 086 adds no column to any relation, adds no table,
 //!   and therefore no `tenancy_exempt` row — `tenancy_coverage.rs`'s
-//!   cardinality-12 pin is untouched.
+//!   cardinality-12 pin is untouched (14 since migration 173; see the PR-10
+//!   amendment above).
 //! * **No route moved** between the `public` and `protected` chains, and no
 //!   route was added or removed. `public_router_allowlist.rs` and
 //!   `viewer_route_table_lint.rs` are untouched; PR-24 changes no handler
@@ -447,7 +454,8 @@
 //!   literal in one repo function, plus one new test and doc corrections. Zero
 //!   `pg_policy` rows read, added, removed or edited; no handler signature
 //!   changes; `public_router_allowlist.rs` and `viewer_route_table_lint.rs` are
-//!   untouched; `tenancy_coverage.rs`' cardinality-12 pin is untouched.
+//!   untouched; `tenancy_coverage.rs`' cardinality-12 pin is untouched (14
+//!   since migration 173).
 //! * **D1 — the residual is UNCHANGED IN KIND and WIDER IN BLAST RADIUS.**
 //!   Degraded definer authority is still fail-OPEN, and here it is worse than it
 //!   is for `hidden_claim_ids`. The mechanism is the same: if the frame loses
@@ -545,7 +553,8 @@
 //! * **No tenancy column.** `ownership` carried none — it is not in migration
 //!   062's `tier_a`, has no `claim_id` and no FK to `claims`, so it is in
 //!   neither §2.4 generator and needs no `tenancy_exempt` row. That registry's
-//!   cardinality-12 pin in `tenancy_coverage.rs` is untouched.
+//!   cardinality-12 pin in `tenancy_coverage.rs` is untouched (14 since
+//!   migration 173).
 //!   `schema_contract.rs` never referenced `ownership`; the three shapes it pins
 //!   (062's `tenancy_transcription_log`, `tenancy_backfill_progress`,
 //!   `tenancy_undeclared_writes`) all SURVIVE 084.

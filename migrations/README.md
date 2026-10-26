@@ -1715,6 +1715,22 @@ restart.
   are free on `main` and in every open PR. **Deploy order:** after 140; no
   binary change. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **173**: public `harvester_tables_tenancy_posture` (backlog 154efca2,
+  ledger F-089-B). Two `tenancy_exempt` rows, `harvester_sources` and
+  `harvester_audit_reports`, each with its reason, a class-level residual
+  (NOT CLOSED) and `reviewed_by = 'backlog 154efca2'`. No column, policy or
+  grant changes: it declares the posture the tables already had, which no
+  register recorded. Both are FK
+  neighbours of the hand-registered tier-A `harvester_fragments` and found by
+  neither generator; `tenancy_coverage.rs::every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt`
+  now requires every such neighbour to be covered or registered, and
+  `the_harvester_exemptions_describe_the_tables_as_they_are` fails if row
+  security or an application write arrives without the row being rewritten.
+  `migration_068_and_069_apply_twice` pins the count at 14 (was 12) and
+  `the_registry_is_exactly_the_fourteen_measured_rows` pins the full
+  membership. Undo: delete the two rows. Slot:
+  see 172. **Deploy order:** independent; no binary change. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
