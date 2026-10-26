@@ -1816,17 +1816,22 @@ pub async fn submit_evidence(
     // writers stored before U024, ~15.5k of them on prod), which the reader
     // excludes (backlog b5cb3efb): one real input beside such a row would then
     // report two sources and a Dempster fold that never happened.
-    let total_sources = i64::try_from(
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(
+    //
+    // Only the rows the fold may use (ruling R-22: every source at least as
+    // widely readable as the claim), as the shared pipeline's preview does:
+    // counting an inadmissible row would mark a one-BBA fold as folded and
+    // so tell every reader of the stored global row that it exists.
+    let total_sources = {
+        let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
             &mut *tx,
             &viewer,
             request.claim_id,
             frame_id,
         )
-        .await?
-        .len(),
-    )
-    .unwrap_or(i64::MAX);
+        .await?;
+        let rows = epigraph_engine::derivation_scope::retain_for_cache(&mut tx, rows).await?;
+        i64::try_from(rows.len()).unwrap_or(i64::MAX)
+    };
 
     // The values the rest of the handler reports and emits: this frame's
     // combination by the shared pipeline. `combine_multiple` folds with
