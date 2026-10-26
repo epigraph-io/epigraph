@@ -1,0 +1,864 @@
+-- 180_aid03_legacy_fleet_parent.sql
+-- Accept a legacy fleet identity as a registration parent (AID03), and record
+-- after the fact the succession that the refusal skipped.
+--
+-- ===================================================================
+-- 1. WHY
+--
+-- Before host-attested registration (161), epigraph-mcp created each fleet
+-- identity through `AgentRepository::create`, which never names `agent_type`,
+-- so the row took the column default `'human'` (001), with `key_kind` at its
+-- default `'ed25519'` and `llm_model` recorded afterwards by
+-- `set_llm_properties`. 161's AID03 accepts a parent only when
+-- `agent_type IS DISTINCT FROM 'human'`, so the host's first keyed registration
+-- of each group's successor named that legacy identity as its parent and was
+-- refused. The host then registered the successor with NO parent: no
+-- succession row, no inherited operator link, and the identity could not
+-- write until an operator linked it by hand. 161's own calibration seeded its
+-- "legacy" parent as `software_agent`, which is why its suite stayed green.
+--
+-- ===================================================================
+-- 2. THE RULE: `epigraph_is_legacy_fleet_parent(agent)`
+--
+-- A parent that 161's LLM test refuses is still accepted when ALL of:
+--   (0) its `agent_type` is exactly `'human'`: the legacy create path's column
+--       default, which is the only shape this repairs. Every other type (a
+--       role node, a `system` or `software_agent` row) stays on 161's test,
+--       unchanged, even though the backfill keyed it too;
+--   (a) it carries LLM evidence: `llm_model` in its properties (what 161
+--       already accepts, recorded best-effort by the old create path) OR an
+--       `operator_links` row of any state naming it as the AGENT (written only
+--       by a maintenance session, so attested: an operator linked it as one
+--       of its agents). This is the conjunct that refuses a keyed (ed25519)
+--       human with no OAuth client and no link, which nothing below catches;
+--   (b) it holds an `identity-legacy` key for its own public key: 161's
+--       backfill (`epigraph_backfill_legacy_agent_keys`) gives one to every
+--       agent that exists at the cut-over and none to a host-registered
+--       identity, and since 161 only a privileged session or a maintenance-
+--       owned definer can write one (161 section 7a), so this is attested;
+--   (c) it is not a keyless human: its key is not `derived` (the OAuth
+--       principal mint's placeholder kind, which the application role can
+--       neither insert nor change, 077) and it is not labelled
+--       `oauth-principal`;
+--   (d) it is not, and never was, a registered human operator: no
+--       `human_operators` row, revoked or not (only maintenance writes one);
+--   (e) it is no OAuth human client's principal: no `oauth_clients` row of
+--       `client_type 'human'` names it as `agent_id`, in any status (a pending,
+--       suspended or revoked human client is still a person's). `agent_id` is
+--       the only column of `oauth_clients` that names an agent: `owner_id` and
+--       `created_by` reference `oauth_clients(id)` (001), so "owns a human
+--       client" is exactly this test.
+-- 161's refusal of a live human operator (`epigraph_is_human_operator`) still
+-- applies to every parent, on either arm.
+--
+-- What each input rests on. The ACCEPT side rests on attested state: the
+-- legacy key, `key_kind`, `human_operators`, `operator_links`. `llm_model`
+-- and `labels` are writable by the application role on its OWN row (118's
+-- column grant, 077's `agents_self_update`); a principal could set
+-- `llm_model` on itself, but that only matters if the HOST names it as a
+-- parent, and a container never names a parent (161 section 1). The REFUSE side includes inputs the
+-- application role can write (it may INSERT `oauth_clients` by dynamic
+-- registration, and may relabel its own row): forging one of those can only
+-- make AID03 refuse, which falls back to what happened before this migration
+-- (the host registers the child with no parent and alerts). It never admits.
+--
+-- ===================================================================
+-- 3. REGISTRATION, RE-STATED
+--
+-- `epigraph_register_agent_identity` is re-stated from 166's body (the latest;
+-- a precondition below checks its md5) with exactly one delta, marked `180`:
+-- the AID03 test accepts a parent for which the rule above holds. The AID03
+-- message, code and HINT are unchanged (the host matches on the code).
+-- Signature, owner and ACL are unchanged (CREATE OR REPLACE keeps them; the
+-- ACL stays the attestor's alone). A later migration that re-bodies the
+-- registration starts from this body.
+--
+-- ===================================================================
+-- 4. THE AFTER-THE-FACT RECORD:
+--    `epigraph_record_legacy_succession(child, parent, group_folder, reason)`
+--
+-- For a child the host registered parentless because AID03 refused its legacy
+-- parent. Maintenance-only (a maintenance or superuser session; EXECUTE is
+-- the maintenance role's alone) and audited. It takes the operator-links
+-- advisory lock, as the registration does. A child that already has a
+-- succession row naming THIS parent, in any group folder, returns
+-- `recorded = false` and writes nothing: one identity serves every group with
+-- the same model and files, so a shared child registered parentless in two
+-- folders against the same legacy parent needs one row, and a call for the
+-- second folder is a repeat, not an error. Otherwise it refuses (AID10,
+-- nothing written, each refusal naming its reason) unless:
+--   * the child is not the parent, and both exist;
+--   * the child was host-registered in that group (a snapshot there) and its
+--     registration audit row in that group recorded NO parent;
+--   * the child has no succession row at all and no display parent (so a
+--     second, conflicting parent is refused: the first record stands);
+--   * the parent is a legacy fleet parent (the rule above) and is not a live
+--     human operator, and was created no later than the child;
+--   * the child is live-linked, and the parent names the SAME operator
+--     (`epigraph_human_of(parent, false)`: a parent link retired since still
+--     names its operator);
+--   * the parent holds no un-detached, unended role attachment. 166 copies a
+--     parent's attachments to its successor at registration; a legacy
+--     (`'human'`-typed) parent cannot be attached (166's ROL02), so this only
+--     refuses an out-of-band case, and copying here would be a grant once an
+--     attachment confers group membership.
+-- It then writes what 161's registration writes for a succession: the
+-- `agent_succession` row (with the child's earliest snapshot in that group;
+-- `attested_by` is the maintenance login), the display `parent_agent_id`, and
+-- one `agent.identity_succession_recorded` security event naming the child,
+-- parent, group, snapshot, operator, reason and `session_user` (the
+-- `agent.identity_` family is reserved for privileged sessions by 161's
+-- RESTRICTIVE policy). It moves NO link: no `operator_links`, membership,
+-- role attachment or edge row is written.
+--
+-- ===================================================================
+-- 5. UNDO
+--
+-- `docs/runbooks/180-undo.sql` restores 166's registration body byte for byte
+-- and drops the two functions this file creates. Run it before
+-- `166-undo.sql`. Succession rows it recorded stay (the table is
+-- append-only), as do their audit rows.
+
+SET LOCAL lock_timeout = '3s';
+
+-- -------------------------------------------------------------------
+-- Precondition: the registration still carries the body this file re-states
+-- (166's). CREATE OR REPLACE replaces a body whole, so applying this over any
+-- other body would silently drop that body's arm. Refuse instead. The md5 is
+-- of `prosrc`, the exact text between 166's dollar quotes.
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    v_found text;
+BEGIN
+    SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
+     WHERE p.oid = to_regprocedure('public.epigraph_register_agent_identity('
+                                   'bytea, uuid, text, text, text, bytea, jsonb)');
+    IF v_found IS DISTINCT FROM '9e195fdea9cf424aa5d6941c20f40651' THEN
+        RAISE EXCEPTION '180: public.epigraph_register_agent_identity(bytea, uuid, text, text, '
+                        'text, bytea, jsonb) is not the body 180 re-states (166''s, md5 '
+                        '9e195fdea9cf424aa5d6941c20f40651); found md5 %. Another migration '
+                        're-bodied it, or 166 is not applied; nothing was changed',
+                        COALESCE(v_found, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Apply a reconciling migration that re-states the registration with '
+                         'every delta instead of this one.';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- THE RULE (section 2)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_is_legacy_fleet_parent(p_agent uuid)
+RETURNS boolean
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT p_agent IS NOT NULL
+       AND EXISTS (
+           SELECT 1 FROM public.agents a
+            WHERE a.id = p_agent
+              -- (0) the legacy create path's default type, and only that
+              AND a.agent_type = 'human'
+              -- (a) LLM evidence: 161's, or an attested operator link
+              AND (a.properties ? 'llm_model'
+                   OR EXISTS (SELECT 1 FROM public.operator_links l
+                               WHERE l.agent_id = a.id))
+              -- (c) not a keyless (OAuth placeholder) human
+              AND a.key_kind <> 'derived'
+              AND NOT ('oauth-principal' = ANY (COALESCE(a.labels, '{}'::text[])))
+              -- (b) a backfilled legacy key for its own public key
+              AND EXISTS (SELECT 1 FROM public.agent_keys k
+                           WHERE k.agent_id = a.id
+                             AND k.key_type = 'identity-legacy'
+                             AND k.public_key = a.public_key))
+       -- (d) never a registered human operator
+       AND NOT EXISTS (SELECT 1 FROM public.human_operators h WHERE h.agent_id = p_agent)
+       -- (e) no OAuth human client names it, in any status
+       AND NOT EXISTS (SELECT 1 FROM public.oauth_clients c
+                        WHERE c.agent_id = p_agent AND c.client_type = 'human')
+$$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_is_legacy_fleet_parent(uuid) FROM PUBLIC;
+
+-- ===================================================================
+-- REGISTRATION (section 3): 166's body with the one `180` delta.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_register_agent_identity(
+    p_identity_pubkey bytea,
+    p_parent_agent    uuid,
+    p_model           text,
+    p_prompt_hash     text,
+    p_group_folder    text,
+    p_signing_pubkey  bytea,
+    p_snapshot        jsonb)
+RETURNS TABLE (agent_id uuid,
+               agent_created boolean,
+               succession_created boolean,
+               snapshot_id uuid,
+               snapshot_created boolean,
+               signing_key_registered boolean,
+               operator_id uuid,
+               inherited boolean,
+               link_live boolean,
+               inherit_reason text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    c_files      constant text[] := ARRAY['identity_md', 'global_claude_md',
+                                          'group_claude_md', 'learned_md'];
+    v_child      uuid;
+    v_props      jsonb;
+    v_parent     uuid := p_parent_agent;
+    v_created    boolean := false;
+    v_succ_rows  integer := 0;
+    v_snapshot   uuid;
+    v_snap_new   boolean := false;
+    v_key_new    boolean := false;
+    v_parent_op  uuid;
+    v_child_op   uuid;
+    v_inherited  boolean := false;
+    v_reason     text;
+    v_in_prompt  jsonb;
+    v_refused    text[] := '{}';
+    v_blob       bytea[] := ARRAY[NULL, NULL, NULL, NULL]::bytea[];
+    v_entry      jsonb;
+    v_hash       bytea;
+    v_size       integer;
+    v_stored     integer;
+    v_unknown    text[];
+    v_live       boolean;
+    v_link_live  boolean;
+    v_personal   uuid;
+    v_fk         record;
+    v_hit        boolean;
+    v_binding    text;
+    v_bound      bytea;
+    v_rec_model  text;
+    v_rec_hash   text;
+    v_roles_new  integer := 0;  -- 166
+    v_shared     boolean := false;  -- 166
+    i            integer;
+BEGIN
+    -- Inputs.
+    IF p_identity_pubkey IS NULL OR octet_length(p_identity_pubkey) <> 32 THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: the identity public key must be 32 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_model IS NULL OR btrim(p_model) = '' OR length(p_model) > 255 THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: a model is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_prompt_hash IS NULL OR p_prompt_hash !~ '^[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: the prompt hash must be 64 lowercase hex '
+                        'characters'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_group_folder IS NULL OR p_group_folder = '' OR length(p_group_folder) > 255 THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: a group folder is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_signing_pubkey IS NOT NULL AND octet_length(p_signing_pubkey) <> 32 THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: the signing public key must be 32 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_signing_pubkey = p_identity_pubkey THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: the signing key must not be the '
+                        'identity key'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_snapshot IS NULL OR jsonb_typeof(p_snapshot) <> 'object' THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: the snapshot must be a JSON object'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT array_agg(k ORDER BY k) INTO v_unknown
+      FROM jsonb_object_keys(p_snapshot) AS k
+     WHERE k <> ALL (c_files || ARRAY['in_prompt', 'runner_version', 'host_sha']);
+    IF v_unknown IS NOT NULL THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: unknown snapshot keys %', v_unknown
+            USING ERRCODE = '22023';
+    END IF;
+    v_in_prompt := p_snapshot -> 'in_prompt';
+    IF v_in_prompt IS NULL OR jsonb_typeof(v_in_prompt) <> 'object' THEN
+        RAISE EXCEPTION 'epigraph_register_agent_identity: snapshot.in_prompt must be a JSON object'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Every link write and every registration, one at a time (107 section 10).
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+
+    -- The parent. Equal to the child (same key): no lineage to record.
+    IF v_parent IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM public.agents a WHERE a.id = v_parent) THEN
+            RAISE EXCEPTION 'epigraph_register_agent_identity: parent % does not exist', v_parent
+                USING ERRCODE = '22023';
+        END IF;
+        IF EXISTS (SELECT 1 FROM public.agents a
+                    WHERE a.id = v_parent AND a.public_key = p_identity_pubkey) THEN
+            v_parent := NULL;
+        -- 180: a legacy fleet identity (agent_type 'human' by the old create
+        -- path's column default, LLM evidence, a backfilled identity-legacy
+        -- key, and no human marker) is an LLM agent too; see
+        -- `epigraph_is_legacy_fleet_parent`.
+        ELSIF (NOT EXISTS (SELECT 1 FROM public.agents a
+                            WHERE a.id = v_parent
+                              AND (a.key_kind = 'derived' OR a.properties ? 'llm_model')
+                              AND a.agent_type IS DISTINCT FROM 'human')
+               AND NOT public.epigraph_is_legacy_fleet_parent(v_parent))  -- 180
+              OR public.epigraph_is_human_operator(v_parent) THEN
+            RAISE EXCEPTION 'AID03: parent % is not an LLM agent', v_parent
+                USING ERRCODE = 'AID03',
+                      HINT = 'A parent is the identity the host last registered for this group.';
+        END IF;
+    END IF;
+
+    -- 1. Find or create the agent by its identity key.
+    SELECT a.id, a.properties INTO v_child, v_props
+      FROM public.agents a WHERE a.public_key = p_identity_pubkey;
+    IF v_child IS NULL THEN
+        INSERT INTO public.agents (public_key, agent_type, key_kind, properties)
+        VALUES (p_identity_pubkey, 'llm', 'derived',
+                jsonb_build_object('llm_model', p_model, 'llm_prompt_hash', p_prompt_hash,
+                                   'source', 'epiclaw'))
+        RETURNING id INTO v_child;
+        v_created := true;
+    ELSE
+        IF NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = v_child)
+           AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                            WHERE s.agent_id = v_child)
+           AND EXISTS (SELECT 1 FROM public.claims c WHERE c.agent_id = v_child) THEN
+            RAISE EXCEPTION 'AID05: agent % has authored claims and was never registered; it is '
+                            'not an EpiClaw identity to adopt', v_child
+                USING ERRCODE = 'AID05';
+        END IF;
+        -- AID09: a never-registered agent is adopted only when it is FRESH,
+        -- decided by a GENERIC scan rather than a list, so a binding table
+        -- added later fails closed without touching this function. Fresh means
+        -- no row in any table references the agent through a foreign key into
+        -- `agents`, except:
+        --   * its GENUINE personal group (`kind 'personal'`, the personal
+        --     did_key, created by the agent itself) and its own membership of
+        --     that group, which is the shape epigraph-mcp creates when it meets
+        --     an identity before the host registers it;
+        --   * its own `identity-legacy` key (the 161 backfill);
+        --   * audit rows (`security_events`), which bind nothing;
+        --   * `claims`, which AID05 already decides.
+        -- It also refuses the two bindings no foreign key into `agents` can
+        -- see: being an OAuth client's owner, and sharing the personal group
+        -- with any other member.
+        IF NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = v_child)
+           AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                            WHERE s.agent_id = v_child) THEN
+            SELECT g.id INTO v_personal
+              FROM public.groups g
+             WHERE g.did_key = 'did:epigraph:personal:' || v_child::text
+               AND g.kind = 'personal'
+               AND g.created_by_agent_id = v_child;
+            FOR v_fk IN
+                SELECT c.conrelid AS rel, a.attname AS col
+                  FROM pg_catalog.pg_constraint c
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                 WHERE c.contype = 'f'
+                   AND c.confrelid = 'public.agents'::regclass
+                   AND array_length(c.conkey, 1) = 1
+                   AND c.conrelid NOT IN ('public.security_events'::regclass,
+                                          'public.claims'::regclass)
+                 ORDER BY c.conrelid::regclass::text, a.attname
+            LOOP
+                -- A table this owner cannot read is not "unbound": fail closed.
+                BEGIN
+                EXECUTE format(
+                    'SELECT EXISTS (SELECT 1 FROM %s WHERE %I = $1%s)',
+                    v_fk.rel::regclass, v_fk.col,
+                    CASE
+                        WHEN v_fk.rel = 'public.groups'::regclass
+                            THEN ' AND id IS DISTINCT FROM $2'
+                        WHEN v_fk.rel = 'public.group_memberships'::regclass
+                            THEN ' AND group_id IS DISTINCT FROM $2'
+                        WHEN v_fk.rel = 'public.agent_keys'::regclass
+                             AND v_fk.col = 'agent_id'
+                            THEN ' AND key_type <> ''identity-legacy'''
+                        ELSE ''
+                    END)
+                  INTO v_hit
+                  USING v_child, v_personal;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    v_hit := true;
+                END;
+                IF v_hit THEN
+                    v_binding := v_fk.rel::regclass::text || '.' || v_fk.col;
+                    EXIT;
+                END IF;
+            END LOOP;
+            IF v_binding IS NULL AND EXISTS (SELECT 1 FROM public.oauth_clients oc
+                                            WHERE oc.owner_id = v_child) THEN
+                v_binding := 'oauth_clients.owner_id';
+            END IF;
+            IF v_binding IS NULL AND v_personal IS NOT NULL
+               AND EXISTS (SELECT 1 FROM public.group_memberships m
+                            WHERE m.group_id = v_personal AND m.agent_id <> v_child) THEN
+                v_binding := 'another member of its personal group';
+            END IF;
+            IF v_binding IS NOT NULL THEN
+                RAISE EXCEPTION 'AID09: agent % was never registered and is not fresh (bound '
+                                'through %); it is not an EpiClaw identity to adopt',
+                                v_child, v_binding
+                    USING ERRCODE = 'AID09';
+            END IF;
+        END IF;
+        -- What the identity was registered under: its earliest snapshot.
+        SELECT s.model, s.prompt_hash INTO v_rec_model, v_rec_hash
+          FROM public.agent_prompt_snapshots s
+         WHERE s.agent_id = v_child
+         ORDER BY s.first_seen, s.id
+         LIMIT 1;
+        IF FOUND AND (v_rec_model IS DISTINCT FROM p_model
+                      OR v_rec_hash IS DISTINCT FROM p_prompt_hash) THEN
+            RAISE EXCEPTION 'epigraph_register_agent_identity: agent % is registered under another '
+                            'model or prompt hash; the identity key is a function of both',
+                            v_child
+                USING ERRCODE = '22023';
+        END IF;
+        -- Display only, re-asserted (and only written when it differs, so a
+        -- repeat start writes nothing here).
+        IF v_props ->> 'llm_model' IS DISTINCT FROM p_model
+           OR v_props ->> 'llm_prompt_hash' IS DISTINCT FROM p_prompt_hash THEN
+            UPDATE public.agents a
+               SET properties = COALESCE(a.properties, '{}'::jsonb)
+                                || jsonb_build_object('llm_model', p_model,
+                                                      'llm_prompt_hash', p_prompt_hash),
+                   updated_at = now()
+             WHERE a.id = v_child;
+        END IF;
+    END IF;
+
+    -- 2. The blobs, then the snapshot (D4).
+    FOR i IN 1 .. 4 LOOP
+        v_entry := p_snapshot -> c_files[i];
+        CONTINUE WHEN v_entry IS NULL OR jsonb_typeof(v_entry) = 'null';
+        IF jsonb_typeof(v_entry) <> 'object' THEN
+            RAISE EXCEPTION 'epigraph_register_agent_identity: snapshot.% must be null or an object',
+                            c_files[i]
+                USING ERRCODE = '22023';
+        END IF;
+        IF v_entry ? 'refused' THEN
+            IF v_entry <> '{"refused": true}'::jsonb THEN
+                RAISE EXCEPTION 'epigraph_register_agent_identity: a refused file is exactly '
+                                '{"refused": true} (snapshot.%)', c_files[i]
+                    USING ERRCODE = '22023';
+            END IF;
+            v_refused := v_refused || c_files[i];
+            CONTINUE;
+        END IF;
+        IF (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(v_entry) AS k)
+           IS DISTINCT FROM ARRAY['blob_hash', 'codec', 'content', 'raw_size']
+           OR v_entry ->> 'codec' IS DISTINCT FROM 'zstd'
+           OR NOT COALESCE(v_entry ->> 'blob_hash' ~ '^[0-9a-f]{64}$', false)
+           OR jsonb_typeof(v_entry -> 'raw_size') IS DISTINCT FROM 'number'
+           OR NOT COALESCE(v_entry ->> 'content' ~ '^([0-9a-f]{2})+$', false) THEN
+            RAISE EXCEPTION 'epigraph_register_agent_identity: snapshot.% must be '
+                            '{blob_hash: 64 hex, raw_size: integer, codec: "zstd", content: hex}',
+                            c_files[i]
+                USING ERRCODE = '22023';
+        END IF;
+        v_hash := decode(v_entry ->> 'blob_hash', 'hex');
+        v_size := (v_entry ->> 'raw_size')::integer;
+        INSERT INTO public.agent_prompt_blobs (blob_hash, codec, raw_size, content)
+        VALUES (v_hash, 'zstd', v_size, decode(v_entry ->> 'content', 'hex'))
+        ON CONFLICT (blob_hash) DO NOTHING;
+        IF NOT FOUND THEN
+            SELECT b.raw_size INTO v_stored FROM public.agent_prompt_blobs b
+             WHERE b.blob_hash = v_hash;
+            IF v_stored IS DISTINCT FROM v_size THEN
+                RAISE EXCEPTION 'epigraph_register_agent_identity: blob % is stored with a '
+                                'different size; refusing to record it',
+                                v_entry ->> 'blob_hash'
+                    USING ERRCODE = '22023';
+            END IF;
+        END IF;
+        v_blob[i] := v_hash;
+    END LOOP;
+
+    INSERT INTO public.agent_prompt_snapshots
+           (agent_id, group_folder, model, prompt_hash, identity_md, global_claude_md,
+            group_claude_md, learned_md, in_prompt, blob_refused, runner_version, host_sha)
+    VALUES (v_child, p_group_folder, p_model, p_prompt_hash, v_blob[1], v_blob[2],
+            v_blob[3], v_blob[4], v_in_prompt, v_refused,
+            p_snapshot ->> 'runner_version', p_snapshot ->> 'host_sha')
+    ON CONFLICT ON CONSTRAINT agent_prompt_snapshots_one_per_state DO NOTHING
+    RETURNING id INTO v_snapshot;
+    IF v_snapshot IS NOT NULL THEN
+        v_snap_new := true;
+    ELSE
+        SELECT s.id INTO v_snapshot
+          FROM public.agent_prompt_snapshots s
+         WHERE s.agent_id = v_child AND s.group_folder = p_group_folder AND s.model = p_model
+           AND s.identity_md IS NOT DISTINCT FROM v_blob[1]
+           AND s.global_claude_md IS NOT DISTINCT FROM v_blob[2]
+           AND s.group_claude_md IS NOT DISTINCT FROM v_blob[3]
+           AND s.learned_md IS NOT DISTINCT FROM v_blob[4]
+           AND s.in_prompt = v_in_prompt AND s.blob_refused = v_refused;
+        UPDATE public.agent_prompt_snapshots s
+           SET last_seen = GREATEST(s.last_seen, now())
+         WHERE s.id = v_snapshot;
+    END IF;
+
+    -- 3. The succession, and the display parent.
+    IF v_parent IS NOT NULL THEN
+        INSERT INTO public.agent_succession (child_agent_id, parent_agent_id, group_folder,
+                                             snapshot_id)
+        VALUES (v_child, v_parent, p_group_folder, v_snapshot)
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS v_succ_rows = ROW_COUNT;
+        UPDATE public.agents a SET parent_agent_id = v_parent, updated_at = now()
+         WHERE a.id = v_child AND a.parent_agent_id IS NULL;
+    END IF;
+
+    -- 4. The signing key (D2). The same key again is a no-op and is checked
+    -- against nothing else, so a copy of it that someone records elsewhere
+    -- once it is public cannot block the identity. A fresh binding must be
+    -- bound nowhere as an attested key (this agent's rotated or revoked keys
+    -- included: a key is never re-activated) and be no agent's identity key.
+    IF p_signing_pubkey IS NOT NULL THEN
+        SELECT k.public_key INTO v_bound
+          FROM public.agent_keys k
+         WHERE k.agent_id = v_child AND k.key_type = 'signing' AND k.status = 'active';
+        IF v_bound IS NULL THEN
+            IF EXISTS (SELECT 1 FROM public.agent_keys k
+                        WHERE k.public_key = p_signing_pubkey
+                          AND lower(btrim(k.key_type)) IN ('signing', 'identity-legacy'))
+               OR EXISTS (SELECT 1 FROM public.agents a WHERE a.public_key = p_signing_pubkey) THEN
+                RAISE EXCEPTION 'epigraph_register_agent_identity: the signing key is already bound '
+                                '(to another agent, or to this one before a rotation or revocation)'
+                    USING ERRCODE = '22023';
+            END IF;
+            INSERT INTO public.agent_keys (agent_id, public_key, key_type, status)
+            VALUES (v_child, p_signing_pubkey, 'signing', 'active');
+            v_key_new := true;
+        ELSIF v_bound <> p_signing_pubkey THEN
+            RAISE EXCEPTION 'AID08: agent % already has a different active signing key; nothing '
+                            'was recorded', v_child
+                USING ERRCODE = 'AID08',
+                      HINT = 'Revoking a bound signing key is a maintenance act; the host then '
+                             'registers its new key.';
+        END IF;
+    END IF;
+
+    -- 5. Inherit the link.
+    v_child_op := public.epigraph_human_of(v_child, false);
+    IF v_parent IS NULL THEN
+        v_reason := 'no_parent';
+    ELSE
+        v_parent_op := public.epigraph_human_of(v_parent, true);
+        IF v_parent_op IS NULL THEN
+            v_reason := CASE WHEN EXISTS (SELECT 1 FROM public.operator_links l
+                                           WHERE l.agent_id = v_parent AND l.retired)
+                             THEN 'parent_link_retired'
+                             ELSE 'parent_unlinked' END;
+        ELSIF v_child_op IS NULL
+              AND EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                           WHERE s.agent_id = v_child AND s.group_folder <> p_group_folder) THEN
+            -- A SHARED identity (it already runs in another group) that nobody
+            -- has linked: whichever group's parent named it first would decide
+            -- the operator of every group running it, and a container chooses
+            -- its next identity through its own LEARNED.md. Record the lineage,
+            -- link nothing; a shared identity is linked by a manual act.
+            v_reason := 'shared_identity';
+        ELSIF v_child_op IS NULL THEN
+            -- The link body's own refusals (55000: 107's shared-signer
+            -- fingerprint, single hop, one operator ever) refuse the LINK, not
+            -- the registration. Their inputs include OPERATED_BY edges, which
+            -- any application session can write, so letting one abort the
+            -- call would let a container stop its group starting. The block
+            -- rolls back only the body's own writes.
+            BEGIN
+                SELECT b.link_live INTO v_live
+                  FROM public.epigraph_link_operator_body(
+                           v_child, v_parent_op,
+                           jsonb_build_object('source', 'epigraph_register_agent_identity',
+                                              'inherited_from', v_parent,
+                                              'group_folder', p_group_folder)) b;
+                -- The body recorded the link (the child had none): that is
+                -- the inheritance, live or not; `link_live` below says which.
+                v_inherited := true;
+                IF NOT COALESCE(v_live, false) THEN
+                    v_reason := 'link_not_live';
+                END IF;
+            EXCEPTION WHEN SQLSTATE '55000' THEN
+                v_reason := 'link_refused';
+            END;
+        ELSIF v_child_op = v_parent_op THEN
+            -- Linked to the same operator already; a RETIRED link cannot
+            -- write, which the host must hear about rather than "linked".
+            v_reason := CASE WHEN EXISTS (SELECT 1 FROM public.operator_links l
+                                           WHERE l.agent_id = v_child AND l.retired)
+                             THEN 'child_link_retired'
+                             ELSE 'already_linked' END;
+        ELSE
+            RAISE EXCEPTION 'AID07: agent % is linked to operator %, but its parent % is live-linked '
+                            'to operator %; nothing was recorded', v_child, v_child_op, v_parent,
+                            v_parent_op
+                USING ERRCODE = 'AID07',
+                      HINT = 'Re-pointing an agent to another operator is an out-of-band act.';
+        END IF;
+    END IF;
+    v_child_op := public.epigraph_human_of(v_child, false);
+    v_link_live := public.epigraph_human_of(v_child, true) IS NOT NULL;
+
+    -- 5b (166). The parent's role attachments: every un-detached attachment
+    -- of the parent that has not ended (live, or not yet started) is copied
+    -- to the child over its window from now (or its own later start) to its
+    -- own end, naming the row it came from: ONE ROW PER GAP the child's own
+    -- un-detached rows for that role leave in that window, none where they
+    -- cover it. So the child is attached for the whole of the parent's
+    -- window (a short row of its own never ends its coverage early), a
+    -- repeat registration finds nothing uncovered, and no copy overlaps a
+    -- live row (the guard never aborts the registration). A parent row the
+    -- child has ever inherited is not copied again (detached included: a
+    -- detach is final, so a repeat registration naming the same parent never
+    -- undoes an operator's detach). So a LEARNED.md edit or a model change
+    -- does not detach an agent from its role. Each copy meets the table's
+    -- guards and writes its own audit row. An attachment only ever refuses,
+    -- so a copy never grants the child anything.
+    -- A SHARED child (it already runs in another group folder: step 5's
+    -- `shared_identity`) is copied ALIKE: an attachment only ever refuses,
+    -- so skipping it would leave a linked, write-capable identity outside
+    -- the role's restriction. The cost, accepted, is that the shared
+    -- identity is dormant in every group it runs in while the role has no
+    -- holder, so the audit row below FLAGS it (`role_attachments_shared =
+    -- 'shared_identity'`) for the host to alert every group affected.
+    IF v_parent IS NOT NULL THEN
+        INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
+                                        inherited_from)
+        SELECT pr.role, v_child, lower(g.gap), upper(g.gap),
+               'succession from ' || v_parent::text || ' in ' || p_group_folder, pr.id
+          FROM public.role_agents pr
+         CROSS JOIN LATERAL unnest(
+                   tstzmultirange(tstzrange(GREATEST(now(), pr.valid_from), pr.valid_to))
+                   - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                                 FROM public.role_agents c
+                                WHERE c.agent_id = v_child AND c.role = pr.role
+                                  AND c.detached_at IS NULL),
+                              '{}'::tstzmultirange)) AS g(gap)
+         WHERE pr.agent_id = v_parent AND pr.detached_at IS NULL
+           AND (pr.valid_to IS NULL OR pr.valid_to > now())
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+         ORDER BY pr.role, lower(g.gap);
+        GET DIAGNOSTICS v_roles_new = ROW_COUNT;
+        v_shared := v_roles_new > 0
+                    AND EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                                 WHERE s.agent_id = v_child
+                                   AND s.group_folder <> p_group_folder);
+    END IF;
+
+    -- 6. The audit row, when something new was recorded.
+    IF v_created OR v_succ_rows > 0 OR v_snap_new OR v_key_new OR v_inherited
+       OR v_roles_new > 0 THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('agent.identity_registered', v_child, true,
+                jsonb_build_object('parent_agent_id', v_parent,
+                                   'group_folder', p_group_folder,
+                                   'model', p_model,
+                                   'prompt_hash', p_prompt_hash,
+                                   'operator_id', v_child_op,
+                                   'snapshot_id', v_snapshot,
+                                   'agent_created', v_created,
+                                   'succession_created', v_succ_rows > 0,
+                                   'snapshot_created', v_snap_new,
+                                   'signing_key_registered', v_key_new,
+                                   'inherited', v_inherited,
+                                   'link_live', v_link_live,
+                                   'inherit_reason', v_reason,
+                                   'role_attachments_copied', v_roles_new,
+                                   'role_attachments_shared',
+                                   CASE WHEN v_shared THEN 'shared_identity' END,
+                                   'recorded_by', session_user));
+    END IF;
+
+    RETURN QUERY
+    SELECT v_child, v_created, v_succ_rows > 0, v_snapshot, v_snap_new, v_key_new,
+           v_child_op, v_inherited, v_link_live, v_reason;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
+    bytea, uuid, text, text, text, bytea, jsonb) FROM PUBLIC;
+
+-- ===================================================================
+-- THE AFTER-THE-FACT RECORD (section 4)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_record_legacy_succession(
+    p_child        uuid,
+    p_parent       uuid,
+    p_group_folder text,
+    p_reason       text)
+RETURNS TABLE (recorded boolean, snapshot_id uuid, operator_id uuid)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_snapshot  uuid;
+    v_child_op  uuid;
+    v_parent_op uuid;
+    v_child_at  timestamptz;
+    v_parent_at timestamptz;
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'epigraph_record_legacy_succession: only a maintenance session records '
+                        'a succession after the fact'
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_child IS NULL OR p_parent IS NULL OR p_group_folder IS NULL
+       OR btrim(p_group_folder) = '' OR p_reason IS NULL OR btrim(p_reason) = '' THEN
+        RAISE EXCEPTION 'epigraph_record_legacy_succession: a child, a parent, a group folder '
+                        'and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF length(p_group_folder) > 255 OR length(p_reason) > 1000 THEN
+        RAISE EXCEPTION 'epigraph_record_legacy_succession: the group folder is at most 255 '
+                        'characters and the reason at most 1000'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_child = p_parent THEN
+        RAISE EXCEPTION 'AID10: the child % is its own parent; nothing was recorded', p_child
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    -- Every link write and every registration, one at a time (107 section 10).
+    PERFORM pg_advisory_xact_lock(hashtext('epigraph.operator_links'));
+
+    SELECT a.created_at INTO v_child_at FROM public.agents a WHERE a.id = p_child;
+    SELECT a.created_at INTO v_parent_at FROM public.agents a WHERE a.id = p_parent;
+    IF v_child_at IS NULL OR v_parent_at IS NULL THEN
+        RAISE EXCEPTION 'AID10: agent % or % does not exist; nothing was recorded',
+                        p_child, p_parent
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    -- The same (child, parent) already on record, in ANY group folder: one row
+    -- per pair is enough (a shared identity runs in several folders), so this
+    -- is a repeat and writes nothing. Before the refusals below, which would
+    -- otherwise read the existing row as "already has a recorded parent".
+    SELECT s.snapshot_id INTO v_snapshot
+      FROM public.agent_succession s
+     WHERE s.child_agent_id = p_child AND s.parent_agent_id = p_parent
+     ORDER BY s.attested_at, s.group_folder
+     LIMIT 1;
+    IF FOUND THEN
+        RETURN QUERY SELECT false, v_snapshot, public.epigraph_human_of(p_child, false);
+        RETURN;
+    END IF;
+
+    -- The child: host-registered in this group, parentless, never given one.
+    SELECT s.id INTO v_snapshot
+      FROM public.agent_prompt_snapshots s
+     WHERE s.agent_id = p_child AND s.group_folder = p_group_folder
+     ORDER BY s.first_seen, s.id
+     LIMIT 1;
+    IF v_snapshot IS NULL THEN
+        RAISE EXCEPTION 'AID10: agent % was never registered in group %; nothing was recorded',
+                        p_child, p_group_folder
+            USING ERRCODE = 'AID10';
+    END IF;
+    IF EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = p_child)
+       OR EXISTS (SELECT 1 FROM public.agents a
+                   WHERE a.id = p_child AND a.parent_agent_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'AID10: agent % already has a recorded parent; nothing was recorded',
+                        p_child
+            USING ERRCODE = 'AID10';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM public.security_events e
+                    WHERE e.event_type = 'agent.identity_registered'
+                      AND e.agent_id = p_child
+                      AND e.details ->> 'group_folder' = p_group_folder
+                      AND e.details ->> 'parent_agent_id' IS NULL) THEN
+        RAISE EXCEPTION 'AID10: no parentless registration of agent % in group % is on record; '
+                        'nothing was recorded', p_child, p_group_folder
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    -- The parent: a legacy fleet identity that preceded the child.
+    IF NOT public.epigraph_is_legacy_fleet_parent(p_parent)
+       OR public.epigraph_is_human_operator(p_parent) THEN
+        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, LLM '
+                        'evidence, an identity-legacy key, and no human marker); nothing was '
+                        'recorded', p_parent
+            USING ERRCODE = 'AID10';
+    END IF;
+    IF v_parent_at > v_child_at THEN
+        RAISE EXCEPTION 'AID10: agent % was created after agent %, so it did not precede it; '
+                        'nothing was recorded', p_parent, p_child
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    -- One operator for both.
+    v_child_op := public.epigraph_human_of(p_child, true);
+    v_parent_op := public.epigraph_human_of(p_parent, false);
+    IF v_child_op IS NULL THEN
+        RAISE EXCEPTION 'AID10: agent % has no live operator link; link it first; nothing was '
+                        'recorded', p_child
+            USING ERRCODE = 'AID10';
+    END IF;
+    IF v_parent_op IS DISTINCT FROM v_child_op THEN
+        RAISE EXCEPTION 'AID10: agent % is linked to operator % but its parent % to %; nothing '
+                        'was recorded', p_child, v_child_op, p_parent,
+                        COALESCE(v_parent_op::text, '(none)')
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    -- A role attachment the registration would have copied: not here.
+    IF EXISTS (SELECT 1 FROM public.role_agents r
+                WHERE r.agent_id = p_parent AND r.detached_at IS NULL
+                  AND (r.valid_to IS NULL OR r.valid_to > now())) THEN
+        RAISE EXCEPTION 'AID10: agent % holds a role attachment that a registration would copy '
+                        'to its successor; record this succession by hand; nothing was recorded',
+                        p_parent
+            USING ERRCODE = 'AID10';
+    END IF;
+
+    INSERT INTO public.agent_succession (child_agent_id, parent_agent_id, group_folder,
+                                         snapshot_id)
+    VALUES (p_child, p_parent, p_group_folder, v_snapshot);
+    UPDATE public.agents a SET parent_agent_id = p_parent, updated_at = now()
+     WHERE a.id = p_child AND a.parent_agent_id IS NULL;
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    VALUES ('agent.identity_succession_recorded', p_child, true,
+            jsonb_build_object('parent_agent_id', p_parent,
+                               'group_folder', p_group_folder,
+                               'snapshot_id', v_snapshot,
+                               'operator_id', v_child_op,
+                               'reason', p_reason,
+                               'recorded_after_the_fact', true,
+                               'session_user', session_user::text));
+
+    RETURN QUERY SELECT true, v_snapshot, v_child_op;
+END $$;
+REVOKE EXECUTE ON FUNCTION
+    public.epigraph_record_legacy_succession(uuid, uuid, text, text) FROM PUBLIC;
+
+-- ===================================================================
+-- OWNERSHIP AND GRANTS, guarded as every such block since 060.
+-- ===================================================================
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_is_legacy_fleet_parent(uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION '
+                'public.epigraph_record_legacy_succession(uuid, uuid, text, text) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_is_legacy_fleet_parent(uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_record_legacy_succession(uuid, uuid, text, text) '
+                'TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION public.epigraph_is_legacy_fleet_parent(uuid) '
+                'FROM epigraph_app';
+        EXECUTE 'REVOKE EXECUTE ON FUNCTION '
+                'public.epigraph_record_legacy_succession(uuid, uuid, text, text) '
+                'FROM epigraph_app';
+    END IF;
+END $$;

@@ -1637,6 +1637,41 @@ restart.
   before a binary with the matching repo/route changes serves. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
+- **180**: public `aid03_legacy_fleet_parent`. 161's AID03 refused every
+  `agent_type 'human'` parent, and the pre-161 create path
+  (`AgentRepository::create`, which names no `agent_type`) left every fleet
+  identity at that column default, so the host's first keyed registration of
+  a group's successor was refused and fell back to registering it with NO
+  parent (no succession, no inherited link). Adds
+  `epigraph_is_legacy_fleet_parent(uuid)` (maintenance-owned definer, no
+  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, LLM evidence
+  (`llm_model`, or an `operator_links` row of any state naming it as the
+  agent), an `identity-legacy` key for its own public key (161's backfill),
+  not a keyless OAuth human (`key_kind 'derived'` or the `oauth-principal`
+  label), never a `human_operators` row (revoked included), and no
+  `client_type 'human'` OAuth client naming it as `agent_id` (any status).
+  Re-states `epigraph_register_agent_identity` from 166's body with one
+  marked delta: AID03 also accepts a parent for which that holds (161's live
+  human-operator refusal still applies to every parent). Adds
+  `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
+  maintenance-session only and audited (`agent.identity_succession_recorded`):
+  for a child the host registered parentless in that folder, with no
+  succession row or display parent, a legacy parent created no later than it
+  and holding no live role attachment, both naming the same operator (child
+  live-linked), it writes the `agent_succession` row and the display parent,
+  and moves no link. A (child, parent) pair already on record in any folder is
+  a repeat (`recorded = false`, nothing written; a shared identity runs in
+  several folders); a second, different parent is refused `AID10`. Pinned by
+  `epigraph-db/tests/legacy_fleet_parent.rs`. Undo:
+  `docs/runbooks/180-undo.sql` (tested: it returns the `public` catalog to
+  below 180 and refuses `55000` over any registration body but 180's or
+  166's). A precondition checks the md5 of 166's registration body and
+  RAISEs `55000` (changing nothing) over any other body; any later edit to
+  that body must update 180's expected md5, and a later migration that
+  re-states the registration starts from 180's. **Deploy order:** after 166;
+  independent of 179. Run `180-undo.sql` before `166-undo.sql`. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+
 - **166**: public `role_attached_agents` (agent identity lineage design D6:
   role-attached agents run only while a human holds the role). Adds the
   append-only, FORCE-RLS `role_agents` (role, agent, window), written only
