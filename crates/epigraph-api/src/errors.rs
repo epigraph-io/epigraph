@@ -794,7 +794,16 @@ impl From<DbError> for ApiError {
                 source: sqlx::Error::Database(db),
             } if epigraph_db::caller_refusal_code(db.message()).is_some() => {
                 let message = db.message().to_string();
-                tracing::warn!(detail = %message, "the database refused the request");
+                // DETAIL is what the reply withholds (AGK01 moved the system
+                // agent's role there), so the server log keeps it.
+                let db_detail = db
+                    .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                    .and_then(sqlx::postgres::PgDatabaseError::detail);
+                tracing::warn!(
+                    detail = %message,
+                    db_detail = ?db_detail,
+                    "the database refused the request"
+                );
                 match db.code().as_deref() {
                     Some("42501") => ApiError::Forbidden { reason: message },
                     Some("55000") => ApiError::Conflict { reason: message },
