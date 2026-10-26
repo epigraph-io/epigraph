@@ -93,47 +93,66 @@ async fn the_successor_keeps_its_author_and_records_the_acting_agent(pool: PgPoo
     );
 }
 
-/// The edge is part of the ACT: an act that rolls back leaves no edge behind
-/// and no successor, so a successor never exists without the record of who
-/// wrote it and a record never names a write that did not happen.
+/// The edge is part of the ACT: when writing it fails, the act fails, and
+/// nothing of it lands (no successor, the predecessor still current), so a
+/// successor never exists without the record of who wrote it.
+///
+/// The failure is forced with a trigger on `edges` that raises only for an
+/// `AUTHORED` insert (the technique of
+/// `epigraph-engine/tests/admin_cascade_failed_reason.rs`), so the act's
+/// other writes, including its `supersedes` edge, go through.
+///
+/// Verified to fail: the edge write's error swallowed (`.ok()` in place of
+/// `?`): the act returns `Ok` and its successor lands with no actor edge.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_rolled_back_act_leaves_no_authorship_edge(pool: PgPool) {
+async fn a_failed_authorship_edge_fails_the_act(pool: PgPool) {
     let a = seed_agent(&pool, "author-a").await;
     let b = seed_agent(&pool, "actor-b").await;
     let old = seed_claim(&pool, a).await;
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_authored() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.relationship = 'AUTHORED' THEN \
+           RAISE EXCEPTION 'forced AUTHORED failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the forcing function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_authored BEFORE INSERT ON edges \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_authored()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the forcing trigger");
 
     let mut tx = pool.begin().await.expect("begin");
-    let (new, _) = ClaimRepository::supersede_act_conn(
+    let result = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(old),
-        "a correction that will be rolled back",
+        "a correction whose authorship cannot be recorded",
         TruthValue::clamped(0.6),
-        "rolled back",
+        "forced failure",
         SupersedeActor::new(b, epigraph_db::SupersedeTool::SupersedeClaim),
     )
-    .await
-    .expect("the act runs");
-    // Inside the act's own transaction the edge is already there ...
-    let inside: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM edges WHERE relationship = 'AUTHORED' \
-            AND source_id = $1 AND target_id = $2",
-    )
-    .bind(b)
-    .bind(new)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("count inside");
-    assert_eq!(inside, 1, "the act writes the edge in its own transaction");
-    tx.rollback().await.expect("rollback");
+    .await;
+    assert!(
+        result.is_err(),
+        "the act must fail when its authorship edge cannot be written: {result:?}"
+    );
+    drop(tx);
 
-    // ... and it goes with the act.
-    assert!(authored_into(&pool, new).await.is_empty());
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("count successors");
+    assert_eq!(successors, 0, "no successor landed");
     let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
         .bind(old)
         .fetch_one(&pool)
         .await
         .expect("the predecessor");
-    assert!(current, "the rolled-back act retired nothing");
+    assert!(current, "the failed act retired nothing");
 }
 
 /// `actor` supersedes `old` through the WHOLE supersession (the act and the
