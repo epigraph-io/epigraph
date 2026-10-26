@@ -194,10 +194,8 @@ pub enum DbError {
     /// names it, with no default, so a new refusal cannot skip the choice.
     ///
     /// The MCP layer sends `message` as written (`errors::designed_refusal`).
-    /// The HTTP layer keeps the 500 these refusals always answered (the same
-    /// redacted body as `QueryFailed`) and logs `message`; routes that know
-    /// what a refusal means map it themselves first (e.g. `mark_duplicate`'s
-    /// 409).
+    /// The HTTP layer answers by `kind` (input 400, authority 403, state 409,
+    /// operator ruling R-55) with `message` as the body's reason, and logs it.
     #[error("{message}")]
     Refused { kind: RefusalKind, message: String },
 

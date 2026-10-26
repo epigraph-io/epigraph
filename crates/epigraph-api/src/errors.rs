@@ -794,14 +794,17 @@ impl From<DbError> for ApiError {
                     message: "A database error occurred".to_string(),
                 }
             }
-            // A repo-authored refusal (backlog e0f0cb68). It answers the 500
-            // it answered as `QueryFailed { Protocol }` before the variant
-            // existed: which status each refusal deserves (400, 403, 409) is
-            // the route's to decide, and routes that know map it first.
-            DbError::Refused { message, .. } => {
-                tracing::warn!(detail = %message, "the repository refused the request");
-                ApiError::DatabaseError {
-                    message: "A database error occurred".to_string(),
+            // A repo-authored refusal (backlog e0f0cb68), answered by its
+            // kind (operator ruling R-55). Its message is text the repo layer
+            // wrote for the caller (MCP sends it as written), so it is the
+            // body's reason. A refusal that must not confirm its target
+            // exists is never a `Refused`: such a site returns `NotFound`.
+            DbError::Refused { kind, message } => {
+                tracing::warn!(?kind, detail = %message, "the repository refused the request");
+                match kind {
+                    epigraph_db::RefusalKind::Input => ApiError::BadRequest { message },
+                    epigraph_db::RefusalKind::Authority => ApiError::Forbidden { reason: message },
+                    epigraph_db::RefusalKind::State => ApiError::Conflict { reason: message },
                 }
             }
             // Fail-closed (elevation plan EL-8): an elevated read that could
