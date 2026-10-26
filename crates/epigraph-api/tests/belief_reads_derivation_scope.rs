@@ -97,6 +97,17 @@ async fn discount_bba(
 /// with its evidence perspective.
 async fn narrowed_evidence(pool: &PgPool, claim: Uuid, group: Uuid, owner: Uuid) -> Uuid {
     let ev = seed_evidence(pool, claim, "document").await;
+    // Pinned, as `epigraph-operator hide-evidence` pins it (migration 110):
+    // without the pin the next evidence INSERT on the claim re-publishes it.
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: hidden')",
+    )
+    .bind(ev)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("pin the hidden evidence");
     sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
         .bind(ev)
         .bind(group)

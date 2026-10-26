@@ -153,6 +153,17 @@ async fn public_claim_with_a_narrowed_bba(pool: &PgPool) -> (Uuid, Uuid, Uuid, U
     let public_only = served(&run(pool, stranger, frame, false, false).await, target);
 
     let hidden_ev = seed_evidence(pool, target, "document").await;
+    // Pinned, as `epigraph-operator hide-evidence` pins it (migration 110):
+    // without the pin the next evidence INSERT on the claim re-publishes it.
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: hidden')",
+    )
+    .bind(hidden_ev)
+    .bind(member)
+    .execute(pool)
+    .await
+    .expect("pin the hidden evidence");
     sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
         .bind(hidden_ev)
         .bind(group)
