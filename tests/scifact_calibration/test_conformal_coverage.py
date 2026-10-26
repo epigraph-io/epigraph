@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 from calibrate_conformal import (
     load_fixtures, stratified_split, fit_quantiles, report, ALPHA, CAL_FRACTION, SEED,
-    CALIBRATION_TOML, CLASSES,
+    CALIBRATION_TOML, CLASSES, CONFORMAL_MARKER, conformal_comment,
 )
 
 # The writer formats each quantile with 6 decimals, so a faithful shipped value
@@ -60,14 +60,15 @@ def held_out(fx):
 
 def check_shipped(fx, path):
     """The shipped [conformal] section must be the refit of these fixtures."""
-    conformal = tomllib.loads(Path(path).read_text()).get("conformal")
+    text = Path(path).read_text()
+    conformal = tomllib.loads(text).get("conformal")
     assert conformal is not None, f"{path} has no [conformal] section"
     assert conformal.get("alpha") == ALPHA, (
         f"shipped alpha {conformal.get('alpha')!r} != the calibrator's {ALPHA}"
     )
     shipped = conformal.get("quantiles", {})
     # The production fit: scripts/calibrate_conformal.py refits on ALL fixtures.
-    q_full, _n_full = fit_quantiles(fx, ALPHA)
+    q_full, n_full = fit_quantiles(fx, ALPHA)
     drift = {
         c: (shipped.get(c), round(q_full[c], 6))
         for c in CLASSES
@@ -77,6 +78,18 @@ def check_shipped(fx, path):
         f"{path} [conformal.quantiles] disagree with a refit of the {len(fx)} "
         f"fixtures (class: (shipped, refit)): {drift}. Re-run "
         f"scripts/calibrate_conformal.py, or restore the shipped values."
+    )
+    # The comment above [conformal] must state the population the shipped
+    # values were fit on: the writer's text for this refit, word for word.
+    start = text.find(CONFORMAL_MARKER)
+    end = text.find("\n[conformal]\n", start)
+    assert start >= 0 and end > start, f"{path}: no {CONFORMAL_MARKER!r} comment above [conformal]"
+    shipped_comment = text[start:end + 1]
+    expected_comment = conformal_comment(n_full, len(fx))
+    assert shipped_comment == expected_comment, (
+        f"{path}: the [conformal] comment does not state the fit's population.\n"
+        f"--- shipped\n{shipped_comment}--- expected (calibrate_conformal.conformal_comment)\n"
+        f"{expected_comment}"
     )
     return q_full
 

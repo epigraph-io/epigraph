@@ -218,8 +218,11 @@ intra_evidence_locality_factor = 0.3
 
 # ── Split-Conformal Prediction Sets ────────────────
 # Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py
-# over 1189 labelled SciFact fixtures (split-conformal, alpha=0.1,
-# seed=42). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
+# on ALL 1189 labelled SciFact fixtures (alpha=0.1). No held-out split:
+# the calibration n is the full corpus. Held-out coverage is measured
+# separately by `calibrate_conformal.py --check`, which fits on a stratified
+# 50% split (seed=42) and scores the rest.
+# score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
 # class c is in the prediction set iff score_c <= q_c. Calibration n per class:
 # supported=508 contradicted=265 not_enough_info=416.
 [conformal]
