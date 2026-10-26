@@ -661,6 +661,75 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
     );
 }
 
+/// A token that carries every group scope but NO agent principal is refused
+/// 401 by the group write routes, before the scope check and before the body
+/// is read. Since backlog 323773fe these routes take the caller's
+/// `ViewerExtractor` first (they run on the caller's stamped transaction), so
+/// the "re-authenticate to obtain an agent" answer is the viewer's 401; it used
+/// to be a 403 from the handlers' own agent checks. Pinned so the
+/// status is a deliberate contract, the same one `rotate_key` and the claim
+/// writers already give.
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_writes_by_a_token_without_an_agent_are_401(pool: PgPool) {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (agentless, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["groups:write".to_string(), "groups:admin".to_string()],
+            "agent",
+            None,
+            None,
+            chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("test JWT issued");
+
+    let creator = seed_agent(&pool, "agentless-creator").await;
+    let (_, body) = create_group(
+        &pool,
+        &token(&["groups:write"], creator),
+        "Agentless",
+        "grp-agentless",
+    )
+    .await;
+    let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+    let other = seed_agent(&pool, "agentless-other").await;
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            "/api/v1/groups".to_string(),
+            Some(json!({ "name": "Nope", "group_public_key": group_key("agentless-nope") })),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/groups/{group_id}/members"),
+            Some(json!({ "agent_id": other, "wrapped_key_share": wrapped_share("agentless") })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/groups/{group_id}/members/{creator}"),
+            None,
+        ),
+    ] {
+        let (status, resp) = send(
+            app(pool.clone()).await,
+            method.clone(),
+            &uri,
+            Some(&agentless),
+            body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} with an agent-less token: {resp}"
+        );
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn add_member_rejects_a_wrapped_share_that_is_not_60_bytes(pool: PgPool) {
     let creator = seed_agent(&pool, "ws-creator").await;
