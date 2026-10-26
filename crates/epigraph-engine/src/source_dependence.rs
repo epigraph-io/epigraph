@@ -405,8 +405,9 @@ struct OwnerPartition {
     independent: Vec<MassFunction>,
     /// One group per owner that at least two distinct agents speak for, in
     /// first-appearance order: per agent, that agent's own fold of its rows
-    /// (same-source rule, then Dempster).
-    sibling_groups: Vec<Vec<MassFunction>>,
+    /// (same-source rule, then Dempster, normalised), and the largest
+    /// conflict any of those per-agent folds saw.
+    sibling_groups: Vec<(Vec<MassFunction>, f64)>,
 }
 
 /// Split already-discounted BBAs into independent inputs and same-owner
@@ -456,12 +457,14 @@ fn owner_partition(
     for owner in group_order {
         let per_agent = groups.remove(&owner).unwrap_or_default();
         let mut members = Vec::with_capacity(per_agent.len());
+        let mut own_conflict: f64 = 0.0;
         for (_, rows) in per_agent {
-            let (agent_fold, _) =
+            let (agent_fold, agent_k) =
                 dempster_across_items(same_source_slots(rows)?, conflict_threshold)?;
+            own_conflict = own_conflict.max(agent_k);
             members.push(agent_fold);
         }
-        sibling_groups.push(members);
+        sibling_groups.push((members, own_conflict));
     }
 
     Ok(OwnerPartition {
@@ -473,9 +476,16 @@ fn owner_partition(
 /// [`combine_with_source_dependence`] with the same-human rule (R-36): the
 /// fold every combine of stored BBAs uses. Each sibling group is reduced by
 /// [`cautious_reduce`] (a group the rule is not defined on folds as
-/// independent), then everything is Dempster-folded. Same return shape: the
-/// combined BBA and the conflict the fold saw, which includes the conflict
-/// the sibling reductions saw (`1 - prod(1 - k)` over all steps).
+/// independent), then everything is Dempster-folded. Same
+/// return shape: the combined BBA and the conflict the fold saw
+/// (`1 - prod(1 - k)` over the final fold and every sibling group).
+///
+/// A sibling group's conflict is the LARGER of what its reduction saw and
+/// what any member agent's own fold saw (that fold is normalised before the
+/// reduction, so its conflict would otherwise vanish as soon as a sibling
+/// writes). Both measure one owner's evidence, so they are not compounded:
+/// a sibling restating an agent's own contest leaves the conflict where the
+/// agent alone put it.
 ///
 /// # Errors
 /// Propagates `DsError` from the cautious or Dempster folds, including
@@ -489,13 +499,16 @@ pub fn combine_with_owner_dependence(
         sibling_groups,
     } = owner_partition(items, conflict_threshold)?;
     let mut group_conflicts: Vec<f64> = Vec::new();
-    for members in sibling_groups {
+    for (members, own_conflict) in sibling_groups {
         match cautious_reduce(&members)? {
             Some((reduced, k)) => {
-                group_conflicts.push(k);
+                group_conflicts.push(k.max(own_conflict));
                 independent.push(reduced);
             }
-            None => independent.extend(members),
+            None => {
+                group_conflicts.push(own_conflict);
+                independent.extend(members);
+            }
         }
     }
     let (combined, k) = dempster_across_items(independent, conflict_threshold)?;
@@ -1353,6 +1366,46 @@ mod tests {
         )
         .unwrap();
         assert!((m_true(&c) - 0.9).abs() < 1e-9, "got {}", m_true(&c));
+    }
+
+    #[test]
+    fn a_siblings_own_contest_still_counts_as_conflict() {
+        // Agent 1 contests itself (a support and a refutation of distinct
+        // sources: Dempster conflict 0.8 * 0.5 = 0.4). Its fold is normalised
+        // before the sibling reduction, so that conflict must be carried into
+        // the fold's reported conflict, not dropped because a sibling agent of
+        // the same human also wrote BBAs. One owner's evidence must not
+        // compound its own conflict either: a sibling restating the same
+        // contest, or a weaker sibling, leaves it at the agent-alone value.
+        let sup = support(0, 0.8, 1.0);
+        let refute = support(1, 0.5, 1.0);
+        let (_, alone) = combine_with_owner_dependence(
+            vec![(by(1, 9), sup.clone()), (by(1, 9), refute.clone())],
+            0.9,
+        )
+        .unwrap();
+        assert!((alone - 0.4).abs() < 1e-9, "PREMISE: got {alone}");
+        for sibling_rows in [
+            // The sibling restates the same contest (the cautious rule is
+            // idempotent, so its reduction sees no new conflict).
+            vec![sup.clone(), refute.clone()],
+            // A weaker sibling support.
+            vec![support(0, 0.6, 1.0)],
+        ] {
+            let mut items = vec![(by(1, 9), sup.clone()), (by(1, 9), refute.clone())];
+            items.extend(sibling_rows.into_iter().map(|m| (by(2, 9), m)));
+            let (_, with_sibling) = combine_with_owner_dependence(items, 0.9).unwrap();
+            assert!(
+                with_sibling >= alone - 1e-9,
+                "the agent's own contest ({alone}) vanished from the fold's conflict once a \
+                 sibling wrote BBAs: {with_sibling}"
+            );
+            assert!(
+                with_sibling <= alone + 1e-6,
+                "one owner's contest compounded like independent evidence: {with_sibling} vs \
+                 {alone}"
+            );
+        }
     }
 
     #[test]
