@@ -738,11 +738,23 @@ impl EdgeRepository {
     /// `(LEAST(source,target), GREATEST(source,target), relationship)`, keyed on
     /// the same `(pair + properties->>'source' = 'cross_source_matcher')`
     /// identity `MatchCandidateRepo::retire` already uses and restricted to
-    /// in-force claim-claim rows. Its predicate is a strict SUBSET of what this
-    /// guard blocks, so it can only ever reject a row the guard would have
-    /// rejected too if it had seen it — and an operator-authored edge over the
-    /// same pair is untouched, which is what keeps this a dedup repair rather
-    /// than a change to what `POST /edges` may write.
+    /// in-force claim-claim rows. Migration 175 re-keys it on
+    /// `lower(relationship)`, so a legacy `CORROBORATES` and a canonical
+    /// `corroborates` matcher row over one pair are one key.
+    ///
+    /// For rows stored in the lower-case or UPPER-case spelling (the two
+    /// [`relationship_spellings`] returns, which this guard matches) the index
+    /// predicate is a strict SUBSET of what this guard blocks, so it can only
+    /// ever reject a row the guard would have rejected too if it had seen it —
+    /// and an operator-authored edge over the same pair is untouched, which is
+    /// what keeps this a dedup repair rather than a change to what
+    /// `POST /edges` may write. A MIXED-case in-force matcher row (e.g.
+    /// `Corroborates`; no matcher writer ever produced one) is the exception:
+    /// the guard misses it and the index swallows the insert, so this form
+    /// reports a dedup hit and the `_returning` / `_oriented` / `_full` forms'
+    /// post-conflict probe finds no row and errors. The operator case-fold
+    /// (`docs/runbooks/edge-relationship-casefold.sql`) rewrites mixed-case rows
+    /// to lower case, which closes that window.
     ///
     /// The second case it covers is why this is a FORCE precondition
     /// (`D-PR17-read-guards-widen-under-rls`): 072 arm (d)'s no-widening rule
