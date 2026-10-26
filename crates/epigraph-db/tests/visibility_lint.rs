@@ -849,6 +849,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          trigger's; nothing for a viewer to filter.",
     ),
     (
+        "ego.rs",
+        "untenanted_entity_types",
+        "Reads `entity_types` -- the schema REGISTRY (type_name, schema_name, table_name, \
+         id_column, tenancy_tier, ...), not a tenant table. Measured at migration head: it \
+         carries neither `visibility` nor `owner_group_id`, `relrowsecurity` and \
+         `relforcerowsecurity` are both false, and it is absent from migration 062's `tier_a` \
+         array, so there is no column to attach a predicate to and no policy for a session GUC \
+         to select. Same relation and same posture as `entity_type.rs::get_by_name_conn` / \
+         `resolve_row` above. WHAT IT IS FOR: `/claims/:id/ego` may emit a bare typed node only \
+         for a neighbour type that has no tenancy of its own, and this fn reads that set from \
+         the registry rather than hard-coding it -- so a type registered after the route was \
+         written is WITHHELD rather than published. Giving it a Viewer would filter the \
+         registry, which is exactly backwards: the set of untenanted types is not viewer-\
+         dependent, and narrowing it per viewer would publish MORE types to a member, not fewer.",
+    ),
+    (
         "elevated_access.rs",
         "record",
         "WRITE through migration 127's app-callable definer `epigraph_record_elevated_access` \
