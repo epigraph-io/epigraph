@@ -1406,3 +1406,60 @@ async fn extract_neighborhood(
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
+
+#[cfg(all(test, feature = "db"))]
+mod less_readable_tests {
+    use super::claims_informed_by_less_readable;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_variable_that_is_no_readable_claim_counts_as_narrower() {
+        // Factor (1, 2) and factor (2, 3); 3 is absent from the tenancy map
+        // (a stale factor id, or a claim the caller cannot read), so every
+        // claim in that component is informed by something less readable.
+        let (a, b, c) = (id(1), id(2), id(3));
+        let world = id(100);
+        let tenancy: HashMap<Uuid, (bool, Uuid)> = [(a, (true, world)), (b, (true, world))]
+            .into_iter()
+            .collect();
+        let f1 = [a, b];
+        let f2 = [b, c];
+        let out = claims_informed_by_less_readable(&[&f1, &f2], &tenancy);
+        assert!(out.contains(&a) && out.contains(&b), "{out:?}");
+        assert!(
+            !out.contains(&c),
+            "an unreadable id is not itself a claim to skip"
+        );
+        // Without the unreadable variable, the all-public component is clean.
+        let out = claims_informed_by_less_readable(&[&f1], &tenancy);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn a_narrower_claim_may_be_informed_by_a_more_readable_one() {
+        let (public_claim, group_claim, other_group_claim) = (id(1), id(2), id(3));
+        let (g, h, world) = (id(200), id(201), id(100));
+        let tenancy: HashMap<Uuid, (bool, Uuid)> = [
+            (public_claim, (true, world)),
+            (group_claim, (false, g)),
+            (other_group_claim, (false, h)),
+        ]
+        .into_iter()
+        .collect();
+        let pair = [public_claim, group_claim];
+        let out = claims_informed_by_less_readable(&[&pair], &tenancy);
+        assert!(out.contains(&public_claim), "{out:?}");
+        assert!(!out.contains(&group_claim), "{out:?}");
+        let groups = [group_claim, other_group_claim];
+        let out = claims_informed_by_less_readable(&[&groups], &tenancy);
+        assert!(
+            out.contains(&group_claim) && out.contains(&other_group_claim),
+            "{out:?}"
+        );
+    }
+}
