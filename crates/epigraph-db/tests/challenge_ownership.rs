@@ -1827,3 +1827,183 @@ async fn challenger_id_is_fixed_at_filing_and_names_the_filer(pool: PgPool) {
         .rows_affected();
     assert_eq!(n, 1);
 }
+
+/// R-13's withdrawal changes `state` and NOTHING ELSE, and every clause of
+/// migration 170's guard is pinned on its own. As the non-bypassing
+/// `epigraph_app`, the outsider on its own PENDING challenge:
+///
+/// * withdraws while also setting `resolved_by` (to any agent), or
+///   `resolved_at`, or `resolution_details`: each refused (CR07, 42501),
+///   because a withdrawal carrying a resolver would show readers a forged
+///   resolver on a withdrawn challenge;
+/// * sets `resolved_at` alone: refused (CR07);
+/// * files a challenge born `withdrawn`, or born `pending` with
+///   `resolution_details` or with `resolved_at`: each refused (CR07).
+///
+/// Every refused statement leaves the row byte-identical and writes nothing.
+/// Calibration, and the `under_review` arm of the guard's state clause: the
+/// claim's owner moves a second challenge to `under_review` through the
+/// definer, and the outsider's withdrawal of it lands, changing `state` and
+/// leaving the definer's `resolved_by`, `resolved_at` and
+/// `resolution_details` exactly as they were.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_withdrawal_changes_the_state_and_nothing_else(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-wd3-owner").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-wd3-out").await;
+    let (forged, _) = fixture::seed_agent_with_group(&pool, "ch-wd3-forged").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "withdrawal only").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (pending, reviewed) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let a = challenge(&mut conn, claim, outsider, "withdrawal only: pending")
+            .await
+            .expect("the outsider's first challenge lands");
+        let b = challenge(&mut conn, claim, outsider, "withdrawal only: under review")
+            .await
+            .expect("the outsider's second challenge lands");
+        (conn, (a, b))
+    })
+    .await;
+    let pending_before = whole_row(&pool, pending).await;
+
+    let p = pool.clone();
+    let refused = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let mut out = Vec::new();
+        for (what, sql) in [
+            (
+                "withdraw and forge resolved_by",
+                "UPDATE challenges SET state = 'withdrawn', resolved_by = $2 WHERE id = $1",
+            ),
+            (
+                "withdraw and set resolved_at",
+                "UPDATE challenges SET state = 'withdrawn', resolved_at = now() \
+                  WHERE id = $1 AND $2::uuid IS NOT NULL",
+            ),
+            (
+                "withdraw and set resolution_details",
+                "UPDATE challenges SET state = 'withdrawn', resolution_details = '{}' \
+                  WHERE id = $1 AND $2::uuid IS NOT NULL",
+            ),
+            (
+                "set resolved_at alone",
+                "UPDATE challenges SET resolved_at = now() WHERE id = $1 AND $2::uuid IS NOT NULL",
+            ),
+        ] {
+            let r = sqlx::query(sql)
+                .bind(pending)
+                .bind(forged)
+                .execute(&mut *conn)
+                .await;
+            out.push((what, r.map(|d| d.rows_affected())));
+        }
+        for (what, sql) in [
+            (
+                "INSERT born withdrawn",
+                "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                         state) \
+                 VALUES ($1, $2, 'factual_error', 'withdrawal only: born', 'withdrawn')",
+            ),
+            (
+                "INSERT born pending with resolution_details",
+                "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                         resolution_details) \
+                 VALUES ($1, $2, 'factual_error', 'withdrawal only: born', '{}')",
+            ),
+            (
+                "INSERT born pending with resolved_at",
+                "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                         resolved_at) \
+                 VALUES ($1, $2, 'factual_error', 'withdrawal only: born', now())",
+            ),
+        ] {
+            let r = sqlx::query(sql)
+                .bind(claim)
+                .bind(outsider)
+                .execute(&mut *conn)
+                .await;
+            out.push((what, r.map(|d| d.rows_affected())));
+        }
+        (conn, out)
+    })
+    .await;
+    for (what, r) in &refused {
+        let e = r
+            .as_ref()
+            .expect_err(&format!("{what}: refused (R-13), not landed"));
+        assert_eq!(sqlstate(e).as_deref(), Some("42501"), "{what}: {e}");
+        assert!(
+            format!("{e:?}").contains(CR07),
+            "{what}: refused by migration 170's resolution guard, not another check: {e:?}"
+        );
+    }
+    assert_eq!(
+        whole_row(&pool, pending).await,
+        pending_before,
+        "the outsider's pending row is untouched"
+    );
+    let born: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM challenges \
+          WHERE claim_id = $1 AND explanation = 'withdrawal only: born'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        born, 0,
+        "no challenge is born withdrawn or with a resolution"
+    );
+
+    // under_review -> withdrawn: the challenger's withdrawal lands, and only
+    // `state` moves.
+    let details = serde_json::json!({ "note": "looking into it" });
+    let d = details.clone();
+    let p = pool.clone();
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = ChallengeRepository::resolve_as_claim_owner(
+            &mut *conn,
+            reviewed,
+            "under_review",
+            Some(&d),
+        )
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the claim's owner moves the challenge to under_review");
+    let reviewed_before = resolution(&pool, reviewed).await;
+    assert_eq!(
+        reviewed_before,
+        (
+            "under_review".to_string(),
+            Some(owner),
+            false,
+            Some(details.clone())
+        ),
+        "CALIBRATION: the definer set the state, the resolver and the details"
+    );
+    let p = pool.clone();
+    let withdrew = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let r = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(reviewed)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        withdrew.expect("the challenger withdraws its challenge under review"),
+        1
+    );
+    assert_eq!(
+        resolution(&pool, reviewed).await,
+        ("withdrawn".to_string(), Some(owner), false, Some(details)),
+        "the withdrawal moved the state and left the definer's columns as they were"
+    );
+}
