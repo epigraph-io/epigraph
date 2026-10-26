@@ -39,8 +39,13 @@
 //! calls on the pool (`state.db_pool.begin()`), and method calls on a repo
 //! object built from the pool (`let r = MatchCandidateRepo::new(..)`).
 //!
-//! A call is VIEWED when its argument list names the handler's viewer
-//! variable. For a `sqlx` chain (`sqlx::query(..).bind(..).fetch_one(conn)`)
+//! A call is VIEWED when its argument list spends the handler's viewer
+//! variable as a WHOLE value: the bare identifier (`&viewer`, `viewer,`), or a
+//! method that hands the whole viewer on ([`WHOLE_VIEWER_METHODS`]: `clone`,
+//! `detach_scoped`, `splice`, `group_bind`, ..). A scalar projection
+//! (`viewer.principal()`, `viewer.writable_groups()`) is NOT a spend: a
+//! raw-pool read keyed on the caller's id filters nothing, which is exactly
+//! the "viewer spent on an unrelated scalar" shape. For a `sqlx` chain (`sqlx::query(..).bind(..).fetch_one(conn)`)
 //! the whole chain counts, and so does the `let` binding of a statement or SQL
 //! string it reads (`let sql = viewer.splice(..)`), because that is where a
 //! spliced predicate is spent.
@@ -255,8 +260,27 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "state.write_as",
         ],
     ),
-    // gated (community and perspective) then write.
-    ("community.rs", "add_member", &["EdgeRepository::create"]),
+    // write: the caller's principal is the community's creator (one `groups`
+    // insert, no read).
+    (
+        "community.rs",
+        "create_community",
+        &["CommunityRepository::create"],
+    ),
+    // gated (community and perspective) then write. The membership write is a
+    // SECURITY DEFINER function on a transaction stamped from this viewer
+    // (`membership_tx`); the principal argument names the actor, and the
+    // function checks it against the stamped one.
+    (
+        "community.rs",
+        "add_member",
+        &["CommunityRepository::add_member", "EdgeRepository::create"],
+    ),
+    (
+        "community.rs",
+        "remove_member",
+        &["CommunityRepository::remove_member"],
+    ),
     // open finding: F-SHARD4-A2.
     (
         "computation.rs",
@@ -883,13 +907,18 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::search_hierarchical_by_text",
         ],
     ),
-    // write: embeddings for the rows this request just ingested.
+    // write: the ingest transaction is stamped with the system agent and binds
+    // the caller's principal for the database's write-authority check
+    // (`begin_system_ingest_stamped_tx`); the authorship edges name that
+    // principal; embeddings for the rows this request just ingested.
     (
         "workflows.rs",
         "ingest_workflow",
         &[
             "WorkflowRepository::set_goal_embedding",
+            "begin_system_ingest_stamped_tx",
             "embed_inserted_workflow_claims",
+            "record_api_authorship",
         ],
     ),
     // untenanted (workflows, behavioral_executions) and write.
@@ -922,15 +951,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::rolling_success_rate",
         ],
     ),
-    // write: the ingest and the embeddings of the rows it inserted.
+    // write: as ingest_workflow (stamped system ingest binding the caller's
+    // principal, authorship edges), the ingest and the embeddings of the rows it
+    // inserted.
     (
         "workflows.rs",
         "store_workflow",
         &[
             "EventRepository::insert",
             "WorkflowRepository::set_goal_embedding",
+            "begin_system_ingest_stamped_tx",
             "embed_inserted_workflow_claims",
             "epigraph_ingest_executor::execute_workflow_ingest_plan",
+            "record_api_authorship",
         ],
     ),
 ];
@@ -1291,6 +1324,36 @@ fn has_word(hay: &str, word: &str) -> bool {
     !words(hay, word, 0, hay.len()).is_empty()
 }
 
+/// `Viewer` methods that hand on the WHOLE viewer (its predicate, its bind, or
+/// a scoped copy of it). Any other method is a scalar projection.
+const WHOLE_VIEWER_METHODS: &[&str] = &[
+    "clone",
+    "detach_scoped",
+    "splice",
+    "splice_write",
+    "group_bind",
+    "writable_bind",
+    "render_predicate",
+    "render_edge_predicate",
+    "render_writable_predicate",
+];
+
+/// Does `region` spend the viewer `v` as a whole value: the bare identifier
+/// (`&viewer`, `viewer,`, `viewer)`), or one of [`WHOLE_VIEWER_METHODS`] on it?
+/// A scalar projection (`viewer.principal()`, `viewer.writable_groups()`) is
+/// not a spend: a raw-pool read keyed on the caller's id filters nothing.
+fn spends_viewer(region: &str, v: &str) -> bool {
+    let s = region.as_bytes();
+    words(region, v, 0, s.len()).into_iter().any(|p| {
+        let q = skip_ws(s, p + v.len());
+        if s.get(q) != Some(&b'.') {
+            return true;
+        }
+        let m_at = skip_ws(s, q + 1);
+        WHOLE_VIEWER_METHODS.contains(&ident_at(s, m_at))
+    })
+}
+
 /// The path written immediately before the `(` at `open`, and where it starts.
 fn callee_before(s: &[u8], open: usize) -> (String, usize) {
     let mut j = open as isize - 1;
@@ -1631,7 +1694,7 @@ fn db_calls(code: &str, sql: &str, h: &Handler) -> Vec<(String, bool)> {
         } else {
             callee.clone()
         };
-        out.push((label, has_word(&region, &h.viewer)));
+        out.push((label, spends_viewer(&region, &h.viewer)));
     }
     out
 }
@@ -1846,6 +1909,22 @@ pub async fn decoys(
     Ok((a, b, c))
 }
 
+pub async fn scalar_projection(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+) -> R {
+    // The caller's id is not a predicate: this read filters nothing.
+    let a = Repo::get(&state.db_pool, viewer.principal()).await?;
+    let b = Repo::in_groups(&state.db_pool, viewer
+        .writable_groups()).await?;
+    // A scoped copy, a clone and the bind still carry the whole viewer.
+    let c = Repo::get_as(&state.db_pool, &viewer.clone()).await?;
+    let d = Repo::get_as(&state.db_pool, viewer.detach_scoped()).await?;
+    let e = Repo::get_in(&state.db_pool, viewer
+        .group_bind()).await?;
+    Ok((a, b, c, d, e))
+}
+
 pub async fn other_name(
     ViewerExtractor(status_viewer): ViewerExtractor,
     State(state): State<AppState>,
@@ -1896,6 +1975,12 @@ mod tests {
         labels(&m, "decoys"),
         vec!["Repo::get", "Repo::get", "Repo::log"],
         "a viewer named in a comment or a string is not a spend"
+    );
+    assert_eq!(
+        labels(&m, "scalar_projection"),
+        vec!["Repo::get", "Repo::in_groups"],
+        "a scalar projection of the viewer (its principal, its writable groups) is not \
+         a spend; a clone, a scoped copy or its group bind is"
     );
     assert_eq!(
         labels(&m, "other_name"),
