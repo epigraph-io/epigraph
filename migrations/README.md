@@ -1710,7 +1710,18 @@ restart.
   live link or live client allowance) holds a live assignment of the role;
   an agent registered to the holder but not attached, and an agent attached
   while another human holds the role, are not members (the same rule as
-  166's `ROL01`). Re-states `epigraph_role_derived_memberships` (165's body
+  166's `ROL01`). Which attachments count: an operator's own attachment
+  (`inherited_from` NULL) as it is; a SUCCESSION COPY (166's registration
+  step 5b or its attach-time lineage follow) only for an agent that runs in
+  ONE group folder (`agent_prompt_snapshots`) which the identity the operator
+  attached (the root of the `inherited_from` chain) also runs in. So a
+  same-folder successor (a prompt or model change) keeps the group, while a
+  SHARED successor (166 copies to those too, flagged `shared_identity`), a
+  successor registered in another folder, and copies of their copies admit
+  nothing. This overturns 166's "a copy never grants" premise for this mode
+  only; 166 itself is unchanged (every copy still refuses under `ROL01`). A
+  detach does not follow the lineage: to take the group from a lineage,
+  detach each attached identity in it, or end the binding. Re-states `epigraph_role_derived_memberships` (165's body
   plus the attached arm; the viewer set, the writer scope and the roster all
   ask it, none is re-stated), `epigraph_group_role_bindings_guard_update`
   (the mode joins the immutable tuple) and `epigraph_group_role_bindings_audit`

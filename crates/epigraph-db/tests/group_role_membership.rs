@@ -2482,9 +2482,81 @@ async fn the_mode_verbs_keep_the_old_signatures_and_a_mode_never_changes(pool: P
 }
 
 // =====================================================================
-// Migration 179: which attachments count. The bound role and the
-// window's start.
+// Migration 179: which attachments count. The bound role, the window's
+// start, and SUCCESSION COPIES (166 copies an attachment to every
+// registered successor, a SHARED one included; in this mode a copy is a
+// read and write grant, so only some copies count).
 // =====================================================================
+
+fn identity_key() -> Vec<u8> {
+    [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat()
+}
+
+/// Register an identity through 161's attestor verb (re-stated by 166) in
+/// `folder`, naming `parent`; returns the agent id. Every identity in a
+/// lineage test is registered this way: a succession copy exists only along
+/// `agent_succession`, and the folder rule reads `agent_prompt_snapshots`,
+/// both of which only the registration writes.
+async fn register_in(pool: &PgPool, key: &[u8], parent: Option<Uuid>, folder: &str) -> Uuid {
+    let key = key.to_vec();
+    let hash = blake3::hash(&key).to_hex().to_string();
+    let folder = folder.to_string();
+    fixture::as_role(pool, "epigraph_identity_attestor", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                 $1, $2, 'test-model-179', $3, $4, NULL, $5)",
+        )
+        .bind(&key)
+        .bind(parent)
+        .bind(&hash)
+        .bind(&folder)
+        .bind(serde_json::json!({"in_prompt": {}}))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the attestor registers the identity");
+        (conn, id)
+    })
+    .await
+}
+
+async fn link_to(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let mut c = pool.acquire().await.expect("acquire");
+    let out = AgentRepository::link_operator(&mut c, agent, human)
+        .await
+        .expect("link the identity");
+    assert!(out.link_live, "PREMISE: a live link: {out:?}");
+}
+
+/// `(un-detached attachment rows to ROLE, of which copies)` for `agent`.
+async fn attachment_rows(pool: &PgPool, agent: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*), count(inherited_from) FROM role_agents \
+          WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .fetch_one(pool)
+    .await
+    .expect("attachment rows")
+}
+
+/// `platform.role_agent_copied_shared` events plus registration audit rows
+/// flagged `shared_identity`, for `agent`.
+async fn shared_flags(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
+            AND (event_type = 'platform.role_agent_copied_shared' \
+                 OR details ->> 'role_attachments_shared' = 'shared_identity')",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("shared flags")
+}
 
 /// THE BOUND ROLE. An agent of the holder attached to ANOTHER role (one its
 /// human also holds, bound to another group) is not a member of a group bound
@@ -2565,5 +2637,294 @@ async fn an_attachment_that_has_not_started_admits_nothing(pool: PgPool) {
         resolves(&pool, future, group).await,
         (false, false),
         "an attachment whose window opens in an hour"
+    );
+}
+
+/// A SHARED SUCCESSOR, BY REGISTRATION. An identity that already runs in
+/// another group folder (a fleet container's, linked to the same human) is
+/// registered as the successor of the attached identity in that identity's
+/// folder. 166's registration copies the attachment to it (flagged
+/// `shared_identity`); that copy must not make it a member: it is
+/// `(false, false)` and absent from the roster. Control: a same-human fleet
+/// identity that was never a successor. Positive control: the attached
+/// identity itself reads and writes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_successor_does_not_inherit_the_group_through_registration(pool: PgPool) {
+    let (h, _) = human(&pool, "shreg-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Shared Reg Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    let control = register_in(&pool, &identity_key(), None, "g-fleet-2").await;
+    link_to(&pool, fleet, h).await;
+    link_to(&pool, control, h).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the attached identity"
+    );
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "PREMISE"
+    );
+
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (1, 1),
+        "PREMISE: 166 copied the attachment"
+    );
+    assert!(
+        shared_flags(&pool, fleet).await >= 1,
+        "PREMISE: the copy was flagged shared"
+    );
+
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "a SHARED successor does not read or write the group through its copy"
+    );
+    assert!(live_roles(&pool, fleet, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, control, group).await,
+        (false, false),
+        "control"
+    );
+    let w = |id: Uuid| (id, "writer".to_string());
+    let mut expected = vec![w(h), w(root)];
+    expected.sort();
+    assert_eq!(roster_now(&pool, group).await, expected, "the roster");
+}
+
+/// A SHARED SUCCESSOR, BY ATTACH. The same shape through 166's other copy
+/// path: the shared successor is registered FIRST, then the root is attached,
+/// and the attach-time lineage follow copies the attachment down to it
+/// (flagged). The copy must not make it a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_successor_does_not_inherit_the_group_through_an_attach(pool: PgPool) {
+    let (h, _) = human(&pool, "shatt-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Shared Attach Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    link_to(&pool, fleet, h).await;
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (0, 0),
+        "PREMISE: nothing to copy yet"
+    );
+
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (1, 1),
+        "PREMISE: the follow copied it"
+    );
+    assert!(
+        shared_flags(&pool, fleet).await >= 1,
+        "PREMISE: the copy was flagged shared"
+    );
+
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the root"
+    );
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "a SHARED successor attached by the lineage follow"
+    );
+}
+
+/// A SUCCESSOR IN ANOTHER FOLDER. A fresh identity (it runs nowhere else, so
+/// it is NOT shared) registered with the attached identity as its parent but
+/// in a DIFFERENT group folder inherits the link and the attachment, and is
+/// still not a member: a copy counts only for a successor running in the
+/// folder of the identity the operator attached. (A count-only "not shared"
+/// test would admit it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_in_another_folder_does_not_inherit_the_group(pool: PgPool) {
+    let (h, _) = human(&pool, "fold-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Folder Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+
+    let elsewhere = register_in(&pool, &identity_key(), Some(root), "g-elsewhere").await;
+    assert_eq!(
+        attachment_rows(&pool, elsewhere).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        shared_flags(&pool, elsewhere).await,
+        0,
+        "PREMISE: not a shared identity"
+    );
+    let viewer = Viewer::resolve(&pool, elsewhere).await.expect("resolve");
+    assert!(
+        !viewer.writable_groups().is_empty(),
+        "PREMISE: the successor inherited a live link (it writes somewhere)"
+    );
+    assert_eq!(
+        resolves(&pool, elsewhere, group).await,
+        (false, false),
+        "a successor running in another folder than the attached identity"
+    );
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL"
+    );
+}
+
+/// A COPY OF A COPY. A shared successor (excluded above) runs on in its other
+/// folder and gets its own successor THERE, which runs nowhere else: 166
+/// copies the shared successor's (inherited) row to it. It is not a member:
+/// the folder a copy must run in is the folder of the identity the operator
+/// ATTACHED (the root of the copy chain), not of the row it was copied from.
+/// Positive control: a successor of the shared identity back in the root's
+/// folder (the job's own next identity) IS a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_of_a_shared_successors_copy_counts_only_in_the_attached_folder(pool: PgPool) {
+    let (h, _) = human(&pool, "chain-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Copy Chain Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    link_to(&pool, fleet, h).await;
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+
+    let fleet_next = register_in(&pool, &identity_key(), Some(fleet), "g-fleet").await;
+    assert_eq!(
+        attachment_rows(&pool, fleet_next).await,
+        (1, 1),
+        "PREMISE: copied from the copy"
+    );
+    assert_eq!(
+        shared_flags(&pool, fleet_next).await,
+        0,
+        "PREMISE: not itself shared"
+    );
+    assert_eq!(
+        resolves(&pool, fleet_next, group).await,
+        (false, false),
+        "a successor of the shared identity in the shared identity's other folder"
+    );
+
+    let job_next = register_in(&pool, &identity_key(), Some(fleet), "g-job").await;
+    assert_eq!(
+        attachment_rows(&pool, job_next).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        resolves(&pool, job_next, group).await,
+        (true, true),
+        "POSITIVE CONTROL: a successor running in the attached identity's folder"
+    );
+}
+
+/// A SAME-FOLDER SUCCESSOR KEEPS THE GROUP. The attached identity's next
+/// identity (a prompt or model change, same folder) is a member through
+/// 166's registration copy, and so is one registered before the attach and
+/// reached by the lineage follow, transitively. So a prompt edit does not cut
+/// the job off. Once such a successor ALSO runs in another folder (it became
+/// shared), its copy no longer counts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_same_folder_successor_keeps_the_group_until_it_runs_elsewhere(pool: PgPool) {
+    let (h, _) = human(&pool, "same-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Same Folder Team", "writer").await;
+
+    // The attach-time follow: root -> mid -> newest registered first.
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    let mid = register_in(&pool, &identity_key(), Some(root), "g-job").await;
+    let newest = register_in(&pool, &identity_key(), Some(mid), "g-job").await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, newest).await,
+        (1, 1),
+        "PREMISE: followed"
+    );
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (true, true),
+        "a same-folder successor reached by the attach-time follow"
+    );
+
+    // The registration copy: the newest identity's own next identity.
+    let next_key = identity_key();
+    let next = register_in(&pool, &next_key, Some(newest), "g-job").await;
+    assert_eq!(
+        attachment_rows(&pool, next).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (true, true),
+        "a same-folder successor through the registration copy"
+    );
+
+    // The same identity then also runs in another folder: it is shared now.
+    register_in(&pool, &next_key, None, "g-fleet").await;
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (false, false),
+        "a successor that now runs in a second folder"
+    );
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (true, true),
+        "CONTROL: its parent stays"
+    );
+}
+
+/// AN EXPLICIT ATTACHMENT COUNTS WHEREVER THE IDENTITY RUNS. The folder rule
+/// applies to succession COPIES only: an identity the operator attached by
+/// name is a member even when it runs in two folders (the operator's act
+/// names it). Pins that documented choice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicitly_attached_identity_is_admitted_in_any_folder(pool: PgPool) {
+    let (h, _) = human(&pool, "explicit-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Explicit Team", "writer").await;
+    let key = identity_key();
+    let shared = register_in(&pool, &key, None, "g-one").await;
+    assert_eq!(register_in(&pool, &key, None, "g-two").await, shared);
+    link_to(&pool, shared, h).await;
+    attach_to_role(&pool, ROLE, shared).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, shared).await,
+        (1, 0),
+        "PREMISE: an explicit row"
+    );
+    assert_eq!(
+        resolves(&pool, shared, group).await,
+        (true, true),
+        "an explicitly attached identity running in two folders"
     );
 }

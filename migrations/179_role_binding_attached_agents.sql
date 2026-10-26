@@ -19,10 +19,30 @@
 --     (1) P is a registered human holding a LIVE assignment of R at t
 --         (165's arm 1, unchanged); or
 --     (3) P is an agent with a LIVE ATTACHMENT to R at t in 166's
---         `role_agents` (not detached, `valid_from <= t < valid_to`), AND
---         P's human by 165's agent arm (the operator of its ACTING live
---         link, or the human of its live client allowance) holds a LIVE
---         assignment of R at t.
+--         `role_agents` (not detached, `valid_from <= t < valid_to`) that
+--         COUNTS (below), AND P's human by 165's agent arm (the operator of
+--         its ACTING live link, or the human of its live client allowance)
+--         holds a LIVE assignment of R at t.
+--
+-- Which attachments count:
+--   * an attachment an operator made for P itself (`inherited_from` NULL)
+--     counts as it is, wherever P runs (the operator's act names P);
+--   * a SUCCESSION COPY (166 step 5b at registration, or 166's attach-time
+--     lineage follow; `inherited_from` set) counts only when P runs in ONE
+--     group folder (`agent_prompt_snapshots`), and that folder is one that
+--     the identity the operator attached runs in: the agent of the ROOT row
+--     of the `inherited_from` chain (the operator's own attachment).
+-- So a successor in the same folder (a prompt or model change of the job
+-- the operator attached) keeps the group; and these admit nothing, although
+-- 166 attaches them all (an attachment there only ever refuses):
+--   * a SHARED successor: an identity that also runs in another group folder
+--     (a fleet container of the same human registered as a successor; 166
+--     flags it `shared_identity`), now or at any later registration;
+--   * a successor registered in a DIFFERENT folder than the attached
+--     identity's, shared or not;
+--   * any later copy of such a copy outside the attached identity's folder.
+-- The folder test reads every snapshot P has, at any time (not only up to
+-- t): a successor that once ran elsewhere does not count again.
 --
 -- (3) is 165's arm 2 narrowed to the agents attached to the bound role. It
 -- needs a live holder, and that holder must be the agent's OWN human: an
@@ -42,6 +62,17 @@
 -- An existing binding takes the column's default (false) and keeps 165's
 -- meaning exactly; a reader that does not know the column sees an attached
 -- binding as holder-only (it under-grants, never over-grants).
+--
+-- 166 says an attachment "only ever refuses, so a copy never grants the
+-- child anything", and copies an attachment to every registered successor,
+-- a shared one included, for that reason. In THIS mode an attachment is part
+-- of a grant (read, and write at `writer`), so that premise no longer holds
+-- for a binding in the attached mode; the copy rule above is what bounds it.
+-- 166's registration and lineage follow are not changed: every copy still
+-- refuses (ROL01) as 166 says; only which copies also grant is decided here.
+-- A DETACH does not follow the lineage (166): to take the group from a
+-- whole lineage, detach every attached identity of it (each copy included),
+-- or end the binding.
 --
 -- ===================================================================
 -- 2. WHERE THE RULE LIVES
@@ -102,9 +133,11 @@
 -- ===================================================================
 -- 4. WHAT THIS DOES NOT CHANGE
 --
---   * `role_agents` still confers nothing on its own: an attachment admits
---     an agent to a group only through a binding in this mode, and only while
---     the agent's own human holds the role.
+--   * `role_agents` grants nothing outside this mode: an attachment admits
+--     an agent to a group only through a binding in this mode, only while
+--     the agent's own human holds the role, and a succession copy only under
+--     the folder rule (section 1). Under 165's modes and in 166's ROL01 it
+--     still only refuses.
 --   * 166's ROL01 write refusal, its may-run question and its registration
 --     copy are untouched.
 --   * The membership door (122's `epigraph_operator_writes_group`) stays
@@ -349,10 +382,14 @@ REVOKE EXECUTE ON FUNCTION
 -- The derivation (165's body); delta: the attached arm (section 1, (3)).
 -- The candidate humans are unchanged; a binding in the attached mode admits
 -- an agent candidate only when the agent itself holds a live attachment to
--- the BOUND role. The holder test below is shared by every arm, so the
--- attached agent's own human must hold the role at `p_at`. `role_agents` is
--- FORCEd and admits this maintenance-owned definer frame; under any other
--- owner it reads no row and the arm admits nobody (fail-closed).
+-- the BOUND role that counts (an operator's own attachment, or a succession
+-- copy under the folder rule). The holder test below is shared by every arm,
+-- so the attached agent's own human must hold the role at `p_at`.
+-- `role_agents` and `agent_prompt_snapshots` are FORCEd and admit this
+-- maintenance-owned definer frame; under any other owner they read no row
+-- and the arm admits nobody (fail-closed). The copy chain is acyclic (166's
+-- guard refuses an `inherited_from` that does not exist yet, so a row never
+-- names itself); UNION stops the walk regardless.
 -- -------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.epigraph_role_derived_memberships(
     p_agent uuid, p_at timestamptz)
@@ -375,12 +412,42 @@ SET search_path = public, pg_temp AS $$
             OR b.include_agents
             -- 179: the attached mode admits an agent ATTACHED to the bound
             -- role (166), live at `p_at`; a detached row counts at no instant.
+            -- An operator's own attachment (no `inherited_from`) counts as
+            -- is. A succession COPY counts only when the agent runs in ONE
+            -- group folder, and that folder is one the identity the operator
+            -- attached (the root of the copy chain) runs in: a shared
+            -- successor, a successor in another folder and a copy of their
+            -- copies admit nothing (section 1).
             OR (b.attached_agents
                 AND EXISTS (SELECT 1 FROM public.role_agents ra
                              WHERE ra.agent_id = p_agent AND ra.role = b.role
                                AND ra.detached_at IS NULL
                                AND ra.valid_from <= p_at
-                               AND (ra.valid_to IS NULL OR p_at < ra.valid_to))))
+                               AND (ra.valid_to IS NULL OR p_at < ra.valid_to)
+                               AND (ra.inherited_from IS NULL
+                                    OR EXISTS (
+                                        WITH RECURSIVE chain (id, agent_id, inherited_from) AS (
+                                            SELECT r.id, r.agent_id, r.inherited_from
+                                              FROM public.role_agents r
+                                             WHERE r.id = ra.inherited_from
+                                            UNION
+                                            SELECT r.id, r.agent_id, r.inherited_from
+                                              FROM public.role_agents r
+                                              JOIN chain ch ON r.id = ch.inherited_from
+                                        ),
+                                        folders AS (
+                                            SELECT DISTINCT s.group_folder
+                                              FROM public.agent_prompt_snapshots s
+                                             WHERE s.agent_id = p_agent
+                                        )
+                                        SELECT 1
+                                          FROM chain root
+                                          JOIN public.agent_prompt_snapshots rs
+                                            ON rs.agent_id = root.agent_id
+                                         WHERE root.inherited_from IS NULL
+                                           AND (SELECT count(*) FROM folders) = 1
+                                           AND rs.group_folder IN (SELECT f.group_folder
+                                                                     FROM folders f))))))
      WHERE p_agent IS NOT NULL AND p_at IS NOT NULL
        AND b.created_at <= p_at AND (b.revoked_at IS NULL OR p_at < b.revoked_at)
        AND public.epigraph_live_role_assignment(c.human, b.role, p_at) IS NOT NULL

@@ -3488,7 +3488,10 @@ async fn migration_179_attached_mode_definers_are_owned_and_granted(pool: PgPool
 /// all ask; a later re-statement from 165's body would silently turn every
 /// `attached_agents` binding into a holder-only one (fail-closed, but quiet:
 /// the role's attached agents lose the group). Keep these fragments when
-/// re-stating it.
+/// re-stating it. They are a text tripwire only; each conjunct is pinned by
+/// BEHAVIOUR in `group_role_membership.rs` (the bound role, the window's
+/// start, the copy rule), so a reformatted but equivalent re-statement fails
+/// here and passes there, and a semantically different one fails there.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
     let body: Option<String> = sqlx::query_scalar(
@@ -3509,6 +3512,16 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "FROM public.role_agents ra",
         "ra.agent_id = p_agent AND ra.role = b.role",
         "ra.detached_at IS NULL",
+        "ra.valid_from <= p_at",
+        // 179's copy rule: an operator's own attachment counts; a succession
+        // copy only for an agent in ONE folder that the copy chain's root
+        // (the attached identity) runs in. Losing it lets a SHARED successor
+        // (166 copies attachments to those too) read the role's group.
+        "ra.inherited_from IS NULL",
+        "WITH RECURSIVE chain",
+        "WHERE root.inherited_from IS NULL",
+        "FROM public.agent_prompt_snapshots s",
+        "(SELECT count(*) FROM folders) = 1",
     ] {
         assert!(
             body.contains(fragment),
