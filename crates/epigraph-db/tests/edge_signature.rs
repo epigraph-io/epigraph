@@ -12,7 +12,8 @@ mod fixture;
 use epigraph_crypto::{AgentSigner, SignatureScheme, SignedEntity};
 use epigraph_db::repos::edge::EdgeRepository;
 use epigraph_db::repos::edge_signature::{
-    edge_attestation_digest, EdgeSignOutcome, EdgeSignatureRepository,
+    edge_attestation_canonical_json, edge_attestation_digest, EdgeAttestation, EdgeSignOutcome,
+    EdgeSignatureRepository,
 };
 use epigraph_db::visibility::Viewer;
 use sqlx::{PgConnection, PgPool};
@@ -204,11 +205,14 @@ async fn a_changed_edge_no_longer_matches_its_attestation_and_a_retraction_still
     }
 }
 
-/// Domain separation at the edge verifier (ruling R-34): a claim- or
-/// evidence-tagged signature over the edge's digest is no edge signature; the
-/// edge-tagged one verifies as `v1`, and a bare-digest one as `legacy`.
+/// Domain separation at the edge verifier (ruling R-34) and v1 only (security
+/// review finding 2): a claim- or evidence-tagged signature over the edge's
+/// digest is no edge signature, and neither is a legacy bare-digest one; only
+/// the edge-tagged v1 message verifies. Every refused arm is reported
+/// `pre_attestation` (no key of the signer made a v1 edge attestation of it),
+/// with no digest comparison.
 #[sqlx::test(migrations = "../../migrations")]
-async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) {
+async fn only_an_edge_tagged_v1_signature_verifies_an_edge(pool: PgPool) {
     // The harness connection is a superuser; sign as the maintenance path does.
     let (_scoped, bypass) = fixture::bypass(&pool).await;
     let signer = AgentSigner::from_bytes(&[0x73; 32]).expect("signer");
@@ -228,11 +232,20 @@ async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) 
     };
     drop(conn);
 
-    for (sig, want) in [
-        (signer.sign_entity(SignedEntity::Claim, &digest), None),
-        (signer.sign_entity(SignedEntity::Evidence, &digest), None),
-        (signer.sign(&digest), Some(SignatureScheme::Legacy)),
+    for (arm, sig, want) in [
+        ("legacy bare digest", signer.sign(&digest), None),
         (
+            "claim-tagged",
+            signer.sign_entity(SignedEntity::Claim, &digest),
+            None,
+        ),
+        (
+            "evidence-tagged",
+            signer.sign_entity(SignedEntity::Evidence, &digest),
+            None,
+        ),
+        (
+            "edge-tagged v1",
             signer.sign_entity(SignedEntity::Edge, &digest),
             Some(SignatureScheme::V1),
         ),
@@ -244,17 +257,110 @@ async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) 
             .await
             .unwrap();
         let check = verify(&pool, id).await;
-        assert_eq!(check.signature_scheme, want, "{check:?}");
-        assert_eq!(check.signature_valid, want.is_some(), "{check:?}");
+        assert_eq!(check.signature_scheme, want, "{arm}: {check:?}");
+        assert_eq!(check.signature_valid, want.is_some(), "{arm}: {check:?}");
+        assert_eq!(check.pre_attestation, want.is_none(), "{arm}: {check:?}");
+        assert_eq!(
+            check.content_matches,
+            want.map(|_| true),
+            "{arm}: {check:?}"
+        );
     }
 }
 
-/// A LEGACY (bare-digest) edge signature binds no entity type, so it counts
-/// only over the row's own attestation digest. A bare-digest signature over
-/// some claim's content hash, stored here together with that hash, is refused
+/// The cross-type replay a legacy edge rung would admit (security review
+/// finding 2): claims hash their raw content bytes, so a claim whose content
+/// is an edge's canonical attestation JSON has a content hash EQUAL to the
+/// edge's attestation digest, and a pre-v1 claim signature over it is a bare
+/// signature over that digest. Copied onto the edge with the digest and the
+/// signer, it must not verify the edge.
+///
+/// RED before the verifier went v1-only: it accepted a legacy signature
+/// whenever the row matched its stored digest, which this one does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pre_v1_claim_signature_over_the_edges_canonical_json_does_not_verify_it(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x78; 32]).expect("signer");
+    let w = seed_signing_writer(&pool, "edge-replay", &signer).await;
+    let a = fixture::seed_public_claim(&pool, w, "replay A").await;
+    let b = fixture::seed_public_claim(&pool, w, "replay B").await;
+    let id = EdgeRepository::create(&pool, a, "claim", b, "claim", "supports", None, None, None)
+        .await
+        .expect("edge");
+    let att = stored_attestation(&pool, id).await;
+    let digest = edge_attestation_digest(&att).unwrap();
+
+    // The collision: a CLAIM with this content has the edge's digest as its
+    // content hash (`prepare_submission` hashes `params.content.as_bytes()`).
+    let claim_content = edge_attestation_canonical_json(&att).unwrap();
+    let claim_hash = epigraph_crypto::ContentHasher::hash(claim_content.as_bytes());
+    assert_eq!(
+        claim_hash, digest,
+        "the canonical JSON is what the digest hashes"
+    );
+    // ...and its pre-v1 claim signature, the bare digest.
+    let pre_v1_claim_sig = signer.sign(&claim_hash);
+
+    sqlx::query("UPDATE edges SET content_hash = $2, signature = $3, signer_id = $4 WHERE id = $1")
+        .bind(id)
+        .bind(digest.as_slice())
+        .bind(pre_v1_claim_sig.as_slice())
+        .bind(w)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let check = verify(&pool, id).await;
+    assert!(
+        !check.signature_valid && check.signature_scheme.is_none(),
+        "a pre-v1 claim signature verified an edge: {check:?}"
+    );
+    assert!(check.signed && check.pre_attestation, "{check:?}");
+}
+
+/// `(id, source_id, source_type, target_id, target_type, relationship,
+/// properties, valid_from, created_at)` of one `edges` row.
+type AttestationRow = (
+    Uuid,
+    Uuid,
+    String,
+    Uuid,
+    String,
+    String,
+    serde_json::Value,
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+/// The stored attestation fields of edge `id`.
+async fn stored_attestation(pool: &PgPool, id: Uuid) -> EdgeAttestation {
+    let row: AttestationRow = sqlx::query_as(
+        "SELECT id, source_id, source_type::text, target_id, target_type::text, \
+                relationship::text, properties, valid_from, created_at \
+           FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("edge row");
+    EdgeAttestation {
+        id: row.0,
+        source_id: row.1,
+        source_type: row.2,
+        target_id: row.3,
+        target_type: row.4,
+        relationship: row.5,
+        properties: row.6,
+        valid_from: row.7,
+        created_at: row.8,
+    }
+}
+
+/// A pre-attestation signed edge (the shape of a bulk attestation written
+/// before the attestation scheme: a bare-digest signature over some other
+/// digest, stored with that digest) is refused and reported `pre_attestation`,
+/// with no digest comparison, so it does not read as "changed since signed"
 /// (security review of this module, finding 2).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_signature_counts_only_over_the_rows_own_digest(pool: PgPool) {
+async fn a_pre_attestation_signature_is_refused_and_reported_as_such(pool: PgPool) {
     let signer = AgentSigner::from_bytes(&[0x77; 32]).expect("signer");
     let w = seed_signing_writer(&pool, "edge-legacy", &signer).await;
     let a = fixture::seed_public_claim(&pool, w, "legacy A").await;
@@ -272,10 +378,15 @@ async fn a_legacy_signature_counts_only_over_the_rows_own_digest(pool: PgPool) {
         .await
         .unwrap();
     let check = verify(&pool, id).await;
-    assert_eq!(check.content_matches, Some(false), "{check:?}");
     assert!(
         !check.signature_valid && check.signature_scheme.is_none(),
         "a bare-digest signature over a claim's hash verified an edge: {check:?}"
+    );
+    assert!(check.signed && check.pre_attestation, "{check:?}");
+    assert_eq!(
+        check.content_matches, None,
+        "a pre-attestation digest is no attestation digest; comparing it reads as \
+         tampering: {check:?}"
     );
 }
 

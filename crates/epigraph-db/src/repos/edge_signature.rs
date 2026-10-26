@@ -40,12 +40,27 @@
 //! The digest is computed from the row AS STORED (read back after the INSERT),
 //! never from the writer's input, so JSONB normalisation of `properties` and
 //! the database's `created_at` cannot make an honest signature fail to verify.
+//!
+//! # v1 only
+//!
+//! The edge verifier accepts ONLY the v1 edge message, never a legacy
+//! bare-digest signature (security review of this module, finding 2: "if
+//! legacy edge signatures cannot exist, accept only v1"). The attestation
+//! schema is defined here for the first time, so no signature made before v1
+//! can be over an attestation digest. And a bare-digest signature binds no
+//! entity type: claims hash their raw content bytes, so a claim whose content
+//! IS an edge's canonical attestation JSON has a content hash equal to that
+//! edge's digest, and its pre-v1 claim signature would read as a valid
+//! signature of the edge. Signed edges written before this module (bulk
+//! attestations, migration 120) are over some other, undefined digest; the
+//! verifier reports them `pre_attestation` and never valid.
 
 use crate::errors::DbError;
 use crate::visibility::Viewer;
 use chrono::{DateTime, SecondsFormat, Utc};
 use epigraph_crypto::{
-    AgentSigner, ContentHasher, SignatureScheme, SignatureVerifier, SignedEntity, HASH_SIZE,
+    signing_message, AgentSigner, ContentHasher, SignatureScheme, SignatureVerifier, SignedEntity,
+    HASH_SIZE,
 };
 use serde::Serialize;
 use sqlx::Row;
@@ -72,13 +87,32 @@ fn ts(t: &DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// The attestation digest of an edge (see the module docs for what it covers).
+/// The canonical JSON text of an edge's attestation object: the exact bytes
+/// [`edge_attestation_digest`] hashes, for a verifier outside this crate.
+///
+/// # Errors
+/// Returns `DbError::InvalidData` only if canonical serialization fails, which
+/// a `serde_json::Value` cannot do in practice.
+pub fn edge_attestation_canonical_json(a: &EdgeAttestation) -> Result<String, DbError> {
+    epigraph_crypto::to_canonical_json(&attestation_object(a)).map_err(|e| DbError::InvalidData {
+        reason: format!("edge attestation canonicalization: {e}"),
+    })
+}
+
+/// The attestation digest of an edge (see the module docs for what it covers):
+/// BLAKE3 over [`edge_attestation_canonical_json`].
 ///
 /// # Errors
 /// Returns `DbError::InvalidData` only if canonical serialization fails, which
 /// a `serde_json::Value` cannot do in practice.
 pub fn edge_attestation_digest(a: &EdgeAttestation) -> Result<[u8; HASH_SIZE], DbError> {
-    let canonical = serde_json::json!({
+    ContentHasher::hash_canonical(&attestation_object(a)).map_err(|e| DbError::InvalidData {
+        reason: format!("edge attestation canonicalization: {e}"),
+    })
+}
+
+fn attestation_object(a: &EdgeAttestation) -> serde_json::Value {
+    serde_json::json!({
         "schema": EDGE_ATTESTATION_SCHEMA,
         "id": a.id.to_string(),
         "source_id": a.source_id.to_string(),
@@ -89,9 +123,6 @@ pub fn edge_attestation_digest(a: &EdgeAttestation) -> Result<[u8; HASH_SIZE], D
         "properties": a.properties,
         "valid_from": a.valid_from.as_ref().map(ts),
         "created_at": ts(&a.created_at),
-    });
-    ContentHasher::hash_canonical(&canonical).map_err(|e| DbError::InvalidData {
-        reason: format!("edge attestation canonicalization: {e}"),
     })
 }
 
@@ -114,14 +145,13 @@ pub enum EdgeSignOutcome {
 pub struct EdgeSignatureCheck {
     /// `edges.signature IS NOT NULL`.
     pub signed: bool,
-    /// The stored signature verifies, as an EDGE signature, over the STORED
+    /// The stored signature verifies, as a v1 EDGE signature, over the STORED
     /// `content_hash`, under a key of the signer that was admitted when the
-    /// edge was created (see `key_kind`).
+    /// edge was created (see `key_kind`). A legacy bare-digest signature never
+    /// counts (see the module docs, "v1 only").
     pub signature_valid: bool,
-    /// Which message verified (`v1` / `legacy`); `None` when nothing does. A
-    /// legacy (bare-digest) signature counts only when `content_matches` is
-    /// `Some(true)`: it binds no entity type, so it is accepted only over this
-    /// row's own attestation digest.
+    /// Which message verified: always `v1` when `signature_valid`, `None`
+    /// otherwise. Kept for symmetry with `verify_claim`'s field.
     pub signature_scheme: Option<SignatureScheme>,
     /// The kind of key that verified: `signing` / `identity-legacy` (an
     /// attested `agent_keys` row whose status and window admit the edge's
@@ -129,8 +159,17 @@ pub struct EdgeSignatureCheck {
     /// when no `agent_keys` row carries it). `None` when nothing verifies.
     pub key_kind: Option<&'static str>,
     /// The row recomputes to its stored `content_hash`; `None` when no digest
-    /// is stored (an unsigned edge, or a legacy signature with no digest).
+    /// is stored, or when the edge is `pre_attestation` (its stored digest is
+    /// then no attestation digest, so there is nothing to compare).
     pub content_matches: Option<bool>,
+    /// The edge carries a signature that is NOT a v1 edge attestation under
+    /// any key its signer ever registered (admitted or not): a signature made
+    /// under an earlier, undefined scheme (a pre-attestation bulk
+    /// attestation), a bare-digest or other-entity signature, or garbage. It
+    /// attests nothing this verifier can check, and is never valid. A v1
+    /// signature whose key was not admitted when the edge was created is NOT
+    /// pre-attestation: it is a real attestation by an unadmitted key.
+    pub pre_attestation: bool,
     pub signer_id: Option<Uuid>,
 }
 
@@ -312,13 +351,11 @@ impl EdgeSignatureRepository {
         let stored_hash: Option<[u8; HASH_SIZE]> =
             stored_hash.and_then(|h| <[u8; HASH_SIZE]>::try_from(h.as_slice()).ok());
 
-        let content_matches = match stored_hash {
-            Some(h) => Some(edge_attestation_digest(&attestation_of(&row))? == h),
-            None => None,
-        };
-
         let created_at: DateTime<Utc> = row.get("created_at");
-        let mut verified: Option<(SignatureScheme, &'static str)> = None;
+        // The kind of the ADMITTED key that verifies the v1 edge message, and
+        // whether ANY key of the signer (admitted or not) does.
+        let mut verified: Option<&'static str> = None;
+        let mut attests = false;
         if let (Some(sig), Some(h), Some(signer)) = (signature.as_deref(), stored_hash, signer_id) {
             if let Ok(sig) = <[u8; 64]>::try_from(sig) {
                 // `agents` and `agent_keys` carry no tenancy columns: a key is
@@ -336,35 +373,52 @@ impl EdgeSignatureRepository {
                         .bind(signer)
                         .fetch_optional(&mut *conn)
                         .await?;
-                let keys = admitted_keys(&rows, agent_key, created_at);
-                verified = keys.iter().find_map(|(key, kind)| {
-                    SignatureVerifier::verify_entity(key, SignedEntity::Edge, &h, &sig)
-                        .ok()
-                        .flatten()
-                        .map(|scheme| (scheme, *kind))
-                });
+                // v1 ONLY: the edge-tagged message, never the bare digest.
+                let message = signing_message(SignedEntity::Edge, &h);
+                let v1 = |key: &[u8; 32]| {
+                    SignatureVerifier::verify(key, &message, &sig).unwrap_or(false)
+                };
+                verified = admitted_keys(&rows, agent_key.clone(), created_at)
+                    .iter()
+                    .find(|(key, _)| v1(key))
+                    .map(|(_, kind)| *kind);
+                attests = verified.is_some()
+                    || rows
+                        .iter()
+                        .map(|(key, ..)| key)
+                        .chain(agent_key.iter())
+                        .filter_map(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+                        .any(|k| v1(&k));
             }
         }
-        // A LEGACY (bare-digest) signature binds no entity type, so it counts
-        // only when the stored digest really is this row's attestation digest:
-        // a bare-digest signature over some claim's or evidence row's content
-        // hash, copied here with that hash, never matches and is refused.
-        if matches!(verified, Some((SignatureScheme::Legacy, _))) && content_matches != Some(true) {
-            verified = None;
-        }
+        let pre_attestation = signature.is_some() && !attests;
+        let content_matches = match stored_hash {
+            Some(h) if !pre_attestation => {
+                Some(edge_attestation_digest(&attestation_of(&row))? == h)
+            }
+            _ => None,
+        };
 
         Ok(Some(EdgeSignatureCheck {
             signed: signature.is_some(),
             signature_valid: verified.is_some(),
-            signature_scheme: verified.map(|(scheme, _)| scheme),
-            key_kind: verified.map(|(_, kind)| kind),
+            signature_scheme: verified.map(|_| SignatureScheme::V1),
+            key_kind: verified,
             content_matches,
+            pre_attestation,
             signer_id,
         }))
     }
 
     /// The unsigned-edge metric: how many of the edges `viewer` may read carry
     /// a signature, and how many do not.
+    ///
+    /// `signed` counts rows CARRYING a signature, which includes signatures
+    /// made before the attestation scheme existed (bulk attestations, which
+    /// [`Self::verify_conn`] reports `pre_attestation` and never valid). It is
+    /// therefore an upper bound on verifiable edges, not a count of them;
+    /// checking each signature is a per-row Ed25519 verify this aggregate does
+    /// not run.
     ///
     /// Viewer-scoped with the EDGE predicate, like every cardinality
     /// `system_stats` reports (PR-09): a corpus-wide count would tell any
