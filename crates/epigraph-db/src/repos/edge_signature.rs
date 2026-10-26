@@ -117,7 +117,10 @@ pub struct EdgeSignatureCheck {
     /// `content_hash`, under a key of the signer that was admitted when the
     /// edge was created (see `key_kind`).
     pub signature_valid: bool,
-    /// Which message verified (`v1` / `legacy`); `None` when nothing does.
+    /// Which message verified (`v1` / `legacy`); `None` when nothing does. A
+    /// legacy (bare-digest) signature counts only when `content_matches` is
+    /// `Some(true)`: it binds no entity type, so it is accepted only over this
+    /// row's own attestation digest.
     pub signature_scheme: Option<SignatureScheme>,
     /// The kind of key that verified: `signing` / `identity-legacy` (an
     /// attested `agent_keys` row whose status and window admit the edge's
@@ -258,6 +261,14 @@ impl EdgeSignatureRepository {
                 });
             }
         }
+        // A LEGACY (bare-digest) signature binds no entity type, so it counts
+        // only when the stored digest really is this row's attestation digest:
+        // a bare-digest signature over some claim's or evidence row's content
+        // hash, copied here with that hash, never matches and is refused.
+        if matches!(verified, Some((SignatureScheme::Legacy, _))) && content_matches != Some(true) {
+            verified = None;
+        }
+
         Ok(Some(EdgeSignatureCheck {
             signed: signature.is_some(),
             signature_valid: verified.is_some(),

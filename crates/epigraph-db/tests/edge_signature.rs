@@ -241,6 +241,36 @@ async fn only_an_edge_tagged_or_legacy_signature_verifies_an_edge(pool: PgPool) 
     }
 }
 
+/// A LEGACY (bare-digest) edge signature binds no entity type, so it counts
+/// only over the row's own attestation digest. A bare-digest signature over
+/// some claim's content hash, stored here together with that hash, is refused
+/// (security review of this module, finding 2).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_signature_counts_only_over_the_rows_own_digest(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x77; 32]).expect("signer");
+    let w = seed_signing_writer(&pool, "edge-legacy", &signer).await;
+    let a = fixture::seed_public_claim(&pool, w, "legacy A").await;
+    let b = fixture::seed_public_claim(&pool, w, "legacy B").await;
+    let id = EdgeRepository::create(&pool, a, "claim", b, "claim", "supports", None, None, None)
+        .await
+        .expect("edge");
+    let claim_hash = epigraph_crypto::ContentHasher::hash(b"some claim's body");
+    sqlx::query("UPDATE edges SET content_hash = $2, signature = $3, signer_id = $4 WHERE id = $1")
+        .bind(id)
+        .bind(claim_hash.as_slice())
+        .bind(signer.sign(&claim_hash).as_slice())
+        .bind(w)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let check = verify(&pool, id).await;
+    assert_eq!(check.content_matches, Some(false), "{check:?}");
+    assert!(
+        !check.signature_valid && check.signature_scheme.is_none(),
+        "a bare-digest signature over a claim's hash verified an edge: {check:?}"
+    );
+}
+
 /// The signer's key must be ADMITTED when the edge was created, by the rule
 /// the claim verifier uses (`key_window_admits`): an active or closed-window
 /// rotated key verifies; a revoked, pending, not-yet-valid or expired one does
