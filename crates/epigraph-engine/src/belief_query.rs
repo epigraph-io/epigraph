@@ -120,78 +120,8 @@ pub async fn get_belief(
     claim_id: Uuid,
     frame_id: Option<Uuid>,
 ) -> Result<BeliefInterval, BeliefQueryError> {
-    get_belief_scoped(pool, None, viewer, claim_id, frame_id).await
-}
-
-/// [`get_belief`] with the caller's tenancy-aware pool, when it has one.
-///
-/// Ruling R-22: a framed read folds only the BBAs whose sources `viewer` can
-/// read, and that is decided by a read the SESSION's row security also
-/// filters. On an unstamped application pool every group-private source is
-/// invisible, so a group member's read would drop its own group's BBAs.
-/// With `scoped`, the derivation and source reads run on a connection stamped
-/// with `viewer`, so a member folds them; without it they run on `pool`, as
-/// before.
-///
-/// # Errors
-/// As [`get_belief`].
-pub async fn get_belief_scoped(
-    pool: &PgPool,
-    scoped: Option<&epigraph_db::ScopedPool>,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    frame_id: Option<Uuid>,
-) -> Result<BeliefInterval, BeliefQueryError> {
     if let Some(frame_id) = frame_id {
-        // ── Framed path: live recomputation from stored BBAs ──────────────
-        let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
-            .await?
-            .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
-
-        let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
-
-        let assignment =
-            FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
-        let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
-            assignment.and_then(|a| a.hypothesis_index),
-            frame.hypothesis_count(),
-        );
-
-        let all_bbas =
-            MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
-
-        if all_bbas.is_empty() {
-            return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
-        }
-
-        // Discount each BBA by its calibrated reliability (evidence-type weight
-        // × locality, via the resolved belief profile) before combining, so the
-        // framed read agrees with the cached `claims.pignistic_prob` that the
-        // recompute path writes. No perspective → the served profile with this
-        // frame's overrides, exactly what the recompute resolves.
-        // `None`: no BBA left once those whose sources this viewer cannot read
-        // are set aside (ruling R-22), which reads as an empty frame.
-        let Some((combined, fold_conflict)) =
-            recompute_framed_belief(pool, scoped, viewer, &frame_row, &frame, &all_bbas, None)
-                .await?
-        else {
-            return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
-        };
-
-        let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
-        let bel = epigraph_ds::measures::belief(&combined, &target);
-        let pl = epigraph_ds::measures::plausibility(&combined, &target);
-        let betp = epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index);
-
-        return Ok(BeliefInterval {
-            belief: bel,
-            plausibility: pl,
-            pignistic_prob: betp,
-            mass_on_conflict: fold_conflict,
-            mass_on_missing: combined.mass_of_missing(),
-            framed: true,
-            source: "recomputed".to_string(),
-        });
+        return framed_belief(pool, None, viewer, claim_id, frame_id).await;
     }
 
     // ── Unframed path: cached DS columns from claim row ───────────────────
@@ -240,6 +170,91 @@ pub async fn get_belief_scoped(
         .ok_or(BeliefQueryError::ClaimNotFound(claim_id))?;
 
     Ok(BeliefInterval::cached_from_truth(claim.truth_value.value()))
+}
+
+/// [`get_belief`] with the caller's tenancy-aware pool, when it has one.
+///
+/// Ruling R-22: a framed read folds only the BBAs whose sources `viewer` can
+/// read, and that is decided by a read the SESSION's row security also
+/// filters. On an unstamped application pool every group-private source is
+/// invisible, so a group member's read would drop its own group's BBAs.
+/// With `scoped`, the framed path's derivation and source reads run on a
+/// connection stamped with `viewer`, so a member folds them; without it they
+/// run on `pool`, as before. The unframed path reads the cache and is
+/// [`get_belief`]'s own.
+///
+/// # Errors
+/// As [`get_belief`].
+pub async fn get_belief_scoped(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Option<Uuid>,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    match frame_id {
+        Some(frame_id) => framed_belief(pool, scoped, viewer, claim_id, frame_id).await,
+        None => get_belief(pool, viewer, claim_id, None).await,
+    }
+}
+
+/// The framed path of [`get_belief`] / [`get_belief_scoped`]: live
+/// recomputation from stored BBAs.
+async fn framed_belief(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    // ── Framed path: live recomputation from stored BBAs ──────────────
+    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
+        .await?
+        .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
+
+    let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
+
+    let assignment =
+        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
+    let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
+        assignment.and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
+
+    if all_bbas.is_empty() {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    }
+
+    // Discount each BBA by its calibrated reliability (evidence-type weight
+    // × locality, via the resolved belief profile) before combining, so the
+    // framed read agrees with the cached `claims.pignistic_prob` that the
+    // recompute path writes. No perspective → the served profile with this
+    // frame's overrides, exactly what the recompute resolves.
+    // `None`: no BBA left once those whose sources this viewer cannot read
+    // are set aside (ruling R-22), which reads as an empty frame.
+    let Some((combined, fold_conflict)) =
+        recompute_framed_belief(pool, scoped, viewer, &frame_row, &frame, &all_bbas, None).await?
+    else {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    };
+
+    let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
+    let bel = epigraph_ds::measures::belief(&combined, &target);
+    let pl = epigraph_ds::measures::plausibility(&combined, &target);
+    let betp = epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index);
+
+    Ok(BeliefInterval {
+        belief: bel,
+        plausibility: pl,
+        pignistic_prob: betp,
+        mass_on_conflict: fold_conflict,
+        mass_on_missing: combined.mass_of_missing(),
+        framed: true,
+        source: "recomputed".to_string(),
+    })
 }
 
 /// Compute a **perspective-scoped** belief on demand — the "frame function".
