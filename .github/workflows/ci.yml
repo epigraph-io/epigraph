@@ -577,7 +577,14 @@ jobs:
         # coverage and efficiency, plus --check, which fails when the shipped
         # calibration.toml [conformal] quantiles (or the comment stating their
         # calibration n) disagree with a refit of the fixtures (backlog 733df577).
-        run: python3 tests/scifact_calibration/test_conformal_coverage.py --check
+        # The job's other database-free pytest file runs here too (a new step
+        # name would need a matching local-gate classification): tests/ci,
+        # the skip-budget checker's own tests, so a change that made the
+        # checker vacuous fails this step instead of leaving the job green.
+        run: |
+          python3 -m pytest -rs tests/ci --junitxml "$RUNNER_TEMP/pytest-ci.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-ci.xml"
+          python3 tests/scifact_calibration/test_conformal_coverage.py --check
 
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every

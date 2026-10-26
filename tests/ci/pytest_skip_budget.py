@@ -14,6 +14,15 @@ dotted module path, plus the class for unittest/class-based tests) and its
 `name`, joined by `::`. An allowed test that did not skip is fine: the
 allowlist is a ceiling, not an expectation. A run with no test cases fails,
 since an empty run is the other way a suite can pass while running nothing.
+
+Two id shapes worth knowing: a module skipped at collection
+(`pytest.skip(..., allow_module_level=True)`, `pytest.importorskip`) is written
+with an EMPTY classname and the dotted module path as its name, so its id is
+`::tests.dedup.test_x`; and an xfail is written as `<skipped
+type="pytest.xfail">`. An xfail counts against the budget like a skip (its
+assertion did not hold, so it is coverage the step does not enforce) and must
+be allowlisted the same way; the report labels it `xfail`, not `skip`.
+
 Standard library only, so it runs before or without the test venv.
 """
 from __future__ import annotations
@@ -23,8 +32,11 @@ import sys
 import xml.etree.ElementTree as ET
 
 
-def skipped_tests(junit_path: str) -> tuple[int, list[tuple[str, str]]]:
-    """Return (number of test cases, [(test id, skip message)] for skipped ones)."""
+def skipped_tests(junit_path: str) -> tuple[int, list[tuple[str, str, str]]]:
+    """Return (number of test cases, [(test id, kind, message)] for skipped ones).
+
+    kind is "xfail" for pytest's xfail outcome, else "skip".
+    """
     root = ET.parse(junit_path).getroot()
     total = 0
     skipped = []
@@ -34,8 +46,9 @@ def skipped_tests(junit_path: str) -> tuple[int, list[tuple[str, str]]]:
         if skip is None:
             continue
         test_id = f"{case.get('classname', '')}::{case.get('name', '')}"
+        kind = "xfail" if skip.get("type") == "pytest.xfail" else "skip"
         message = (skip.get("message") or "").strip().splitlines()
-        skipped.append((test_id, message[0] if message else ""))
+        skipped.append((test_id, kind, message[0] if message else ""))
     return total, skipped
 
 
@@ -50,10 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skip budget: {args.junit} has no test cases", file=sys.stderr)
         return 1
     allowed = set(args.allow)
-    over = [(t, m) for t, m in skipped if t not in allowed]
-    for t, m in skipped:
+    over = [t for t, _, _ in skipped if t not in allowed]
+    for t, kind, m in skipped:
         tag = "allowed" if t in allowed else "NOT ALLOWED"
-        print(f"skip budget: {tag}: {t}: {m}")
+        print(f"skip budget: {tag} ({kind}): {t}: {m}")
     if over:
         print(
             f"skip budget: {len(over)} skip(s) outside the allowlist "
