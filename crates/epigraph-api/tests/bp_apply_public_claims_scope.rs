@@ -119,12 +119,33 @@ async fn bp_apply_never_writes_a_public_claim_from_a_private_neighbour(pool: PgP
         Some(1),
         "the skip is reported: {body}"
     );
-    // Control: the all-public component is still applied.
-    let written = body["applied_count"].as_u64().unwrap_or_default();
+    // Controls. `applied_count >= 1` alone would hold if only the private
+    // claim were written, so each claim that must be applied is checked: the
+    // all-public component, and the group-private claim (a NARROWER claim may
+    // be informed by a more readable one; its audience can read both).
+    let served = |claim: Uuid| -> f64 {
+        body["updated_beliefs"]
+            .as_array()
+            .expect("updated_beliefs")
+            .iter()
+            .find(|b| b["claim_id"].as_str() == Some(claim.to_string().as_str()))
+            .and_then(|b| b["betp"].as_f64())
+            .unwrap_or_else(|| panic!("no BP value for {claim}: {body}"))
+    };
+    let seeds = [(private, 0.95), (left, 0.9), (right, 0.3)];
     assert!(
-        written >= 1,
-        "the all-public component must still be applied: {body}"
+        seeds.iter().any(|(c, p)| (served(*c) - p).abs() > 1e-6),
+        "PREMISE: BP moved at least one of the claims that must be applied: {body}"
     );
+    for (claim, _) in seeds {
+        let cached = betp(&pool, claim).await.expect("cache");
+        assert!(
+            (cached - served(claim)).abs() < 1e-9,
+            "claim {claim} must be applied (cache {cached}, BP {}): {body}",
+            served(claim)
+        );
+    }
+    assert_eq!(body["applied_count"].as_u64(), Some(3), "{body}");
 }
 
 async fn team_group(pool: &PgPool, label: &str) -> Uuid {
