@@ -168,7 +168,8 @@ async fn evolve_step_on_a_parent_the_caller_cannot_see_returns_404(pool: PgPool)
 /// turns it into `DbError::WriteRefused`, a denial the route must render as
 /// 403 (as `From<DbError>` does everywhere else), not fold into its 500 arm. A
 /// `BEFORE UPDATE` trigger that skips only the parent's `is_current` change
-/// produces the zero-row retire deterministically.
+/// produces the zero-row retire deterministically; the next test pins what
+/// the real policies do instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_nothing(
     pool: PgPool,
@@ -241,4 +242,72 @@ async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_n
         .await
         .expect("parent");
     assert!(!still_current, "the parent is retired");
+}
+
+/// `supersedes` on a PUBLIC step the caller can read but does not own, on the
+/// application role with the real row-security policies and no stand-in: a
+/// refusal with nothing written and the lineage's one current head intact
+/// (backlog d34f5096).
+///
+/// A regression pin, green before and after the d34f5096 fix. It measures what
+/// the real policies do on the path the stand-in above exercises: the parent's
+/// `SELECT ... FOR UPDATE` returns the readable row, and the claims tenancy
+/// policy refuses the write by RAISING at its WITH CHECK (SQLSTATE 42501, the
+/// transaction aborted), not by matching zero rows. The successor inherits the
+/// parent's owner group and INSERT and UPDATE share that WITH CHECK, so "may
+/// write the successor but not retire the predecessor" cannot arise through
+/// the claims policies today. Only the invariant is pinned, not the status:
+/// the route currently answers that refusal 500, a separate defect.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersedes_of_a_readable_step_the_caller_cannot_write_is_refused_and_writes_nothing(
+    pool: PgPool,
+) {
+    let (a, a_group) = seed_agent_with_group(&pool, "owner-a").await;
+    let (b, _) = seed_agent_with_group(&pool, "reader-b").await;
+    // Owned by A's group and published: every viewer may read it, only A's
+    // group may write it. Seeded directly, as the fixture's seeders do (they
+    // pair `public` only with the world group, which nobody writes).
+    let parent = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                             is_current, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.8, $4, true, 'public', $5)",
+    )
+    .bind(parent)
+    .bind(format!("A's public step {parent}"))
+    .bind(parent.as_bytes().repeat(2))
+    .bind(a)
+    .bind(a_group)
+    .execute(&pool)
+    .await
+    .expect("seed A's public step");
+    let state = app_role_state(&pool).await;
+
+    let content = format!("successor by a reader {}", Uuid::new_v4());
+    let (status, body) = evolve_as(&pool, &state, b, parent, &content, "supersedes").await;
+    assert!(
+        !status.is_success(),
+        "a step the caller may read but not write is refused: {status} {body}"
+    );
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        0,
+        "no successor"
+    );
+    assert_eq!(current_heads(&pool, parent).await, 1, "one current head");
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("parent");
+    assert!(still_current, "the parent is untouched");
+
+    // Control: the owner, who can write the parent, supersedes it on the same
+    // state, so the refusal above is the caller's lack of write authority and
+    // not the harness.
+    let content = format!("successor by the owner {}", Uuid::new_v4());
+    let (status, body) = evolve_as(&pool, &state, a, parent, &content, "supersedes").await;
+    assert_eq!(status, StatusCode::OK, "the owner may supersede: {body}");
+    assert_eq!(claims_with_content(&pool, &content).await, 1);
+    assert_eq!(current_heads(&pool, parent).await, 1, "one current head");
 }
