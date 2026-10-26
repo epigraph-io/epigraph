@@ -2086,6 +2086,14 @@ The events stay. Run it AFTER `129-undo.sql` (129's policies call
 `epigraph_admin_scopes_armed()`, so 128-undo refuses while they exist) and
 before 127-undo.
 
+A disarm is reversible for the refresh chains minted while armed: a new chain
+stores its CONSENTED scopes (`oauth::scopes::chain_scopes`), not the
+chokepoint's output, so an admin-only scope stripped from the access token at
+the first mint comes back at the chain's first refresh after the disarm.
+Chains minted before this release by a binary that stored the stripped set
+stay without it; their holder re-consents (a new authorization-code grant, or
+a fresh `client_credentials` grant for a service or agent).
+
 ## The standing admin read arms follow the switch (migration 129)
 
 Migration 129 rewrites the four read policies that carry a STANDING

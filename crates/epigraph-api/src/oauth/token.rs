@@ -621,6 +621,9 @@ async fn handle_client_credentials(
             None => granted.clone(),
         }
     };
+    // The refresh chain stores the consent, not the chokepoint's output; see
+    // [`crate::oauth::scopes::chain_scopes`].
+    let chain_scopes = crate::oauth::scopes::chain_scopes(requested_scopes.clone());
     let effective_scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
@@ -668,7 +671,7 @@ async fn handle_client_credentials(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
-            &effective_scopes,
+            &chain_scopes,
             Utc::now() + refresh_ttl,
         )
         .await
@@ -1176,7 +1179,10 @@ async fn handle_authorization_code(
         _ => Duration::minutes(15),
     };
     // The code's consented scopes, through the mint chokepoint (never the
-    // elevation scope; the admin-only scopes per migration 128's switch).
+    // elevation scope; the admin-only scopes per migration 128's switch). The
+    // refresh chain stores the consent itself; see
+    // [`crate::oauth::scopes::chain_scopes`].
+    let chain_scopes = crate::oauth::scopes::chain_scopes(row.scopes.clone());
     let effective_scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
@@ -1209,7 +1215,7 @@ async fn handle_authorization_code(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
-            &effective_scopes,
+            &chain_scopes,
             Utc::now() + refresh_ttl,
         )
         .await

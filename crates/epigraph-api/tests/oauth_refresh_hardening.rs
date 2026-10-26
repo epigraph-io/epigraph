@@ -249,3 +249,204 @@ async fn a_refresh_scope_naming_only_a_stripped_scope_is_invalid_scope_and_keeps
     );
     assert_eq!(token_scopes(&jwt, &body), v(&["claims:read"]));
 }
+
+// ── 35a89d3d: the chain stores the consent, not the chokepoint's output ──────
+
+// The external grant's fixture (shared with the provider suites).
+mod oauth_providers;
+
+use std::sync::Arc;
+
+use epigraph_api::oauth::providers::{
+    config::{ProviderConfig, ProviderFlow},
+    google::GoogleProvider,
+    jwks::JwksCache,
+    ExternalIdentityProvider, OidcRedirectFlow, ProviderRegistry,
+};
+use oauth_providers::fixtures::ProviderFixture;
+
+/// An active SERVICE client holding `scopes`, with a fresh secret. Returns
+/// `(client_id, secret hex)`.
+async fn service_client(pool: &PgPool, scopes: &[String]) -> (String, String) {
+    let secret: [u8; 32] = rand::random();
+    let client_id = format!("a11_svc_{}", Uuid::new_v4().simple());
+    OAuthClientRepository::create(
+        pool,
+        &client_id,
+        Some(blake3::hash(&secret).as_bytes()),
+        "a11 service",
+        "service",
+        scopes,
+        scopes,
+        "active",
+        None,
+        None,
+        Some("A11 Test Org"),
+        Some("a11@example.com"),
+        None,
+    )
+    .await
+    .expect("service client");
+    (client_id, hex::encode(secret))
+}
+
+fn service_grant(client_id: &str, secret: &str) -> Value {
+    json!({
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": secret,
+    })
+}
+
+fn service_refresh(token: &str, client_id: &str, secret: &str) -> Value {
+    json!({
+        "grant_type": "refresh_token",
+        "refresh_token": token,
+        "client_id": client_id,
+        "client_secret": secret,
+    })
+}
+
+/// A chain minted by the code exchange while armed gets `claims:admin` back
+/// on its first refresh after a disarm (the consent is the chain's ceiling;
+/// the chokepoint runs on every mint).
+///
+/// Catches: `handle_authorization_code` storing `grantable`'s output, which
+/// lost the stripped scope from the chain for good.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_code_chain_minted_armed_regains_the_admin_scope_after_a_disarm(pool: PgPool) {
+    let (client_id, code) = self_connector_code(&pool).await;
+    set_armed(&pool, true).await;
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let (status, body) = post_token(&app, code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:read"]),
+        "PREMISE: armed, the exchange strips claims:admin"
+    );
+    let r0 = refresh_token_of(&body);
+
+    set_armed(&pool, false).await;
+    let (status, body) = post_token(&app, refresh_grant(&r0)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:admin", "claims:read"]),
+        "the disarm is reversible for a chain minted while armed"
+    );
+}
+
+/// The same for a service's `client_credentials` chain.
+///
+/// Catches: `handle_client_credentials` storing `grantable`'s output.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_client_credentials_chain_minted_armed_regains_the_admin_scope_after_a_disarm(
+    pool: PgPool,
+) {
+    let (client_id, secret) = service_client(&pool, &v(HELD)).await;
+    set_armed(&pool, true).await;
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let (status, body) = post_token(&app, service_grant(&client_id, &secret)).await;
+    assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:read"]),
+        "PREMISE: armed, the grant strips claims:admin"
+    );
+    let r0 = refresh_token_of(&body);
+
+    set_armed(&pool, false).await;
+    let (status, body) = post_token(&app, service_refresh(&r0, &client_id, &secret)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:admin", "claims:read"]),
+        "the disarm is reversible for a chain minted while armed"
+    );
+}
+
+/// A google provider whose auto-provisioned clients hold `HELD`.
+fn google_registry(fx: &ProviderFixture) -> Arc<ProviderRegistry> {
+    let cid_var = "OAUTH_REFRESH_HARDENING_GOOGLE_CLIENT_ID".to_string();
+    let sec_var = "OAUTH_REFRESH_HARDENING_GOOGLE_CLIENT_SECRET".to_string();
+    std::env::set_var(&cid_var, "test-audience");
+    std::env::set_var(&sec_var, "test-secret");
+    let cfg = ProviderConfig {
+        name: "google".into(),
+        flow: ProviderFlow::Redirect,
+        grant_type: "google_id_token".into(),
+        issuer: "https://accounts.google.com".into(),
+        extra_issuers: vec![],
+        jwks_url: fx.jwks_url.clone(),
+        audience: None,
+        audience_env: Some(cid_var.clone()),
+        client_id_env: Some(cid_var),
+        client_secret_env: Some(sec_var),
+        auth_endpoint: Some("https://example/auth".into()),
+        token_endpoint: Some(format!("{}/token", fx.mock_server.uri())),
+        redirect_uri: None,
+        redirect_uri_env: None,
+        auto_provision: true,
+        default_scopes: v(HELD),
+        allowed_emails: vec![],
+        allowed_domains: vec![],
+    };
+    let provider = Arc::new(GoogleProvider::from_config(&cfg, JwksCache::new()).unwrap());
+    let mut r = ProviderRegistry::empty();
+    r.register(
+        provider.clone() as Arc<dyn ExternalIdentityProvider>,
+        Some(provider as Arc<dyn OidcRedirectFlow>),
+    )
+    .unwrap();
+    Arc::new(r)
+}
+
+/// The same for an external provider's assertion grant (the shared
+/// `provision_external_user` mint, which the redirect exchange also uses).
+///
+/// Catches: `provision_external_user` storing `grantable`'s output.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_external_grant_chain_minted_armed_regains_the_admin_scope_after_a_disarm(pool: PgPool) {
+    let fx = ProviderFixture::new().await;
+    set_armed(&pool, true).await;
+    let st = state(&pool).await.with_providers(google_registry(&fx));
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let now = Utc::now().timestamp();
+    let id_token = fx.sign(&json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-audience",
+        "sub": "a11-ext",
+        "email": "a11-ext@example.com",
+        "email_verified": true,
+        "name": "a11-ext",
+        "iat": now,
+        "exp": now + 600,
+    }));
+    let (status, body) = post_token(
+        &app,
+        json!({ "grant_type": "google_id_token", "assertion": id_token }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "external grant: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:read"]),
+        "PREMISE: armed, the grant strips claims:admin"
+    );
+    let r0 = refresh_token_of(&body);
+
+    set_armed(&pool, false).await;
+    let (status, body) = post_token(&app, refresh_grant(&r0)).await;
+    assert_eq!(status, StatusCode::OK, "refresh: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:admin", "claims:read"]),
+        "the disarm is reversible for a chain minted while armed"
+    );
+}

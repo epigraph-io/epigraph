@@ -153,6 +153,24 @@ pub async fn grantable(
     }
 }
 
+/// The scopes a NEW refresh chain stores: the consented set a grant minted
+/// from (the code's consent, the request's intersection with the grant),
+/// BEFORE [`grantable`]'s switch-dependent strip, less `platform:admin` (no
+/// non-elevated mint ever carries it, so the chain has no use for it).
+///
+/// The chain's stored set is the ceiling of every later refresh (migration
+/// 140), and [`grantable`] runs on every mint, refresh included. Storing its
+/// OUTPUT instead made an admin-only scope stripped at the first mint (the
+/// switch armed, or unreadable) leave the chain for good, so an operator's
+/// arm-then-disarm rollback did not give it back until the person
+/// re-consented. Storing the consent makes that rollback reversible and
+/// widens nothing: the access token minted from the chain still goes through
+/// the chokepoint.
+#[must_use]
+pub fn chain_scopes(consented: Vec<String>) -> Vec<String> {
+    epigraph_auth::without_elevated_only_scope(consented)
+}
+
 /// What a path that HANDS OUT scopes (client approval, registration's
 /// request, the operator CLI's grant) may do with the admin-only ones it was
 /// asked for.
