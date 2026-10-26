@@ -939,8 +939,9 @@ impl WorkflowRepository {
     /// establish, in plan order: the lookup an outcome report maps each
     /// `step_index` through, shared by the MCP tool and the HTTP route so step
     /// N is one step on both transports. Element N is step N; a step whose
-    /// position the viewer cannot establish is not listed, and neither is any
-    /// step after it.
+    /// position the rule below can establish is listed, and the list stops at
+    /// the first one it cannot (see the residuals at the end: a hidden
+    /// UNINDEXED chain member is not detected).
     ///
     /// Same order as [`Self::resolve_steps_to_heads`] (the `step_follows`
     /// chain, over the `plan_index` order, `created_at` only for edges that
@@ -981,6 +982,19 @@ impl WorkflowRepository {
     /// privileged read: hidden ordinal edges AFTER every visible one, followed
     /// by visible unordered steps. One ingest writes a plan's ordinal edges
     /// under one owner, so it needs a later re-ownership of part of a plan.
+    ///
+    /// Second residual, accepted: a hidden UNINDEXED step inside the chain.
+    /// With visible indexed steps `[a, b, c]` and an unindexed `x` between `a`
+    /// and `b` that the viewer cannot read (a step another group's `add_step`
+    /// re-owned, or a pre-existing private claim with the same compound id),
+    /// the pairs `(a, x)` and `(x, b)` have an end outside the visible set and
+    /// are dropped, the chain reads `[a]`, `[b, c]`, and all three are
+    /// provable: the viewer's `step_index` 1 resolves to `b`, which is step 2
+    /// in plan order. Detecting it means cutting the list at a `step_follows`
+    /// edge from a listed step to a claim outside the visible step set, which
+    /// also fires on cross-generation pairs (a step claim shared by two
+    /// generations carries the other generation's `step_follows` edges, to
+    /// steps that are not in this plan at all), so it is not done here.
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.

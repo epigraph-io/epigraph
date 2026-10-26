@@ -20,9 +20,14 @@ pub struct AddStepParams {
     /// the workflow-ingest stamp can read is public is indexed one past the
     /// largest `plan_index` it can read. Every other add (an insert, or an
     /// append to a plan with a non-public `executes` edge or with no integer
-    /// `plan_index`) is left unindexed (`plan_index: null` in the response),
-    /// and every plan-order reader still lists it at slot `position`: they
-    /// walk the `step_follows` chain, not `plan_index` (ruling R-38).
+    /// `plan_index`) is left unindexed (`plan_index: null` in the response).
+    /// The chain readers (find_workflow, find_workflow_hierarchical, the
+    /// outcome reports' `step_index`) list it at slot `position`: they walk
+    /// the `step_follows` chain, not `plan_index` (ruling R-38). Two
+    /// exceptions: when the plan's `step_follows` pairs fork or cycle there is
+    /// no single chain and those readers fall back to stored `plan_index`
+    /// order (an unindexed step last), and `get_workflow_plan` always reports
+    /// stored order.
     #[serde(default)]
     pub position: Option<u32>,
 }
