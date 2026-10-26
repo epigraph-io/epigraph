@@ -510,7 +510,7 @@ async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
     assert_eq!(forgotten.claim_id, convention);
     let refutes: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
         "SELECT owner_group_id, visibility::text, co_owner_group_id, writer_group_id \
-           FROM edges WHERE target_id = $1 AND relationship = 'REFUTES'",
+           FROM edges WHERE target_id = $1 AND relationship = 'refutes'",
     )
     .bind(convention)
     .fetch_all(&pool)
