@@ -249,12 +249,21 @@ async fn supersede_of_group_private_executed_step_keeps_the_executes_edge(pool: 
 
     // The combined form (one privileged transaction: act + edge migration).
     let mut conn = pool.acquire().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(p.steps[1])
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_conn(
         &mut conn,
         ClaimId::from_uuid(p.steps[1]),
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede of a group-private step");
@@ -289,12 +298,21 @@ async fn deferred_supersede_replay_of_group_private_step_keeps_the_executes_edge
     // migration later on the maintenance connection (and a second time, as a
     // replay of an already-applied cascade would).
     let mut tx = pool.begin().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(p.steps[2])
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(p.steps[2]),
         "step 2: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede act");
@@ -424,12 +442,21 @@ async fn public_step_supersede_still_moves_executes(pool: PgPool) {
     let before = plan(&pool, p.workflow).await;
 
     let mut conn = pool.acquire().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(p.steps[1])
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_conn(
         &mut conn,
         ClaimId::from_uuid(p.steps[1]),
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede of a public step");
@@ -513,12 +540,21 @@ async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
     )
     .await
     .expect("dedup act");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(p.steps[1])
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(p.steps[1]),
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede act");
@@ -720,12 +756,21 @@ async fn a_non_public_claim_keeps_its_outgoing_executes_through_all_three_acts(p
     let partner = fixture::seed_group_claim(&pool, agent, group, "runner 2's partner").await;
 
     let mut conn = pool.acquire().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(sources[0])
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, _) = ClaimRepository::supersede_conn(
         &mut conn,
         ClaimId::from_uuid(sources[0]),
         "runner 0, restated",
         TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede");

@@ -958,6 +958,33 @@ impl DuplicateProvenance {
 /// new, it would read as pointing at its own predecessor.
 pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
 
+/// The agent that PERFORMS a supersession, and the write path it came through
+/// (backlog 73085534, operator ruling R-23).
+///
+/// The replacement keeps the documented contract: it inherits the retired
+/// claim's author (`claims.agent_id`) and owner. The acting agent is recorded
+/// as a graph relationship instead, the convention the workflow writes use for
+/// claims authored by someone other than the agent that called (#600,
+/// `epigraph_ingest_executor::record_caller_authorship`): one `AUTHORED` edge,
+/// `agent` -> `claim`, from `agent` to the replacement, with properties
+/// `{"tool": tool, "was_created": true}`, written in the act's own transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupersedeActor<'a> {
+    /// The acting agent (`agents.id`): the caller's agent over HTTP and MCP,
+    /// the named custodian on the operator CLI.
+    pub agent: Uuid,
+    /// The write path, recorded as the edge's `tool` property.
+    pub tool: &'a str,
+}
+
+impl<'a> SupersedeActor<'a> {
+    /// `agent` acting through `tool`.
+    #[must_use]
+    pub const fn new(agent: Uuid, tool: &'a str) -> Self {
+        Self { agent, tool }
+    }
+}
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -6254,10 +6281,12 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor<'_>,
     ) -> Result<(Uuid, Uuid), DbError> {
         let mut tx = pool.begin().await?;
         let ids =
-            Self::supersede_conn(&mut tx, old_claim_id, new_content, new_truth, reason).await?;
+            Self::supersede_conn(&mut tx, old_claim_id, new_content, new_truth, reason, actor)
+                .await?;
         tx.commit().await?;
         Ok(ids)
     }
@@ -6296,22 +6325,31 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor<'_>,
     ) -> Result<(Uuid, Uuid), DbError> {
         require_privileged_session(
             &mut *conn,
             "supersede_conn (its edge migration re-points other writers' edges)",
         )
         .await?;
-        let (new_uuid, old_uuid) =
-            Self::supersede_act_conn(&mut *conn, old_claim_id, new_content, new_truth, reason)
-                .await?;
+        let (new_uuid, old_uuid) = Self::supersede_act_conn(
+            &mut *conn,
+            old_claim_id,
+            new_content,
+            new_truth,
+            reason,
+            actor,
+        )
+        .await?;
         migrate_superseded_edges(&mut *conn, old_uuid, new_uuid).await?;
         Ok((new_uuid, old_uuid))
     }
 
     /// The supersession's own act, and nothing else: retire `old_claim_id`,
-    /// insert its replacement and the `supersedes` edge between them. Returns
-    /// `(new_id, old_id)`.
+    /// insert its replacement and the `supersedes` edge between them, and
+    /// record `actor` as the replacement's `AUTHORED` edge (the replacement
+    /// itself keeps the retired claim's author; see [`SupersedeActor`]).
+    /// Returns `(new_id, old_id)`.
     ///
     /// Every row it writes is a row the superseder authors (its own claim, the
     /// replacement, which inherits the old claim's tenancy, and the edge
@@ -6330,6 +6368,7 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor<'_>,
     ) -> Result<(Uuid, Uuid), DbError> {
         let old_uuid: Uuid = old_claim_id.into();
         let new_uuid = Uuid::new_v4();
@@ -6438,6 +6477,28 @@ impl ClaimRepository {
         .bind(old_uuid)
         .bind(reason)
         .execute(&mut *conn)
+        .await?;
+
+        // The acting agent (backlog 73085534, ruling R-23): the replacement
+        // above is authored as the RETIRED claim's author, so without this
+        // edge the agent that restated it appears nowhere in the graph. The
+        // #600 convention, spelled exactly as
+        // `epigraph_ingest_executor::record_caller_authorship` writes it (that
+        // crate depends on this one, so the call is the repo function it
+        // uses). Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
+        // A failure is an error: the act rolls back rather than land a
+        // successor with no record of who wrote it.
+        crate::repos::edge::EdgeRepository::create_if_not_exists_conn(
+            &mut *conn,
+            actor.agent,
+            "agent",
+            new_uuid,
+            "claim",
+            "AUTHORED",
+            Some(serde_json::json!({"tool": actor.tool, "was_created": true})),
+            None,
+            None,
+        )
         .await?;
 
         Ok((new_uuid, old_uuid))

@@ -459,6 +459,7 @@ async fn submit_packet_rejects_tombstone_duplicate_with_409(pool: PgPool) {
         "A corrected, different claim that replaces the original",
         TruthValue::new(0.6).expect("valid truth value"),
         "test: retire the original to create a tombstone",
+        epigraph_db::SupersedeActor::new(agent_uuid, "test"),
     )
     .await
     .expect("supersede should succeed");

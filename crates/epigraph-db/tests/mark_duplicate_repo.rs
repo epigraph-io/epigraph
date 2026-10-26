@@ -405,12 +405,21 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
     ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(c1), ClaimId::from_uuid(c2))
         .await
         .expect("calibration: c1 marked onto the current c2");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(s)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(s),
         "superseded canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede s");

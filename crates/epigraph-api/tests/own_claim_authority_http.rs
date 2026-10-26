@@ -333,6 +333,58 @@ async fn a_writer_of_the_owning_group_may_supersede_over_http(pool: PgPool) {
     assert_eq!(deferral_agent(&pool, &resp.cascade).await, Some(w));
 }
 
+/// Every `AUTHORED` edge into `claim`: `(source_id, source_type, properties)`.
+async fn authored_into(pool: &PgPool, claim: Uuid) -> Vec<(Uuid, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT source_id, source_type, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND target_type = 'claim' \
+          ORDER BY source_id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read AUTHORED edges")
+}
+
+/// Backlog 73085534 (ruling R-23), over HTTP on the application role: a group
+/// writer W supersedes the human H's claim. The successor keeps H as its
+/// author, and W, the agent that performed the act, is recorded by exactly one
+/// `AUTHORED` edge to the successor, written with the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writers_supersede_records_the_writer_as_the_successors_author_edge(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, hg) = seed_agent_with_group(&pool, "r23-http-human").await;
+    let (w, _) = seed_agent_with_group(&pool, "r23-http-writer").await;
+    add_member(&pool, hg, w, "writer").await;
+    let c = claim_of(&pool, h, hg, "group", "the group's claim").await;
+
+    let (_, Json(resp)) = supersede_claim(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        human(w, &["claims:write"]),
+        Path(c),
+        supersede_body(c),
+    )
+    .await
+    .expect("a writer of the owning group supersedes");
+    let new = resp.new_claim_id;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(&pool)
+        .await
+        .expect("the successor");
+    assert_eq!(author, h, "the successor inherits the predecessor's author");
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            w,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+        )],
+        "the acting writer is recorded as the successor's AUTHORED edge"
+    );
+}
+
 /// Authorship is not write authority, over HTTP as over MCP: the author of a
 /// claim in a group whose `writer` membership it has lost is refused BY NAME on
 /// both routes (before OA1's shared rule it reached the database, whose row

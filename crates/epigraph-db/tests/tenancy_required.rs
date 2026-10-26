@@ -450,12 +450,21 @@ async fn a_successor_of_a_group_private_claim_is_group_private(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "sup").await;
     let old = group_claim(&pool, agent, group, "private original").await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (_old, new) = ClaimRepository::supersede(
         &pool,
         epigraph_core::ClaimId::from_uuid(old),
         "private correction",
         epigraph_core::TruthValue::clamped(0.9),
         "test",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede");

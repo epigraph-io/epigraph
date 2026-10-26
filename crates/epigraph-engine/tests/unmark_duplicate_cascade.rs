@@ -913,12 +913,21 @@ async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool, how: Retire)
 
         let replacement = match how {
             Retire::Supersede => {
+                // The acting agent the act records (backlog 73085534): this
+                // fixture acts as the claim's own author.
+                let supersede_actor: uuid::Uuid =
+                    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+                        .bind(canonical)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("the superseded claim's author");
                 let (replacement, _) = ClaimRepository::supersede_act_conn(
                     &mut conn,
                     ClaimId::from_uuid(canonical),
                     &format!("canonical, revised {}", Uuid::new_v4()),
                     epigraph_core::TruthValue::clamped(0.5),
                     "revision",
+                    epigraph_db::SupersedeActor::new(supersede_actor, "test"),
                 )
                 .await
                 .expect("supersede act");
@@ -1031,12 +1040,21 @@ async fn an_unmark_follows_a_consolidated_canonical(pool: PgPool) {
 /// Supersede `old` through the act and carry its edges on, as the supersede
 /// routes do; returns the replacement.
 async fn supersede(conn: &mut sqlx::PgConnection, old: Uuid) -> Uuid {
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         conn,
         ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede act");

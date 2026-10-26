@@ -927,6 +927,7 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
                         &format!("revision of {old}"),
                         epigraph_core::TruthValue::new(0.6).expect("truth"),
                         "operator binding probe",
+                        epigraph_db::SupersedeActor::new(writer, "test"),
                     )
                     .await;
                     if r.is_ok() {
@@ -1152,6 +1153,7 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
                 "a revision of l1",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
                 "operator binding probe",
+                epigraph_db::SupersedeActor::new(x, "test"),
             )
             .await;
             if r.is_ok() {
@@ -1387,12 +1389,22 @@ async fn supersede_on(
     old: Uuid,
 ) -> Result<(Uuid, Uuid), epigraph_db::DbError> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_optional(&mut *tx)
+            .await
+            .expect("read the superseded claim's author")
+            .unwrap_or_else(uuid::Uuid::nil);
     let r = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("custodial revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),
         "operator binding probe",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await;
     if r.is_ok() {

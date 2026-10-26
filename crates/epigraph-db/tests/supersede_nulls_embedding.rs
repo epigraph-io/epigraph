@@ -81,12 +81,21 @@ async fn supersede_nulls_embedding_on_old_claim(pool: PgPool) {
     );
 
     // Supersede the old claim.
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (new_id, returned_old) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(old_id),
         "supersede-embedding-test-new",
         TruthValue::clamped(0.85),
         "regression test for chk_deprecated_no_embedding",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .unwrap();

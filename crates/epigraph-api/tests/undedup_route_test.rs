@@ -305,12 +305,21 @@ async fn undedup_follows_a_superseded_canonical_to_its_replacement() {
     assert_eq!(status, 200, "{b}");
 
     let mut conn = pool.acquire().await.expect("acquire");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(canonical)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
         epigraph_core::ClaimId::from_uuid(canonical),
         &format!("r11 canonical, revised {tag}"),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede act");
@@ -493,12 +502,21 @@ async fn undedup_of_a_legacy_mark_is_refused_with_the_reason_until_backfilled() 
 
 async fn supersede(pool: &sqlx::PgPool, old: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("acquire");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("supersede act");

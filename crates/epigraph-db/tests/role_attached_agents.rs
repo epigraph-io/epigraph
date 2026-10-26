@@ -3245,6 +3245,7 @@ async fn a_humans_supersede_of_an_attached_agents_claim_is_refused_after_the_end
                     "a restatement after the end",
                     epigraph_core::TruthValue::new(0.6).expect("truth"),
                     "completion-round pin",
+                    epigraph_db::SupersedeActor::new(h, "test"),
                 )
                 .await;
                 sqlx::query("ROLLBACK")

@@ -34,8 +34,9 @@ pub async fn supersede_claim(
     // The gate read, the authority decision and the stamped transaction the
     // act runs on (batch OA1): see [`begin_claim_act`]. `actor` is the
     // principal that transaction is stamped as, which the cascade's audit row
-    // names.
-    let (mut tx, actor) = begin_claim_act(
+    // names; `caller` is the agent that called (the same agent unless a
+    // `claims:admin` caller borrowed this server's stamp).
+    let (mut tx, actor, caller) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -51,12 +52,19 @@ pub async fn supersede_claim(
     // incoming edge is its source writer's assertion, and re-pointing another
     // writer's edge is the administrative cascade's job below.
     let truth = TruthValue::clamped(params.truth_value);
+    //
+    // The replacement keeps the retired claim's author; the CALLER is recorded
+    // as its `AUTHORED` edge (backlog 73085534, ruling R-23), the #600
+    // convention for a claim authored by someone other than the agent that
+    // called. Not the borrowed server stamp: crediting the server agent would
+    // misattribute the act exactly as the inherited author did.
     let (new_id, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
         old_claim_id,
         &params.content,
         truth,
         &params.reason,
+        epigraph_db::SupersedeActor::new(caller, "supersede_claim"),
     )
     .await
     .map_err(|e| match e {
@@ -134,8 +142,10 @@ pub(crate) async fn admin_session_or_deferral<'s>(
 }
 
 /// The gate read, the authority decision and the stamped transaction a claim
-/// act (`supersede_claim`, `mark_duplicate`) runs on. Returns that transaction
-/// and the principal it is stamped as.
+/// act (`supersede_claim`, `mark_duplicate`) runs on. Returns that transaction,
+/// the principal it is stamped as, and the CALLER's write identity (the agent
+/// that called; it differs from the stamp only on the `claims:admin` borrow of
+/// this server's agent, step 3 below).
 ///
 /// # Authenticated callers (batch OA1, operator decision D1)
 ///
@@ -187,7 +197,7 @@ async fn begin_claim_act<'p>(
     canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
-) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid), McpError> {
+) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid, uuid::Uuid), McpError> {
     let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
 
     // The write identity (batch H-b, D1): the caller's own agent over HTTP,
@@ -202,7 +212,7 @@ async fn begin_claim_act<'p>(
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
         crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
-        return Ok((tx, caller.agent_id()));
+        return Ok((tx, caller.agent_id(), caller.agent_id()));
     };
 
     let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
@@ -255,7 +265,7 @@ async fn begin_claim_act<'p>(
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
-        return Ok((caller_tx, caller.agent_id()));
+        return Ok((caller_tx, caller.agent_id(), caller.agent_id()));
     }
     if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
         // Not reachable through `claim_act_arm` (a non-admin arm requires the
@@ -271,7 +281,7 @@ async fn begin_claim_act<'p>(
         .await?;
     drop(caller_tx);
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
-    Ok((tx, server_agent.agent_id()))
+    Ok((tx, server_agent.agent_id(), caller.agent_id()))
 }
 
 pub async fn mark_duplicate(
@@ -291,7 +301,7 @@ pub async fn mark_duplicate(
     // the canonical is the caller's choice to make only where it could write
     // itself. Either one the caller cannot read is reported as not found,
     // exactly like a missing claim.
-    let (mut tx, actor) = begin_claim_act(
+    let (mut tx, actor, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -462,7 +472,7 @@ pub(crate) async fn unmark_gate(
              written"
         )));
     }
-    let (mut tx, actor) = begin_claim_act(
+    let (mut tx, actor, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -489,7 +499,7 @@ pub(crate) async fn unmark_gate(
     // The same gate over each claim that replaced the canonical: the reversal
     // moves the duplicate's rows off it as off the canonical.
     for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
-        let (mut tx, _) = begin_claim_act(
+        let (mut tx, _, _) = begin_claim_act(
             server,
             viewer,
             auth,

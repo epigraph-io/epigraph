@@ -2491,6 +2491,7 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
                 "W's corrected claim",
                 epigraph_core::TruthValue::clamped(0.6),
                 "a correction",
+                epigraph_db::SupersedeActor::new(w, "test"),
             )
             .await
             .expect("W supersedes its own claim on the app role");
@@ -3024,6 +3025,7 @@ async fn a_deferral_names_only_the_recording_sessions_own_act(pool: PgPool) {
                 "A's corrected claim",
                 epigraph_core::TruthValue::clamped(0.6),
                 "a correction",
+                epigraph_db::SupersedeActor::new(a, "test"),
             )
             .await
             .expect("A supersedes its own claim");

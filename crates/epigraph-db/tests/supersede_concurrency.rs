@@ -49,12 +49,21 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
 
     // A: supersede inside an open transaction; it now holds old's row lock.
     let mut a = pool.begin().await.expect("begin A");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *a)
+            .await
+            .expect("the superseded claim's author");
     let (a_new, _) = ClaimRepository::supersede_act_conn(
         &mut a,
         ClaimId::from_uuid(old),
         "revision from A",
         TruthValue::clamped(0.6),
         "race A",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("A's supersession succeeds");
@@ -70,12 +79,21 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
             .await
             .expect("B pid");
         pid_tx.send(pid).expect("send pid");
+        // The acting agent the act records (backlog 73085534): this
+        // fixture acts as the claim's own author.
+        let supersede_actor: uuid::Uuid =
+            sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+                .bind(old)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("the superseded claim's author");
         let r = ClaimRepository::supersede_act_conn(
             &mut tx,
             ClaimId::from_uuid(old),
             "revision from B",
             TruthValue::clamped(0.7),
             "race B",
+            epigraph_db::SupersedeActor::new(supersede_actor, "test"),
         )
         .await;
         match r {
@@ -162,22 +180,40 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
         "calibration: the claim starts with both vectors"
     );
     let mut tx = pool.begin().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the superseded claim's author");
     ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(old),
         "first revision",
         TruthValue::clamped(0.6),
         "first",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect("first supersession succeeds");
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the superseded claim's author");
     let again = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(old),
         "second revision",
         TruthValue::clamped(0.6),
         "second",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await
     .expect_err("a retired claim cannot be superseded again");
@@ -193,6 +229,7 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
         "revision of nothing",
         TruthValue::clamped(0.6),
         "missing",
+        epigraph_db::SupersedeActor::new(Uuid::new_v4(), "test"),
     )
     .await
     .expect_err("a missing claim cannot be superseded");
@@ -247,12 +284,21 @@ async fn supersede_act_conn_refuses_a_current_claim_it_cannot_retire(pool: PgPoo
     .expect("install the retirement stand-in");
 
     let mut tx = pool.begin().await.unwrap();
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("the superseded claim's author");
     let r = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(old),
         "revision that cannot retire its original",
         TruthValue::clamped(0.6),
         "unretirable",
+        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
     )
     .await;
     // Commit whatever the call left on the transaction: a refusal must have

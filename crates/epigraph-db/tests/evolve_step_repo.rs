@@ -407,6 +407,7 @@ async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool
         "a plain restatement",
         epigraph_core::TruthValue::clamped(0.6),
         "restated",
+        epigraph_db::SupersedeActor::new(agent, "test"),
     )
     .await
     .expect("supersede act");
