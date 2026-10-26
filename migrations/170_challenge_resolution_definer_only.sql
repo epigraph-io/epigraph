@@ -98,6 +98,23 @@
 -- is withdrawn; a settled one keeps its verdict, which the owner may still
 -- re-resolve (R-14).
 --
+-- TWO READINGS OF R-13 PENDING AN OPERATOR RULING. R-13 says "the outsider
+-- owner may only set state='withdrawn' on its own challenge". This file reads
+-- it (a) as the CHALLENGER (`challenger_id` = the session principal), not
+-- every writer of the row's owning group, and (b) as withdrawing an
+-- UNRESOLVED challenge only (the two sections above give the reasons). Both
+-- are the narrower reading. If the ruling differs, only the withdrawal arm of
+-- the guard below (its `OLD.state IN (...)` and `OLD.challenger_id` clauses)
+-- and its test arms change: the `challenger_id` rule and the DELETE refusal do
+-- not depend on either answer.
+--
+-- TRUST BOUNDARY. The challenger check here and 168's resolver stamp both
+-- read `epigraph_principal_id()`, the session's `epigraph.principal_id`
+-- setting, which the HTTP and MCP transports stamp from the authenticated
+-- caller. The guarantees in this file are for sessions stamped that way; a
+-- connection that sets its own session settings sits outside them, the same
+-- boundary as every principal-keyed rule in this schema.
+--
 -- The definer passes because it is owned by `epigraph_maintenance` (168
 -- section 7), so inside its frame `current_user` is the maintenance role and
 -- the invoker guard reads the session as privileged; so does a maintenance
