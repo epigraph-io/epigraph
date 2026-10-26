@@ -1000,6 +1000,34 @@ async fn a_retired_legacy_parent_link_still_names_the_operator(pool: PgPool) {
     assert!(r.recorded);
 }
 
+/// The folder is checked BEFORE the repeat short-circuit. Once a pair is on
+/// record, the same pair named for a folder the child never ran in is refused
+/// AID10 (nothing written). It is not reported as a harmless repeat
+/// (`recorded = false`), which would let a wrong (child, parent, folder)
+/// assertion look accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_recorded_pair_named_for_a_folder_the_child_never_ran_in_is_refused_aid10(
+    pool: PgPool,
+) {
+    let inc = incident(&pool).await;
+    assert!(
+        try_record(&pool, inc.child, inc.parent, GROUP)
+            .await
+            .expect("the record in the child's folder")
+            .recorded
+    );
+    let before = footprint(&pool).await;
+    let err = try_record(&pool, inc.child, inc.parent, "g-never")
+        .await
+        .expect_err("a folder the child never ran in is not a repeat");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID10"), "{err}");
+    assert!(
+        err.to_string().contains("was never registered in group"),
+        "{err}"
+    );
+    assert_eq!(footprint(&pool).await, before, "a refusal writes nothing");
+}
+
 /// Only the maintenance role may record: the application role and the
 /// attestor are refused EXECUTE (42501) and nothing changes.
 #[sqlx::test(migrations = "../../migrations")]

@@ -91,13 +91,20 @@
 -- For a child the host registered parentless because AID03 refused its legacy
 -- parent. Maintenance-only (a maintenance or superuser session; EXECUTE is
 -- the maintenance role's alone) and audited. It takes the operator-links
--- advisory lock, as the registration does. A child that already has a
--- succession row naming THIS parent, in any group folder, returns
--- `recorded = false` and writes nothing: one identity serves every group with
--- the same model and files, so a shared child registered parentless in two
--- folders against the same legacy parent needs one row, and a call for the
--- second folder is a repeat, not an error. Otherwise it refuses (AID10,
--- nothing written, each refusal naming its reason) unless:
+-- advisory lock, as the registration does. It first requires that the
+-- child was host-registered in that group (a snapshot there; AID10
+-- otherwise). Then a child that already has a succession row naming THIS
+-- parent, in any group folder, and that also registered parentless in the
+-- named folder, returns `recorded = false` and writes nothing: one identity
+-- serves every group with the same model and files, so a shared child
+-- registered parentless in two folders against the same legacy parent needs
+-- one row, and a call for the second folder is a repeat, not an error. A
+-- folder the child never ran in is refused, never a repeat. The function
+-- cannot tell WHICH legacy identity a folder's parent was (legacy rows have
+-- no snapshot, and the legacy key is not derivable in SQL), so the
+-- (child, parent, folder) triple is the caller's assertion: take it from the
+-- host's refusal alert for that folder. Otherwise it refuses (AID10, nothing
+-- written, each refusal naming its reason) unless:
 --   * the child is not the parent, and both exist;
 --   * the child was host-registered in that group (a snapshot there) and its
 --     registration audit row in that group recorded NO parent;
@@ -708,11 +715,13 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = public, pg_temp AS $$
 #variable_conflict use_column
 DECLARE
-    v_snapshot  uuid;
-    v_child_op  uuid;
-    v_parent_op uuid;
-    v_child_at  timestamptz;
-    v_parent_at timestamptz;
+    v_snapshot   uuid;
+    v_prev       uuid;
+    v_parentless boolean;
+    v_child_op   uuid;
+    v_parent_op  uuid;
+    v_child_at   timestamptz;
+    v_parent_at  timestamptz;
 BEGIN
     IF NOT (public.epigraph_bypass()
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
@@ -748,21 +757,10 @@ BEGIN
             USING ERRCODE = 'AID10';
     END IF;
 
-    -- The same (child, parent) already on record, in ANY group folder: one row
-    -- per pair is enough (a shared identity runs in several folders), so this
-    -- is a repeat and writes nothing. Before the refusals below, which would
-    -- otherwise read the existing row as "already has a recorded parent".
-    SELECT s.snapshot_id INTO v_snapshot
-      FROM public.agent_succession s
-     WHERE s.child_agent_id = p_child AND s.parent_agent_id = p_parent
-     ORDER BY s.attested_at, s.group_folder
-     LIMIT 1;
-    IF FOUND THEN
-        RETURN QUERY SELECT false, v_snapshot, public.epigraph_human_of(p_child, false);
-        RETURN;
-    END IF;
-
-    -- The child: host-registered in this group, parentless, never given one.
+    -- The child: host-registered in this group, parentless there. The folder
+    -- is checked FIRST, before the repeat below, so a (child, parent) pair
+    -- named for a folder the child never ran in, or ran in with a parent, is
+    -- refused rather than reported as a harmless repeat.
     SELECT s.id INTO v_snapshot
       FROM public.agent_prompt_snapshots s
      WHERE s.agent_id = p_child AND s.group_folder = p_group_folder
@@ -773,6 +771,29 @@ BEGIN
                         p_child, p_group_folder
             USING ERRCODE = 'AID10';
     END IF;
+    v_parentless := EXISTS (SELECT 1 FROM public.security_events e
+                             WHERE e.event_type = 'agent.identity_registered'
+                               AND e.agent_id = p_child
+                               AND e.details ->> 'group_folder' = p_group_folder
+                               AND e.details ->> 'parent_agent_id' IS NULL);
+
+    -- The same (child, parent) already on record, in ANY group folder, named
+    -- for a folder where the child also registered parentless: one row per
+    -- pair is enough (a shared identity runs in several folders), so this is
+    -- a repeat and writes nothing. Before the refusal below, which would
+    -- otherwise read the existing row as "already has a recorded parent".
+    IF v_parentless THEN
+        SELECT s.snapshot_id INTO v_prev
+          FROM public.agent_succession s
+         WHERE s.child_agent_id = p_child AND s.parent_agent_id = p_parent
+         ORDER BY s.attested_at, s.group_folder
+         LIMIT 1;
+        IF FOUND THEN
+            RETURN QUERY SELECT false, v_prev, public.epigraph_human_of(p_child, false);
+            RETURN;
+        END IF;
+    END IF;
+
     IF EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = p_child)
        OR EXISTS (SELECT 1 FROM public.agents a
                    WHERE a.id = p_child AND a.parent_agent_id IS NOT NULL) THEN
@@ -780,11 +801,7 @@ BEGIN
                         p_child
             USING ERRCODE = 'AID10';
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM public.security_events e
-                    WHERE e.event_type = 'agent.identity_registered'
-                      AND e.agent_id = p_child
-                      AND e.details ->> 'group_folder' = p_group_folder
-                      AND e.details ->> 'parent_agent_id' IS NULL) THEN
+    IF NOT v_parentless THEN
         RAISE EXCEPTION 'AID10: no parentless registration of agent % in group % is on record; '
                         'nothing was recorded', p_child, p_group_folder
             USING ERRCODE = 'AID10';

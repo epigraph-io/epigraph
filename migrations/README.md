@@ -1661,9 +1661,13 @@ restart.
   succession row or display parent, a legacy parent created no later than it
   and holding no live role attachment, both naming the same operator (child
   live-linked), it writes the `agent_succession` row and the display parent,
-  and moves no link. A (child, parent) pair already on record in any folder is
-  a repeat (`recorded = false`, nothing written; a shared identity runs in
-  several folders); a second, different parent is refused `AID10`. Pinned by
+  and moves no link. The folder is checked first: a (child, parent) pair
+  already on record in any folder, named for a folder the child also
+  registered parentless in, is a repeat (`recorded = false`, nothing written;
+  a shared identity runs in several folders), while a folder the child never
+  ran in is refused `AID10`; a second, different parent is refused `AID10`.
+  The (child, parent, folder) triple is the caller's assertion (no SQL can
+  derive a folder's legacy parent): take it from the host's refusal alert. Pinned by
   `epigraph-db/tests/legacy_fleet_parent.rs`. Undo:
   `docs/runbooks/180-undo.sql` (tested: it returns the `public` catalog to
   below 180 and refuses `55000` over any registration body but 180's or
