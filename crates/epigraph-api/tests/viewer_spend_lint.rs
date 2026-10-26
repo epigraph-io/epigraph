@@ -21,6 +21,18 @@
 //! registers it with a reason. Removing one fails too, until the register is
 //! lowered, so the register cannot rot into folklore.
 //!
+//! # The population
+//!
+//! Every `fn` in `src/routes/` that holds a viewer: a handler (it destructures
+//! `ViewerExtractor(<ident>)`) or a route helper a handler delegates to (it
+//! takes an `<ident>: &Viewer` parameter, whatever the ident). A handler that
+//! passes `&viewer` to a helper counts that call as viewed, so the helper's own
+//! body is measured as well; its `&PgPool` and connection parameters are
+//! database handles there. A helper declared inside a handler is measured once,
+//! as itself. Viewer-holding code outside `src/routes/` (the MCP tools, the
+//! repo layer) is not in this population; `visibility_lint.rs` covers the
+//! repo layer's SQL.
+//!
 //! # What counts as a database call
 //!
 //! A call (function or method) whose argument list names, after comments are
@@ -33,7 +45,10 @@
 //!   `maintenance`, `Connection::begin`, `.begin()`, `.acquire()`), from
 //!   `state`, or from another connection;
 //! * `state` itself (`&state`, `state.clone()`): a helper handed the whole
-//!   `AppState` can reach the pool.
+//!   `AppState` can reach the pool;
+//! * in a route helper, a parameter typed as a pool (`&PgPool`) or as a
+//!   connection (`&mut PgConnection`, `ScopedRead`, `ScopedTx`, `Transaction`),
+//!   passed bare or dereferenced.
 //!
 //! Plus `state.read_as` / `state.write_as` / `state.begin_claim_write`, receiver
 //! calls on the pool (`state.db_pool.begin()`), and method calls on a repo
@@ -966,6 +981,166 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "record_api_authorship",
         ],
     ),
+    // ── route helpers a handler hands its viewer to ──────────────────────
+    //
+    // A handler that passes `&viewer` to one of these counts that call as
+    // viewed, so each helper's own body is measured and reviewed here.
+    //
+    // claims.rs::create_claim_core (POST /claims, /claims/batch). untenanted:
+    // the CALLER's own membership of the group it asks to encrypt into (the
+    // authenticated id, never the body), then that group's current key epoch,
+    // read only after the membership check passed; the author's agent row.
+    // write: everything else runs on the claim-write transaction stamped with
+    // this viewer, except the best-effort post-commit embedding, AUTHORED /
+    // HAS_TRACE / DERIVED_FROM edges and provenance row, which are raw-pool
+    // writes for a row this call created (`was_created`; ROUTE_LAYER_WRITES in
+    // viewer_route_table_lint.rs).
+    (
+        "claims.rs",
+        "create_claim_core",
+        &[
+            "AgentRepository::get_by_id",
+            "ClaimEncryptionRepository::insert_conn",
+            "ClaimRepository::create_strict",
+            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::lock_content_hash_agent",
+            "EdgeRepository::create",
+            "EdgeRepository::create",
+            "EdgeRepository::create",
+            "GroupKeyEpochRepository::get_current_epoch",
+            "GroupMembershipRepository::is_member",
+            "provenance::record_provenance",
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query(UPDATE).execute",
+        ],
+    ),
+    // stamped: computation.rs::apply_bp_updates runs on a write transaction
+    // stamped with this viewer; its "which ids are visible" read and the role
+    // read are row security's (a single layer, as every stamped entry), and
+    // the writes are WITH CHECK's. BP apply is off unless the operator turns
+    // it on (EPIGRAPH_BP_APPLY).
+    (
+        "computation.rs",
+        "apply_bp_updates",
+        &[
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query_scalar(SELECT).fetch_all",
+            "sqlx::query_scalar(dynamic).fetch_all",
+        ],
+    ),
+    // edges.rs's DS recomputation after an edge write: the raw-pool reads (the
+    // source claim's author id, for BBA attribution; the reasoning traces that
+    // name the updated claim) reach no response field, the acquires are
+    // mechanical (no_unscoped_pool.rs counts these edges.rs sites), and the
+    // wiring and recomputation themselves take the viewer.
+    (
+        "edges.rs",
+        "propagate_to_dependents",
+        &["sqlx::query_as(SELECT).fetch_all"],
+    ),
+    ("edges.rs", "recompute_claim_belief", &["db_pool.acquire"]),
+    (
+        "edges.rs",
+        "trigger_edge_ds_recomputation",
+        &[
+            "db_pool.acquire",
+            "sqlx::query_scalar(SELECT).fetch_optional",
+        ],
+    ),
+    // stamped: the neighborhood's edge projections, on the caller's stamped
+    // connection, are constrained in Rust to endpoints that survived the
+    // viewer-filtered node projection (PR-07); the edges' own predicate is
+    // F-edges-unfiltered.
+    (
+        "graph_neighborhood.rs",
+        "atomic_response",
+        &["sqlx::query_as(SELECT).fetch_all"],
+    ),
+    (
+        "graph_neighborhood.rs",
+        "compound_response",
+        &[
+            "sqlx::query_as(WITH).fetch_all",
+            "sqlx::query_as(WITH).fetch_all",
+            "sqlx::query_as(WITH).fetch_all",
+        ],
+    ),
+    // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
+    // unconverted no_unscoped_pool.rs site); every projection in
+    // load_subgraph_conn splices the viewer except `agents` (untenanted).
+    (
+        "graph_query_utils.rs",
+        "load_subgraph",
+        &["db_pool.acquire"],
+    ),
+    (
+        "graph_query_utils.rs",
+        "load_subgraph_conn",
+        &["sqlx::query_as(SELECT).fetch_all"],
+    ),
+    // stamped: the plan read on the actor's own stamped connection; the 404 is
+    // migration 087's SELECT policy.
+    (
+        "privatization.rs",
+        "load_plan_for_actor",
+        &["PrivatizationRepository::load_plan_conn"],
+    ),
+    // no SQL: the savepoint around the viewer-taking theme probe.
+    (
+        "search.rs",
+        "probe_theme_coverage_isolated",
+        &[
+            "sqlx::query(RELEASE).execute",
+            "sqlx::query(SAVEPOINT).execute",
+        ],
+    ),
+    // write: submit.rs::persist_packet runs on the claim-write transaction
+    // stamped with this viewer (claim, trace, evidence, edges); the raw-pool
+    // read is the packet's author agent (untenanted).
+    (
+        "submit.rs",
+        "persist_packet",
+        &[
+            "AgentRepository::get_by_id",
+            "ClaimRepository::default_decl_for_author",
+            "sqlx::query(?).execute",
+            "sqlx::query(?).execute",
+            "sqlx::query(?).execute",
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query(UPDATE).execute",
+            "sqlx::query_scalar(INSERT).fetch_one",
+            "sqlx::query_scalar(INSERT).fetch_one",
+            "sqlx::query_scalar(INSERT).fetch_one",
+            "sqlx::query_scalar(INSERT).fetch_one",
+            "sqlx::query_scalar(INSERT).fetch_one",
+        ],
+    ),
+    // write: workflows.rs's ingest helpers run on the system-ingest transaction
+    // that binds the caller's principal for the database's write-authority
+    // check; the lineage anchors are workflows rows (untenanted), the
+    // authority check is for the caller's principal over each anchor, and the
+    // rest record the submitter, the per-anchor provenance and the admin audit.
+    (
+        "workflows.rs",
+        "auto_wire_inserted_edges",
+        &["begin_system_ingest_stamped_tx"],
+    ),
+    (
+        "workflows.rs",
+        "record_workflow_submitter",
+        &[
+            "WorkflowRepository::record_submitter",
+            "audit_api_admin_workflow_write",
+            "record_api_caller_workflow_write",
+        ],
+    ),
+    (
+        "workflows.rs",
+        "workflow_ingest_submitter",
+        &["WorkflowRepository::ingest_anchors", "workflow_authority"],
+    ),
 ];
 
 // ── source views ────────────────────────────────────────────────────────────
@@ -1188,9 +1363,70 @@ struct Handler {
     name: String,
     viewer: String,
     body: (usize, usize),
+    /// Parameters typed as a pool (`&PgPool`): aliases of `state.db_pool`.
+    pools: Vec<String>,
+    /// Parameters typed as a connection (`&mut PgConnection`, `ScopedRead`,
+    /// `ScopedTx`, `Transaction`): any use inside a call is a database call.
+    conns: Vec<String>,
 }
 
-/// Every `fn` whose parameters destructure `ViewerExtractor(<ident>)`.
+/// `(name, flattened type)` of each `<ident>: <type>` parameter in `params`
+/// (the text between, and including, the parentheses). Pattern parameters
+/// (`State(state): ..`) have no plain name and are skipped.
+fn typed_params(params: &str) -> Vec<(String, String)> {
+    let p = params.as_bytes();
+    let inner = &p[1..p.len() - 1];
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, &c) in inner.iter().enumerate() {
+        match c {
+            b'>' if i > 0 && inner[i - 1] == b'-' => {}
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' | b'>' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    let mut out = Vec::new();
+    for part in parts {
+        let part = std::str::from_utf8(part).expect("ASCII params");
+        let Some(colon) = part.find(':') else {
+            continue;
+        };
+        let name = part[..colon].trim().trim_start_matches("mut ").trim();
+        if name.is_empty() || !name.bytes().all(is_ident) || part[colon..].starts_with("::") {
+            continue;
+        }
+        let ty: String = part[colon + 1..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        out.push((name.to_string(), ty));
+    }
+    out
+}
+
+/// Is `ty` (flattened) a reference to `Viewer`: `&Viewer`, `&epigraph_db::Viewer`,
+/// `&epigraph_db::visibility::Viewer`?
+fn is_viewer_ref(ty: &str) -> bool {
+    let Some(rest) = ty.strip_prefix('&') else {
+        return false;
+    };
+    let rest = rest.trim_start_matches("'_").trim_start_matches("mut");
+    rest == "Viewer"
+        || (rest.ends_with("::Viewer") && rest.bytes().all(|c| is_ident(c) || c == b':'))
+}
+
+/// Every viewer-holding `fn`: one whose parameters destructure
+/// `ViewerExtractor(<ident>)` (a handler), or one with an `<ident>: &Viewer`
+/// parameter (a route helper a handler delegates its viewer to). A handler
+/// that passes `&viewer` to a helper counts that call as viewed, so the
+/// helper's own body has to be measured too, or a raw-pool read inside it
+/// would be invisible.
 fn handlers(code: &str, sql: &str) -> Vec<Handler> {
     let s = code.as_bytes();
     let excluded = excluded_spans(code, sql);
@@ -1227,7 +1463,28 @@ fn handlers(code: &str, sql: &str) -> Vec<Handler> {
                 }
             }
         }
+        let typed = typed_params(params);
+        if viewer.is_none() {
+            viewer = typed
+                .iter()
+                .find(|(_, ty)| is_viewer_ref(ty))
+                .map(|(n, _)| n.clone());
+        }
         let Some(viewer) = viewer else { continue };
+        let pools = typed
+            .iter()
+            .filter(|(_, ty)| ty.contains("PgPool"))
+            .map(|(n, _)| n.clone())
+            .collect();
+        let conns = typed
+            .iter()
+            .filter(|(_, ty)| {
+                ["PgConnection", "ScopedRead", "ScopedTx", "Transaction<"]
+                    .iter()
+                    .any(|t| ty.contains(t))
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
         let (Some(brace), semi) = (find(s, b"{", params_end), find(s, b";", params_end)) else {
             continue;
         };
@@ -1238,6 +1495,8 @@ fn handlers(code: &str, sql: &str) -> Vec<Handler> {
             name,
             viewer,
             body: (brace, close_of(s, brace)),
+            pools,
+            conns,
         });
     }
     out
@@ -1554,13 +1813,18 @@ fn chain_label(
     )
 }
 
-/// Every database call in `h`'s body as `(label, viewed)`.
-fn db_calls(code: &str, sql: &str, h: &Handler) -> Vec<(String, bool)> {
+/// Every database call in `h`'s body as `(label, viewed)`, except calls inside
+/// the `nested` spans (the bodies of viewer-holding fns declared inside this
+/// one, which are measured on their own).
+fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Vec<(String, bool)> {
     let s = code.as_bytes();
     let (b, e) = h.body;
-    let bindings = lets(code, b, e);
-    let mut pool_aliases: Vec<String> = Vec::new();
-    let mut conns: Vec<String> = Vec::new();
+    let bindings: Lets = lets(code, b, e)
+        .into_iter()
+        .filter(|(_, _, at, _, _)| !nested.iter().any(|&(x, y)| x <= *at && *at <= y))
+        .collect();
+    let mut pool_aliases: Vec<String> = h.pools.clone();
+    let mut conns: Vec<String> = h.conns.clone();
     let mut repos: Vec<(String, String)> = Vec::new();
     for (name, is_mut, _, ra, rb) in &bindings {
         let rhs = &code[*ra..*rb];
@@ -1672,6 +1936,13 @@ fn db_calls(code: &str, sql: &str, h: &Handler) -> Vec<(String, bool)> {
             }
         }
     }
+    // A connection parameter handed on as it is (`Repo::get(conn, id)`).
+    for conn in &h.conns {
+        for p in words(code, conn, b, e) {
+            enclose(&mut calls, p);
+        }
+    }
+    calls.retain(|&open, _| !nested.iter().any(|&(x, y)| x <= open && open <= y));
 
     let mut out = Vec::new();
     for (&open, (callee, plain)) in &calls {
@@ -1703,12 +1974,26 @@ fn db_calls(code: &str, sql: &str, h: &Handler) -> Vec<(String, bool)> {
 /// plus the population size `(handlers, calls)`.
 type Measured = BTreeMap<(String, String), Vec<String>>;
 
-fn measure_source(file: &str, src: &str, out: &mut Measured) -> (usize, usize) {
+/// Every viewer-holding fn measured, as `(file, fn)`.
+type Population = std::collections::BTreeSet<(String, String)>;
+
+fn measure_source(
+    file: &str,
+    src: &str,
+    out: &mut Measured,
+    pop: &mut Population,
+) -> (usize, usize) {
     let (code, sql) = views(src);
     let hs = handlers(&code, &sql);
     let mut n_calls = 0;
     for h in &hs {
-        let calls = db_calls(&code, &sql, h);
+        pop.insert((file.to_string(), h.name.clone()));
+        let nested: Vec<(usize, usize)> = hs
+            .iter()
+            .map(|o| o.body)
+            .filter(|&(x, y)| h.body.0 < x && y < h.body.1)
+            .collect();
+        let calls = db_calls(&code, &sql, h, &nested);
         n_calls += calls.len();
         let mut unviewed: Vec<String> = calls
             .into_iter()
@@ -1724,7 +2009,7 @@ fn measure_source(file: &str, src: &str, out: &mut Measured) -> (usize, usize) {
     (hs.len(), n_calls)
 }
 
-fn measure_tree() -> (Measured, usize, usize) {
+fn measure_tree() -> (Measured, usize, usize, Population) {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
     let mut files: Vec<_> = std::fs::read_dir(&dir)
         .expect("read routes dir")
@@ -1732,6 +2017,7 @@ fn measure_tree() -> (Measured, usize, usize) {
         .collect();
     files.sort();
     let mut out = Measured::new();
+    let mut pop = Population::new();
     let (mut n_handlers, mut n_calls, mut n_files) = (0, 0, 0);
     for path in files {
         if path.is_dir() {
@@ -1754,7 +2040,7 @@ fn measure_tree() -> (Measured, usize, usize) {
         n_files += 1;
         let name = path.file_name().and_then(|n| n.to_str()).expect("utf-8");
         let src = std::fs::read_to_string(&path).expect("read route file");
-        let (h, c) = measure_source(name, &src, &mut out);
+        let (h, c) = measure_source(name, &src, &mut out, &mut pop);
         n_handlers += h;
         n_calls += c;
     }
@@ -1762,7 +2048,7 @@ fn measure_tree() -> (Measured, usize, usize) {
         n_files > 40,
         "found {n_files} route files; wrong directory?"
     );
-    (out, n_handlers, n_calls)
+    (out, n_handlers, n_calls, pop)
 }
 
 fn reviewed() -> Measured {
@@ -1791,7 +2077,7 @@ fn multiset_diff(a: &[String], b: &[String]) -> Vec<String> {
 
 #[test]
 fn every_unviewed_database_call_in_a_viewer_handler_is_reviewed() {
-    let (measured, _, _) = measure_tree();
+    let (measured, _, _, _) = measure_tree();
     let want = reviewed();
     let mut report = String::new();
     let keys: std::collections::BTreeSet<_> = measured.keys().chain(want.keys()).collect();
@@ -1822,25 +2108,49 @@ fn every_unviewed_database_call_in_a_viewer_handler_is_reviewed() {
 /// exact-set test above with an empty register.
 #[test]
 fn the_scanner_sees_the_whole_viewer_surface() {
-    let (measured, handlers, calls) = measure_tree();
+    let (measured, handlers, calls, pop) = measure_tree();
+    eprintln!(
+        "population: {handlers} viewer-holding fns, {calls} database calls, {} with an \
+         unviewed call, {} unviewed calls",
+        measured.len(),
+        measured.values().map(Vec::len).sum::<usize>()
+    );
+    // Route helpers a handler delegates its viewer to, including one nested in
+    // a handler (edges.rs) and one whose viewer is not called `viewer`.
+    for (file, helper) in [
+        ("claims.rs", "create_claim_core"),
+        ("crud.rs", "require_readable_claim"),
+        ("edges.rs", "build_evidence_chains"),
+        ("edges.rs", "evidence_by_relationship"),
+        ("graph_query_utils.rs", "load_subgraph_conn"),
+        ("lineage.rs", "get_ancestor_lineage"),
+        ("privatization.rs", "resolve_seeds"),
+        ("submit.rs", "persist_packet"),
+    ] {
+        assert!(
+            pop.contains(&(file.to_string(), helper.to_string())),
+            "{file}::{helper} takes a `&Viewer` and must be in the measured population"
+        );
+    }
     assert!(
-        handlers >= 140,
-        "found {handlers} viewer-holding handlers; measured 149 on 2026-10-26"
+        handlers >= 160,
+        "found {handlers} viewer-holding fns (handlers and route helpers); measured 176 \
+         on 2026-10-26"
     );
     assert!(
-        calls >= 600,
-        "found {calls} database calls in them; measured over 650 on 2026-10-26"
+        calls >= 700,
+        "found {calls} database calls in them; measured 768 on 2026-10-26"
     );
     assert!(
-        measured.len() >= 50,
-        "found {} handlers with an unviewed call; measured 86 on 2026-10-26",
+        measured.len() >= 80,
+        "found {} viewer-holding fns with an unviewed call; measured 102 on 2026-10-26",
         measured.len()
     );
 }
 
 fn unviewed_in(src: &str) -> Measured {
     let mut out = Measured::new();
-    measure_source("fixture.rs", src, &mut out);
+    measure_source("fixture.rs", src, &mut out, &mut Population::new());
     out
 }
 
@@ -1990,5 +2300,84 @@ mod tests {
     assert!(
         !m.contains_key(&("fixture.rs".to_string(), "in_tests".to_string())),
         "a #[cfg(test)] item is not a handler"
+    );
+}
+
+/// A route helper a handler hands its viewer to is measured on its own: its pool, connection and `AppState`
+/// parameters are database handles, its own `&Viewer` parameter (whatever it
+/// is called) is the viewer, and a helper declared inside a handler is
+/// measured once, as itself.
+#[test]
+fn the_scanner_measures_route_helpers() {
+    let src = r##"
+async fn state_helper(state: &AppState, viewer: &epigraph_db::Viewer, id: Uuid) -> R {
+    let ok = Repo::get_as(&state.db_pool, viewer, id).await?;
+    let raw = Repo::is_member(&state.db_pool, id).await?;
+    Ok((ok, raw))
+}
+
+async fn pool_helper(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+) -> R {
+    let ok = Repo::get_as(pool, viewer, id).await?;
+    let raw = Repo::get(pool, id).await?;
+    let mut tx = pool.begin().await?;
+    Ok((ok, raw))
+}
+
+async fn conn_helper(conn: &mut sqlx::PgConnection, bypass: &Viewer, id: Uuid) -> R {
+    let a = Repo::get(conn, id).await?;
+    let b = sqlx::query_as("SELECT 1").bind(id).fetch_one(&mut *conn).await?;
+    let c = Repo::get_as(&mut *conn, bypass, id).await?;
+    Ok((a, b, c))
+}
+
+pub async fn outer(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+) -> R {
+    async fn inner(conn: &mut sqlx::PgConnection, viewer: &Viewer) -> R {
+        Repo::list(conn).await
+    }
+    let mut read = state.read_as(&viewer).await?;
+    inner(&mut *read, &viewer).await
+}
+
+async fn not_a_viewer(pool: &PgPool, viewers: &[Viewer], f: impl Fn(u8) -> u8) -> R {
+    Repo::get(pool).await
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "state_helper"),
+        vec!["Repo::is_member"],
+        "a helper handed the viewer and AppState: its raw-pool read is reported"
+    );
+    assert_eq!(
+        labels(&m, "pool_helper"),
+        vec!["Repo::get", "db_pool.begin"],
+        "a helper's `&PgPool` parameter is the pool"
+    );
+    assert_eq!(
+        labels(&m, "conn_helper"),
+        vec!["Repo::get", "sqlx::query_as(SELECT).fetch_one"],
+        "a helper's connection parameter, passed bare or dereferenced, is a connection, \
+         and its `&Viewer` parameter is the viewer whatever its name"
+    );
+    assert!(
+        labels(&m, "outer").is_empty(),
+        "the nested helper's calls are not the outer handler's: {:?}",
+        labels(&m, "outer")
+    );
+    assert_eq!(
+        labels(&m, "inner"),
+        vec!["Repo::list"],
+        "a helper nested in a handler is measured as itself"
+    );
+    assert!(
+        !m.contains_key(&("fixture.rs".to_string(), "not_a_viewer".to_string())),
+        "a slice of viewers is not a viewer parameter"
     );
 }
