@@ -1664,7 +1664,8 @@ pub struct EvolveStepResponse {
 /// `content` or an `edge_type` other than `supersedes` / `revises`; 404 for a
 /// parent that does not exist or that the caller cannot see; 409 for
 /// `supersedes` on a parent that is no longer current (`revises` may still
-/// branch from it).
+/// branch from it); 403 for a `supersedes` whose retire of the parent changed
+/// no row.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1760,9 +1761,10 @@ pub async fn evolve_step(
         e @ (epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::Conflict { .. }) => {
             ApiError::from(e)
         }
-        // A `supersedes` parent the caller can read but whose retirement row
-        // security refused (backlog d34f5096): a denial, 403 as
-        // `From<DbError>` maps it, not a server fault.
+        // A `supersedes` parent whose retire changed no row (backlog
+        // d34f5096): a denial, 403 as `From<DbError>` maps it, not a server
+        // fault. Defensive: the claims tenancy policy refuses an unwritable
+        // parent by raising at WITH CHECK, not with a zero-row retire.
         e @ epigraph_db::DbError::WriteRefused { .. } => ApiError::from(e),
         e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {

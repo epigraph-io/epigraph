@@ -227,8 +227,8 @@ async fn evolve_step_supersede_of_a_non_current_step_is_invalid_params_on_the_ap
 /// with two current heads.
 ///
 /// A `BEFORE UPDATE` trigger that skips only the parent's `is_current` change
-/// stands in for a row-security USING clause that refuses the UPDATE without
-/// raising.
+/// produces a retire that changes no row without raising (the claims tenancy
+/// policy refuses an unwritable parent by raising at WITH CHECK instead).
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersede_whose_retire_is_refused_is_invalid_request_on_the_app_role(
     pool: PgPool,
