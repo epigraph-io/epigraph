@@ -1579,6 +1579,35 @@ impl AgentRepository {
         )
     }
 
+    /// [`Self::human_of`] for many agents in one read: each agent of `agents`
+    /// that is bound to a human, mapped to that human. An agent bound to no
+    /// human (or, with `live_only`, only through a retired link) is absent.
+    /// Duplicates in `agents` are harmless; an empty slice issues no query.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn humans_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        agents: &[Uuid],
+        live_only: bool,
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>, DbError> {
+        if agents.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT a.id, public.epigraph_human_of(a.id, $2) \
+               FROM (SELECT DISTINCT unnest($1::uuid[]) AS id) a",
+        )
+        .bind(agents)
+        .bind(live_only)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(agent, human)| human.map(|h| (agent, h)))
+            .collect())
+    }
+
     /// May `agent_id` run now? Migration 166's `epigraph_role_agent_may_run`,
     /// EXECUTE-able on the request DSN (and by the identity attestor). An
     /// unattached agent always may; an attached one only while its linked

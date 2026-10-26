@@ -551,21 +551,22 @@ async fn perspective_tier_inputs(
 /// profile ([`effective_source_strength_profiled`]: perspective → per-frame →
 /// profile tables → stored `source_strength` → unknown-type weight, with
 /// locality applied) before the SAME combination the recompute/write path
-/// uses ([`crate::source_dependence::combine_with_source_dependence`], with
-/// the profile's conflict threshold). The rows' source keys arrive in
+/// uses ([`crate::source_dependence::combine_with_owner_dependence`], with
+/// the profile's conflict threshold). The rows' sources arrive in
 /// `source_keys` (one per row, from
-/// [`crate::source_dependence::source_keys_for_rows`]), so this function
-/// issues no queries.
+/// [`crate::source_dependence::bba_sources_for_rows`]; a bare
+/// `Option<SourceKey>` carries no owner and gets only the same-source rule),
+/// so this function issues no queries.
 ///
 /// Returns `Ok(None)` only when `rows` is empty.
 ///
 /// # Errors
 /// `ParseMasses` on a malformed stored BBA; `Ds` when discounting or the fold
 /// fails.
-pub fn combine_framed_bbas(
+pub fn combine_framed_bbas<S: Into<crate::source_dependence::BbaSource>>(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
-    source_keys: Vec<Option<crate::source_dependence::SourceKey>>,
+    source_keys: Vec<S>,
     ctx: &FramedBeliefContext,
 ) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
@@ -575,6 +576,7 @@ pub fn combine_framed_bbas(
 
     let mut items = Vec::with_capacity(rows.len());
     for (row, key) in rows.iter().zip(source_keys) {
+        let key: crate::source_dependence::BbaSource = key.into();
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
         let alpha = effective_source_strength_profiled(row, &ctx.profile);
@@ -586,7 +588,9 @@ pub fn combine_framed_bbas(
 
     // Combine via the SAME function the recompute/write path uses: same-source
     // repeats (one agent re-reading one `source_url`) are folded cautiously
-    // into one, then everything is Dempster-folded (`combine_multiple`). Using
+    // into one, agreeing BBAs of sibling agents of one human are folded
+    // cautiously (ruling R-36), then everything is Dempster-folded
+    // (`combine_multiple`). Using
     // that one function is what makes this compute-on-read result reproduce
     // the cached value for the same stored BBAs (backlog 4c42c0bf); a plain
     // `combine_multiple` here served the inflated same-source value while the
@@ -597,7 +601,7 @@ pub fn combine_framed_bbas(
     // fold's `aggregate_conflict`, because Dempster normalises it out of the
     // combined mass. A single BBA is not folded; its own empty-set mass is
     // the conflict.
-    let (combined, conflict) = crate::source_dependence::combine_with_source_dependence(
+    let (combined, conflict) = crate::source_dependence::combine_with_owner_dependence(
         items,
         ctx.profile.combination.conflict_threshold,
     )
@@ -629,8 +633,10 @@ async fn recompute_framed_belief(
         return Ok(None);
     }
     let ctx = FramedBeliefContext::resolve(pool, viewer, frame_row, perspective_id).await?;
-    let source_keys = crate::source_dependence::source_keys_for_rows(pool, viewer, rows).await?;
-    combine_framed_bbas(frame, rows, source_keys, &ctx)
+    let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
+    let sources = crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, rows).await?;
+    drop(conn);
+    combine_framed_bbas(frame, rows, sources, &ctx)
 }
 
 /// Batch sibling of [`get_perspective_belief`]: compute the lensed belief for a
@@ -708,8 +714,10 @@ async fn perspective_belief_for_claim(
 
     // Claim-scoped like the BBA fetch above (one query, skipped when no row
     // can carry a source key), so the page-level hoist is unchanged.
+    let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
     let source_keys =
-        crate::source_dependence::source_keys_for_rows(pool, viewer, &all_bbas).await?;
+        crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, &all_bbas).await?;
+    drop(conn);
     let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, source_keys, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 

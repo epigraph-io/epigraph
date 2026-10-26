@@ -807,12 +807,14 @@ pub async fn auto_wire_ds_update(
     // function the recompute path uses (`edge_factor::compute_combined_belief`):
     // BBAs from one agent re-reading one `source_url` are folded cautiously into
     // one before the Dempster fold, so a re-worded re-observation of an
-    // unchanged source no longer counts as corroboration (backlog 4c42c0bf).
-    // Rows with no source identity fold exactly as before.
+    // unchanged source no longer counts as corroboration (backlog 4c42c0bf),
+    // and agreeing BBAs of sibling agents of one human are folded cautiously
+    // rather than multiplied (ruling R-36). Rows with no source identity fold
+    // exactly as before.
     let source_keys =
-        epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
             .await
-            .map_err(|e| format!("evidence source_url read: {e}"))?;
+            .map_err(|e| format!("BBA source read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
     let frame_overrides = frame_profile_overrides(&mut *conn, viewer, frame_id).await?;
     let profile = resolve_frame_profile(
@@ -828,7 +830,7 @@ pub async fn auto_wire_ds_update(
         items.push((key, discounted));
     }
     let (combined, fold_conflict) =
-        epigraph_engine::source_dependence::combine_with_source_dependence(
+        epigraph_engine::source_dependence::combine_with_owner_dependence(
             items,
             profile.combination.conflict_threshold,
         )

@@ -21,20 +21,22 @@
 //!   auto-wire from N distinct source claims by one ingesting agent is N
 //!   sources. A BBA whose evidence carries no `source_url` has no key and is
 //!   folded as independent, exactly as before.
-//! - provenance LCA between agents. The REST `routes/independence.rs` analysis
-//!   does that, but it passes `mass_functions` row ids to `get_lca`, which
-//!   walks claim lineage, so in practice it never finds a shared ancestor. It
-//!   is left where it is.
+//! - provenance LCA between agents. Dependence between DIFFERENT agents is
+//!   decided by who they act for instead: the same-human rule (ruling R-36,
+//!   [`combine_with_owner_dependence`]), which also replaced the LCA test of
+//!   the REST `routes/independence.rs` analysis.
 //!
-//! Every combine of stored BBAs goes through [`combine_with_source_dependence`]:
-//! the MCP writes (`ds_auto::auto_wire_ds_update`), the recompute
-//! (`edge_factor::compute_combined_belief`) and the compute-on-read readers
-//! (`belief_query::combine_framed_bbas`, behind framed `get_belief`,
-//! `get_perspective_belief` and its batch). For a viewer who can see the
-//! evidence rows its BBAs reference, the next recompute therefore cannot
-//! re-inflate what the write left honest, and those readers agree with the
-//! cache. The REST combine paths (`routes/belief.rs`, `routes/assess.rs`) are
-//! not routed here yet; they still Dempster-fold every BBA.
+//! Every combine of stored BBAs goes through [`combine_with_owner_dependence`]
+//! (the same-source rule plus the same-human rule): the MCP writes
+//! (`ds_auto::auto_wire_ds_update`), the recompute
+//! (`edge_factor::compute_combined_belief`, behind MCP `submit_ds_evidence`,
+//! REST `POST /frames/:id/evidence` and every cache refresh) and the
+//! compute-on-read readers (`belief_query::combine_framed_bbas`, behind framed
+//! `get_belief`, `get_perspective_belief` and its batch). For a viewer who can
+//! see the evidence rows its BBAs reference, the next recompute therefore
+//! cannot re-inflate what the write left honest, and those readers agree with
+//! the cache. The atom fold (`atom_items`) still calls
+//! [`combine_with_source_dependence`] for its legacy-grouping comparison.
 //!
 //! Source keys are read through the caller's viewer
 //! ([`source_keys_for_rows`]). A BBA can be visible while its evidence row is
@@ -177,6 +179,15 @@ pub fn combine_with_source_dependence(
     items: Vec<(Option<SourceKey>, MassFunction)>,
     conflict_threshold: f64,
 ) -> Result<(MassFunction, f64), DsError> {
+    dempster_across_items(same_source_slots(items)?, conflict_threshold)
+}
+
+/// The same-source reduction of [`combine_with_source_dependence`], before
+/// its Dempster fold: one BBA per (source, focal element) slot plus every
+/// unkeyed or non-simple-support BBA on its own, in first-appearance order.
+fn same_source_slots(
+    items: Vec<(Option<SourceKey>, MassFunction)>,
+) -> Result<Vec<MassFunction>, DsError> {
     // One slot per (source, focal element), in first-appearance order so the
     // fold input is deterministic (both rules are order-independent; logs and
     // float rounding are not). Anything without a group key is its own slot.
@@ -215,16 +226,235 @@ pub fn combine_with_source_dependence(
             }
         }
     }
+    Ok(for_fold)
+}
 
-    if for_fold.len() == 1 {
-        let only = for_fold.pop().expect("len == 1");
-        let k = only.mass_of_conflict();
-        Ok((only, k))
-    } else {
-        let (combined, reports) = combination::combine_multiple(&for_fold, conflict_threshold)?;
-        let k = combination::fold_conflict(&combined, &reports);
-        Ok((combined, k))
+// ── Same-human dependence (ruling R-36, backlog fe3ec493) ──────────────────
+//
+// Ruling Q-U027F-2 (agents of one human replace or contest, never aggregate)
+// was enforced only by `/claims/:id/assess`'s owner slot. R-36 extends it to
+// every path that combines stored BBAs, at COMBINE time: the rows stay as
+// written (history kept) and the fold decides what they are worth together.
+//
+// The reading implemented here, chosen so that R-36 and R-37 ("agent-only
+// keying stays rejected") both hold:
+//
+// - WITHIN one agent nothing changes: its repeats of one `source_url` fold
+//   cautiously ([`same_source_slots`]) and its distinct sources (distinct
+//   evidence, workflow trials, edges from distinct source claims) reinforce
+//   by Dempster, as before.
+// - ACROSS distinct agents of ONE owner (the live human they resolve to,
+//   `epigraph_human_of(agent, true)`, else the agent itself), BBAs that say
+//   the same thing (one-sided on one focal element, see [`one_sided_focus`])
+//   never multiply: each agent's own fold of its rows on that focal element
+//   is one input, and the group keeps the STRONGEST input (the largest mass on
+//   the focal element). For classical simple supports on one focal set that
+//   is exactly Denoeux's cautious rule ([`combination::cautious_combine`] is
+//   min-commonality, which there keeps the larger weight); for the open-world
+//   one-sided BBAs `submit_ds_evidence` callers write (`{"0": x, "~": y}`),
+//   which `cautious_combine` does not model, it is the same strongest-wins
+//   rule SPEC §3.3's within-group partition ([`item_partition`]) uses. A
+//   second agent of the same human agreeing therefore adds nothing.
+// - A sibling that says the OPPOSITE (another focal element) is a contest:
+//   its BBA stays a separate Dempster input, so the disagreement shows up as
+//   conflict rather than being normalised away by the min-commonality rule.
+// - An agent bound to no human is its own owner and has no sibling, so its
+//   rows fold exactly as before. So does a row with no `source_agent_id`, and
+//   a BBA that is not one-sided (mass on both a hypothesis and its rival, as
+//   `/claims/:id/assess`'s directed BBAs carry, a complement focal element,
+//   or conflict mass): no reduction that keeps both sides is defined here, so
+//   those fold as independent. Known limit, recorded with the ruling.
+
+/// The one focal element a ONE-SIDED BBA commits mass to: exactly one
+/// positive focal element other than Θ carries mass, besides closed- and
+/// open-world ignorance. `None` for anything else (vacuous, conflict mass,
+/// another complement element, or mass on two non-Θ elements).
+fn one_sided_focus(m: &MassFunction) -> Option<FocalElement> {
+    let frame = m.frame();
+    let mut focus: Option<&FocalElement> = None;
+    for (fe, _) in m.focal_elements() {
+        // Ignorance, closed (Θ) or open-world (`~`, which the JSON form
+        // parses to the vacuous complement element, and the missing element).
+        if fe.is_theta(frame) || fe.is_missing(frame) || fe.is_vacuous_element() {
+            continue;
+        }
+        if fe.is_conflict() || fe.complement || focus.is_some() {
+            return None;
+        }
+        focus = Some(fe);
     }
+    focus.cloned()
+}
+
+/// Who a stored BBA speaks for: its writing agent, the owner that agent
+/// resolves to, and its same-source key ([`SourceKey`]), if any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BbaSource {
+    /// `mass_functions.source_agent_id`.
+    pub agent_id: Option<Uuid>,
+    /// The live human `agent_id` acts for, else `agent_id` itself.
+    pub owner_id: Option<Uuid>,
+    /// The same-source key, when the row's evidence names a `source_url`.
+    pub source: Option<SourceKey>,
+}
+
+impl From<Option<SourceKey>> for BbaSource {
+    fn from(source: Option<SourceKey>) -> Self {
+        Self::keyed(source)
+    }
+}
+
+impl BbaSource {
+    /// A source with no owner: only the same-source rule applies to it.
+    #[must_use]
+    pub fn keyed(source: Option<SourceKey>) -> Self {
+        Self {
+            agent_id: source.as_ref().map(|k| k.agent_id),
+            owner_id: None,
+            source,
+        }
+    }
+}
+
+/// The [`BbaSource`] of each row, in row order: [`source_keys_for_rows`]
+/// plus each source agent's owner, read in one batched lookup
+/// ([`epigraph_db::AgentRepository::humans_of`], live bindings only, as
+/// `/claims/:id/assess` resolves its owner). An agent bound to no live human
+/// is its own owner.
+///
+/// Both reads run on `conn` (a stamped transaction derefs to one), so a write
+/// path's stamped transaction sees the evidence rows its own BBAs reference.
+///
+/// # Errors
+/// `DbError` if a read fails.
+pub async fn bba_sources_for_rows(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    rows: &[MassFunctionRow],
+) -> Result<Vec<BbaSource>, epigraph_db::DbError> {
+    let keys = source_keys_for_rows(&mut *conn, viewer, rows).await?;
+    let agents: Vec<Uuid> = rows.iter().filter_map(|r| r.source_agent_id).collect();
+    let humans = epigraph_db::AgentRepository::humans_of(&mut *conn, &agents, true).await?;
+    Ok(rows
+        .iter()
+        .zip(keys)
+        .map(|(r, source)| BbaSource {
+            agent_id: r.source_agent_id,
+            owner_id: r
+                .source_agent_id
+                .map(|a| humans.get(&a).copied().unwrap_or(a)),
+            source,
+        })
+        .collect())
+}
+
+/// The inputs of the owner-aware fold, before its final Dempster step.
+struct OwnerPartition {
+    /// BBAs that fold as independent evidence: everything outside a sibling
+    /// group, already reduced by the same-source rule.
+    independent: Vec<MassFunction>,
+    /// One group per (owner, focal element) that at least two distinct agents
+    /// of that owner speak to, in first-appearance order: the focal element
+    /// and, per agent, that agent's own fold of its rows on it (same-source
+    /// rule, then Dempster).
+    sibling_groups: Vec<(FocalElement, Vec<MassFunction>)>,
+}
+
+/// Split already-discounted BBAs into independent inputs and same-owner
+/// sibling groups (see the section comment above for the rule).
+fn owner_partition(
+    items: Vec<(BbaSource, MassFunction)>,
+    conflict_threshold: f64,
+) -> Result<OwnerPartition, DsError> {
+    type OwnerKey = (Uuid, FocalElement);
+    let owner_key = |src: &BbaSource, mf: &MassFunction| -> Option<(OwnerKey, Uuid)> {
+        let agent = src.agent_id?;
+        let owner = src.owner_id?;
+        one_sided_focus(mf).map(|f| ((owner, f), agent))
+    };
+
+    // Which (owner, focal element) keys have at least two distinct agents.
+    let mut agents_per_key: HashMap<OwnerKey, Vec<Uuid>> = HashMap::new();
+    for (src, mf) in &items {
+        if let Some((k, agent)) = owner_key(src, mf) {
+            let agents = agents_per_key.entry(k).or_default();
+            if !agents.contains(&agent) {
+                agents.push(agent);
+            }
+        }
+    }
+
+    // Per sibling key, per agent (both in first-appearance order), that
+    // agent's rows on the key; everything else stays on the legacy path.
+    let mut group_order: Vec<OwnerKey> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let mut groups: HashMap<OwnerKey, Vec<(Uuid, Vec<(Option<SourceKey>, MassFunction)>)>> =
+        HashMap::new();
+    let mut rest: Vec<(Option<SourceKey>, MassFunction)> = Vec::new();
+    for (src, mf) in items {
+        match owner_key(&src, &mf) {
+            Some((k, agent)) if agents_per_key.get(&k).is_some_and(|a| a.len() > 1) => {
+                let per_agent = groups.entry(k.clone()).or_insert_with(|| {
+                    group_order.push(k);
+                    Vec::new()
+                });
+                match per_agent.iter_mut().find(|(a, _)| *a == agent) {
+                    Some((_, rows)) => rows.push((src.source, mf)),
+                    None => per_agent.push((agent, vec![(src.source, mf)])),
+                }
+            }
+            _ => rest.push((src.source, mf)),
+        }
+    }
+
+    let mut sibling_groups = Vec::with_capacity(group_order.len());
+    for k in group_order {
+        let per_agent = groups.remove(&k).unwrap_or_default();
+        let mut members = Vec::with_capacity(per_agent.len());
+        for (_, rows) in per_agent {
+            let (agent_fold, _) =
+                dempster_across_items(same_source_slots(rows)?, conflict_threshold)?;
+            members.push(agent_fold);
+        }
+        sibling_groups.push((k.1, members));
+    }
+
+    Ok(OwnerPartition {
+        independent: same_source_slots(rest)?,
+        sibling_groups,
+    })
+}
+
+/// [`combine_with_source_dependence`] with the same-human rule (R-36): the
+/// fold every combine of stored BBAs uses. Each sibling group keeps its
+/// strongest member (the largest mass on the group's focal element; the
+/// first such member on a tie), then everything is Dempster-folded. Same
+/// return shape: the combined BBA and the conflict the fold saw.
+///
+/// # Errors
+/// Propagates `DsError` from the Dempster folds, including
+/// `combine_multiple`'s error when `items` is empty.
+pub fn combine_with_owner_dependence(
+    items: Vec<(BbaSource, MassFunction)>,
+    conflict_threshold: f64,
+) -> Result<(MassFunction, f64), DsError> {
+    let OwnerPartition {
+        mut independent,
+        sibling_groups,
+    } = owner_partition(items, conflict_threshold)?;
+    for (focus, members) in sibling_groups {
+        let mut strongest: Option<MassFunction> = None;
+        for m in members {
+            if strongest
+                .as_ref()
+                .is_none_or(|s| m.mass_of(&focus) > s.mass_of(&focus))
+            {
+                strongest = Some(m);
+            }
+        }
+        independent.extend(strongest);
+    }
+    dempster_across_items(independent, conflict_threshold)
 }
 
 // ── Canonical item key (atom-level belief, SPEC §3.3) ──────────────────────
@@ -954,6 +1184,169 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.masses(), independent.masses());
+    }
+
+    // ── R-36: the same-human rule ──────────────────────────────────────────
+
+    /// A row by `agent`, owned by `owner`, with no same-source key.
+    fn by(agent: u128, owner: u128) -> BbaSource {
+        BbaSource {
+            agent_id: Some(Uuid::from_u128(agent)),
+            owner_id: Some(Uuid::from_u128(owner)),
+            source: None,
+        }
+    }
+
+    fn m_true(m: &MassFunction) -> f64 {
+        m.mass_of(&FocalElement::positive(BTreeSet::from([0])))
+    }
+
+    #[test]
+    fn two_agents_of_one_human_keep_the_stronger_never_the_product() {
+        // Agents 1 and 2 both act for human 9. Dempster would give
+        // 1 - 0.4 * 0.3 = 0.88; first-wins 0.6, last-wins 0.7 by accident of
+        // order, so both orders are checked.
+        for items in [
+            vec![
+                (by(1, 9), support(0, 0.6, 1.0)),
+                (by(2, 9), support(0, 0.7, 1.0)),
+            ],
+            vec![
+                (by(2, 9), support(0, 0.7, 1.0)),
+                (by(1, 9), support(0, 0.6, 1.0)),
+            ],
+        ] {
+            let (c, k) = combine_with_owner_dependence(items, 0.9).unwrap();
+            assert!(
+                (m_true(&c) - 0.7).abs() < 1e-9,
+                "got m(TRUE) = {}",
+                m_true(&c)
+            );
+            assert!((total(&c) - 1.0).abs() < 1e-9);
+            assert!(
+                k.abs() < 1e-12,
+                "agreeing siblings carry no conflict, got {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_agents_distinct_sources_still_reinforce() {
+        // R-37: agent-only keying stays rejected. One agent's two distinct
+        // pieces of evidence are two sources, whether it acts for a human
+        // (owner 9) or for nobody (it is its own owner).
+        for owner in [9, 1] {
+            let (c, _) = combine_with_owner_dependence(
+                vec![
+                    (by(1, owner), support(0, 0.6, 1.0)),
+                    (by(1, owner), support(0, 0.7, 1.0)),
+                ],
+                0.9,
+            )
+            .unwrap();
+            assert!((m_true(&c) - 0.88).abs() < 1e-9, "got {}", m_true(&c));
+        }
+    }
+
+    #[test]
+    fn agents_of_different_humans_still_reinforce() {
+        let (c, _) = combine_with_owner_dependence(
+            vec![
+                (by(1, 9), support(0, 0.6, 1.0)),
+                (by(2, 8), support(0, 0.7, 1.0)),
+            ],
+            0.9,
+        )
+        .unwrap();
+        assert!((m_true(&c) - 0.88).abs() < 1e-9, "got {}", m_true(&c));
+    }
+
+    #[test]
+    fn a_siblings_refutation_is_a_contest_not_collapsed() {
+        let sup = support(0, 0.8, 1.0);
+        let refute = support(1, 0.5, 1.0);
+        let (dempster, _) =
+            combination::combine_multiple(&[sup.clone(), refute.clone()], 0.9).unwrap();
+        let (c, k) =
+            combine_with_owner_dependence(vec![(by(1, 9), sup), (by(2, 9), refute)], 0.9).unwrap();
+        assert_eq!(c.masses(), dempster.masses());
+        assert!(k > 0.3, "the contest must show as conflict, got {k}");
+    }
+
+    #[test]
+    fn each_sibling_contributes_its_own_fold_and_the_strongest_wins() {
+        // Agent 1 (two distinct sources: 1 - 0.4 * 0.5 = 0.8) and its sibling
+        // agent 2 (0.7) give 0.8; an agent of another human (0.5) then
+        // reinforces by Dempster: 1 - 0.2 * 0.5 = 0.9.
+        let (c, _) = combine_with_owner_dependence(
+            vec![
+                (by(1, 9), support(0, 0.6, 1.0)),
+                (by(2, 9), support(0, 0.7, 1.0)),
+                (by(1, 9), support(0, 0.5, 1.0)),
+                (by(3, 7), support(0, 0.5, 1.0)),
+            ],
+            0.9,
+        )
+        .unwrap();
+        assert!((m_true(&c) - 0.9).abs() < 1e-9, "got {}", m_true(&c));
+    }
+
+    #[test]
+    fn rows_without_an_agent_or_owner_fold_as_before() {
+        let one = support(0, 0.6, 1.0);
+        let two = support(0, 0.7, 1.0);
+        let legacy =
+            combine_with_source_dependence(vec![(None, one.clone()), (None, two.clone())], 0.9)
+                .unwrap()
+                .0;
+        let (c, _) = combine_with_owner_dependence(
+            vec![(BbaSource::default(), one), (BbaSource::keyed(None), two)],
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(c.masses(), legacy.masses());
+    }
+
+    #[test]
+    fn open_world_siblings_keep_the_stronger_too() {
+        // `submit_ds_evidence` callers write open-world BBAs; those siblings
+        // must not multiply either.
+        let ow = |t: f64| {
+            MassFunction::from_json_masses(frame(), &serde_json::json!({"0": t, "~": 1.0 - t}))
+                .unwrap()
+        };
+        let (dempster, _) = combination::combine_multiple(&[ow(0.6), ow(0.7)], 0.9).unwrap();
+        let (c, _) =
+            combine_with_owner_dependence(vec![(by(1, 9), ow(0.6)), (by(2, 9), ow(0.7))], 0.9)
+                .unwrap();
+        assert_eq!(c.masses(), ow(0.7).masses());
+        assert_ne!(c.masses(), dempster.masses());
+    }
+
+    #[test]
+    fn two_sided_sibling_bbas_fold_independently() {
+        // A documented limit: a BBA with mass on both a hypothesis and its
+        // rival (an assess-built directed BBA) has no one-sided reduction, so
+        // siblings' two-sided BBAs fold as before.
+        let mixed = |t: f64, f: f64| {
+            MassFunction::from_json_masses(
+                frame(),
+                &serde_json::json!({"0": t, "1": f, "0,1": 1.0 - t - f}),
+            )
+            .unwrap()
+        };
+        let legacy = combine_with_source_dependence(
+            vec![(None, mixed(0.6, 0.1)), (None, mixed(0.5, 0.2))],
+            0.9,
+        )
+        .unwrap()
+        .0;
+        let (c, _) = combine_with_owner_dependence(
+            vec![(by(1, 9), mixed(0.6, 0.1)), (by(2, 9), mixed(0.5, 0.2))],
+            0.9,
+        )
+        .unwrap();
+        assert_eq!(c.masses(), legacy.masses());
     }
 
     #[test]

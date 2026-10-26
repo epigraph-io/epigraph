@@ -1100,9 +1100,10 @@ async fn compute_combined_belief_over(
 
     // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
     // one `source_url`) are folded cautiously into one before the Dempster
-    // fold (backlog 4c42c0bf, `crate::source_dependence`); the write path
-    // `ds_auto::auto_wire_ds_update` uses the same function, so a recompute
-    // cannot re-inflate what the write left honest.
+    // fold (backlog 4c42c0bf, `crate::source_dependence`), and so are the
+    // agreeing BBAs of sibling agents of one human (ruling R-36); the write
+    // path `ds_auto::auto_wire_ds_update` uses the same function, so a
+    // recompute cannot re-inflate what the write left honest.
     //
     // `fold_conflict` is the conflict the fold SAW. Since U025 every
     // `combine_multiple` step is Dempster, which normalises conflict out of
@@ -1111,17 +1112,17 @@ async fn compute_combined_belief_over(
     // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
     // A single (or single-source) BBA is not folded: its own empty-set mass
     // is the conflict.
-    let source_keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+    let sources = crate::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
         .await
-        .map_err(|e| format!("evidence source_url read: {e}"))?;
+        .map_err(|e| format!("BBA source read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
-    for (row, key) in all_rows.iter().zip(source_keys) {
+    for (row, key) in all_rows.iter().zip(sources) {
         let mf = parse_stored_bba(frame, &row.masses)?;
         let reliability = effective_source_strength_profiled(row, &profile);
         let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
         items.push((key, d));
     }
-    let (combined, fold_conflict) = crate::source_dependence::combine_with_source_dependence(
+    let (combined, fold_conflict) = crate::source_dependence::combine_with_owner_dependence(
         items,
         profile.combination.conflict_threshold,
     )
