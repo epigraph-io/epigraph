@@ -12,7 +12,7 @@ async fn spawn() -> (std::net::SocketAddr, tokio::sync::oneshot::Sender<()>) {
 }
 
 /// An admin, who passed the old route's scope gate, gets 404: no route. The
-/// UMAP pipeline's routes still answer (not 404) for the same bearer.
+/// UMAP pipeline's routes still answer with success for the same bearer.
 #[tokio::test(flavor = "multi_thread")]
 async fn build_from_corpus_is_gone_and_the_umap_routes_remain() {
     let (addr, _shutdown) = spawn().await;
@@ -43,11 +43,13 @@ async fn build_from_corpus_is_gone_and_the_umap_routes_remain() {
             .send()
             .await
             .unwrap();
-        assert_ne!(
-            resp.status(),
-            404,
-            "{path} (UMAP pipeline) must stay routed: {}",
-            resp.status()
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        // Success, not merely "not 404": a kept route that broke during the
+        // removal (500) or lost its auth wiring (401/403) must fail here too.
+        assert!(
+            status.is_success(),
+            "{path} (UMAP pipeline) must stay routed and working, got {status}: {body}"
         );
     }
 }
