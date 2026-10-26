@@ -23,7 +23,10 @@ use epigraph_crypto::{
 };
 use epigraph_db::ClaimRepository;
 use epigraph_mcp::tools::claims::verify_claim;
-use epigraph_mcp::types::{MemorizeParams, SubmitClaimParams, VerifyClaimParams};
+use epigraph_mcp::types::{
+    MemorizeParams, ReportWorkflowOutcomeParams, StepExecution, SubmitClaimParams,
+    UpdateWithEvidenceParams, VerifyClaimParams,
+};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -64,9 +67,13 @@ async fn a_legacy_bare_digest_claim_signature_still_verifies_as_legacy(pool: PgP
     assert_eq!(resp["signature_scheme"], "legacy", "{resp}");
 }
 
-/// The cross-type substitution the backlog names: the signer's EVIDENCE
+/// The cross-type substitution the backlog names: the signer's v1 EVIDENCE
 /// signature over `H`, copied onto a claim whose content hash is `H`, is not a
 /// claim signature. It is present (`signed`) and rejected.
+///
+/// A REGRESSION GUARD, not a red: a v1-tagged signature verified nowhere before
+/// this branch, so this also passes on the base. The substitution that DID
+/// work on the base (a legacy bare-digest evidence signature) is the next test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_evidence_signature_copied_onto_a_claim_does_not_verify(pool: PgPool) {
     let signer = AgentSigner::from_bytes(&[0x63u8; 32]).expect("signer");
@@ -84,6 +91,36 @@ async fn an_evidence_signature_copied_onto_a_claim_does_not_verify(pool: PgPool)
         "an evidence-tagged signature verified a claim: {resp}"
     );
     assert_eq!(resp["signature_scheme"], Value::Null, "{resp}");
+}
+
+/// The ruled residual exposure (R-34: legacy stays verifiable): a LEGACY
+/// evidence signature is a bare-digest signature, byte for byte the same as a
+/// legacy claim signature over the same `H`, so copied onto a same-content
+/// claim it still verifies. It must be reported `legacy`, never `v1`, so a
+/// reader can see the row carries no type binding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_evidence_signature_on_a_same_content_claim_reports_legacy(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x65u8; 32]).expect("signer");
+    let agent = seed_agent(&pool, &signer.public_key()).await;
+    let content = "R-34: a legacy evidence signature, copied onto a claim.";
+    let h = ContentHasher::hash(content.as_bytes());
+    let legacy_evidence_sig = signer.sign(&h);
+    let claim = insert_claim(
+        &pool,
+        agent,
+        content,
+        &h,
+        Some(&legacy_evidence_sig),
+        Some(agent),
+    )
+    .await;
+
+    let resp = run_verify(&pool, claim).await;
+    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
+    assert_eq!(
+        resp["signature_scheme"], "legacy",
+        "a bare-digest signature must never read as type-bound: {resp}"
+    );
 }
 
 /// The write side: `create_strict_signed` stores a signature only when it
@@ -224,6 +261,180 @@ async fn memorize_signs_the_claim_and_its_evidence_under_v1(pool: PgPool) {
     .await
     .expect("a signed evidence row");
     assert_evidence_signed_v1(&pool, claim, &evidence_text).await;
+}
+
+/// The key every `build_scoped_test_server` signs with.
+fn test_server_key() -> [u8; 32] {
+    AgentSigner::from_bytes(&[0xA7u8; 32])
+        .expect("signer")
+        .public_key()
+}
+
+/// Every signed evidence row `sql` selects (`content_hash, signature`) is a v1
+/// EVIDENCE signature by the server key, and no claim signature over the same
+/// digest. At least one row, so the check cannot pass vacuously.
+async fn assert_signed_evidence_rows_v1(
+    pool: &PgPool,
+    writer: &str,
+    sql: &str,
+    bind: Option<Uuid>,
+) {
+    let mut q = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(sql);
+    if let Some(b) = bind {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool).await.expect("evidence rows");
+    assert!(!rows.is_empty(), "{writer} wrote no signed evidence row");
+    let key = test_server_key();
+    for (hash, sig) in rows {
+        let hash: [u8; 32] = hash.try_into().expect("32-byte hash");
+        let sig: [u8; 64] = sig.try_into().expect("64-byte signature");
+        assert_eq!(
+            SignatureVerifier::verify_entity(&key, SignedEntity::Evidence, &hash, &sig).unwrap(),
+            Some(SignatureScheme::V1),
+            "{writer}: an evidence row is not signed as v1 evidence"
+        );
+        assert_eq!(
+            SignatureVerifier::verify_entity(&key, SignedEntity::Claim, &hash, &sig).unwrap(),
+            None,
+            "{writer}: an evidence signature verifies as a claim signature"
+        );
+    }
+}
+
+fn ingest_extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+    serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": format!("R-34 {tag}: Tagged Signatures for Ingested Documents"),
+            "doi": format!("10.9999/r34-{tag}"),
+            "source_type": "Paper",
+            "authors": [{"name": "Alice Author", "affiliations": [], "roles": ["author"]}]
+        },
+        "thesis": format!("R-34 {tag}: tagged signatures bind each row to its entity type."),
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": "Methods",
+            "paragraphs": [{
+                "text": format!("R-34 {tag}: every evidence row is signed over a tagged message."),
+                "atoms": [format!("R-34 {tag}: evidence rows carry v1 signatures.")],
+                "generality": [1],
+                "confidence": 0.9
+            }]
+        }],
+        "relationships": []
+    }))
+    .expect("fixture parses")
+}
+
+const ALL_SIGNED_EVIDENCE: &str =
+    "SELECT content_hash, signature FROM evidence WHERE signature IS NOT NULL";
+const CLAIMS_SIGNED_EVIDENCE: &str =
+    "SELECT content_hash, signature FROM evidence WHERE claim_id = $1 AND signature IS NOT NULL";
+
+/// `ingest_document`'s evidence sign site (`do_ingest_document`). Its claim
+/// sign site is guarded by `epigraph-crypto`'s `entity_signing_sites` ratchet
+/// instead: the document walk's claim INSERTs
+/// (`create_with_id_if_absent_conn`, `create_conn`) store no signature, so no
+/// row shows it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_signs_its_evidence_under_v1(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &ingest_extraction("document"),
+        None,
+    )
+    .await
+    .expect("document ingests");
+    assert_signed_evidence_rows_v1(&pool, "ingest_document", ALL_SIGNED_EVIDENCE, None).await;
+}
+
+/// `ingest_document_spine`'s evidence sign site (`do_ingest_document_spine`);
+/// its claim sign site as for `ingest_document`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_document_spine_signs_its_evidence_under_v1(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    epigraph_mcp::tools::ingestion::do_ingest_document_spine(
+        &server,
+        &viewer,
+        &ingest_extraction("spine"),
+        None,
+    )
+    .await
+    .expect("spine ingests");
+    assert_signed_evidence_rows_v1(&pool, "ingest_document_spine", ALL_SIGNED_EVIDENCE, None).await;
+}
+
+/// `update_with_evidence`'s evidence sign site (`tools/claims.rs`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_signs_its_evidence_under_v1(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let claim_id = common::seed_claim(&pool, "R-34 writer: update_with_evidence", 0.5).await;
+    epigraph_mcp::tools::claims::update_with_evidence(
+        &server,
+        &viewer,
+        UpdateWithEvidenceParams {
+            canonical_name: None,
+            step_index: None,
+            claim_id: claim_id.to_string(),
+            evidence_type: "empirical".to_string(),
+            evidence_data: "R-34: a measurement".to_string(),
+            source_url: None,
+            supports: true,
+            strength: 0.8,
+            labels: vec![],
+        },
+        None,
+    )
+    .await
+    .expect("update_with_evidence");
+    assert_signed_evidence_rows_v1(
+        &pool,
+        "update_with_evidence",
+        CLAIMS_SIGNED_EVIDENCE,
+        Some(claim_id),
+    )
+    .await;
+}
+
+/// `report_workflow_outcome`'s evidence sign site (`tools/workflows.rs`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_signs_its_evidence_under_v1(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let workflow = common::seed_workflow_claim(&pool, "R-34 workflow outcome", &["s1"]).await;
+    epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        ReportWorkflowOutcomeParams {
+            workflow_id: workflow.to_string(),
+            success: true,
+            execution_log: vec![StepExecution {
+                step_index: 0,
+                planned: "s1".to_string(),
+                actual: "s1".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            }],
+            outcome_details: "ran".to_string(),
+            quality: Some(0.8),
+            goal_text: None,
+        },
+        None,
+    )
+    .await
+    .expect("report_workflow_outcome");
+    assert_signed_evidence_rows_v1(
+        &pool,
+        "report_workflow_outcome",
+        CLAIMS_SIGNED_EVIDENCE,
+        Some(workflow),
+    )
+    .await;
 }
 
 /// The claim's signed evidence row: its signature verifies under the server
