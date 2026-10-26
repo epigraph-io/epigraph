@@ -4,8 +4,11 @@
 //! Dempster's rule assumes independence. Agents that act for the SAME human
 //! are not independent sources: ruling Q-U027F-2 says they replace or
 //! contest, never aggregate, and ruling R-36 applies that to every
-//! BBA-combining path. Their BBAs are therefore combined cautiously (the
-//! min-commonality rule) before standard combination.
+//! BBA-combining path. Their BBAs are therefore reduced by Denoeux's cautious
+//! rule (`epigraph_engine::source_dependence::cautious_reduce`, built on
+//! `epigraph_ds::combination::cautious_rule`) before standard combination.
+//! The older min-commonality `combination::cautious_combine` is not used: it
+//! drops open-world mass, which every default-shaped assessment carries.
 //!
 //! The owner of an agent is the live human it resolves to (migration 149's
 //! `epigraph_human_of(agent, true)`), else the agent itself, exactly as
@@ -20,8 +23,8 @@ use uuid::Uuid;
 /// Result of the same-human dependence analysis
 #[derive(Debug, Clone)]
 pub struct IndependenceAnalysis {
-    /// Groups of BBAs written by sibling agents of one owner (each group gets
-    /// cautious_combine)
+    /// Groups of BBAs written by sibling agents of one owner (each group is
+    /// reduced by `source_dependence::cautious_reduce`)
     pub dependent_groups: Vec<Vec<MassFunction>>,
     /// BBAs whose owner has no other agent among the rows (get standard
     /// combine_multiple)

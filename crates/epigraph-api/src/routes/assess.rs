@@ -426,8 +426,12 @@ pub async fn assess_claim(
 
     // Reduce each dependent group (sibling agents of one owner, ruling R-36)
     // by Denoeux's cautious rule, the reduction the engine fold applies
-    // (`source_dependence::cautious_reduce`), so this response and the cache
-    // agree on what siblings are worth. The min-commonality
+    // (`source_dependence::cautious_reduce`). This response and the cache
+    // agree when each sibling has one row on the frame (the assessment slot,
+    // or one restating it). They can differ otherwise: this fold puts all of
+    // a group's rows into one cautious reduction, while the engine first
+    // Dempster-folds each agent's own rows (and applies the same-source rule
+    // and its reliability discounts). The cache is the engine's. The min-commonality
     // `combination::cautious_combine` used here before drops open-world mass,
     // which every default-shaped assessment carries. A group the rule is not
     // defined on folds as independent, as before.
