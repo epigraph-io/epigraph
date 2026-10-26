@@ -1,15 +1,22 @@
-//! An unreachable JWKS endpoint answers 503 with a fixed `service`, and the
-//! fetch error stays on the server (backlog f238ec73).
+//! An identity provider's failure text stays on the server (backlog f238ec73):
+//! an unreachable JWKS answers 503 with a fixed `service`, and an upstream
+//! error answers 502 with a fixed `reason`.
 //!
 //! `ProviderError::JwksFetch(msg)` carries the fetcher's error. For the
 //! production fetcher that is reqwest's transport error, which names the JWKS
 //! URL, an operator-configured address. The device exchange
 //! (`oauth/device.rs::exchange_endpoint`) and the external-assertion grant
 //! (`oauth/token.rs::handle_external_grant`) interpolated it into the 503's
-//! `service`. Each test drives one reachable arm over HTTP with a real
-//! `GoogleProvider` whose JWKS URL nothing listens on; the arm that
-//! `GoogleProvider::exchange_code` cannot reach is covered by the helper's
-//! unit test (`oauth::providers::jwks_unavailable_tests`).
+//! `service`. `ProviderError::Upstream(msg)` (the IdP's error body, or a
+//! transport error naming the token endpoint) went into the 502's `reason`.
+//!
+//! The first two tests drive the two validate arms over HTTP with a real
+//! `GoogleProvider` whose JWKS URL nothing listens on. `GoogleProvider` cannot
+//! make `exchange_code` return `JwksFetch`, nor `validate` return `Upstream`,
+//! so the remaining arms are driven through [`FailingIdp`], a registered
+//! provider that only supplies the failure: the response asserted on is the
+//! real handler's. Each test also checks the warn line names its own `flow`,
+//! which is what ties it to one arm.
 
 use std::sync::Arc;
 
@@ -26,7 +33,7 @@ use epigraph_api::oauth::providers::config::{ProviderConfig, ProviderFlow};
 use epigraph_api::oauth::providers::google::GoogleProvider;
 use epigraph_api::oauth::providers::jwks::JwksCache;
 use epigraph_api::oauth::providers::{
-    ExternalIdentityProvider, OidcRedirectFlow, ProviderRegistry,
+    ExternalIdentity, ExternalIdentityProvider, OidcRedirectFlow, ProviderError, ProviderRegistry,
 };
 use epigraph_api::{create_router, ApiConfig, AppState};
 
@@ -182,4 +189,200 @@ async fn the_device_exchange_withholds_the_jwks_fetch_error(pool: PgPool) {
     let (status, body) = send(app, req).await;
     assert_redacted_503(status, &body);
     logs_assert(on_one_line);
+}
+
+// ---------------------------------------------------------------------------
+// The arms GoogleProvider cannot reach: a provider that only fails.
+// ---------------------------------------------------------------------------
+
+const STUB_NAME: &str = "stub-idp";
+const STUB_GRANT: &str = "stub_id_token";
+
+/// Which failure a [`FailingIdp`] call answers with. Each carries text only
+/// the server may see: [`MARKER`] in an internal-looking URL.
+#[derive(Clone, Copy)]
+enum Fail {
+    Jwks,
+    Upstream,
+}
+
+impl Fail {
+    fn err(self) -> ProviderError {
+        match self {
+            Fail::Jwks => ProviderError::JwksFetch(format!(
+                "error sending request for url (https://idp.internal/{MARKER}/certs)"
+            )),
+            Fail::Upstream => ProviderError::Upstream(format!(
+                "token endpoint https://idp.internal/{MARKER}/token returned 500: \
+                 {{\"error\":\"server_error\"}}"
+            )),
+        }
+    }
+}
+
+/// A registered redirect provider whose `exchange_code` fails with
+/// `exchange` (or returns a token when `None`) and whose `validate` always
+/// fails with `validate`.
+struct FailingIdp {
+    exchange: Option<Fail>,
+    validate: Fail,
+}
+
+#[async_trait::async_trait]
+impl ExternalIdentityProvider for FailingIdp {
+    fn name(&self) -> &str {
+        STUB_NAME
+    }
+    fn grant_type(&self) -> &str {
+        STUB_GRANT
+    }
+    async fn validate(&self, _assertion: &str) -> Result<ExternalIdentity, ProviderError> {
+        Err(self.validate.err())
+    }
+    fn auto_provision(&self) -> bool {
+        false
+    }
+    fn default_scopes(&self) -> &[String] {
+        &[]
+    }
+}
+
+#[async_trait::async_trait]
+impl OidcRedirectFlow for FailingIdp {
+    fn build_auth_url(&self, _state: &str, _challenge: &str, _redirect_uri: &str) -> String {
+        "https://idp.example/auth".into()
+    }
+    async fn exchange_code(
+        &self,
+        _code: &str,
+        _redirect_uri: &str,
+        _pkce_verifier: &str,
+    ) -> Result<String, ProviderError> {
+        match self.exchange {
+            Some(f) => Err(f.err()),
+            None => Ok(token_with_a_kid()),
+        }
+    }
+}
+
+fn stub_app(pool: &PgPool, idp: FailingIdp) -> axum::Router {
+    let idp = Arc::new(idp);
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            idp.clone() as Arc<dyn ExternalIdentityProvider>,
+            Some(idp as Arc<dyn OidcRedirectFlow>),
+        )
+        .expect("register the stub provider");
+    create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)))
+}
+
+fn exchange_request() -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(format!("/oauth/{STUB_NAME}/exchange"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "code": "stub-code",
+                "code_verifier": "this-is-a-fixed-pkce-code-verifier-of-adequate-length-123456",
+                "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// ONE captured line holds the helper's message, this arm's `flow`, and the
+/// withheld text.
+fn warned(message: &'static str, flow: &'static str) -> impl Fn(&[&str]) -> Result<(), String> {
+    move |lines: &[&str]| {
+        lines
+            .iter()
+            .any(|l| l.contains(message) && l.contains(flow) && l.contains(MARKER))
+            .then_some(())
+            .ok_or_else(|| format!("no `{message}` warn line for flow {flow} carries `{MARKER}`"))
+    }
+}
+
+fn assert_redacted_502(status: StatusCode, body: &str) {
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains(MARKER) && !body.contains("idp.internal"),
+        "the provider's upstream error reached the client: {body}"
+    );
+    assert!(
+        body.contains("the identity provider request failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+}
+
+/// `POST /oauth/<name>/exchange` whose `exchange_code` cannot fetch the JWKS:
+/// the exchange arm of `exchange_endpoint` (flow `device_exchange`).
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_code_exchange_withholds_its_jwks_fetch_error(pool: PgPool) {
+    let app = stub_app(
+        &pool,
+        FailingIdp {
+            exchange: Some(Fail::Jwks),
+            validate: Fail::Jwks,
+        },
+    );
+    let (status, body) = send(app, exchange_request()).await;
+    assert!(
+        !body.contains("idp.internal"),
+        "the JWKS fetch error reached the client: {body}"
+    );
+    assert_redacted_503(status, &body);
+    logs_assert(warned(
+        "identity provider JWKS unavailable",
+        "device_exchange",
+    ));
+}
+
+/// `POST /oauth/<name>/exchange` whose returned id_token's validation fails
+/// upstream: the validate arm's `Upstream` (flow `device_validate`).
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_device_validate_withholds_the_upstream_error(pool: PgPool) {
+    let app = stub_app(
+        &pool,
+        FailingIdp {
+            exchange: None,
+            validate: Fail::Upstream,
+        },
+    );
+    let (status, body) = send(app, exchange_request()).await;
+    assert_redacted_502(status, &body);
+    logs_assert(warned(
+        "identity provider request failed",
+        "device_validate",
+    ));
+}
+
+/// `POST /oauth/token` with the stub's assertion grant, whose validation fails
+/// upstream: `handle_external_grant`'s `Upstream` arm (flow `external_grant`).
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_external_grant_withholds_the_upstream_error(pool: PgPool) {
+    let app = stub_app(
+        &pool,
+        FailingIdp {
+            exchange: None,
+            validate: Fail::Upstream,
+        },
+    );
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "grant_type": STUB_GRANT, "assertion": token_with_a_kid() })
+                .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = send(app, req).await;
+    assert_redacted_502(status, &body);
+    logs_assert(warned("identity provider request failed", "external_grant"));
 }

@@ -326,9 +326,10 @@ mod upstream_tests {
     /// exchange, the device validate path and the external-grant validate
     /// path): the 502's reason and rendered message are fixed text, and the
     /// provider's text reaches the server log on the helper's own line. The
-    /// two validate-path arms cannot be reached through the providers that
-    /// exist today, so this is their coverage; the exchange arm is also driven
-    /// over HTTP in tests/oauth_authorization_code.rs.
+    /// shipped providers cannot reach the two validate-path arms; they are
+    /// driven over HTTP through a stub provider in
+    /// tests/oauth_jwks_unavailable_redaction.rs, and the exchange arm in
+    /// tests/oauth_authorization_code.rs.
     #[test]
     #[tracing_test::traced_test]
     fn an_upstream_failure_answers_a_fixed_reason_and_logs_the_providers_text() {
@@ -362,11 +363,11 @@ mod jwks_unavailable_tests {
     use super::{jwks_unavailable, JWKS_UNAVAILABLE_SERVICE};
     use crate::errors::ApiError;
 
-    /// The helper behind every `ProviderError::JwksFetch` arm. The device
-    /// exchange's own arm (`exchange_code` returning `JwksFetch`) cannot be
-    /// reached through the providers that exist today, so this is its
-    /// coverage; the two validate arms are also driven over HTTP in
-    /// tests/oauth_jwks_unavailable_redaction.rs.
+    /// The helper behind every `ProviderError::JwksFetch` arm. All three arms
+    /// are also driven over HTTP in tests/oauth_jwks_unavailable_redaction.rs:
+    /// the two validate arms through a real `GoogleProvider`, and the device
+    /// exchange's own arm (`exchange_code` returning `JwksFetch`, which no
+    /// shipped provider does) through a stub provider.
     #[test]
     #[tracing_test::traced_test]
     fn a_jwks_fetch_failure_answers_a_fixed_service_and_logs_the_fetch_error() {
