@@ -798,7 +798,7 @@ impl From<DbError> for ApiError {
             // it answered as `QueryFailed { Protocol }` before the variant
             // existed: which status each refusal deserves (400, 403, 409) is
             // the route's to decide, and routes that know map it first.
-            DbError::Refused { message } => {
+            DbError::Refused { message, .. } => {
                 tracing::warn!(detail = %message, "the repository refused the request");
                 ApiError::DatabaseError {
                     message: "A database error occurred".to_string(),
@@ -900,6 +900,7 @@ mod tests {
     async fn a_repo_refusal_keeps_the_redacted_500_it_answered_before() {
         const ID: &str = "00000000-0000-0000-0000-00000000e0f0";
         let api = ApiError::from(DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
             message: format!("consolidate: source {ID} is not current"),
         });
         let ApiError::DatabaseError { .. } = &api else {

@@ -61,7 +61,7 @@ pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
 ///   `CX02: ...`), the convention the migrations' `RAISE EXCEPTION` refusals
 ///   follow. This arm reads the database's MESSAGE (not the driver's
 ///   wrapping of it), and only that message is returned.
-/// * `DbError::Refused { message }`, the variant the repo layer builds for
+/// * `DbError::Refused { message, .. }`, the variant the repo layer builds for
 ///   its own refusals (`mark_duplicate: canonical ... is not current`); every
 ///   such site in `epigraph-db` writes literal text and ids, no error. A
 ///   `sqlx::Error::Protocol`, bare or `?`-converted into
@@ -78,7 +78,7 @@ fn designed_refusal(e: &dyn std::any::Any) -> Option<String> {
     };
     if let Some(db) = e.downcast_ref::<epigraph_db::DbError>() {
         return match db {
-            epigraph_db::DbError::Refused { message } => Some(message.clone()),
+            epigraph_db::DbError::Refused { message, .. } => Some(message.clone()),
             epigraph_db::DbError::QueryFailed { source } => database(source),
             _ => None,
         };
@@ -576,6 +576,7 @@ mod tests {
     #[test]
     fn a_repo_authored_refusal_passes_and_a_bare_protocol_error_does_not() {
         let designed = internal_error(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
             message: "mark_duplicate: canonical c is not current; refusing".to_string(),
         });
         assert_eq!(designed.code, ErrorCode::INTERNAL_ERROR);

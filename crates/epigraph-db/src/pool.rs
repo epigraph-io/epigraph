@@ -686,7 +686,9 @@ fn plain_role_identifier(role: &str) -> Result<(), DbError> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
     {
+        // Input: the role name is not one this statement can splice.
         return Err(DbError::Refused {
+            kind: crate::RefusalKind::Input,
             message: format!("not a plain role identifier: {role}"),
         });
     }

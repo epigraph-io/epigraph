@@ -6282,7 +6282,9 @@ impl ClaimRepository {
                         entity: "Claim".to_string(),
                         id: old_uuid,
                     },
+                    // State: the claim was retired before this request.
                     Some(false) => DbError::Refused {
+                        kind: crate::RefusalKind::State,
                         message: format!("Claim {} has already been superseded", old_uuid),
                     },
                     // Visible and current, yet the UPDATE matched no row: the
@@ -7676,7 +7678,9 @@ impl ClaimRepository {
             return Ok(vec![]);
         }
         if claim_ids.len() > Self::MAX_PAIRWISE_IDS {
+            // Input: the id list is over the bound, whatever the graph holds.
             return Err(DbError::Refused {
+                kind: crate::RefusalKind::Input,
                 message: format!(
                     "pairwise_cosine_distance: {} ids exceeds MAX_PAIRWISE_IDS={}; \
                      split the input into smaller batches",
@@ -8148,7 +8152,9 @@ impl ClaimRepository {
         .await?
         .unwrap_or(false);
         if foreign_private_canonical {
+            // Authority: the session may read the canonical but not write it.
             return Err(DbError::Refused {
+                kind: crate::RefusalKind::Authority,
                 message: format!(
                     "FA04: canonical {canon_uuid} is not public and this session cannot write \
                      it; a dedup would move the duplicate's derived rows into its owner's \
@@ -8181,7 +8187,10 @@ impl ClaimRepository {
         .fetch_one(&mut *tx)
         .await?;
         if false_binding {
+            // Authority: binding the canonical is its writer's to do, not this
+            // session's.
             return Err(DbError::Refused {
+                kind: crate::RefusalKind::Authority,
                 message: format!(
                     "FA07: duplicate {dup_uuid} is bound to binary_truth at a non-zero index, and \
                      canonical {canon_uuid} (which this session cannot write) has no binding: a \
@@ -8445,12 +8454,19 @@ impl ClaimRepository {
                 id: dup_uuid,
             });
         };
-        let not_marked = |why: &str| DbError::Refused {
+        let not_marked = |kind: crate::RefusalKind, why: &str| DbError::Refused {
+            kind,
             message: format!("unmark_duplicate: claim {dup_uuid} {why}; nothing was written"),
         };
         let canonical = match (supersedes, current) {
             (Some(c), false) => c,
-            _ => return Err(not_marked("is not a retired duplicate")),
+            // State: the claim the caller reads is not a marked duplicate.
+            _ => {
+                return Err(not_marked(
+                    crate::RefusalKind::State,
+                    "is not a retired duplicate",
+                ))
+            }
         };
         let sql = viewer.splice(
             "SELECT e.id, \
@@ -8480,7 +8496,10 @@ impl ClaimRepository {
         // before anything about the canonical: the missing edge is what blocks
         // this un-mark whatever became of the canonical since.
         let Some((identity_edge, legacy_backfill)) = identity_edge else {
+            // State: the mark has no identity edge (read through the viewer, so
+            // an unreadable edge is this same answer, never an oracle).
             return Err(not_marked(
+                crate::RefusalKind::State,
                 &no_identity_edge_refusal(&mut tx, viewer, dup_uuid).await?,
             ));
         };
@@ -8492,12 +8511,17 @@ impl ClaimRepository {
             authorized_chain,
         ) {
             (Ok(chain), None) => chain,
-            (Err(why), None) => return Err(not_marked(&why)),
+            // State: the canonical's chain cannot be followed (e.g. it was
+            // itself marked a duplicate).
+            (Err(why), None) => return Err(not_marked(crate::RefusalKind::State, &why)),
             (Ok(chain), Some(authorized)) if chain.as_slice() == authorized => chain,
             // Said without the claims this read found: under the maintenance
             // viewer they may include a replacement the caller cannot read.
+            // State: the chain moved after authority was checked; a retry
+            // re-checks it.
             (_, Some(_)) => {
                 return Err(not_marked(
+                    crate::RefusalKind::State,
                     "has a canonical that was replaced again since the caller's authority was \
                      checked (the chain the un-mark would follow is no longer the one checked); \
                      retry the un-mark",
@@ -8527,7 +8551,10 @@ impl ClaimRepository {
         }
         let retracted = q.execute(&mut *tx).await?.rows_affected();
         if restored != 1 || retracted != 1 {
+            // Authority: both rows were read through the viewer; the session
+            // may not write them.
             return Err(not_marked(
+                crate::RefusalKind::Authority,
                 "or its identity edge is not writable by this session",
             ));
         }
@@ -10666,21 +10693,32 @@ impl ClaimRepository {
         acting_agent_id: Uuid,
     ) -> Result<ConsolidateResult, DbError> {
         use sqlx::Acquire;
-        let protocol = |m: String| DbError::Refused { message: m };
+        let refused = |kind: crate::RefusalKind, m: String| DbError::Refused { kind, message: m };
 
         if source_ids.len() < CONSOLIDATE_MIN_SOURCES || source_ids.len() > CONSOLIDATE_MAX_SOURCES
         {
-            return Err(protocol(format!(
+            // Input: the source count is out of bounds.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                format!(
                 "consolidate: need {CONSOLIDATE_MIN_SOURCES}..={CONSOLIDATE_MAX_SOURCES} sources, got {}",
                 source_ids.len()
             )));
         }
         let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
         if unique.len() != source_ids.len() {
-            return Err(protocol("consolidate: duplicate source ids".into()));
+            // Input: the source list names a claim twice.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                "consolidate: duplicate source ids".into(),
+            ));
         }
         if merged_content.trim().is_empty() {
-            return Err(protocol("consolidate: merged_content is empty".into()));
+            // Input: there is no merged content to write.
+            return Err(refused(
+                crate::RefusalKind::Input,
+                "consolidate: merged_content is empty".into(),
+            ));
         }
 
         let mut tx = conn.begin().await?;
@@ -10720,17 +10758,21 @@ impl ClaimRepository {
             });
         }
         for r in &locked {
+            // State (both): a source was retired before this merge.
             if !r.is_current {
-                return Err(protocol(format!(
-                    "consolidate: source {} is not current",
-                    r.id
-                )));
+                return Err(refused(
+                    crate::RefusalKind::State,
+                    format!("consolidate: source {} is not current", r.id),
+                ));
             }
             if r.supersedes.is_some() {
-                return Err(protocol(format!(
-                    "consolidate: source {} is already superseded; refusing to re-merge",
-                    r.id
-                )));
+                return Err(refused(
+                    crate::RefusalKind::State,
+                    format!(
+                        "consolidate: source {} is already superseded; refusing to re-merge",
+                        r.id
+                    ),
+                ));
             }
         }
 
@@ -11616,7 +11658,9 @@ async fn mark_duplicate_act(
     provenance: &DuplicateProvenance,
 ) -> Result<Uuid, DbError> {
     if dup_uuid == canon_uuid {
+        // Input: a claim cannot be its own duplicate.
         return Err(DbError::Refused {
+            kind: crate::RefusalKind::Input,
             message: "mark_duplicate: dup == canonical".into(),
         });
     }
@@ -11640,8 +11684,10 @@ async fn mark_duplicate_act(
                 id: canon_uuid,
             })
         }
+        // State: the canonical was retired before this mark.
         Some(false) => {
             return Err(DbError::Refused {
+                kind: crate::RefusalKind::State,
                 message: format!(
                     "mark_duplicate: canonical {canon_uuid} is not current; refusing to build a \
                      dedup chain onto a retired claim"
@@ -11664,7 +11710,9 @@ async fn mark_duplicate_act(
         });
     };
     if existing.is_some() {
+        // State: the duplicate is already retired into another claim.
         return Err(DbError::Refused {
+            kind: crate::RefusalKind::State,
             message: format!("Claim {dup_uuid} already superseded; refusing to overwrite"),
         });
     }

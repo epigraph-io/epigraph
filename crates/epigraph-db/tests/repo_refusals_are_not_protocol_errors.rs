@@ -3,7 +3,7 @@
 //!
 //! A refusal the repo layer authors ("mark_duplicate: canonical .. is not
 //! current", "FA07: ..", "not a plain role identifier: ..") is
-//! `DbError::Refused { message }`. It used to be built as
+//! `DbError::Refused { kind, message }`. It used to be built as
 //! `DbError::QueryFailed { source: sqlx::Error::Protocol(msg) }`, the shape
 //! `From<sqlx::Error>` also gives sqlx's own protocol errors, so the MCP layer
 //! could not tell the two apart and now redacts `QueryFailed { Protocol }`
@@ -126,7 +126,7 @@ fn the_repo_layer_builds_no_protocol_error_of_its_own() {
         offenders.is_empty(),
         "a repo-authored refusal built as sqlx::Error::Protocol(..) is indistinguishable from \
          sqlx's own protocol errors, so the MCP layer redacts it. Build \
-         DbError::Refused {{ message }} instead. Sites:\n  {}",
+         DbError::Refused {{ kind, message }} instead. Sites:\n  {}",
         offenders.join("\n  ")
     );
     for (file, allowed, why) in ALLOWED {
