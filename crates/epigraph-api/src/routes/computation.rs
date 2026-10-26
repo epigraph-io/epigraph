@@ -728,6 +728,49 @@ async fn apply_bp_updates(
     Ok((written, skipped, skipped_compounds, skipped_less_readable))
 }
 
+/// The stored BBAs that seed a CDST BP run, admitted on one viewer-stamped
+/// connection.
+///
+/// Ruling R-22: a run that writes caches (`apply`) seeds each claim with the
+/// BBAs its own recompute may fold (every source at least as widely readable
+/// as the claim); a read-only run SERVES its values to the caller, so it seeds
+/// with the BBAs whose every source the caller can read
+/// (`derivation_scope::retain_for_viewer`). A row on a public claim is public
+/// whatever it was derived from, so without either filter a stranger's BP
+/// value moved with evidence narrowed to a group.
+#[cfg(feature = "db")]
+async fn bp_seed_rows(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+    apply: bool,
+) -> Result<Vec<epigraph_db::MassFunctionRow>, ApiError> {
+    let rows =
+        epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, viewer, claim_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load mass functions: {e}"),
+            })?;
+    let mut read = state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "propagate_beliefs",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows = if apply {
+        epigraph_engine::derivation_scope::retain_for_cache(&mut read, rows).await?
+    } else {
+        epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, rows).await?
+    };
+    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+    Ok(rows)
+}
+
 /// The claims of a BP run whose connected component in the factor graph
 /// (`factor_variables`, one variable list per factor) holds a variable less
 /// readable than the claim: one absent from `tenancy` (no claim the caller can
@@ -922,63 +965,34 @@ pub async fn propagate_beliefs(
     // -- CDST branch: decide mode, load mass functions if needed ---------------
     let mode = request.mode.as_deref().unwrap_or("auto");
 
-    // Only load mass functions when CDST might be used (skip for explicit scalar/interval)
-    let use_cdst = match mode {
-        "cdst" => true,
-        "scalar" | "interval" => false,
+    // Only load mass functions when CDST might be used (skip for explicit
+    // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
+    // (ruling R-22), for the coverage check too, so a BBA the caller may not
+    // see a fold of cannot flip the mode either.
+    let (use_cdst, seed_rows) = match mode {
+        "cdst" => (
+            true,
+            bp_seed_rows(&state, &viewer, &all_var_ids, apply).await?,
+        ),
+        "scalar" | "interval" => (false, Vec::new()),
         _ => {
-            // Auto: load mass functions and check coverage
-            let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-                &state.db_pool,
-                &viewer,
-                &all_var_ids,
-            )
-            .await
-            .unwrap_or_default();
+            // Auto: load mass functions and check coverage (a failed load
+            // reads as no coverage, as before).
+            let rows = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
+                .await
+                .unwrap_or_default();
             let claims_with_mf: std::collections::HashSet<Uuid> =
-                mf_rows.iter().map(|r| r.claim_id).collect();
-            !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len()
+                rows.iter().map(|r| r.claim_id).collect();
+            let use_cdst = !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len();
+            (use_cdst, rows)
         }
     };
 
     if use_cdst {
-        let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-            &state.db_pool,
-            &viewer,
-            &all_var_ids,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to load mass functions: {e}"),
-        })?;
-        // Ruling R-22: a run that writes caches seeds each claim with the BBAs
-        // its own recompute may fold (every source at least as widely readable
-        // as the claim).
-        let mf_rows = if apply {
-            let mut scope_read = state.read_as(&viewer).await.map_err(|e| {
-                tracing::error!(
-                    target: "tenancy.scoped_read",
-                    error = %e,
-                    handler = "propagate_beliefs",
-                    "could not acquire a viewer-stamped connection"
-                );
-                ApiError::InternalError {
-                    message: "Failed to acquire a scoped connection".to_string(),
-                }
-            })?;
-            let rows =
-                epigraph_engine::derivation_scope::retain_for_cache(&mut scope_read, mf_rows)
-                    .await?;
-            crate::routes::finish_scoped_read(scope_read, "propagate_beliefs").await?;
-            rows
-        } else {
-            mf_rows
-        };
-
         // Combine multiple mass functions per claim via adaptive combination
         // (a claim may have evidence from multiple sources/agents)
         let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
-        for row in &mf_rows {
+        for row in &seed_rows {
             if let Ok(mf) = epigraph_engine::cdst_bp::parse_mass_function_row(&row.masses) {
                 evidence
                     .entry(row.claim_id)
