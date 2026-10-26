@@ -28,9 +28,10 @@
 -- 1. THE RULE
 -- ===================================================================
 --
--- One guard function, `epigraph_challenge_resolution_guard()`, on three
--- BEFORE ROW triggers. For an application session (anything 114's
--- `epigraph_session_is_privileged_writer()` says is NOT privileged):
+-- One guard function, `epigraph_challenge_resolution_guard()`, on four ROW
+-- triggers (three BEFORE, one AFTER INSERT). For an application session
+-- (anything 114's `epigraph_session_is_privileged_writer()` says is NOT
+-- privileged):
 --
 --   * UPDATE: the only change of the four resolution columns it may make is
 --     the CHALLENGER's own withdrawal: `state` to `withdrawn`, from an
@@ -40,8 +41,33 @@
 --     refused, CR07 (42501).
 --   * INSERT: a challenge is born unresolved: `state = 'pending'` and the three
 --     other columns NULL, else CR07 (42501).
+--   * `challenger_id` names the filer and is fixed at filing: an INSERT's
+--     `challenger_id` must be the session principal (plain `=`, so NULL is
+--     refused), and an UPDATE that changes it is refused, CR08 (42501). The
+--     INSERT half is an AFTER row trigger, so row security's `WITH CHECK`
+--     answers an unstamped session first, as it did before this file; the
+--     exception still aborts the statement, so nothing is written.
 --   * DELETE: refused, CR09 (42501). A challenge is never removed by an
 --     application session; the challenger retracts it by withdrawing it.
+--
+-- WHY `challenger_id` IS FIXED. The withdrawal arm above keys on
+-- `OLD.challenger_id = epigraph_principal_id()`, and readers are shown
+-- `challenger_id` as who filed the challenge. No earlier guard covers the
+-- column (114/168's writer-owner guard and 115's owner guard watch tenancy
+-- columns only), so without this a session row security lets UPDATE a row
+-- could make itself that row's challenger and then withdraw it, or name any
+-- agent as the filer of its own row or of a new one. Every filing path an
+-- application session uses already passes its own principal: the HTTP
+-- `submit_challenge` route (`Some(caller)` on the viewer-stamped transaction,
+-- after refusing a body that names another challenger) and the MCP
+-- `challenge_claim` tool (`Some(agent_id)` on the author-stamped
+-- transaction). The paths that file with a NULL challenger (`gaps.rs`'s gap
+-- challenges, `conflicts.rs::resolve_conflict`) run on the API's raw pool: on
+-- a privileged connection this guard passes them; on an unstamped
+-- `epigraph_app` connection 077's row security already refuses them.
+-- `ChallengeRepository::insert_gap_challenge(agent_id)` has no non-test
+-- caller; on an application session it now files only as the principal. No
+-- path files on another agent's behalf, so none is exempted.
 --
 -- WHY DELETE IS REFUSED OUTRIGHT. 077 grants `epigraph_app` DELETE, and 115's
 -- restrictive DELETE policy admits every writer of the row's owning group. So
@@ -101,15 +127,15 @@
 -- ===================================================================
 --
 -- Depends on 114 (`epigraph_session_is_privileged_writer`) and 168 (the
--- definer). Three `CREATE TRIGGER`s take a short lock on `challenges`, under
+-- definer). Four `CREATE TRIGGER`s take a short lock on `challenges`, under
 -- `lock_timeout`. Independent of the binaries: no binary path plain-UPDATEs a
 -- resolution column on an application session (the resolve routes call the
 -- definer), and a binary without the resolve routes against a database with
 -- this file loses nothing it had.
 --
 -- UNDO: DROP TRIGGER challenges_resolution_guard_update,
--- challenges_resolution_guard_insert and challenges_resolution_guard_delete ON
--- public.challenges, then DROP FUNCTION
+-- challenges_resolution_guard_insert, challenges_challenger_guard_insert and
+-- challenges_resolution_guard_delete ON public.challenges, then DROP FUNCTION
 -- public.epigraph_challenge_resolution_guard().
 --
 -- Checked before claiming: no `origin/main` migration and no open PR carries a
@@ -130,6 +156,18 @@ BEGIN
             OLD.id
             USING ERRCODE = '42501';
     END IF;
+    -- The AFTER INSERT arm: who filed it. After row security's WITH CHECK, so
+    -- an unstamped session is still refused by row security first.
+    IF TG_OP = 'INSERT' AND TG_WHEN = 'AFTER' THEN
+        IF public.epigraph_session_is_privileged_writer() THEN RETURN NULL; END IF;
+        -- Plain `=`: a NULL challenger or a NULL principal never matches.
+        IF NOT COALESCE(NEW.challenger_id = public.epigraph_principal_id(), false) THEN
+            RAISE EXCEPTION 'CR08: a challenge is filed by its challenger: challenger_id must '
+                'be the session principal; nothing was written'
+                USING ERRCODE = '42501';
+        END IF;
+        RETURN NULL;
+    END IF;
     IF public.epigraph_session_is_privileged_writer() THEN RETURN NEW; END IF;
     IF TG_OP = 'INSERT' THEN
         IF NEW.state = 'pending'
@@ -141,6 +179,11 @@ BEGIN
         RAISE EXCEPTION 'CR07: a challenge is filed unresolved (state pending, no resolver, '
             'time or details); its resolution is set only through '
             'epigraph_resolve_challenge; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NEW.challenger_id IS DISTINCT FROM OLD.challenger_id THEN
+        RAISE EXCEPTION 'CR08: challenge % challenger_id is fixed when the challenge is filed; '
+            'nothing was written', OLD.id
             USING ERRCODE = '42501';
     END IF;
     -- Plain `=`: a NULL challenger or a NULL principal never matches.
@@ -163,9 +206,11 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_challenge_resolution_guard() FROM PUB
 
 DROP TRIGGER IF EXISTS challenges_resolution_guard_update ON public.challenges;
 CREATE TRIGGER challenges_resolution_guard_update
-    BEFORE UPDATE OF state, resolved_by, resolved_at, resolution_details ON public.challenges
+    BEFORE UPDATE OF state, resolved_by, resolved_at, resolution_details, challenger_id
+    ON public.challenges
     FOR EACH ROW
-    WHEN (OLD.state IS DISTINCT FROM NEW.state
+    WHEN (OLD.challenger_id IS DISTINCT FROM NEW.challenger_id
+          OR OLD.state IS DISTINCT FROM NEW.state
           OR OLD.resolved_by IS DISTINCT FROM NEW.resolved_by
           OR OLD.resolved_at IS DISTINCT FROM NEW.resolved_at
           OR OLD.resolution_details IS DISTINCT FROM NEW.resolution_details)
@@ -179,6 +224,12 @@ CREATE TRIGGER challenges_resolution_guard_insert
           OR NEW.resolved_by IS NOT NULL
           OR NEW.resolved_at IS NOT NULL
           OR NEW.resolution_details IS NOT NULL)
+    EXECUTE FUNCTION public.epigraph_challenge_resolution_guard();
+
+DROP TRIGGER IF EXISTS challenges_challenger_guard_insert ON public.challenges;
+CREATE TRIGGER challenges_challenger_guard_insert
+    AFTER INSERT ON public.challenges
+    FOR EACH ROW
     EXECUTE FUNCTION public.epigraph_challenge_resolution_guard();
 
 DROP TRIGGER IF EXISTS challenges_resolution_guard_delete ON public.challenges;

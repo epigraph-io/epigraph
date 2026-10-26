@@ -1660,3 +1660,170 @@ async fn no_application_session_deletes_a_challenge(pool: PgPool) {
         .rows_affected();
     assert_eq!(n, 1, "the privileged connection deletes the row");
 }
+
+// =========================================================================
+// Migration 170, challenger_id: fixed at filing, and it is the filer.
+// =========================================================================
+
+/// The text the challenger refusal carries (migration 170's guard).
+const CR08: &str = "CR08";
+
+/// `challenger_id` is set once, when the challenge is filed, and it names the
+/// filer. R-13's one exception (the challenger withdraws its own challenge)
+/// keys on `challenger_id = epigraph_principal_id()`, and readers are shown
+/// `challenger_id` as who filed the challenge, so for every application
+/// session (the non-bypassing `epigraph_app`, stamped as a request is):
+///
+/// * an UPDATE that CHANGES `challenger_id` is refused (CR08, 42501), by the
+///   claim's owner on a colleague's insider row (row security admits the
+///   owner's UPDATEs of it) and by the outsider on its own row; each row is
+///   byte-identical, and the owner's withdrawal of the colleague's challenge
+///   that follows is still refused (CR07), so the row stays `pending`;
+/// * an INSERT whose `challenger_id` is not the session principal (another
+///   agent, or NULL) is refused (CR08), and nothing is written.
+///
+/// Calibrations: the filer's own INSERT lands; an UPDATE that names
+/// `challenger_id` without changing it lands (the rule is about a change, not
+/// about the column being mentioned); and the privileged harness connection
+/// still re-attributes a row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn challenger_id_is_fixed_at_filing_and_names_the_filer(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-cid-owner").await;
+    let (outsider, _) = fixture::seed_agent_with_group(&pool, "ch-cid-out").await;
+    let (colleague, _) = fixture::seed_agent_with_group(&pool, "ch-cid-colleague").await;
+    let (forged, _) = fixture::seed_agent_with_group(&pool, "ch-cid-forged").await;
+    add_writer(&pool, owner_group, colleague).await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "challenger id").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let theirs = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let t = challenge(&mut conn, claim, outsider, "challenger id: the outsider's").await;
+        (conn, t)
+    })
+    .await
+    .expect("CALIBRATION: the outsider files as itself");
+    let p = pool.clone();
+    let insiders = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, colleague).await;
+        let i = challenge(&mut conn, claim, colleague, "challenger id: a colleague's").await;
+        (conn, i)
+    })
+    .await
+    .expect("CALIBRATION: the colleague files as itself");
+    let theirs_before = whole_row(&pool, theirs).await;
+    let insiders_before = whole_row(&pool, insiders).await;
+
+    // The claim's owner makes itself the challenger of a colleague's row, then
+    // withdraws it: two statements, the first must already be refused.
+    let p = pool.clone();
+    let (relabel, withdraw) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = sqlx::query("UPDATE challenges SET challenger_id = $2 WHERE id = $1")
+            .bind(insiders)
+            .bind(owner)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        let w = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(insiders)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+        (conn, (r, w))
+    })
+    .await;
+    let e = relabel.expect_err("the owner cannot make itself the challenger of a colleague's row");
+    assert_eq!(sqlstate(&e).as_deref(), Some("42501"), "{e}");
+    assert!(
+        format!("{e:?}").contains(CR08),
+        "refused by migration 170's challenger guard: {e:?}"
+    );
+    let e = withdraw.expect_err("the owner's withdrawal of a colleague's challenge stays refused");
+    assert!(format!("{e:?}").contains(CR07), "{e:?}");
+    assert_eq!(
+        whole_row(&pool, insiders).await,
+        insiders_before,
+        "the colleague's row is untouched and still pending"
+    );
+    assert_eq!(resolution(&pool, insiders).await.0, "pending");
+
+    // The outsider re-attributes its own row, and files in another's name.
+    let p = pool.clone();
+    let (own_relabel, as_other, as_nobody, same_value) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, outsider).await;
+            let r = sqlx::query("UPDATE challenges SET challenger_id = $2 WHERE id = $1")
+                .bind(theirs)
+                .bind(forged)
+                .execute(&mut *conn)
+                .await
+                .map(|d| d.rows_affected());
+            let insert = "INSERT INTO challenges (claim_id, challenger_id, challenge_type, \
+                                                  explanation) \
+                          VALUES ($1, $2, 'factual_error', 'challenger id: filed for another')";
+            let o = sqlx::query(insert)
+                .bind(claim)
+                .bind(Some(forged))
+                .execute(&mut *conn)
+                .await
+                .map(|d| d.rows_affected());
+            let n = sqlx::query(insert)
+                .bind(claim)
+                .bind(None::<Uuid>)
+                .execute(&mut *conn)
+                .await
+                .map(|d| d.rows_affected());
+            let s = sqlx::query(
+                "UPDATE challenges SET challenger_id = challenger_id, explanation = explanation \
+                  WHERE id = $1",
+            )
+            .bind(theirs)
+            .execute(&mut *conn)
+            .await
+            .map(|d| d.rows_affected());
+            (conn, (r, o, n, s))
+        })
+        .await;
+    for (what, r) in [
+        ("the outsider re-attributes its own challenge", own_relabel),
+        ("an INSERT naming another agent as the challenger", as_other),
+        ("an INSERT naming no challenger", as_nobody),
+    ] {
+        let e = r.expect_err(&format!("{what}: refused, not landed"));
+        assert_eq!(sqlstate(&e).as_deref(), Some("42501"), "{what}: {e}");
+        assert!(
+            format!("{e:?}").contains(CR08),
+            "{what}: refused by migration 170's challenger guard: {e:?}"
+        );
+    }
+    assert_eq!(
+        same_value.expect("CALIBRATION: naming challenger_id without changing it lands"),
+        1
+    );
+    assert_eq!(
+        whole_row(&pool, theirs).await,
+        theirs_before,
+        "the outsider's row is untouched"
+    );
+    let filed_for_another: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM challenges \
+          WHERE claim_id = $1 AND explanation = 'challenger id: filed for another'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(filed_for_another, 0, "nothing is filed in another's name");
+
+    // CALIBRATION: a privileged connection re-attributes (an operator repair).
+    let n = sqlx::query("UPDATE challenges SET challenger_id = $2 WHERE id = $1")
+        .bind(theirs)
+        .bind(forged)
+        .execute(&pool)
+        .await
+        .expect("a privileged re-attribution")
+        .rows_affected();
+    assert_eq!(n, 1);
+}
