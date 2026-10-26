@@ -2148,6 +2148,12 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
         // ('epigraph_maintenance', ..) = true, ('epigraph', ..) = true
         // (superuser), ('epigraph_seed', ..) = false. So the app-owned case
         // this exists to catch still fails, which is the point.
+        //
+        // OVERLOADS (179 added mode-taking overloads of two registered
+        // verbs): the register names a function, not a signature, so every
+        // overload of the name is checked by reporting the WORST-owned one
+        // (`false` sorts first). A bare `LIMIT 1` would check whichever
+        // overload the catalog returned first and could pass a misowned one.
         // ==============================================================
         let owner: Option<(String, bool)> = sqlx::query_as(
             "SELECT r.rolname, pg_has_role(r.rolname, $2, 'MEMBER')
@@ -2155,6 +2161,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                JOIN pg_namespace n ON n.oid = p.pronamespace
                JOIN pg_roles r ON r.oid = p.proowner
               WHERE n.nspname = 'public' AND p.proname = $1
+              ORDER BY pg_has_role(r.rolname, $2, 'MEMBER') ASC, p.oid
               LIMIT 1",
         )
         .bind(f)
@@ -2677,6 +2684,18 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_bind_group_role",
             "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            false,
+        ),
+        // 179: the mode-taking overloads of the same two verbs (a binding
+        // that admits the holder and the role's attached agents only).
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+            false,
+        ),
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
             false,
         ),
         (
