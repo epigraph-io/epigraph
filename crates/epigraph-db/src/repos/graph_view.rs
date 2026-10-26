@@ -778,6 +778,14 @@ impl GraphViewRepository {
                     }
                     None => String::new(),
                 };
+                // The recursive step filters the EDGE it crosses, not the node
+                // it passes through: an intermediate node is hidden only
+                // because an edge touching it inherits its endpoints' tenancy
+                // (migration 070's trigger, the endpoint meet), so a walk never
+                // crosses an edge onto or off a node the viewer cannot read. An
+                // edge whose tenancy was changed without re-stamping breaks
+                // that; F-edges-unfiltered in docs/tenancy/progress.json owns
+                // the residual.
                 let join = match w.direction {
                     GqlDirection::Outgoing => "e.source_id = p.id",
                     GqlDirection::Incoming => "e.target_id = p.id",
