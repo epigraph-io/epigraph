@@ -21,12 +21,36 @@
 //! trigger is now "not in the hydrated set" rather than "redacted", which also
 //! covers the id that matches no row in any entity table.
 //!
+//! # A bare typed node is for a neighbour with no tenancy to withhold
+//!
+//! "Not in the hydrated set" used to mean *dropped* only for a `claim`. Every
+//! other type was emitted as a bare typed node — id, declared type, edges
+//! kept — and `evidence`, `reasoning_traces`, `perspectives`, `contexts`,
+//! `communities` and `frames` all carry their own `(visibility,
+//! owner_group_id)`, so a non-member received the id, type and relationship of
+//! a group-private row. For a trace it was also an oracle: a non-member read
+//! label `"trace"` where a member read `"deductive (0.90)"`.
+//!
+//! A bare node is now emitted only for a type in
+//! `EgoEdges::untenanted_types` — `EgoRepository::untenanted_entity_types`,
+//! i.e. a registered type whose declared tier is not `'columns'` AND whose
+//! backing table has no `owner_group_id` to filter on (agent, paper, activity,
+//! …). Anything else that did not hydrate is DROPPED together with its edges:
+//! a tenanted row the viewer may not read, an id no table knows about, and a
+//! type this route cannot check are one answer, which is what stops the
+//! difference between them being readable off the response.
+//!
+//! The decision is fail-closed by construction: the set names the types that
+//! may be shown, so an unregistered type, or a type registered after this code
+//! was written, is withheld rather than published.
+//!
 //! `total_edges` needs no correction here. `EgoRepository::edges` counts the
-//! degree inside the same viewer predicate that produces the edge rows, so the
-//! number is the visible degree by construction rather than the true degree
-//! minus whatever this handler happened to drop. `truncated` stays cap-only, so
-//! the pair says "the cap cut the list" and never "there is more you cannot
-//! see".
+//! degree inside the same viewer predicate that produces the edge rows — and
+//! since that predicate dispatches on the far endpoint's type with the same
+//! `untenanted_types` set this handler uses, the number is the visible degree
+//! by construction rather than the true degree minus whatever this handler
+//! happened to drop. `truncated` stays cap-only, so the pair says "the cap cut
+//! the list" and never "there is more you cannot see".
 //!
 //! All SQL lives in `epigraph_db::EgoRepository`.
 
@@ -160,8 +184,10 @@ fn to_node(entity: EgoEntity) -> EgoNode {
     }
 }
 
-/// A neighbour that no entity table knows about: the edge still declares its
-/// type, so it is rendered as a bare typed node rather than dropped.
+/// A neighbour that no entity table knows about, **of a type with no tenancy
+/// of its own**: the edge still declares its type, so it is rendered as a bare
+/// typed node rather than dropped. Callers must check the type against
+/// `EgoEdges::untenanted_types` first — see the module docs.
 fn unhydrated_node(id: Uuid, entity_type: &str) -> EgoNode {
     EgoNode {
         id,
@@ -263,14 +289,15 @@ pub async fn claim_ego(
             nodes.push(to_node(entity));
         }
     }
-    // A declared neighbour that hydration did not return is either an id no
-    // entity table knows about or a claim this viewer may not read, and this
+    // A declared neighbour that hydration did not return is an id no entity
+    // table knows about, or a tenanted row this viewer may not read, and this
     // handler cannot tell the two apart — by design, since telling them apart
-    // IS the existence oracle. Only ids whose declared type is not `claim` are
-    // emitted as bare typed nodes; a `claim` that did not hydrate is dropped,
-    // and the loop below drops its edges with it.
+    // IS the existence oracle. A bare typed node is therefore emitted ONLY for
+    // a type that has no tenancy to withhold (`untenanted_types`, from the
+    // registry on the same connection); every other non-hydrated neighbour is
+    // dropped, and the retain below drops its edges with it.
     for (id, entity_type) in &declared_type {
-        if !seen.contains(id) && entity_type != "claim" {
+        if !seen.contains(id) && fetched.untenanted_types.contains(entity_type) {
             nodes.push(unhydrated_node(*id, entity_type));
             seen.insert(*id);
         }
@@ -278,8 +305,8 @@ pub async fn claim_ego(
 
     // An edge to a node that is not in `nodes` is dropped. `total_edges` is
     // untouched: the repo already counted only the edges whose far endpoint
-    // this viewer may see, so it needs no correction here, and correcting it
-    // twice would under-report.
+    // this viewer may see — by the same per-type rule applied here — so it
+    // needs no correction, and correcting it twice would under-report.
     let kept_ids: HashSet<Uuid> = nodes
         .iter()
         .map(|n| n.id)

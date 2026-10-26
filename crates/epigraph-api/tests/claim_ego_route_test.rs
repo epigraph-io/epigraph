@@ -137,6 +137,118 @@ async fn seed_paper(pool: &PgPool, title: &str) -> Uuid {
     id
 }
 
+/// Evidence for `claim_id`, labelled by its `doi` the way `EgoRepository::
+/// hydrate` reads it — so the owner's label and a non-member's would differ if
+/// a non-member were shown one at all.
+async fn seed_evidence(pool: &PgPool, claim_id: Uuid, doi: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO evidence (id, raw_content, content_hash, evidence_type, claim_id, properties) \
+         VALUES ($1, 'ev', $2, 'document', $3, jsonb_build_object('doi', $4::text))",
+    )
+    .bind(id)
+    .bind(&hash)
+    .bind(claim_id)
+    .bind(doi)
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+    id
+}
+
+/// A perspective: `tenancy_tier = 'columns'` (migration 069) and a legal edge
+/// endpoint, but a table this route does not hydrate.
+async fn seed_perspective(pool: &PgPool, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO perspectives (id, name, description) VALUES ($1, $2, 'p')")
+        .bind(id)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed perspective");
+    id
+}
+
+/// `owner`'s personal group, with the `agents` row `groups_created_by_fkey`
+/// needs. `common::seed_private_ownership` gets this for free because its
+/// callers mint the claim with `seed_claim_with_agent`; a private trace or
+/// evidence row has no such step.
+async fn personal_group_for(pool: &PgPool, owner: Uuid) -> Uuid {
+    let pk: Vec<u8> = owner.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type) \
+         VALUES ($1, $2, 'system') ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(owner)
+    .bind(&pk)
+    .execute(pool)
+    .await
+    .expect("seed the owning agent");
+    common::personal_group_of(pool, owner).await
+}
+
+/// Stamp a NON-CLAIM tenanted row group-private to `owner`'s personal group.
+///
+/// `common::seed_private_ownership` only knows `claims`. These two tables carry
+/// the same `(visibility, owner_group_id)` pair — migration 062's `tier_a`
+/// array includes both — and migration 070's writer-owner guard admits the
+/// UPDATE only for a privileged session, which the test pool is and the
+/// handler under test is not.
+async fn make_trace_private(pool: &PgPool, trace_id: Uuid, owner: Uuid) {
+    let group = personal_group_for(pool, owner).await;
+    let got: Option<(String, Uuid)> = sqlx::query_as(
+        "UPDATE reasoning_traces SET visibility = 'group', owner_group_id = $2 \
+         WHERE id = $1 RETURNING visibility, owner_group_id",
+    )
+    .bind(trace_id)
+    .bind(group)
+    .fetch_optional(pool)
+    .await
+    .expect("stamp the trace group-private");
+    assert_eq!(
+        got,
+        Some(("group".to_string(), group)),
+        "a mis-stamped trace makes every 'a stranger sees nothing' assertion vacuous"
+    );
+}
+
+async fn make_evidence_private(pool: &PgPool, evidence_id: Uuid, owner: Uuid) {
+    let group = personal_group_for(pool, owner).await;
+    let got: Option<(String, Uuid)> = sqlx::query_as(
+        "UPDATE evidence SET visibility = 'group', owner_group_id = $2 \
+         WHERE id = $1 RETURNING visibility, owner_group_id",
+    )
+    .bind(evidence_id)
+    .bind(group)
+    .fetch_optional(pool)
+    .await
+    .expect("stamp the evidence group-private");
+    assert_eq!(
+        got,
+        Some(("group".to_string(), group)),
+        "a mis-stamped evidence row makes every 'a stranger sees nothing' assertion vacuous"
+    );
+}
+
+/// Force every edge in `ids` public.
+///
+/// THE TRAP THIS DISARMS, same as the claim-neighbour tests below: migration
+/// 070 makes an edge inherit its endpoints' tenancy, so an edge stamped by the
+/// trigger would be withheld by the EDGE predicate alone and the assertions
+/// would hold with the far-endpoint guard deleted.
+async fn force_edges_public(pool: &PgPool, ids: &[Uuid]) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = \
+         '00000000-0000-0000-0000-000000000000'::uuid, co_owner_group_id = NULL \
+         WHERE id = ANY($1)",
+    )
+    .bind(ids.to_vec())
+    .execute(pool)
+    .await
+    .expect("force the connecting edges public");
+}
+
 async fn seed_activity(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -726,4 +838,167 @@ async fn the_degree_cap_and_invisibility_subtract_independently(pool: PgPool) {
     assert_eq!(body["edges"].as_array().expect("edges").len(), 2);
     assert_eq!(body["truncated"], Value::Bool(true));
     assert_eq!(body["total_edges"], 5);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_private_non_claim_neighbour_is_dropped_rather_than_bared(pool: PgPool) {
+    // The leak: a bare typed node was emitted for ANY non-claim neighbour that
+    // failed to hydrate, so a non-member received the id, the entity type and
+    // the relationship of a group-private reasoning trace and a group-private
+    // evidence row, their edges were kept, and `total_edges` counted them. It
+    // was an oracle on top: a non-member read label "trace", the owner reads
+    // "deductive (0.75)".
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim(&pool, "public centre").await;
+
+    let trace = seed_trace(&pool, center).await;
+    let trace_edge =
+        common::insert_edge(&pool, center, trace, "claim", "trace", "derived_from").await;
+    make_trace_private(&pool, trace, owner).await;
+
+    let evidence = seed_evidence(&pool, center, "10.1234/secret").await;
+    let evidence_edge =
+        common::insert_edge(&pool, evidence, center, "evidence", "claim", "supports").await;
+    make_evidence_private(&pool, evidence, owner).await;
+
+    // Untenanted neighbours: `agents` and `papers` are not in migration 062's
+    // `tier_a` array and carry no `owner_group_id`, so there is nothing to
+    // withhold and both must still arrive — for the stranger too.
+    let agent = seed_agent_named(&pool, "Dr. Ada Lovelace").await;
+    let agent_edge =
+        common::insert_edge(&pool, center, agent, "claim", "agent", "attributed_to").await;
+    let paper = seed_paper(&pool, "A Paper With A Title").await;
+    let paper_edge = common::insert_edge(&pool, center, paper, "claim", "paper", "asserts").await;
+
+    force_edges_public(&pool, &[trace_edge, evidence_edge, agent_edge, paper_edge]).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{center}/ego");
+
+    // A signed-in stranger.
+    let (status, _, raw_body) = raw(&app, &path, Some(&reader())).await;
+    assert_eq!(status, StatusCode::OK, "body: {raw_body}");
+    let body: Value = serde_json::from_str(&raw_body).expect("json body");
+
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![agent.to_string(), paper.to_string()];
+    want.sort();
+    assert_eq!(
+        ids, want,
+        "only the untenanted neighbours may be reported, got {body}"
+    );
+
+    // Not the id, not the type, not the edge: the whole body, because a
+    // node-list assertion alone would pass while the id rode out on an edge.
+    assert!(
+        !raw_body.contains(&trace.to_string()),
+        "the private trace's uuid appears in the response: {raw_body}"
+    );
+    assert!(
+        !raw_body.contains(&evidence.to_string()),
+        "the private evidence's uuid appears in the response: {raw_body}"
+    );
+    assert!(
+        !raw_body.contains("\"trace\""),
+        "even the bare entity type of a hidden trace is a disclosure: {raw_body}"
+    );
+    assert!(
+        !raw_body.contains("\"evidence\""),
+        "even the bare entity type of hidden evidence is a disclosure: {raw_body}"
+    );
+    assert_eq!(
+        body["edges"].as_array().expect("edges").len(),
+        2,
+        "the edges to the withheld neighbours go with them, got {body}"
+    );
+    assert_eq!(
+        body["total_edges"], 2,
+        "`total_edges` must not count an edge whose far endpoint is a tenanted \
+         row this caller may not read, got {body}"
+    );
+    assert_eq!(
+        body["truncated"],
+        Value::Bool(false),
+        "invisibility is not cap-truncation, got {body}"
+    );
+
+    // CALIBRATION: the owner sees all four, hydrated. Without this arm the
+    // assertions above would pass against a handler that dropped every
+    // non-claim neighbour, or returned nothing at all.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![
+        agent.to_string(),
+        evidence.to_string(),
+        paper.to_string(),
+        trace.to_string(),
+    ];
+    want.sort();
+    assert_eq!(ids, want, "body: {body}");
+    assert_eq!(node(&body, trace)["entity_type"], "trace");
+    assert_eq!(node(&body, trace)["label"], "deductive (0.75)");
+    assert_eq!(node(&body, evidence)["entity_type"], "evidence");
+    assert_eq!(node(&body, evidence)["label"], "Evidence: 10.1234/secret");
+    assert_eq!(node(&body, agent)["label"], "Dr. Ada Lovelace");
+    assert_eq!(node(&body, paper)["label"], "A Paper With A Title");
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 4);
+    assert_eq!(body["total_edges"], 4);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tenanted_type_this_route_cannot_hydrate_is_withheld_even_when_public(pool: PgPool) {
+    // `perspective` is `tenancy_tier = 'columns'` (migration 069) and a legal
+    // edge endpoint, but `EgoRepository::hydrate` does not read `perspectives`.
+    // A type whose visibility this route cannot check is a type it must not
+    // report — including for its owner, since the alternative is a bare node
+    // whose presence is the same disclosure for the private rows of the same
+    // table. Deliberate, documented in the module doc, and pinned here so it
+    // is a decision rather than an accident.
+    let owner = Uuid::new_v4();
+    let center = common::seed_claim(&pool, "public centre").await;
+    let perspective = seed_perspective(&pool, "a public perspective").await;
+    let p_edge = common::insert_edge(
+        &pool,
+        center,
+        perspective,
+        "claim",
+        "perspective",
+        "framed_by",
+    )
+    .await;
+    let visible = common::seed_claim(&pool, "a claim that does hydrate").await;
+    common::insert_edge(&pool, center, visible, "claim", "claim", "supports").await;
+    force_edges_public(&pool, &[p_edge]).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{center}/ego");
+
+    for (who, token) in [
+        ("a stranger", reader()),
+        (
+            "the centre's own group",
+            common::mint_token_with_agent(&["claims:read"], owner),
+        ),
+    ] {
+        let (status, _, raw_body) = raw(&app, &path, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {raw_body}");
+        let body: Value = serde_json::from_str(&raw_body).expect("json body");
+        assert_eq!(
+            node_ids(&body),
+            vec![visible.to_string()],
+            "{who} must not receive an unhydratable tenanted neighbour, got {body}"
+        );
+        assert!(
+            !raw_body.contains(&perspective.to_string()),
+            "{who} received the perspective's uuid: {raw_body}"
+        );
+        assert_eq!(
+            body["total_edges"], 1,
+            "{who}: `total_edges` counts only what the route can vouch for, got {body}"
+        );
+    }
 }
