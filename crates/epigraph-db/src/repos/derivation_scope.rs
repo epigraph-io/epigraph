@@ -66,6 +66,22 @@ const CACHE_ADMISSIBLE_SQL: &str = "SELECT mf.id FROM mass_functions mf \
                                               OR (c.visibility <> 'public' \
                                                   AND s.owner_group_id = c.owner_group_id)))))";
 
+/// The derivation half of [`DerivationScopeRepository::viewer_derived`], over
+/// a `mass_functions mf` already in scope: every source the row was derived
+/// from (the evidence it cites; for an edge-factor row, the edge and the
+/// edge's source claim) is visible to the viewer. Placeholders are
+/// `Viewer::splice`'s.
+const VIEWER_DERIVED_PREDICATE: &str = "(mf.evidence_id IS NULL \
+            OR EXISTS (SELECT 1 FROM evidence e \
+                        WHERE e.id = mf.evidence_id /* {VISIBILITY:e} */)) \
+       AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
+            OR mf.perspective_id IS NULL \
+            OR EXISTS (SELECT 1 FROM edges ed \
+                        WHERE ed.id = mf.perspective_id /* {EDGE_VISIBILITY:ed} */ \
+                          AND EXISTS (SELECT 1 FROM claims s \
+                                       WHERE s.id = ed.source_id \
+                                         /* {VISIBILITY:s} */)))";
+
 /// Repository for derivation-scoped belief reads.
 pub struct DerivationScopeRepository;
 
@@ -149,18 +165,11 @@ impl DerivationScopeRepository {
             return Ok(HashSet::new());
         }
         let sql = viewer.splice(
-            "SELECT mf.id FROM mass_functions mf \
-             WHERE mf.id = ANY($1) /* {VISIBILITY:mf} */ \
-               AND (mf.evidence_id IS NULL \
-                    OR EXISTS (SELECT 1 FROM evidence e \
-                                WHERE e.id = mf.evidence_id /* {VISIBILITY:e} */)) \
-               AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
-                    OR mf.perspective_id IS NULL \
-                    OR EXISTS (SELECT 1 FROM edges ed \
-                                WHERE ed.id = mf.perspective_id /* {EDGE_VISIBILITY:ed} */ \
-                                  AND EXISTS (SELECT 1 FROM claims s \
-                                               WHERE s.id = ed.source_id \
-                                                 /* {VISIBILITY:s} */)))",
+            &format!(
+                "SELECT mf.id FROM mass_functions mf \
+                 WHERE mf.id = ANY($1) /* {{VISIBILITY:mf}} */ \
+                   AND {VIEWER_DERIVED_PREDICATE}"
+            ),
             2,
         );
         let mut q = sqlx::query_scalar(&sql).bind(row_ids);
@@ -169,5 +178,35 @@ impl DerivationScopeRepository {
         }
         let ids: Vec<Uuid> = q.fetch_all(executor).await?;
         Ok(ids.into_iter().collect())
+    }
+
+    /// How many of `claim_id`'s `mass_functions` rows `viewer` may see a
+    /// belief folded from: rows it can see whose every derivation source it
+    /// can read (the [`Self::viewer_derived`] rule). This is the count a
+    /// reader is told (`GET /api/v1/claims/:id/belief`'s
+    /// `mass_function_count`): a row on a public claim is public whatever it
+    /// was derived from, so a plain visible-row count rose when a private
+    /// edge was wired, an existence oracle over the private source.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn count_viewer_derived_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT COUNT(*) FROM mass_functions mf \
+                 WHERE mf.claim_id = $1 /* {{VISIBILITY:mf}} */ \
+                   AND {VIEWER_DERIVED_PREDICATE}"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
     }
 }

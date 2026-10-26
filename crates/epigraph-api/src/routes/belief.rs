@@ -75,14 +75,19 @@ pub struct BeliefResponse {
     /// Frame incompleteness: m((Omega, true)) — frame may be missing propositions
     pub mass_on_missing: Option<f64>,
     pub pignistic_prob: Option<f64>,
-    /// How many mass functions **this reader can see** contribute to the claim.
+    /// How many mass functions **this reader can see** contribute to the claim:
+    /// rows it can see whose every derivation source (cited evidence; for an
+    /// edge-factor row, the edge and its source claim) it can read (ruling
+    /// R-22), so a BBA derived from a source the reader cannot read is neither
+    /// folded into what it is shown nor counted.
     ///
     /// # This is deliberately NOT the denominator of the interval above
     ///
     /// `belief`/`plausibility`/`pignistic_prob` are precomputed aggregate
-    /// columns on `claims`, recomputed from *every* BBA in the corpus. No
-    /// visibility predicate can narrow them — they are a single stored number,
-    /// not a query over `mass_functions`. This count, by contrast, is
+    /// columns on `claims`, recomputed from every BBA whose sources are at
+    /// least as widely readable as the claim (ruling R-22), whoever reads
+    /// them. No per-reader predicate can narrow them — they are a single
+    /// stored number, not a query over `mass_functions`. This count, by contrast, is
     /// viewer-filtered (PR-07). So whenever a contributing BBA is group-private,
     /// `mass_function_count` is strictly less than the number of mass functions
     /// the interval actually rests on.
@@ -710,6 +715,8 @@ pub async fn get_claim_belief(
     State(state): State<AppState>,
     Path(claim_id): Path<Uuid>,
 ) -> Result<Json<BeliefResponse>, ApiError> {
+    use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
+
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -736,9 +743,12 @@ pub async fn get_claim_belief(
         id: claim_id.to_string(),
     })?;
 
-    // Count mass functions across all frames for this claim, as the viewer.
+    // Count mass functions across all frames for this claim, as the viewer,
+    // and only those whose every source the viewer can read (ruling R-22): a
+    // row on a public claim is public whatever it was derived from, so a
+    // plain visible-row count rose when a private edge was wired.
     let mass_function_count =
-        epigraph_db::MassFunctionRepository::count_for_claim(&mut *read, &viewer, claim_id)
+        DerivationScopeRepository::count_viewer_derived_for_claim(&mut *read, &viewer, claim_id)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: e.to_string(),
