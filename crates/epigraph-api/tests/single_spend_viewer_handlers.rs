@@ -161,3 +161,105 @@ async fn analyze_on_a_hypothesis_the_caller_cannot_read_is_404_and_writes_nothin
         "calibration: the owner's analyze must land (bbas {bbas}, edges {edges}, status {exp_status})"
     );
 }
+
+// ── POST /api/v1/clusters and POST /api/v1/frames/:id/assign-claim ─────────
+
+async fn frame_rows(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("count claim_frames")
+}
+
+/// `upsert_cluster` and `assign_claim_to_frame` spent their viewer on the FRAME
+/// and never read the CLAIM they bind to it, so a `claims:admin` caller could
+/// bind a claim it cannot read. Their siblings in the same file
+/// (`reassign_claim`, and `forget_convention` in `conventions.rs`) already read
+/// their claim through the viewer first. Now these two do: an unreadable claim
+/// is 404 and no `claim_frames` row is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_nothing() {
+    let (url, pool) = shared_pool().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) = common::test_bearer_token_with_seeded_client(
+        &pool,
+        &["claims:read", "claims:write", "claims:admin"],
+    )
+    .await;
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "a12-frame-owner").await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['in','out']::text[]) RETURNING id",
+    )
+    .bind(format!("a12-frame-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let http = reqwest::Client::new();
+
+    for (visibility, readable) in [("public", true), ("group", false)] {
+        let content = format!("a12 frame target {visibility} {}", Uuid::new_v4());
+        let seed = || async {
+            if readable {
+                viewer_fixture::seed_public_claim(&pool, owner, &content).await
+            } else {
+                viewer_fixture::seed_group_claim(&pool, owner, group, &content).await
+            }
+        };
+
+        // ── assign-claim ──
+        let claim = seed().await;
+        let status = http
+            .post(format!("http://{addr}/api/v1/frames/{frame}/assign-claim"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"claim_id": claim, "hypothesis_index": 0}))
+            .send()
+            .await
+            .expect("assign-claim request")
+            .status()
+            .as_u16();
+        let rows = frame_rows(&pool, claim).await;
+        if readable {
+            assert_eq!(
+                status, 201,
+                "calibration ({visibility}): assign-claim must succeed"
+            );
+            assert_eq!(rows, 1, "calibration: the binding must land");
+        } else {
+            assert_eq!(
+                status, 404,
+                "binding a claim the caller cannot read must be 404, got {status}"
+            );
+            assert_eq!(rows, 0, "a refused assign-claim must write no binding");
+        }
+
+        // ── clusters ──
+        let claim = seed().await;
+        let status = http
+            .post(format!("http://{addr}/api/v1/clusters"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "claim_id": claim,
+                "cluster_label": format!("a12-{}", Uuid::new_v4()),
+            }))
+            .send()
+            .await
+            .expect("clusters request")
+            .status()
+            .as_u16();
+        let rows = frame_rows(&pool, claim).await;
+        if readable {
+            assert_eq!(
+                status, 201,
+                "calibration ({visibility}): clusters must succeed"
+            );
+            assert_eq!(rows, 1, "calibration: the cluster binding must land");
+        } else {
+            assert_eq!(
+                status, 404,
+                "clustering a claim the caller cannot read must be 404, got {status}"
+            );
+            assert_eq!(rows, 0, "a refused cluster upsert must write no binding");
+        }
+    }
+}

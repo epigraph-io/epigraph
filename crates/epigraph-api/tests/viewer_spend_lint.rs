@@ -317,8 +317,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "list_candidates",
         &["MatchCandidateRepo::new"],
     ),
-    // DEFECT, measured here and fixed by a following commit: the frame is read
-    // through the viewer, the CLAIM bound to it is not.
+    // gated: the frame and (since backlog 4815dcf7) the claim are read through
+    // the viewer before the binding is written.
     (
         "crud.rs",
         "assign_claim_to_frame",
@@ -357,8 +357,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "update_evidence",
         &["provenance::record_provenance"],
     ),
-    // DEFECT, measured here and fixed by a following commit: as
-    // assign_claim_to_frame.
+    // gated: as assign_claim_to_frame (the claim is read through the viewer
+    // before the frame is found or created and the binding written).
     (
         "crud.rs",
         "upsert_cluster",
