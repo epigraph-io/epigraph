@@ -1698,6 +1698,25 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **170**: public `challenge_resolution_definer_only` (operator ruling R-13,
+  backlog c6e20f43). A challenge's resolution columns (`state`, `resolved_by`,
+  `resolved_at`, `resolution_details`) change only through 168's
+  `epigraph_resolve_challenge`, which stamps the real caller. Adds the invoker
+  guard `epigraph_challenge_resolution_guard()` (re-owned to
+  `epigraph_maintenance`, registered in `tenancy_backfill.rs`'s invoker
+  exemptions) on two BEFORE ROW triggers: for an application session (not
+  114's `epigraph_session_is_privileged_writer()`), an UPDATE may only
+  withdraw an UNRESOLVED challenge (`pending` / `under_review` ->
+  `withdrawn`, the other three columns unchanged), and an INSERT is born
+  `pending` with no resolver, time or details; anything else is refused
+  `CR07` (42501). Closes the forged-`resolved_by` gap 168 left: the outsider
+  owns its row, so 077 let it plain-UPDATE its own resolution columns. 168's
+  definer passes (its maintenance-owned frame reads as privileged), so R-14
+  (re-resolve, direct `pending` -> `accepted` / `rejected`, audited) is
+  unchanged. Pinned by `epigraph-db/tests/challenge_ownership.rs`. Undo: drop
+  the two triggers and the function. **Deploy order:** after 168; independent
+  of the binaries. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 
 ## `-- no-transaction` migrations
 

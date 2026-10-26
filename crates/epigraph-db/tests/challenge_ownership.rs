@@ -713,9 +713,9 @@ async fn the_claims_owner_sets_an_outsiders_challenge_status_and_nothing_else(po
     assert_eq!(audit[0].1["state_before"], "pending");
     assert_eq!(audit[0].1["state_after"], "rejected");
 
-    // The audit record is the trustworthy one: the outsider (which owns the
-    // row, and so may rewrite the row's own resolution columns) cannot rewrite
-    // or delete it, nor can the resolver.
+    // The audit record cannot be rewritten or deleted either, by the outsider
+    // (which owns the row; since migration 170 it cannot rewrite the row's
+    // resolution columns) or by the resolver.
     for agent in [outsider, owner] {
         let p = pool.clone();
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -792,12 +792,9 @@ async fn the_claims_owner_sets_an_outsiders_challenge_status_and_nothing_else(po
 /// accepted, rejected, withdrawn) has no `resolved`, and the ruling's
 /// "resolved" is a resolution, i.e. `accepted` or `rejected`.
 ///
-/// What this does NOT pin: exclusivity of the resolution columns. The outsider
-/// OWNS its row (R-CH1), so 077 still lets it UPDATE its own row's `state` /
-/// `resolved_by` / `resolved_at` / `resolution_details` by plain SQL; the
-/// ruling is silent on that and it is escalated to the operator. The record
-/// that names the resolver and that no application session can rewrite is the
-/// `security_events` row (see the main arm).
+/// Exclusivity of the resolution columns (no plain-SQL UPDATE of them by any
+/// application session, the outsider owner included) is ruling R-13 and
+/// migration 170, pinned by `resolution_columns_change_only_through_the_definer`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_a_writer_of_the_claims_group_sets_a_status_through_the_definer(pool: PgPool) {
     let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-rs-owner").await;
@@ -1173,4 +1170,248 @@ async fn a_session_without_a_principal_sets_no_challenge_status(pool: PgPool) {
     .await;
     then_owner.expect("CALIBRATION: the same groups WITH the principal set the status");
     assert_eq!(resolution(&pool, theirs).await.1, Some(owner));
+}
+
+// =========================================================================
+// RULING R-13 (migration 170): the resolution columns change only through
+// `epigraph_resolve_challenge`; an application session may only WITHDRAW.
+// =========================================================================
+
+/// The text every R-13 refusal carries (migration 170's guard).
+const CR07: &str = "CR07";
+
+/// R-13's main arm. Since migration 168 the OUTSIDER owns its challenge row,
+/// so 077 let it plain-UPDATE that row's own resolution columns, including
+/// `resolved_by`: it could name ANY agent as the resolver readers are shown,
+/// or file a challenge born `accepted` with a forged resolver. And a writer of
+/// the claim's group could do the same, unaudited, on an insider's row. Now,
+/// for every application session (the non-bypassing `epigraph_app`, stamped
+/// as a request is):
+///
+/// * the outsider's plain UPDATE of `resolved_by`, of `state` to a resolution
+///   (`under_review`, `accepted`) or of `resolution_details` is refused
+///   (42501, CR07), and so is an INSERT born with a resolution;
+/// * the claim's owner's plain UPDATE of an INSIDER's row (which 077 admits:
+///   the row is the claim group's) is refused the same way: the definer is
+///   the one path, for both shapes of row;
+/// * the definer still lands, stamping the real caller, and (ruling R-14) the
+///   owner may re-resolve a settled challenge, each change audited;
+/// * the outsider may still WITHDRAW its own unresolved challenge, and only
+///   that: `state = 'withdrawn'` with the other three columns untouched, which
+///   is the one change the ruling leaves it. A SETTLED challenge (`accepted` /
+///   `rejected`) is not withdrawn: the definer refuses to resolve a withdrawn
+///   row (CR06), so a withdrawal after the verdict would bury the claim
+///   owner's verdict where nobody can restate it.
+///
+/// Every refused statement leaves the row byte-identical.
+#[sqlx::test(migrations = "../../migrations")]
+async fn resolution_columns_change_only_through_the_definer(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "ch-r13-owner").await;
+    let (outsider, outsider_group) = fixture::seed_agent_with_group(&pool, "ch-r13-out").await;
+    let (forged, _) = fixture::seed_agent_with_group(&pool, "ch-r13-forged").await;
+    let claim = public_claim_owned_by(&pool, owner, owner_group, "r13").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    let p = pool.clone();
+    let (theirs, later_withdrawn) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, outsider).await;
+            let t = challenge(&mut conn, claim, outsider, "r13 outsider")
+                .await
+                .expect("the outsider's challenge lands");
+            let w = challenge(&mut conn, claim, outsider, "r13 outsider, withdrawn later")
+                .await
+                .expect("the outsider's second challenge lands");
+            (conn, (t, w))
+        })
+        .await;
+    let p = pool.clone();
+    let insiders = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let i = challenge(&mut conn, claim, owner, "r13 insider").await;
+        (conn, i)
+    })
+    .await
+    .expect("the insider's challenge lands");
+    assert_eq!(
+        tenancy(&pool, theirs).await,
+        (outsider_group, "public".to_string(), true),
+        "CALIBRATION: the outsider owns its row, so 077 admits its UPDATEs of it"
+    );
+    assert_eq!(
+        tenancy(&pool, insiders).await,
+        (owner_group, "public".to_string(), false),
+        "CALIBRATION: the insider's row is the claim group's, so 077 admits the owner's UPDATEs"
+    );
+    let theirs_before = whole_row(&pool, theirs).await;
+    let insiders_before = whole_row(&pool, insiders).await;
+
+    // The outsider, on its own row, and an INSERT born resolved.
+    let p = pool.clone();
+    let outsider_writes = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let mut out = Vec::new();
+        for (what, sql) in [
+            (
+                "forge resolved_by",
+                "UPDATE challenges SET resolved_by = $2 WHERE id = $1",
+            ),
+            (
+                "self-accept with a forged resolver",
+                "UPDATE challenges SET state = 'accepted', resolved_by = $2, \
+                 resolved_at = now(), resolution_details = '{\"by\": \"forged\"}' WHERE id = $1",
+            ),
+            (
+                "set under_review",
+                "UPDATE challenges SET state = 'under_review' WHERE id = $1 AND $2::uuid IS NOT NULL",
+            ),
+            (
+                "write resolution_details",
+                "UPDATE challenges SET resolution_details = '{}' WHERE id = $1 AND $2::uuid IS NOT NULL",
+            ),
+        ] {
+            let r = sqlx::query(sql)
+                .bind(theirs)
+                .bind(forged)
+                .execute(&mut *conn)
+                .await;
+            out.push((what, r.map(|d| d.rows_affected())));
+        }
+        let born = sqlx::query(
+            "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                     state, resolved_by, resolved_at) \
+             VALUES ($1, $2, 'factual_error', 'born accepted', 'accepted', $3, now())",
+        )
+        .bind(claim)
+        .bind(outsider)
+        .bind(forged)
+        .execute(&mut *conn)
+        .await;
+        out.push(("INSERT born accepted", born.map(|d| d.rows_affected())));
+        (conn, out)
+    })
+    .await;
+
+    // The claim's owner, by plain SQL on the insider's row.
+    let p = pool.clone();
+    let owner_plain = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = sqlx::query(
+            "UPDATE challenges SET state = 'accepted', resolved_by = $2, resolved_at = now() \
+              WHERE id = $1",
+        )
+        .bind(insiders)
+        .bind(forged)
+        .execute(&mut *conn)
+        .await;
+        (conn, r.map(|d| d.rows_affected()))
+    })
+    .await;
+
+    for (what, r) in outsider_writes.iter().chain(std::iter::once(&(
+        "owner's plain UPDATE of an insider's row",
+        owner_plain,
+    ))) {
+        let e = r
+            .as_ref()
+            .expect_err(&format!("{what}: refused (R-13), not landed"));
+        assert_eq!(sqlstate(e).as_deref(), Some("42501"), "{what}: {e}");
+        assert!(
+            format!("{e:?}").contains(CR07),
+            "{what}: refused by migration 170's resolution guard, not another check: {e:?}"
+        );
+    }
+    assert_eq!(
+        whole_row(&pool, theirs).await,
+        theirs_before,
+        "the outsider's row is untouched"
+    );
+    assert_eq!(
+        whole_row(&pool, insiders).await,
+        insiders_before,
+        "the insider's row is untouched"
+    );
+    let born: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM challenges WHERE claim_id = $1 AND explanation = 'born accepted'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(born, 0, "no challenge is born resolved");
+
+    // The definer still lands for both rows, stamping the real caller; R-14:
+    // pending -> accepted directly, then a re-resolution, each audited.
+    let p = pool.clone();
+    let definer = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let a =
+            ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, "accepted", None).await;
+        let b =
+            ChallengeRepository::resolve_as_claim_owner(&mut *conn, theirs, "rejected", None).await;
+        let c = ChallengeRepository::resolve_as_claim_owner(&mut *conn, insiders, "accepted", None)
+            .await;
+        (conn, (a, b, c))
+    })
+    .await;
+    definer.0.expect("R-14: pending -> accepted directly");
+    definer
+        .1
+        .expect("R-14: the owner re-resolves a settled challenge");
+    definer
+        .2
+        .expect("the insider's row resolves through the definer too");
+    assert_eq!(
+        resolution(&pool, theirs).await,
+        ("rejected".to_string(), Some(owner), true, None)
+    );
+    assert_eq!(
+        resolution(&pool, insiders).await.1,
+        Some(owner),
+        "the real caller"
+    );
+    let audit = resolution_audit(&pool, theirs).await;
+    assert_eq!(
+        audit
+            .iter()
+            .map(|(_, d)| d["state_after"].clone())
+            .collect::<Vec<_>>(),
+        vec![serde_json::json!("accepted"), serde_json::json!("rejected")],
+        "every resolution of the outsider's row is audited: {audit:?}"
+    );
+
+    // The one change left to the outsider: withdrawing an UNRESOLVED challenge.
+    let p = pool.clone();
+    let (withdrew, settled) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, outsider).await;
+        let w = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(later_withdrawn)
+            .execute(&mut *conn)
+            .await;
+        let s = sqlx::query("UPDATE challenges SET state = 'withdrawn' WHERE id = $1")
+            .bind(theirs)
+            .execute(&mut *conn)
+            .await;
+        (conn, (w, s))
+    })
+    .await;
+    assert_eq!(
+        withdrew
+            .expect("the outsider withdraws its own pending challenge")
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        resolution(&pool, later_withdrawn).await,
+        ("withdrawn".to_string(), None, false, None),
+        "a withdrawal changes the state and nothing else"
+    );
+    let settled = settled.expect_err("a settled challenge is not withdrawn");
+    assert_eq!(sqlstate(&settled).as_deref(), Some("42501"), "{settled}");
+    assert!(format!("{settled:?}").contains(CR07), "{settled:?}");
+    assert_eq!(
+        resolution(&pool, theirs).await.0,
+        "rejected",
+        "the verdict stands"
+    );
 }
