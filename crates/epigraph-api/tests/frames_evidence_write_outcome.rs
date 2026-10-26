@@ -291,3 +291,86 @@ async fn each_rest_write_reports_whether_it_inserted_deduplicated_or_replaced(
         "the perspective's write left the slot without a perspective as it was"
     );
 }
+
+async fn beta(pool: &PgPool, claim: Uuid) -> (f64, f64) {
+    sqlx::query_as("SELECT beta_alpha, beta_beta FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("read the claim's Beta parameters")
+}
+
+/// Backlog 33ce3f5d: an identical resubmission stores nothing new (its write
+/// outcome is `unchanged`), so the parallel Beta-Bernoulli update must not
+/// count it again. At origin/main the route applied the Beta update on every
+/// call, so `bayesian_posterior` (and the claim's `beta_alpha`) moved on a
+/// resubmission whose stored BBA did not change.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unchanged_resubmission_leaves_bayesian_posterior_where_it_was(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "33ce3f5d-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    // The claim asserts hypothesis 0 of the frame, so the Beta update has a
+    // singleton to read the evidence's support from.
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .execute(&w.pool)
+    .await
+    .expect("assign the claim to hypothesis 0");
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    let body = serde_json::json!({
+        "claim_id": w.claim, "reliability": 0.8, "evidence_type": "statistical",
+        "masses": {"0": 0.7, "0,1": 0.3},
+    });
+    let before = beta(&w.pool, w.claim).await;
+
+    let first = post(&w, &token_a, body.clone()).await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    let after_first = beta(&w.pool, w.claim).await;
+    assert!(
+        after_first.0 > before.0,
+        "CALIBRATION: a first submission applies the Beta update ({before:?} -> {after_first:?})"
+    );
+    let posterior = first["bayesian_posterior"]
+        .as_f64()
+        .expect("bayesian_posterior");
+
+    let again = post(&w, &token_a, body.clone()).await;
+    assert_eq!(again["write_outcome"], "unchanged", "{again}");
+    assert_eq!(
+        beta(&w.pool, w.claim).await,
+        after_first,
+        "an unchanged resubmission must not apply the Beta update again"
+    );
+    assert_eq!(
+        again["bayesian_posterior"].as_f64(),
+        Some(posterior),
+        "an unchanged resubmission reports the posterior it left: {again}"
+    );
+    assert!(
+        warnings(&again)
+            .iter()
+            .any(|x| x.contains("bayesian_posterior did not move")),
+        "the unchanged warning says the posterior did not move: {again}"
+    );
+
+    // A replacement is a different BBA: it is counted.
+    let mut replaced = body;
+    replaced["reliability"] = serde_json::json!(0.5);
+    let replaced = post(&w, &token_a, replaced).await;
+    assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    assert!(
+        beta(&w.pool, w.claim).await.0 > after_first.0,
+        "a replaced BBA still applies its Beta update"
+    );
+}
