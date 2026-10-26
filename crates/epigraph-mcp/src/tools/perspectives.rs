@@ -178,9 +178,7 @@ pub async fn set_source_reliability(
     // review measured it moving scoped_belief); for a typo it does nothing.
     let (unknown_keys, warnings) = unknown_source_reliability_keys(
         params.source_reliability.keys().map(String::as_str),
-        &epigraph_engine::calibration::CalibrationConfig::from_workspace_root().unwrap_or_else(
-            |_| epigraph_engine::calibration::CalibrationConfig::default_for_phase2_fallback(),
-        ),
+        epigraph_engine::belief_profile::BeliefProfile::served(),
     );
     let mut out = serde_json::json!({
         "perspective_id": id.to_string(),
@@ -202,14 +200,15 @@ pub async fn set_source_reliability(
 /// map up with the BBA's LOWERCASED `evidence_type`, strict-key:
 /// 1. the key is not lowercase — it can never equal a lowercased string;
 /// 2. the key is outside the engine's evidence-type vocabulary
-///    ([`epigraph_engine::edge_factor::is_known_evidence_type_key`]). No
+///    ([`epigraph_engine::edge_factor::is_known_evidence_type_key_in`], read
+///    from the served belief profile the fold uses). No
 ///    write path tags a BBA with such a string except `submit_ds_evidence`
 ///    naming it verbatim, which reports it as unknown in turn.
 ///
 /// Sorted, so the response is deterministic.
 fn unknown_source_reliability_keys<'a>(
     keys: impl Iterator<Item = &'a str>,
-    calibration: &epigraph_engine::calibration::CalibrationConfig,
+    profile: &epigraph_engine::belief_profile::BeliefProfile,
 ) -> (Vec<String>, Vec<String>) {
     let mut keys: Vec<&str> = keys.collect();
     keys.sort_unstable();
@@ -223,7 +222,7 @@ fn unknown_source_reliability_keys<'a>(
                 key.to_lowercase()
             ));
             unknown.push(key.to_string());
-        } else if !epigraph_engine::edge_factor::is_known_evidence_type_key(key, calibration) {
+        } else if !epigraph_engine::edge_factor::is_known_evidence_type_key_in(key, profile) {
             warnings.push(format!(
                 "source_reliability key {key:?} is stored but is not in the evidence-type \
                  vocabulary (calibration.toml [evidence_type_weights] keys, \

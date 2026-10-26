@@ -160,3 +160,201 @@ async fn cli_promote_leaves_the_evidence_on_one_binary_frame(pool: PgPool) {
     assert_eq!(folded[0].masses, masses, "with the source's masses");
     assert_ne!(folded[0].id, source, "the source row itself is retired");
 }
+
+/// `hypothesis status` on a promoted hypothesis reads the frame its evidence
+/// was moved to, `research_validity` (backlog 090221d9): reading
+/// `hypothesis_assessment` printed zero belief, or, as here, the masses of a
+/// BBA another agent filed there after the promotion.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_status_of_a_promoted_hypothesis_reads_research_validity(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "090221d9-cli").await;
+    let (later, _) = fixture::seed_agent_with_group(&pool, "090221d9-cli-later").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "090221d9 cli promoted hypothesis").await;
+    let hyp_frame = binary_frame(&pool, "hypothesis_assessment").await;
+    binary_frame(&pool, "research_validity").await;
+    seed_completed_analysis(&pool, agent, claim).await;
+    let store = |who: Uuid, masses: serde_json::Value| {
+        let pool = pool.clone();
+        async move {
+            epigraph_db::MassFunctionRepository::store_with_perspective(
+                &pool,
+                claim,
+                hyp_frame,
+                Some(who),
+                None,
+                &masses,
+                None,
+                Some("error_derived"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+            .expect("seed a hypothesis_assessment BBA")
+        }
+    };
+    store(agent, serde_json::json!({"0": 0.8, "0,1": 0.2})).await;
+
+    let url = fixture::database_url_for(&pool).await;
+    let run = |args: [&str; 2]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .env("DATABASE_URL", &url)
+            .env("MAINTENANCE_DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("spawn hypothesis");
+        assert!(
+            out.status.success(),
+            "hypothesis {args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let id = claim.to_string();
+    run(["promote", &id]);
+    store(later, serde_json::json!({"1": 0.9, "0,1": 0.1})).await;
+
+    let printed = run(["status", &id]);
+    assert!(
+        printed.contains("Status: promoted"),
+        "CALIBRATION: {printed}"
+    );
+    assert!(
+        printed.contains("Supported:   0.8000") && printed.contains("Unsupported: 0.0000"),
+        "a promoted hypothesis's status prints the evidence it was promoted on:\n{printed}"
+    );
+}
+
+/// `experiment analyze` on a PROMOTED hypothesis files its error-derived BBA on
+/// `research_validity`, the frame the promoted hypothesis's readers (`hypothesis
+/// status`, the HTTP status) read (operator ruling R-8: writers follow the
+/// readers). Filed on `hypothesis_assessment`, the new analysis is invisible to
+/// every reader of the promoted hypothesis.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_analyze_after_promotion_files_on_research_validity(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "r8-cli").await;
+    let (later, _) = fixture::seed_agent_with_group(&pool, "r8-cli-later").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "r8 cli hypothesis analyzed later").await;
+    let hyp_frame = binary_frame(&pool, "hypothesis_assessment").await;
+    let rv_frame = binary_frame(&pool, "research_validity").await;
+    seed_completed_analysis(&pool, agent, claim).await;
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim,
+        hyp_frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        None,
+        Some("error_derived"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed the hypothesis_assessment BBA");
+
+    let url = fixture::database_url_for(&pool).await;
+    let run = |bin: &str, args: &[&str]| {
+        let out = Command::new(bin)
+            .args(args)
+            .env("DATABASE_URL", &url)
+            .env("MAINTENANCE_DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .output()
+            .expect("spawn the binary");
+        assert!(
+            out.status.success(),
+            "{bin} {args:?} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let id = claim.to_string();
+    run(BIN, &["promote", &id]);
+    let on = |frame: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<Uuid>, Option<String>, serde_json::Value)>(
+                "SELECT source_agent_id, combination_method, masses FROM mass_functions \
+                  WHERE claim_id = $1 AND frame_id = $2 ORDER BY created_at, id",
+            )
+            .bind(claim)
+            .bind(frame)
+            .fetch_all(&pool)
+            .await
+            .expect("read BBAs")
+        }
+    };
+    assert!(
+        on(hyp_frame).await.is_empty(),
+        "CALIBRATION: the promotion left nothing on hypothesis_assessment"
+    );
+
+    // A later experiment's result, analyzed through the real binary.
+    let experiment: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiments (hypothesis_id, created_by, status) \
+         VALUES ($1, $2, 'running') RETURNING id",
+    )
+    .bind(claim)
+    .bind(later)
+    .fetch_one(&pool)
+    .await
+    .expect("seed experiment");
+    let result: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiment_results (experiment_id, data_source, raw_measurements, measurement_count) \
+         VALUES ($1, 'instrument', $2, 2) RETURNING id",
+    )
+    .bind(experiment)
+    .bind(serde_json::json!([
+        {"value": 1.2, "random_error": 0.05, "systematic_error": 0.02},
+        {"value": 1.1, "random_error": 0.05, "systematic_error": 0.02}
+    ]))
+    .fetch_one(&pool)
+    .await
+    .expect("seed result");
+    run(
+        env!("CARGO_BIN_EXE_experiment"),
+        &[
+            "analyze",
+            &result.to_string(),
+            "--direction",
+            "refutes",
+            "--agent-id",
+            &later.to_string(),
+            "--scope",
+            "small_sample_size",
+        ],
+    );
+
+    assert!(
+        on(hyp_frame).await.is_empty(),
+        "evidence analyzed after the promotion must not land on hypothesis_assessment"
+    );
+    let rv = on(rv_frame).await;
+    let filed: Vec<_> = rv.iter().filter(|(a, _, _)| *a == Some(later)).collect();
+    assert_eq!(
+        filed.len(),
+        1,
+        "the later analysis is on research_validity: {rv:?}"
+    );
+    assert_eq!(filed[0].1.as_deref(), Some("error_derived"));
+    assert!(
+        filed[0]
+            .2
+            .get("1")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            > 0.0,
+        "with the refuting masses: {:?}",
+        filed[0].2
+    );
+    assert!(
+        rv.iter().any(|(a, _, _)| *a == Some(agent)),
+        "beside the promoted evidence: {rv:?}"
+    );
+}

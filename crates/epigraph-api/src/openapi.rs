@@ -443,6 +443,7 @@ async fn update_labels_doc() {}
         (status = 401),
         (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = []))
 )]

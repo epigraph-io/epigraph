@@ -1609,6 +1609,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_lock_public_claim_for_attach", 114),
     ("epigraph_dedup_move_bbas", 114),
     ("epigraph_reown_legacy_writer_bbas", 114),
+    // 168 (ruling R-3), the claim owner's challenge-resolution definer, kept
+    // beside the 114 machinery 168 reuses. Fails CLOSED under a non-member
+    // owner: its `challenges` read is filtered by 168's claim-readable policy
+    // and its UPDATE by 077's WITH CHECK (the outsider's row is not the
+    // owner's), so every resolution is refused "not found" or 42501 (loud).
+    ("epigraph_resolve_challenge", 168),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3281,8 +3287,23 @@ async fn linked_author_personal_residue(
 /// Print up to 20 offending ids. Tables without an `id` column
 /// (`claim_frames`, `claim_cluster_membership`, `claim_neighborhood_membership`)
 /// are keyed on `claim_id` instead — a per-entity fact, not the uniform PK the
-/// acceptance line implies.
+/// acceptance line implies. `harvester_claim_provenance` has no `id` and no
+/// single-column key (its PK is `(claim_id, fragment_id)`), so its rows are
+/// listed by both key columns.
 async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
+    if table == "harvester_claim_provenance" {
+        let keys: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT claim_id, fragment_id FROM harvester_claim_provenance \
+              WHERE owner_group_id = $1 ORDER BY claim_id, fragment_id LIMIT 20",
+        )
+        .bind(WORLD)
+        .fetch_all(pool)
+        .await?;
+        for (claim_id, fragment_id) in keys {
+            eprintln!("    {table}.(claim_id, fragment_id) = ({claim_id}, {fragment_id})");
+        }
+        return Ok(());
+    }
     if table == "harvester_fragments" {
         // Strict mode only (the caller skips this under `platform`): list the
         // rows `harvester_fragment_residual` counted, seed-owned repairable

@@ -580,6 +580,102 @@ async fn an_elevated_session_writes_nothing_until_it_ends(pool: PgPool) {
     assert_eq!(got, Ok(1), "P writes again once the session has ended");
 }
 
+/// Migration 168 section 7 (ruling R-3): the claim owner's
+/// challenge-resolution definer is owned by the maintenance role, which 126's
+/// `challenges_elevated_no_update` (a policy on `epigraph_app`) does not name,
+/// so it refuses an ELEVATED session itself (CR05, 42501): an elevated
+/// session writes no challenge by this path either. The same principal
+/// unelevated sets the status (the calibration: the refusal is the elevation,
+/// not a malformed call).
+///
+/// Verified to fail with the definer's `epigraph_is_elevated()` refusal
+/// removed (the elevated call lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_claim_owner_sets_no_challenge_status(pool: PgPool) {
+    let p = holder(&pool, "arms-resolve-p", 14).await;
+    let (outsider, outsider_group) =
+        fixture::seed_agent_with_group(&pool, "arms-resolve-outsider").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'P public claim', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(p.person)
+    .bind(p.group)
+    .execute(&pool)
+    .await
+    .expect("P's public claim");
+    // The real attach path: the outsider's own stamped application session
+    // (ScopedPool::acquire_as + epigraph_app), so 168's attach rule makes the
+    // row the outsider's, exactly as a production challenge lands.
+    let s = scoped(&pool).await;
+    let outsider_viewer = Viewer::resolve(&pool, outsider)
+        .await
+        .expect("resolve the outsider");
+    let mut conn = app_conn(&s, &outsider_viewer).await;
+    let theirs = epigraph_db::ChallengeRepository::create(
+        &mut *conn,
+        claim,
+        Some(outsider),
+        "factual_error",
+        "an outsider objects",
+    )
+    .await;
+    release(conn).await;
+    let theirs = theirs.expect("the outsider's challenge lands");
+    let (owner, owned): (Uuid, bool) =
+        sqlx::query_as("SELECT owner_group_id, writer_owned FROM challenges WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("read the challenge's tenancy");
+    assert_eq!(
+        (owner, owned),
+        (outsider_group, true),
+        "CALIBRATION: 168's attach rule made the row the outsider's"
+    );
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+        &mut *conn, theirs, "accepted", None,
+    )
+    .await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session sets no challenge status");
+    assert_eq!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42501"),
+        "refused as elevated: {e}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state::text FROM challenges WHERE id = $1")
+        .bind(theirs)
+        .fetch_one(&pool)
+        .await
+        .expect("state");
+    assert_eq!(state, "pending", "nothing was written elevated");
+
+    let mut conn = app_conn(&s, &plain).await;
+    let landed = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+        &mut *conn, theirs, "accepted", None,
+    )
+    .await;
+    release(conn).await;
+    landed.expect("CALIBRATION: P unelevated sets the status");
+    let (state, by): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state::text, resolved_by FROM challenges WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("resolution");
+    assert_eq!((state.as_str(), by), ("accepted", Some(p.person)));
+}
+
 // =====================================================================
 // The standing admin read arms follow the admin-scope switch (migration 129)
 // =====================================================================

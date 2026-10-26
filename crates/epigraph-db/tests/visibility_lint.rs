@@ -2075,6 +2075,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "backfill_legacy_dedup_identity_edges_conn",
+        "WRITE, privileged only (refuses otherwise). The operator backfill of the identity \
+         edge of legacy fuzzy_dedup_claims duplicates; its selection over claims and edges is \
+         corpus-wide by design and runs on the maintenance connection.",
+    ),
+    (
+        "claim.rs",
         "require_privileged_session",
         "Reads no table and filters nothing: it asks the session one boolean, \
          `epigraph_session_is_privileged_writer()`, before a privileged-only write.",
@@ -2853,10 +2860,24 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          policy for table \"challenges\"` and writing nothing. The only connection that can \
          satisfy that check comes from `ScopedPool::begin_as`, which hands back a transaction. \
          WHOSE group: the row is claim-derived, so 074's `epigraph_derived_require_tenancy` fills \
-         its tenancy from the CHALLENGED CLAIM and 070 arm (c) re-stamps it unconditionally — the \
-         check is about the claim's owning group, not the challenger's, and \
-         `tool_write_tables_require_a_stamp.rs` pins all three directions of that. SCOPE: the \
-         executor widened, the SQL is byte-identical and was not re-derived.",
+         its tenancy from the CHALLENGED CLAIM for an insider; since migration 168 (ruling R-CH1) \
+         an outsider's challenge on a PUBLIC claim is owned by the challenger's own write group \
+         (114's attach rule), and `tool_write_tables_require_a_stamp.rs` / \
+         `challenge_ownership.rs` pin both. SCOPE: the executor widened, the SQL is \
+         byte-identical and was not re-derived.",
+    ),
+    (
+        "challenge.rs",
+        "resolve_as_claim_owner",
+        "`SELECT public.epigraph_resolve_challenge(..)` (migration 168 section 7, ruling R-3). A \
+         WRITE of four resolution columns of one `challenges` row, through a maintenance-owned \
+         definer, and it returns nothing, so a `&Viewer` would be spent on nothing: there is no \
+         FROM and no marker to fill. The read control is inside the definer, from the same \
+         session GUCs a Viewer is stamped from: the challenge's CLAIM must be public or in \
+         `epigraph_session_groups()` (else 'challenge not found', the same text as a random id), \
+         and the claim's owner must be in `epigraph_writable_groups()`. It needs the stamped \
+         transaction of `ScopedPool::begin_as` (an unstamped session has no principal and is \
+         refused CR01). Pinned by `challenge_ownership.rs` and `elevated_arms.rs`.",
     ),
     (
         "frame.rs",

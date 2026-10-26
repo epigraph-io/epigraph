@@ -86,9 +86,7 @@ pub async fn unconstrained_analysis(
     }
 
     let provider = std::env::var("EPIGRAPH_LLM_PROVIDER").unwrap_or_else(|_| "anthropic".into());
-    let client = create_llm_client(&provider).map_err(|e| ApiError::ServiceUnavailable {
-        service: format!("LLM client init failed for provider '{provider}': {e}"),
-    })?;
+    let client = create_llm_client(&provider).map_err(|e| llm_unavailable("client init", e))?;
     let model_used = client.model_name().to_string();
 
     let prompt = build_prompt(&question);
@@ -101,9 +99,7 @@ pub async fn unconstrained_analysis(
     .map_err(|_| ApiError::ServiceUnavailable {
         service: "LLM request timed out after 120 seconds".into(),
     })?
-    .map_err(|e: LlmError| ApiError::ServiceUnavailable {
-        service: format!("LLM request failed: {e}"),
-    })?;
+    .map_err(|e: LlmError| llm_unavailable("request", e))?;
 
     let raw_response = match raw_value {
         serde_json::Value::String(s) => s,
@@ -135,6 +131,23 @@ pub async fn unconstrained_analysis(
             "Unconstrained analysis requires the 'genai' feature; rebuild with --features genai"
                 .into(),
     })
+}
+
+/// The 503 for an LLM provider failure at `stage`, with the provider's error
+/// kept on the server.
+///
+/// The error is logged (`tracing::warn!`, target `api.analyze`) and the
+/// response names only the stage: a provider error can name the provider's
+/// endpoint or echo its response body, and the client-init error names the
+/// server's configured provider (backlog 49863d2c). Compiled under `test` as
+/// well as `genai`, so its unit test runs in every build: CI never compiles
+/// the `genai` handler that calls it.
+#[cfg(any(feature = "genai", test))]
+fn llm_unavailable(stage: &'static str, e: impl std::fmt::Display) -> ApiError {
+    tracing::warn!(target: "api.analyze", stage, error = %e, "LLM provider failure");
+    ApiError::ServiceUnavailable {
+        service: format!("LLM {stage} failed; the detail is in the server log"),
+    }
 }
 
 /// Parse structured claims from the LLM response.
@@ -171,6 +184,75 @@ fn parse_claims_from_response(response: &str) -> Vec<UnconstrainedClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An LLM provider's error text stays on the server (backlog 49863d2c):
+    /// the 503's `service` and its rendered message carry a fixed reason
+    /// naming the stage, not the provider's error, which can name the
+    /// provider's endpoint or echo its response body.
+    #[test]
+    #[tracing_test::traced_test]
+    fn llm_unavailable_withholds_the_provider_error_text() {
+        const MARKER: &str = "529 overloaded from https://llm-gateway-6e2a.internal/v1";
+        let e = llm_unavailable("request", MARKER);
+        let ApiError::ServiceUnavailable { service } = &e else {
+            panic!("an LLM failure is a 503: {e:?}");
+        };
+        assert!(
+            !service.contains("llm-gateway-6e2a") && !e.to_string().contains("llm-gateway-6e2a"),
+            "the provider's error text reached the response: {e}"
+        );
+        assert!(
+            service.contains("LLM request failed"),
+            "the fixed reason names the stage: {service}"
+        );
+        assert!(
+            logs_contain("llm-gateway-6e2a"),
+            "the withheld detail must reach the server log"
+        );
+
+        // The client-init stage: its error names the server's configured
+        // provider, which is the server's to read.
+        let init = llm_unavailable("client init", "unknown provider 'llm-provider-6e2a'");
+        let ApiError::ServiceUnavailable { service } = &init else {
+            panic!("an LLM failure is a 503: {init:?}");
+        };
+        assert!(
+            service.contains("LLM client init failed") && !service.contains("llm-provider-6e2a"),
+            "{service}"
+        );
+        assert!(logs_contain("llm-provider-6e2a"));
+    }
+
+    /// CI never compiles the `genai` handler, so its wiring is pinned on the
+    /// source: both LLM failure sites go through `llm_unavailable`, and the
+    /// only `service: format!(` outside these tests is the helper's own fixed
+    /// reason, so no provider error is interpolated into a 503 (backlog
+    /// 49863d2c).
+    #[test]
+    fn the_genai_handler_routes_every_provider_error_through_llm_unavailable() {
+        let src = include_str!("analyze.rs");
+        let code = &src[..src
+            .find("#[cfg(test)]\nmod tests")
+            .expect("the test module marker")];
+        for site in [
+            "create_llm_client(&provider).map_err(|e| llm_unavailable(\"client init\", e))",
+            ".map_err(|e: LlmError| llm_unavailable(\"request\", e))",
+        ] {
+            assert!(code.contains(site), "the handler no longer has: {site}");
+        }
+        let interpolated: Vec<_> = code.match_indices("service: format!(").collect();
+        assert_eq!(
+            interpolated.len(),
+            1,
+            "a 503 body is built with format! outside llm_unavailable: {interpolated:?}"
+        );
+        assert!(
+            code[interpolated[0].0..].starts_with(
+                "service: format!(\"LLM {stage} failed; the detail is in the server log\")"
+            ),
+            "the one format! must be llm_unavailable's fixed reason"
+        );
+    }
 
     #[test]
     fn test_parse_claims_valid_json() {

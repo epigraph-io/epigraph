@@ -491,7 +491,7 @@ async fn prepare_submission(
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
-                    internal_error(format!(
+                    crate::errors::internal_error_text(format!(
                         "novelty gate: nearest claim {existing_id} vanished before read-back"
                     ))
                 })?;
@@ -1249,6 +1249,45 @@ pub async fn verify_claim(
     })
 }
 
+/// The steps of `ds_auto::auto_wire_ds_update` (and the helpers it calls)
+/// whose name the caller may read: each is a literal of ds_auto's own,
+/// written as the `"<step>: <cause>"` prefix of its error.
+const DS_UPDATE_STEPS: &[&str] = &[
+    "assign_claim",
+    "binary frame",
+    "build BBA",
+    "combine_multiple",
+    "discount",
+    "ensure_evidence_perspective",
+    "evidence source_url read",
+    "evidence_type_weights",
+    "fallback get_by_name",
+    "get_by_name",
+    "get_for_claim_binary_frames",
+    "intra_evidence_locality_factor",
+    "parse stored BBA",
+    "serialize BBA",
+    "store BBA",
+    "store truth_value seed",
+    "truth_value seed",
+    "update_claim_belief",
+];
+
+/// The caller's message for a failed DS wire in `update_with_evidence`.
+///
+/// `e` is ds_auto's `"<step>: <cause>"`. The cause can be driver text (a
+/// constraint, SQL, a host) and stays in the server log (backlog 49863d2c);
+/// the step is kept only when it is one of [`DS_UPDATE_STEPS`], so an error
+/// of any other shape gets the step-less message (fails closed).
+fn ds_wire_failure_message(e: &str) -> String {
+    const TAIL: &str = "the claim's Dempster-Shafer belief could not be wired. Rolled back; \
+                        nothing from this submission was stored";
+    match e.split_once(": ").map(|(step, _)| step) {
+        Some(step) if DS_UPDATE_STEPS.contains(&step) => format!("{step}: {TAIL}"),
+        _ => TAIL.to_string(),
+    }
+}
+
 pub async fn update_with_evidence(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1513,9 +1552,10 @@ pub async fn update_with_evidence(
     )
     .await
     .map_err(|e| {
-        // Logged as well as returned. `internal_error` only builds the
-        // `McpError`, so without this a dropped wire here would never reach
-        // the server log. #497 added this warn so that one log query
+        // Logged as well as returned. The reply is designed text
+        // (`internal_error_text`, which does not log), so without this a
+        // dropped wire here would never reach the server log, and its cause
+        // reaches only the log. #497 added this warn so that one log query
         // ("ds auto-wire failed") finds every dropped wire, whichever tool
         // dropped it; `submit_claim`'s path emits the same prefix with the same
         // `claim_id`/`tool` fields. The wording differs because the outcome
@@ -1525,7 +1565,7 @@ pub async fn update_with_evidence(
             tool = "update_with_evidence",
             "ds auto-wire failed: {e}. Rolled back; nothing from this submission was stored"
         );
-        internal_error(e)
+        crate::errors::internal_error_text(ds_wire_failure_message(&e))
     })?;
 
     // ── THE TWO CLAIM UPDATES, IN ONE AUTHOR-STAMPED TRANSACTION ────────
@@ -2078,7 +2118,7 @@ pub async fn resolve_backlog_item(
         // rather than trusted, because following it would retire the item
         // against a claim this call did not write.
         PreparedSubmission::Existing(_) => {
-            return Err(internal_error(
+            return Err(crate::errors::internal_error_text(
                 "resolve_backlog_item: the novelty gate returned an existing claim for a \
                  resolution at threshold 0.0; refusing to retire the item against a claim this \
                  call did not write. Nothing was written.",
@@ -2177,10 +2217,13 @@ pub async fn resolve_backlog_item(
         )
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "resolve_backlog_item: could not record basis {basis_uuid}: {e}. Nothing was \
-                 written: the resolution claim was rolled back with it."
-            ))
+            crate::errors::internal_error_logged(
+                format!(
+                    "resolve_backlog_item: could not record basis {basis_uuid}. Nothing was \
+                     written: the resolution claim was rolled back with it."
+                ),
+                e,
+            )
         })?;
         basis_edge_ids.push(row.id.to_string());
     }
@@ -2220,11 +2263,14 @@ pub async fn resolve_backlog_item(
             )
             .await
             .map_err(|e| {
-                internal_error(format!(
-                    "resolve_backlog_item: could not label {original_id} resolved: {e}. Nothing \
-                     was written: the resolution claim and its basis edges were rolled back \
-                     with it."
-                ))
+                crate::errors::internal_error_logged(
+                    format!(
+                        "resolve_backlog_item: could not label {original_id} resolved. Nothing \
+                         was written: the resolution claim and its basis edges were rolled back \
+                         with it."
+                    ),
+                    e,
+                )
             })?
         };
 
@@ -3186,5 +3232,43 @@ mod tests {
             trace_reasoning_type("vibes", Methodology::Instrumental),
             "statistical"
         );
+    }
+
+    /// A failed DS wire tells the caller WHICH of ds_auto's steps failed and
+    /// nothing of the cause; an error that does not open with one of those
+    /// steps gets the step-less message (backlog 49863d2c).
+    #[test]
+    fn a_ds_wire_failure_message_keeps_the_step_and_withholds_the_cause() {
+        use super::ds_wire_failure_message;
+        let late = ds_wire_failure_message(
+            "update_claim_belief: error returned from database: new row for relation \
+             \"claims\" violates check constraint \"chk_secret_5c1e\"",
+        );
+        assert!(late.starts_with("update_claim_belief: "), "{late}");
+        assert!(late.contains("Rolled back"), "{late}");
+        assert!(
+            !late.contains("chk_secret_5c1e") && !late.contains("violates"),
+            "{late}"
+        );
+        let spaced = ds_wire_failure_message("store truth_value seed: pool timed out");
+        assert!(spaced.starts_with("store truth_value seed: "), "{spaced}");
+        assert!(!spaced.contains("timed out"), "{spaced}");
+
+        // Not a ds_auto step: the step-less message, whatever the prefix's shape.
+        for e in [
+            "error returned from database: relation \"secret_5c1e\" does not exist",
+            "frame \"binary_truth\": could not open a savepoint: db-host-5c1e",
+            "assign_claim_secret_5c1e: x",
+            "ASSIGN_CLAIM: x",
+            "assign_claim",
+            "",
+        ] {
+            let m = ds_wire_failure_message(e);
+            assert!(
+                m.starts_with("the claim's Dempster-Shafer belief could not be wired"),
+                "{e:?} -> {m}"
+            );
+            assert!(!m.contains("5c1e") && !m.contains("ASSIGN"), "{e:?} -> {m}");
+        }
     }
 }

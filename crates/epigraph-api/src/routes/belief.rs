@@ -330,10 +330,21 @@ pub struct EvidenceSubmissionResponse {
     pub pignistic_prob: Option<f64>,
     pub bayesian_posterior: f64,
     pub total_sources: i64,
+    /// What this write did to the caller's BBA for its key (claim, frame,
+    /// agent, perspective_id), decided before the store by the probe MCP
+    /// `submit_ds_evidence` shares (`epigraph_db::bba_write_outcome`):
+    /// `inserted`, `unchanged` (an identical resubmission: the stored values
+    /// stay the same, though the upsert still refreshes the row's
+    /// `created_at`) or `replaced` (a different BBA overwrote it, same
+    /// `mass_function_id`). Backlog 6f82db4f.
+    pub write_outcome: String,
+    /// True exactly when `write_outcome` is `unchanged`.
+    pub deduplicated: bool,
     /// What the caller should know about this submission's effect: a
     /// deprecated request field it sent (`combination_method`, `gamma`,
-    /// `assume_independent`), or that the claim's cache was not updated (it
-    /// carries another frame). Omitted when empty.
+    /// `assume_independent`), that the claim's cache was not updated (it
+    /// carries another frame), or that the write was `unchanged` or
+    /// `replaced`. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -1117,6 +1128,23 @@ pub async fn submit_evidence(
         });
     }
 
+    // 0b. Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis
+    //     goes to the frame its readers read, `research_validity` (writers
+    //     follow the readers, operator ruling R-8; MCP `submit_ds_evidence`
+    //     does the same). Read as the caller, before anything is written.
+    let named_frame = frame_id;
+    let redirected = {
+        let mut read = state.read_as(&viewer).await?;
+        epigraph_engine::promotion::promoted_hypothesis_evidence_frame(
+            &mut read,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?
+    };
+    let frame_id = redirected.as_ref().map_or(frame_id, |f| f.id);
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
@@ -1464,6 +1492,38 @@ pub async fn submit_evidence(
     //     untyped, tier 4 for an uncalibrated type) must not apply
     //     `reliability` a second time.
     let masses_json = modified.masses_to_json();
+    // Canonical key, or the caller's own key lowercased (bc06ec6f).
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+
+    // 5a'. What the store below does to the caller's row for its key (backlog
+    //      6f82db4f, the REST twin of bcbe34b2): the upsert returns only the
+    //      id, so read the row first, on this transaction, and compare it with
+    //      exactly what 5b stores. The caller's row has an agent, so the
+    //      cached-combination exclusion never hides it.
+    let write_outcome = {
+        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite};
+        let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await?;
+        classify(
+            prior_for(&rows, request.agent_id, request.perspective_id),
+            &BbaWrite {
+                masses: &masses_json,
+                combination_method: "discount",
+                evidence_type: stored_evidence_type.as_deref(),
+                locality_tag: "unknown",
+                source_strength: Some(1.0),
+                conflict_k: None,
+                evidence_id: None,
+            },
+        )
+    };
+
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         &mut *tx,
         request.claim_id,
@@ -1474,9 +1534,7 @@ pub async fn submit_evidence(
         None,
         Some("discount"),
         Some(1.0), // `reliability` is already in the masses; see 5b
-        // Canonical key, or the caller's own key lowercased (bc06ec6f).
-        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref())
-            .as_deref(),
+        stored_evidence_type.as_deref(),
         "unknown", // locality not known at HTTP belief endpoint; see issue #197
         None,      // HTTP belief endpoint has no evidence row in scope (issue #197 Phase 3)
     )
@@ -1575,6 +1633,29 @@ pub async fn submit_evidence(
             })?
             .flatten();
     let mut warnings = deprecated_parameter_warnings(&request);
+    if redirected.is_some() {
+        warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
+            request.claim_id,
+            named_frame,
+            frame_id,
+        ));
+    }
+    match write_outcome {
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged => warnings.push(
+            "this BBA is identical to the one this agent already stored for this claim, frame \
+             and perspective_id; its stored values are unchanged (the row's created_at is \
+             refreshed), so the claim's Dempster-Shafer belief did not move on its account \
+             (bayesian_posterior still applies this submission's Beta update)."
+                .to_string(),
+        ),
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(
+            "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
+             perspective_id (same mass_function_id); it was not added beside it. To add \
+             independent evidence, submit it under a distinct perspective_id."
+                .to_string(),
+        ),
+        epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
+    }
     if cache_frame != Some(frame_id) {
         warnings.push(format!(
             "claim {}'s cached belief was NOT updated by this call: it carries another frame \
@@ -2314,6 +2395,8 @@ pub async fn submit_evidence(
             pignistic_prob: Some(final_betp),
             bayesian_posterior,
             total_sources,
+            write_outcome: write_outcome.as_str().to_string(),
+            deduplicated: write_outcome.deduplicated(),
             warnings,
         }),
     ))
@@ -3258,6 +3341,8 @@ mod tests {
             pignistic_prob: Some(0.85),
             bayesian_posterior: 0.5,
             total_sources: 3,
+            write_outcome: "inserted".to_string(),
+            deduplicated: false,
             warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -3433,6 +3518,8 @@ mod tests {
             pignistic_prob: Some(0.76),
             bayesian_posterior: 0.71,
             total_sources: 5,
+            write_outcome: "inserted".to_string(),
+            deduplicated: false,
             warnings: vec![],
         };
         let json = serde_json::to_string(&resp).unwrap();

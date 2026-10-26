@@ -105,14 +105,25 @@ class _Cursor:
             ids = params[0]
             # (id, is_deduped, trace_count, mf_count, edge_count, is_current)
             self._all = [
-                (i, False, 0, 0, 0, self.claims[i]["is_current"])
+                (
+                    i,
+                    self.claims[i].get("deduped", False),
+                    0,
+                    0,
+                    0,
+                    self.claims[i]["is_current"],
+                )
                 for i in ids
                 if i in self.claims
             ]
         elif "supersedes" in sql and sql.lstrip().upper().startswith("SELECT"):
             c = self.claims.get(params[0])
             # (is_deduped, supersedes, is_current)
-            self._one = None if c is None else (False, c["supersedes"], c["is_current"])
+            self._one = (
+                None
+                if c is None
+                else (c.get("deduped", False), c["supersedes"], c["is_current"])
+            )
 
     def fetchone(self):
         return self._one
@@ -295,6 +306,27 @@ class FuzzyDedupThroughTheEndpointTests(unittest.TestCase):
                 self.assertEqual(self._posts(), [], out)
                 self.assertRegex(out, r"duplicates_skipped_already_superseded:\s+1\b")
                 self.assertEqual(rc, 0, out)
+
+    def test_an_unmarked_legacy_claim_is_live_again(self):
+        # A pre-2026-10 mark by this script left the `deduped` label; once the
+        # identity-edge backfill made it a normal dedup record and it was
+        # un-marked (operator ruling R-7) it is CURRENT again, with the label
+        # still on it. It is live: picked as the canonical when it is the
+        # snapshot's rep, and marked like any other member when it is not. A
+        # labelled member still retired stays passed over.
+        self.claims[CANON] = {"is_current": True, "supersedes": None, "deduped": True}
+        self.claims[DUP_A] = {"is_current": True, "supersedes": None, "deduped": True}
+        self.claims[DUP_B] = {"is_current": False, "supersedes": ELSEWHERE, "deduped": True}
+        rc, out = self._run(
+            ["--execute"], {"EPIGRAPH_TOKEN": "tok-123", "EPIGRAPH_API_BASE": self.base}
+        )
+        posts = self._posts()
+        self.assertEqual([p["path"] for p in posts], [f"/api/v1/claims/{DUP_A}/dedup"], out)
+        self.assertEqual(posts[0]["body"]["canonical_id"], CANON, out)
+        # DUP_B (still a retired legacy mark) is passed over silently, as
+        # before; DUP_SUPERSEDED is still counted.
+        self.assertRegex(out, r"duplicates_skipped_already_superseded:\s+1\b")
+        self.assertEqual(rc, 0, out)
 
     def test_a_rerun_passes_over_its_own_earlier_marks(self):
         # DUP_A was marked onto CANON by an earlier run (the endpoint set

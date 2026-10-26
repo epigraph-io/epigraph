@@ -1,21 +1,25 @@
-//! `challenge_claim` against a claim whose owning group the challenger cannot
-//! write is REFUSED BY NAME, not reported as a raw row-security error.
+//! `challenge_claim` under operator ruling R-CH1 (migration 168) and R-CH1b.
 //!
-//! The challenge row inherits the challenged claim's `(visibility,
-//! owner_group_id)` (migration 074's BEFORE-row trigger, re-stamped by 070), and
-//! migration 077's `WITH CHECK` on `challenges` asks for that group in the
-//! stamp's writable set. So a challenger that can READ a claim (it is public)
-//! but cannot WRITE its group is refused by the database. That refusal is
-//! intended (the tool's own doc: "a policy question rather than a bug"); what
-//! it reached the caller as was not: an `INTERNAL_ERROR` carrying `new row
-//! violates row-level security policy for table "challenges"` (backlog
-//! deebc487, 3/3 attempts, no row written).
+//! * An OUTSIDER (a challenger that cannot write the challenged claim's owning
+//!   group) challenging a PUBLIC claim succeeds, and the row is owned by the
+//!   outsider's own write group, public, `writer_owned`. Before 168 the row
+//!   inherited the claim's group and was refused (the tool answered that by
+//!   name, backlog deebc487).
+//! * An insider's challenge inherits the claim's tenancy, as before.
+//! * A group-private claim the challenger can READ but not write is a clean,
+//!   named refusal (no outsider-owned private row the claim's owners could not
+//!   see).
+//! * A claim the challenger cannot read answers EXACTLY like a nonexistent
+//!   claim id (R-CH1b): same code, same text modulo the id, same data.
+//! * After the claim is privatized, `list_challenges` on it answers a
+//!   non-member exactly as it answers a random id: the outsider's public row
+//!   must not become an existence oracle for the private claim.
 //!
 //! Both pools of the server are downgraded to `epigraph_app` (a superuser pool
-//! bypasses the policy, so the challenge would simply land); the fixture is
-//! seeded on the superuser pool. Both transports are covered: stdio (`auth:
-//! None`, the server's own agent) and an HTTP caller with a `claims:write`
-//! token, which is the reported shape.
+//! bypasses the policies, and 114's attach rule leaves a privileged session on
+//! the inherit path, so every arm would be vacuous); the fixture is seeded on
+//! the superuser pool. Both transports are covered: stdio (`auth: None`, the
+//! server's own agent) and an HTTP caller with a `claims:write` token.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -26,8 +30,9 @@ use common::*;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::challenges::challenge_claim;
-use epigraph_mcp::types::ChallengeclaimParams;
+use epigraph_mcp::tools::challenges::{challenge_claim, list_challenges};
+use epigraph_mcp::tools::events::list_events;
+use epigraph_mcp::types::{ChallengeclaimParams, ListChallengesParams, ListEventsParams};
 use rmcp::model::ErrorCode;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -122,87 +127,217 @@ fn assert_clean_refusal(e: &rmcp::ErrorData, claim: Uuid, group: Uuid, arm: &str
     );
 }
 
+/// `(owner_group_id, visibility, writer_owned)` of the one challenge on `claim`.
+async fn challenge_tenancy(pool: &PgPool, claim: Uuid) -> (Uuid, String, bool) {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, writer_owned FROM challenges \
+          WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("exactly one challenge on the claim")
+}
+
+fn ok_json(r: &rmcp::model::CallToolResult) -> serde_json::Value {
+    let text = r
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("a text result");
+    serde_json::from_str(&text).expect("json result")
+}
+
+/// R-CH1 on both transports: an outsider's challenge on another group's PUBLIC
+/// claim lands, owned by the outsider's own group, public and flagged; an
+/// insider's challenge (the HTTP caller on its own claim) inherits as before.
 #[sqlx::test(migrations = "../../migrations")]
-async fn challenge_claim_on_an_unwritable_group_claim_is_a_clean_refusal(pool: PgPool) {
+async fn an_outsiders_challenge_on_a_public_claim_is_owned_by_the_outsider(pool: PgPool) {
     let (server, agent, viewer) = app_role_server(&pool).await;
-    let own_group = personal_group_of(&pool, agent).await;
+    let server_group = personal_group_of(&pool, agent).await;
     let (author, author_group) =
         fixture::seed_agent_with_group(&pool, "challenge-target-author").await;
-    let foreign = public_claim_in(&pool, author, author_group, "a public claim, B's group").await;
+    let on_stdio = public_claim_in(&pool, author, author_group, "public, B's group, stdio").await;
+    let on_http = public_claim_in(&pool, author, author_group, "public, B's group, http").await;
 
     // stdio: the server's own agent challenges another group's public claim.
-    let e = challenge_claim(&server, &viewer, params(foreign), None)
+    let r = challenge_claim(&server, &viewer, params(on_stdio), None)
         .await
-        .expect_err("the server agent does not write the claim's group");
-    assert_clean_refusal(&e, foreign, author_group, "stdio");
+        .expect("an outsider's challenge on a public claim lands (R-CH1)");
+    assert_eq!(ok_json(&r)["claim_id"], on_stdio.to_string());
     assert_eq!(
-        challenges_on(&pool, foreign).await,
-        0,
-        "stdio: nothing written"
+        challenge_tenancy(&pool, on_stdio).await,
+        (server_group, "public".to_string(), true),
+        "stdio: owned by the server agent's group, public, writer-owned"
     );
 
-    // HTTP: a `claims:write` caller, the reported shape.
+    // HTTP: a `claims:write` caller, a different identity from the server's.
     let (caller, token, caller_viewer) = seed_caller(&pool, &["claims:write"]).await;
-    let e = challenge_claim(&server, &caller_viewer, params(foreign), Some(&token))
+    let caller_group = personal_group_of(&pool, caller).await;
+    challenge_claim(&server, &caller_viewer, params(on_http), Some(&token))
         .await
-        .expect_err("the caller does not write the claim's group");
-    assert_clean_refusal(&e, foreign, author_group, "http");
+        .expect("an HTTP outsider's challenge on a public claim lands");
     assert_eq!(
-        challenges_on(&pool, foreign).await,
-        0,
-        "http: nothing written"
+        challenge_tenancy(&pool, on_http).await,
+        (caller_group, "public".to_string(), true),
+        "http: owned by the CALLER's group, not the server's"
     );
 
-    // HTTP control: a claim in the CALLER's own group is challenged. The same
-    // claim is first refused on stdio (the server agent does not write the
-    // caller's personal group), so the two identities are distinguishable:
-    // a preflight that resolved the wrong identity's writable groups, or none,
-    // refuses this call.
-    let caller_group = personal_group_of(&pool, caller).await;
-    let callers = public_claim_in(
-        &pool,
-        caller,
-        caller_group,
-        "a public claim, caller's group",
-    )
-    .await;
-    let e = challenge_claim(&server, &viewer, params(callers), None)
-        .await
-        .expect_err("the server agent does not write the caller's group");
-    assert_clean_refusal(&e, callers, caller_group, "stdio on the caller's claim");
-    assert_eq!(challenges_on(&pool, callers).await, 0);
+    // Insider control: the caller challenges its own public claim and the row
+    // inherits the claim's tenancy, unflagged.
+    let callers = public_claim_in(&pool, caller, caller_group, "public, caller's group").await;
     challenge_claim(&server, &caller_viewer, params(callers), Some(&token))
         .await
-        .expect("an HTTP caller challenges a claim in its own group");
+        .expect("an insider's challenge lands");
     assert_eq!(
-        challenges_on(&pool, callers).await,
+        challenge_tenancy(&pool, callers).await,
+        (caller_group, "public".to_string(), false)
+    );
+}
+
+/// A group-private claim the challenger can READ (a reader member of its
+/// group) but not write: a clean, named refusal, not the raw row-security
+/// error, and the owning group is not disclosed. Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_readable_private_claim_the_challenger_cannot_write_is_a_clean_refusal(pool: PgPool) {
+    let (server, _agent, _viewer) = app_role_server(&pool).await;
+    let (author, author_group) =
+        fixture::seed_agent_with_group(&pool, "challenge-private-author").await;
+    let (caller, token, _) = seed_caller(&pool, &["claims:write"]).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(author_group)
+    .bind(caller)
+    .execute(&pool)
+    .await
+    .expect("reader membership");
+    let caller_viewer = Viewer::resolve(&pool, caller).await.expect("viewer");
+    let private = fixture::seed_group_claim(&pool, author, author_group, "B's private claim").await;
+
+    let e = challenge_claim(&server, &caller_viewer, params(private), Some(&token))
+        .await
+        .expect_err("a reader cannot challenge a private claim");
+    assert_clean_refusal(&e, private, author_group, "reader");
+    assert_eq!(challenges_on(&pool, private).await, 0, "nothing written");
+}
+
+/// R-CH1b: a claim the challenger cannot read is answered EXACTLY like a claim
+/// id that does not exist, on both transports: same error code, same message
+/// with the id replaced, same data. Nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unreadable_claim_is_indistinguishable_from_a_nonexistent_one(pool: PgPool) {
+    let (server, _agent, viewer) = app_role_server(&pool).await;
+    let (author, author_group) =
+        fixture::seed_agent_with_group(&pool, "challenge-hidden-author").await;
+    let hidden = fixture::seed_group_claim(&pool, author, author_group, "B's hidden claim").await;
+    let missing = Uuid::new_v4();
+    let (_caller, token, caller_viewer) = seed_caller(&pool, &["claims:write"]).await;
+
+    let shape = |e: &rmcp::ErrorData, id: Uuid| {
+        (
+            e.code,
+            e.message.replace(&id.to_string(), "<id>"),
+            e.data
+                .as_ref()
+                .map(|d| d.to_string().replace(&id.to_string(), "<id>")),
+        )
+    };
+    for (arm, v, auth) in [
+        ("stdio", &viewer, None),
+        ("http", &caller_viewer, Some(&token)),
+    ] {
+        let on_hidden = challenge_claim(&server, v, params(hidden), auth)
+            .await
+            .expect_err("an unreadable claim");
+        let on_missing = challenge_claim(&server, v, params(missing), auth)
+            .await
+            .expect_err("a nonexistent claim");
+        assert_eq!(
+            shape(&on_hidden, hidden),
+            shape(&on_missing, missing),
+            "{arm}: an unreadable claim must answer exactly as a nonexistent one"
+        );
+        assert!(
+            on_missing.message.contains("not found"),
+            "{arm}: positive pin on the shared text: {on_missing:?}"
+        );
+    }
+    assert_eq!(challenges_on(&pool, hidden).await, 0, "nothing written");
+}
+
+/// R-CH1b on the read side. The outsider's challenge is public and stays where
+/// it is when the claim is privatized (168), so `list_challenges` on the now
+/// private claim must answer a non-member exactly as it answers a random id:
+/// otherwise the outsider's row is an existence oracle for a private claim.
+/// While the claim is public the challenge is listed (the positive control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn listing_a_privatized_claims_challenges_is_no_existence_oracle(pool: PgPool) {
+    let (server, _agent, viewer) = app_role_server(&pool).await;
+    let (author, author_group) =
+        fixture::seed_agent_with_group(&pool, "challenge-list-author").await;
+    let claim = public_claim_in(&pool, author, author_group, "public, to be privatized").await;
+    challenge_claim(&server, &viewer, params(claim), None)
+        .await
+        .expect("an outsider's challenge on a public claim lands");
+    let (_stranger, _token, stranger_viewer) = seed_caller(&pool, &["claims:read"]).await;
+
+    let listed = |r: rmcp::model::CallToolResult| ok_json(&r)["total"].as_u64().expect("total");
+    let list = |id: Uuid| ListChallengesParams {
+        claim_id: id.to_string(),
+    };
+    let before = list_challenges(&server, &stranger_viewer, list(claim))
+        .await
+        .expect("list");
+    assert_eq!(
+        listed(before),
         1,
-        "http: the control lands"
+        "control: a public claim's challenge is listed"
+    );
+    // The `claim.challenged` event names the claim: the event surface must
+    // hide it with the claim too.
+    let events_naming_claim = |r: rmcp::model::CallToolResult| {
+        ok_json(&r).to_string().matches(&claim.to_string()).count()
+    };
+    let challenged = || ListEventsParams {
+        event_type: Some("claim.challenged".to_string()),
+        actor_id: None,
+        limit: Some(100),
+    };
+    let ev_before = list_events(&server, &stranger_viewer, challenged())
+        .await
+        .expect("list events");
+    assert!(
+        events_naming_claim(ev_before) > 0,
+        "control: the challenge's event is listed while the claim is public"
     );
 
-    // A claim the challenger cannot READ is not found: the refusal above is
-    // only ever about a claim the caller can already see, so it adds no
-    // existence oracle.
-    let hidden = fixture::seed_group_claim(&pool, author, author_group, "B's private claim").await;
-    let e = challenge_claim(&server, &viewer, params(hidden), None)
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
         .await
-        .expect_err("an unreadable claim");
-    assert!(
-        e.message.contains("not found") && !e.message.contains("row-level security"),
-        "an unreadable claim is not found: {e:?}"
-    );
-    assert!(
-        !matches!(e.data.as_ref(), Some(d) if d["error"] == "not_writer"),
-        "an unreadable claim must not be answered as a write refusal: {e:?}"
-    );
-    assert_eq!(challenges_on(&pool, hidden).await, 0);
-
-    // Control: a claim in the challenger's own group is challenged normally.
-    let mine = public_claim_in(&pool, agent, own_group, "a public claim, own group").await;
-    challenge_claim(&server, &viewer, params(mine), None)
+        .expect("privatize the claim");
+    let on_private = list_challenges(&server, &stranger_viewer, list(claim))
         .await
-        .expect("the server agent challenges a claim in its own group");
-    assert_eq!(challenges_on(&pool, mine).await, 1, "the control lands");
+        .expect("list");
+    let on_random = list_challenges(&server, &stranger_viewer, list(Uuid::new_v4()))
+        .await
+        .expect("list");
+    assert_eq!(
+        ok_json(&on_private),
+        ok_json(&on_random),
+        "a privatized claim's challenges answer a non-member exactly as a random id does"
+    );
+    let ev_after = list_events(&server, &stranger_viewer, challenged())
+        .await
+        .expect("list events");
+    assert_eq!(
+        events_naming_claim(ev_after),
+        0,
+        "no event names the privatized claim to a non-member"
+    );
 }
 
 /// A `42501` from the challenge INSERT itself, AFTER the preflight admitted

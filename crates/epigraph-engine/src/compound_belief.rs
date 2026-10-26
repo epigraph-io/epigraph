@@ -46,9 +46,10 @@ use epigraph_ds::conjunction::{
 use epigraph_ds::{DsError, FocalElement, MassFunction};
 
 use crate::atom_items::{
-    atom_axiom_rows, atom_fold, key_and_discount, read_rows, reads_this_side_of_promotion,
+    atom_axiom_rows, atom_fold_under, key_and_discount, read_rows, reads_this_side_of_promotion,
     AxiomClass, AxiomMode, AxiomRow,
 };
+use crate::belief_profile::BeliefProfile;
 use crate::belief_query::FramedBeliefContext;
 use crate::belief_view::{
     compound_ready, Basis, BeliefView, DerivedBelief, Envelope, InputSummary, LeafProfile,
@@ -64,10 +65,12 @@ const ZERO: f64 = 1e-12;
 // ── per-leaf inputs ─────────────────────────────────────────────────────────
 
 /// What a batch knows about each atom it reads: its Display rows, and for an
-/// atom with none, its kept cache.
+/// atom with none, its kept cache; and the profile of the lens they were read
+/// under, which their fold takes.
 struct AtomInputs {
     rows: HashMap<Uuid, Vec<AxiomRow>>,
     caches: HashMap<Uuid, AtomCache>,
+    profile: BeliefProfile,
 }
 
 impl AtomInputs {
@@ -87,7 +90,11 @@ impl AtomInputs {
         let caches = atom_cache_batch(&mut *conn, viewer, &uncovered)
             .await
             .map_err(|e| format!("atom_cache_batch: {e}"))?;
-        Ok(Self { rows, caches })
+        Ok(Self {
+            rows,
+            caches,
+            profile: ctx.profile().clone(),
+        })
     }
 
     /// The leaf's state for the readiness predicates (SPEC §7.1).
@@ -107,7 +114,7 @@ impl AtomInputs {
         Ok(match self.state(atom) {
             LeafState::Axiom => {
                 let rows = &self.rows[&atom];
-                let f = atom_fold(rows)?;
+                let f = atom_fold_under(rows, &self.profile)?;
                 BeliefView {
                     claim_id: atom,
                     basis: Basis::Axiom,

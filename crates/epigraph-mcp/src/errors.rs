@@ -14,12 +14,122 @@ pub fn invalid_params(msg: impl Into<String>) -> McpError {
     }
 }
 
-pub fn internal_error(e: impl std::fmt::Display) -> McpError {
+/// The message every redacted [`internal_error`] carries in place of the
+/// error it was given.
+pub const INTERNAL_ERROR_MESSAGE: &str = "internal error; the detail is in the server log";
+
+/// A server fault whose detail stays on the server.
+///
+/// `e` is logged (`tracing::error!`, target `mcp.internal_error`) and the
+/// JSON-RPC message is [`INTERNAL_ERROR_MESSAGE`]: call sites hand this a
+/// driver, upstream or provider error (`.map_err(internal_error)`,
+/// `internal_error(format!("...: {e}"))`), whose text can name SQL, internal
+/// hosts or another tenant's rows, so it never reaches the caller. The MCP
+/// twin of the HTTP layer's `ApiError::InternalError` redaction (PR #667).
+///
+/// One exception: a refusal the codebase itself authored
+/// ([`designed_refusal`]) is sent as it was written, because it is the
+/// caller's remedy. It is recognised from the error's type, never from the
+/// rendered `Display` of `e`, so it only applies where `e` reaches this call
+/// unwrapped (`.map_err(internal_error)`): a coded refusal formatted into a
+/// `String` first (`internal_error(format!("ctx: {e}"))`) is redacted.
+///
+/// Text the CALLER must read (an operator remedy, "Nothing was written") is
+/// [`internal_error_text`], or [`internal_error_logged`] when there is also an
+/// error to keep server-side.
+pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
+    if let Some(text) = designed_refusal(&e) {
+        return internal_error_text(text);
+    }
+    tracing::error!(target: "mcp.internal_error", detail = %e, "internal error");
     McpError {
         code: ErrorCode::INTERNAL_ERROR,
-        message: Cow::from(e.to_string()),
+        message: Cow::Borrowed(INTERNAL_ERROR_MESSAGE),
         data: None,
     }
+}
+
+/// The caller-facing text of a refusal the codebase authored, or `None`.
+///
+/// Two shapes qualify:
+///
+/// * a `sqlx::Error::Database` (bare or inside `DbError::QueryFailed`) whose
+///   own message opens with a schema refusal code ([`coded`]: `FA07: ...`,
+///   `CX02: ...`), the convention the migrations' `RAISE EXCEPTION` refusals
+///   follow. This arm reads the database's MESSAGE (not the driver's
+///   wrapping of it), and only that message is returned.
+/// * `DbError::QueryFailed { source: sqlx::Error::Protocol(msg) }`, the shape
+///   the repo layer builds for its own refusals (`mark_duplicate: canonical
+///   ... is not current`); every such site in `epigraph-db` writes literal
+///   text and ids, no error. A bare `sqlx::Error::Protocol` does not qualify,
+///   because `epigraph-engine` stringifies other errors into that variant.
+///   RESIDUAL: `From<sqlx::Error> for DbError` wraps ANY `Protocol` error into
+///   this same shape once it is `?`-converted, including sqlx's own protocol
+///   errors and an engine stringification that went through `DbError`, and
+///   that text is then sent as written. A dedicated `DbError` variant for
+///   repo-authored refusals would close it.
+///
+/// A designed refusal without a code (a `RAISE` that names no code) is
+/// redacted like any other error: that fails closed.
+fn designed_refusal(e: &dyn std::any::Any) -> Option<String> {
+    let database = |s: &sqlx::Error| match s {
+        sqlx::Error::Database(d) if coded(d.message()) => Some(d.message().to_string()),
+        _ => None,
+    };
+    if let Some(db) = e.downcast_ref::<epigraph_db::DbError>() {
+        return match db {
+            epigraph_db::DbError::QueryFailed {
+                source: sqlx::Error::Protocol(msg),
+            } => Some(msg.clone()),
+            epigraph_db::DbError::QueryFailed { source } => database(source),
+            _ => None,
+        };
+    }
+    e.downcast_ref::<sqlx::Error>().and_then(database)
+}
+
+/// Whether a database message opens with a schema refusal code: two to five
+/// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
+fn coded(message: &str) -> bool {
+    let b = message.as_bytes();
+    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    (2..=5).contains(&caps)
+        && b.len() > caps + 2
+        && b[caps].is_ascii_digit()
+        && b[caps + 1].is_ascii_digit()
+        && b[caps + 2] == b':'
+}
+
+/// A server fault whose message is DESIGNED, caller-facing text, sent
+/// verbatim.
+///
+/// Never interpolate an error's `Display` (a driver, upstream or provider
+/// error) into `message`: that is what [`internal_error`] and
+/// [`internal_error_logged`] exist to keep out of a response. Identifiers the
+/// caller already holds (its tool name, its agent id) are fine.
+pub fn internal_error_text(message: impl Into<String>) -> McpError {
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: Cow::from(message.into()),
+        data: None,
+    }
+}
+
+/// [`internal_error_text`] for a site that also holds the error that caused
+/// it: `message` (designed text, no error interpolated) goes to the caller,
+/// `cause` to the server log (target `mcp.internal_error`).
+pub fn internal_error_logged(
+    message: impl Into<String>,
+    cause: impl std::fmt::Display,
+) -> McpError {
+    let message = message.into();
+    tracing::error!(
+        target: "mcp.internal_error",
+        reply = %message,
+        detail = %cause,
+        "internal error"
+    );
+    internal_error_text(message)
 }
 
 /// The explicit refusal for a patch, retract or delete of an edge the caller
@@ -173,7 +283,12 @@ pub fn executor_caller_error(
             message: Cow::from(format!("{context}: {e}")),
             data: None,
         },
-        other => internal_error(format!("{context}: {other}")),
+        // Migration 148's armed-and-unregistered refusal: its text is the
+        // operator's remedy (no driver error in it), so the caller reads it.
+        e @ epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { .. } => {
+            internal_error_text(format!("{context}: {e}"))
+        }
+        other => internal_error_logged(format!("{context}: {INTERNAL_ERROR_MESSAGE}"), other),
     }
 }
 
@@ -344,5 +459,153 @@ mod tests {
             ErrorCode::INTERNAL_ERROR,
             "#498's system-agent preflight refusal keeps its classification"
         );
+    }
+    /// A driver or upstream error handed to `internal_error` stays on the
+    /// server: the JSON-RPC message the caller reads does not carry its text,
+    /// and the server log does (backlog 49863d2c).
+    #[test]
+    #[tracing_test::traced_test]
+    fn internal_error_withholds_the_error_text_and_logs_it() {
+        const MARKER: &str = "relation \"secret_table_7f3a\" does not exist at db-host-7f3a";
+        let e = internal_error(format!("could not read: {MARKER}"));
+        assert_eq!(e.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            e.message, INTERNAL_ERROR_MESSAGE,
+            "the fixed message is sent"
+        );
+        assert!(
+            !e.message.contains("secret_table_7f3a") && !e.message.contains("db-host-7f3a"),
+            "the error text reached the caller: {}",
+            e.message
+        );
+        assert!(e.data.is_none(), "no detail in data either: {:?}", e.data);
+        assert!(
+            logs_contain("secret_table_7f3a"),
+            "the withheld detail must reach the server log"
+        );
+    }
+    /// Designed caller-facing text survives verbatim, and the cause handed to
+    /// `internal_error_logged` stays on the server.
+    #[test]
+    #[tracing_test::traced_test]
+    fn designed_internal_error_text_reaches_the_caller_and_its_cause_does_not() {
+        let text = internal_error_text("tool_x: nothing was written; register the agent first");
+        assert_eq!(text.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            text.message, "tool_x: nothing was written; register the agent first",
+            "designed text must reach the caller unchanged"
+        );
+
+        let logged = internal_error_logged(
+            "tool_x: could not commit. Nothing was written.",
+            "connection to db-host-91c2 refused",
+        );
+        assert_eq!(logged.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            logged.message,
+            "tool_x: could not commit. Nothing was written."
+        );
+        assert!(
+            !logged.message.contains("db-host-91c2"),
+            "{}",
+            logged.message
+        );
+        assert!(
+            logs_contain("db-host-91c2"),
+            "the withheld cause must reach the server log"
+        );
+    }
+
+    /// The executor's fall-through arm keeps its context prefix and withholds
+    /// the executor error; migration 148's unregistered-system-agent refusal is
+    /// the operator's remedy and is kept verbatim.
+    #[test]
+    fn executor_fall_through_withholds_the_error_and_keeps_the_remedy() {
+        use epigraph_ingest_executor::IngestExecutorError as X;
+        let other = executor_caller_error(
+            "workflow ingest",
+            X::AgentCreation("create: duplicate key value violates \"agents_pkey_7d1e\"".into()),
+        );
+        assert_eq!(other.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            other.message.starts_with("workflow ingest: "),
+            "{}",
+            other.message
+        );
+        assert!(
+            !other.message.contains("agents_pkey_7d1e"),
+            "{}",
+            other.message
+        );
+
+        let unregistered = executor_caller_error(
+            "workflow ingest",
+            X::SystemAgentUnregistered {
+                role: "workflow-ingest",
+            },
+        );
+        assert_eq!(unregistered.code, ErrorCode::INTERNAL_ERROR);
+        assert!(
+            unregistered.message.contains("register-system-agent"),
+            "the operator remedy must reach the caller: {}",
+            unregistered.message
+        );
+    }
+
+    /// A refusal the repo layer authored (`QueryFailed { Protocol }`) is the
+    /// caller's remedy and is sent as written; a bare `sqlx::Error::Protocol`
+    /// handed over unconverted (engine code stringifies other errors into it)
+    /// is not. Once `?` converts such an error into `DbError` it takes the
+    /// first shape: see [`designed_refusal`]'s RESIDUAL.
+    #[test]
+    fn a_repo_authored_refusal_passes_and_a_bare_protocol_error_does_not() {
+        let designed = internal_error(epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Protocol(
+                "mark_duplicate: canonical c is not current; refusing".to_string(),
+            ),
+        });
+        assert_eq!(designed.code, ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            designed.message,
+            "mark_duplicate: canonical c is not current; refusing"
+        );
+
+        let bare = internal_error(sqlx::Error::Protocol(
+            "Check constraint chk_secret_7a1 violated".to_string(),
+        ));
+        assert_eq!(bare.message, INTERNAL_ERROR_MESSAGE, "{}", bare.message);
+
+        let other = internal_error(epigraph_db::DbError::CheckViolation {
+            constraint: "chk_secret_7a1".to_string(),
+            message: "violated".to_string(),
+        });
+        assert_eq!(other.message, INTERNAL_ERROR_MESSAGE, "{}", other.message);
+    }
+
+    /// The schema-code gate decides which database text reaches the caller,
+    /// so both of its edges are pinned: two to five capitals, exactly two
+    /// digits, a colon, at the start of the message.
+    #[test]
+    fn a_schema_refusal_code_is_recognised_only_in_its_exact_shape() {
+        for accepted in [
+            "FA07: writer-owned attach refused",
+            "CX02: x",
+            "ABCDE12: five capitals",
+        ] {
+            assert!(coded(accepted), "{accepted:?} must be recognised");
+        }
+        for rejected in [
+            "A07: one capital",
+            "ABCDEF07: six capitals",
+            "FA7: one digit",
+            "FA071: three digits",
+            "fa07: lowercase",
+            "x FA07: not at the start",
+            "FA07 no colon",
+            "duplicate key value violates unique constraint \"agents_pkey\"",
+            "",
+        ] {
+            assert!(!coded(rejected), "{rejected:?} must not be recognised");
+        }
     }
 }

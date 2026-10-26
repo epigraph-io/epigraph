@@ -50,6 +50,7 @@
 //!
 //! All migrations are in `/migrations/` and should be run with `sqlx migrate run`.
 
+pub mod bba_write_outcome;
 pub mod errors;
 pub mod label_validation;
 pub mod operator_binding;

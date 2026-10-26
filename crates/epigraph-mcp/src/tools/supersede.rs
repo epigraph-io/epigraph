@@ -387,6 +387,15 @@ pub(crate) struct UnmarkExpectation {
 /// and the principal the un-mark acts as.
 pub(crate) struct UnmarkGate {
     pub canonical: uuid::Uuid,
+    /// The canonical, then each claim that replaced it since, ending with the
+    /// current one the duplicate is restored against (operator ruling R-11);
+    /// the caller's authority was checked over every one of them. `Err` with
+    /// the reason when the duplicate has no dedup identity edge (reported
+    /// first, as the act does: R-7), or there is no current canonical (one of
+    /// the chain is itself a marked duplicate, or was deprecated): the un-mark
+    /// refuses then, and a batch that un-marks that claim first may still
+    /// proceed.
+    pub chain: Result<Vec<uuid::Uuid>, String>,
     author: uuid::Uuid,
     content: String,
     actor: uuid::Uuid,
@@ -408,7 +417,7 @@ pub(crate) async fn unmark_gate(
     dup: uuid::Uuid,
     expected: UnmarkExpectation,
 ) -> Result<UnmarkGate, McpError> {
-    let (canonical, author, content) = {
+    let (canonical, chain, author, content) = {
         let mut tx = crate::claim_helper::begin_author_stamped_tx(
             server,
             server.write_identity(auth, viewer).await?,
@@ -434,7 +443,18 @@ pub(crate) async fn unmark_gate(
                 )));
             }
         }
-        (canonical, claim.agent_id.into(), claim.content.clone())
+        // A canonical superseded or consolidated since is followed to its
+        // current replacement, and the reversal acts on every claim of that
+        // chain, so the caller's authority is checked over each below.
+        let chain = ClaimRepository::unmark_chain_conn(&mut tx, viewer, dup, canonical)
+            .await
+            .map_err(internal_error)?;
+        (
+            canonical,
+            chain,
+            claim.agent_id.into(),
+            claim.content.clone(),
+        )
     };
     if let Some(expected) = expected.canonical.filter(|e| *e != canonical) {
         return Err(invalid_params(format!(
@@ -466,8 +486,37 @@ pub(crate) async fn unmark_gate(
             "un-mark as a duplicate",
         ));
     }
+    // The same gate over each claim that replaced the canonical: the reversal
+    // moves the duplicate's rows off it as off the canonical.
+    for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
+        let (mut tx, _) = begin_claim_act(
+            server,
+            viewer,
+            auth,
+            dup,
+            Some(*replacement),
+            "unmark_duplicate",
+            "un-mark as a duplicate",
+        )
+        .await?;
+        let may = ClaimRepository::session_may_unmark_conn(
+            &mut tx,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(*replacement),
+        )
+        .await
+        .map_err(internal_error)?;
+        tx.rollback().await.map_err(internal_error)?;
+        if !may {
+            return Err(crate::errors::claim_not_writer(
+                *replacement,
+                "un-mark a duplicate onto",
+            ));
+        }
+    }
     Ok(UnmarkGate {
         canonical,
+        chain,
         author,
         content,
         actor,
@@ -486,10 +535,13 @@ pub(crate) async fn unmark_duplicate_expecting(
 ) -> Result<serde_json::Value, McpError> {
     let UnmarkGate {
         canonical,
+        chain,
         author,
         content,
         actor,
     } = unmark_gate(server, viewer, auth, dup, expected).await?;
+    let chain =
+        chain.map_err(|why| invalid_params(format!("claim {dup} {why}; nothing was written")))?;
 
     // No administrative connection: refuse before anything is written.
     let mut session = crate::maintenance::admin_cascade_session(server)
@@ -508,13 +560,20 @@ pub(crate) async fn unmark_duplicate_expecting(
         Some(canonical),
     );
     let (conn, admin_viewer) = session.split();
-    let (outcome, belief_cascade) =
-        admin_cascade::apply_unmark(conn, admin_viewer, viewer, &trigger, dup, canonical)
-            .await
-            .map_err(|e| match e {
-                admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
-                other => invalid_params(other.to_string()),
-            })?;
+    let (outcome, belief_cascade) = admin_cascade::apply_unmark_authorized(
+        conn,
+        admin_viewer,
+        viewer,
+        &trigger,
+        dup,
+        canonical,
+        Some(&chain),
+    )
+    .await
+    .map_err(|e| match e {
+        admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
+        other => invalid_params(other.to_string()),
+    })?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule), through the claim's author like every other write path.
@@ -531,6 +590,7 @@ pub(crate) async fn unmark_duplicate_expecting(
     Ok(serde_json::json!({
         "duplicate_id": dup,
         "canonical_id": outcome.canonical_id,
+        "current_canonical_id": outcome.current_canonical_id,
         "mode": "unmark_duplicate",
         "embedded": embedded,
         "cascade": outcome.cascade,

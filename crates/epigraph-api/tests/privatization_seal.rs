@@ -135,6 +135,28 @@ async fn applied_seal_plan(pool: &PgPool, world: &fx::World, seeds: &[Uuid]) -> 
     );
     assert!(effects.unrecoverable.is_some());
     assert!(effects.reversibility.is_some());
+    // Ruling R-5: the seal KEEPS an outsider's (writer-owned) challenge,
+    // unencrypted, so the preview must say so rather than list `challenges`
+    // as destroyed and nothing more.
+    assert_eq!(
+        effects.keeps_writer_owned_rows,
+        Some(routes::SEAL_KEEPS),
+        "the seal preview must name the tables whose writer-owned rows the seal keeps"
+    );
+    let kept = effects
+        .kept_rows
+        .expect("the seal preview must say what the kept rows are");
+    for needle in [
+        "challenge",
+        "NOT encrypted",
+        "plaintext",
+        "read the sealed claim",
+    ] {
+        assert!(
+            kept.contains(needle),
+            "the kept-rows sentence must say {needle:?}: {kept}"
+        );
+    }
 
     let plan = preview.0.plan_id;
     let scoped = fx::scoped(pool).await;
@@ -1278,6 +1300,11 @@ async fn the_seal_preview_counts_the_source_fragments_it_would_blank_for_outside
          there is no sharing'"
     );
     assert!(restrict.side_effects.unrecoverable.is_none());
+    assert!(
+        restrict.side_effects.keeps_writer_owned_rows.is_none()
+            && restrict.side_effects.kept_rows.is_none(),
+        "a restrict deletes nothing, so it keeps nothing by exception"
+    );
 }
 
 /// Create a plan through the ROUTE and return its preview, without applying it.
@@ -1746,6 +1773,36 @@ fn the_drain_registers_a_handler_for_the_job_the_unseal_enqueues() {
 /// to the mutation without being added to the preview is a seal that destroys
 /// something the admin was not warned about; the reverse is a warning about a
 /// loss that does not happen.
+/// The preview's KEPT list and the mutation's KEPT list are the SAME set
+/// (ruling R-5), and every kept table is also one the preview names as
+/// destroyed (its non-writer-owned rows are).
+///
+/// A table the mutation starts keeping without the preview saying so leaves
+/// plaintext behind that the operator was told is destroyed.
+#[test]
+fn the_preview_names_exactly_the_tables_whose_writer_owned_rows_the_seal_keeps() {
+    let told: std::collections::BTreeSet<&str> = routes::SEAL_KEEPS.iter().copied().collect();
+    let done: std::collections::BTreeSet<&str> =
+        epigraph_db::repos::privatization::SEAL_KEEPS_WRITER_OWNED
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(
+        told, done,
+        "the seal preview's kept-table list and the seal mutation's kept list disagree"
+    );
+    assert!(
+        !told.is_empty(),
+        "CALIBRATION: R-5 keeps outsider challenges, so the kept list is not empty"
+    );
+    let destroyed: std::collections::BTreeSet<&str> =
+        routes::SEAL_DESTROYS.iter().copied().collect();
+    assert!(
+        told.is_subset(&destroyed),
+        "a kept table is one whose OTHER rows the seal destroys: {told:?} vs {destroyed:?}"
+    );
+}
+
 #[test]
 fn the_preview_names_exactly_the_tables_the_seal_deletes() {
     let told: std::collections::BTreeSet<&str> = routes::SEAL_DESTROYS.iter().copied().collect();

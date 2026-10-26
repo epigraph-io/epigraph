@@ -619,7 +619,8 @@ pub struct RecallParams {
 
     #[schemars(
         description = "When true, REPLACE the flat `results` array with an `epistemic_partition` \
-                       object grouping the same hits into `confirmed` (belief_score >= 0.75 and \
+                       object grouping the same hits into `confirmed` (belief_score at or above the \
+                       served belief profile's gates.confirmed_score, default 0.75, and \
                        not contested), `open_question` (is_contested — any live \
                        contradicts/refutes), and `uncertain` (everything else). The score is \
                        each hit's `belief_score`, the same value `min_truth` gates on, not its \
@@ -1690,9 +1691,15 @@ pub(crate) fn is_false(v: &bool) -> bool {
 /// Score at or above which a NON-contested result is reported as `confirmed`
 /// by [`EpistemicPartition`] (backlog e7736ff6).
 ///
-/// One constant, shared by `recall` and `recall_with_context`, so "confirmed"
-/// cannot come to mean two different things on the two recall surfaces.
-pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
+/// One parameter, shared by `recall` and `recall_with_context`, so "confirmed"
+/// cannot come to mean two different things on the two recall surfaces. It is
+/// the served belief profile's `gates.confirmed_score` (built-in default 0.75,
+/// overridable in `calibration.toml`'s `[belief_profiles.<name>]`).
+pub(crate) fn confirmed_score() -> f64 {
+    epigraph_engine::belief_profile::BeliefProfile::served()
+        .gates
+        .confirmed_score
+}
 
 /// A post-RRF recall page grouped by the epistemic status of each hit, rather
 /// than returned as one flat ranked list (backlog e7736ff6).
@@ -1706,7 +1713,7 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 ///   independent signals; a corpus can hold a 0.9 claim and a live refutation
 ///   of it at the same time, and that pair is precisely what the caller must
 ///   not be told is settled.
-/// * `confirmed` — not contested AND gated score `>= `[`CONFIRMED_SCORE`].
+/// * `confirmed` — not contested AND gated score `>= `[`confirmed_score`].
 /// * `uncertain` — everything else.
 ///
 /// The score is the GATED score: the value `min_truth` compared against
@@ -1728,7 +1735,7 @@ pub(crate) const CONFIRMED_SCORE: f64 = 0.75;
 /// without it, and only the JSON shape differs.
 #[derive(Debug, Clone, Serialize)]
 pub struct EpistemicPartition<T> {
-    /// Uncontested, with a gated score at or above [`CONFIRMED_SCORE`].
+    /// Uncontested, with a gated score at or above [`confirmed_score`].
     pub confirmed: Vec<T>,
     /// Neither confirmed nor contested — believed, but not settled.
     pub uncertain: Vec<T>,
@@ -1774,11 +1781,12 @@ impl<T> EpistemicPartition<T> {
             uncertain: Vec::new(),
             open_question: Vec::new(),
         };
+        let confirmed = confirmed_score();
         for item in items {
             let (score, is_contested) = (item.gated_score(), item.is_contested());
             if is_contested {
                 out.open_question.push(item);
-            } else if score >= CONFIRMED_SCORE {
+            } else if score >= confirmed {
                 out.confirmed.push(item);
             } else {
                 out.uncertain.push(item);

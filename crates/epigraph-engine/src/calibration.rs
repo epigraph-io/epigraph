@@ -72,6 +72,17 @@ pub struct CalibrationConfig {
     /// rather than panicking when calibration.toml predates this feature.
     #[serde(default)]
     pub conformal: ConformalConfig,
+
+    /// Named belief-profile override tables (`[belief_profiles.<name>]`),
+    /// kept as raw JSON values. Each is a merge patch over the profile built
+    /// from the sections above; see `crate::belief_profile`.
+    ///
+    /// Deliberately untyped here: a typo inside a profile table must not fail
+    /// the parse of this whole file (which would drop every calibration table
+    /// to the load-failure fallback). The profile resolver validates each
+    /// table on its own and ignores, with a warning, one that does not fit.
+    #[serde(default)]
+    pub belief_profiles: HashMap<String, serde_json::Value>,
 }
 
 /// Multiplicative locality factor for intra-source evidential BBAs.
@@ -89,7 +100,8 @@ pub struct EvidenceLocality {
 
 fn default_evidence_locality() -> EvidenceLocality {
     EvidenceLocality {
-        intra_evidence_locality_factor: 0.3,
+        intra_evidence_locality_factor:
+            crate::belief_profile::defaults::INTRA_EVIDENCE_LOCALITY_FACTOR,
     }
 }
 
@@ -260,8 +272,9 @@ impl CalibrationConfig {
             return (p[0], p[1], p[2]);
         }
 
-        // Hard-coded fallback (should never happen if TOML is well-formed)
-        (0.50, 0.08, 0.42)
+        // Built-in fallback (should never happen if TOML is well-formed)
+        let [s, a, i] = crate::belief_profile::defaults::METHODOLOGY_FALLBACK;
+        (s, a, i)
     }
 
     /// Look up journal reliability.
@@ -303,7 +316,7 @@ impl CalibrationConfig {
                 return w;
             }
         }
-        0.5
+        crate::belief_profile::defaults::UNKNOWN_EVIDENCE_TYPE_WEIGHT
     }
 
     /// True iff `evidence_type` resolves to a calibrated weight (either
@@ -372,8 +385,9 @@ impl CalibrationConfig {
     /// (e.g. classifier thresholds) must propagate the original
     /// `CalibrationError` instead of using this fallback.
     pub fn default_for_phase2_fallback() -> Self {
+        use crate::belief_profile::defaults as d;
         Self {
-            default_journal_reliability: 0.78,
+            default_journal_reliability: d::DEFAULT_JOURNAL_RELIABILITY,
             methodology_profiles: HashMap::new(),
             methodology_aliases: HashMap::new(),
             evidence_type_weights: HashMap::new(),
@@ -381,15 +395,16 @@ impl CalibrationConfig {
             section_tier_weights: HashMap::new(),
             journal_reliability: HashMap::new(),
             evidence_locality: EvidenceLocality {
-                intra_evidence_locality_factor: 0.3,
+                intra_evidence_locality_factor: d::INTRA_EVIDENCE_LOCALITY_FACTOR,
             },
             classifier_thresholds: ClassifierThresholds {
-                nei_threshold: 0.85,
-                support_threshold: 0.15,
-                conflict_threshold: 0.05,
-                has_opposing_threshold: 0.1,
+                nei_threshold: d::CLASSIFIER_NEI_THRESHOLD,
+                support_threshold: d::CLASSIFIER_SUPPORT_THRESHOLD,
+                conflict_threshold: d::CLASSIFIER_CONFLICT_THRESHOLD,
+                has_opposing_threshold: d::CLASSIFIER_HAS_OPPOSING_THRESHOLD,
             },
             conformal: ConformalConfig::default(),
+            belief_profiles: HashMap::new(),
         }
     }
 
