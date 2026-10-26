@@ -83,7 +83,11 @@ fn format_pgvector(vec: &[f32]) -> String {
 ///   connection stamped with the principal the row names, and `pool` is not
 ///   stamped. See [`log_recall_event`].
 /// - `viewer`    — who the recall runs as; its principal is the audit row's
-///   `agent_id`
+///   `agent_id`. A `Bypass` viewer has no principal: its audit row is
+///   agent-less and is written on `pool`, so a `Bypass` viewer MUST be paired
+///   with the maintenance connection pool its lease came from. On an
+///   application-role `pool` that row is refused by `recall_events_tenancy`
+///   (the recall is still served; the audit row is lost with a warning).
 /// - `embedder`  — embedding service; only `generate_query` is called
 /// - `query`     — natural-language query string
 /// - `limit`     — maximum number of results to return (clamped 1–50 by callers)
@@ -228,9 +232,12 @@ enum AuditNotWritten {
 /// group it lost.
 ///
 /// A `Bypass` viewer has no principal: its row stays agent-less and
-/// instance-wide, written on `pool`, which for that viewer is a maintenance
-/// connection. That is the only agent-less row this path writes, and it is
-/// admitted only through the bypass arm.
+/// instance-wide, written on `pool`. That is the only agent-less row this path
+/// writes, and it is admitted only through the bypass arm, so it lands only
+/// when the caller honours [`recall`]'s contract and passes the maintenance
+/// pool with a `Bypass` viewer. It is not routed through `scoped` instead:
+/// `ScopedPool::begin_as` refuses a `Bypass` viewer, and minting a maintenance
+/// lease inside this library would grant a bypass the caller never asked for.
 #[allow(clippy::too_many_arguments)]
 async fn log_recall_event(
     pool: &PgPool,
