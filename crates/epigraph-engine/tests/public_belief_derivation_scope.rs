@@ -45,13 +45,28 @@ async fn with_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
         .expect("set the source interval");
 }
 
-async fn cached_betp(pool: &PgPool, claim: Uuid) -> f64 {
-    sqlx::query_scalar::<_, Option<f64>>("SELECT pignistic_prob FROM claims WHERE id = $1")
-        .bind(claim)
-        .fetch_one(pool)
-        .await
-        .expect("read the cache")
-        .expect("the cache is filled")
+/// The claim's cached (BetP, Bel, Pl): ruling R-22 names the whole interval
+/// ("truth/pignistic/Bel/Pl caches"), not only BetP.
+async fn cached(pool: &PgPool, claim: Uuid) -> (f64, f64, f64) {
+    let row: (Option<f64>, Option<f64>, Option<f64>) =
+        sqlx::query_as("SELECT pignistic_prob, belief, plausibility FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("read the cache");
+    match row {
+        (Some(b), Some(bel), Some(pl)) => (b, bel, pl),
+        other => panic!("the cache is filled: {other:?}"),
+    }
+}
+
+fn close(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9 && (a.2 - b.2).abs() < 1e-9
+}
+
+/// Strictly more support on both BetP and Bel.
+fn above(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    a.0 > b.0 + 1e-3 && a.1 > b.1 + 1e-3
 }
 
 async fn edge_visibility(pool: &PgPool, edge: Uuid) -> String {
@@ -74,11 +89,11 @@ async fn wire(pool: &PgPool, viewer: &Viewer, signer: Uuid, edge: Uuid, from: Uu
     );
 }
 
-async fn framed_betp(pool: &PgPool, viewer: &Viewer, claim: Uuid, frame: Uuid) -> f64 {
-    belief_query::get_belief(pool, viewer, claim, Some(frame))
+async fn framed(pool: &PgPool, viewer: &Viewer, claim: Uuid, frame: Uuid) -> (f64, f64, f64) {
+    let b = belief_query::get_belief(pool, viewer, claim, Some(frame))
         .await
-        .expect("framed get_belief")
-        .pignistic_prob
+        .expect("framed get_belief");
+    (b.pignistic_prob, b.belief, b.plausibility)
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -102,9 +117,9 @@ async fn a_private_edge_factor_never_enters_a_public_claims_belief(pool: PgPool)
     let public_edge = fixture::seed_edge(&pool, public_source, target).await;
     assert_eq!(edge_visibility(&pool, public_edge).await, "public");
     wire(&pool, &public, author, public_edge, public_source, target).await;
-    let public_only = cached_betp(&pool, target).await;
+    let public_only = cached(&pool, target).await;
     assert!(
-        (framed_betp(&pool, &public, target, frame).await - public_only).abs() < 1e-9,
+        close(framed(&pool, &public, target, frame).await, public_only),
         "PREMISE: the framed read agrees with the cache"
     );
 
@@ -132,22 +147,22 @@ async fn a_private_edge_factor_never_enters_a_public_claims_belief(pool: PgPool)
         .expect("recompute as the member");
     drop(conn);
 
-    let cached = cached_betp(&pool, target).await;
+    let cached = cached(&pool, target).await;
     assert!(
-        (cached - public_only).abs() < 1e-9,
+        close(cached, public_only),
         "the public claim's cached belief moved with a group-private edge factor: \
-         {public_only} -> {cached}"
+         {public_only:?} -> {cached:?}"
     );
-    let public_read = framed_betp(&pool, &public, target, frame).await;
+    let public_read = framed(&pool, &public, target, frame).await;
     assert!(
-        (public_read - public_only).abs() < 1e-9,
+        close(public_read, public_only),
         "a public reader's framed belief folded a group-private edge factor: \
-         {public_only} -> {public_read}"
+         {public_only:?} -> {public_read:?}"
     );
-    let member_read = framed_betp(&pool, &member_viewer, target, frame).await;
+    let member_read = framed(&pool, &member_viewer, target, frame).await;
     assert!(
-        member_read > public_only + 1e-3,
-        "the group member's own read must still fold both BBAs: {member_read} vs {public_only}"
+        above(member_read, public_only),
+        "the group member's own read must still fold both BBAs: {member_read:?} vs {public_only:?}"
     );
 }
 
@@ -194,11 +209,22 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
         .await
         .expect("recompute");
     drop(conn);
-    let public_only = cached_betp(&pool, target).await;
+    let public_only = cached(&pool, target).await;
 
     // The second BBA cites evidence narrowed to the member's group (the shape
     // `epigraph-operator hide-evidence` leaves: the BBA row stays public).
     let hidden_ev = fixture::seed_evidence(&pool, target, "document").await;
+    // Pinned, as `epigraph-operator hide-evidence` pins it (migration 110):
+    // without the pin the next evidence INSERT on the claim re-publishes it.
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: hidden')",
+    )
+    .bind(hidden_ev)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("pin the hidden evidence");
     sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
         .bind(hidden_ev)
         .bind(group)
@@ -215,21 +241,21 @@ async fn a_bba_citing_group_private_evidence_never_enters_a_public_claims_belief
         .expect("recompute as the member");
     drop(conn);
 
-    let cached = cached_betp(&pool, target).await;
+    let cached = cached(&pool, target).await;
     assert!(
-        (cached - public_only).abs() < 1e-9,
+        close(cached, public_only),
         "the public claim's cache folded a BBA citing group-private evidence: \
-         {public_only} -> {cached}"
+         {public_only:?} -> {cached:?}"
     );
-    let public_read = framed_betp(&pool, &public, target, frame).await;
+    let public_read = framed(&pool, &public, target, frame).await;
     assert!(
-        (public_read - public_only).abs() < 1e-9,
-        "a public reader folded a BBA citing group-private evidence: {public_read}"
+        close(public_read, public_only),
+        "a public reader folded a BBA citing group-private evidence: {public_read:?}"
     );
-    let member_read = framed_betp(&pool, &member_viewer, target, frame).await;
+    let member_read = framed(&pool, &member_viewer, target, frame).await;
     assert!(
-        member_read > public_only + 1e-3,
-        "the group member's own read must still fold both BBAs: {member_read} vs {public_only}"
+        above(member_read, public_only),
+        "the group member's own read must still fold both BBAs: {member_read:?} vs {public_only:?}"
     );
 }
 
@@ -288,9 +314,9 @@ async fn another_groups_private_edge_factor_never_enters_a_group_claims_cache(po
     // The group's own BBA: an edge between two of group A's claims.
     let a_edge = fixture::seed_edge(&pool, a_source, target).await;
     wire(&pool, &both_viewer, both, a_edge, a_source, target).await;
-    let own_only = cached_betp(&pool, target).await;
+    let own_only = cached(&pool, target).await;
     assert!(
-        (framed_betp(&pool, &a_viewer, target, frame).await - own_only).abs() < 1e-9,
+        close(framed(&pool, &a_viewer, target, frame).await, own_only),
         "PREMISE: a group-A reader's framed read agrees with the cache"
     );
 
@@ -303,20 +329,20 @@ async fn another_groups_private_edge_factor_never_enters_a_group_claims_cache(po
         .expect("recompute as the member of both groups");
     drop(conn);
 
-    let cached = cached_betp(&pool, target).await;
+    let cached = cached(&pool, target).await;
     assert!(
-        (cached - own_only).abs() < 1e-9,
+        close(cached, own_only),
         "group A's claim cached a BBA derived from group B's private claim: \
-         {own_only} -> {cached}"
+         {own_only:?} -> {cached:?}"
     );
-    let a_read = framed_betp(&pool, &a_viewer, target, frame).await;
+    let a_read = framed(&pool, &a_viewer, target, frame).await;
     assert!(
-        (a_read - own_only).abs() < 1e-9,
-        "a member of group A only folded group B's source: {own_only} -> {a_read}"
+        close(a_read, own_only),
+        "a member of group A only folded group B's source: {own_only:?} -> {a_read:?}"
     );
-    let both_read = framed_betp(&pool, &both_viewer, target, frame).await;
+    let both_read = framed(&pool, &both_viewer, target, frame).await;
     assert!(
-        both_read > own_only + 1e-3,
-        "a member of both groups must still fold both BBAs: {both_read} vs {own_only}"
+        above(both_read, own_only),
+        "a member of both groups must still fold both BBAs: {both_read:?} vs {own_only:?}"
     );
 }

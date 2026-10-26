@@ -25,7 +25,7 @@ use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief, EdgeFactorOutcome,
 };
-use epigraph_mcp::types::GetBeliefParams;
+use epigraph_mcp::types::{GetBeliefParams, ScopedBeliefParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
 use rmcp::model::ContentBlock;
 use sqlx::PgPool;
@@ -61,7 +61,27 @@ async fn wire(pool: &PgPool, viewer: &Viewer, signer: Uuid, edge: Uuid, from: Uu
     assert_eq!(out, EdgeFactorOutcome::Wired, "PREMISE: the edge wires");
 }
 
-async fn framed_betp(server: &EpiGraphMcpFull, viewer: &Viewer, claim: Uuid, frame: Uuid) -> f64 {
+/// (BetP, Bel, Pl) from a tool's JSON reply.
+fn interval(out: rmcp::model::CallToolResult) -> (f64, f64, f64) {
+    let text = match out.content.first().cloned().expect("content") {
+        ContentBlock::Text(t) => t.text,
+        other => panic!("expected text, got {other:?}"),
+    };
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let num = |k: &str| {
+        json[k]
+            .as_f64()
+            .unwrap_or_else(|| panic!("missing {k} in {json}"))
+    };
+    (num("pignistic_prob"), num("belief"), num("plausibility"))
+}
+
+async fn framed(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    claim: Uuid,
+    frame: Uuid,
+) -> (f64, f64, f64) {
     let out = tools::ds::get_belief(
         server,
         viewer,
@@ -73,12 +93,35 @@ async fn framed_betp(server: &EpiGraphMcpFull, viewer: &Viewer, claim: Uuid, fra
     )
     .await
     .expect("get_belief");
-    let text = match out.content.first().cloned().expect("content") {
-        ContentBlock::Text(t) => t.text,
-        other => panic!("expected text, got {other:?}"),
-    };
-    let json: serde_json::Value = serde_json::from_str(&text).expect("json");
-    json["pignistic_prob"].as_f64().expect("pignistic_prob")
+    interval(out)
+}
+
+/// `scoped_belief`'s frame function (a perspective scope with a frame): the
+/// belief computed live for this viewer.
+async fn perspective_framed(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    claim: Uuid,
+    frame: Uuid,
+    perspective: Uuid,
+) -> (f64, f64, f64) {
+    let out = tools::ds::scoped_belief(
+        server,
+        viewer,
+        ScopedBeliefParams {
+            claim_id: claim.to_string(),
+            scope_type: "perspective".to_string(),
+            scope_id: perspective.to_string(),
+            frame_id: Some(frame.to_string()),
+        },
+    )
+    .await
+    .expect("scoped_belief");
+    interval(out)
+}
+
+fn close(a: (f64, f64, f64), b: (f64, f64, f64)) -> bool {
+    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9 && (a.2 - b.2).abs() < 1e-9
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -116,20 +159,50 @@ async fn a_members_framed_read_folds_its_groups_source_on_the_app_role(pool: PgP
     drop(conn);
 
     let server = app_role_server(&pool).await;
-    let stranger = framed_betp(&server, &public, target, frame).await;
-    let mine = framed_betp(&server, &member_viewer, target, frame).await;
-    let cached: f64 = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
-        .bind(target)
-        .fetch_one(&pool)
-        .await
-        .expect("cache");
+    let stranger = framed(&server, &public, target, frame).await;
+    let mine = framed(&server, &member_viewer, target, frame).await;
+    let cached: (f64, f64, f64) =
+        sqlx::query_as("SELECT pignistic_prob, belief, plausibility FROM claims WHERE id = $1")
+            .bind(target)
+            .fetch_one(&pool)
+            .await
+            .expect("cache");
     assert!(
-        (stranger - cached).abs() < 1e-9,
-        "a reader outside the group must see only the admissible fold ({cached}), got {stranger}"
+        close(stranger, cached),
+        "a reader outside the group must see only the admissible fold (BetP, Bel, Pl \
+         {cached:?}), got {stranger:?}"
     );
     assert!(
-        mine > stranger + 1e-3,
+        mine.0 > stranger.0 + 1e-3 && mine.1 > stranger.1 + 1e-3,
         "the group member's own framed read on the application role must still fold its \
-         group's source: member {mine} vs stranger {stranger}"
+         group's source: member {mine:?} vs stranger {stranger:?}"
+    );
+
+    // The same member clause through `scoped_belief`'s frame function (ruling
+    // R-22 names "scoped_belief / perspective reads"), on the same pools.
+    let perspective = epigraph_db::PerspectiveRepository::create(
+        &pool,
+        "r22 app perspective",
+        None,
+        Some(author),
+        None,
+        &[frame],
+        None,
+        None,
+    )
+    .await
+    .expect("perspective")
+    .id;
+    let stranger_p = perspective_framed(&server, &public, target, frame, perspective).await;
+    let mine_p = perspective_framed(&server, &member_viewer, target, frame, perspective).await;
+    assert!(
+        close(stranger_p, stranger),
+        "scoped_belief served a reader outside the group a different fold than get_belief \
+         ({stranger:?}): {stranger_p:?}"
+    );
+    assert!(
+        mine_p.0 > stranger_p.0 + 1e-3 && mine_p.1 > stranger_p.1 + 1e-3,
+        "scoped_belief on the application role must still fold the member's group source: \
+         member {mine_p:?} vs stranger {stranger_p:?}"
     );
 }
