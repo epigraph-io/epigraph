@@ -1137,7 +1137,8 @@ pub async fn report_outcome(
 /// not match `q`, it has no goal embedding, or its truth is below `min_truth`;
 /// each entry carries `is_lineage_head`, `lineage_head_generation` and
 /// `lineage_head_deprecated`. The result can then exceed `limit` by one head
-/// per matched lineage.
+/// per matched lineage. A live head leads its lineage group; a deprecated head
+/// (truth below `min_truth`) sorts after the live rows of its group.
 ///
 /// Use `GET /api/v1/workflows/search` for flat-JSON workflows.
 #[cfg(feature = "db")]
