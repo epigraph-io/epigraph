@@ -306,6 +306,9 @@ mod tests {
         assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
         assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
         assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+        // The claim owner's resolution of a challenge (R-3/R-13): the tool
+        // tests call it directly, past the router's scope check.
+        assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply

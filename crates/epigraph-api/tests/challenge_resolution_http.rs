@@ -229,9 +229,9 @@ async fn the_claims_owner_resolves_an_outsiders_challenge_and_nobody_else_does(
         json!({"state": "accepted", "resolved_by": w.outsider}),
     )
     .await;
-    assert!(
-        (400..500).contains(&s),
-        "a body naming a resolver is refused, not silently ignored: {s} {b}"
+    assert_eq!(
+        s, 422,
+        "a body naming a resolver is refused by deny_unknown_fields, not silently ignored: {b}"
     );
     let (s, b) = resolve_as(
         &w,
@@ -335,12 +335,30 @@ async fn a_withdrawn_challenge_is_409(pool_opts: PgPoolOptions, conn_opts: PgCon
 
 /// R-CH1b: a challenge on a claim the caller cannot read answers EXACTLY like
 /// a random id: same 404, same body with the id replaced; nothing written.
+///
+/// Calibration: the same caller resolving a challenge it CAN read but may not
+/// resolve (its own, on the public claim) gets 403, so the route exists and a
+/// readable refusal is told apart from an unreadable one; the 404 below is the
+/// R-CH1b answer, not a missing route.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unreadable_challenge_answers_exactly_as_a_nonexistent_one(
     pool_opts: PgPoolOptions,
     conn_opts: PgConnectOptions,
 ) {
     let w = world(pool_opts, conn_opts).await;
+    let readable = outsiders_challenge(&w, w.public).await;
+    let (s_readable, b_readable) = resolve_as(
+        &w,
+        w.outsider,
+        &["claims:write"],
+        readable,
+        json!({"state": "accepted"}),
+    )
+    .await;
+    assert_eq!(
+        s_readable, 403,
+        "CALIBRATION: a readable challenge the caller may not resolve is 403: {b_readable}"
+    );
     let hidden: Uuid = sqlx::query_scalar(
         "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, state) \
          VALUES ($1, $2, 'factual_error', 'an insider on a private claim', 'pending') \
