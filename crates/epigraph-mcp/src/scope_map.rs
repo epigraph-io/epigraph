@@ -99,6 +99,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
+    // The claim owner's twin of `POST /api/v1/challenges/:id/resolve`
+    // (ruling R-3): it writes the four resolution columns of a challenge
+    // through migration 168's definer, as the calling principal.
+    ("resolve_challenge", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
     ("decide_match_candidate", "claims:write"),

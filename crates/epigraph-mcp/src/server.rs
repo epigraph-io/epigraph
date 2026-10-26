@@ -2173,7 +2173,7 @@ impl EpiGraphMcpFull {
         tools::graph::traverse(self, viewer, params).await
     }
 
-    // ── Challenges (2 tools) ──
+    // ── Challenges (3 tools) ──
 
     #[tool(
         description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. The challenge is filed as the calling principal (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's agent on stdio). Refused with an error, writing nothing, when the claim is owned by a group the caller cannot write."
@@ -2199,6 +2199,20 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::challenges::list_challenges(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Set the resolution status of a challenge filed against a claim you own: under_review, accepted or rejected (a pending challenge may be accepted or rejected directly, and a settled one re-resolved; every change is audited). Only a writer of the challenged claim's owning group may do this; the challenger's own text and ownership are untouched. The resolver recorded is always the calling principal (your own OAuth agent over HTTP; this server's agent on stdio). A challenge you cannot see answers exactly as one that does not exist. Returns {challenge_id, claim_id, state, resolved_by, resolved_at, resolution_details}."
+    )]
+    async fn resolve_challenge(
+        &self,
+        Parameters(params): Parameters<ResolveChallengeParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::challenges::resolve_challenge(self, viewer, params, auth).await
     }
 
     // ── Events (2 tools) ──

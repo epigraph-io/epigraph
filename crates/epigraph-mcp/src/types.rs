@@ -2827,6 +2827,25 @@ pub struct ListChallengesParams {
     pub claim_id: String,
 }
 
+/// `resolve_challenge`'s parameters. There is no resolver field, and an
+/// unknown field is refused: the resolver is always the calling principal
+/// (operator ruling R-13).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveChallengeParams {
+    #[schemars(description = "UUID of the challenge to resolve")]
+    pub challenge_id: String,
+
+    #[schemars(
+        description = "Resolution status to set: under_review, accepted or rejected. A pending challenge may be accepted or rejected directly, and a settled one re-resolved."
+    )]
+    pub state: String,
+
+    #[schemars(description = "Optional JSON object recording the resolution (e.g. the reason)")]
+    #[serde(default)]
+    pub resolution_details: Option<serde_json::Value>,
+}
+
 // ── Events ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
