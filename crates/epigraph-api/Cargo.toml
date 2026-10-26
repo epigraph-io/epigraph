@@ -67,7 +67,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"], optional = true }
 
 axum = { workspace = true }  # Web framework
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
 rustls = { version = "0.23", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs)
 tokio = { workspace = true }  # Async runtime
 tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
