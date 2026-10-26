@@ -1,0 +1,449 @@
+#![cfg(feature = "db")]
+//! The group management routes on the APPLICATION ROLE (backlog 323773fe).
+//!
+//! `group_lifecycle.rs` and `group_rotation.rs` drive these routes on the test
+//! superuser, which bypasses row security, so they prove the handlers' own
+//! checks and nothing about the database. Here both pools of the `AppState`
+//! are `epigraph_app` (no BYPASSRLS, the group tables' `*_tenancy` policies
+//! FORCEd), as in production. A route that still reads or writes on the raw,
+//! unstamped pool sees no group row and no membership there, so:
+//!
+//! * `POST /api/v1/groups` is refused by `groups_tenancy`'s `WITH CHECK`
+//!   (500), and
+//! * `POST /api/v1/groups/:id/members`, `DELETE
+//!   /api/v1/groups/:id/members/:agent_id` and `GET /api/v1/groups/:id` answer
+//!   a real admin or member 403 "Not a member of this group".
+//!
+//! Every success arm below fails on that shape, and the refusals pin that the
+//! stamped routes still refuse the callers they must.
+//!
+//! Fixtures are seeded and read back on the superuser `#[sqlx::test]` pool.
+
+use axum::{
+    body::Body,
+    http::{header, Method, Request, StatusCode},
+};
+use epigraph_api::{create_router, ApiConfig, AppState};
+use epigraph_db::{GroupRepository, ScopedPool, SessionGucMode};
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use tower::ServiceExt;
+use uuid::Uuid;
+
+mod viewer_fixture;
+
+async fn app_role_router(pool: &PgPool) -> axum::Router {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: every arm here is vacuous"
+    );
+    let url = viewer_fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let raw = viewer_fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped);
+    create_router(state)
+}
+
+async fn seed_agent(pool: &PgPool, name: &str) -> Uuid {
+    let key: [u8; 32] = *blake3::hash(name.as_bytes()).as_bytes();
+    sqlx::query_scalar("INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id")
+        .bind(key.as_slice())
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .expect("seed agent")
+}
+
+fn token(agent_id: Uuid) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (t, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec![
+                "groups:write".to_string(),
+                "groups:admin".to_string(),
+                "groups:read".to_string(),
+            ],
+            "agent",
+            None,
+            Some(agent_id),
+            chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("test JWT issued");
+    t
+}
+
+async fn send(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    as_agent: Uuid,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {}", token(as_agent)));
+    let req = match body {
+        Some(b) => req
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(b.to_string()))
+            .unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn group_key(seed: &str) -> String {
+    hex::encode(blake3::hash(seed.as_bytes()).as_bytes())
+}
+
+/// A structurally valid 60-byte wrapped share (opaque to the server).
+fn wrapped_share(seed: &str) -> String {
+    let mut bytes = Vec::with_capacity(60);
+    bytes.extend_from_slice(blake3::hash(seed.as_bytes()).as_bytes());
+    bytes.extend_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..28]);
+    hex::encode(bytes)
+}
+
+/// A keyed team group created on the SUPERUSER pool, exactly as
+/// `POST /api/v1/groups` would create it, so the member and read routes can be
+/// measured independently of the create route.
+async fn seeded_group(pool: &PgPool, admin: Uuid, seed: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let key = blake3::hash(seed.as_bytes());
+    let did = epigraph_crypto::DidKey::from_public_key(key.as_bytes())
+        .as_str()
+        .to_string();
+    GroupRepository::create_with_admin(pool, id, Some(seed), &did, key.as_bytes(), None, admin)
+        .await
+        .expect("seed group");
+    id
+}
+
+/// Live `(agent_id, role, epoch)` rows of `group`, read on the superuser pool.
+async fn live_roster(pool: &PgPool, group: Uuid) -> Vec<(Uuid, String, i32)> {
+    let mut rows: Vec<(Uuid, String, i32)> = sqlx::query_as(
+        "SELECT agent_id, role, epoch FROM group_memberships \
+          WHERE group_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .fetch_all(pool)
+    .await
+    .expect("roster");
+    rows.sort();
+    rows
+}
+
+fn member_body(agent: Uuid, role: &str, seed: &str) -> Value {
+    json!({
+        "agent_id": agent,
+        "wrapped_key_share": wrapped_share(seed),
+        "role": role,
+    })
+}
+
+/// The creator creates a group and adds a member, both on the application
+/// role, and every row the two routes write is committed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_creator_creates_a_group_and_adds_a_member_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-creator").await;
+    let member = seed_agent(&pool, "323773fe-member").await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        "/api/v1/groups",
+        creator,
+        Some(json!({ "name": "323773fe app role", "group_public_key": group_key("323773fe-a") })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create_group on the app role: {body}"
+    );
+    let group: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+
+    let created_by: Uuid =
+        sqlx::query_scalar("SELECT created_by_agent_id FROM groups WHERE id = $1")
+            .bind(group)
+            .fetch_one(&pool)
+            .await
+            .expect("the group row committed");
+    assert_eq!(created_by, creator);
+    let epochs: Vec<(i32, String)> =
+        sqlx::query_as("SELECT epoch, status FROM group_key_epochs WHERE group_id = $1")
+            .bind(group)
+            .fetch_all(&pool)
+            .await
+            .expect("epochs");
+    assert_eq!(epochs, vec![(0, "active".to_string())], "epoch 0 committed");
+    assert_eq!(
+        live_roster(&pool, group).await,
+        vec![(creator, "admin".to_string(), 0)],
+        "the creator's admin row committed"
+    );
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group}/members"),
+        creator,
+        Some(member_body(member, "writer", "323773fe-a-share")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "add_member on the app role: {body}"
+    );
+    let mut want = vec![
+        (creator, "admin".to_string(), 0),
+        (member, "writer".to_string(), 0),
+    ];
+    want.sort();
+    assert_eq!(live_roster(&pool, group).await, want);
+}
+
+/// The member route on its own, for an admin whose group was created out of
+/// band: the admin check must see the caller's membership.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_adds_a_member_on_the_application_role(pool: PgPool) {
+    let admin = seed_agent(&pool, "323773fe-admin").await;
+    let member = seed_agent(&pool, "323773fe-new").await;
+    let group = seeded_group(&pool, admin, "323773fe-b").await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group}/members"),
+        admin,
+        Some(member_body(member, "reader", "323773fe-b-share")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "add_member on the app role: {body}"
+    );
+    assert!(
+        live_roster(&pool, group)
+            .await
+            .contains(&(member, "reader".to_string(), 0)),
+        "the new member's row committed"
+    );
+}
+
+/// The stamped member route still refuses a non-admin member and a stranger,
+/// and writes nothing for either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_member_route_refuses_a_non_admin_and_a_stranger_on_the_application_role(pool: PgPool) {
+    let admin = seed_agent(&pool, "323773fe-c-admin").await;
+    let writer = seed_agent(&pool, "323773fe-c-writer").await;
+    let stranger = seed_agent(&pool, "323773fe-c-stranger").await;
+    let target = seed_agent(&pool, "323773fe-c-target").await;
+    let group = seeded_group(&pool, admin, "323773fe-c").await;
+    epigraph_db::GroupMembershipRepository::add_member(
+        &pool,
+        group,
+        writer,
+        &hex::decode(wrapped_share("323773fe-c-writer")).unwrap(),
+        0,
+        "writer",
+    )
+    .await
+    .expect("seed writer");
+    let before = live_roster(&pool, group).await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group}/members"),
+        writer,
+        Some(member_body(target, "reader", "323773fe-c-1")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a writer is not an admin: {body}"
+    );
+    assert!(
+        body.to_string().contains("Admin role required"),
+        "the writer is refused as a non-admin member, not as a non-member: {body}"
+    );
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::POST,
+        &format!("/api/v1/groups/{group}/members"),
+        stranger,
+        Some(member_body(target, "reader", "323773fe-c-2")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a stranger: {body}");
+    assert!(
+        body.to_string().contains("Not a member of this group"),
+        "{body}"
+    );
+
+    assert_eq!(
+        live_roster(&pool, group).await,
+        before,
+        "nothing was written"
+    );
+}
+
+/// `GET /api/v1/groups/:id` answers a live member, and still refuses a
+/// stranger, on the application role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_member_reads_the_group_on_the_application_role(pool: PgPool) {
+    let admin = seed_agent(&pool, "323773fe-d-admin").await;
+    let stranger = seed_agent(&pool, "323773fe-d-stranger").await;
+    let group = seeded_group(&pool, admin, "323773fe-d").await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get_group on the app role: {body}");
+    assert_eq!(body["id"].as_str(), Some(group.to_string().as_str()));
+    assert_eq!(body["member_count"], json!(1));
+    assert_eq!(body["current_epoch"], json!(0));
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        stranger,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a stranger: {body}");
+}
+
+/// `revoked_at IS NOT NULL` for `agent`'s row, `reseal_required_at IS NOT
+/// NULL` on the group, and the current epoch's status, on the superuser pool.
+async fn removal_state(pool: &PgPool, group: Uuid, agent: Uuid) -> (bool, bool, String) {
+    let revoked: bool = sqlx::query_scalar(
+        "SELECT revoked_at IS NOT NULL FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("membership");
+    let marked: bool =
+        sqlx::query_scalar("SELECT reseal_required_at IS NOT NULL FROM groups WHERE id = $1")
+            .bind(group)
+            .fetch_one(pool)
+            .await
+            .expect("group");
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM group_key_epochs WHERE group_id = $1 AND epoch = 0")
+            .bind(group)
+            .fetch_one(pool)
+            .await
+            .expect("epoch");
+    (revoked, marked, status)
+}
+
+/// `DELETE /api/v1/groups/:id/members/:agent_id` on the application role, by
+/// the group's creator. The removal revokes the row and marks the re-key
+/// obligation in the same transaction, and the last-admin guard still refuses.
+///
+/// Only the CREATOR is exercised, deliberately. The removal's
+/// `UPDATE groups SET reseal_required_at` must pass `groups_tenancy`'s
+/// `WITH CHECK`, which admits only the group's creator (migration 077); an
+/// admin who did not create the group is refused there. That is a policy
+/// question for its own migration, recorded on backlog 323773fe, and this test
+/// does not pin either answer to it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_creator_removes_members_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-e-creator").await;
+    let second = seed_agent(&pool, "323773fe-e-second").await;
+    let reader = seed_agent(&pool, "323773fe-e-reader").await;
+    let group = seeded_group(&pool, creator, "323773fe-e").await;
+    for (agent, role) in [(second, "admin"), (reader, "reader")] {
+        epigraph_db::GroupMembershipRepository::add_member(
+            &pool,
+            group,
+            agent,
+            &hex::decode(wrapped_share(&format!("323773fe-e-{agent}"))).unwrap(),
+            0,
+            role,
+        )
+        .await
+        .expect("seed member");
+    }
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{group}/members/{reader}"),
+        creator,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the creator removes a reader: {body}"
+    );
+    assert_eq!(
+        removal_state(&pool, group, reader).await,
+        (true, true, "rotating".to_string()),
+        "revoked, and the re-key obligation marked in the same transaction"
+    );
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{group}/members/{second}"),
+        creator,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the creator removes an admin: {body}"
+    );
+    assert!(removal_state(&pool, group, second).await.0);
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{group}/members/{creator}"),
+        creator,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the last admin stays: {body}");
+    assert!(!removal_state(&pool, group, creator).await.0);
+}

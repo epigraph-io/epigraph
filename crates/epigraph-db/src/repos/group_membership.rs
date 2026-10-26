@@ -51,6 +51,38 @@ impl GroupMembershipRepository {
         epoch: i32,
         role: &str,
     ) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::add_member_conn(
+            &mut conn,
+            group_id,
+            agent_id,
+            wrapped_key_share,
+            epoch,
+            role,
+        )
+        .await
+    }
+
+    /// [`Self::add_member`] over a borrowed connection.
+    ///
+    /// `POST /api/v1/groups/:id/members` calls this on the caller's
+    /// `ScopedPool::begin_as` transaction (backlog 323773fe), the same one its
+    /// admin check ran on. On the application role
+    /// `group_memberships_tenancy`'s `WITH CHECK` admits the row only through
+    /// `epigraph_is_group_admin(group_id)`, which reads the CONNECTION's
+    /// stamped principal; an unstamped connection is refused.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, wrapped_key_share))]
+    pub async fn add_member_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+        wrapped_key_share: &[u8],
+        epoch: i32,
+        role: &str,
+    ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
@@ -63,7 +95,7 @@ impl GroupMembershipRepository {
         .bind(wrapped_key_share)
         .bind(epoch)
         .bind(role)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok(row.0)
@@ -239,6 +271,32 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<RevokeOutcome, DbError> {
         let mut tx = pool.begin().await?;
+        let outcome =
+            Self::revoke_member_unless_last_admin_conn(&mut tx, group_id, agent_id).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// [`Self::revoke_member_unless_last_admin`] on a transaction the CALLER
+    /// owns: every statement above, in the same order, and no `BEGIN` /
+    /// `COMMIT` of its own. The roster lock is held until the caller commits,
+    /// so the guard's argument is unchanged as long as `conn` is a transaction
+    /// (the caller must not pass a bare autocommit connection: each statement
+    /// would then release the roster lock as it finished).
+    ///
+    /// `DELETE /api/v1/groups/:id/members/:agent_id` calls this on the
+    /// caller's `ScopedPool::begin_as` transaction (backlog 323773fe), the
+    /// same one its admin check ran on.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any statement fails.
+    #[instrument(skip(conn))]
+    pub async fn revoke_member_unless_last_admin_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<RevokeOutcome, DbError> {
+        let tx = conn;
 
         // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
         // The `UPDATE` below locks only the row it writes; this locks the whole
@@ -352,7 +410,6 @@ impl GroupMembershipRepository {
             }
         };
 
-        tx.commit().await?;
         Ok(outcome)
     }
 
@@ -403,6 +460,21 @@ impl GroupMembershipRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn get_members(pool: &PgPool, group_id: Uuid) -> Result<Vec<MembershipRow>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_members_conn(&mut conn, group_id).await
+    }
+
+    /// [`Self::get_members`] over a borrowed connection, for
+    /// `GET /api/v1/groups/:id` on the caller's stamped read (backlog
+    /// 323773fe).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_members_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<Vec<MembershipRow>, DbError> {
         let rows: Vec<MembershipRow> = sqlx::query_as(
             r#"
             SELECT id, group_id, agent_id, wrapped_key_share, epoch, role, joined_at, revoked_at
@@ -412,7 +484,7 @@ impl GroupMembershipRepository {
             "#,
         )
         .bind(group_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         Ok(rows)
@@ -424,6 +496,24 @@ impl GroupMembershipRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn is_member(pool: &PgPool, group_id: Uuid, agent_id: Uuid) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::is_member_conn(&mut conn, group_id, agent_id).await
+    }
+
+    /// [`Self::is_member`] over a borrowed connection, for
+    /// `GET /api/v1/groups/:id`'s membership gate on the caller's stamped read
+    /// (backlog 323773fe). On the unstamped application pool
+    /// `group_memberships_tenancy` shows no row and every member reads as a
+    /// non-member.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn is_member_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
         let row: (bool,) = sqlx::query_as(
             r#"
             SELECT EXISTS (
@@ -434,7 +524,7 @@ impl GroupMembershipRepository {
         )
         .bind(group_id)
         .bind(agent_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok(row.0)
@@ -467,7 +557,8 @@ impl GroupMembershipRepository {
 
     /// [`Self::get_member_role`] over a borrowed connection.
     ///
-    /// Exists for `POST /api/v1/groups/:id/rotate`, whose whole body runs on
+    /// Exists for `POST /api/v1/groups/:id/rotate` (and, since backlog
+    /// 323773fe, the member routes), whose whole body runs on
     /// one `ScopedPool::begin_as` transaction: the handler must decide
     /// authorization on the SAME stamped connection that performs the rotation,
     /// and it must reach the raw application pool nowhere, because

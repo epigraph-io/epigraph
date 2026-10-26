@@ -200,6 +200,7 @@ pub struct RotateKeyResponse {
 /// "is an admin of the target group" as an authorization condition — an
 /// attacker manufactures a compliant group in one request.
 pub async fn create_group(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     RequireScopeGroupsWrite(auth_ctx): RequireScopeGroupsWrite,
     Json(req): Json<CreateGroupRequest>,
@@ -256,8 +257,15 @@ pub async fn create_group(
     // membership is what makes the caller's first `add_member` succeed; before
     // PR-02 no membership row was ever written, so `require_group_admin` 403'd
     // the creator on their own group.
-    GroupRepository::create_with_admin(
-        &state.db_pool,
+    //
+    // The transaction is the caller's STAMPED one (backlog 323773fe). On the
+    // application role `groups_tenancy` admits the INSERT only when
+    // `created_by_agent_id = epigraph_principal_id()`, and an unstamped
+    // connection has no principal, so this route used to answer 500 for every
+    // caller once the deployed DSN stopped bypassing row security.
+    let mut tx = state.write_as(&viewer, "groups::create_group").await?;
+    GroupRepository::create_with_admin_conn(
+        &mut tx,
         group_id,
         Some(req.name.trim()),
         &did_key,
@@ -284,6 +292,9 @@ pub async fn create_group(
         other => ApiError::DatabaseError {
             message: format!("Failed to create group: {other}"),
         },
+    })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit group creation: {e}"),
     })?;
 
     tracing::info!(
@@ -312,16 +323,24 @@ pub async fn create_group(
 /// Both, never either: the scope says the token class may manage groups, the
 /// membership says which ones.
 pub async fn add_member(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     RequireScopeGroupsAdmin(auth_ctx): RequireScopeGroupsAdmin,
     Path(group_id): Path<Uuid>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<(StatusCode, Json<AddMemberResponse>), ApiError> {
-    crate::middleware::group_authz::require_group_admin(&auth_ctx, group_id, &state.db_pool)
-        .await?;
+    // The whole route runs on ONE transaction stamped with the caller's viewer
+    // (backlog 323773fe), as `rotate_key` does: the admin check, the reads and
+    // the INSERT. On the unstamped application pool `group_memberships_tenancy`
+    // shows no row, so the admin check answered 403 "Not a member of this
+    // group" for a real admin, and the INSERT's `WITH CHECK`
+    // (`epigraph_is_group_admin`, keyed on the stamped principal) would have
+    // refused it anyway.
+    let mut tx = state.write_as(&viewer, "groups::add_member").await?;
+    crate::middleware::group_authz::require_group_admin_conn(&auth_ctx, group_id, &mut tx).await?;
 
     // Verify group exists
-    let group = GroupRepository::get_by_id(&state.db_pool, group_id)
+    let group = GroupRepository::get_by_id_conn(&mut tx, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query group: {e}"),
@@ -393,7 +412,7 @@ pub async fn add_member(
     // would hand them a share that decrypts nothing. "Current" and not "active":
     // the row may be `rotating` while a removal's re-key obligation is
     // outstanding, and a newcomer is pinned to it in that state too.
-    let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
+    let current_epoch = GroupKeyEpochRepository::get_current_epoch_conn(&mut tx, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query current epoch: {e}"),
@@ -407,8 +426,8 @@ pub async fn add_member(
     let epoch = current_epoch.epoch;
 
     // Persist membership
-    let membership_id = GroupMembershipRepository::add_member(
-        &state.db_pool,
+    let membership_id = GroupMembershipRepository::add_member_conn(
+        &mut tx,
         group_id,
         req.agent_id,
         &wrapped_key_bytes,
@@ -433,6 +452,9 @@ pub async fn add_member(
         other => ApiError::DatabaseError {
             message: format!("Failed to add member: {other}"),
         },
+    })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit membership: {e}"),
     })?;
 
     tracing::info!(
@@ -473,15 +495,20 @@ pub async fn add_member(
 /// group permanently unadministrable, since `require_group_admin` is the only
 /// way in and there is no break-glass path.
 pub async fn remove_member(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     RequireScopeGroupsAdmin(auth_ctx): RequireScopeGroupsAdmin,
     Path((group_id, agent_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
-    crate::middleware::group_authz::require_group_admin(&auth_ctx, group_id, &state.db_pool)
-        .await?;
+    // One transaction stamped with the caller's viewer for the whole route
+    // (backlog 323773fe): the admin check, the existence read, the roster lock
+    // and the revoke. On the unstamped application pool the admin check saw no
+    // membership and answered 403 for a real admin.
+    let mut tx = state.write_as(&viewer, "groups::remove_member").await?;
+    crate::middleware::group_authz::require_group_admin_conn(&auth_ctx, group_id, &mut tx).await?;
 
     // Verify group exists
-    GroupRepository::get_by_id(&state.db_pool, group_id)
+    GroupRepository::get_by_id_conn(&mut tx, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query group: {e}"),
@@ -508,14 +535,15 @@ pub async fn remove_member(
     // its WHERE clause reads. The repo function now locks the group's live
     // roster first; see its doc comment. This route is unchanged by that:
     // the three outcomes and their statuses are exactly as before.
-    let outcome = GroupMembershipRepository::revoke_member_unless_last_admin(
-        &state.db_pool,
-        group_id,
-        agent_id,
+    let outcome = GroupMembershipRepository::revoke_member_unless_last_admin_conn(
+        &mut tx, group_id, agent_id,
     )
     .await
     .map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to remove member: {e}"),
+    })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit member removal: {e}"),
     })?;
 
     match outcome {
@@ -551,6 +579,7 @@ pub async fn remove_member(
 /// tenancy boundary are not public metadata, and an anonymous caller could
 /// previously enumerate every group on the instance by id.
 pub async fn get_group(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     axum::Extension(auth_ctx): axum::Extension<crate::middleware::bearer::AuthContext>,
     Path(group_id): Path<Uuid>,
@@ -561,9 +590,24 @@ pub async fn get_group(
         reason: "token carries no agent principal; re-authenticate to obtain one".to_string(),
     })?;
 
+    // Every read below runs on the caller's stamped connection (backlog
+    // 323773fe). On the unstamped application pool `group_memberships_tenancy`
+    // shows no row, so a live member read as a non-member and got 403.
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "groups::get_group",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+
     // Membership is checked before existence is confirmed, so a non-member
     // learns nothing about whether the id names a real group.
-    let is_member = GroupMembershipRepository::is_member(&state.db_pool, group_id, agent_id)
+    let is_member = GroupMembershipRepository::is_member_conn(&mut read, group_id, agent_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query membership: {e}"),
@@ -575,7 +619,7 @@ pub async fn get_group(
         });
     }
 
-    let group = GroupRepository::get_by_id(&state.db_pool, group_id)
+    let group = GroupRepository::get_by_id_conn(&mut read, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query group: {e}"),
@@ -585,13 +629,13 @@ pub async fn get_group(
             id: group_id.to_string(),
         })?;
 
-    let members = GroupMembershipRepository::get_members(&state.db_pool, group_id)
+    let members = GroupMembershipRepository::get_members_conn(&mut read, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query members: {e}"),
         })?;
 
-    let current_epoch = GroupKeyEpochRepository::get_current_epoch(&state.db_pool, group_id)
+    let current_epoch = GroupKeyEpochRepository::get_current_epoch_conn(&mut read, group_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query current epoch: {e}"),
@@ -631,15 +675,10 @@ pub async fn get_group(
 /// §9.2 step 11d onward, with no error. It also keeps this file at the exact
 /// site count `crates/epigraph-db/tests/no_unscoped_pool.rs` records for it —
 /// that register is at its ceiling and a new raw-pool read here would be a
-/// regression the ratchet exists to stop. Note the asymmetry this creates and
-/// does not resolve: rotation is stamped, while the other four group routes
-/// (including the removal that sets `reseal_required_at`) still run unstamped,
-/// as the sites `no_unscoped_pool.rs` still registers as unconverted do. That
-/// clause carried a literal count and the word "all" until conversion shard 4,
-/// which made both wrong — the count moved, and the conversion shards have
-/// since stamped read handlers in other files. Deliberately non-numeric now:
-/// every shard in this series has had to re-sweep a hard-coded copy of that
-/// figure, and the register is the thing to read.
+/// regression the ratchet exists to stop. The other four group routes ran
+/// unstamped until backlog 323773fe moved them onto the caller's stamped
+/// connection too (`write_as` for the three writers, `read_as` for
+/// `get_group`), so this file no longer reaches the raw pool at all.
 ///
 /// # The refusals, and why each is a refusal rather than a best effort
 ///
