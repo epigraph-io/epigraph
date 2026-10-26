@@ -889,34 +889,50 @@ mod tests {
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
-    /// A repo-authored refusal (`DbError::Refused`, backlog e0f0cb68) keeps
-    /// the HTTP answer it had as `QueryFailed { Protocol }`: a 500 whose body
-    /// is the fixed database-error text, with the refusal's own words in the
-    /// server log. Routes that know what a refusal means map it before this
-    /// (`versioning::mark_duplicate`'s 409).
+    /// A repo-authored refusal (`DbError::Refused`, backlog e0f0cb68) is
+    /// answered by its kind (operator ruling R-55): input 400, authority 403,
+    /// state 409, each with the refusal's own words in the body (the repo
+    /// layer authored them for the caller; MCP sends them as written too),
+    /// and each still logged. Before R-55 every kind was the redacted 500.
     #[cfg(feature = "db")]
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn a_repo_refusal_keeps_the_redacted_500_it_answered_before() {
+    async fn a_repo_refusal_is_answered_by_its_kind_with_its_words() {
+        use epigraph_db::RefusalKind;
         const ID: &str = "00000000-0000-0000-0000-00000000e0f0";
-        let api = ApiError::from(DbError::Refused {
-            kind: epigraph_db::RefusalKind::State,
-            message: format!("consolidate: source {ID} is not current"),
-        });
-        let ApiError::DatabaseError { .. } = &api else {
-            panic!("a repo refusal keeps its 500: {api:?}");
-        };
-        let (status, body) = rendered(api).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            body.contains("a database error occurred"),
-            "the fixed database-error text: {body}"
-        );
-        assert!(
-            !body.contains(ID) && !body.contains("not current"),
-            "the refusal's text reached the HTTP body: {body}"
-        );
-        // The log line is the only server-side record of the refusal.
+        let cases = [
+            (
+                RefusalKind::Input,
+                StatusCode::BAD_REQUEST,
+                "consolidate: duplicate source ids",
+            ),
+            (
+                RefusalKind::Authority,
+                StatusCode::FORBIDDEN,
+                "FA07: canonical 00000000-0000-0000-0000-00000000e0f0 (which this session cannot write) has no binding",
+            ),
+            (
+                RefusalKind::State,
+                StatusCode::CONFLICT,
+                "consolidate: source 00000000-0000-0000-0000-00000000e0f0 is not current",
+            ),
+        ];
+        for (kind, want, message) in cases {
+            let (status, body) = rendered(ApiError::from(DbError::Refused {
+                kind,
+                message: message.to_string(),
+            }))
+            .await;
+            assert_eq!(status, want, "{kind:?}: {body}");
+            assert!(
+                body.contains(message),
+                "{kind:?}: the refusal's words reach the caller: {body}"
+            );
+            assert!(
+                !body.contains("database error occurred"),
+                "{kind:?}: not the redacted database-error body: {body}"
+            );
+        }
         logs_assert(|lines: &[&str]| {
             lines
                 .iter()
