@@ -831,13 +831,44 @@ const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-
 /// The sentinel `evidence.raw_content` carries once its claim is sealed.
 ///
 /// Not id-suffixed, and it does not need to be: `evidence` has no generated
-/// tsvector and its `content_hash` is left as the ORIGINAL body's digest (it is
-/// not recomputed from the sentinel), so the reasons the claim sentinel carries
-/// an id do not apply. One fixed token is the smaller side channel.
+/// tsvector, and its `content_hash` is replaced by the per-row
+/// [`SEAL_EVIDENCE_DIGEST_SENTINEL`], so nothing keyed on the body needs the
+/// sentinel to differ between rows. One fixed token is the smaller side
+/// channel.
 ///
 /// `pub(crate)` for `EvidenceRepository::update_raw_content`, which refuses to
 /// rewrite a row holding it.
 pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+
+/// The `evidence.content_hash` a sealed row carries: SHA-256 of an id-derived
+/// token, computed per row by the seal UPDATE (backlog 12b68201).
+///
+/// The original digest is BLAKE3 of the plaintext body (or a caller-supplied
+/// digest of an external artefact), so leaving it on a sealed row lets anyone
+/// who can read the row confirm a guessed body against it. The sentinel is a
+/// function of the row id alone, so it says nothing about the body; it is 32
+/// bytes (`evidence_content_hash_length`); and it differs per row, so two
+/// sealed rows never look like duplicates of each other, nor of a later row
+/// with the same body, to the evidence de-duplication
+/// (`EvidenceRepository`, migration 171). The original digest travels in the
+/// ciphertext under [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] and unseal puts it
+/// back.
+///
+/// A SQL fragment over the alias `e`, like [`SEAL_CONTENT_SENTINEL`]: the seal
+/// UPDATE is set-based, and unseal recognises the sentinel with the same
+/// expression.
+const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
+    "sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'))";
+
+/// The key under which a seal manifest carries an evidence row's
+/// `evidence.content_hash` (lowercase hex) inside that row's `properties`.
+///
+/// The seal replaces the column with [`SEAL_EVIDENCE_DIGEST_SENTINEL`], and a
+/// body-less (external) row's digest was supplied by its writer, so the
+/// server could not rebuild it on unseal: like
+/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`], it rides in the properties the client
+/// encrypts, and unseal splits it back out into the column.
+pub const SEALED_EVIDENCE_CONTENT_HASH_KEY: &str = "$sealed_content_hash";
 
 /// The key under which a seal manifest carries an evidence row's
 /// `evidence.source_url` inside that row's `properties`.
@@ -857,40 +888,72 @@ pub const SEALED_EVIDENCE_SOURCE_URL_KEY: &str = "$sealed_source_url";
 
 /// `properties` as the seal manifest serves it for one evidence row: the row's
 /// own properties, plus its `source_url` under
-/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`] when the column holds one.
+/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`] when the column holds one, and its
+/// `content_hash` (hex) under [`SEALED_EVIDENCE_CONTENT_HASH_KEY`].
 ///
 /// A non-object `properties` (the schema does not forbid one) is served
-/// unchanged and the URL is not folded, because there is no key to put it
-/// under; the seal still NULLs the column. Every writer in this codebase
-/// stores an object.
+/// unchanged and neither column is folded, because there is no key to put them
+/// under; the seal still NULLs the URL and replaces the digest, and unseal
+/// then recomputes the digest from the restored body (a body-less row keeps
+/// the sentinel). Every writer in this codebase stores an object.
 #[must_use]
 pub fn seal_manifest_evidence_properties(
     properties: &serde_json::Value,
     source_url: Option<&str>,
+    content_hash: &[u8],
 ) -> serde_json::Value {
     let mut out = properties.clone();
-    if let (Some(url), Some(map)) = (source_url, out.as_object_mut()) {
+    if let Some(map) = out.as_object_mut() {
+        if let Some(url) = source_url {
+            map.insert(
+                SEALED_EVIDENCE_SOURCE_URL_KEY.to_string(),
+                serde_json::Value::String(url.to_string()),
+            );
+        }
         map.insert(
-            SEALED_EVIDENCE_SOURCE_URL_KEY.to_string(),
-            serde_json::Value::String(url.to_string()),
+            SEALED_EVIDENCE_CONTENT_HASH_KEY.to_string(),
+            serde_json::Value::String(hex::encode(content_hash)),
         );
     }
     out
 }
 
+/// One evidence row's restored `properties`, split by
+/// [`split_unsealed_evidence_properties`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsealedEvidenceProperties {
+    /// The properties with both carrier keys removed.
+    pub properties: serde_json::Value,
+    /// The URL [`SEALED_EVIDENCE_SOURCE_URL_KEY`] carried, if any.
+    pub source_url: Option<String>,
+    /// The digest [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] carried, if it was
+    /// 64 hex characters. Anything else is dropped, as if absent.
+    pub content_hash: Option<Vec<u8>>,
+}
+
 /// The inverse of [`seal_manifest_evidence_properties`]: the restored
-/// properties with [`SEALED_EVIDENCE_SOURCE_URL_KEY`] removed, and the URL it
-/// carried, if any.
+/// properties with [`SEALED_EVIDENCE_SOURCE_URL_KEY`] and
+/// [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] removed, and what they carried.
 #[must_use]
 pub fn split_unsealed_evidence_properties(
     properties: &serde_json::Value,
-) -> (serde_json::Value, Option<String>) {
+) -> UnsealedEvidenceProperties {
     let mut out = properties.clone();
-    let url = out
-        .as_object_mut()
-        .and_then(|map| map.remove(SEALED_EVIDENCE_SOURCE_URL_KEY))
-        .and_then(|v| v.as_str().map(str::to_string));
-    (out, url)
+    let (source_url, content_hash) = match out.as_object_mut() {
+        Some(map) => (
+            map.remove(SEALED_EVIDENCE_SOURCE_URL_KEY)
+                .and_then(|v| v.as_str().map(str::to_string)),
+            map.remove(SEALED_EVIDENCE_CONTENT_HASH_KEY)
+                .and_then(|v| v.as_str().and_then(|h| hex::decode(h).ok()))
+                .filter(|bytes| bytes.len() == 32),
+        ),
+        None => (None, None),
+    };
+    UnsealedEvidenceProperties {
+        properties: out,
+        source_url,
+        content_hash,
+    }
 }
 
 /// `privacy_tier` on every encryption row.
@@ -3084,10 +3147,11 @@ impl PrivatizationRepository {
                 Option<String>,
                 serde_json::Value,
                 Option<String>,
+                Vec<u8>,
             ),
         >(
             r"
-            SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url
+            SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url, e.content_hash
               FROM public.evidence e
              WHERE e.claim_id = ANY($1)
              ORDER BY e.claim_id, e.id
@@ -3117,15 +3181,19 @@ impl PrivatizationRepository {
                     .iter()
                     .filter(|(cid, ..)| *cid == claim_id)
                     .map(
-                        |(_, id, raw_content, properties, source_url)| SealManifestEvidence {
-                            id: *id,
-                            raw_content: raw_content.clone(),
-                            // The column is plaintext the seal NULLs, so it
-                            // travels inside the encrypted properties.
-                            properties: seal_manifest_evidence_properties(
-                                properties,
-                                source_url.as_deref(),
-                            ),
+                        |(_, id, raw_content, properties, source_url, content_hash)| {
+                            SealManifestEvidence {
+                                id: *id,
+                                raw_content: raw_content.clone(),
+                                // The URL is plaintext the seal NULLs and the
+                                // digest one it replaces, so both travel inside
+                                // the encrypted properties.
+                                properties: seal_manifest_evidence_properties(
+                                    properties,
+                                    source_url.as_deref(),
+                                    content_hash,
+                                ),
+                            }
                         },
                     )
                     .collect(),
@@ -3375,17 +3443,18 @@ impl PrivatizationRepository {
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
 
-            sqlx::query(
+            sqlx::query(&format!(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = $2,
+                       content_hash = {SEAL_EVIDENCE_DIGEST_SENTINEL},
                        embedding = NULL,
                        embedding_3072 = NULL,
-                       properties = '{}'::jsonb,
+                       properties = '{{}}'::jsonb,
                        source_url = NULL
                  WHERE e.id = ANY($1)
-                ",
-            )
+                "
+            ))
             .bind(&evidence_ids)
             .bind(SEAL_EVIDENCE_SENTINEL)
             .execute(&mut *conn)
@@ -3747,36 +3816,64 @@ impl PrivatizationRepository {
         let mut evidence_contents: Vec<Option<String>> = Vec::new();
         let mut evidence_props: Vec<serde_json::Value> = Vec::new();
         let mut evidence_urls: Vec<Option<String>> = Vec::new();
+        let mut evidence_hashes: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut evidence_body_hashes: Vec<Option<Vec<u8>>> = Vec::new();
         for item in items.iter().filter(|i| restored.contains(&i.claim_id)) {
             for e in &item.evidence {
                 evidence_ids.push(e.id);
                 evidence_parents.push(item.claim_id);
                 evidence_contents.push(e.raw_content.clone());
-                // The seal folded `evidence.source_url` into the encrypted
-                // properties; split it back out into the column. COALESCE keeps
-                // the column of a row sealed before the fold existed.
-                let (properties, source_url) = split_unsealed_evidence_properties(&e.properties);
-                evidence_props.push(properties);
-                evidence_urls.push(source_url);
+                // The seal folded `evidence.source_url` and `content_hash`
+                // into the encrypted properties; split them back out into the
+                // columns.
+                let split = split_unsealed_evidence_properties(&e.properties);
+                evidence_props.push(split.properties);
+                evidence_urls.push(split.source_url);
+                evidence_hashes.push(split.content_hash);
+                evidence_body_hashes.push(
+                    e.raw_content
+                        .as_ref()
+                        .map(|body| blake3::hash(body.as_bytes()).as_bytes().to_vec()),
+                );
             }
         }
         if !evidence_ids.is_empty() {
-            sqlx::query(
+            // The digest, in order: the one the seal folded into the
+            // ciphertext; else, on a row holding the seal's digest sentinel
+            // (sealed without the fold), BLAKE3 of the restored body; else the
+            // column as it is (a row sealed before the sentinel existed still
+            // holds its original digest). A body-less row with neither keeps
+            // the sentinel: its writer-supplied digest is not recoverable.
+            //
+            // A restored digest may equal a row the same owner wrote on the
+            // claim while it was sealed. Evidence has no unique key (migration
+            // 171), so both rows stay, as any stored duplicate does; the unseal
+            // is not refused.
+            sqlx::query(&format!(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = t.raw_content,
                        properties = t.properties,
-                       source_url = COALESCE(t.source_url, e.source_url)
-                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[])
-                    AS t(evidence_id, claim_id, raw_content, properties, source_url)
+                       source_url = COALESCE(t.source_url, e.source_url),
+                       content_hash = COALESCE(
+                           t.content_hash,
+                           CASE WHEN e.content_hash = {SEAL_EVIDENCE_DIGEST_SENTINEL}
+                                THEN t.body_hash END,
+                           e.content_hash)
+                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[],
+                              $6::bytea[], $7::bytea[])
+                    AS t(evidence_id, claim_id, raw_content, properties, source_url,
+                         content_hash, body_hash)
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
-                ",
-            )
+                "
+            ))
             .bind(&evidence_ids)
             .bind(&evidence_parents)
             .bind(&evidence_contents)
             .bind(&evidence_props)
             .bind(&evidence_urls)
+            .bind(&evidence_hashes)
+            .bind(&evidence_body_hashes)
             .execute(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;

@@ -384,26 +384,34 @@ async fn seal_payload(pool: &PgPool, claim: Uuid) -> SealCommitItem {
             .await
             .expect("read versions");
 
-    // `source_url` is folded into the properties the CLI encrypts, as the seal
-    // manifest serves them.
-    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> =
-        sqlx::query_as::<_, (Uuid, Option<String>, serde_json::Value, Option<String>)>(
-            "SELECT id, raw_content, properties, source_url FROM evidence \
+    // `source_url` and `content_hash` are folded into the properties the CLI
+    // encrypts, as the seal manifest serves them.
+    let evidence: Vec<(Uuid, Option<String>, serde_json::Value)> = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Option<String>,
+            serde_json::Value,
+            Option<String>,
+            Vec<u8>,
+        ),
+    >(
+        "SELECT id, raw_content, properties, source_url, content_hash FROM evidence \
               WHERE claim_id = $1 ORDER BY id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read evidence")
+    .into_iter()
+    .map(|(id, raw, props, url, hash)| {
+        (
+            id,
+            raw,
+            seal_manifest_evidence_properties(&props, url.as_deref(), &hash),
         )
-        .bind(claim)
-        .fetch_all(pool)
-        .await
-        .expect("read evidence")
-        .into_iter()
-        .map(|(id, raw, props, url)| {
-            (
-                id,
-                raw,
-                seal_manifest_evidence_properties(&props, url.as_deref()),
-            )
-        })
-        .collect();
+    })
+    .collect();
 
     SealCommitItem {
         claim_id: claim,
