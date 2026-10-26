@@ -172,4 +172,37 @@ async fn a_failed_repair_records_a_static_reason_not_the_error_text(pool: PgPool
             .contains("forced-repair-failure-9d6f"),
         "nor does the caller's status carry it: {status:?}"
     );
+
+    // The read the backlog item is about, done the way the triggering agent
+    // does it: the application role, stamped as that agent and nothing else
+    // (`security_events_read` admits the rows naming it). It sees the failed
+    // row, and the row carries the static code, not the database's text.
+    // (Already fixed on main before this pin; a green pin, verified against a
+    // mutant that records the error text.)
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut app_conn = app.acquire().await.expect("acquire as the app role");
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+        .bind(author.to_string())
+        .execute(&mut *app_conn)
+        .await
+        .expect("stamp the triggering agent");
+    let readable: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'cascade.admin_failed' AND id = $1",
+    )
+    .bind(failed_id)
+    .fetch_all(&mut *app_conn)
+    .await
+    .expect("read as the triggering agent");
+    assert_eq!(
+        readable.len(),
+        1,
+        "CALIBRATION: the triggering agent reads its failed row on the app role"
+    );
+    let seen = readable[0].to_string();
+    assert_eq!(readable[0]["reason_code"], "repair_failed", "{seen}");
+    assert!(
+        !seen.contains("forced-repair-failure-9d6f") && !seen.contains("secret_edges_shadow"),
+        "the triggering agent reads the database's error text: {seen}"
+    );
 }
