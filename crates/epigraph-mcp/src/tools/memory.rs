@@ -86,6 +86,9 @@ pub async fn memorize(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            // memorize's `tags` ARE its labels (persisted below), so a
+            // status-tagged memory gets the same bypass as submit_claim.
+            &tags,
         )
         .await
         {

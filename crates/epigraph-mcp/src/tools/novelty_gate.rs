@@ -17,9 +17,32 @@
 //!   is fixed, NOT the tunable `novelty_threshold`.
 //! - otherwise — insert normally, no flag.
 //!
-//! `novelty_threshold = 0.0` is the escape hatch: a distance is never `< 0.0`,
-//! so the semantic-duplicate branch never fires and every submission inserts
-//! (still subject to the fixed 0.15 near-duplicate soft-flag).
+//! # Two escape hatches
+//!
+//! 1. **`novelty_threshold = 0.0`**: a distance is never `< 0.0`, so the
+//!    semantic-duplicate branch never fires and every submission inserts
+//!    (still subject to the fixed 0.15 near-duplicate soft-flag). This is a
+//!    per-CALL opt-out: the caller has to remember it on every submission.
+//!
+//! 2. **Status labels** ([`STATUS_CLAIM_LABELS`]): a STRUCTURAL opt-out that
+//!    travels with the claim's own labels rather than with the caller's
+//!    argument list (operator ruling R-35). A recurring report ("run
+//!    2026-07-12: 41 sources, 4 new" then "run 2026-07-19: 42 sources, 7 new")
+//!    is templated by construction: only numbers and dates change, so its
+//!    embedding sits well inside the 0.05 band and each run silently collapsed
+//!    into the PRIOR run's claim, destroying the time series the report exists
+//!    to build (backlog `a3e63a12` weekly backfill report, `0a97ba24`
+//!    norcal-rfp generator status). Hatch 1 was the documented workaround and
+//!    it did not hold: it has to be re-asserted at every call site.
+//!
+//!    A labelled status claim gets the SAME semantics as
+//!    `novelty_threshold = 0.0`: suppression off, 0.15 soft-flag still on.
+//!    Suppression is what loses data; the flag is only discoverability.
+//!
+//! The bypass sits in [`decide`], the one function every gated write path
+//! (`submit_claim`, `batch_submit_claims` through it, `memorize`) calls, and
+//! `labels` is a required argument there. No HTTP claim-write route runs this
+//! gate, so there is nothing to bypass on that transport.
 
 use epigraph_db::{ClaimRepository, NearestClaimHit};
 use sqlx::PgPool;
@@ -38,6 +61,66 @@ pub const NEAR_DUPLICATE_BAND: f64 = 0.15;
 /// compatible: existing callers that don't know about this param get this
 /// value, not 0.0 (which would disable the gate entirely).
 pub const DEFAULT_NOVELTY_THRESHOLD: f64 = 0.05;
+
+/// Labels that mark a claim as a templated per-run status or telemetry report,
+/// exempt from novelty suppression (see the module docs' escape hatch 2).
+///
+/// These are the labels recurring reporters already attach to their own
+/// summaries, not a new taxonomy:
+///
+/// * `telemetry`: the marker this repo's embedding policy already keys on;
+///   scheduled agents also put it on per-run observations (url-discovery
+///   results, filter-drop lists, fetch outages).
+/// * The per-run summary labels the scheduled writers in epiclaw-host's
+///   `deploy/` prompts write today: the norcal-rfp generators, reviewers,
+///   revisers and cross-generator dedup (`norcal-rfp-*-status`), and the
+///   grant-monitor generators, dedup and run summary (`grant-*-status`). Those
+///   writers rebuild their roster of completed cycles from these labels, so a
+///   collapsed run reads as a cycle that never ran.
+/// * The bare forms the same reporters used before their labels were prefixed
+///   (`gen-status`, `generator-summary`, `review-status`, `revise-status`,
+///   `research-scan`).
+///
+/// Matching is EXACT (no prefix, suffix or case folding). Deliberately excluded
+/// although they co-occur with status claims: TOPIC labels such as
+/// `graph-integrity`, `maintenance` or `rfp`. They say what a claim is about,
+/// not that it is a periodic report, and exempting one would silently disable
+/// dedup for genuine content on that topic. A new recurring reporter adds its
+/// summary label here.
+pub const STATUS_CLAIM_LABELS: [&str; 13] = [
+    "telemetry",
+    "gen-status",
+    "generator-summary",
+    "review-status",
+    "revise-status",
+    "research-scan",
+    "norcal-rfp-gen-status",
+    "norcal-rfp-review-status",
+    "norcal-rfp-revise-status",
+    "norcal-rfp-dedup-status",
+    "grant-gen-status",
+    "grant-run-status",
+    "grant-dedup-status",
+];
+
+/// `true` when any of `labels` is in [`STATUS_CLAIM_LABELS`].
+#[must_use]
+pub fn is_status_claim(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| STATUS_CLAIM_LABELS.contains(&l.as_str()))
+}
+
+/// The threshold actually applied to a submission: `0.0` (never suppress) for
+/// a status claim, otherwise the caller's `novelty_threshold`.
+#[must_use]
+pub fn effective_threshold(novelty_threshold: f64, labels: &[String]) -> f64 {
+    if is_status_claim(labels) {
+        0.0
+    } else {
+        novelty_threshold
+    }
+}
 
 /// Outcome of the gate decision, independent of I/O — see [`classify`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,12 +174,19 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// — `EpiGraphMcpFull` itself still only ever constructs this with its one
 /// concrete `McpEmbedder` (hardcoded to the OpenAI endpoint); this is not a
 /// server-wide trait-object refactor.
+///
+/// `labels` are the labels the CALLER attaches to this submission
+/// (`submit_claim`'s `labels`, `memorize`'s `tags`); a status label lifts
+/// suppression ([`effective_threshold`]). They are a required argument so that
+/// a new gated write path has to pass its real labels: never `&[]` as a
+/// placeholder.
 pub async fn decide(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     content: &str,
     novelty_threshold: f64,
+    labels: &[String],
 ) -> Option<(GateDecision, String)> {
     let vector = embedder.generate(content).await.ok()?;
     let pgvec = crate::embed::format_pgvector(&vector);
@@ -108,7 +198,8 @@ pub async fn decide(
             return None;
         }
     };
-    Some((classify(&nearest, novelty_threshold), pgvec))
+    let threshold = effective_threshold(novelty_threshold, labels);
+    Some((classify(&nearest, threshold), pgvec))
 }
 
 #[cfg(test)]
@@ -280,6 +371,7 @@ mod tests {
             &embedder,
             text,
             DEFAULT_NOVELTY_THRESHOLD,
+            &[],
         )
         .await
         .expect("decide must succeed with a working mock embedder");
@@ -330,6 +422,7 @@ mod tests {
             &embedder,
             text,
             0.0,
+            &[],
         )
         .await
         .expect("decide must succeed with a working mock embedder");
@@ -357,10 +450,61 @@ mod tests {
             &embedder,
             "an utterly unrelated claim with no corpus neighbors",
             DEFAULT_NOVELTY_THRESHOLD,
+            &[],
         )
         .await
         .expect("decide must succeed with a working mock embedder");
 
         assert_eq!(decision, GateDecision::Insert);
+    }
+
+    // ── status-claim bypass (ruling R-35) ────────────────────────────────
+
+    #[test]
+    fn is_status_claim_matches_only_the_listed_labels_exactly() {
+        for label in STATUS_CLAIM_LABELS {
+            assert!(
+                is_status_claim(&["2026-07-19".to_string(), label.to_string()]),
+                "`{label}` is in STATUS_CLAIM_LABELS and must be recognized"
+            );
+        }
+        assert!(!is_status_claim(&[]));
+        assert!(!is_status_claim(&[
+            "graph-integrity".to_string(),
+            "maintenance".to_string(),
+            "rfp".to_string(),
+            "backlog".to_string(),
+        ]));
+        // Exact, not substring / prefix / suffix / case-insensitive: a claim
+        // ABOUT telemetry, or a lookalike, is not a status report.
+        for lookalike in [
+            "telemetry-design",
+            "Telemetry",
+            "norcal-rfp-gen-status-v2",
+            "rfp-gen-status",
+            "per-exit-status",
+        ] {
+            assert!(
+                !is_status_claim(&[lookalike.to_string()]),
+                "`{lookalike}` must not bypass the gate"
+            );
+        }
+    }
+
+    /// A status label pins the effective threshold to 0.0 whatever the caller
+    /// passed, including a deliberately raised one; any other label set passes
+    /// the caller's value through untouched.
+    #[test]
+    fn status_label_overrides_any_caller_supplied_threshold() {
+        let status = vec!["grant-gen-status".to_string()];
+        assert!(effective_threshold(DEFAULT_NOVELTY_THRESHOLD, &status).abs() < f64::EPSILON);
+        assert!(effective_threshold(0.9, &status).abs() < f64::EPSILON);
+        let plain = vec!["backlog".to_string()];
+        assert!((effective_threshold(0.9, &plain) - 0.9).abs() < f64::EPSILON);
+        assert!(
+            (effective_threshold(DEFAULT_NOVELTY_THRESHOLD, &plain) - DEFAULT_NOVELTY_THRESHOLD)
+                .abs()
+                < f64::EPSILON
+        );
     }
 }
