@@ -489,6 +489,28 @@ async fn promote(
 
     let mut tx = pool.begin().await?;
 
+    // The status write comes FIRST and is conditional, so the gate is atomic
+    // (backlog 03b1508f): the gate above ran before this transaction, so two
+    // concurrent promotions could both pass it. This UPDATE takes the claim
+    // row's lock; a promotion that waited on another one that has since
+    // committed re-checks the row, changes nothing and is refused before
+    // anything else is written (the transaction rolls back on drop).
+    let flipped = sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+          WHERE id = $1 AND properties->>'hypothesis_status' IS DISTINCT FROM 'promoted'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if flipped != 1 {
+        return Err(format!(
+            "hypothesis {id} is already promoted (a concurrent promotion committed first), \
+             or its status could not be written; nothing was written"
+        )
+        .into());
+    }
+
     // Copy mass function
     // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
     // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
@@ -527,10 +549,6 @@ async fn promote(
         .bind(rv_frame.0)
         .execute(&mut *tx)
         .await?;
-
-    // Update status
-    sqlx::query("UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1")
-        .bind(id).execute(&mut *tx).await?;
 
     tx.commit().await?;
 

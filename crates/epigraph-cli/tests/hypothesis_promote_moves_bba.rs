@@ -473,3 +473,84 @@ async fn cli_refuses_to_promote_an_already_promoted_hypothesis(pool: PgPool) {
         "the refused promotion leaves the later hypothesis_assessment BBA in place"
     );
 }
+
+/// Backlog 03b1508f (2): the promote gate is atomic. A promotion whose gate
+/// read the hypothesis as not yet promoted, while another promotion was
+/// committing, must not promote it again once that one has committed. Here
+/// the other promotion holds the claim row with its status write
+/// uncommitted; the CLI is started, waits on that row, and the other commits.
+/// At origin/main the CLI's status write simply ran after the other's commit
+/// and the second promotion moved the evidence again (exit 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_promotion_racing_a_committed_promotion_is_refused(pool: PgPool) {
+    let (_agent, claim, hyp_frame, rv_frame) = promotable(&pool, "03b1508f-cli-race").await;
+    let source = frame_rows(&pool, claim, hyp_frame).await;
+    assert_eq!(source.len(), 1, "CALIBRATION: one source BBA");
+    let url = fixture::database_url_for(&pool).await;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("database name");
+
+    let mut other = pool
+        .begin()
+        .await
+        .expect("the other promotion's transaction");
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+         WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(&mut *other)
+    .await
+    .expect("the other promotion's status write");
+
+    let child = promote_cmd(&url, claim)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hypothesis");
+    let mut blocked = false;
+    for _ in 0..1200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind(&db)
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        blocked,
+        "CALIBRATION: the CLI promotion reached the claim row the other promotion holds"
+    );
+    other.commit().await.expect("the other promotion commits");
+
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .expect("join")
+        .expect("wait for hypothesis");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the racing promotion must be refused once the other committed, got exit {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr.contains("already promoted"), "{stderr}");
+    assert!(
+        frame_rows(&pool, claim, rv_frame).await.is_empty(),
+        "the refused promotion writes no research_validity copy"
+    );
+    assert_eq!(
+        frame_rows(&pool, claim, hyp_frame).await,
+        source,
+        "the refused promotion leaves the source BBA in place"
+    );
+}

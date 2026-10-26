@@ -563,3 +563,87 @@ async fn evidence_analyzed_after_promotion_lands_on_research_validity(
         "beside the promoted evidence, not over it"
     );
 }
+
+/// Backlog 03b1508f (2): the promote gate is atomic. The gate reads the
+/// hypothesis's status before the promotion's transaction, so two concurrent
+/// promotions could both pass it. Here the other promotion holds the claim
+/// row with its status write uncommitted; this promotion passes the gate (it
+/// reads the committed, unpromoted status), waits on the claim row, and the
+/// other commits. At origin/main its status write then simply ran: 200, and
+/// the hypothesis_assessment BBA was moved by a promotion of an already
+/// promoted hypothesis. Now the status flip is the transaction's first,
+/// conditional write, and the late promotion is refused with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promotion_racing_a_committed_promotion_is_refused(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "03b1508f-race").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "03b1508f racing promotion").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("database name");
+
+    let mut other = pool
+        .begin()
+        .await
+        .expect("the other promotion's transaction");
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+         WHERE id = $1",
+    )
+    .bind(r.claim)
+    .execute(&mut *other)
+    .await
+    .expect("the other promotion's status write");
+
+    let racing = tokio::spawn(promote(r.addr, agent, r.claim));
+    let mut blocked = false;
+    for _ in 0..1200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind(&db)
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        blocked,
+        "CALIBRATION: the promotion reached the claim row the other promotion holds"
+    );
+    other.commit().await.expect("the other promotion commits");
+
+    let (status, body) = racing.await.expect("join the racing promotion");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "a promotion that lost the race is refused: {status} {body}"
+    );
+    assert!(body.contains("already promoted"), "{body}");
+    assert!(
+        rows(&pool, r.claim, r.rv_frame).await.is_empty(),
+        "the refused promotion writes no research_validity copy"
+    );
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame)
+            .await
+            .iter()
+            .any(|row| row.id == source.id),
+        "the refused promotion leaves the source in place"
+    );
+}
