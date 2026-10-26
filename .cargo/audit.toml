@@ -45,8 +45,9 @@ ignore = [
                          #   `rust_crypto` backend -> p256 / p384 ->
                          #   elliptic-curve 0.13 -> crypto-bigint 0.5 (NOT
                          #   via rsa, which uses num-bigint-dig). The fix
-                         #   needs elliptic-curve 0.14, i.e. a jsonwebtoken
-                         #   major. Unreachable with secret inputs: no crate
+                         #   needs elliptic-curve 0.14 (crypto-bigint 0.7),
+                         #   i.e. a jsonwebtoken release on elliptic-curve
+                         #   0.14. Unreachable with secret inputs: no crate
                          #   constructs an EC key (no EncodingKey/DecodingKey
                          #   ::from_ec_*, no from_jwk), and every Validation
                          #   pins RS256 (Google / Cloudflare Access public
@@ -54,8 +55,8 @@ ignore = [
                          #   ES384 code paths never run, and an EC VERIFY
                          #   would handle public data only. An EC private key
                          #   or an ES* algorithm in production re-opens this
-                         #   entry. Revisit on the next jsonwebtoken /
-                         #   elliptic-curve (or rsa) major.
+                         #   entry. Revisit when a jsonwebtoken release
+                         #   moves to elliptic-curve 0.14 (a minor could).
 
     # ── FIXED, not suppressed (issue #287) ──────────────────────────────────
     # RUSTSEC-2024-0363 (sqlx 0.7.4 binary-protocol cast),
@@ -109,8 +110,9 @@ ignore = [
 #   0.27.1; Dependabot alerts #13 on Cargo.lock and #16 on
 #   crates/epigraph-api/Cargo.toml). 2026-10-26 operator ruling R-26:
 #   DISMISSED UNTIL NEEDED, not bumped, for the reasons below; revisit on the
-#   next otel major or when the `otel` pipeline is wired up. Unbounded allocation in `BaggagePropagator::extract_with_context`
-#   on an oversized inbound `baggage` header (availability only). NOT REACHABLE:
+#   next otel major or when the `otel` pipeline is wired up.
+#   Unbounded allocation in `BaggagePropagator::extract_with_context` on an
+#   oversized inbound `baggage` header (availability only). NOT REACHABLE:
 #   - opentelemetry_sdk is pulled only by epigraph-api's optional `otel`
 #     feature, which is not a default feature. `cargo tree -i opentelemetry_sdk
 #     --workspace -e normal` matches no package without `--features
