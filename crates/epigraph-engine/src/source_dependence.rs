@@ -488,18 +488,23 @@ pub fn combine_with_owner_dependence(
         mut independent,
         sibling_groups,
     } = owner_partition(items, conflict_threshold)?;
-    let mut survived: Option<f64> = None;
+    let mut group_conflicts: Vec<f64> = Vec::new();
     for members in sibling_groups {
         match cautious_reduce(&members)? {
             Some((reduced, k)) => {
-                survived = Some(survived.unwrap_or(1.0) * (1.0 - k));
+                group_conflicts.push(k);
                 independent.push(reduced);
             }
             None => independent.extend(members),
         }
     }
     let (combined, k) = dempster_across_items(independent, conflict_threshold)?;
-    Ok((combined, survived.map_or(k, |s| 1.0 - (1.0 - k) * s)))
+    if group_conflicts.is_empty() {
+        return Ok((combined, k));
+    }
+    // The conflict every step saw, as `aggregate_conflict` counts it.
+    let survived: f64 = group_conflicts.iter().map(|g| 1.0 - g).product();
+    Ok((combined, 1.0 - (1.0 - k) * survived))
 }
 
 // ── Canonical item key (atom-level belief, SPEC §3.3) ──────────────────────
