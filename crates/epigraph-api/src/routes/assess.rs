@@ -454,11 +454,15 @@ pub async fn assess_claim(
     // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
     let (combined, reports) = if for_combination.len() <= 1 {
+        // Nothing admissible left to fold (the rows read above can be emptied
+        // by the derivation scope, e.g. a claim whose visibility changed
+        // between the write and this read): report this call's own
+        // assessment rather than index an empty list.
         (
             for_combination
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| indexed_rows[0].2.clone()),
+                .unwrap_or_else(|| mass_function.clone()),
             vec![],
         )
     } else {
