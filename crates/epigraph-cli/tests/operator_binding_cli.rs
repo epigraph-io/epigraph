@@ -2398,3 +2398,70 @@ async fn arm_census_output_is_unchanged_with_an_empty_allowlist(pool: PgPool) {
         refused.show()
     );
 }
+
+/// Backlog 73085534 (ruling R-23) in the ALLOWLIST census: an allowlisted
+/// service S supersedes the human's claim in a group S's operator does not
+/// write. The successor inherits the human's author id, but S wrote it, so S is
+/// OUT-OF-SCOPE for that group (and nothing is UNBOUND).
+///
+/// Verified to fail: `out_of_scope_allowlisted_writers` alone reverted to
+/// attributing by `claims.agent_id` (the successor counted for the human, S
+/// not listed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_lists_an_allowlisted_agent_that_superseded_outside_its_operators_groups(
+    pool: PgPool,
+) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let v0 = submitted_claim(&pool, human, s_group, 0).await;
+
+    let before = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        !before.stdout.contains("OUT-OF-SCOPE"),
+        "CALIBRATION: the human's own claim is in neither list: {}",
+        before.show()
+    );
+    supersede_as(&pool, v0, human, s).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains(&format!("OUT-OF-SCOPE\t{s}\t{s_group}\t1 claim(s)")),
+        "S wrote the successor outside its operator's groups: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// The converse: an allowlisted service S whose only claim in the group is
+/// older than the window is NOT out of scope because the in-scope human
+/// superseded that claim today. The successor inherits S's author id; counting
+/// it for S listed S and refused `--apply`.
+///
+/// Verified to fail: `out_of_scope_allowlisted_writers` alone reverted to
+/// attributing by `claims.agent_id` (S listed OUT-OF-SCOPE, `--apply`
+/// refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_does_not_list_an_allowlisted_inherited_author_as_out_of_scope(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let v0 = submitted_claim(&pool, s, s_group, 60).await;
+    supersede_as(&pool, v0, s, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(!r.stdout.contains("OUT-OF-SCOPE"), "{}", r.show());
+    assert!(!r.stdout.contains(&s.to_string()), "{}", r.show());
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "{}", r.show());
+}
