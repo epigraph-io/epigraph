@@ -523,13 +523,16 @@ fn agent_refresh(token: &str, client_id: &str, key: &SigningKey) -> Value {
     })
 }
 
-/// A service chain refreshes only with the service's own secret. Without it,
-/// with a wrong one, or under another client's id and secret, the refresh is
-/// refused and the presented token is left intact (it then refreshes with
-/// the right credential).
+/// A service chain refreshes only with the service's own secret, presented
+/// under the chain's own `client_id`. Without a credential (`400`), with a
+/// wrong secret (`401`), under another client's id with that client's secret
+/// (`401`), or under another client's id with the chain's OWN secret (`401`,
+/// the `client_id` binding), the refresh is refused and the presented token
+/// is left intact (it then refreshes with the right credential).
 ///
 /// Catches: possession of the refresh token being the only authentication of
-/// a confidential client on the refresh grant (RFC 6749 section 6).
+/// a confidential client on the refresh grant (RFC 6749 section 6), and a
+/// request `client_id` that is not compared with the chain's client.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
     let (client_id, secret) = service_client(&pool, &v(&["claims:read"])).await;
@@ -540,21 +543,28 @@ async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
     let r0 = refresh_token_of(&body);
 
     let wrong: [u8; 32] = rand::random();
-    for (what, req) in [
-        ("no credential", refresh_grant(&r0)),
+    for (what, req, expected) in [
+        ("no credential", refresh_grant(&r0), StatusCode::BAD_REQUEST),
         (
             "a wrong secret",
             service_refresh(&r0, &client_id, &hex::encode(wrong)),
+            StatusCode::UNAUTHORIZED,
         ),
         (
             "another client's id and secret",
             service_refresh(&r0, &other_id, &other_secret),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "another client's id with the chain's own secret",
+            service_refresh(&r0, &other_id, &secret),
+            StatusCode::UNAUTHORIZED,
         ),
     ] {
         let (status, body) = post_token(&app, req).await;
-        assert!(
-            status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
-            "{what}: a service refresh must authenticate the service, got {status}: {body}"
+        assert_eq!(
+            status, expected,
+            "{what}: a service refresh must authenticate the service: {body}"
         );
         assert!(body.get("access_token").is_none(), "{what}: {body}");
     }
@@ -568,30 +578,42 @@ async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
 }
 
 /// An agent chain refreshes only with a fresh assertion under the agent's own
-/// key; the refused requests leave the presented token intact.
+/// key, presented under the chain's own `client_id`. Without an assertion
+/// (`400`), with one under another key (`401`), or under ANOTHER agent's
+/// `client_id` with an assertion under the chain's own key (`401`, the
+/// `client_id` binding), the refresh is refused and the presented token is
+/// left intact.
 ///
-/// Catches: the agent arm of the same defect.
+/// Catches: the agent arm of the same defect, and of the missing binding.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_refresh_requires_an_assertion_under_the_agents_key(pool: PgPool) {
     let key = SigningKey::from_bytes(&[0x5a; 32]);
     let stranger = SigningKey::from_bytes(&[0x5b; 32]);
+    let other_agent_key = SigningKey::from_bytes(&[0x5c; 32]);
     let client_id = agent_client(&pool, &key).await;
+    let other_agent_id = agent_client(&pool, &other_agent_key).await;
     let app = create_router(state(&pool).await);
     let (status, body) = post_token(&app, agent_grant(&client_id, &key)).await;
     assert_eq!(status, StatusCode::OK, "client_credentials: {body}");
     let r0 = refresh_token_of(&body);
 
-    for (what, req) in [
-        ("no assertion", refresh_grant(&r0)),
+    for (what, req, expected) in [
+        ("no assertion", refresh_grant(&r0), StatusCode::BAD_REQUEST),
         (
             "an assertion under another key",
             agent_refresh(&r0, &client_id, &stranger),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "another agent's client_id with the chain's own key",
+            agent_refresh(&r0, &other_agent_id, &key),
+            StatusCode::UNAUTHORIZED,
         ),
     ] {
         let (status, body) = post_token(&app, req).await;
-        assert!(
-            status == StatusCode::UNAUTHORIZED || status == StatusCode::BAD_REQUEST,
-            "{what}: an agent refresh must authenticate the agent, got {status}: {body}"
+        assert_eq!(
+            status, expected,
+            "{what}: an agent refresh must authenticate the agent: {body}"
         );
         assert!(body.get("access_token").is_none(), "{what}: {body}");
     }
