@@ -362,6 +362,27 @@ async fn generations_that_share_steps_keep_their_own_order(pool: PgPool) {
         shared >= 3,
         "PRECONDITION: the generations share their step claims ({shared})"
     );
+    // PRECONDITION: the shared `step_follows` pairs over the three shared
+    // steps are a cycle (gen 0 writes a->b, b->c; gen 1 writes c->a, a->b), so
+    // a naive chain walk has no head. Without this the assertions below would
+    // pass vacuously if no chain had been written at all.
+    let shared_steps = step_ids(&pool, gen1_id, &gen1).await;
+    let pairs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT source_id, target_id FROM edges \
+         WHERE relationship = 'step_follows' \
+           AND source_id = ANY($1) AND target_id = ANY($1)",
+    )
+    .bind(&shared_steps)
+    .fetch_all(&pool)
+    .await
+    .expect("step_follows pairs");
+    let (a, b, c) = (shared_steps[0], shared_steps[1], shared_steps[2]);
+    for (from, to) in [(a, b), (b, c), (c, a)] {
+        assert!(
+            pairs.contains(&(from, to)),
+            "PRECONDITION: the shared step_follows pairs form the cycle a->b->c->a; got {pairs:?}"
+        );
+    }
 
     for (id, want) in [(gen1_id, gen1), (gen2_id, gen2)] {
         let texts: Vec<String> =
