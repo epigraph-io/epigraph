@@ -341,3 +341,239 @@ async fn the_key_loader_admits_only_a_usable_key() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The ids of `claim`'s edges with `relationship` (either endpoint).
+async fn edges_of(pool: &PgPool, endpoint: Uuid, relationship: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM edges WHERE (source_id = $1 OR target_id = $1) AND relationship = $2",
+    )
+    .bind(endpoint)
+    .bind(relationship)
+    .fetch_all(pool)
+    .await
+    .expect("edges")
+}
+
+/// `POST /api/v1/submit/packet` (the HTTP twin of `submit_claim`):
+/// `persist_packet`'s five structural edges, on its stamped claim-write
+/// transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_packet_attests_its_structural_edges() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let author = common::seed_system_agent(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:write"], author);
+    let content = format!(
+        "R-50: a packet's structural edges are signed {}",
+        Uuid::new_v4()
+    );
+    let evidence = format!("evidence for {content}");
+    let evidence_hash = epigraph_crypto::ContentHasher::to_hex(
+        &epigraph_crypto::ContentHasher::hash(evidence.as_bytes()),
+    );
+    let out = post(
+        addr,
+        &token,
+        "/api/v1/submit/packet",
+        serde_json::json!({
+            "claim": { "content": content, "initial_truth": 0.7, "agent_id": author },
+            "evidence": [{
+                "content_hash": evidence_hash,
+                "evidence_type": {
+                    "type": "observation", "observed_at": chrono::Utc::now(),
+                    "method": "test", "location": null
+                },
+                "raw_content": evidence,
+                "signature": null
+            }],
+            "reasoning_trace": {
+                "methodology": "deductive",
+                "inputs": [{"type": "evidence", "index": 0}],
+                "confidence": 0.7, "explanation": "test", "signature": null
+            },
+            "signature": "0".repeat(128)
+        }),
+    )
+    .await;
+    let claim = id_of(&out, "claim_id");
+    for rel in ["AUTHORED", "HAS_TRACE", "TRACES", "SUPPORTS"] {
+        let edges = edges_of(&pool, claim, rel).await;
+        assert_eq!(edges.len(), 1, "{rel}: {edges:?} ({out})");
+        assert_attested(&pool, edges[0], signer_id, &format!("packet {rel}")).await;
+    }
+    let uses: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT e.id FROM edges e JOIN reasoning_traces t ON t.id = e.source_id \
+          WHERE t.claim_id = $1 AND e.relationship = 'USES_EVIDENCE'",
+    )
+    .bind(claim)
+    .fetch_all(&pool)
+    .await
+    .expect("USES_EVIDENCE");
+    assert_eq!(uses.len(), 1, "{uses:?}");
+    assert_attested(&pool, uses[0], signer_id, "packet USES_EVIDENCE").await;
+}
+
+/// `POST /api/v1/frames/:id/evidence` (`submit_evidence`): its WITHIN_FRAME
+/// edge (claim -> frame, structural), under the stamped transaction's
+/// savepoint. Its `evidence`-typed SUPPORTS / CONTRADICTS / GENERATED_BY edges
+/// (and `assess_claim`'s) name a `mass_functions` id as `evidence`, which
+/// `edges_validate_refs` refuses: dead writes (`unstamped_http_edge_writes.rs`),
+/// so there is no row to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_evidence_attests_its_edges() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let agent = common::seed_system_agent(&pool).await;
+    let claim =
+        common::seed_claim(&pool, &format!("R-50 evidence target {}", Uuid::new_v4())).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['TRUE','FALSE']::text[]) \
+         RETURNING id",
+    )
+    .bind(format!("r50-frame-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+    post(
+        addr,
+        &token,
+        &format!("/api/v1/frames/{frame}/evidence"),
+        serde_json::json!({
+            "claim_id": claim, "agent_id": agent,
+            "masses": {"0": 0.8, "0,1": 0.2},
+            "reliability": 1.0,
+        }),
+    )
+    .await;
+    let within: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'WITHIN_FRAME'",
+    )
+    .bind(claim)
+    .bind(frame)
+    .fetch_all(&pool)
+    .await
+    .expect("WITHIN_FRAME");
+    assert_eq!(within.len(), 1, "{within:?}");
+    assert_attested(&pool, within[0], signer_id, "submit_evidence WITHIN_FRAME").await;
+}
+
+/// A writer on the UNSTAMPED raw pool (`POST /api/v1/perspectives`'s
+/// PERSPECTIVE_OF, through `EdgeRepository::create_signed`): signed too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_raw_pool_writer_attests_its_edge() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let owner = common::seed_system_agent(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:write"], owner);
+    let out = post(
+        addr,
+        &token,
+        "/api/v1/perspectives",
+        serde_json::json!({
+            "name": format!("R-50 perspective {}", Uuid::new_v4()),
+            "owner_agent_id": owner,
+        }),
+    )
+    .await;
+    let perspective = id_of(&out, "id");
+    let edges = edges_of(&pool, perspective, "PERSPECTIVE_OF").await;
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_attested(&pool, edges[0], signer_id, "perspectives PERSPECTIVE_OF").await;
+}
+
+/// The single-edge CRUD and span writers, on the raw pool:
+/// `POST /api/v1/evidence` (claim -> evidence DERIVED_FROM),
+/// `POST /api/v1/reasoning-traces` (claim -> trace HAS_TRACE),
+/// `POST /api/v1/spans` (agent -> span attributed_to) and
+/// `PUT /api/v1/spans/:id/close` (span -> claim generated).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_evidence_trace_and_span_writers_attest_their_edges() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let agent = common::seed_system_agent(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:write", "evidence:write"], agent);
+    let claim = common::seed_claim(&pool, &format!("R-50 crud target {}", Uuid::new_v4())).await;
+    let between = |s: Uuid, t: Uuid, rel: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let ids: Vec<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+                    AND relationship = $3",
+            )
+            .bind(s)
+            .bind(t)
+            .bind(rel)
+            .fetch_all(&pool)
+            .await
+            .expect("edges");
+            assert_eq!(ids.len(), 1, "{rel}: {ids:?}");
+            ids[0]
+        }
+    };
+
+    let ev = post(
+        addr,
+        &token,
+        "/api/v1/evidence",
+        serde_json::json!({
+            "agent_id": agent, "claim_id": claim,
+            "raw_content": "R-50 evidence body",
+            "evidence_type": {
+                "type": "observation", "observed_at": chrono::Utc::now(),
+                "method": "test", "location": null
+            },
+        }),
+    )
+    .await;
+    let e = between(claim, id_of(&ev, "id"), "DERIVED_FROM").await;
+    assert_attested(&pool, e, signer_id, "evidence DERIVED_FROM").await;
+
+    let tr = post(
+        addr,
+        &token,
+        "/api/v1/reasoning-traces",
+        serde_json::json!({
+            "claim_id": claim, "agent_id": agent, "methodology": "deductive",
+            "confidence": 0.7, "explanation": "R-50 trace",
+        }),
+    )
+    .await;
+    let e = between(claim, id_of(&tr, "id"), "HAS_TRACE").await;
+    assert_attested(&pool, e, signer_id, "reasoning-traces HAS_TRACE").await;
+
+    let span = post(
+        addr,
+        &token,
+        "/api/v1/spans",
+        serde_json::json!({
+            "trace_id": Uuid::new_v4().simple().to_string(),
+            "span_name": "r50-span", "agent_id": agent,
+        }),
+    )
+    .await;
+    let span_id = id_of(&span, "id");
+    let e = between(agent, span_id, "attributed_to").await;
+    assert_attested(&pool, e, signer_id, "spans attributed_to").await;
+
+    let resp = reqwest::Client::new()
+        .put(format!("http://{addr}/api/v1/spans/{span_id}/close"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "generated_ids": [claim] }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(
+        status.is_success(),
+        "close span: {status}: {}",
+        resp.text().await.unwrap()
+    );
+    let e = between(span_id, claim, "generated").await;
+    assert_attested(&pool, e, signer_id, "spans/close generated").await;
+}
