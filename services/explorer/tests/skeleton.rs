@@ -447,6 +447,79 @@ async fn dev_bearer_signs_in_anonymous_requests_on_localhost() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.body);
 }
 
+/// Item 2 of the review: the configured public URL being loopback is a fact
+/// about configuration, not about the request. A request whose own `Host` is
+/// not loopback, or that any proxy relayed, must not be handed the bearer —
+/// otherwise one operator slip exposes a real, write-scoped token to every
+/// anonymous visitor.
+#[tokio::test]
+async fn the_dev_bearer_is_withheld_from_a_foreign_host_or_a_proxied_request() {
+    let app = spawn_with(
+        &[
+            (ENV_PUBLIC_BASE_URL, "http://localhost:8096/explorer"),
+            (ENV_DEV_BEARER, "dev-token"),
+        ],
+        probe_routes(),
+    )
+    .await;
+    // Mounted up front, so a request that IS signed in with the bearer gets
+    // a clean 200 and the assertions below name the real failure.
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}")))
+        .and(header("authorization", "Bearer dev-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(claim_json()))
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/claims/{CLAIM}/belief")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(belief_json()))
+        .mount(&app.upstream)
+        .await;
+
+    for headers in [
+        // DNS rebinding, or a proxy that kept the public name.
+        &[("host", "explorer.example.com")][..],
+        &[("host", "explorer.example.com:8096")][..],
+        &[("host", "localhost.example.com:8096")][..],
+        // A proxy relayed this, so the loopback peer proves nothing — and a
+        // proxy may have rewritten `Host` to a loopback name itself.
+        &[
+            ("host", "localhost:8096"),
+            ("x-forwarded-for", "203.0.113.7"),
+        ][..],
+        &[("host", "localhost:8096"), ("forwarded", "for=203.0.113.7")][..],
+    ] {
+        let res = app.get_with("/explorer/probe", headers).await;
+        assert_eq!(
+            res.status,
+            StatusCode::SEE_OTHER,
+            "{headers:?} was signed in with the dev bearer: {}",
+            res.body
+        );
+        assert_eq!(
+            res.location(),
+            Some("/explorer/auth/login?return_to=%2Fexplorer%2Fprobe"),
+            "{headers:?}"
+        );
+    }
+    // `SignedIn` rejected before any upstream call, so the bearer never
+    // left the process.
+    assert!(
+        app.upstream
+            .received_requests()
+            .await
+            .is_some_and(|r| r.is_empty()),
+        "a withheld dev bearer still reached upstream"
+    );
+
+    // A direct loopback request still gets it (the guard is not a blanket
+    // refusal, and `/health` and anonymous pages are unaffected).
+    let res = app
+        .get_with("/explorer/probe", &[("host", "127.0.0.1:8096")])
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+}
+
 // ---- upstream error mapping ------------------------------------------------------
 
 #[tokio::test]

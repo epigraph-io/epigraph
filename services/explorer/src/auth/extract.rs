@@ -198,9 +198,70 @@ pub async fn resolve_auth(state: &AppState, headers: &HeaderMap) -> RequestAuth 
         }
     }
     match &state.config.dev_bearer {
-        Some(t) => RequestAuth::DevBearer(t.clone()),
+        Some(t) if dev_bearer_allowed(headers) => RequestAuth::DevBearer(t.clone()),
+        Some(_) => {
+            tracing::warn!(
+                "dev bearer withheld: this request is not a direct, unproxied call to a \
+                 loopback host"
+            );
+            RequestAuth::Anonymous
+        }
         None => RequestAuth::Anonymous,
     }
+}
+
+/// Whether *this request* may be signed in with the dev bearer.
+///
+/// `Config::from_lookup` already refuses `EPIGRAPH_EXPLORER_DEV_BEARER`
+/// unless the configured public base URL is loopback, but that is a
+/// statement about configuration, not about the request in hand. An
+/// operator slip — a public base URL left at `http://localhost:8096` while
+/// a proxy fronts the port, or a page that DNS-rebinds its own name to
+/// 127.0.0.1 — would hand a real bearer, with the signing-in user's full
+/// granted scopes, to every anonymous visitor. So the request has to earn
+/// it too:
+///
+/// - its `Host` must be a loopback name: `localhost`, an IPv4 loopback
+///   address or `[::1]`, in any case and with any port. A rebinding or
+///   proxied request carries the public name instead. A request with no
+///   `Host` at all is in-process (the integration tests) or a non-browser
+///   client; every browser sends one.
+/// - it must carry neither `X-Forwarded-For` nor `Forwarded`. Their
+///   presence means a proxy relayed the request, so the TCP peer being
+///   loopback says nothing about who sent it — and a proxy that rewrites
+///   `Host` to a loopback name would otherwise pass the check above.
+///
+/// Withholding the bearer rather than refusing the request keeps anonymous
+/// pages and `/health` working for any `Host`. This applies to the dev
+/// bearer alone, on purpose: a session cookie is bound to the origin that
+/// set it, so a rebinding page never holds one.
+pub fn dev_bearer_allowed(headers: &HeaderMap) -> bool {
+    for proxied in ["x-forwarded-for", "forwarded"] {
+        if headers.contains_key(proxied) {
+            return false;
+        }
+    }
+    let Some(raw) = headers.get(axum::http::header::HOST) else {
+        return true;
+    };
+    let Ok(host) = raw.to_str() else {
+        return false;
+    };
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // `[v6]` or `[v6]:port`.
+        let Some((v6, _)) = rest.split_once(']') else {
+            return false;
+        };
+        return v6
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|a| a.is_loopback());
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _port)| name)
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|a| a.is_loopback())
 }
 
 /// Browser-visible path + query of the request (works whether or not a
@@ -304,6 +365,64 @@ mod tests {
         assert_eq!(k, a.cache_key());
         assert_eq!(RequestAuth::Anonymous.cache_key(), "anon");
         assert_eq!(RequestAuth::DevBearer("x".into()).cache_key(), "dev");
+    }
+
+    /// The dev bearer is judged by the request, not only by the configured
+    /// public URL: a non-loopback `Host`, or any sign that a proxy relayed
+    /// the request, withholds it.
+    #[test]
+    fn only_a_direct_unproxied_loopback_request_may_carry_the_dev_bearer() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            dev_bearer_allowed(&h)
+        };
+        for ok in [
+            "localhost",
+            "localhost:8096",
+            "LocalHost:8096",
+            "127.0.0.1",
+            "127.0.0.1:8096",
+            "127.1.2.3:80",
+            "[::1]",
+            "[::1]:8096",
+        ] {
+            assert!(with(&[("host", ok)]), "{ok}");
+        }
+        for refused in [
+            "explorer.example.com",
+            "explorer.example.com:8096",
+            "localhost.example.com:8096",
+            "127.0.0.1.example.com",
+            "10.0.0.1:8096",
+            "[::2]:8096",
+            "[::1",
+            "",
+        ] {
+            assert!(!with(&[("host", refused)]), "{refused}");
+        }
+        // An in-process or non-browser request has no `Host`.
+        assert!(dev_bearer_allowed(&HeaderMap::new()));
+
+        // A forwarding header withholds the bearer even from a loopback
+        // `Host`: a proxy relayed this, so the peer says nothing about the
+        // sender, and a proxy may well have rewritten `Host` itself.
+        for proxied in [
+            &[
+                ("host", "localhost:8096"),
+                ("x-forwarded-for", "203.0.113.7"),
+            ][..],
+            &[("host", "localhost:8096"), ("forwarded", "for=203.0.113.7")][..],
+            &[("x-forwarded-for", "203.0.113.7")][..],
+            &[("forwarded", "proto=https")][..],
+        ] {
+            assert!(!with(proxied), "{proxied:?}");
+        }
     }
 
     #[test]
