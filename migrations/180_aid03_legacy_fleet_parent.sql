@@ -25,12 +25,15 @@
 --       default, which is the only shape this repairs. Every other type (a
 --       role node, a `system` or `software_agent` row) stays on 161's test,
 --       unchanged, even though the backfill keyed it too;
---   (a) it carries LLM evidence: `llm_model` in its properties (what 161
---       already accepts, recorded best-effort by the old create path) OR an
---       `operator_links` row of any state naming it as the AGENT (written only
---       by a maintenance session, so attested: an operator linked it as one
---       of its agents). This is the conjunct that refuses a keyed (ed25519)
---       human with no OAuth client and no link, which nothing below catches;
+--   (a) an operator linked it: an `operator_links` row of any state names
+--       it as the AGENT. Only a maintenance session or a maintenance-owned
+--       definer writes one (107), so this is attested: an operator linked
+--       it as one of its agents (a link retired since still attests that).
+--       `llm_model` is NOT read: the row may set it on itself, and the old
+--       create path recorded it best-effort only. This is the conjunct that
+--       refuses a keyed (ed25519) human with no OAuth client and no link,
+--       and a row that described itself as an LLM, which nothing below
+--       catches;
 --   (b) it holds an `identity-legacy` key for its own public key: 161's
 --       backfill (`epigraph_backfill_legacy_agent_keys`) gives one to every
 --       agent that exists at the cut-over and none to a host-registered
@@ -51,12 +54,20 @@
 -- 161's refusal of a live human operator (`epigraph_is_human_operator`) still
 -- applies to every parent, on either arm.
 --
--- What each input rests on. The ACCEPT side rests on attested state: the
--- legacy key, `key_kind`, `human_operators`, `operator_links`. `llm_model`
--- and `labels` are writable by the application role on its OWN row (118's
--- column grant, 077's `agents_self_update`); a principal could set
--- `llm_model` on itself, but that only matters if the HOST names it as a
--- parent, and a container never names a parent (161 section 1). The REFUSE side includes inputs the
+-- What each input rests on, and the threat. The host finds a cut-over
+-- parent by its LEGACY identity key, which anyone can compute (it derives
+-- from the model and the prompt hash), so anyone who can create an agent
+-- can plant a row under it and wait for the host to name that row as a
+-- parent: the API create path gives a `'human'` ed25519 row, the row may
+-- set `llm_model` and `labels` on itself (118's column grant, 077's
+-- `agents_self_update`), and a later run of the re-runnable key backfill
+-- gives it an `identity-legacy` key, because the backfill keys every agent
+-- that exists when it runs (humans included). So the ACCEPT side must rest
+-- on attested state only, and the operator link (a) is that: without it a
+-- planted row would be accepted silently and named, permanently, in the
+-- append-only `agent_succession` row and the display parent, where the
+-- refusal instead alerts. The legacy key (b) and the human markers (c)-(e)
+-- narrow the attested set further. The REFUSE side includes inputs the
 -- application role can write (it may INSERT `oauth_clients` by dynamic
 -- registration, and may relabel its own row): forging one of those can only
 -- make AID03 refuse, which falls back to what happened before this migration
@@ -159,10 +170,10 @@ SET search_path = public, pg_temp AS $$
             WHERE a.id = p_agent
               -- (0) the legacy create path's default type, and only that
               AND a.agent_type = 'human'
-              -- (a) LLM evidence: 161's, or an attested operator link
-              AND (a.properties ? 'llm_model'
-                   OR EXISTS (SELECT 1 FROM public.operator_links l
-                               WHERE l.agent_id = a.id))
+              -- (a) an attested operator link, of any state (never the
+              -- self-writable `llm_model`)
+              AND EXISTS (SELECT 1 FROM public.operator_links l
+                           WHERE l.agent_id = a.id)
               -- (c) not a keyless (OAuth placeholder) human
               AND a.key_kind <> 'derived'
               AND NOT ('oauth-principal' = ANY (COALESCE(a.labels, '{}'::text[])))
@@ -296,8 +307,8 @@ BEGIN
                     WHERE a.id = v_parent AND a.public_key = p_identity_pubkey) THEN
             v_parent := NULL;
         -- 180: a legacy fleet identity (agent_type 'human' by the old create
-        -- path's column default, LLM evidence, a backfilled identity-legacy
-        -- key, and no human marker) is an LLM agent too; see
+        -- path's column default, an operator link, a backfilled
+        -- identity-legacy key, and no human marker) is an LLM agent too; see
         -- `epigraph_is_legacy_fleet_parent`.
         ELSIF (NOT EXISTS (SELECT 1 FROM public.agents a
                             WHERE a.id = v_parent
@@ -782,9 +793,9 @@ BEGIN
     -- The parent: a legacy fleet identity that preceded the child.
     IF NOT public.epigraph_is_legacy_fleet_parent(p_parent)
        OR public.epigraph_is_human_operator(p_parent) THEN
-        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, LLM '
-                        'evidence, an identity-legacy key, and no human marker); nothing was '
-                        'recorded', p_parent
+        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, an '
+                        'operator link, an identity-legacy key, and no human marker); nothing '
+                        'was recorded', p_parent
             USING ERRCODE = 'AID10';
     END IF;
     IF v_parent_at > v_child_at THEN

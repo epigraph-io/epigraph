@@ -1644,9 +1644,11 @@ restart.
   a group's successor was refused and fell back to registering it with NO
   parent (no succession, no inherited link). Adds
   `epigraph_is_legacy_fleet_parent(uuid)` (maintenance-owned definer, no
-  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, LLM evidence
-  (`llm_model`, or an `operator_links` row of any state naming it as the
-  agent), an `identity-legacy` key for its own public key (161's backfill),
+  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, an
+  `operator_links` row of any state naming it as the agent (attested; the
+  self-writable `llm_model` is not read, because the host finds the parent
+  by a legacy key anyone can compute and plant a row under), an
+  `identity-legacy` key for its own public key (161's backfill),
   not a keyless OAuth human (`key_kind 'derived'` or the `oauth-principal`
   label), never a `human_operators` row (revoked included), and no
   `client_type 'human'` OAuth client naming it as `agent_id` (any status).

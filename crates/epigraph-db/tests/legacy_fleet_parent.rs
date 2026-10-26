@@ -20,14 +20,18 @@
 //!
 //! # What is under test
 //!
-//! * The legacy fleet parent is accepted, its operator is inherited, and the
-//!   succession is recorded.
+//! * The legacy fleet parent (operator-linked) is accepted, its operator is
+//!   inherited, and the succession is recorded.
+//! * A row no operator linked is refused, even when it set `llm_model` on
+//!   itself and the backfill keyed it: the parent is found by a key anyone
+//!   can compute, so only attested state may admit it.
 //! * A REAL human keeps being refused even when it carries the full legacy
-//!   shape (`llm_model`, a backfilled legacy key, `agent_type 'human'`): a
-//!   registered human operator, a revoked one, a keyless (derived) human, a
-//!   human with an OAuth human client of its own (any status), and a row
-//!   created after the backfill (no legacy key). Each case adds exactly
-//!   one marker to the accepted shape, so the marker is what refuses it.
+//!   shape (`llm_model`, an operator link, a backfilled legacy key,
+//!   `agent_type 'human'`): a registered human operator, a revoked one, a
+//!   keyless (derived) human, a human with an OAuth human client of its own
+//!   (any status), and a row created after the backfill (no legacy key). Each
+//!   case adds exactly one marker to the accepted shape, so the marker is
+//!   what refuses it.
 //! * `epigraph_record_legacy_succession` records the succession of a
 //!   parentless child (the row, the display parent, one audit row), moves no
 //!   link, is idempotent, is maintenance-only, and refuses every case outside
@@ -235,6 +239,95 @@ async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {
     assert!(out.link_live, "the manual link must be live");
 }
 
+/// A live `operator_links` row making `agent` an agent of `operator`, written
+/// by a superuser with triggers off (`session_replication_role = replica`),
+/// i.e. past the link verb's own refusals (a human operator, for one, can
+/// never be linked as an agent through it). The refuse-side cases use it so
+/// that each one carries the attested link the accepted shape requires, and
+/// its human marker is the only thing that refuses it.
+async fn link_past_the_guard(pool: &PgPool, agent: Uuid, operator: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    // The operator's personal group, minted the way the link verb mints it
+    // (with triggers ON).
+    let group: Uuid = sqlx::query_scalar("SELECT public.epigraph_ensure_personal_group($1)")
+        .bind(operator)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the operator's personal group");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let r = sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(agent)
+    .bind(operator)
+    .bind(group)
+    .execute(&mut *conn)
+    .await;
+    sqlx::query("SET session_replication_role = DEFAULT")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    assert_eq!(
+        r.expect("a link written past the guard").rows_affected(),
+        1,
+        "one link row"
+    );
+}
+
+async fn has_link(pool: &PgPool, agent: Uuid) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM operator_links WHERE agent_id = $1)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("link row")
+}
+
+/// A row made through the API create path (`agent_type 'human'`, ed25519)
+/// that then records `llm_model` on ITSELF, over an application session
+/// stamped with its own principal id (118's column grant, 077's
+/// `agents_self_update`). Nobody links it. This is what anyone holding an
+/// agent-create right can plant under a key the host computes.
+async fn self_described_llm_row(pool: &PgPool) -> Uuid {
+    let id: Uuid = AgentRepository::create(pool, &helpers::make_agent(Some("self-described")))
+        .await
+        .expect("create through the API create path")
+        .id
+        .into();
+    // No extra grant: the update rides on the migrations' own grants only.
+    let rows = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(id.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp the principal");
+        let r = sqlx::query(
+            "UPDATE agents SET properties = COALESCE(properties, '{}'::jsonb) \
+               || '{\"llm_model\":\"self-described-model\"}'::jsonb, updated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected());
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(
+        rows.expect("CALIBRATION: an application session updates its own row"),
+        1,
+        "CALIBRATION: the principal set llm_model on itself"
+    );
+    id
+}
+
 async fn retire_link(pool: &PgPool, agent: Uuid) {
     sqlx::query("UPDATE operator_links SET retired = true WHERE agent_id = $1")
         .bind(agent)
@@ -401,8 +494,9 @@ async fn a_legacy_human_typed_fleet_parent_with_a_legacy_key_is_accepted(pool: P
 }
 
 /// The old create path records `llm_model` best-effort only (a failed
-/// `set_llm_properties` leaves the row without it), so the operator link is
-/// the other LLM evidence: a legacy `'human'` row with a backfilled key and NO
+/// `set_llm_properties` leaves the row without it), and `llm_model` is
+/// self-writable anyway, so the rule does not read it: the operator link is
+/// the LLM evidence. A legacy `'human'` row with a backfilled key and NO
 /// `llm_model`, which an operator linked as one of its agents, is accepted and
 /// passes the link on.
 #[sqlx::test(migrations = "../../migrations")]
@@ -427,7 +521,7 @@ async fn a_linked_legacy_parent_without_llm_model_is_accepted(pool: PgPool) {
     // Unlinked, it has no LLM evidence at all: still refused.
     let err = try_register(&pool, &new_identity(), Some(parent), GROUP)
         .await
-        .expect_err("an unlinked legacy row with no llm_model is not an LLM agent");
+        .expect_err("an unlinked legacy row is not an LLM agent");
     assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
 
     link(&pool, parent, operator).await;
@@ -555,15 +649,18 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
     .await
     .expect("human oauth client");
 
-    // The legacy shape without `llm_model` (an ed25519 'human' row with no
-    // other marker): the LLM evidence 161 already requires.
-    let no_llm = Uuid::new_v4();
+    // An ed25519 'human' row that no operator ever linked (and with no
+    // `llm_model`): the attested LLM evidence the rule requires is missing.
+    let no_link = Uuid::new_v4();
     sqlx::query("INSERT INTO agents (id, public_key, display_name) VALUES ($1, $2, 'a person')")
-        .bind(no_llm)
+        .bind(no_link)
         .bind(random32())
         .execute(&pool)
         .await
         .expect("seed a keyed human");
+
+    // The same, carrying the `llm_model` it can set on itself.
+    let unlinked_llm = legacy_fleet_row(&pool).await;
 
     backfill_legacy_keys(&pool).await;
 
@@ -571,6 +668,26 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
     // row.
     let unkeyed = legacy_fleet_row(&pool).await;
     assert!(!has_legacy_key(&pool, unkeyed).await, "CALIBRATION: no key");
+
+    // Every case but the two unlinked ones carries the operator link the
+    // accepted shape requires, so its human marker (or its missing key) is
+    // the ONLY thing that refuses it. Written past the link verb's guards: the
+    // verb itself refuses to link some of these.
+    let linker = human_operator(&pool).await;
+    for p in [
+        operator,
+        revoked,
+        registry_only,
+        keyless,
+        labelled,
+        oauth_human,
+        unkeyed,
+    ] {
+        link_past_the_guard(&pool, p, linker).await;
+    }
+    for p in [no_link, unlinked_llm] {
+        assert!(!has_link(&pool, p).await, "CALIBRATION: never linked");
+    }
 
     for (parent, what) in [
         (operator, "a registered human operator"),
@@ -582,13 +699,23 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
         (keyless, "a keyless (derived) human"),
         (labelled, "an OAuth-principal-labelled human"),
         (oauth_human, "a human with an OAuth human client"),
-        (unkeyed, "a 'human' row with no legacy key"),
-        (no_llm, "a keyed 'human' row with no llm_model"),
+        (unkeyed, "a linked 'human' row with no legacy key"),
+        (no_link, "a keyed 'human' row no operator linked"),
+        (
+            unlinked_llm,
+            "a keyed 'human' row with llm_model that no operator linked",
+        ),
     ] {
         if parent != unkeyed {
             assert!(
                 has_legacy_key(&pool, parent).await,
                 "CALIBRATION: {what} carries a legacy key, so the marker refuses it"
+            );
+        }
+        if parent != no_link && parent != unlinked_llm {
+            assert!(
+                has_link(&pool, parent).await,
+                "CALIBRATION: {what} is operator-linked, so the marker refuses it"
             );
         }
         let before = footprint(&pool).await;
@@ -603,13 +730,146 @@ async fn a_real_human_with_the_legacy_shape_is_still_refused_aid03(pool: PgPool)
         );
     }
 
-    // POSITIVE CONTROL: the same shape with no marker is accepted (the
-    // backfill now keys `unkeyed` too, which no longer matters: it was tested).
+    // POSITIVE CONTROL: the same shape with no marker, linked by an operator
+    // through the verb, is accepted (the backfill now keys `unkeyed` too,
+    // which no longer matters: it was tested).
     let clean = legacy_fleet_row(&pool).await;
     backfill_legacy_keys(&pool).await;
+    link(&pool, clean, linker).await;
     try_register(&pool, &new_identity(), Some(clean), GROUP)
         .await
-        .expect("the unmarked legacy shape is accepted");
+        .expect("the unmarked, operator-linked legacy shape is accepted");
+}
+
+/// The parent a host finds by the legacy identity key is found by a key
+/// anyone can compute (model and prompt hash), so anyone who can create an
+/// agent can plant a row under it: the API create path gives a `'human'`
+/// ed25519 row, the row sets `llm_model` on itself, and the next run of the
+/// re-runnable key backfill gives it an `identity-legacy` key. None of that is
+/// attested. Such a row is refused AID03 and nothing changes: the host then
+/// registers the child with no parent and alerts, as before the legacy rule.
+/// Once an operator links the same row (an attested, maintenance-only act) it
+/// is accepted, so the link is what decides.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_self_described_llm_row_no_operator_linked_is_refused_aid03(pool: PgPool) {
+    let planted = self_described_llm_row(&pool).await;
+    assert!(
+        backfill_legacy_keys(&pool).await > 0,
+        "a re-run of the backfill"
+    );
+    let (agent_type, key_kind, has_model): (Option<String>, String, bool) = sqlx::query_as(
+        "SELECT agent_type, key_kind, properties ? 'llm_model' FROM agents WHERE id = $1",
+    )
+    .bind(planted)
+    .fetch_one(&pool)
+    .await
+    .expect("the planted row");
+    assert_eq!(
+        (agent_type.as_deref(), key_kind.as_str(), has_model),
+        (Some("human"), "ed25519", true),
+        "CALIBRATION: the planted row has the legacy shape"
+    );
+    assert!(
+        has_legacy_key(&pool, planted).await,
+        "CALIBRATION: the backfill keyed it"
+    );
+    assert!(!has_link(&pool, planted).await, "CALIBRATION: unlinked");
+
+    let before = footprint(&pool).await;
+    let err = try_register(&pool, &new_identity(), Some(planted), GROUP)
+        .await
+        .expect_err("an unlinked self-described row is not a parent");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+
+    // POSITIVE CONTROL: the same row once an operator linked it.
+    let operator = human_operator(&pool).await;
+    link(&pool, planted, operator).await;
+    let child = try_register(&pool, &new_identity(), Some(planted), GROUP)
+        .await
+        .expect("an operator-linked legacy row is accepted");
+    assert!(child.succession_created, "{child:?}");
+}
+
+/// The shape of a real cut-over parent: three legacy fleet identities of ONE
+/// operator, each `agent_type 'human'` (the old default) with `llm_model`, a
+/// live operator link, an `identity-legacy` key for its own public key, key
+/// kind `ed25519`, no `oauth-principal` label, no `human_operators` row and
+/// no human OAuth client. Each is accepted as a parent and passes its
+/// operator on. A link the operator has since RETIRED still attests the
+/// parent (the legacy links are scheduled for retirement), so a parent
+/// retired before its group registers is accepted too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let mut parents = Vec::new();
+    for _ in 0..3 {
+        parents.push(legacy_fleet_row(&pool).await);
+    }
+    backfill_legacy_keys(&pool).await;
+    for p in &parents {
+        link(&pool, *p, operator).await;
+    }
+    for p in &parents {
+        #[allow(clippy::type_complexity)]
+        let shape: (
+            Option<String>,
+            bool,
+            bool,
+            bool,
+            String,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT a.agent_type, \
+                    a.properties ? 'llm_model', \
+                    EXISTS (SELECT 1 FROM operator_links l \
+                             WHERE l.agent_id = a.id AND NOT l.retired), \
+                    EXISTS (SELECT 1 FROM agent_keys k WHERE k.agent_id = a.id \
+                               AND k.key_type = 'identity-legacy' \
+                               AND k.public_key = a.public_key), \
+                    a.key_kind, \
+                    'oauth-principal' = ANY (COALESCE(a.labels, '{}'::text[])), \
+                    EXISTS (SELECT 1 FROM human_operators h WHERE h.agent_id = a.id), \
+                    EXISTS (SELECT 1 FROM oauth_clients c \
+                             WHERE c.agent_id = a.id AND c.client_type = 'human') \
+               FROM agents a WHERE a.id = $1",
+        )
+        .bind(p)
+        .fetch_one(&pool)
+        .await
+        .expect("the parent's shape");
+        assert_eq!(
+            shape,
+            (
+                Some("human".to_string()),
+                true,
+                true,
+                true,
+                "ed25519".to_string(),
+                false,
+                false,
+                false
+            ),
+            "CALIBRATION: the cut-over parent shape"
+        );
+        let child = try_register(&pool, &new_identity(), Some(*p), GROUP)
+            .await
+            .expect("an operator-linked legacy parent is accepted");
+        assert!(
+            child.succession_created && child.inherited && child.link_live,
+            "{child:?}"
+        );
+        assert_eq!(child.operator_id, Some(operator));
+    }
+
+    retire_link(&pool, parents[0]).await;
+    let child = try_register(&pool, &new_identity(), Some(parents[0]), GROUP)
+        .await
+        .expect("a parent whose link was retired is still attested");
+    assert!(child.succession_created, "{child:?}");
+    assert_eq!(child.inherit_reason.as_deref(), Some("parent_link_retired"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
