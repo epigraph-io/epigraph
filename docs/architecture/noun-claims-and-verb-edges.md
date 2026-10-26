@@ -104,7 +104,22 @@ Writers are responsible for retry/cleanup if the verb-edge call fails after the 
 
 ## Edge signing
 
-Schema supports `signature` / `signer_id` on edges (migration 073). S1 does not require edge signing; the existing `EdgeRepository::create` call passes `None` for signature fields. S3 writer plans specify the signing strategy per writer (host_agent has key material; ingest scripts may not). The "same audit guarantee as claim signatures" claim above is therefore aspirational — schema-supported, S3-realised.
+`edges` carries `signature`, `signer_id` and `content_hash` (initial schema; migration 117's `edges_repoint_unsign` clears all three when a non-privileged session re-points an edge). The "same audit guarantee as claim signatures" claim above is still aspirational: what an edge signature covers, how it is written and how it is checked are now defined, but no writer signs yet.
+
+**What is signed** (`epigraph_db::repos::edge_signature`). The attestation digest is BLAKE3 over the canonical JSON of the stored row's `{schema: "epigraph-edge-attestation/1", id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, created_at}` (timestamps RFC 3339, microseconds, UTC). It is stored in `edges.content_hash`, and the signature is over the v1 edge message `epigraph-sig-v1:edge:` || digest, so it never verifies as a claim or evidence signature. `id` and `created_at` bind it to the row; `valid_to` is excluded, so a retraction never reads as tampering; `properties` is included, so a later patch (`patch_edge`, a workflow's `plan_index` rewrite) or an administrative re-point leaves `signature_valid: true` with `content_matches: false` ("changed since it was signed").
+
+**How it is written.** `EdgeSignatureRepository::sign_created_edge_conn(conn, edge_id, signer, signer_id)` runs on the writer's own stamped connection, right after the INSERT, and only for an edge this act created (never on a dedup hit). It locks the row `FOR UPDATE`, so migration 117's owner-scoped UPDATE policy stops anyone but the edge's owner from attesting it, and it never overwrites an existing attestation. `verify_conn` checks it; `coverage` (viewer-scoped) is the unsigned-edge metric, reported by `system_stats` (`detailed: true`) as `edges_signed` / `edges_unsigned`.
+
+**Writer inventory.** `crates/epigraph-db/tests/edge_writer_signing_ratchet.rs` is the measured register of every edge-emitting site under `crates/*/src` (98 sites in 58 functions when it landed), each with its signing status. A new site fails the test until it is registered; a site registered `Signed` must call `sign_created_edge_conn`; the unsigned count only goes down. Why each group does not sign today:
+
+| Writers | Key material | Status |
+|---|---|---|
+| `epigraph-mcp` (verb-edges in `claim_helper.rs`, the `link_*` tools, ingestion, perspectives, auth lineage, `resolve_backlog_item`) | the MCP server's signing key | Unsigned, pending a ruling: the pair CHECK requires `signer_id` with a signature, and `backfill_factors`' `EDGE_QUERY` reads `COALESCE(e.signer_id, src.agent_id)` as an edge factor's agent, so stamping the server's agent changes that attribution |
+| `epigraph-api` routes | none: HTTP claims are signed by their client in the packet | Unsigned; giving the API server a key is a deployment decision |
+| `epigraph-ingest-executor`, `epigraph-engine` matching, operator CLIs | none | Unsigned; a caller that holds a key would sign through the returned edge ids |
+| repository acts in `epigraph-db` (supersede, dedup, consolidate, analysis, semantic links, match promotion) and the `EdgeRepository` primitives | none | Unsigned; the signing caller has to receive the edge id |
+
+Since migration 120 the author of an edge is `edges.writer_group_id`, not `signer_id`. On legacy rows `signer_id` is, where set, a bulk attestation key; `epigraph_reown_legacy_edges_to_signer` takes a mandatory exclusion list of non-author signing keys, which would have to include the MCP server's agent once that server signs.
 
 ## Supersession carries verb-edges, except a step's frozen ones
 
