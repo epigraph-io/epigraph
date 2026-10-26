@@ -115,6 +115,11 @@ const EXCLUDED: &[(&str, &str)] = &[
         "role-to-group bindings (165): maintenance-written governance, read only by the \
          derivation definers",
     ),
+    (
+        "role_agents",
+        "role attachments (166): maintenance-written, read only through the role-agent \
+         definers; an attachment confers no read and widens nothing",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (

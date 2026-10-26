@@ -94,7 +94,7 @@ pub use admin_scope_enforcement::{
 };
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
-    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
 };
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};

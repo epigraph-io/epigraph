@@ -218,8 +218,11 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
         },
         // Migration 122's OPL01: the author is not bound to a human operator.
         // The same class of denial; its rendering carries the code and the fix.
+        // Migration 166's ROL01 (a role's agent without its live holder) is
+        // the same class.
         e @ (epigraph_db::DbError::OperatorLinkRequired { .. }
-        | epigraph_db::DbError::OperatorScopeRefused { .. }) => McpError {
+        | epigraph_db::DbError::OperatorScopeRefused { .. }
+        | epigraph_db::DbError::RoleHolderRequired { .. }) => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(e.to_string()),
             data: None,
@@ -355,6 +358,16 @@ mod tests {
         });
         assert_eq!(scope.code, ErrorCode::INVALID_REQUEST);
         assert!(scope.message.contains("OPL02"), "{}", scope.message);
+
+        let role = db_caller_error(epigraph_db::DbError::RoleHolderRequired {
+            message: "ROL01: agent a is attached to role r".to_string(),
+        });
+        assert_eq!(
+            role.code,
+            ErrorCode::INVALID_REQUEST,
+            "a role's agent without its holder is a denial, not a server fault"
+        );
+        assert!(role.message.contains("ROL01"), "{}", role.message);
 
         // An elevated request asking to write (EL-6): a denial, not a fault.
         let elevated = db_caller_error(epigraph_db::DbError::ElevatedReadOnly);

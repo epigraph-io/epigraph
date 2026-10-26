@@ -843,6 +843,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The key the agent is found by: the identity key in the separate-signing-key
     // mode, the signer's own key otherwise.
     let identity_key = identity_public_key.unwrap_or_else(|| signer.public_key());
+    // Migration 166: an agent attached to a role runs only while its linked
+    // human holds the role. Refused at boot, on every transport, so a gap
+    // fails fast instead of at the first write (ROL01). Read-only, and before
+    // `self_link` or any tool resolves (and so may create) the agent row.
+    match epigraph_mcp::role_gate::check_role_holder(&pool, &identity_key).await {
+        Ok(Some((agent, gate))) if gate.role.is_some() => tracing::info!(
+            agent_id = %agent,
+            role = gate.role.as_deref().unwrap_or_default(),
+            "role-attached agent: its linked human holds the role"
+        ),
+        Ok(_) => {}
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(1);
+        }
+    }
     tracing::info!(public_key = %hex::encode(identity_key), "Agent identity ready");
 
     // Create embedder.

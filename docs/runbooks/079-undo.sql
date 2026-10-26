@@ -128,7 +128,10 @@ DECLARE t text;
           'agent_prompt_blobs','agent_prompt_snapshots','agent_succession',
           -- ---- role-to-group bindings (165) ------------------------------
           -- FORCEd by 165 at creation, same precedent and reason.
-          'group_role_bindings'];
+          'group_role_bindings',
+          -- ---- role-attached agents (166) --------------------------------
+          -- FORCEd by 166 at creation, same precedent and reason.
+          'role_agents'];
 BEGIN
     FOREACH t IN ARRAY protected LOOP
         IF EXISTS (SELECT 1 FROM pg_class c

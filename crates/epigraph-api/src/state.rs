@@ -700,6 +700,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // The role-to-group bindings (165), FORCEd by the migration that creates
     // them, on the same precedent.
     "group_role_bindings",
+    // Role-attached agents (166), FORCEd by the migration that creates it, on
+    // the same precedent.
+    "role_agents",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
