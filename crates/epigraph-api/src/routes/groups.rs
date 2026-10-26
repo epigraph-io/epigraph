@@ -494,6 +494,9 @@ pub async fn add_member(
 /// Refuses (409) to remove the group's LAST live admin — that would leave the
 /// group permanently unadministrable, since `require_group_admin_conn` is the only
 /// way in and there is no break-glass path.
+///
+/// Every refusal the DATABASE makes on this route is a 403, never a 500 (ruling
+/// R-56): see [`removal_db_error`].
 pub async fn remove_member(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -510,9 +513,7 @@ pub async fn remove_member(
     // Verify group exists
     GroupRepository::get_by_id_conn(&mut tx, group_id)
         .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to query group: {e}"),
-        })?
+        .map_err(|e| removal_db_error(e, "Failed to query group"))?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Group".to_string(),
             id: group_id.to_string(),
@@ -539,12 +540,10 @@ pub async fn remove_member(
         &mut tx, group_id, agent_id,
     )
     .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: format!("Failed to remove member: {e}"),
-    })?;
-    tx.commit().await.map_err(|e| ApiError::DatabaseError {
-        message: format!("Failed to commit member removal: {e}"),
-    })?;
+    .map_err(|e| removal_db_error(e, "Failed to remove member"))?;
+    tx.commit()
+        .await
+        .map_err(|e| removal_db_error(e, "Failed to commit member removal"))?;
 
     match outcome {
         epigraph_db::RevokeOutcome::Revoked => {}
@@ -570,6 +569,38 @@ pub async fn remove_member(
     );
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The answer `DELETE /api/v1/groups/:id/members/:agent_id` gives a database
+/// error (ruling R-56, backlog 323773fe).
+///
+/// SQLSTATE 42501 is the database refusing THIS caller this roster change: a
+/// policy's `WITH CHECK`, migration 181's re-key mark (`GRA01`), or migration
+/// 164's verb-made team group, whose roster only the maintenance verbs write.
+/// That is a denial, not a server fault, so it is a 403; the refusal aborts the
+/// transaction, so nothing was changed. The writer-authority refusals the
+/// other write surfaces answer 403 ([`epigraph_db::DbError::is_write_authority_refusal`])
+/// keep their own mapping. Anything else is still a 500.
+fn removal_db_error(e: epigraph_db::DbError, context: &str) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        tracing::info!(
+            target: "tenancy.scoped_write",
+            error = %e,
+            handler = "groups::remove_member",
+            "member removal refused by the database"
+        );
+        return ApiError::Forbidden {
+            reason: "the database refused this membership change for the caller; nothing was \
+                     changed"
+                .to_string(),
+        };
+    }
+    if e.is_write_authority_refusal() {
+        return ApiError::from(e);
+    }
+    ApiError::DatabaseError {
+        message: format!("{context}: {e}"),
+    }
 }
 
 /// Get group info including member count.
