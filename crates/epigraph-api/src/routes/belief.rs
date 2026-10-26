@@ -296,6 +296,14 @@ struct ScopedBeliefWrite {
 /// the engine's owner-aware rule (ruling R-36: sibling agents of one human
 /// are reduced cautiously, never multiplied). `None` when no row is left or
 /// the fold fails (best-effort, as before).
+///
+/// Stored-row semantics (changed with R-22 / R-36): `mass_on_empty` and
+/// `conflict_k` are both the conflict the WHOLE fold saw (every step,
+/// sibling reductions included), where `conflict_k` used to be the last
+/// pairwise step's K; for two BBAs they are the same number. A single BBA is
+/// not folded: `mass_on_empty` is its own conflict mass, `conflict_k` and
+/// `strategy` are NULL, as before. `strategy` is `Dempster`, or
+/// `cautious+Dempster` when a same-human sibling group was reduced.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn scoped_belief_write(
@@ -330,6 +338,7 @@ async fn scoped_belief_write(
         .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope sources: {e}"))
         .ok()?;
     let folded = rows.len() >= 2;
+    let cautious = epigraph_engine::source_dependence::has_same_owner_siblings(&sources);
     let items = sources
         .into_iter()
         .zip(rows.into_iter().map(|(_, m)| m))
@@ -349,7 +358,15 @@ async fn scoped_belief_write(
         mass_on_empty: k,
         mass_on_missing,
         conflict_k: folded.then_some(k),
-        strategy: folded.then(|| "Dempster".to_string()),
+        // The rule that produced the stored fold, in the spelling `/assess`
+        // already stores for a cautious-then-Dempster fold.
+        strategy: folded.then(|| {
+            if cautious {
+                "cautious+Dempster".to_string()
+            } else {
+                "Dempster".to_string()
+            }
+        }),
         pignistic_prob,
     })
 }

@@ -398,6 +398,19 @@ pub async fn bba_sources_for_rows(
         .collect())
 }
 
+/// Whether any owner speaks through at least two distinct agents among
+/// `sources`, i.e. whether [`combine_with_owner_dependence`] reduces a sibling
+/// group cautiously rather than folding everything by Dempster's rule. For a
+/// caller that records which rule produced a stored fold.
+#[must_use]
+pub fn has_same_owner_siblings(sources: &[BbaSource]) -> bool {
+    let mut seen: HashMap<Uuid, Uuid> = HashMap::new();
+    sources.iter().any(|s| match (s.owner_id, s.agent_id) {
+        (Some(owner), Some(agent)) => *seen.entry(owner).or_insert(agent) != agent,
+        _ => false,
+    })
+}
+
 /// The inputs of the owner-aware fold, before its final Dempster step.
 struct OwnerPartition {
     /// Everything outside a sibling group, in row order, with its
@@ -1506,6 +1519,16 @@ mod tests {
             "got {}",
             m_true(&out[1])
         );
+    }
+
+    #[test]
+    fn sibling_detection_matches_the_partition() {
+        assert!(has_same_owner_siblings(&[by(1, 9), by(3, 7), by(2, 9)]));
+        assert!(!has_same_owner_siblings(&[by(1, 9), by(1, 9), by(3, 7)]));
+        assert!(!has_same_owner_siblings(&[
+            BbaSource::default(),
+            BbaSource::keyed(None)
+        ]));
     }
 
     #[test]

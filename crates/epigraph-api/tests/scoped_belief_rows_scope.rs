@@ -26,7 +26,9 @@ use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
 use sqlx::PgPool;
 use uuid::Uuid;
-use viewer_fixture::{scoped_pool, seed_agent_with_group, seed_evidence, seed_public_claim};
+use viewer_fixture::{
+    scoped_pool, seed_agent_with_group, seed_evidence, seed_human_operator, seed_public_claim,
+};
 
 const EPS: f64 = 1e-9;
 
@@ -206,4 +208,81 @@ async fn stored_scoped_beliefs_never_fold_a_bba_citing_narrowed_evidence(pool: P
         "{single:?}"
     );
     assert!(single.mass_on_empty.abs() < EPS, "{single:?}");
+}
+
+async fn link(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("link the agent to its human");
+    assert!(out.link_live, "{out:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stored_perspective_belief_reduces_siblings_and_records_its_rule(pool: PgPool) {
+    let state = state(&pool).await;
+    let frame = frame(&pool, "r36_scoped_rows").await;
+    let (human, _) = seed_human_operator(&pool, "r36-scoped-human").await;
+    let (one, _) = seed_agent_with_group(&pool, "r36-scoped-one").await;
+    let (two, _) = seed_agent_with_group(&pool, "r36-scoped-two").await;
+    link(&pool, one, human).await;
+    link(&pool, two, human).await;
+    let (stranger, _) = seed_agent_with_group(&pool, "r36-scoped-stranger").await;
+    let (author, _) = seed_agent_with_group(&pool, "r36-scoped-author").await;
+    let p = perspective(&pool, author, frame, "r36 scoped perspective").await;
+    let claim = |label: &'static str| {
+        let pool = pool.clone();
+        async move { seed_public_claim(&pool, author, label).await }
+    };
+    let alone = claim("r36 scoped: stronger sibling alone").await;
+    let siblings = claim("r36 scoped: siblings").await;
+    let owners = claim("r36 scoped: different owners").await;
+    let contest = claim("r36 scoped: a contest").await;
+
+    submit(&state, &pool, two, alone, frame, p, support(0.7)).await;
+    // The stronger sibling first, so "the latest row wins" cannot pass.
+    submit(&state, &pool, two, siblings, frame, p, support(0.7)).await;
+    submit(&state, &pool, one, siblings, frame, p, support(0.6)).await;
+    submit(&state, &pool, two, owners, frame, p, support(0.7)).await;
+    submit(&state, &pool, stranger, owners, frame, p, support(0.6)).await;
+    submit(&state, &pool, two, contest, frame, p, support(0.6)).await;
+    let refute = serde_json::json!({"1": 0.5, "0,1": 0.5});
+    submit(&state, &pool, stranger, contest, frame, p, refute).await;
+
+    let a = stored(&pool, alone, frame, Some(p)).await;
+    let s = stored(&pool, siblings, frame, Some(p)).await;
+    assert!(
+        (s.belief - a.belief).abs() < EPS
+            && (s.plausibility - a.plausibility).abs() < EPS
+            && s.pignistic_prob
+                .zip(a.pignistic_prob)
+                .is_some_and(|(x, y)| (x - y).abs() < EPS),
+        "the stored perspective belief aggregated two agents of one human: {s:?} vs the \
+         stronger alone {a:?}"
+    );
+    assert_eq!(
+        s.strategy_used.as_deref(),
+        Some("cautious+Dempster"),
+        "the stored row names the rule that produced it: {s:?}"
+    );
+    assert!(
+        s.conflict_k.is_some_and(|k| k.abs() < EPS) && s.mass_on_empty.abs() < EPS,
+        "agreeing siblings carry no conflict: {s:?}"
+    );
+
+    let o = stored(&pool, owners, frame, Some(p)).await;
+    assert!(
+        o.belief > a.belief + 1e-3,
+        "agents of different owners must still reinforce: {o:?} vs {a:?}"
+    );
+    assert_eq!(o.strategy_used.as_deref(), Some("Dempster"), "{o:?}");
+
+    // A two-BBA contest: Dempster's K = 0.6 * 0.5 = 0.3, stored as both the
+    // fold's conflict and its (only) step's K, as before.
+    let c = stored(&pool, contest, frame, Some(p)).await;
+    assert!(
+        (c.mass_on_empty - 0.3).abs() < EPS && c.conflict_k.is_some_and(|k| (k - 0.3).abs() < EPS),
+        "a contest's conflict: {c:?}"
+    );
+    assert_eq!(c.strategy_used.as_deref(), Some("Dempster"), "{c:?}");
 }
