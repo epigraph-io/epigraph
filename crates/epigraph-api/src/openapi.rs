@@ -457,7 +457,8 @@ async fn evolve_step_doc() {}
     params(
         ("q" = String, Query, description = "Search query"),
         ("limit" = Option<i64>, Query, description = "Maximum results (default: 10, max: 50)"),
-        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions"),
+        ("resolve_to_latest" = Option<bool>, Query, description = "Whether to resolve steps to latest versions. When true, the lineage head (highest generation) of every matched canonical_name is always returned, and each entry carries is_lineage_head, lineage_head_generation and lineage_head_deprecated (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group. The result can exceed limit by one head per matched lineage."),
+        ("min_truth" = Option<f64>, Query, description = "Minimum truth_value to surface (default: 0.3, so rows deprecated via deprecate_workflow at 0.05 drop out). With resolve_to_latest it also decides which lineage heads are flagged deprecated and sorted after their group's live rows."),
     ),
     responses(
         (status = 200, body = HierarchicalSearchResponse),

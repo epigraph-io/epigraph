@@ -1314,8 +1314,11 @@ impl WorkflowRepository {
     ///
     /// When `resolve_to_latest` is true, callers want the newest generation
     /// per `canonical_name`; ordering becomes `(canonical_name ASC,
-    /// generation DESC, created_at DESC)` so callers can dedup by walking
-    /// the head of each canonical group without a sort.
+    /// deprecated LAST, generation DESC, created_at DESC)`, where "deprecated"
+    /// is `truth_value < min_truth`. A live head therefore leads its canonical
+    /// group, and a deprecated head (only the added head can be below
+    /// `min_truth`) sorts after the live rows of its group: still returned,
+    /// never the first row a caller walking the group picks.
     ///
     /// **`resolve_to_latest` also guarantees the lineage head is present.** The
     /// ILIKE predicate matches each row's OWN goal text, and sibling
@@ -1357,7 +1360,9 @@ impl WorkflowRepository {
         let sql = if resolve_to_latest {
             // `matched` is the old statement, LIMIT included; `heads` adds the
             // highest generation of each matched canonical_name with no goal
-            // or truth filter. Both read `workflows` alone.
+            // or truth filter. Both read `workflows` alone. The union is
+            // wrapped so the ORDER BY may sort on an expression: a head below
+            // `min_truth` ($2) trails the live rows of its group.
             "WITH matched AS ( \
                  SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
                  FROM workflows \
@@ -1373,10 +1378,12 @@ impl WorkflowRepository {
                  WHERE w.canonical_name IN (SELECT canonical_name FROM matched) \
                  ORDER BY w.canonical_name, w.generation DESC \
              ) \
-             SELECT * FROM matched \
-             UNION ALL \
-             SELECT * FROM heads h WHERE h.id NOT IN (SELECT id FROM matched) \
-             ORDER BY canonical_name ASC, generation DESC, created_at DESC, id ASC"
+             SELECT * FROM ( \
+                 SELECT * FROM matched \
+                 UNION ALL \
+                 SELECT * FROM heads h WHERE h.id NOT IN (SELECT id FROM matched) \
+             ) u \
+             ORDER BY canonical_name ASC, (truth_value < $2) ASC, generation DESC, created_at DESC, id ASC"
                 .to_string()
         } else {
             "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
@@ -1410,9 +1417,11 @@ impl WorkflowRepository {
     /// With `resolve_to_latest`, as in [`Self::search_hierarchical_by_text`],
     /// the lineage head of every matched `canonical_name` is guaranteed
     /// present: a head with no `goal_embedding`, below the similarity floor,
-    /// below `min_truth` or past the LIMIT is added. An added head sorts at its
-    /// group's best match distance, ahead of that match, so the matched rows
-    /// keep their relative order.
+    /// below `min_truth` or past the LIMIT is added. An added LIVE head sorts at
+    /// its group's best match distance, ahead of that match; an added
+    /// DEPRECATED head (`truth_value < min_truth`) sorts at its group's worst
+    /// match distance, after that match, so it trails every live row of its
+    /// group. Either way the matched rows keep their relative order.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
@@ -1447,8 +1456,10 @@ impl WorkflowRepository {
             // highest generation of each matched canonical_name with no
             // embedding, similarity or truth filter. All three CTEs read
             // `workflows` alone. The final ORDER BY sits on the outermost
-            // SELECT: an injected head (no distance) takes its group's best
-            // distance and sorts ahead of that row.
+            // SELECT: an injected live head (no distance) takes its group's
+            // best distance and sorts ahead of that row; an injected
+            // deprecated head takes the group's worst distance and sorts after
+            // it. Only an injected head can be below `min_truth` ($3).
             let sql = "WITH q AS (SELECT $1::vector AS v), \
                  matched AS ( \
                      SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
@@ -1472,13 +1483,17 @@ impl WorkflowRepository {
                      SELECT h.*, true AS injected FROM heads h \
                      WHERE h.id NOT IN (SELECT id FROM matched) \
                  ), ranked AS ( \
-                     SELECT c.*, COALESCE(c.distance, \
-                                MIN(c.distance) OVER (PARTITION BY c.canonical_name)) AS sort_distance \
+                     SELECT c.*, (c.truth_value < $3) AS deprecated, \
+                            CASE WHEN c.truth_value < $3 \
+                                 THEN MAX(c.distance) OVER (PARTITION BY c.canonical_name) \
+                                 ELSE COALESCE(c.distance, \
+                                      MIN(c.distance) OVER (PARTITION BY c.canonical_name)) \
+                            END AS sort_distance \
                      FROM combined c \
                  ) \
                  SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, truth_value \
                  FROM ranked \
-                 ORDER BY sort_distance ASC, injected DESC, generation DESC, created_at DESC, id ASC";
+                 ORDER BY sort_distance ASC, deprecated ASC, injected DESC, generation DESC, created_at DESC, id ASC";
             return sqlx::query_as::<_, HierarchicalWorkflowRow>(sql)
                 .bind(&vec_str)
                 .bind(similarity_threshold)
@@ -2698,8 +2713,13 @@ mod tests {
         .await
         .unwrap();
         let gens: Vec<i32> = hits.iter().map(|h| h.generation).collect();
-        assert_eq!(gens, vec![2, 1, 0], "head injected first in its group");
-        assert_eq!(hits[0].id, head);
+        assert_eq!(
+            gens,
+            vec![1, 0, 2],
+            "the head (truth 0.05, below min_truth) is injected but, being \
+             deprecated, trails the live rows of its group"
+        );
+        assert_eq!(hits[2].id, head);
 
         let hits = WorkflowRepository::search_hierarchical_by_text(
             &pool,
@@ -2711,5 +2731,148 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hits.len(), 2, "default mode unchanged");
+    }
+
+    /// Seeds `canonical` gens 0..=1 (live, truth 1.0 and 0.6, goal
+    /// "consider all available tools") and a head at gen 2 with
+    /// `head_truth` and a goal the text query misses. Gen 0 sits at cosine
+    /// similarity 0.8 to the axis-0 query vector, gen 1 at 1.0, and the head
+    /// has no embedding, so on both search paths the head is ADDED. Returns
+    /// `(ids by generation, query vector)`.
+    async fn seed_threshold_lineage(
+        pool: &sqlx::PgPool,
+        canonical: &str,
+        head_truth: f64,
+    ) -> (Vec<uuid::Uuid>, Vec<f32>) {
+        let mut qvec = vec![0.0f32; 1536];
+        qvec[0] = 1.0;
+        let mut near = vec![0.0f32; 1536];
+        near[0] = 0.8;
+        near[1] = 0.6;
+        let mut ids = Vec::new();
+        for (g, goal, truth, emb) in [
+            (0, "consider all available tools", 1.0, Some(&near)),
+            (1, "consider all available tools", 0.6, Some(&qvec)),
+            (2, "rewrite the plan", head_truth, None),
+        ] {
+            let id = uuid::Uuid::new_v4();
+            WorkflowRepository::insert_root(
+                pool,
+                id,
+                canonical,
+                g,
+                goal,
+                None,
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+            WorkflowRepository::set_truth_value(pool, id, truth)
+                .await
+                .unwrap();
+            if let Some(v) = emb {
+                WorkflowRepository::set_goal_embedding(pool, id, v)
+                    .await
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+        (ids, qvec)
+    }
+
+    /// Text path: "deprecated" is `truth_value < min_truth` for the CALLER's
+    /// `min_truth`, not a constant. A 0.4 head leads at 0.3 and trails at
+    /// 0.5; a 0.05 head leads at 0.0. Each case fails a hardcoded threshold
+    /// (`< 0.3` fails 0.5, `<= 0.05` fails 0.5, any constant above 0.05
+    /// fails 0.0).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_hierarchical_by_text_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, _) = seed_threshold_lineage(&pool, "text-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let p = &pool;
+        let at = move |min_truth: f64| {
+            WorkflowRepository::search_hierarchical_by_text(
+                p,
+                "available tools",
+                10,
+                min_truth,
+                true,
+            )
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
+        );
+    }
+
+    /// Embedding path, the same thresholds. A deprecated head takes its
+    /// group's WORST distance, which here is gen 0's: the tie is decided by
+    /// the `deprecated` tiebreak alone (`injected DESC` would put the head
+    /// first). A live head takes the BEST distance, gen 1's. The statement
+    /// spells the predicate twice (tiebreak column, distance CASE); with
+    /// either copy on a constant `< 0.3`, the 0.5 case comes out by
+    /// generation `[1, 2, 0]` instead of `[1, 0, 2]`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn find_hierarchical_by_embedding_deprecation_follows_min_truth(pool: sqlx::PgPool) {
+        let (ids, qvec) = seed_threshold_lineage(&pool, "embed-threshold-test", 0.4).await;
+        let order = |hits: Vec<HierarchicalWorkflowRow>| -> Vec<uuid::Uuid> {
+            hits.iter().map(|h| h.id).collect()
+        };
+        let leads = vec![ids[2], ids[1], ids[0]];
+        let trails = vec![ids[1], ids[0], ids[2]];
+
+        let (p, q) = (&pool, &qvec[..]);
+        let at = move |min_truth: f64| {
+            WorkflowRepository::find_hierarchical_by_embedding(p, q, 0.5, min_truth, 10, true)
+        };
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            leads,
+            "0.4 head at min_truth 0.3 is live"
+        );
+        assert_eq!(
+            order(at(0.5).await.unwrap()),
+            trails,
+            "0.4 head at min_truth 0.5 is deprecated"
+        );
+
+        WorkflowRepository::set_truth_value(&pool, ids[2], 0.05)
+            .await
+            .unwrap();
+        assert_eq!(
+            order(at(0.0).await.unwrap()),
+            leads,
+            "0.05 head at min_truth 0.0 is live"
+        );
+        assert_eq!(
+            order(at(0.3).await.unwrap()),
+            trails,
+            "0.05 head at min_truth 0.3 is deprecated"
+        );
     }
 }

@@ -735,10 +735,16 @@ pub struct QueryClaimsByLabelParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "Skip the first N matching claims (default 0). Combine with `limit` to page through large result sets — results are ordered by `created_at DESC`."
+        description = "Skip the first N matching claims (default 0). Kept for compatibility; prefer `after`, whose page boundaries do not drift under concurrent writes. Results are ordered by `(created_at DESC, id DESC)`."
     )]
     #[serde(default)]
     pub offset: Option<i64>,
+
+    #[schemars(
+        description = "Opaque keyset cursor. When present, the response is an object {claims: [...], next_cursor: string|null} instead of a bare array: pass \"\" for the first page, then each response's next_cursor unchanged; next_cursor is null once the set is exhausted. Omit it for the legacy bare-array response. Cannot be combined with a non-zero `offset`."
+    )]
+    #[serde(default)]
+    pub after: Option<String>,
 
     #[schemars(
         description = "Opt-in (default false). When true, each returned claim carries `source_urls`: the URLs of the evidence attached to it (the evidence `source_url`; for older rows a document URL, an http(s) testimony source, or a DOI as https://doi.org/<doi>), oldest evidence first, deduplicated. Costs one extra batched query for the page. When false the response is unchanged and no `source_urls` key is present."
@@ -940,7 +946,7 @@ pub struct FindWorkflowHierarchicalParams {
     pub limit: Option<i64>,
 
     #[schemars(
-        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth), and the head leads its lineage group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
+        description = "When true, walk each step's step_lineage_id to the head version(s) and surface them as `resolved_steps`, and guarantee the true lineage head is present for every matched canonical_name: its highest generation (the one improve_workflow_hierarchy builds on) is added even when its goal does not match the query, it has no goal embedding, or its truth is below min_truth. Each entry then carries `is_lineage_head`, `lineage_head_generation` and `lineage_head_deprecated` (the head's truth is below min_truth); a live head leads its lineage group, while a deprecated head (truth below min_truth) sorts after the live rows of its group; the result can exceed `limit` by one head per matched lineage. Defaults to false (frozen step references, matched rows only, newest-created-at first)."
     )]
     pub resolve_to_latest: Option<bool>,
 
