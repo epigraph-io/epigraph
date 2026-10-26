@@ -176,6 +176,89 @@ pub struct CompoundNeighborRow {
     pub pignistic_prob: Option<f64>,
 }
 
+/// The node table `POST /api/v1/graph/query` anchors on (a closed set: no
+/// caller string ever reaches a table name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GqlNodeTable {
+    Claims,
+    Evidence,
+    Agents,
+    ReasoningTraces,
+}
+
+impl GqlNodeTable {
+    const fn table(self) -> &'static str {
+        match self {
+            Self::Claims => "claims",
+            Self::Evidence => "evidence",
+            Self::Agents => "agents",
+            Self::ReasoningTraces => "reasoning_traces",
+        }
+    }
+
+    /// `agents` carries no tenancy columns (it is not in migration 062's
+    /// `tier_a`), so it is the one anchor with no predicate to splice.
+    const fn tenanted(self) -> bool {
+        !matches!(self, Self::Agents)
+    }
+}
+
+/// A column a graph-query condition may name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GqlColumn {
+    TruthValue,
+    /// `(properties->>'confidence')::float8`.
+    Confidence,
+    /// `properties->>'<name>'`; `name` must be ASCII alphanumeric or `_`.
+    Property(String),
+}
+
+/// A graph-query comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GqlOp {
+    Eq,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+/// A graph-query comparison value. Numbers and text are bound; a boolean is
+/// written into the statement (it is one of two fixed tokens).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GqlValue {
+    Number(f64),
+    Text(String),
+    Bool(bool),
+}
+
+/// One `WHERE` condition on the anchor table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GqlCondition {
+    pub column: GqlColumn,
+    pub op: GqlOp,
+    pub value: GqlValue,
+}
+
+/// Which way a graph-query walk follows `edges`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GqlDirection {
+    Outgoing,
+    Incoming,
+    Any,
+}
+
+/// The `edges` walk of a graph query with an edge pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GqlWalk<'a> {
+    /// Already checked against the route's relationship allowlist; bound, not
+    /// written into the statement.
+    pub relationship: Option<&'a str>,
+    pub direction: GqlDirection,
+    pub min_hops: usize,
+    pub max_hops: usize,
+}
+
 /// Reads for the graph-visualisation endpoints.
 pub struct GraphViewRepository;
 
@@ -599,6 +682,139 @@ impl GraphViewRepository {
         let mut q = sqlx::query_as::<_, SubgraphTraceRow>(&sql).bind(node_ids);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The node ids a graph query selects: the anchor rows matching
+    /// `conditions` (newest first, `limit` of them), or, with a `walk`, every
+    /// node the walk reaches from those anchors at a depth in
+    /// `min_hops..=max_hops`. The caller projects the ids through
+    /// `load_subgraph`, which filters each node table again.
+    ///
+    /// # Viewer
+    ///
+    /// Both halves are filtered, and they have to be (backlog 4815dcf7). This
+    /// statement lived inline in `routes/graph_query.rs` and spent no viewer:
+    /// only the final projection did. So a caller-chosen property predicate
+    /// matched rows the caller cannot read and the walk returned their readable
+    /// neighbours, the walk crossed edges the caller cannot read, and
+    /// unreadable rows filled the `LIMIT` window before the projection dropped
+    /// them. The anchor table carries `{VISIBILITY:n}` (except `agents`, which
+    /// has no tenancy columns, as in `load_subgraph`), and the recursive step
+    /// carries `{EDGE_VISIBILITY:e}`, so the walk follows only edges the viewer
+    /// can read. Both markers bind the same group array.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for a property name outside `[A-Za-z0-9_]`;
+    /// `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, conditions))]
+    pub async fn graph_query_node_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        table: GqlNodeTable,
+        conditions: &[GqlCondition],
+        limit: i64,
+        walk: Option<GqlWalk<'_>>,
+    ) -> Result<Vec<Uuid>, DbError> {
+        enum Bind<'b> {
+            Number(f64),
+            Text(&'b str),
+        }
+        let mut binds: Vec<Bind<'_>> = Vec::new();
+        let mut filters = String::new();
+        for c in conditions {
+            let column = match &c.column {
+                GqlColumn::TruthValue => "truth_value".to_string(),
+                GqlColumn::Confidence => "(properties->>'confidence')::float8".to_string(),
+                GqlColumn::Property(name) => {
+                    if name.is_empty()
+                        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(DbError::InvalidData {
+                            reason: format!("invalid graph-query property name: {name}"),
+                        });
+                    }
+                    format!("properties->>'{name}'")
+                }
+            };
+            let op = match c.op {
+                GqlOp::Eq => "=",
+                GqlOp::Gt => ">",
+                GqlOp::Lt => "<",
+                GqlOp::Gte => ">=",
+                GqlOp::Lte => "<=",
+            };
+            let rhs = match &c.value {
+                GqlValue::Number(n) => {
+                    binds.push(Bind::Number(*n));
+                    format!("${}", binds.len())
+                }
+                GqlValue::Text(t) => {
+                    binds.push(Bind::Text(t));
+                    format!("${}", binds.len())
+                }
+                GqlValue::Bool(b) => b.to_string(),
+            };
+            filters.push_str(&format!(" AND {column} {op} {rhs}"));
+        }
+        let name = table.table();
+        let anchor_marker = if table.tenanted() {
+            " /* {VISIBILITY:n} */"
+        } else {
+            ""
+        };
+        let anchor = format!(
+            "SELECT n.id FROM {name} n WHERE true{filters}{anchor_marker} \
+             ORDER BY n.created_at DESC, n.id LIMIT {limit}"
+        );
+        let sql = match walk {
+            None => anchor,
+            Some(w) => {
+                let rel = match w.relationship {
+                    Some(r) => {
+                        binds.push(Bind::Text(r));
+                        format!(" AND e.relationship = ${}", binds.len())
+                    }
+                    None => String::new(),
+                };
+                let join = match w.direction {
+                    GqlDirection::Outgoing => "e.source_id = p.id",
+                    GqlDirection::Incoming => "e.target_id = p.id",
+                    GqlDirection::Any => "(e.source_id = p.id OR e.target_id = p.id)",
+                };
+                format!(
+                    "WITH RECURSIVE paths(id, depth) AS ( \
+                       (SELECT a.id, 0 FROM ({anchor}) a) \
+                       UNION \
+                       SELECT CASE WHEN e.source_id = p.id THEN e.target_id ELSE e.source_id END, \
+                              p.depth + 1 \
+                       FROM edges e JOIN paths p ON {join} \
+                       WHERE p.depth < {max}{rel} /* {{EDGE_VISIBILITY:e}} */ \
+                     ) \
+                     SELECT DISTINCT id FROM paths WHERE depth >= {min}",
+                    max = w.max_hops,
+                    min = w.min_hops,
+                )
+            }
+        };
+        let marked = table.tenanted() || walk.is_some();
+        let sql = if marked {
+            viewer.splice(&sql, binds.len() + 1)
+        } else {
+            sql
+        };
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql);
+        for b in &binds {
+            q = match b {
+                Bind::Number(n) => q.bind(*n),
+                Bind::Text(t) => q.bind(*t),
+            };
+        }
+        if marked {
+            if let Some(g) = viewer.group_bind() {
+                q = q.bind(g);
+            }
         }
         Ok(q.fetch_all(executor).await?)
     }

@@ -540,16 +540,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "expand",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
-    // DEFECT, measured here and fixed by a following commit: the id selection
-    // and the edges walk run with no predicate; only the projection is viewed.
-    (
-        "graph_query.rs",
-        "execute_graph_query",
-        &[
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-        ],
-    ),
     // stamped: the group-admin check is the database's, for the caller.
     (
         "groups.rs",

@@ -14,6 +14,13 @@
 mod common;
 mod viewer_fixture;
 
+use std::collections::BTreeSet;
+
+use axum::{extract::State, Json};
+use epigraph_api::middleware::bearer::ViewerExtractor;
+use epigraph_api::routes::graph_query::{execute_graph_query, GraphQueryRequest};
+use epigraph_api::state::{ApiConfig, AppState};
+use epigraph_db::visibility::Viewer;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -262,4 +269,142 @@ async fn binding_a_claim_the_caller_cannot_read_to_a_frame_is_404_and_writes_not
             assert_eq!(rows, 0, "a refused cluster upsert must write no binding");
         }
     }
+}
+
+// ── POST /api/v1/graph/query ───────────────────────────────────────────────
+
+/// A claim carrying `properties.probe`, public or private to `group`.
+async fn seed_probe(pool: &PgPool, agent: Uuid, group: Option<Uuid>, probe: &str) -> Uuid {
+    let content = format!("a12 graph query probe {probe} {}", Uuid::new_v4());
+    let claim = match group {
+        Some(g) => viewer_fixture::seed_group_claim(pool, agent, g, &content).await,
+        None => viewer_fixture::seed_public_claim(pool, agent, &content).await,
+    };
+    sqlx::query(
+        "UPDATE claims SET properties = jsonb_build_object('probe', $2::text) WHERE id = $1",
+    )
+    .bind(claim)
+    .bind(probe)
+    .execute(pool)
+    .await
+    .expect("tag probe claim");
+    claim
+}
+
+async fn run_as(pool: &PgPool, viewer: Viewer, query: String) -> BTreeSet<Uuid> {
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let Json(out) = execute_graph_query(
+        ViewerExtractor(viewer),
+        State(state),
+        Json(GraphQueryRequest {
+            query,
+            agent_id: None,
+        }),
+    )
+    .await
+    .expect("graph query succeeds");
+    out.nodes.into_iter().map(|n| n.id).collect()
+}
+
+/// `execute_graph_query` spent its viewer on the final node projection
+/// (`load_subgraph`) only. The id selection and the `edges` walk that decide
+/// WHICH nodes are projected ran with no predicate. Three consequences, one arm
+/// each below.
+struct GraphWorld {
+    owner: Uuid,
+    group: Uuid,
+    stranger: Uuid,
+}
+
+async fn graph_world(pool: &PgPool) -> GraphWorld {
+    let (owner, group) = viewer_fixture::seed_agent_with_group(pool, "a12-gq-owner").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(pool, "a12-gq-stranger").await;
+    GraphWorld {
+        owner,
+        group,
+        stranger,
+    }
+}
+
+async fn viewer_of(pool: &PgPool, agent: Uuid) -> Viewer {
+    Viewer::resolve(pool, agent).await.expect("resolve viewer")
+}
+
+/// A caller-chosen property predicate matched a claim the caller cannot read,
+/// and the walk from it returned its readable neighbour. The edge is forced
+/// public (`viewer_fixture::seed_edge_owned_by`) so only the anchor's own
+/// predicate can exclude the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_does_not_anchor_on_a_claim_the_caller_cannot_read(pool: PgPool) {
+    let w = graph_world(&pool).await;
+    let world = viewer_fixture::world_group(&pool).await;
+    let probe = Uuid::new_v4().to_string();
+    let private_anchor = seed_probe(&pool, w.owner, Some(w.group), &probe).await;
+    let target = viewer_fixture::seed_public_claim(&pool, w.owner, "a12 gq anchor target").await;
+    viewer_fixture::seed_edge_owned_by(&pool, private_anchor, target, "public", world).await;
+    let q = format!("MATCH (n:claim)-[:supports]->(m:claim) WHERE n.probe = '{probe}' RETURN *");
+    assert_eq!(
+        run_as(&pool, viewer_of(&pool, w.owner).await, q.clone()).await,
+        BTreeSet::from([target]),
+        "calibration: the anchor's owner reaches its target"
+    );
+    let got = run_as(&pool, viewer_of(&pool, w.stranger).await, q).await;
+    assert!(
+        got.is_empty(),
+        "a property predicate must not anchor on a claim the caller cannot read; got {got:?}"
+    );
+}
+
+/// The walk crossed edges the caller cannot read, so a readable claim two hops
+/// away came back through an unreadable one: public anchor -> (group edge) ->
+/// group claim -> (group edge) -> public claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_does_not_walk_edges_the_caller_cannot_read(pool: PgPool) {
+    let w = graph_world(&pool).await;
+    let probe = Uuid::new_v4().to_string();
+    let anchor = seed_probe(&pool, w.owner, None, &probe).await;
+    let middle = viewer_fixture::seed_group_claim(&pool, w.owner, w.group, "a12 gq middle").await;
+    let far = viewer_fixture::seed_public_claim(&pool, w.owner, "a12 gq far").await;
+    viewer_fixture::seed_edge(&pool, anchor, middle).await;
+    viewer_fixture::seed_edge(&pool, middle, far).await;
+    let q =
+        format!("MATCH (n:claim)-[:supports*2..2]->(m:claim) WHERE n.probe = '{probe}' RETURN *");
+    assert!(
+        run_as(&pool, viewer_of(&pool, w.owner).await, q.clone())
+            .await
+            .contains(&far),
+        "calibration: the owner walks through its own claim to the far one"
+    );
+    let got = run_as(&pool, viewer_of(&pool, w.stranger).await, q).await;
+    assert!(
+        !got.contains(&far),
+        "the walk must not cross edges the caller cannot read; got {got:?}"
+    );
+}
+
+/// Unreadable rows filled the LIMIT window before the projection dropped them:
+/// the newest probe row is private, an older one public, and `LIMIT 1` came
+/// back empty for the stranger.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_limit_counts_only_rows_the_caller_can_read(pool: PgPool) {
+    let w = graph_world(&pool).await;
+    let probe = Uuid::new_v4().to_string();
+    let older_public = seed_probe(&pool, w.owner, None, &probe).await;
+    let newer_private = seed_probe(&pool, w.owner, Some(w.group), &probe).await;
+    sqlx::query("UPDATE claims SET created_at = now() - interval '1 day' WHERE id = $1")
+        .bind(older_public)
+        .execute(&pool)
+        .await
+        .expect("age the public probe");
+    let q = format!("MATCH (n:claim) WHERE n.probe = '{probe}' RETURN * LIMIT 1");
+    assert_eq!(
+        run_as(&pool, viewer_of(&pool, w.owner).await, q.clone()).await,
+        BTreeSet::from([newer_private]),
+        "calibration: the owner's window holds its newest probe row"
+    );
+    assert_eq!(
+        run_as(&pool, viewer_of(&pool, w.stranger).await, q).await,
+        BTreeSet::from([older_public]),
+        "LIMIT must count only rows the caller can read"
+    );
 }
