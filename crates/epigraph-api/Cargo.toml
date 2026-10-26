@@ -276,3 +276,10 @@ required-features = ["db"]
 name = "tls_pem_loading"
 path = "tests/tls_pem_loading.rs"
 required-features = ["tls"]
+
+# Installs a process-level rustls provider, so it cannot share a binary with
+# tls_pem_loading (which must run with none installed).
+[[test]]
+name = "tls_provider_choice"
+path = "tests/tls_provider_choice.rs"
+required-features = ["tls"]
