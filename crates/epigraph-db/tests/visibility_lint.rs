@@ -2309,8 +2309,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE. The last-admin-guarded revoke and its re-key mark (`group_memberships`, \
          `groups`, `group_key_epochs`) on the caller's stamped transaction, with the roster \
          lock held until that caller commits. None of the three tables carries a tenancy column \
-         for a Viewer to filter on; each one's migration-077 policy, evaluated on the \
-         CONNECTION, is the control, and the route has checked the caller's admin role on it.",
+         for a Viewer to filter on; the membership and epoch writes are controlled by their \
+         migration-077 policies, evaluated on the CONNECTION, and the `groups` mark by migration \
+         181's definer, which admits only a live admin of that group (keyed on the stamped \
+         principal). The route has checked the caller's admin role on the same connection.",
     ),
     // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
     // the raw pool onto the route's stamped transaction.
