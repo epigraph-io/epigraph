@@ -119,8 +119,11 @@ pub async fn do_link_alternative(
         props.insert("rationale".to_string(), Value::String(r.clone()));
     }
 
-    let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning_conn(
+    // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
+    // returns the existing edge unchanged.
+    let (edge_id, created) = EdgeRepository::create_symmetric_if_absent_returning_signed_conn(
         &mut tx,
+        Some(server.edge_signing_key().await?),
         a,
         b,
         "alternative_of",

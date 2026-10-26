@@ -129,10 +129,6 @@ const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, 
      signing caller must receive the edge id";
 const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
      writer signs by passing its key to the primitive's _signed_conn twin";
-const PENDING_SIGNER_ID_RULING: &str = "the MCP server holds a key, but stamping \
-     edges.signer_id with the server's agent changes what backfill_factors::EDGE_QUERY reads \
-     as an edge factor's agent (COALESCE(e.signer_id, src.agent_id)); awaiting an operator \
-     ruling (backlog dae795f8)";
 
 const NO_KEY_DB_FUNCTION: &str = "a database function (SECURITY DEFINER entry point or \
      trigger) holds no entity key; its edges could only be signed at INSERT time by a key the \
@@ -165,7 +161,7 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 
 /// The exact number of unsigned edge-emitting sites, Rust ([`REGISTER`]) plus
 /// database ([`DB_REGISTER`]). Should only go down; see the module docs.
-const UNSIGNED_SITES_HIGH_WATER: usize = 103;
+const UNSIGNED_SITES_HIGH_WATER: usize = 85;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -520,55 +516,55 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-mcp/src/claim_helper.rs",
         "emit_verb_edge_best_effort",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/server.rs",
         "record_auth_lineage",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/claims.rs",
         "resolve_backlog_item",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document",
         5,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document_spine",
         5,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_alternative.rs",
         "do_link_alternative",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_epistemic.rs",
         "do_link_epistemic",
         2,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_hierarchical.rs",
         "do_link_hierarchical",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/perspectives.rs",
         "create_perspective",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
 ];
 

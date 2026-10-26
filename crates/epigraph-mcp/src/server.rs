@@ -308,6 +308,24 @@ impl EpiGraphMcpFull {
     pub async fn signer_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
     }
+
+    /// The key this server attests the edges it INSERTS with (rulings R-49,
+    /// R-50): its signer, recorded as `edges.signer_id` =
+    /// [`Self::signer_agent_id`]. The signer is never the edge's author: an
+    /// edge's author is its source claim's (`backfill_factors::EDGE_QUERY`,
+    /// the operator's `EDGE_WRITER_SQL`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`Self::signer_agent_id`] returns.
+    pub async fn edge_signing_key(
+        &self,
+    ) -> Result<epigraph_db::repos::EdgeSigningKey<'_>, McpError> {
+        Ok(epigraph_db::repos::EdgeSigningKey {
+            signer: &self.signer,
+            signer_id: self.signer_agent_id().await?,
+        })
+    }
 }
 
 /// Builds the per-session servers of ONE HTTP listener, all sharing ONE
@@ -613,8 +631,25 @@ impl EpiGraphMcpFull {
             }
         };
 
-        match epigraph_db::EdgeRepository::create_if_not_exists(
-            &self.pool,
+        // A world-owned structural edge (both endpoints agents): attested at
+        // INSERT by the server's key (R-50), the only point it can be signed.
+        let edge_key = match self.edge_signing_key().await {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(error = ?e, "auth-lineage edge: no signing key; skipping");
+                return;
+            }
+        };
+        let mut conn = match self.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = ?e, "auth-lineage edge: no connection; skipping");
+                return;
+            }
+        };
+        match epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
+            &mut conn,
+            Some(edge_key),
             mcp_agent,
             "agent",
             principal,

@@ -605,12 +605,16 @@ async fn write_submission(
     // and a provider round trip must not hold a transaction open.
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
+    // The AUTHORED / DERIVED_FROM / HAS_TRACE verb-edges are attested at
+    // INSERT by this server's key (R-49/R-50); the signer is not their author.
+    let edge_key = server.edge_signing_key().await?;
     let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
         &mut *conn,
         viewer,
         claim,
         Some(signer_agent_id),
         tool_name,
+        Some(edge_key),
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();
@@ -731,6 +735,7 @@ async fn write_submission(
         "DERIVED_FROM",
         Some(serde_json::json!({"was_created": was_created})),
         tool_name,
+        Some(edge_key),
     )
     .await?;
     crate::claim_helper::emit_verb_edge_best_effort(
@@ -742,6 +747,7 @@ async fn write_submission(
         "HAS_TRACE",
         Some(serde_json::json!({"was_created": was_created})),
         tool_name,
+        Some(edge_key),
     )
     .await?;
 
@@ -2214,8 +2220,11 @@ pub async fn resolve_backlog_item(
         // private basis's group. A private basis is readable here only if it is
         // this agent's own (the viewer check above), so its edge lands in a group
         // this stamp can write.
-        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
+        // returns the existing edge unchanged.
+        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
             &mut tx,
+            Some(server.edge_signing_key().await?),
             *basis_uuid,
             "claim",
             resolution_uuid,
