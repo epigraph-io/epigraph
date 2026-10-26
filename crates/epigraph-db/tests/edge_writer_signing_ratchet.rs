@@ -36,6 +36,13 @@
 //!
 //! # What it does not see
 //!
+//! Whether a [`Signed`] writer's edges are really signed. The check reads the
+//! call, and `sign_created_edge_conn` returns `Ok(NotSignable)` without an
+//! error for an edge the session may not update (a world-owned structural
+//! verb-edge, another writer's edge). Every writer flipped to `Signed` needs a
+//! DB test asserting that its edge carries a verifying v1 signature
+//! (`EdgeSignatureRepository::verify_conn`).
+//!
 //! A writer that builds `INSERT INTO edges` from pieces split across string
 //! literals or lines, or that calls a private wrapper with another name, is
 //! invisible to a line scanner. The wrappers in-tree today are themselves
