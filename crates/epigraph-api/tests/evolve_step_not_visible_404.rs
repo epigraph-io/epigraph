@@ -108,6 +108,21 @@ async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
         .expect("count")
 }
 
+/// Current claims on `parent`'s lineage, counted without its lineage id: the
+/// parent plus anything written as its successor, by column or by edge.
+async fn current_heads(pool: &PgPool, parent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claims \
+         WHERE (id = $1 OR supersedes = $1 \
+                OR id IN (SELECT source_id FROM edges WHERE target_id = $1)) \
+           AND COALESCE(is_current, true)",
+    )
+    .bind(parent)
+    .fetch_one(pool)
+    .await
+    .expect("count heads")
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_on_a_parent_the_caller_cannot_see_returns_404(pool: PgPool) {
     let (a, a_group) = seed_agent_with_group(&pool, "owner-a").await;
@@ -149,12 +164,11 @@ async fn evolve_step_on_a_parent_the_caller_cannot_see_returns_404(pool: PgPool)
 /// `supersedes` on a parent the caller can see and evolve, whose retirement
 /// the database refuses, answers 403 with nothing written (backlog d34f5096).
 ///
-/// Row security that refuses an UPDATE through its USING clause matches zero
-/// rows without raising; `ClaimRepository::evolve_step_conn` turns that into
-/// `DbError::WriteRefused`, a denial the route must render as 403 (as
-/// `From<DbError>` does everywhere else), not fold into its 500 arm. A
+/// A retire that changes no row does not raise; `ClaimRepository::evolve_step_conn`
+/// turns it into `DbError::WriteRefused`, a denial the route must render as
+/// 403 (as `From<DbError>` does everywhere else), not fold into its 500 arm. A
 /// `BEFORE UPDATE` trigger that skips only the parent's `is_current` change
-/// stands in for the refusing policy deterministically.
+/// produces the zero-row retire deterministically.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_nothing(
     pool: PgPool,
@@ -186,15 +200,45 @@ async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_n
         StatusCode::FORBIDDEN,
         "a refused retirement is a write refusal, not a server fault: {body}"
     );
+    // The 403 is the refused retire (`DbError::WriteRefused` on the parent),
+    // not another denial on the route such as its lineage authority gate.
+    assert!(
+        body.contains("was refused") && body.contains(&parent.to_string()),
+        "the 403 names the refused supersede of the parent: {body}"
+    );
     assert_eq!(
         claims_with_content(&pool, &content).await,
         0,
         "no successor"
     );
+    assert_eq!(current_heads(&pool, parent).await, 1, "one current head");
     let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
         .bind(parent)
         .fetch_one(&pool)
         .await
         .expect("parent");
     assert!(still_current, "the parent is untouched");
+
+    // Control: without the stand-in, the same owner supersedes the same
+    // parent on the same state, so the 403 above is the refused retire and
+    // not the harness or an authority gate.
+    sqlx::raw_sql("DROP TRIGGER aaa_test_skip_step_retire ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop the retirement stand-in");
+    let content = format!("successor of a retirable step {}", Uuid::new_v4());
+    let (status, body) = evolve_as(&pool, &state, a, parent, &content, "supersedes").await;
+    assert_eq!(status, StatusCode::OK, "the owner may supersede: {body}");
+    assert_eq!(claims_with_content(&pool, &content).await, 1);
+    assert_eq!(
+        current_heads(&pool, parent).await,
+        1,
+        "the successor is the one current head"
+    );
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("parent");
+    assert!(!still_current, "the parent is retired");
 }
