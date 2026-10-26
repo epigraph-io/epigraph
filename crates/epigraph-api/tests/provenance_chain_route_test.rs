@@ -302,6 +302,144 @@ async fn a_private_ancestor_and_its_edge_are_absent_for_everyone_but_its_owner(p
     assert_eq!(body["edges"].as_array().expect("edges").len(), 1);
 }
 
+/// Force every edge in `ids` public.
+///
+/// THE TRAP THIS DISARMS, the same one `claim_ego_route_test::force_edges_public`
+/// disarms: migration 070 makes an edge inherit its endpoints' tenancy, so an
+/// edge the trigger stamped from a private endpoint is withheld by the
+/// recursive term's EDGE predicate alone, and every assertion below would stay
+/// green with the far-CLAIM predicate deleted. Forced public, the edge survives
+/// the walk and the claim predicate is the only thing that can stop the
+/// frontier.
+async fn force_edges_public(pool: &PgPool, ids: &[Uuid]) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = \
+         '00000000-0000-0000-0000-000000000000'::uuid, co_owner_group_id = NULL \
+         WHERE id = ANY($1)",
+    )
+    .bind(ids.to_vec())
+    .execute(pool)
+    .await
+    .expect("force the connecting edges public");
+}
+
+/// An invisible claim must not extend the frontier — not just be dropped from
+/// `nodes` afterwards.
+///
+/// The shape:
+///
+/// ```text
+///   p3 --supports--> secret --supports--> root
+///                      ^                   |
+///                      +----supports-------+
+/// ```
+///
+/// `secret` is group-private to `owner`; `root` and `p3` are public; all three
+/// edges are forced public. For a stranger, `secret` is unreadable, so `p3` is
+/// reachable ONLY through it and the loop `root -> secret -> root` exists only
+/// through it.
+///
+/// Before the far-claim predicate on the recursive term, the walk expanded
+/// `secret` anyway, because only `nodes` was claim-filtered while `cycles`,
+/// `depth` and `truncated` were all computed from the raw walk. A stranger
+/// therefore got back:
+///
+/// * `cycles: [[root, secret, root]]` — `secret`'s uuid, in plain text;
+/// * `p3` as a node at depth 2 with NO edge joining it to the root, which says
+///   a hidden intermediate exists and that this claim stands behind it;
+/// * `truncated: true` at `max_depth=2`, a bound this viewer's own corpus never
+///   reached.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_the_viewer_cannot_read_does_not_extend_the_walk(pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let root = common::seed_claim(&pool, "public conclusion").await;
+    let secret = common::seed_claim_with_agent(&pool, "classified premise", owner).await;
+    let p3 = common::seed_claim(&pool, "public premise behind the secret").await;
+
+    // secret -> root, p3 -> secret, and root -> secret to close a loop that
+    // runs through `secret` and nothing else.
+    let e_secret_root =
+        common::insert_edge(&pool, secret, root, "claim", "claim", "supports").await;
+    let e_p3_secret = common::insert_edge(&pool, p3, secret, "claim", "claim", "supports").await;
+    let e_root_secret =
+        common::insert_edge(&pool, root, secret, "claim", "claim", "supports").await;
+
+    common::seed_private_ownership(&pool, secret, owner).await;
+    force_edges_public(&pool, &[e_secret_root, e_p3_secret, e_root_secret]).await;
+
+    let app = router(&pool).await;
+    let path = format!("/api/v1/claims/{root}/provenance-chain");
+    let stranger = reader();
+
+    let (status, body) = get(&app, &path, Some(&stranger)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    // The private uuid appears NOWHERE: not in nodes, not in edges, not in
+    // cycles. This is the whole finding in one line.
+    assert!(
+        !body.to_string().contains(&secret.to_string()),
+        "the invisible claim's uuid must not appear anywhere in the response, got {body}"
+    );
+    assert_eq!(
+        body["cycles"],
+        serde_json::json!([]),
+        "a cycle path running through an unreadable claim must not be reported, got {body}"
+    );
+
+    // `p3` is reachable only through `secret`, so it is ABSENT — not present at
+    // depth 2 as an orphan whose missing edge announces the hidden hop.
+    assert_eq!(
+        node_ids(&body),
+        vec![root.to_string()],
+        "a claim reachable only through an unreadable one must be absent, not orphaned, got {body}"
+    );
+    assert_eq!(body["edges"], serde_json::json!([]), "got {body}");
+
+    // `truncated` describes the bound THIS viewer's corpus hit. At max_depth=2
+    // the unfiltered walk reached depth 2 (`p3`) and reported a cut; the
+    // stranger's own reachable graph stops at the root.
+    let (status, body) = get(&app, &format!("{path}?max_depth=2"), Some(&stranger)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["truncated"],
+        Value::Bool(false),
+        "truncated must reflect the viewer-visible walk, not the unfiltered one, got {body}"
+    );
+    assert!(
+        !body.to_string().contains(&secret.to_string()),
+        "got {body}"
+    );
+
+    // CALIBRATION: the owner sees the whole shape, so the assertions above are
+    // about tenancy and not about a walk that returns nothing. The owner's own
+    // chain still reports the loop and still reaches `p3`.
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+    let (status, body) = get(&app, &path, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let mut ids = node_ids(&body);
+    ids.sort();
+    let mut want = vec![root.to_string(), secret.to_string(), p3.to_string()];
+    want.sort();
+    assert_eq!(ids, want, "the owner reaches p3 through secret, got {body}");
+    assert_eq!(node(&body, p3)["depth"], 2);
+    // Two, not three: the row that closes the loop is a cycle row, and cycle
+    // rows are reported in `cycles` rather than contributing an edge.
+    assert_eq!(
+        body["edges"].as_array().expect("edges").len(),
+        2,
+        "got {body}"
+    );
+    assert_eq!(
+        body["cycles"],
+        serde_json::json!([[
+            root.to_string(),
+            secret.to_string(),
+            root.to_string()
+        ]]),
+        "the owner, who can read every hop, still sees the loop, got {body}"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_private_root_is_the_same_404_as_a_root_that_does_not_exist(pool: PgPool) {
     let owner = Uuid::new_v4();

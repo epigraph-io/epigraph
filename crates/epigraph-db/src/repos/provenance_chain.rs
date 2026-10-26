@@ -166,9 +166,20 @@ impl ProvenanceChainRepository {
         // MACRO SITE — static three-bind spelling. The predicate lives on the
         // RECURSIVE term, which is the only place `edges` is read: an edge the
         // viewer cannot see must not extend the frontier, or the walk leaks the
-        // shape of another tenant's graph one hop at a time. The hydration
-        // query below filters `claims` the same way, so a node id that survived
-        // the walk still yields no content unless the claim itself is visible.
+        // shape of another tenant's graph one hop at a time.
+        //
+        // TWO predicates, because the frontier is extended by an (edge, claim)
+        // PAIR and either half can be invisible on its own. The second one —
+        // the `EXISTS` on the far claim `nxt.id`, spelled exactly as the
+        // hydration query below spells it — is what keeps an unreadable claim
+        // from extending the walk at all. Filtering only `edges` here and
+        // leaving the claim to hydration was not enough: hydration shapes
+        // `nodes`, but `cycles`, `depth` and `truncated` are all computed from
+        // the raw walk, so an invisible claim that stayed in the frontier
+        // leaked its uuid through `cycles`, pulled its own visible ancestors in
+        // behind it as nodes with no edge joining them to the root, and made
+        // `truncated` report a bound the viewer's own corpus never hit.
+        // Stopping the frontier is the single place that fixes all four.
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -202,6 +213,12 @@ impl ProvenanceChainRepository {
                        OR (e.owner_group_id = ANY($6::uuid[])
                            AND (e.co_owner_group_id IS NULL
                                 OR e.co_owner_group_id = ANY($6::uuid[]))))
+                  AND EXISTS (
+                      SELECT 1 FROM claims fc
+                      WHERE fc.id = nxt.id
+                        AND ($5::bool OR fc.visibility = 'public'
+                             OR fc.owner_group_id = ANY($6::uuid[]))
+                  )
             )
             SELECT node AS "node!", depth AS "depth!", is_cycle AS "is_cycle!",
                    path AS "path!", e_source, e_target, e_rel

@@ -16,11 +16,13 @@
 //! exactly the same body.
 //!
 //! This handler applies no access pass of its own. Both halves of the walk are
-//! filtered in the repo: an edge the viewer cannot see does not extend the
-//! frontier, and a claim the viewer cannot read is absent from `nodes` — and,
-//! since the repo retains edges against the hydrated node set, absent from
-//! `edges` too. An ancestor that is not there is not there; there is no
-//! placeholder node and no blanked field.
+//! filtered in the repo, and BOTH are filtered on the frontier: neither an edge
+//! the viewer cannot see nor a claim the viewer cannot read extends it. An
+//! unreadable ancestor is therefore absent from `nodes`, from `edges`, and from
+//! `cycles` — and anything reachable only THROUGH it is absent too, rather than
+//! arriving as a node with no edge joining it to the root. `truncated` likewise
+//! describes the bound this viewer's own corpus hit. An ancestor that is not
+//! there is not there; there is no placeholder node and no blanked field.
 //!
 //! All SQL lives in `epigraph_db::ProvenanceChainRepository`.
 //!
