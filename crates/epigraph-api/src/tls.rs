@@ -58,7 +58,13 @@ impl TlsConfig {
             .map_err(Error::other)?
             .with_no_client_auth()
             .with_single_cert(chain, key)
-            .map_err(|e| invalid(format!("certificate/key rejected: {e}")))?;
+            .map_err(|e| {
+                invalid(format!(
+                    "{} / {}: certificate/key rejected: {e}",
+                    self.cert_path.display(),
+                    self.key_path.display()
+                ))
+            })?;
         // What axum-server's own PEM loader sets: keep HTTP/2 over ALPN.
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
