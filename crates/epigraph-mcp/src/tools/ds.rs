@@ -879,12 +879,10 @@ pub async fn compare_methods(
             .map_err(internal_error)?;
     // Ruling R-22: only the BBAs whose sources this viewer can read; a
     // reader outside a group never sees a fold of BBAs derived from it.
-    let all_bbas = {
-        let mut conn = server.pool.acquire().await.map_err(internal_error)?;
-        epigraph_engine::derivation_scope::retain_for_viewer(&mut conn, viewer, all_bbas)
+    let all_bbas =
+        epigraph_engine::derivation_scope::retain_for_viewer(&server.pool, viewer, all_bbas)
             .await
-            .map_err(internal_error)?
-    };
+            .map_err(internal_error)?;
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));

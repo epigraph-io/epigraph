@@ -643,7 +643,8 @@ async fn recompute_framed_belief(
     let ctx = FramedBeliefContext::resolve(pool, viewer, frame_row, perspective_id).await?;
     let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
     // Ruling R-22: only the BBAs whose sources this viewer can read.
-    let rows = crate::derivation_scope::retain_for_viewer(&mut conn, viewer, rows.to_vec()).await?;
+    let rows =
+        crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, rows.to_vec()).await?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -729,7 +730,7 @@ async fn perspective_belief_for_claim(
     // can carry a source key), so the page-level hoist is unchanged.
     let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
     // Ruling R-22: only the BBAs whose sources this viewer can read.
-    let all_bbas = crate::derivation_scope::retain_for_viewer(&mut conn, viewer, all_bbas).await?;
+    let all_bbas = crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, all_bbas).await?;
     if all_bbas.is_empty() {
         return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
     }

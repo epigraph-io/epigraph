@@ -43,8 +43,8 @@ pub async fn retain_for_cache(
 ///
 /// # Errors
 /// `DbError` if the read fails.
-pub async fn retain_for_viewer(
-    conn: &mut sqlx::PgConnection,
+pub async fn retain_for_viewer<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
     rows: Vec<MassFunctionRow>,
 ) -> Result<Vec<MassFunctionRow>, DbError> {
@@ -52,7 +52,7 @@ pub async fn retain_for_viewer(
         return Ok(rows);
     }
     let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
-    let admissible = DerivationScopeRepository::viewer_derived(&mut *conn, viewer, &ids).await?;
+    let admissible = DerivationScopeRepository::viewer_derived(executor, viewer, &ids).await?;
     Ok(rows
         .into_iter()
         .filter(|r| admissible.contains(&r.id))

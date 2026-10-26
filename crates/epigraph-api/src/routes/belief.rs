@@ -2772,7 +2772,7 @@ pub async fn get_pignistic(
         .collect();
     rows.sort_by_key(|r| r.id);
     let rows =
-        epigraph_engine::derivation_scope::retain_for_viewer(&mut read, &viewer, rows).await?;
+        epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, &viewer, rows).await?;
     let (rows, masses): (Vec<epigraph_db::MassFunctionRow>, Vec<MassFunction>) = rows
         .into_iter()
         .filter_map(|row| {
