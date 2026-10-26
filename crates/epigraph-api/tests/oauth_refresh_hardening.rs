@@ -744,18 +744,29 @@ async fn a_code_exchange_for_a_suspended_connector_app_is_refused(pool: PgPool) 
 }
 
 /// The operator revoke keyed by (person, app), run as the maintenance role,
-/// revokes that app's live chains of that person and nothing else.
+/// revokes that app's live chains of that person and nothing else: not the
+/// person's chain through another app, and not another person's chain
+/// through the same app.
 ///
 /// Catches: the only lever being the per-person revoke, which logs the person
-/// out of every connector.
+/// out of every connector; and a per-app revoke that drops the person key,
+/// which logs everyone out of that app.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_operator_revoke_for_one_app_leaves_the_persons_other_app_live(pool: PgPool) {
     let (app_a, app_a_row, human) = app_and_human(&pool).await;
     let app_b = format!("a11_dcr_b_{}", Uuid::new_v4().simple());
     client_row(&pool, &app_b, "human", &v(&["claims:read"])).await;
+    let other_person = client_row(
+        &pool,
+        &format!("a11_person2_{}", Uuid::new_v4().simple()),
+        "human",
+        &v(&["claims:read"]),
+    )
+    .await;
     let router = create_router(state(&pool).await);
     let ra = connect(&pool, &router, &app_a, human).await;
     let rb = connect(&pool, &router, &app_b, human).await;
+    let ra_other = connect(&pool, &router, &app_a, other_person).await;
 
     let mut tx = pool.begin().await.expect("begin");
     sqlx::query("SET LOCAL ROLE epigraph_maintenance")
@@ -770,7 +781,7 @@ async fn the_operator_revoke_for_one_app_leaves_the_persons_other_app_live(pool:
             .await
             .expect("the operator revoke");
     tx.commit().await.expect("commit");
-    assert_eq!(n, 1, "app A's one live chain of the person");
+    assert_eq!(n, 1, "app A's one live chain of the person, and no other");
     for (role, expected) in [
         ("public", false),
         ("epigraph_app", false),
@@ -786,9 +797,76 @@ async fn the_operator_revoke_for_one_app_leaves_the_persons_other_app_live(pool:
         .expect("privilege");
         assert_eq!(can, expected, "{role} EXECUTE on the per-app revoke");
     }
+    for function in [
+        "public.epigraph_refresh_token_revoke_client_app(uuid, uuid)",
+        "public.epigraph_refresh_token_inherit_issuing_app()",
+    ] {
+        let config: Option<Vec<String>> =
+            sqlx::query_scalar("SELECT proconfig FROM pg_proc WHERE oid = $1::regprocedure")
+                .bind(function)
+                .fetch_one(&pool)
+                .await
+                .expect("proconfig");
+        assert_eq!(
+            config,
+            Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+            "{function} resolves its names in pg_catalog only"
+        );
+    }
 
     let (status, body) = post_token(&router, refresh_grant(&ra)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "app A revoked: {body}");
     let (status, body) = post_token(&router, refresh_grant(&rb)).await;
-    assert_eq!(status, StatusCode::OK, "app B untouched: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the person's app B chain is untouched: {body}"
+    );
+    let (status, body) = post_token(&router, refresh_grant(&ra_other)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "another person's app A chain is untouched: {body}"
+    );
+}
+
+/// A bound chain whose connector app row is GONE (deleted, for example by an
+/// orphan-client cleanup) is refused and its token burned: an app the refresh
+/// grant cannot find reads as not active. Migration 174 has no foreign key on
+/// purpose, so this check is the only guard.
+///
+/// Catches: a refresh grant that reads a missing app as "nothing to check"
+/// and keeps rotating the chain.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chain_whose_connector_app_was_deleted_is_refused_and_burned(pool: PgPool) {
+    let (app_client_id, app_row, human) = app_and_human(&pool).await;
+    let router = create_router(state(&pool).await);
+    let r0 = connect(&pool, &router, &app_client_id, human).await;
+
+    sqlx::query("DELETE FROM oauth_authorization_codes WHERE client_id = $1")
+        .bind(&app_client_id)
+        .execute(&pool)
+        .await
+        .expect("delete the app's codes");
+    let deleted = sqlx::query("DELETE FROM oauth_clients WHERE id = $1")
+        .bind(app_row)
+        .execute(&pool)
+        .await
+        .expect("delete the app")
+        .rows_affected();
+    assert_eq!(deleted, 1, "PREMISE: the app row is gone");
+
+    let (status, body) = post_token(&router, refresh_grant(&r0)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a chain of a deleted connector app refreshed: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+    let (status, body) = post_token(&router, refresh_grant(&r0)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the denied refresh burned the presented token: {body}"
+    );
 }
