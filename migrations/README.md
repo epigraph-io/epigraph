@@ -1715,7 +1715,12 @@ restart.
   NOT rewritten here: the fold is the operator runbook
   `docs/runbooks/edge-relationship-casefold.sql` (backup table, undo in
   `edge-relationship-casefold-undo.sql`), run after this migration. **Deploy
-  precondition:** the census in the file header (expected zero rows). Undo:
+  order (binding):** epigraph-api first (only it applies migrations), THEN
+  epigraph-mcp / epigraph-jobs / `decompose_claims`, THEN the operator fold. A
+  matcher binary running against a database without 175 writes `corroborates`
+  edges that get no factor (AFTER INSERT trigger, no backfill) and fall outside
+  090's index; see the file header. **Deploy precondition:** the census in the
+  file header (expected zero rows). Undo:
   re-run 011's function body and 090's index statement. **Applied to
   throwaway databases only, NOT to any deployed database.**
 

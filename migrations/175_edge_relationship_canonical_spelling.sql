@@ -56,6 +56,33 @@
 -- would abort this migration and the api's boot with it.
 --
 -- ===================================================================
+-- DEPLOY ORDER (binding: getting it wrong damages data silently)
+--
+-- Only epigraph-api applies migrations (at boot). epigraph-mcp, epigraph-jobs
+-- and the CLI binaries never migrate, but they ship the writers that now store
+-- lower case (the cross-source matcher's `corroborates`, MCP
+-- `link_epistemic`, `decompose_claims --retarget --apply`). So:
+--
+--   1. Deploy epigraph-api FIRST and confirm it applied 175.
+--   2. THEN deploy epigraph-mcp, epigraph-jobs and decompose_claims.
+--   3. The operator case-fold runbook
+--      (`docs/runbooks/edge-relationship-casefold.sql`) runs only after 175.
+--
+-- If an MCP binary with this change runs against a database WITHOUT 175, every
+-- matcher `corroborates` edge written in that gap (a) gets NO belief-
+-- propagation factor, permanently (`edges_auto_factor` is AFTER INSERT only,
+-- 011's `edge_to_factor_type` has no `corroborates` row, and nothing here
+-- backfills), and (b) falls outside 090's unique index predicate, which names
+-- only `CORROBORATES`. A `decompose_claims --retarget --apply` against an api
+-- without this change POSTs lower-case `contradicts` and gets 400 (loud, but
+-- the run fails).
+--
+-- Not here, pending an operator ruling: a factor backfill for claim/claim
+-- `corroborates` / `refutes` edges that have no factors row (pre-existing
+-- lower-case rows, and any written in a mis-ordered deploy). It changes belief
+-- propagation for those rows, so it is a separate, ruled follow-up.
+--
+-- ===================================================================
 -- DEPLOY PRECONDITION (same census shape as 090's)
 --
 -- The new key is coarser than 090's: a pair holding BOTH an in-force matcher
