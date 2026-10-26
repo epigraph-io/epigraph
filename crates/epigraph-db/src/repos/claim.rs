@@ -629,7 +629,8 @@ pub struct DedupRevert {
     /// The BP factor slots (`factor_type:lo,hi`) the repair minted on the
     /// canonical for the edges it moved there: slots that were EMPTY before
     /// the mark (an occupied slot keeps its factor and the repair mints
-    /// nothing into it).
+    /// nothing into it). Informational, for the audit record: the un-mark
+    /// reads [`Self::slot_edges_without_factor`], which is derived from it.
     #[serde(default)]
     pub minted_factor_slots: Vec<String>,
     /// The canonical's own edges that mapped to one of those slots at the
