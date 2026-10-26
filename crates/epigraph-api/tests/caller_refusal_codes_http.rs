@@ -22,6 +22,9 @@
 //!   a claim it has already declared non-public.
 //! * Fail closed: an uncoded database refusal with a SQLSTATE the coded arm
 //!   maps (42501) still answers the redacted 500.
+//! * The mapper's policy is the LISTED codes (`CALLER_REFUSAL_CODES`), not any
+//!   message of the code shape: an older coded refusal (FA07) keeps the
+//!   redacted 500; a listed 22023 refusal (AAR01) takes the 400 fallback.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -245,5 +248,63 @@ async fn an_uncoded_refusal_keeps_the_redacted_500(pool: PgPool) {
     assert!(
         !body.to_string().contains("permission denied"),
         "the uncoded database text stays server-side: {body}"
+    );
+}
+
+/// The coded arm's fallback class: a listed code under SQLSTATE 22023 (AAR01,
+/// `epigraph_admin_act_args` on an unknown kind, a function the application
+/// role may EXECUTE) is the caller's invalid parameter, a 400 carrying it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn api_mapper_answers_a_coded_22023_refusal_with_400(pool: PgPool) {
+    let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let e = sqlx::query("SELECT public.epigraph_admin_act_args('nope', '{}'::jsonb)")
+        .execute(&app_pool)
+        .await
+        .expect_err("an unknown admin act kind is refused");
+    assert_eq!(
+        e.as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("22023"),
+        "PREMISE: the refusal is an invalid-parameter SQLSTATE"
+    );
+    let (status, body) = http_answer(epigraph_db::DbError::from(e)).await;
+    let text = body.to_string();
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a coded 22023 refusal is the caller's bad parameter, not a 500: {text}"
+    );
+    assert!(
+        text.contains("AAR01:") && text.contains("is not an admin act kind"),
+        "the body carries the refusal code and its reason: {text}"
+    );
+}
+
+/// The arm admits the LISTED codes (`CALLER_REFUSAL_CODES`, each reviewed for
+/// what it discloses), not any message of the code SHAPE: a refusal carrying
+/// an older code nobody reviewed for an HTTP body keeps the redacted 500 even
+/// under a SQLSTATE (42501) the arm maps to 403. Raised by the database on
+/// the application role, so the error has the real driver shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_older_coded_refusal_keeps_the_redacted_500(pool: PgPool) {
+    let app_pool = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let e = sqlx::query(
+        "DO $$ BEGIN RAISE EXCEPTION 'FA07: an older coded refusal' \
+         USING ERRCODE = '42501'; END $$",
+    )
+    .execute(&app_pool)
+    .await
+    .expect_err("the block raises");
+    assert_eq!(
+        e.as_database_error().map(|d| d.message().to_string()),
+        Some("FA07: an older coded refusal".to_string()),
+        "PREMISE: the message opens with a code of the allowlist's shape"
+    );
+    let (status, body) = http_answer(epigraph_db::DbError::from(e)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        !body.to_string().contains("FA07"),
+        "an unlisted code's text stays server-side: {body}"
     );
 }
