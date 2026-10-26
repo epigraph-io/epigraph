@@ -1476,3 +1476,71 @@ async fn an_overflowing_matcher_score_exponent_does_not_block_the_unmark(pool: P
     unmark(&pool, dup, &repair.revert).await;
     assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
 }
+
+/// Backlog 5272d890 (1), the round-trip over-mint PR #687 left as a known
+/// limitation. The canonical has an edge to X whose factor something removed;
+/// the duplicate has an edge from X of a different relationship that maps to
+/// the same `(factor_type, pair)` slot. The mark mints the moved edge's factor
+/// into that empty slot; the un-mark deletes it again, and at origin/main the
+/// freed slot was then re-filled from the canonical's own edge, so the round
+/// trip left the canonical a factor it did not have before the mark. The
+/// revert record now names the canonical's edges that sat unfactored in a slot
+/// the mark minted into, and the un-mark leaves them as it found them.
+///
+/// The second arm is the refill the un-mark must keep: a canonical edge of the
+/// same slot created AFTER the mark could not mint (the mark's factor held the
+/// slot) and gets its factor once the un-mark frees it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mark_unmark_round_trip_leaves_an_unfactored_canonical_edge_unfactored(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+
+    // Arm 1: the canonical's edge was unfactored before the mark.
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let x = fixture::seed_public_claim(&pool, a, "x").await;
+    let e_c = edge(&pool, x, canonical, "provides_evidence").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_c)
+        .execute(&pool)
+        .await
+        .expect("remove the canonical edge's factor");
+    let e_d = edge(&pool, x, dup, "supports").await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, canonical)],
+        "CALIBRATION: the mark minted the moved edge's factor into the empty slot"
+    );
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, dup)],
+        "CALIBRATION: the un-mark put the duplicate's factor back"
+    );
+    assert!(
+        factors_of_edge(&pool, e_c).await.is_empty(),
+        "the round trip must not mint a factor for the canonical edge the mark found unfactored"
+    );
+
+    // Arm 2: the canonical's edge came after the mark.
+    let canonical2 = fixture::seed_public_claim(&pool, a, "canonical 2").await;
+    let dup2 = fixture::seed_public_claim(&pool, a, "duplicate 2").await;
+    let y = fixture::seed_public_claim(&pool, a, "y").await;
+    let e_d2 = edge(&pool, y, dup2, "supports").await;
+    let repair2 = mark(&pool, dup2, canonical2).await;
+    let e_c2 = edge(&pool, y, canonical2, "provides_evidence").await;
+    assert!(
+        factors_of_edge(&pool, e_c2).await.is_empty(),
+        "CALIBRATION: the mark's factor held the slot, so the later edge minted none"
+    );
+    unmark(&pool, dup2, &repair2.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d2).await,
+        vec![sorted_pair(y, dup2)]
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_c2).await,
+        vec![sorted_pair(y, canonical2)],
+        "a canonical edge created after the mark gets the slot the un-mark frees"
+    );
+}
