@@ -126,7 +126,13 @@ composed — see §8.3.
 payload with no transformation: nodes carry `label`, `pignistic_prob`,
 `frame_id`, and (compound mode) `atom_count`; edges carry `relationship`.
 
-- **Belief → node fill.** `pignistic_prob` on a sequential ramp.
+- **Belief → node fill.** ~~`pignistic_prob` on a sequential ramp.~~
+  **Superseded:** the canvas ramps `truth_value`, and carries no belief column
+  at all. A compound claim's cached `pignistic_prob` is a fold of its own BBAs
+  rather than a value derived from its leaves, so a hue ramped on it asserts
+  more than the number says, and a role-blind reader that serves it is a
+  finding in `crates/epigraph-db/tests/no_role_blind_belief_reads.rs`. See the
+  impl plan §2.2 and §3.6.
 - **Frame → hue family.** `frame_id` groups visually; 126 frames means a hashed
   palette, not a legend.
 - **`atom_count` → radius** in compound mode.

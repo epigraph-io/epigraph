@@ -114,8 +114,10 @@ pub struct EgoNode {
     pub content: Option<String>,
     #[serde(default)]
     pub truth_value: Option<f64>,
-    #[serde(default)]
-    pub pignistic_prob: Option<f64>,
+    /// No belief column: `/claims/:id/ego` does not serve one (a compound's
+    /// cached BetP is a fold of its own BBAs, not a value derived from its
+    /// leaves — see the kernel's `routes/ego.rs` module docs). The claim
+    /// page's belief figure comes from [`BeliefResponse`] instead.
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default)]

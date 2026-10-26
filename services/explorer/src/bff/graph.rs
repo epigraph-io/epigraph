@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! { "center": uuid|null,
-//!   "nodes": [{ id, entity_type, label, content, truth_value, pignistic_prob,
+//!   "nodes": [{ id, entity_type, label, content, truth_value,
 //!               labels, is_current, is_center, frame_id, atom_count,
 //!               kind, href, expand_href, graph_href }],
 //!   "edges": [{ id, source, target, relationship, family, directed, strength }],
@@ -20,6 +20,17 @@
 //! blanking. The overviews are cached for 60 s per viewer
 //! ([`RequestAuth::cache_key`]); upstream visibility differs per viewer, so
 //! one viewer's cached body is never served to another.
+//!
+//! # No cached BetP on a canvas node
+//!
+//! [`CanvasNode`] carries `truth_value` and no belief column. A compound
+//! claim's cached `pignistic_prob` is a fold of its own BBAs rather than a
+//! value derived from its leaves, so a colour ramped on it tells the viewer
+//! something the number does not say; the kernel's `/claims/:id/ego` therefore
+//! does not serve the field at all (`routes/ego.rs` module docs). `graph.js`
+//! ramps node fill on `truth_value`. A claim's belief is shown only on the
+//! claim page, from `/claims/:id/belief`, which is role-aware and
+//! frame-scoped. Do not re-add the field here.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -92,7 +103,6 @@ pub struct CanvasNode {
     /// Claim text for the side panel, ≤ [`CONTENT_CHARS`].
     pub content: Option<String>,
     pub truth_value: Option<f64>,
-    pub pignistic_prob: Option<f64>,
     pub labels: Vec<String>,
     pub is_current: Option<bool>,
     pub is_center: bool,
@@ -157,7 +167,6 @@ impl CanvasNode {
             label: non_empty_line(label).unwrap_or_else(|| id.to_string()),
             content: Some(truncate_chars(label.trim(), CONTENT_CHARS)),
             truth_value: None,
-            pignistic_prob: None,
             labels: Vec::new(),
             is_current: None,
             is_center: false,
@@ -194,7 +203,6 @@ fn ego_node(n: EgoNode, is_center: bool, links: &Links) -> CanvasNode {
             .as_deref()
             .map(|c| truncate_chars(c.trim(), CONTENT_CHARS)),
         truth_value: n.truth_value,
-        pignistic_prob: n.pignistic_prob,
         labels: n.labels,
         is_current: n.is_current,
         is_center,
@@ -325,7 +333,6 @@ pub fn canvas_from_neighborhood(
                         let mut node = CanvasNode::from_claim_label(n.id, &n.label, links);
                         node.kind = Some(n.kind).filter(|k| !k.is_empty());
                         node.atom_count = (n.atom_count > 0).then_some(n.atom_count);
-                        node.pignistic_prob = n.pignistic_prob;
                         node.frame_id = n.frame_id;
                         node
                     })
@@ -353,7 +360,6 @@ pub fn canvas_from_neighborhood(
                     .map(|n| {
                         let mut node = CanvasNode::from_claim_label(n.id, &n.label, links);
                         node.kind = Some("atom".into());
-                        node.pignistic_prob = n.pignistic_prob;
                         node.frame_id = n.frame_id;
                         node
                     })
@@ -658,7 +664,7 @@ mod tests {
     fn ego_json() -> serde_json::Value {
         json!({
             "center": {"id": uuid(1), "entity_type": "claim", "label": "Centre\nclaim",
-                       "content": "Centre claim", "truth_value": 0.7, "pignistic_prob": 0.8,
+                       "content": "Centre claim", "truth_value": 0.7,
                        "labels": ["x"], "is_current": true},
             "nodes": [
                 {"id": uuid(2), "entity_type": "claim", "label": "Second", "content": "Second claim",
@@ -786,7 +792,6 @@ mod tests {
         assert_eq!(g.nodes[0].frame_id, Some(uuid(70)));
         assert_eq!(g.nodes[0].kind.as_deref(), Some("compound"));
         assert_eq!(g.nodes[1].label, "Standalone claim");
-        assert_eq!(g.nodes[1].pignistic_prob, Some(0.1));
         assert_eq!(g.nodes[1].frame_id, Some(uuid(71)));
         assert_eq!(g.nodes[1].atom_count, None);
 

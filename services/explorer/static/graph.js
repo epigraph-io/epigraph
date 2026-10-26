@@ -121,11 +121,15 @@
     return Math.round(range[0] + (range[1] - range[0]) * t);
   }
 
-  /** Sequential ramp on pignistic_prob, else truth_value; neutral grey when
-   * the node has neither. Hue from frame_id, else type. */
+  /** Sequential ramp on truth_value; neutral grey when the node has none.
+   * Hue from frame_id, else type.
+   *
+   * Deliberately NOT belief: a canvas node carries no cached BetP, because a
+   * compound claim's is a fold of its own BBAs rather than a value derived
+   * from its leaves, so a hue ramped on it would assert more than the number
+   * says. A claim's belief is shown only on the claim page. */
   function nodeFill(d, dark) {
-    let p = num(d.pignistic_prob);
-    if (p === null) p = num(d.truth_value);
+    const p = num(d.truth_value);
     if (p === null) return 'hsl(210, 6%, ' + NEUTRAL_LIGHTNESS[dark ? 1 : 0] + '%)';
     const t = Math.min(1, Math.max(0, p));
     const hue = hueFor(String(d.frame_id || d.entity_type || 'claim').toLowerCase());
@@ -838,8 +842,8 @@
       }
 
       const rows = [];
-      const belief = fmt(d.pignistic_prob);
-      if (belief) rows.push(['Belief', belief]);
+      // No belief row: the canvas payload carries no cached BetP (see
+      // nodeFill). The claim page shows belief, from /claims/:id/belief.
       const truth = fmt(d.truth_value);
       if (truth) rows.push(['Truth value', truth]);
       if (typeof d.is_current === 'boolean') rows.push(['Current', d.is_current ? 'yes' : 'no, superseded']);

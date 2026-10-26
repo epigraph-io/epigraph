@@ -136,9 +136,24 @@ canvas both read this. Query: `max_degree` (default 40, clamp `1..=200`),
 ```
 
 `EgoNode`: `id`, `entity_type`, `label` (≤ 160 chars, cut on a char boundary),
-and for claims `content`, `truth_value`, `pignistic_prob?`, `labels`,
-`is_current`; `redacted: bool` on every node. `direction` is relative to the
-centre (`"out"` = centre is source).
+and for claims `content`, `truth_value`, `labels`, `is_current`;
+`redacted: bool` on every node. `direction` is relative to the centre
+(`"out"` = centre is source).
+
+**There is no `pignistic_prob` (nor `belief` / `plausibility`) on an `EgoNode`,
+and it must not be added.** An earlier draft of this section specified one. A
+compound claim's cached belief columns are a fold of its own BBAs rather than a
+value derived from its leaves, so every reader that serves or computes with
+them has to know the claim's role — the rule
+`crates/epigraph-db/tests/no_role_blind_belief_reads.rs` enforces. This payload
+is a flat `id = ANY($1)` hydration across whatever types the edge rows named,
+so it has no role to dispatch on; registering the two readers as `Tag::Todo`
+would have added BRAND-NEW role-blind readers to a register that exists only
+for PRE-EXISTING ones awaiting conversion under SPEC §7.2, moving DONE
+criterion D5 ("D5 passes only when the register holds writer entries alone")
+backwards. `truth_value` stays because this path only projects it, never
+compares, orders on or folds it. A claim's belief comes from
+`GET /api/v1/claims/:id/belief`, which is role-aware and frame-scoped.
 
 ### 2.3 `GET /api/v1/claims/:id/placement`
 
@@ -357,9 +372,9 @@ No real hostnames or IPs in source, docs or examples — RFC 2606 names only
 - Single click selects a node and shows its detail. Double click or "expand"
   fetches `/bff/graph/ego/:id` and merges the result. The link opens the node's
   page.
-- Node fill is a sequential ramp on `pignistic_prob`, falling back to
-  `truth_value`. Hue comes from a hashed `frame_id` or entity type. Radius comes
-  from `atom_count` where present.
+- Node fill is a sequential ramp on `truth_value` — deliberately not belief,
+  which the canvas payload does not carry (see §2.2). Hue comes from a hashed
+  `frame_id` or entity type. Radius comes from `atom_count` where present.
 - Edge style is set by relationship family: support (solid), refute (dashed,
   warm) and structural (thin grey).
 - A visible node cap of 150, with a "truncated" notice. The layout works in light

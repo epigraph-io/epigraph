@@ -39,7 +39,7 @@ const HOSTILE: &str = "\"><script>alert(1)</script>";
 fn ego_json(center_label: &str) -> Value {
     json!({
         "center": {"id": CLAIM, "entity_type": "claim", "label": center_label,
-                   "content": center_label, "truth_value": 0.7, "pignistic_prob": 0.8,
+                   "content": center_label, "truth_value": 0.7,
                    "labels": ["physics"], "is_current": true},
         "nodes": [
             {"id": SECOND, "entity_type": "claim", "label": "A second claim",
@@ -126,7 +126,13 @@ async fn ego_bff_clamps_degree_and_returns_the_canvas_shape() {
         centre["graph_href"],
         format!("/explorer/claim/{CLAIM}/graph")
     );
-    assert_eq!(centre["pignistic_prob"], 0.8);
+    assert_eq!(centre["truth_value"], 0.7);
+    assert_eq!(
+        centre["pignistic_prob"],
+        Value::Null,
+        "a canvas node carries no cached belief column; graph.js ramps node \
+         fill on truth_value (bff::graph module docs)"
+    );
     assert_eq!(centre["labels"], json!(["physics"]));
 
     let agent = node(&body, AGENT);

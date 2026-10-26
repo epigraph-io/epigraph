@@ -211,7 +211,6 @@ pub struct Neighbour {
     /// `None` for entity types without a page (paper, trace, …).
     pub href: Option<String>,
     pub truth_value: Option<f64>,
-    pub pignistic_prob: Option<f64>,
     /// `Some(false)` for a superseded claim.
     pub is_current: Option<bool>,
 }
@@ -406,7 +405,6 @@ fn neighbour(id: Uuid, edge_type: &str, node: &EgoNode, links: &Links) -> Neighb
         entity_type,
         text,
         truth_value: node.truth_value,
-        pignistic_prob: node.pignistic_prob,
         is_current: node.is_current,
     }
 }
@@ -427,7 +425,6 @@ mod tests {
             label: label.into(),
             content: (t == "claim").then(|| label.to_string()),
             truth_value: None,
-            pignistic_prob: None,
             labels: vec![],
             is_current: None,
         }

@@ -52,6 +52,24 @@
 //! happened to drop. `truncated` stays cap-only, so the pair says "the cap cut
 //! the list" and never "there is more you cannot see".
 //!
+//! # A claim node carries no cached BetP
+//!
+//! A claim node is `{ id, entity_type, label, content, truth_value, labels,
+//! is_current }`. There is deliberately no `pignistic_prob` (nor `belief` /
+//! `plausibility`): a compound claim's cached belief columns are a fold of its
+//! own BBAs rather than a value derived from its leaves, so serving them needs
+//! the claim's role, and this payload is a flat hydration with no role to
+//! dispatch on. Colouring a compound's node by its cached BetP would show a
+//! viewer a number that does not mean what the colour implies, so the field is
+//! absent rather than present with a caveat.
+//!
+//! The Explorer's graph canvas ramps node fill on `truth_value` for this
+//! reason; the claim page's belief figure comes from
+//! `GET /api/v1/claims/:id/belief`, which is role-aware and frame-scoped. Do
+//! not re-add a belief field here — `epigraph-db`'s
+//! `tests/no_role_blind_belief_reads.rs` will fail, and registering the reader
+//! instead would move DONE criterion D5 backwards.
+//!
 //! All SQL lives in `epigraph_db::EgoRepository`.
 
 use std::collections::{HashMap, HashSet};
@@ -100,8 +118,6 @@ pub struct EgoNode {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truth_value: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pignistic_prob: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,7 +194,6 @@ fn to_node(entity: EgoEntity) -> EgoNode {
         label,
         content: entity.content,
         truth_value: entity.truth_value,
-        pignistic_prob: entity.pignistic_prob,
         labels: entity.labels,
         is_current: entity.is_current,
     }
@@ -195,7 +210,6 @@ fn unhydrated_node(id: Uuid, entity_type: &str) -> EgoNode {
         label: entity_type.to_string(),
         content: None,
         truth_value: None,
-        pignistic_prob: None,
         labels: None,
         is_current: None,
     }

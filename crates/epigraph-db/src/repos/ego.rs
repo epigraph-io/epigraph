@@ -16,6 +16,23 @@
 //! (see `routes/graph.rs` `GRAPH_VIEW_RELATIONSHIPS`), so a case-sensitive
 //! filter would silently hide half the graph.
 //!
+//! # Hydrated claims carry no cached BetP
+//!
+//! The claim hydration SELECT reads `content`, `truth_value`, `labels` and
+//! `is_current` — deliberately NOT `pignistic_prob` (nor `belief` /
+//! `plausibility`). A compound claim's cached belief columns are a fold of its
+//! own BBAs, not a value derived from its leaves, so a reader that serves them
+//! must know the claim's role; this hydration is a flat `id = ANY($1)` fetch
+//! across whatever types the edge rows named, and has no role to dispatch on.
+//! Serving the number anyway would hand a caller a figure that does not mean
+//! what a compound node implies it means.
+//!
+//! `truth_value` is projected, never compared, ordered on or folded, which is
+//! the distinction `crates/epigraph-db/tests/no_role_blind_belief_reads.rs`
+//! draws. Anything that needs a claim's belief should ask
+//! `GET /api/v1/claims/:id/belief`, which is role-aware and frame-scoped. Do
+//! not re-add a belief column here.
+//!
 //! # Tenancy
 //!
 //! Every statement is filtered in SQL against the caller's [`Viewer`]. The
@@ -124,7 +141,6 @@ pub struct EgoEntity {
     pub label: String,
     pub content: Option<String>,
     pub truth_value: Option<f64>,
-    pub pignistic_prob: Option<f64>,
     pub labels: Option<Vec<String>>,
     pub is_current: Option<bool>,
 }
@@ -135,7 +151,6 @@ struct ClaimHydrationRow {
     id: Uuid,
     content: String,
     truth_value: f64,
-    pignistic_prob: Option<f64>,
     labels: Vec<String>,
     is_current: bool,
 }
@@ -422,7 +437,7 @@ impl EgoRepository {
         let mut out: Vec<EgoEntity> = Vec::new();
 
         let claims_sql = viewer.splice(
-            "SELECT c.id, c.content, c.truth_value, c.pignistic_prob, c.labels, c.is_current \
+            "SELECT c.id, c.content, c.truth_value, c.labels, c.is_current \
              FROM claims c WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
             2,
         );
@@ -441,7 +456,6 @@ impl EgoRepository {
                 label: row.content.clone(),
                 content: Some(row.content),
                 truth_value: Some(row.truth_value),
-                pignistic_prob: row.pignistic_prob,
                 labels: Some(row.labels),
                 is_current: Some(row.is_current),
             });
@@ -468,7 +482,6 @@ impl EgoRepository {
                 label,
                 content: None,
                 truth_value: None,
-                pignistic_prob: None,
                 labels: None,
                 is_current: None,
             });
@@ -506,7 +519,6 @@ impl EgoRepository {
                 label,
                 content: None,
                 truth_value: None,
-                pignistic_prob: None,
                 labels: None,
                 is_current: None,
             });
@@ -534,7 +546,6 @@ impl EgoRepository {
                 label: format!("{reasoning_type} ({confidence:.2})"),
                 content: None,
                 truth_value: None,
-                pignistic_prob: None,
                 labels: None,
                 is_current: None,
             });
@@ -555,7 +566,6 @@ impl EgoRepository {
                 label,
                 content: None,
                 truth_value: None,
-                pignistic_prob: None,
                 labels: None,
                 is_current: None,
             });

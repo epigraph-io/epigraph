@@ -270,6 +270,16 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
         common::insert_edge(&pool, center, out_neighbour, "claim", "claim", "supports").await;
     let in_edge =
         common::insert_edge(&pool, in_neighbour, center, "claim", "claim", "supports").await;
+    // A cached BetP ON the centre, so the absence asserted below is the route
+    // declining to serve the column, not the column being null.
+    sqlx::query(
+        "UPDATE claims SET belief = 0.4, plausibility = 0.9, pignistic_prob = 0.65 \
+         WHERE id = ANY($1)",
+    )
+    .bind(vec![center, out_neighbour, in_neighbour])
+    .execute(&pool)
+    .await
+    .expect("cache a BetP on every fixture claim");
     let app = router(&pool).await;
 
     let (status, body) = get(
@@ -314,7 +324,9 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
             "labels",
             "truth_value",
         ],
-        "pignistic_prob is omitted, not null, when the claim has none"
+        "a claim node carries no cached belief column: `pignistic_prob` is not \
+         part of this payload at all (routes/ego.rs module docs), and the other \
+         claim-only fields are omitted rather than null when absent"
     );
     assert_eq!(body["center"]["id"], center.to_string());
     assert_eq!(body["center"]["entity_type"], "claim");
@@ -322,6 +334,21 @@ async fn happy_path_returns_the_documented_shape(pool: PgPool) {
     assert_eq!(body["center"]["content"], "the centre claim");
     assert_eq!(body["center"]["truth_value"], 0.5);
     assert_eq!(body["center"]["is_current"], Value::Bool(true));
+
+    // Not the centre's alone: no node in the payload names a belief column,
+    // even though every fixture claim has one cached. A compound's cached BetP
+    // is a fold of its own BBAs, so a role-blind hydration must not serve it.
+    for node in std::iter::once(&body["center"])
+        .chain(body["nodes"].as_array().expect("nodes array").iter())
+    {
+        let obj = node.as_object().expect("node object");
+        for banned in ["pignistic_prob", "belief", "plausibility"] {
+            assert!(
+                !obj.contains_key(banned),
+                "the ego payload must not carry `{banned}`; got {node}"
+            );
+        }
+    }
 
     let ids = node_ids(&body);
     assert_eq!(ids.len(), 2, "both neighbours hydrated, got {body}");

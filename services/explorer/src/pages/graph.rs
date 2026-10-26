@@ -11,6 +11,8 @@
 //!   copies that claim's URL instead. An upstream 404 — or theme expand's
 //!   synthetic placeholder — renders "view expired — clustering has re-run".
 
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -27,7 +29,7 @@ use crate::bff::graph::{
 use crate::error::{not_found_as, AppError};
 use crate::links::{with_centre_claim as with_claim, Links};
 use crate::state::AppState;
-use crate::upstream::graph::{clamp_expand_budget, NeighborhoodMode};
+use crate::upstream::graph::{clamp_expand_budget, NeighborhoodExpand, NeighborhoodMode};
 use crate::upstream::{degrade, Degraded, PlacementResponse, UpstreamError};
 use crate::view::render;
 
@@ -549,6 +551,17 @@ async fn neighborhood(
     // Upstream falls through to compound for anything but `atomic`; trust
     // the shape it sent over the mode we asked for.
     page.atomic = expand.mode() == NeighborhoodMode::Atomic;
+    // Read upstream's BetP here rather than off the canvas node: `CanvasNode`
+    // carries no belief column, because a colour ramped on a compound's cached
+    // BetP says more than the number does (see `bff::graph` module docs). A
+    // labelled figure in this list is a different claim from a hue, so the
+    // column stays — sourced, like the community page's, from the raw payload.
+    let betps: HashMap<Uuid, Option<f64>> = match &expand {
+        NeighborhoodExpand::Compound(c) => {
+            c.nodes.iter().map(|n| (n.id, n.pignistic_prob)).collect()
+        }
+        NeighborhoodExpand::Atomic(a) => a.nodes.iter().map(|n| (n.id, n.pignistic_prob)).collect(),
+    };
     let (graph, groups) = canvas_from_neighborhood(expand, links);
     page.nodes = graph
         .nodes
@@ -556,7 +569,7 @@ async fn neighborhood(
         .map(|n| ClaimRow {
             href: links.claim(n.id),
             label: n.label.clone(),
-            betp: fmt_num(n.pignistic_prob),
+            betp: fmt_num(betps.get(&n.id).copied().flatten()),
         })
         .collect();
     page.edges = edge_rows(&graph);
