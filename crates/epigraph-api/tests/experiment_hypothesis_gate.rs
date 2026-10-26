@@ -511,6 +511,44 @@ async fn analyzing_needs_the_hypothesis_writable_not_only_readable() {
     );
 }
 
+/// R-51: a stranger naming a real, correctly paired experiment and result
+/// whose hypothesis it cannot read gets the same 404 as for a result that
+/// does not exist. Answering with a `hypothesis` 404 instead told it the pair
+/// exists and handed it the private hypothesis's id.
+#[tokio::test(flavor = "multi_thread")]
+async fn analyzing_onto_a_hidden_hypothesis_is_the_missing_result_404() {
+    let w = world("r51-analyze-hidden").await;
+    ensure_hypothesis_frame(&w.pool).await;
+    let (experiment, result) = seed_experiment(&w.pool, w.hypothesis, w.owner, "collecting").await;
+
+    let before = analyze_footprint(&w, experiment).await;
+    let (status, body) = analyze(&w, w.stranger, RW, experiment, result).await;
+    assert_eq!(
+        status, 404,
+        "hidden hypothesis must be 404, got {status} {body}"
+    );
+    let missing = Uuid::new_v4();
+    let (missing_status, missing_body) = analyze(&w, w.stranger, RW, experiment, missing).await;
+    assert_eq!(missing_status, 404, "calibration: a missing result is 404");
+    assert_eq!(
+        masked(&body, result),
+        masked(&missing_body, missing),
+        "a result on a hidden hypothesis must be indistinguishable from a missing one"
+    );
+    assert!(
+        !body.to_string().contains(&w.hypothesis.to_string()),
+        "the refusal must not name the hidden hypothesis: {body}"
+    );
+    assert_eq!(
+        analyze_footprint(&w, experiment).await,
+        before,
+        "a refused analyze must write no BBA, no edge and no status change"
+    );
+
+    let (status, body) = analyze(&w, w.owner, RW, experiment, result).await;
+    assert_eq!(status, 200, "calibration: the owner analyzes: {body}");
+}
+
 /// R-52: analyze writes evidence, so it takes the scope every other evidence
 /// writer takes. The owner of the hypothesis with a read-only token is refused
 /// 403 naming `claims:write`, and nothing lands.
