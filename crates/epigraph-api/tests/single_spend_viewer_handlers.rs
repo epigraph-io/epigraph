@@ -209,8 +209,7 @@ async fn analyze_refuses_a_result_that_belongs_to_another_experiment() {
         &format!("a12 idor hidden hypothesis {}", Uuid::new_v4()),
     )
     .await;
-    let (_hidden_experiment, hidden_result) =
-        seed_experiment(&pool, hidden_hypothesis, other).await;
+    let (hidden_experiment, hidden_result) = seed_experiment(&pool, hidden_hypothesis, other).await;
 
     let result_footprint = |result: Uuid| {
         let pool = pool.clone();
@@ -236,30 +235,50 @@ async fn analyze_refuses_a_result_that_belongs_to_another_experiment() {
     let analyze = |experiment: Uuid, result: Uuid| {
         let (http, token) = (http.clone(), token.clone());
         async move {
-            http.post(format!(
-                "http://{addr}/api/v1/experiments/{experiment}/results/{result}/analyze"
-            ))
-            .bearer_auth(&token)
-            .json(&serde_json::json!({
-                "agent_id": caller,
-                "direction": "supports",
-                "scope_limitations": [],
-                "expected_value": 0.0,
-            }))
-            .send()
-            .await
-            .expect("analyze request")
-            .status()
-            .as_u16()
+            let res = http
+                .post(format!(
+                    "http://{addr}/api/v1/experiments/{experiment}/results/{result}/analyze"
+                ))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "agent_id": caller,
+                    "direction": "supports",
+                    "scope_limitations": [],
+                    "expected_value": 0.0,
+                }))
+                .send()
+                .await
+                .expect("analyze request");
+            let status = res.status().as_u16();
+            let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+            (status, body)
         }
+    };
+    // A 404 body with the named result id masked, so two refusals naming
+    // different ids can be compared.
+    let masked = |body: &serde_json::Value, id: Uuid| -> String {
+        body.to_string().replace(&id.to_string(), "<id>")
     };
 
     let before_hidden = result_footprint(hidden_result).await;
     let before_own = analyze_footprint(&pool, own_hypothesis, own_experiment).await;
-    let status = analyze(own_experiment, hidden_result).await;
+    let (status, body) = analyze(own_experiment, hidden_result).await;
     assert_eq!(
         status, 404,
         "a result named under an experiment it does not belong to must be 404, got {status}"
+    );
+    // ORACLE: the refusal is the same 404 as a result that does not exist.
+    let missing = Uuid::new_v4();
+    let (missing_status, missing_body) = analyze(own_experiment, missing).await;
+    assert_eq!(missing_status, 404, "calibration: a missing result is 404");
+    assert_eq!(
+        masked(&body, hidden_result),
+        masked(&missing_body, missing),
+        "a mismatched result must be indistinguishable from a missing one"
+    );
+    assert_eq!(
+        body["details"]["entity"], "result",
+        "the refusal names the result, not anything behind it: {body}"
     );
     assert_eq!(
         result_footprint(hidden_result).await,
@@ -272,11 +291,39 @@ async fn analyze_refuses_a_result_that_belongs_to_another_experiment() {
         "nothing derived from the other result may land on the caller's hypothesis"
     );
 
-    // CALIBRATION: the caller's own result under its own experiment.
+    // ORDER: the pairing is checked BEFORE the hypothesis read. The caller's
+    // own result named under the hidden experiment is the `result` 404; were
+    // the pairing checked after the gate, the hidden experiment's unreadable
+    // hypothesis would answer first with a `hypothesis` 404.
+    let before_own_result = result_footprint(own_result).await;
+    let (status, body) = analyze(hidden_experiment, own_result).await;
     assert_eq!(
-        analyze(own_experiment, own_result).await,
-        200,
-        "calibration: the matching pair must succeed"
+        status, 404,
+        "a mismatched pair under a hidden experiment is 404"
+    );
+    assert_eq!(
+        body["details"]["entity"], "result",
+        "the pairing must refuse before the hypothesis gate runs: {body}"
+    );
+    assert_eq!(
+        result_footprint(own_result).await,
+        before_own_result,
+        "the refused pair must not touch the caller's own result"
+    );
+
+    // CALIBRATION: the caller's own result under its own experiment, and the
+    // footprint above sees exactly what it writes (an `analyzes` edge onto the
+    // result, the result marked complete), so its "unchanged" is not vacuous.
+    let (status, _) = analyze(own_experiment, own_result).await;
+    assert_eq!(status, 200, "calibration: the matching pair must succeed");
+    assert_ne!(
+        before_own_result.0, "complete",
+        "calibration: a fresh result is not complete before its analyze"
+    );
+    assert_eq!(
+        result_footprint(own_result).await,
+        ("complete".to_string(), 1),
+        "calibration: the matching analyze links the result and marks it complete"
     );
 }
 
