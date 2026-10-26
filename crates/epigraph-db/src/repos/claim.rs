@@ -688,6 +688,12 @@ pub struct UnmarkedDuplicate {
     /// Read from the edge's reserved `properties.dedup` (only the act and the
     /// backfill write it), never from the claim's patchable properties.
     pub legacy_backfill: bool,
+    /// For a [`Self::legacy_backfill`] mark, what the act stripped from the
+    /// restored claim (operator ruling R-18): `{"labels": [...], "properties":
+    /// {...}}`, the stale `deduped` label and the `deduped_*` properties the
+    /// raw-SQL `fuzzy_dedup_claims` wrote, with their values, for the audit
+    /// row. `None` for every other mark.
+    pub legacy_stripped: Option<serde_json::Value>,
 }
 
 impl UnmarkedDuplicate {
@@ -8512,16 +8518,42 @@ impl ClaimRepository {
         // Both writes carry the write predicate: on an application session the
         // viewer's writable groups, on the maintenance session (a bypass
         // viewer) nothing, as row security decides there too.
+        // A legacy mark's restored claim also loses what the raw-SQL script
+        // wrote to say it was deduplicated (operator ruling R-18): the
+        // `deduped` label and every `deduped_*` property. `o` is the row as it
+        // was, so the act returns what it stripped, for the audit row.
         let claim_sql = viewer.splice_write(
-            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW() \
-              WHERE c.id = $1 /* {WRITABLE:c} */",
-            2,
+            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW(), \
+                    labels = CASE WHEN $2 THEN array_remove(c.labels, 'deduped') \
+                                  ELSE c.labels END, \
+                    properties = CASE WHEN $2 THEN \
+                                   (SELECT COALESCE(jsonb_object_agg(p.k, p.v), '{}'::jsonb) \
+                                      FROM jsonb_each(c.properties) AS p(k, v) \
+                                     WHERE p.k NOT LIKE 'deduped\\_%') \
+                                 ELSE c.properties END \
+               FROM claims AS o \
+              WHERE c.id = $1 AND o.id = c.id /* {WRITABLE:c} */ \
+             RETURNING \
+               (SELECT COALESCE(array_agg(l), ARRAY[]::text[]) \
+                  FROM unnest(COALESCE(o.labels, ARRAY[]::text[])) AS l WHERE $2 AND l = 'deduped'), \
+               (SELECT COALESCE(jsonb_object_agg(p.k, p.v), '{}'::jsonb) \
+                  FROM jsonb_each(COALESCE(o.properties, '{}'::jsonb)) AS p(k, v) \
+                 WHERE $2 AND p.k LIKE 'deduped\\_%')",
+            3,
         );
-        let mut q = sqlx::query(&claim_sql).bind(dup_uuid);
+        let mut q = sqlx::query_as::<_, (Vec<String>, serde_json::Value)>(&claim_sql)
+            .bind(dup_uuid)
+            .bind(legacy_backfill);
         if let Some(w) = viewer.writable_bind() {
             q = q.bind(w);
         }
-        let restored = q.execute(&mut *tx).await?.rows_affected();
+        let stripped = q.fetch_optional(&mut *tx).await?;
+        let restored = u64::from(stripped.is_some());
+        let legacy_stripped = stripped
+            .filter(|_| legacy_backfill)
+            .map(|(labels, properties)| {
+                serde_json::json!({ "labels": labels, "properties": properties })
+            });
         let edge_sql = viewer.splice_write(
             "UPDATE edges AS e SET valid_to = now() WHERE e.id = $1 /* {WRITABLE:e} */",
             2,
@@ -8542,6 +8574,7 @@ impl ClaimRepository {
             chain,
             identity_edge,
             legacy_backfill,
+            legacy_stripped,
         })
     }
 

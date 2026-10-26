@@ -357,11 +357,13 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
     sqlx::query(
         "UPDATE claims SET supersedes = $1, is_current = false, embedding = NULL, \
                            embedding_3072 = NULL, \
-                           labels = array_append(COALESCE(labels, ARRAY[]::text[]), 'deduped'), \
+                           labels = COALESCE(labels, ARRAY[]::text[]) \
+                                    || ARRAY['r18-kept', 'deduped'], \
                            properties = COALESCE(properties, '{}'::jsonb) \
                              || jsonb_build_object('deduped_into', $1::text, \
                                                    'deduped_by', 'fuzzy_dedup_claims', \
-                                                   'deduped_at', now()::text) \
+                                                   'deduped_at', now()::text, \
+                                                   'r18_kept', true) \
           WHERE id = $2",
     )
     .bind(canonical)
@@ -413,6 +415,59 @@ async fn a_backfilled_legacy_mark_is_unmarked_as_an_ordinary_record(pool: PgPool
     assert_eq!(
         undedup["reversed_event_id"],
         serde_json::Value::Null,
+        "{undedup}"
+    );
+
+    // Operator ruling R-18 (backlog 0e013aa8): the restored claim no longer
+    // carries what the legacy script wrote to say it was deduplicated: its
+    // `deduped` label and `deduped_*` properties go, and the audit row records
+    // what was stripped. Its other labels and properties stay.
+    let (labels, properties): (Vec<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT COALESCE(labels, ARRAY[]::text[]), properties FROM claims WHERE id = $1",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("the restored claim");
+    assert!(
+        !labels.iter().any(|l| l == "deduped"),
+        "the stale 'deduped' label is stripped: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "r18-kept"),
+        "CALIBRATION: other labels stay: {labels:?}"
+    );
+    let left: Vec<&String> = properties
+        .as_object()
+        .map(|o| o.keys().filter(|k| k.starts_with("deduped_")).collect())
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "the stale deduped_* properties are stripped: {properties}"
+    );
+    assert_eq!(
+        properties["r18_kept"],
+        serde_json::json!(true),
+        "CALIBRATION: other properties stay: {properties}"
+    );
+    let stripped = &undedup["legacy_stripped"];
+    assert_eq!(
+        stripped["labels"],
+        serde_json::json!(["deduped"]),
+        "the audit row names the stripped label: {undedup}"
+    );
+    assert_eq!(
+        stripped["properties"]["deduped_into"],
+        serde_json::json!(canonical.to_string()),
+        "the audit row keeps the stripped properties' values: {undedup}"
+    );
+    assert_eq!(
+        stripped["properties"]["deduped_by"],
+        serde_json::json!("fuzzy_dedup_claims"),
+        "{undedup}"
+    );
+    assert!(
+        stripped["properties"]["deduped_at"].is_string(),
         "{undedup}"
     );
 }
