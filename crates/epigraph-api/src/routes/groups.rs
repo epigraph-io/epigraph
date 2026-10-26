@@ -492,7 +492,7 @@ pub async fn add_member(
 /// # Authorization
 /// `groups:admin` scope AND a live `role='admin'` membership in this group.
 /// Refuses (409) to remove the group's LAST live admin — that would leave the
-/// group permanently unadministrable, since `require_group_admin` is the only
+/// group permanently unadministrable, since `require_group_admin_conn` is the only
 /// way in and there is no break-glass path.
 pub async fn remove_member(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,

@@ -24,7 +24,7 @@ pub use rate_limit::{rate_limit_middleware, RateLimitResponse};
 pub use bearer::{bearer_auth_middleware, optional_bearer_auth_middleware, AuthContext};
 pub use epigraph_auth::ClientType;
 #[cfg(feature = "db")]
-pub use group_authz::require_group_admin;
+pub use group_authz::require_group_admin_conn;
 #[cfg(feature = "db")]
 pub use instance_authz::require_instance_admin_for_group;
 #[cfg(feature = "db")]

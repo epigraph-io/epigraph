@@ -332,7 +332,6 @@
 //!   connection primitive that `visibility_lint.rs`'s two connection rules
 //!   cannot see, because their scan root is `crates/epigraph-db/src/repos`.
 //!   Enumerated so no shard author mistakes this table for complete —
-//!   `middleware/group_authz.rs::require_group_admin`,
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
 //!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,

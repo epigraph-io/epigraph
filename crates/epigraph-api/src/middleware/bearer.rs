@@ -401,7 +401,7 @@ require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
 // Group management. `groups:write` creates a group (the creator becomes its sole
 // admin); `groups:admin` manages an EXISTING group's membership and is checked
 // alongside a live `role='admin'` membership in that group
-// (`middleware::group_authz::require_group_admin`) — scope AND membership.
+// (`middleware::group_authz::require_group_admin_conn`) — scope AND membership.
 // Using the extractor rather than `check_scopes` inside the handler matters
 // here: these routes take a `Json` body, and an extractor rejection runs before
 // body parsing, so a scope failure is 403 rather than 422 (issue #128).
