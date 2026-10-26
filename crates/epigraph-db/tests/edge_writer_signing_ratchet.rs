@@ -21,6 +21,17 @@
 //! skipped, so a doc-comment mention and an in-crate unit test are not
 //! writers.
 //!
+//! And the DATABASE-SIDE writers: every SQL function (SECURITY DEFINER entry
+//! point or trigger function) defined in `migrations/*.sql` whose LIVE
+//! definition inserts into `edges` ([`DB_REGISTER`]). Files are read in
+//! migration order and `CREATE [OR REPLACE] FUNCTION` / `DROP FUNCTION` in
+//! statement order, so only each function's latest definition counts, and a
+//! site is keyed by `(the migration holding that definition, function)`: a
+//! later migration that redefines a registered function trips the ratchet
+//! until its entry is moved to the new file and re-reviewed. One-shot data
+//! statements (a top-level `INSERT` or `DO` block) run once at migrate time
+//! and are not writers.
+//!
 //! # The rules
 //!
 //! * A new site (a new function, or one more site in a registered function) is
@@ -31,8 +42,12 @@
 //! * A [`Signed`] entry's function must call `sign_created_edge_conn`, so a
 //!   signed writer cannot silently stop signing.
 //! * A site that disappears must have its entry REMOVED (exact match both ways).
-//! * [`UNSIGNED_SITES_HIGH_WATER`] is the exact number of unsigned sites. It
-//!   only goes down: signing a writer lowers it in the same commit.
+//! * [`UNSIGNED_SITES_HIGH_WATER`] is the exact number of unsigned sites
+//!   (Rust and database). It should only go down: signing a writer lowers it
+//!   in the same commit. The test checks that the number EQUALS the register,
+//!   not that it never rises: raising it (a new unsigned writer) is a
+//!   reviewed act, visible in the diff of this file, not something the test
+//!   can refuse.
 //!
 //! # What it does not see
 //!
@@ -45,7 +60,12 @@
 //!
 //! A writer that builds `INSERT INTO edges` from pieces split across string
 //! literals or lines, or that calls a private wrapper with another name, is
-//! invisible to a line scanner. The wrappers in-tree today are themselves
+//! invisible to a line scanner. On the SQL side the scanner reads
+//! dollar-quoted function bodies (`AS $$ .. $$`, `AS $tag$ .. $tag$`) with
+//! `--` comments removed; it does not see a body quoted with single quotes, an
+//! `INSERT` assembled by `EXECUTE format(..)`, or a writer reached only
+//! through a function of another name (none of these write edges in-tree
+//! today), and it keys overloads by name. The wrappers in-tree today are themselves
 //! sites (`emit_verb_edge_best_effort`, `create_edge_under_savepoint`, the
 //! `EdgeRepository` primitives), so their callers are covered through them.
 
@@ -85,6 +105,10 @@ const PENDING_SIGNER_ID_RULING: &str = "the MCP server holds a key, but stamping
      as an edge factor's agent (COALESCE(e.signer_id, src.agent_id)); awaiting an operator \
      ruling (backlog dae795f8)";
 
+const NO_KEY_DB_FUNCTION: &str = "a database function (SECURITY DEFINER entry point or \
+     trigger) holds no entity key; its edges could only be signed at INSERT time by a key the \
+     caller passes in, or by a database-held key (backlog dae795f8 Q2)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// The function attests the edges it creates.
@@ -113,8 +137,55 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
     }
 }
 
-/// The exact number of unsigned edge-emitting sites. Only goes down.
-const UNSIGNED_SITES_HIGH_WATER: usize = 98;
+/// The exact number of unsigned edge-emitting sites, Rust ([`REGISTER`]) plus
+/// database ([`DB_REGISTER`]). Should only go down; see the module docs.
+const UNSIGNED_SITES_HIGH_WATER: usize = 103;
+
+/// A database-side edge writer: the migration holding the function's LIVE
+/// definition, the function, and its `INSERT INTO edges` count.
+struct DbSite {
+    migration: &'static str,
+    function: &'static str,
+    count: usize,
+    status: Status,
+}
+
+/// The database-side inventory, measured from `migrations/*.sql`.
+const DB_REGISTER: &[DbSite] = &[
+    // The legacy-author OPERATED_BY backfill (custodian role).
+    DbSite {
+        migration: "123_custodian_role.sql",
+        function: "epigraph_link_legacy_authors",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
+    // OPERATED_BY, behind epigraph_link_operator and the identity lineage.
+    DbSite {
+        migration: "161_agent_identity_lineage.sql",
+        function: "epigraph_link_operator_body",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
+    DbSite {
+        migration: "122_operator_binding.sql",
+        function: "epigraph_link_retired_agent",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
+    DbSite {
+        migration: "122_operator_binding.sql",
+        function: "epigraph_link_retired_shared_signer",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
+    // The role-assignment audit trigger (OCCUPIES verb-edges).
+    DbSite {
+        migration: "130_pending_admin_acts.sql",
+        function: "epigraph_role_assignments_audit",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
+];
 
 /// The inventory (backlog `dae795f8` step 1), measured.
 const REGISTER: &[Site] = &[
@@ -616,23 +687,242 @@ fn measure() -> BTreeMap<(String, String), (usize, String)> {
     out
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The SQL text with `--` line comments removed (a migration's comments
+/// mention functions and `INSERT INTO edges` freely).
+fn strip_sql_comments(sql: &str) -> String {
+    sql.split('\n')
+        .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Count `INSERT INTO [public.]edges` (word-bounded, any case and spacing).
+fn edge_inserts(sql: &str) -> usize {
+    let words: Vec<String> = sql
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    words
+        .windows(3)
+        .filter(|w| {
+            w[0] == "insert" && w[1] == "into" && (w[2] == "edges" || w[2] == "public.edges")
+        })
+        .count()
+}
+
+/// The function name after a `FUNCTION` keyword at `at`, lower-cased and
+/// without a `public.` prefix, and the byte offset just past it.
+fn sql_name_at(lower: &str, at: usize) -> Option<(String, usize)> {
+    let rest = &lower[at..];
+    let skipped = rest.len() - rest.trim_start().len();
+    let start = at + skipped;
+    let end = lower[start..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"'))
+        .map_or(lower.len(), |i| start + i);
+    let name = lower[start..end].replace('"', "");
+    let name = name.strip_prefix("public.").unwrap_or(&name).to_string();
+    (!name.is_empty()).then_some((name, end))
+}
+
+/// The dollar-quoted body that follows `from`: `(body start, body end, past
+/// the closing quote)`.
+fn dollar_body(sql: &str, from: usize) -> Option<(usize, usize, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' && !bytes[i + 1].is_ascii_digit() {
+                let tag = &sql[i..=j];
+                let close = sql[j + 1..].find(tag)? + j + 1;
+                return Some((j + 1, close, close + tag.len()));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Apply one migration file's `CREATE [OR REPLACE] FUNCTION` / `DROP FUNCTION`
+/// statements, in order, to `live` (`function -> (migration, edge INSERTs)`).
+fn apply_migration(live: &mut BTreeMap<String, (String, usize)>, file: &str, sql: &str) {
+    let sql = strip_sql_comments(sql);
+    let lower = sql.to_ascii_lowercase();
+    let words: Vec<(usize, &str)> = {
+        let mut out = Vec::new();
+        let mut start = None;
+        for (i, b) in lower.bytes().enumerate() {
+            if is_ident_byte(b) {
+                start.get_or_insert(i);
+            } else if let Some(s0) = start.take() {
+                out.push((s0, &lower[s0..i]));
+            }
+        }
+        if let Some(s0) = start {
+            out.push((s0, &lower[s0..]));
+        }
+        out
+    };
+    let mut skip_until = 0;
+    for (k, (pos, word)) in words.iter().enumerate() {
+        if *pos < skip_until || *word != "function" || k == 0 {
+            continue;
+        }
+        let prev = words[k - 1].1;
+        let prev2 = k.checked_sub(2).map(|i| words[i].1);
+        let prev3 = k.checked_sub(3).map(|i| words[i].1);
+        let create = prev == "create"
+            || (prev == "replace" && prev2 == Some("or") && prev3 == Some("create"));
+        let drop = prev == "drop";
+        if !(create || drop) {
+            continue;
+        }
+        let mut at = pos + word.len();
+        if drop {
+            // DROP FUNCTION [IF EXISTS] a(..), b(..) [CASCADE];
+            let stmt_end = lower[at..].find(';').map_or(lower.len(), |i| at + i);
+            let mut list = lower[at..stmt_end].trim_start().to_string();
+            if let Some(rest) = list.strip_prefix("if exists") {
+                list = rest.to_string();
+            }
+            let mut depth = 0i32;
+            let mut item = String::new();
+            for c in list.chars().chain(std::iter::once(',')) {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' if depth == 0 => {
+                        if let Some((name, _)) = sql_name_at(&item, 0) {
+                            live.remove(&name);
+                        }
+                        item.clear();
+                        continue;
+                    }
+                    _ if depth == 0 => item.push(c),
+                    _ => {}
+                }
+            }
+            skip_until = stmt_end;
+            continue;
+        }
+        let Some((name, after)) = sql_name_at(&lower, at) else {
+            continue;
+        };
+        at = after;
+        let Some((body_start, body_end, past)) = dollar_body(&sql, at) else {
+            continue;
+        };
+        let n = edge_inserts(&sql[body_start..body_end]);
+        live.insert(name, (file.to_string(), n));
+        skip_until = past;
+    }
+}
+
+/// `function -> (migration, edge INSERTs)` for every SQL function whose LIVE
+/// definition inserts into `edges`.
+fn scan_migrations(files: &[(String, String)]) -> BTreeMap<String, (String, usize)> {
+    let mut live = BTreeMap::new();
+    for (file, sql) in files {
+        apply_migration(&mut live, file, sql);
+    }
+    live.retain(|_, (_, n)| *n > 0);
+    live
+}
+
+fn measure_migrations() -> BTreeMap<String, (String, usize)> {
+    let dir = workspace_root().join("migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("migrations/")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+        .collect();
+    files.sort();
+    let files: Vec<(String, String)> = files
+        .into_iter()
+        .map(|p| {
+            (
+                p.file_name().expect("name").to_string_lossy().into_owned(),
+                std::fs::read_to_string(&p).expect("read migration"),
+            )
+        })
+        .collect();
+    scan_migrations(&files)
+}
+
+/// The SQL scanner: only the LIVE definition counts (a redefinition without
+/// the INSERT, a DROP, and a drop-then-recreate in one file), comments and
+/// one-shot statements are not writers, and a `$tag$` body is read.
 #[test]
-fn every_edge_emitting_site_is_registered_with_its_signing_status() {
-    let measured = measure();
+fn the_migration_scanner_tracks_each_functions_live_definition() {
+    let files: Vec<(String, String)> = [
+        (
+            "001_a.sql",
+            "-- CREATE FUNCTION public.commented() .. INSERT INTO edges\n\
+             CREATE OR REPLACE FUNCTION public.f_kept(p uuid) RETURNS void LANGUAGE plpgsql AS $$\n\
+             BEGIN INSERT INTO public.edges (source_id) VALUES (p); END $$;\n\
+             CREATE FUNCTION g_redefined() RETURNS void AS $body$\n\
+             BEGIN INSERT INTO edges(id) VALUES (gen_random_uuid()); END $body$ LANGUAGE plpgsql;\n\
+             CREATE FUNCTION h_dropped() RETURNS void AS $$ BEGIN INSERT INTO edges (id) VALUES (1); END $$;\n\
+             CREATE FUNCTION staging_only() RETURNS void AS $$ BEGIN INSERT INTO edges_staging (id) VALUES (1); END $$;\n\
+             INSERT INTO edges (id) VALUES (gen_random_uuid());\n\
+             DO $$ BEGIN INSERT INTO edges (id) VALUES (gen_random_uuid()); END $$;",
+        ),
+        (
+            "002_b.sql",
+            "CREATE OR REPLACE FUNCTION public.g_redefined() RETURNS void AS $$ BEGIN PERFORM 1; END $$;\n\
+             DROP FUNCTION IF EXISTS public.h_dropped(), other(uuid);\n\
+             DROP FUNCTION public.r_recreated(uuid);\n\
+             CREATE FUNCTION public.r_recreated(p uuid) RETURNS void AS $$\n\
+             BEGIN INSERT INTO edges (id) VALUES (p); INSERT INTO public.edges (id) VALUES (p); END $$;",
+        ),
+    ]
+    .into_iter()
+    .map(|(f, s)| (f.to_string(), s.to_string()))
+    .collect();
+    let live = scan_migrations(&files);
+    assert_eq!(
+        live.into_iter().collect::<Vec<_>>(),
+        vec![
+            ("f_kept".to_string(), ("001_a.sql".to_string(), 1)),
+            ("r_recreated".to_string(), ("002_b.sql".to_string(), 2)),
+        ]
+    );
+
+    // And the live tree is not vacuous: OPERATED_BY's writer is seen.
+    assert!(
+        measure_migrations().contains_key("epigraph_link_operator_body"),
+        "the migration scanner no longer sees epigraph_link_operator_body"
+    );
+}
+
+/// Everything wrong between a measurement and a register, as messages.
+fn check(
+    measured: &BTreeMap<(String, String), (usize, String)>,
+    register: &[Site],
+    db_measured: &BTreeMap<String, (String, usize)>,
+    db_register: &[DbSite],
+    high_water: usize,
+) -> Vec<String> {
     let mut problems = Vec::new();
 
     let mut registered = BTreeMap::new();
-    for s in REGISTER {
+    for s in register {
         let key = (s.file.to_string(), s.func.to_string());
-        assert!(
-            registered.insert(key, s).is_none(),
-            "duplicate register entry {}::{}",
-            s.file,
-            s.func
-        );
+        if registered.insert(key, s).is_some() {
+            problems.push(format!("duplicate register entry {}::{}", s.file, s.func));
+        }
     }
 
-    for ((file, func), (n, body)) in &measured {
+    for ((file, func), (n, body)) in measured {
         match registered.get(&(file.clone(), func.clone())) {
             None => problems.push(format!(
                 "UNREGISTERED edge-emitting site {file}::{func} ({n} site(s)): sign the edges it \
@@ -655,7 +945,7 @@ fn every_edge_emitting_site_is_registered_with_its_signing_status() {
             }
         }
     }
-    for s in REGISTER {
+    for s in register {
         if !measured.contains_key(&(s.file.to_string(), s.func.to_string())) {
             problems.push(format!(
                 "STALE register entry {}::{}: the site is gone, remove the entry",
@@ -664,20 +954,142 @@ fn every_edge_emitting_site_is_registered_with_its_signing_status() {
         }
     }
 
-    let unsigned: usize = REGISTER
+    for (function, (migration, n)) in db_measured {
+        match db_register.iter().find(|d| d.function == function) {
+            None => problems.push(format!(
+                "UNREGISTERED database edge writer {migration}::{function} ({n} INSERT(s) into \
+                 edges): register it in DB_REGISTER with its signing status"
+            )),
+            Some(d) => {
+                if d.migration != migration || d.count != *n {
+                    problems.push(format!(
+                        "database edge writer {function} is live in {migration} with {n} \
+                         INSERT(s), registered {}/{}: a migration redefined it; review the new \
+                         definition and update the entry",
+                        d.migration, d.count
+                    ));
+                }
+                if d.status == Signed {
+                    problems.push(format!(
+                        "database edge writer {function} is registered Signed, but no database \
+                         function holds a key to sign with"
+                    ));
+                }
+            }
+        }
+    }
+    for d in db_register {
+        if !db_measured.contains_key(d.function) {
+            problems.push(format!(
+                "STALE database register entry {}::{}: no live definition inserts into edges",
+                d.migration, d.function
+            ));
+        }
+    }
+
+    let unsigned: usize = register
         .iter()
         .filter(|s| matches!(s.status, Unsigned(_)))
         .map(|s| s.count)
+        .chain(
+            db_register
+                .iter()
+                .filter(|d| matches!(d.status, Unsigned(_)))
+                .map(|d| d.count),
+        )
         .sum();
-    if unsigned != UNSIGNED_SITES_HIGH_WATER {
+    if unsigned != high_water {
         problems.push(format!(
             "{unsigned} unsigned edge-emitting sites, UNSIGNED_SITES_HIGH_WATER says \
-             {UNSIGNED_SITES_HIGH_WATER}: the number only goes down; lower it when a writer \
-             starts signing, never raise it"
+             {high_water}: lower it when a writer starts signing; raising it registers a new \
+             unsigned writer, which is a reviewed act"
         ));
     }
+    problems
+}
 
+#[test]
+fn every_edge_emitting_site_is_registered_with_its_signing_status() {
+    let problems = check(
+        &measure(),
+        REGISTER,
+        &measure_migrations(),
+        DB_REGISTER,
+        UNSIGNED_SITES_HIGH_WATER,
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The rules themselves, on a synthetic register (so each has a committed
+/// test, not only the live tree, where no writer is `Signed` yet): a `Signed`
+/// entry whose function does not call `sign_created_edge_conn` fails, one
+/// that does passes, a count drift and an unregistered site fail, and the
+/// high-water number must equal the register.
+#[test]
+fn the_register_rules_hold_on_a_synthetic_register() {
+    let body_signing = format!("let id = EdgeRepository::create(..);\n{SIGN_CALL}(conn, ..);\n");
+    let body_silent = "let id = EdgeRepository::create(..);\n".to_string();
+    let measured: BTreeMap<(String, String), (usize, String)> = [
+        (("a.rs".to_string(), "signs".to_string()), (1, body_signing)),
+        (
+            ("a.rs".to_string(), "stopped".to_string()),
+            (1, body_silent),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let register = [
+        site("a.rs", "signs", 1, Signed),
+        site("a.rs", "stopped", 1, Signed),
+    ];
+    let no_db = BTreeMap::new();
+    assert_eq!(
+        check(&measured, &register, &no_db, &[], 0),
+        vec![format!(
+            "a.rs::stopped is registered Signed but no longer calls {SIGN_CALL}"
+        )]
+    );
+
+    let register = [
+        site("a.rs", "signs", 1, Signed),
+        site("a.rs", "stopped", 2, Unsigned("why")),
+    ];
+    let problems = check(&measured, &register, &no_db, &[], 1);
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(problems[0].contains("has 1 edge-emitting site(s), registered 2"));
+    assert!(problems[1].contains("2 unsigned edge-emitting sites"));
+
+    let problems = check(&measured, &register[..1], &no_db, &[], 0);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].starts_with("UNREGISTERED edge-emitting site a.rs::stopped"));
+
+    // The database half: an unregistered function, a redefinition that moved
+    // it to another migration, and a stale entry.
+    let db: BTreeMap<String, (String, usize)> = [
+        ("f_new".to_string(), ("200_new.sql".to_string(), 1)),
+        ("f_moved".to_string(), ("201_redefine.sql".to_string(), 1)),
+    ]
+    .into_iter()
+    .collect();
+    let db_register = [
+        DbSite {
+            migration: "150_old.sql",
+            function: "f_moved",
+            count: 1,
+            status: Unsigned("why"),
+        },
+        DbSite {
+            migration: "150_old.sql",
+            function: "f_gone",
+            count: 1,
+            status: Unsigned("why"),
+        },
+    ];
+    let problems = check(&BTreeMap::new(), &[], &db, &db_register, 2);
+    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert!(problems[0].contains("database edge writer f_moved is live in 201_redefine.sql"));
+    assert!(problems[1].starts_with("UNREGISTERED database edge writer 200_new.sql::f_new"));
+    assert!(problems[2].starts_with("STALE database register entry 150_old.sql::f_gone"));
 }
 
 /// The scanner is not vacuous, and it ignores what is not a writer: it sees a
