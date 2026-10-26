@@ -2018,6 +2018,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
+    // 181 (ruling R-56), the group admin's re-key mark. Under a non-member
+    // owner its `groups` UPDATE meets `groups_tenancy` as the session and is
+    // refused for every admin who did not create the group (42501, loud: the
+    // member removal is refused whole, the pre-181 behaviour); its GRA02 arm
+    // refuses a filtered UPDATE rather than dropping the mark silently.
+    ("epigraph_mark_group_reseal_required", 181),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2736,6 +2742,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_role_agent_write_check",
             "public.epigraph_role_agent_write_check()",
             false,
+        ),
+        // 181: the member-removal route marks the re-key obligation through
+        // it on the request DSN; without the grant every removal is 42501.
+        (
+            "epigraph_mark_group_reseal_required",
+            "public.epigraph_mark_group_reseal_required(uuid)",
+            true,
         ),
     ];
 
