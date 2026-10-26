@@ -403,6 +403,20 @@ async fn promote(
     viewer: &epigraph_db::visibility::Viewer,
     id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Promoted once, as the HTTP route refuses it (409, backlog 03b1508f): the
+    // gate below reads `hypothesis_assessment` only, so a BBA filed there
+    // after the promotion could pass it, and a second promotion would move
+    // that BBA onto `research_validity` beside the first one's.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    if status.as_deref() == Some(epigraph_engine::promotion::PROMOTED_STATUS) {
+        return Err(format!("hypothesis {id} is already promoted; nothing was written").into());
+    }
+
     // Re-check gate (inline the logic from status)
     let completed_with_analysis =
         epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, viewer, id)

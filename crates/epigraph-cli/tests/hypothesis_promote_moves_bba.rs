@@ -358,3 +358,118 @@ async fn cli_analyze_after_promotion_files_on_research_validity(pool: PgPool) {
         "beside the promoted evidence: {rv:?}"
     );
 }
+
+/// Every BBA on (claim, frame), oldest first, as `(id, masses)`.
+async fn frame_rows(pool: &PgPool, claim: Uuid, frame: Uuid) -> Vec<(Uuid, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT id, masses FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(claim)
+    .bind(frame)
+    .fetch_all(pool)
+    .await
+    .expect("read BBA rows")
+}
+
+/// A promotable hypothesis: a completed analysis with an explicit scope and a
+/// `hypothesis_assessment` BBA whose Bel(supported) 0.8 clears the gate.
+async fn promotable(pool: &PgPool, tag: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (agent, _group) = fixture::seed_agent_with_group(pool, tag).await;
+    let claim = fixture::seed_public_claim(pool, agent, &format!("{tag} hypothesis")).await;
+    let hyp_frame = binary_frame(pool, "hypothesis_assessment").await;
+    let rv_frame = binary_frame(pool, "research_validity").await;
+    seed_completed_analysis(pool, agent, claim).await;
+    store_assessment(
+        pool,
+        claim,
+        hyp_frame,
+        agent,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    (agent, claim, hyp_frame, rv_frame)
+}
+
+async fn store_assessment(
+    pool: &PgPool,
+    claim: Uuid,
+    hyp_frame: Uuid,
+    agent: Uuid,
+    masses: serde_json::Value,
+) -> Uuid {
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        hyp_frame,
+        Some(agent),
+        None,
+        &masses,
+        None,
+        Some("error_derived"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed a hypothesis_assessment BBA")
+}
+
+fn promote_cmd(url: &str, claim: Uuid) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["promote", &claim.to_string()])
+        .env("DATABASE_URL", url)
+        .env("MAINTENANCE_DATABASE_URL", url)
+        .env("RUST_LOG", "warn");
+    cmd
+}
+
+/// Backlog 03b1508f (1): `hypothesis promote` refuses an already-promoted
+/// hypothesis, as `POST /hypothesis/:id/promote` does (409) since #687. At
+/// origin/main the CLI re-ran the gate on `hypothesis_assessment` only, so a
+/// BBA filed there after the promotion (here a ready-making one) passed it,
+/// and the CLI promoted again and moved that BBA onto `research_validity`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_refuses_to_promote_an_already_promoted_hypothesis(pool: PgPool) {
+    let (agent, claim, hyp_frame, rv_frame) = promotable(&pool, "03b1508f-cli-twice").await;
+    let url = fixture::database_url_for(&pool).await;
+    let first = promote_cmd(&url, claim).output().expect("spawn hypothesis");
+    assert!(
+        first.status.success(),
+        "CALIBRATION: the first promotion runs: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let promoted = frame_rows(&pool, claim, rv_frame).await;
+    assert_eq!(promoted.len(), 1, "CALIBRATION: one promoted row");
+
+    let later = store_assessment(
+        &pool,
+        claim,
+        hyp_frame,
+        agent,
+        serde_json::json!({"0": 0.95, "0,1": 0.05}),
+    )
+    .await;
+    let again = promote_cmd(&url, claim).output().expect("spawn hypothesis");
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !again.status.success(),
+        "a second promotion must be refused, got exit {:?}: {}",
+        again.status.code(),
+        String::from_utf8_lossy(&again.stdout)
+    );
+    assert!(stderr.contains("already promoted"), "{stderr}");
+    assert_eq!(
+        frame_rows(&pool, claim, rv_frame).await,
+        promoted,
+        "the refused promotion leaves research_validity as the first one left it"
+    );
+    assert!(
+        frame_rows(&pool, claim, hyp_frame)
+            .await
+            .iter()
+            .any(|(id, _)| *id == later),
+        "the refused promotion leaves the later hypothesis_assessment BBA in place"
+    );
+}
