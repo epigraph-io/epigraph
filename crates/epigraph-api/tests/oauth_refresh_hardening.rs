@@ -250,6 +250,108 @@ async fn a_refresh_scope_naming_only_a_stripped_scope_is_invalid_scope_and_keeps
     assert_eq!(token_scopes(&jwt, &body), v(&["claims:read"]));
 }
 
+/// The 2026-10-08 operator ruling keeps partial overlap LENIENT after the
+/// chokepoint too: a `scope` naming one issuable scope and one the chokepoint
+/// strips issues the issuable one (200) and rotates the chain. A behaviour
+/// pin: it passes on the base as well; it fails if the post-chokepoint gate
+/// is made strict (refusing whenever the chokepoint stripped a named scope).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refresh_scope_naming_a_stripped_and_an_issuable_scope_issues_the_issuable_one(
+    pool: PgPool,
+) {
+    let (client_id, code) = self_connector_code(&pool).await;
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let (status, body) = post_token(&app, code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    let r0 = refresh_token_of(&body);
+    set_armed(&pool, true).await;
+
+    let (status, body) = post_token(
+        &app,
+        json!({
+            "grant_type": "refresh_token",
+            "refresh_token": r0,
+            "scope": "claims:read claims:admin",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "partial overlap stays lenient while armed: {body}"
+    );
+    assert_eq!(token_scopes(&jwt, &body), v(&["claims:read"]));
+    assert!(
+        body["refresh_token"].as_str().is_some_and(|r| r != r0),
+        "a rotated successor: {body}"
+    );
+    let (status, body) = post_token(&app, refresh_grant(&r0)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the presented token was spent by the rotation: {body}"
+    );
+}
+
+/// The post-chokepoint refusal applies only to a request that NAMED a scope.
+/// On a chain whose every scope is admin-only, refreshed while armed: a named
+/// `claims:admin` is `invalid_scope` and keeps the chain; a blank `scope`
+/// (`" "`) and an absent one mean "as originally granted" (RFC 6749
+/// section 6) and are answered, not refused (200, nothing the chokepoint
+/// stripped in the access token).
+///
+/// Catches: the `names_a_scope` conjunct dropped, which turned every armed
+/// refresh of an admin-only chain into `invalid_scope`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_refresh_scope_is_not_the_named_scope_refusal(pool: PgPool) {
+    let client_id = format!("a11_adm_{}", Uuid::new_v4().simple());
+    let id = client_row(&pool, &client_id, "human", &v(&["claims:admin"])).await;
+    let code = code_for(&pool, &client_id, id, &v(&["claims:admin"])).await;
+    let st = state(&pool).await;
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let (status, body) = post_token(&app, code_grant(&code, &client_id)).await;
+    assert_eq!(status, StatusCode::OK, "code grant: {body}");
+    assert_eq!(
+        token_scopes(&jwt, &body),
+        v(&["claims:admin"]),
+        "PREMISE: unarmed, the chain issues claims:admin"
+    );
+    let r0 = refresh_token_of(&body);
+    set_armed(&pool, true).await;
+
+    let (status, body) = post_token(
+        &app,
+        json!({ "grant_type": "refresh_token", "refresh_token": r0, "scope": "claims:admin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "named, stripped: {body}");
+    assert_eq!(body["error"], "invalid_scope", "named, stripped: {body}");
+
+    let (status, body) = post_token(
+        &app,
+        json!({ "grant_type": "refresh_token", "refresh_token": r0, "scope": " " }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a blank scope names nothing, so it is not refused: {body}"
+    );
+    assert_eq!(token_scopes(&jwt, &body), Vec::<String>::new());
+    let r1 = refresh_token_of(&body);
+
+    let (status, body) = post_token(&app, refresh_grant(&r1)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an absent scope names nothing, so it is not refused: {body}"
+    );
+    assert_eq!(token_scopes(&jwt, &body), Vec::<String>::new());
+}
+
 // ── 35a89d3d: the chain stores the consent, not the chokepoint's output ──────
 
 // The external grant's fixture (shared with the provider suites).
