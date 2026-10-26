@@ -258,8 +258,8 @@ fn same_source_slots(
 //   the frame, so such a pair is regularised: each input keeps
 //   `1 - CAUTIOUS_REGULARIZATION` of its masses and moves the rest to total
 //   ignorance (Denoeux's own remedy), which moves no value by more than that
-//   fraction. A frame above [`MAX_CAUTIOUS_HYPOTHESES`] folds as independent,
-//   as before.
+//   fraction. A frame above [`MAX_CAUTIOUS_HYPOTHESES`] folds as independent
+//   as before, with a warning (`belief.same_human`): a known residual of R-36.
 // - An agent bound to no human is its own owner and has no sibling, so its
 //   rows fold exactly as before. So does a row with no `source_agent_id`.
 
@@ -476,7 +476,7 @@ fn owner_partition(
 /// [`combine_with_source_dependence`] with the same-human rule (R-36): the
 /// fold every combine of stored BBAs uses. Each sibling group is reduced by
 /// [`cautious_reduce`] (a group the rule is not defined on folds as
-/// independent), then everything is Dempster-folded. Same
+/// independent, with a warning), then everything is Dempster-folded. Same
 /// return shape: the combined BBA and the conflict the fold saw
 /// (`1 - prod(1 - k)` over the final fold and every sibling group).
 ///
@@ -506,6 +506,15 @@ pub fn combine_with_owner_dependence(
                 independent.push(reduced);
             }
             None => {
+                // R-36 does not hold for this group: say so rather than
+                // aggregate silently.
+                tracing::warn!(
+                    target: "belief.same_human",
+                    siblings = members.len(),
+                    hypotheses = members.first().map(|m| m.frame().hypothesis_count()),
+                    "same-human sibling BBAs fold as independent: the cautious rule is not \
+                     defined on them (frame above the cautious limit, or total conflict)"
+                );
                 group_conflicts.push(own_conflict);
                 independent.extend(members);
             }
@@ -1406,6 +1415,27 @@ mod tests {
                  {alone}"
             );
         }
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_sibling_group_the_cautious_rule_cannot_reduce_is_reported() {
+        // Above MAX_CAUTIOUS_HYPOTHESES the rule is not computed, so siblings
+        // fold as independent: a residual of R-36 that must be visible.
+        let hypotheses: Vec<String> = (0..=MAX_CAUTIOUS_HYPOTHESES)
+            .map(|i| format!("h{i}"))
+            .collect();
+        let big = FrameOfDiscernment::new("big", hypotheses).unwrap();
+        let s = |t: f64| MassFunction::simple(big.clone(), BTreeSet::from([0]), t).unwrap();
+        let (c, _) =
+            combine_with_owner_dependence(vec![(by(1, 9), s(0.6)), (by(2, 9), s(0.7))], 0.9)
+                .unwrap();
+        assert!(
+            (m_true(&c) - 0.88).abs() < 1e-9,
+            "PREMISE: got {}",
+            m_true(&c)
+        );
+        assert!(logs_contain("same-human sibling BBAs fold as independent"));
     }
 
     #[test]
