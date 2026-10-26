@@ -808,12 +808,12 @@ human (`OPL02`).
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
 
-### Delegated run tokens (dormant)
+### Delegated run tokens (dormant until armed)
 
 An operated agent is stdio-only, with ONE carve-out: a delegated run token.
 Such a token is an ordinary `agent` access token for the operated agent
 whose `dlg` claim names the agent of the OAuth client that asked for it (the
-DELEGATOR). Nothing mints one yet.
+DELEGATOR). The run-token grant below mints one.
 
 **What is checked, on every request that carries `dlg`.** The REST bearer
 middlewares (`middleware/bearer.rs::admit_delegated`, right after the
@@ -873,6 +873,61 @@ and revoking the token's jti. Disarming the switch needs a restart.
 
 An old binary decodes a `dlg` token as an ordinary token for an operated agent
 and refuses it, so any deploy order fails closed.
+
+**The grant (`grant_type=urn:epigraph:grant:run-token`,
+`oauth/run_token.rs`).** A host that runs operated agents asks
+`POST /oauth/token` for a token for the agent it is about to run:
+
+| Field | Value |
+|---|---|
+| `client_id`, `client_secret` | the delegator: an `active` `service` client (hex secret, checked as client_credentials checks it) |
+| `agent_public_key` | the principal's IDENTITY public key, 64 hex (a host-keyed identity cannot be derived by the server, so the host names it) |
+| `run_label` | optional free text, at most 64 characters, naming the schedule or run; audit only |
+| `scope` | optional; absent means the delegator's granted scopes |
+
+The answer is an `agent` token for the principal (`sub` the delegator client,
+`dlg` the delegator's agent, no `owner_id`), at most 900 seconds, with NO
+refresh token: the host mints again before it lapses. Its scopes are the
+asked-for ones that the delegator is granted AND that lie inside the delegated
+ceiling, through the mint chokepoint. Nothing else in the request matters:
+a field naming a group is ignored, because the token's viewer is resolved by
+the server on every request from the principal's own memberships.
+
+It is refused (`invalid_request`, `invalid_client`, `invalid_grant` or
+`invalid_scope`, RFC 6749 §5.2) unless all of these hold, in this order:
+
+* the process read `EPIGRAPH_RUN_TOKENS=on` (else `unsupported_grant_type`:
+  the grant does not exist, and nothing is recorded);
+* the delegator client authenticates and has an agent (never created here);
+* an agent has the identity key (never created here: the host registers an
+  identity and links it before it runs it);
+* the agent's recorded model (`agents.properties ->> 'llm_model'`) is listed
+  in `EPIGRAPH_RUN_TOKEN_MODELS` (comma or whitespace separated; EMPTY
+  refuses every mint). The property is display state the application role
+  may rewrite on the agent's own row, so this narrows which identities the
+  grant serves; it is not authority;
+* `AgentRepository::delegated_principal_pool` answers `Some`, the same
+  question every request then repeats.
+
+Every mint writes one `security_events` row `oauth_run_token_minted` (the
+principal as `agent_id`; details: delegator, delegator client, operator,
+operator group, jti, exp, scopes, run label) BEFORE the token is returned,
+and a mint whose row cannot be written returns no token. Every refusal
+writes one `oauth_run_token_refused` row with a machine reason. Neither
+carries the secret or the token. A single token can be revoked by the jti
+its row names.
+
+**Arming it (operator, in order).** (1) Create the delegator `service`
+client (legal-entity fields; approve it to `active`) with `granted_scopes`
+inside the ceiling, and keep its secret in a host-only file. (2) Mint one
+`client_credentials` token for it so its agent exists. (3) Give that agent a
+`writer` MEMBERSHIP of the operator's group (never a link). (4)
+`epigraph-operator allow-author-binding-client` naming the operator
+(maintenance). (5) Set `EPIGRAPH_RUN_TOKENS=on` on BOTH `epigraph-api` (the
+grant and the REST check) and the MCP HTTP listener (the MCP check), and
+`EPIGRAPH_RUN_TOKEN_MODELS` on `epigraph-api`. (6) Verify with one mint and
+its `oauth_run_token_minted` row. Disarming is the reverse; suspending the
+delegator client stops every token on its next request.
 
 Deploy 149 with or after the system-agent registry (148): its
 "not a registered system agent" conjunct reads `system_agents` softly and is
