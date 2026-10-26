@@ -153,6 +153,11 @@ ciborium = "0.2"
 # with `epigraph-mcp`'s axum under a renamed dev-dependency.
 rmcp = { workspace = true }
 axum08 = { package = "axum", version = "0.8" }
+# `tests/tls_pem_loading.rs` only (`tls` feature): a TLS client that handshakes
+# against the config the PEM loader built. Both are already in the graph
+# through axum-server's `tls-rustls`; dev-only, no new package.
+rustls = "0.23"
+tokio-rustls = "0.26"
 
 [[test]]
 name = "boot_secret_gate_test"
@@ -263,3 +268,10 @@ path = "tests/integration/idempotency_2p5_tests.rs"
 name = "belief_modes_surfaces_agree"
 path = "tests/belief_modes_surfaces_agree.rs"
 required-features = ["db"]
+
+# The PEM loader behind EPIGRAPH_TLS_CERT / EPIGRAPH_TLS_KEY exists only under
+# the `tls` feature: `cargo test -p epigraph-api --features tls --test tls_pem_loading`.
+[[test]]
+name = "tls_pem_loading"
+path = "tests/tls_pem_loading.rs"
+required-features = ["tls"]

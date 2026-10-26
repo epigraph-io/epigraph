@@ -1359,6 +1359,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rsa",
+ "rustls",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -1368,6 +1369,7 @@ dependencies = [
  "subtle",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tokio-test",
  "toml",
  "tower 0.5.3",
@@ -4065,6 +4067,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
