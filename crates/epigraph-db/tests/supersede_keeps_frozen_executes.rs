@@ -263,7 +263,10 @@ async fn supersede_of_group_private_executed_step_keeps_the_executes_edge(pool: 
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede of a group-private step");
@@ -312,7 +315,10 @@ async fn deferred_supersede_replay_of_group_private_step_keeps_the_executes_edge
         "step 2: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -456,7 +462,10 @@ async fn public_step_supersede_still_moves_executes(pool: PgPool) {
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede of a public step");
@@ -554,7 +563,10 @@ async fn public_step_deferred_replays_still_move_executes(pool: PgPool) {
         "step 1: do the thing, restated",
         TruthValue::clamped(0.6),
         "restated",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -770,7 +782,10 @@ async fn a_non_public_claim_keeps_its_outgoing_executes_through_all_three_acts(p
         "runner 0, restated",
         TruthValue::clamped(0.6),
         "restated",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede");

@@ -927,7 +927,10 @@ async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool, how: Retire)
                     &format!("canonical, revised {}", Uuid::new_v4()),
                     epigraph_core::TruthValue::clamped(0.5),
                     "revision",
-                    epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+                    epigraph_db::SupersedeActor::new(
+                        supersede_actor,
+                        epigraph_db::SupersedeTool::SupersedeClaim,
+                    ),
                 )
                 .await
                 .expect("supersede act");
@@ -1054,7 +1057,10 @@ async fn supersede(conn: &mut sqlx::PgConnection, old: Uuid) -> Uuid {
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");

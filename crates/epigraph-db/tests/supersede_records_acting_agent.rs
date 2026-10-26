@@ -68,7 +68,7 @@ async fn the_successor_keeps_its_author_and_records_the_acting_agent(pool: PgPoo
         "a correction written by B",
         TruthValue::clamped(0.6),
         "B corrects A",
-        SupersedeActor::new(b, "supersede_claim"),
+        SupersedeActor::new(b, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .expect("B's supersession lands");
@@ -109,7 +109,7 @@ async fn a_rolled_back_act_leaves_no_authorship_edge(pool: PgPool) {
         "a correction that will be rolled back",
         TruthValue::clamped(0.6),
         "rolled back",
-        SupersedeActor::new(b, "supersede_claim"),
+        SupersedeActor::new(b, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .expect("the act runs");
@@ -134,4 +134,61 @@ async fn a_rolled_back_act_leaves_no_authorship_edge(pool: PgPool) {
         .await
         .expect("the predecessor");
     assert!(current, "the rolled-back act retired nothing");
+}
+
+/// `actor` supersedes `old` through the WHOLE supersession (the act and the
+/// edge migration, on this privileged pool), as the request paths and their
+/// cascade do. Returns the successor.
+async fn supersede_through_the_cascade(pool: &PgPool, old: Uuid, actor: Uuid) -> Uuid {
+    let (new, _) = ClaimRepository::supersede(
+        pool,
+        ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        TruthValue::clamped(0.6),
+        "chain probe",
+        SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
+    new
+}
+
+/// A chain of two supersessions: B restates A's v0 as v1, then C restates v1
+/// as v2. The act's edge records who wrote THAT claim, so the second
+/// supersession's edge migration must leave B's edge on v1 (B wrote v1, not
+/// v2), and v2 carries C's edge alone. Moving it onto v2 erased the record of
+/// v1's writer and credited B with a claim it never wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrote(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let c = seed_agent(&pool, "actor-c").await;
+    let v0 = seed_claim(&pool, a).await;
+
+    let v1 = supersede_through_the_cascade(&pool, v0, b).await;
+    let v2 = supersede_through_the_cascade(&pool, v1, c).await;
+
+    let act = |who: Uuid| {
+        (
+            who,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+        )
+    };
+    assert_eq!(
+        authored_into(&pool, v1).await,
+        vec![act(b)],
+        "the retired v1 keeps the record of its writer B"
+    );
+    assert_eq!(
+        authored_into(&pool, v2).await,
+        vec![act(c)],
+        "v2 records C, who wrote it, and nothing from B"
+    );
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(v2)
+        .fetch_one(&pool)
+        .await
+        .expect("v2");
+    assert_eq!(author, a, "v2 still inherits the chain's author");
 }

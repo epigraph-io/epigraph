@@ -2599,7 +2599,10 @@ async fn a_revert_after_the_canonical_was_superseded_restores_against_its_replac
         &format!("{PUMP_A} (revised)"),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede the canonical");

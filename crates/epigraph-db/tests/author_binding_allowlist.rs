@@ -1903,7 +1903,10 @@ async fn the_new_attribution_surface_is_pinned(pool: PgPool) {
                 "a revision of R's claim",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
                 "author binding allowlist probe",
-                epigraph_db::SupersedeActor::new(s.agent, "test"),
+                epigraph_db::SupersedeActor::new(
+                    s.agent,
+                    epigraph_db::SupersedeTool::SupersedeClaim,
+                ),
             )
             .await;
             if res.is_ok() {

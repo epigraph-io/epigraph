@@ -64,7 +64,7 @@ pub async fn supersede_claim(
         &params.content,
         truth,
         &params.reason,
-        epigraph_db::SupersedeActor::new(caller, "supersede_claim"),
+        epigraph_db::SupersedeActor::new(caller, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .map_err(|e| match e {

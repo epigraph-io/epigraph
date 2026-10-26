@@ -125,13 +125,14 @@ pub use repos::{
     RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
     RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
     SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SweepCandidate, TaskRepository,
-    TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep,
-    TripleRepository, TripleRow, UnmarkedDuplicate, WebhookSubscriptionRepository,
-    WebhookSubscriptionRow, WorkflowExecutionRepository, WorkflowExecutionRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
-    DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
-    EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
+    TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
+    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{

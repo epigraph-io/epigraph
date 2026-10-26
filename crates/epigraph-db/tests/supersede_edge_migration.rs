@@ -96,7 +96,10 @@ async fn refutes_edge_filed_against_the_original_stays_on_the_original(pool: PgP
         "corrected series; the geometric objection is withdrawn",
         TruthValue::clamped(0.9),
         "correcting the confound inference",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -136,7 +139,10 @@ async fn contradicts_edge_asserted_by_the_original_stays_on_the_original(pool: P
         "withdrawing the confound objection; the measurement is sound",
         TruthValue::clamped(0.9),
         "retracting the objection",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -177,7 +183,10 @@ async fn strengthening_edges_still_migrate_in_both_directions(pool: PgPool) {
         "the original finding, restated with tighter bounds",
         TruthValue::clamped(0.9),
         "tightening bounds",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();

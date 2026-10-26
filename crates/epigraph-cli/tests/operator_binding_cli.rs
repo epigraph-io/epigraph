@@ -320,6 +320,23 @@ async fn arm_arms_when_every_recent_writer_is_bound(pool: PgPool) {
 /// its author's `AUTHORED` edge, in ONE transaction, as the submit paths write
 /// a claim (both rows carry that transaction's timestamp).
 async fn submitted_claim(pool: &PgPool, agent: Uuid, group: Uuid, age_days: i32) -> Uuid {
+    claim_with_authored_edge(pool, agent, agent, "submit_claim", group, age_days).await
+}
+
+/// A `('public', group)` claim authored as `author`, written `age_days` ago
+/// together with ONE `AUTHORED` edge from `edge_source` carrying `{"tool":
+/// tool}`, in ONE transaction (both rows carry that transaction's timestamp).
+/// With `edge_source != author` this is the #600 shape: a claim written under
+/// another author, the calling agent recorded by the edge.
+async fn claim_with_authored_edge(
+    pool: &PgPool,
+    author: Uuid,
+    edge_source: Uuid,
+    tool: &str,
+    group: Uuid,
+    age_days: i32,
+) -> Uuid {
+    let agent = author;
     let id = Uuid::new_v4();
     let mut tx = pool.begin().await.expect("begin");
     sqlx::query(
@@ -340,12 +357,13 @@ async fn submitted_claim(pool: &PgPool, agent: Uuid, group: Uuid, age_days: i32)
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                             properties, created_at) \
-         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{\"tool\": \"submit_claim\"}', \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', jsonb_build_object('tool', $4::text), \
                  now() - make_interval(days => $3))",
     )
-    .bind(agent)
+    .bind(edge_source)
     .bind(id)
     .bind(age_days)
+    .bind(tool)
     .execute(&mut *tx)
     .await
     .expect("seed the author's AUTHORED edge");
@@ -358,16 +376,7 @@ async fn submitted_claim(pool: &PgPool, agent: Uuid, group: Uuid, age_days: i32)
 /// successor, after checking that the retired claim's own `AUTHORED` edge now
 /// sits on it too: the shape the census must see through.
 async fn supersede_as(pool: &PgPool, old: Uuid, author: Uuid, actor: Uuid) -> Uuid {
-    let (new, _) = epigraph_db::ClaimRepository::supersede(
-        pool,
-        epigraph_core::ClaimId::from_uuid(old),
-        &format!("a restatement of {old}"),
-        epigraph_core::TruthValue::clamped(0.6),
-        "census probe",
-        epigraph_db::SupersedeActor::new(actor, "supersede_claim"),
-    )
-    .await
-    .expect("supersede");
+    let new = supersede_raw(pool, old, actor).await;
     let mut sources: Vec<Uuid> = sqlx::query_scalar(
         "SELECT source_id FROM edges WHERE relationship = 'AUTHORED' AND target_id = $1",
     )
@@ -382,6 +391,23 @@ async fn supersede_as(pool: &PgPool, old: Uuid, author: Uuid, actor: Uuid) -> Uu
         sources, want,
         "calibration: the successor carries the actor's edge AND the author's migrated one"
     );
+    new
+}
+
+/// `actor` supersedes `old` (the act AND the edge migration, on this
+/// privileged pool), with no calibration: the second hop of a chain, whose
+/// successor's edges the census tests themselves are about.
+async fn supersede_raw(pool: &PgPool, old: Uuid, actor: Uuid) -> Uuid {
+    let (new, _) = epigraph_db::ClaimRepository::supersede(
+        pool,
+        epigraph_core::ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        epigraph_core::TruthValue::clamped(0.6),
+        "census probe",
+        epigraph_db::SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
     new
 }
 
@@ -438,6 +464,63 @@ async fn census_does_not_count_an_inherited_author_as_a_live_writer(pool: PgPool
     );
     assert_eq!(r.code, 0, "{}", r.show());
     assert!(armed(&pool).await, "nothing unbound wrote, so --apply arms");
+}
+
+/// Backlog 73085534 (ruling R-23) across a CHAIN: the quiet author's 60-day-old
+/// claim is superseded twice today by the bound human. Both successors are the
+/// human's writes. The second supersession must not strip the first act's
+/// record off v1 (it used to move onto v2), or v1 falls back to its inherited
+/// author and the quiet author is listed as a live writer again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_count_an_inherited_author_after_a_chain_of_supersessions(pool: PgPool) {
+    let (quiet, group) = fixture::seed_agent_with_group(&pool, "census-quiet-author").await;
+    let (human, _) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let v0 = submitted_claim(&pool, quiet, group, 60).await;
+    let v1 = supersede_as(&pool, v0, quiet, human).await;
+    supersede_raw(&pool, v1, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(
+        !r.stdout.contains(&quiet.to_string()),
+        "the quiet author wrote nothing in the window: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        r.show()
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "nothing unbound wrote, so --apply arms");
+}
+
+/// The converse chain: the unbound agent U restates the human's claim (v1),
+/// then the human restates U's v1 (v2). U wrote v1, so U is a live writer; the
+/// second supersession must not carry U's record onto v2 and drop U from the
+/// census.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_still_counts_the_first_actor_of_a_chain_of_supersessions(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "census-actor").await;
+    let v0 = submitted_claim(&pool, human, group, 0).await;
+    let v1 = supersede_as(&pool, v0, human, unbound).await;
+    supersede_raw(&pool, v1, human).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains(&format!("UNBOUND\t{unbound}\t1 claim(s)")),
+        "U wrote v1: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t1"),
+        "{}",
+        dry.show()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

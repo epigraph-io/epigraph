@@ -969,21 +969,59 @@ pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
 /// `agent` -> `claim`, from `agent` to the replacement, with properties
 /// `{"tool": tool, "was_created": true}`, written in the act's own transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SupersedeActor<'a> {
+pub struct SupersedeActor {
     /// The acting agent (`agents.id`): the caller's agent over HTTP and MCP,
     /// the named custodian on the operator CLI.
     pub agent: Uuid,
     /// The write path, recorded as the edge's `tool` property.
-    pub tool: &'a str,
+    pub tool: SupersedeTool,
 }
 
-impl<'a> SupersedeActor<'a> {
+impl SupersedeActor {
     /// `agent` acting through `tool`.
     #[must_use]
-    pub const fn new(agent: Uuid, tool: &'a str) -> Self {
+    pub const fn new(agent: Uuid, tool: SupersedeTool) -> Self {
         Self { agent, tool }
     }
 }
+
+/// The write paths a supersession comes through, spelled as its act's
+/// `AUTHORED` edge records them (`properties.tool`).
+///
+/// A CLOSED set, because that spelling is how the act's edge is told apart
+/// from every other `AUTHORED` edge on a claim while keeping the #600
+/// properties byte-for-byte: the edge records who wrote THAT claim, so a later
+/// supersession's edge migration leaves it where it is
+/// ([`SUPERSEDE_ACT_TOOLS`] in `migrate_superseded_edges`), and the operator
+/// arming census reads it to attribute the successor to its actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersedeTool {
+    /// HTTP `POST /api/v1/claims/:id/supersede` and MCP `supersede_claim`.
+    SupersedeClaim,
+    /// The operator CLI's `custodial-supersede`.
+    CustodialSupersede,
+}
+
+impl SupersedeTool {
+    /// Every write path, in declaration order.
+    pub const ALL: [Self; 2] = [Self::SupersedeClaim, Self::CustodialSupersede];
+
+    /// The `tool` property the act's edge carries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersedeClaim => "supersede_claim",
+            Self::CustodialSupersede => "custodial-supersede",
+        }
+    }
+}
+
+/// [`SupersedeTool::ALL`] spelled: the `tool` values that mark an `AUTHORED`
+/// edge as a supersession's act edge.
+pub const SUPERSEDE_ACT_TOOLS: &[&str] = &[
+    SupersedeTool::SupersedeClaim.as_str(),
+    SupersedeTool::CustodialSupersede.as_str(),
+];
 
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1178,6 +1216,15 @@ async fn migrate_superseded_edges(
         }
     }
     let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
+    // A supersession's own act edge (backlog 73085534, R-23) records who
+    // wrote the claim it points at, so it stays on that claim when the claim
+    // is itself superseded: carried onto the successor it would credit the
+    // earlier actor with a claim it never wrote and strip the retired claim of
+    // the record of its writer.
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -1191,6 +1238,8 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
+           AND NOT (source_type = 'agent' AND relationship = 'AUTHORED' \
+                    AND COALESCE(properties->>'tool' = ANY($6), false)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
@@ -1200,6 +1249,7 @@ async fn migrate_superseded_edges(
     .bind(&weakening)
     .bind(&frozen)
     .bind(&agent_authorship)
+    .bind(&act_tools)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -6281,7 +6331,7 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
-        actor: SupersedeActor<'_>,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         let mut tx = pool.begin().await?;
         let ids =
@@ -6325,7 +6375,7 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
-        actor: SupersedeActor<'_>,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         require_privileged_session(
             &mut *conn,
@@ -6368,7 +6418,7 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
-        actor: SupersedeActor<'_>,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         let old_uuid: Uuid = old_claim_id.into();
         let new_uuid = Uuid::new_v4();
@@ -6495,7 +6545,7 @@ impl ClaimRepository {
             new_uuid,
             "claim",
             "AUTHORED",
-            Some(serde_json::json!({"tool": actor.tool, "was_created": true})),
+            Some(serde_json::json!({"tool": actor.tool.as_str(), "was_created": true})),
             None,
             None,
         )

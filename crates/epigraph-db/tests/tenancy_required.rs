@@ -464,7 +464,10 @@ async fn a_successor_of_a_group_private_claim_is_group_private(pool: PgPool) {
         "private correction",
         epigraph_core::TruthValue::clamped(0.9),
         "test",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede");

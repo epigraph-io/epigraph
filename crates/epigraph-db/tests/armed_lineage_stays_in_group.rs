@@ -222,7 +222,10 @@ async fn supersede_on(
         &format!("a revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),
         "lineage probe",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await;
     if r.is_ok() {

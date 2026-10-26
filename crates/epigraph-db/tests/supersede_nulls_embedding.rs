@@ -95,7 +95,10 @@ async fn supersede_nulls_embedding_on_old_claim(pool: PgPool) {
         "supersede-embedding-test-new",
         TruthValue::clamped(0.85),
         "regression test for chk_deprecated_no_embedding",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();

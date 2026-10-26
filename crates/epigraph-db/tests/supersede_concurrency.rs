@@ -63,7 +63,10 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
         "revision from A",
         TruthValue::clamped(0.6),
         "race A",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("A's supersession succeeds");
@@ -93,7 +96,10 @@ async fn concurrent_supersede_of_one_claim_yields_one_successor(pool: PgPool) {
             "revision from B",
             TruthValue::clamped(0.7),
             "race B",
-            epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+            epigraph_db::SupersedeActor::new(
+                supersede_actor,
+                epigraph_db::SupersedeTool::SupersedeClaim,
+            ),
         )
         .await;
         match r {
@@ -194,7 +200,10 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
         "first revision",
         TruthValue::clamped(0.6),
         "first",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("first supersession succeeds");
@@ -213,7 +222,10 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
         "second revision",
         TruthValue::clamped(0.6),
         "second",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect_err("a retired claim cannot be superseded again");
@@ -229,7 +241,10 @@ async fn supersede_act_conn_keeps_not_found_and_already_superseded_shapes(pool: 
         "revision of nothing",
         TruthValue::clamped(0.6),
         "missing",
-        epigraph_db::SupersedeActor::new(Uuid::new_v4(), "test"),
+        epigraph_db::SupersedeActor::new(
+            Uuid::new_v4(),
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect_err("a missing claim cannot be superseded");
@@ -298,7 +313,10 @@ async fn supersede_act_conn_refuses_a_current_claim_it_cannot_retire(pool: PgPoo
         "revision that cannot retire its original",
         TruthValue::clamped(0.6),
         "unretirable",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await;
     // Commit whatever the call left on the transaction: a refusal must have

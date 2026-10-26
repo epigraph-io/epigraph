@@ -1078,7 +1078,10 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
         "canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -1193,7 +1196,10 @@ async fn superseding_an_unmarked_duplicate_leaves_its_retracted_identity_edge(po
         "a duplicate, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -1281,7 +1287,10 @@ async fn supersede_canonical(pool: &PgPool, old: Uuid) -> Uuid {
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");

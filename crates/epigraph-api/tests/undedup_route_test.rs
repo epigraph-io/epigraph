@@ -319,7 +319,10 @@ async fn undedup_follows_a_superseded_canonical_to_its_replacement() {
         &format!("r11 canonical, revised {tag}"),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -516,7 +519,10 @@ async fn supersede(pool: &sqlx::PgPool, old: Uuid) -> Uuid {
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");

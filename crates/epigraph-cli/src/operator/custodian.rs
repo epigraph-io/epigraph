@@ -423,7 +423,7 @@ pub async fn custodial_supersede(
         &req.content,
         truth,
         &req.reason,
-        epigraph_db::SupersedeActor::new(req.actor, "custodial-supersede"),
+        epigraph_db::SupersedeActor::new(req.actor, epigraph_db::SupersedeTool::CustodialSupersede),
     )
     .await?;
     let migration = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new).await?;

@@ -419,7 +419,10 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
         "superseded canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede s");

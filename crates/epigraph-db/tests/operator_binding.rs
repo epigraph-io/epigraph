@@ -927,7 +927,10 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
                         &format!("revision of {old}"),
                         epigraph_core::TruthValue::new(0.6).expect("truth"),
                         "operator binding probe",
-                        epigraph_db::SupersedeActor::new(writer, "test"),
+                        epigraph_db::SupersedeActor::new(
+                            writer,
+                            epigraph_db::SupersedeTool::SupersedeClaim,
+                        ),
                     )
                     .await;
                     if r.is_ok() {
@@ -1153,7 +1156,7 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
                 "a revision of l1",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
                 "operator binding probe",
-                epigraph_db::SupersedeActor::new(x, "test"),
+                epigraph_db::SupersedeActor::new(x, epigraph_db::SupersedeTool::SupersedeClaim),
             )
             .await;
             if r.is_ok() {
@@ -1404,7 +1407,10 @@ async fn supersede_on(
         &format!("custodial revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),
         "operator binding probe",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await;
     if r.is_ok() {

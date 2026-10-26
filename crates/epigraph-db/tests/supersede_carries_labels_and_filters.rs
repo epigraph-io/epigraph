@@ -100,7 +100,10 @@ async fn supersede_carries_labels_but_not_properties_to_new_claim(pool: PgPool) 
         r#"{"goal":"new goal","steps":["b"]}"#,
         TruthValue::clamped(0.85),
         "test supersede",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -145,7 +148,10 @@ async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: 
         r#"{"goal":"deploy widget","steps":["mcp-only step"]}"#,
         TruthValue::clamped(0.85),
         "MCP migration",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -202,7 +208,10 @@ async fn supersede_carries_labels_but_not_near_duplicate(pool: PgPool) {
         r#"{"goal":"g","steps":["b"]}"#,
         TruthValue::clamped(0.85),
         "plan rev 2",
-        epigraph_db::SupersedeActor::new(supersede_actor, "test"),
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
