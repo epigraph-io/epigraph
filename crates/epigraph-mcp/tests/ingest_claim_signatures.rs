@@ -52,6 +52,9 @@ fn extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
     .expect("fixture parses")
 }
 
+/// `(id, level, content_hash, signature, signer_id)` of one ingested claim.
+type ClaimSignatureRow = (Uuid, i32, Vec<u8>, Option<Vec<u8>>, Option<Uuid>);
+
 async fn verify(pool: &PgPool, claim: Uuid) -> Value {
     let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
         .bind(claim)
@@ -78,7 +81,7 @@ async fn verify(pool: &PgPool, claim: Uuid) -> Value {
 /// signer agent, and `verify_claim` reports it signed, valid, `v1`. At least
 /// one row per class, so the check cannot pass vacuously.
 async fn assert_stored_and_verifying(pool: &PgPool, tool: &str, levels: &[i32]) {
-    let rows: Vec<(Uuid, i32, Vec<u8>, Option<Vec<u8>>, Option<Uuid>)> = sqlx::query_as(
+    let rows: Vec<ClaimSignatureRow> = sqlx::query_as(
         "SELECT id, (properties->>'level')::int, content_hash, signature, signer_id \
            FROM claims WHERE properties ? 'level' ORDER BY 2",
     )
