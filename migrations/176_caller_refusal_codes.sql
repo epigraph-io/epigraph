@@ -5,9 +5,20 @@
 -- caller only when its MESSAGE opens with a schema refusal code
 -- (`^[A-Z]{2,5}[0-9]{2}:`, e.g. `FA07: ...`); every other database text is
 -- replaced with the generic internal-error reply and kept in the server log.
--- The refusals below are DESIGNED caller-facing text that an application
--- session reaches on a caller's write, but they named no code, so a caller
--- was told only "internal error". This migration gives each one a code.
+-- The refusals below are DESIGNED caller-facing text in functions an
+-- application session runs on a caller's write: a function epigraph_app may
+-- EXECUTE, or a trigger on a table epigraph_app may write. They named no
+-- code, so a caller that reached one was told only "internal error". This
+-- migration gives each one a code.
+--
+-- WHICH OF THEM A SHIPPED TRANSPORT REACHES (measured when this was written):
+--   * AGK01: POST /api/v1/agents and the MCP document ingest's author agents.
+--     The one that answered the generic internal error / 500 before this.
+--   * AAR01-AAR12: the propose-admin-act route and tool, which already relayed
+--     their SQLSTATE-22023 text; they now carry a code as well.
+--   * TEN01-TEN02, GRM01-GRM06, PRV01: guards on tables epigraph_app may
+--     write; no shipped route or tool reaches these arms. They are coded so
+--     that a later path that does reach one answers with a readable refusal.
 --
 -- WHAT CHANGES: each function is restated with CREATE OR REPLACE from its
 -- LATEST definition (named above it), and only RAISE statements differ: a
@@ -18,7 +29,7 @@
 -- SECURITY mode, volatility and search_path; the bodies are otherwise
 -- byte-identical to their latest prior definition (pinned by
 -- crates/epigraph-db/tests/caller_refusal_codes_restatement.rs, which compares
--- the catalog of a database at 175 with the same database after 176).
+-- the catalog of a database before 176 with the same database at 176).
 --
 -- WHAT DOES NOT (R-25: only refusals a caller can reach are coded):
 --   * maintenance-only, operator-CLI and admin-only refusals (functions the
@@ -39,8 +50,8 @@
 --
 -- Codes introduced: AAR01-AAR12 (admin-act arguments), TEN01-TEN02 (row
 -- ownership), GRM01-GRM06 (groups and their rosters), PRV01 (sealing),
--- AGK01 (a system agent's registered key). The HTTP layer maps exactly
--- these codes (epigraph_db::CALLER_REFUSAL_CODES) to a 4xx carrying the
+-- AGK01 (a system agent's registered key). The HTTP layer's shared mapper
+-- (From<DbError> for ApiError) maps exactly these codes (epigraph_db::CALLER_REFUSAL_CODES) to a 4xx carrying the
 -- message; the MCP layer already passes any coded message.
 
 -- epigraph_admin_act_args: latest definition 130_pending_admin_acts.sql.
@@ -218,8 +229,9 @@ BEGIN
 END $$;
 
 -- epigraph_owner_immutable_guard: latest definition
--- 115_owner_scoped_delete.sql. BEFORE UPDATE on rows epigraph_app may UPDATE.
--- Coded: TEN01.
+-- 115_owner_scoped_delete.sql. BEFORE UPDATE on rows epigraph_app may UPDATE;
+-- no application code path re-owns a row (only maintenance-session tools do),
+-- so no shipped route or tool reaches this arm. Coded: TEN01.
 
 CREATE OR REPLACE FUNCTION public.epigraph_owner_immutable_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
@@ -235,7 +247,8 @@ END $$;
 -- epigraph_writer_owner_guard: latest definition
 -- 114_writer_owned_derived_rows.sql. BEFORE UPDATE on evidence,
 -- mass_functions, reasoning_traces and challenges, which epigraph_app may
--- UPDATE. Coded: TEN02.
+-- UPDATE; no application code path re-owns or moves such a row, so no shipped
+-- route or tool reaches this arm. Coded: TEN02.
 
 CREATE OR REPLACE FUNCTION public.epigraph_writer_owner_guard() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
@@ -250,7 +263,9 @@ END $$;
 
 -- epigraph_group_memberships_identity_immutable: latest definition
 -- 109_group_memberships_guards.sql. BEFORE UPDATE on group_memberships, which
--- epigraph_app may UPDATE. Coded: GRM01.
+-- epigraph_app may UPDATE; no application code path changes a membership's
+-- group_id or agent_id, so no shipped route or tool reaches this arm. Coded:
+-- GRM01.
 
 CREATE OR REPLACE FUNCTION public.epigraph_group_memberships_identity_immutable()
 RETURNS trigger
@@ -268,7 +283,11 @@ END $$;
 
 -- epigraph_group_memberships_no_retired_writer: latest definition
 -- 109_group_memberships_guards.sql. BEFORE INSERT OR UPDATE on
--- group_memberships (the HTTP add-member write). Coded: GRM02.
+-- group_memberships, which epigraph_app may write. The arm needs a retired
+-- operator link whose operator group (the operator's personal group, which
+-- is keyless) is the target group; HTTP add-member needs a key epoch a
+-- keyless group lacks, so no shipped route or tool reaches it. The ids it
+-- names are the ones the writer supplied (agent and group). Coded: GRM02.
 
 CREATE OR REPLACE FUNCTION public.epigraph_group_memberships_no_retired_writer()
 RETURNS trigger
@@ -290,7 +309,8 @@ END $$;
 
 -- epigraph_groups_identity_immutable: latest definition
 -- 108_groups_identity_immutable.sql. BEFORE UPDATE on groups, which
--- epigraph_app may UPDATE. Coded: GRM03.
+-- epigraph_app may UPDATE; no application code path changes these columns,
+-- so no shipped route or tool reaches this arm. Coded: GRM03.
 
 CREATE OR REPLACE FUNCTION public.epigraph_groups_identity_immutable()
 RETURNS trigger
@@ -306,8 +326,10 @@ BEGIN
 END $$;
 
 -- epigraph_groups_personal_identity_names_creator: latest definition
--- 108_groups_identity_immutable.sql. BEFORE INSERT on groups (the HTTP create-
--- group write). Coded: GRM04.
+-- 108_groups_identity_immutable.sql. BEFORE INSERT on groups, for a personal
+-- group or a did:epigraph:personal: identity. The HTTP create-group write
+-- inserts a keyed team group, which the trigger does not select, so no
+-- shipped route or tool reaches this arm. Coded: GRM04.
 
 CREATE OR REPLACE FUNCTION public.epigraph_groups_personal_identity_names_creator()
 RETURNS trigger
@@ -330,8 +352,11 @@ END $$;
 
 -- epigraph_team_group_roster_verbs_only: latest definition
 -- 164_keyless_team_group_verbs.sql. BEFORE INSERT OR UPDATE on
--- group_memberships: an application write to a team group's roster. Coded:
--- GRM05.
+-- group_memberships: an application write to a verb-made team group's roster.
+-- No shipped route or tool reaches it: HTTP add-member needs a key epoch a
+-- verb-made group never has, and on the application role HTTP remove-member's
+-- session cannot see a verb-made roster (it answers 403 before any write).
+-- Coded: GRM05.
 
 CREATE OR REPLACE FUNCTION public.epigraph_team_group_roster_verbs_only()
 RETURNS trigger
@@ -355,7 +380,11 @@ END $$;
 
 -- epigraph_team_group_row_verbs_only: latest definition
 -- 164_keyless_team_group_verbs.sql. BEFORE INSERT / UPDATE on groups in the
--- team-group namespace. Coded: GRM06.
+-- team-group namespace or keyless team groups. HTTP create-group inserts a
+-- keyed did:key group, which the trigger does not select, and the HTTP group
+-- routes that update a group row first need an admin roster read that their
+-- application session cannot make for a verb-made group (see GRM05), so no
+-- shipped route or tool reaches this arm. Coded: GRM06.
 
 CREATE OR REPLACE FUNCTION public.epigraph_team_group_row_verbs_only()
 RETURNS trigger
@@ -374,8 +403,9 @@ BEGIN
 END $$;
 
 -- epigraph_no_public_sealed: latest definition 081_privatization_guards.sql.
--- BEFORE INSERT OR UPDATE on claim_encryption (the HTTP claim create's sealing
--- write). Coded: PRV01.
+-- BEFORE INSERT OR UPDATE on claim_encryption, which epigraph_app may write.
+-- The HTTP claim create seals only a claim it has already declared non-public,
+-- so no shipped route or tool reaches this arm. Coded: PRV01.
 
 CREATE OR REPLACE FUNCTION public.epigraph_no_public_sealed() RETURNS trigger
 LANGUAGE plpgsql AS $$
