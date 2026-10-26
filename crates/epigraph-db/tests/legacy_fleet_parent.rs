@@ -812,16 +812,7 @@ async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPoo
     }
     for p in &parents {
         #[allow(clippy::type_complexity)]
-        let shape: (
-            Option<String>,
-            bool,
-            bool,
-            bool,
-            String,
-            bool,
-            bool,
-            bool,
-        ) = sqlx::query_as(
+        let shape: (Option<String>, bool, bool, bool, String, bool, bool, bool) = sqlx::query_as(
             "SELECT a.agent_type, \
                     a.properties ? 'llm_model', \
                     EXISTS (SELECT 1 FROM operator_links l \
@@ -1006,9 +997,7 @@ async fn a_retired_legacy_parent_link_still_names_the_operator(pool: PgPool) {
 /// (`recorded = false`), which would let a wrong (child, parent, folder)
 /// assertion look accepted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_recorded_pair_named_for_a_folder_the_child_never_ran_in_is_refused_aid10(
-    pool: PgPool,
-) {
+async fn a_recorded_pair_named_for_a_folder_the_child_never_ran_in_is_refused_aid10(pool: PgPool) {
     let inc = incident(&pool).await;
     assert!(
         try_record(&pool, inc.child, inc.parent, GROUP)
