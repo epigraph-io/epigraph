@@ -1238,6 +1238,7 @@ pub async fn verify_claim(
         signed,
         key_bound: binding.key_bound,
         key_kind: binding.key_kind,
+        signature_scheme: binding.signature_scheme,
         hash_check,
         hash_matches: match hash_check {
             HashCheck::Match => Some(true),

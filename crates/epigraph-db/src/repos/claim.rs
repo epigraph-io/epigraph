@@ -6638,13 +6638,19 @@ impl ClaimRepository {
 
         let (signature, signer_id): (Option<Vec<u8>>, Option<Uuid>) =
             match (signer_id, claim.signature) {
+                // Versioned (ruling R-34): a v1 claim-tagged signature or a
+                // legacy bare-digest one. A signature tagged for another
+                // entity kind (evidence, edge) is not a claim signature.
                 (Some(signer), Some(sig))
-                    if epigraph_crypto::SignatureVerifier::verify(
-                        &claim.public_key,
-                        &content_hash,
-                        &sig,
-                    )
-                    .unwrap_or(false) =>
+                    if matches!(
+                        epigraph_crypto::SignatureVerifier::verify_entity(
+                            &claim.public_key,
+                            epigraph_crypto::SignedEntity::Claim,
+                            &content_hash,
+                            &sig,
+                        ),
+                        Ok(Some(_))
+                    ) =>
                 {
                     (Some(sig.to_vec()), Some(signer))
                 }
