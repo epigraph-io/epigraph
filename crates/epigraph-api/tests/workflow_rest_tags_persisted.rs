@@ -39,6 +39,28 @@ use viewer_fixture::{
     database_url_for, downgraded_pool, register_system_agent, seed_agent_with_group,
 };
 
+/// The `AuthContext` the bearer middleware injects for a `claims:write` token
+/// bound to `agent`: both workflow write routes require that scope.
+fn claims_writer(
+    agent: Uuid,
+) -> Option<axum::Extension<epigraph_api::middleware::bearer::AuthContext>> {
+    Some(axum::Extension(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: Uuid::new_v4(),
+            agent_id: Some(agent),
+            owner_id: Some(agent),
+            client_type: epigraph_api::middleware::ClientType::Agent,
+            scopes: vec!["claims:read".to_string(), "claims:write".to_string()],
+            jti: Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    ))
+}
+
 /// An application-role `AppState`: `scoped` and `db_pool` are two separate
 /// `epigraph_app` pools.
 async fn app_role_state(pool: &PgPool) -> AppState {
@@ -166,7 +188,7 @@ async fn rest_ingest_and_read_metadata(
     let Json(body) = epigraph_api::routes::workflows::ingest_workflow(
         ViewerExtractor(Viewer::resolve(pool, caller).await.expect("viewer")),
         State(state),
-        None,
+        claims_writer(caller),
         Json(epigraph_api::routes::workflows::IngestWorkflowRequest {
             extraction,
             tenancy: None,

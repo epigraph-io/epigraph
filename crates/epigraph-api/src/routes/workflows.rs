@@ -2140,6 +2140,8 @@ pub struct IngestWorkflowRequest {
     responses(
         (status = 200, body = serde_json::Value),
         (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write, or a declared group the caller or the ingest system agent does not write"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2151,6 +2153,15 @@ pub async fn ingest_workflow(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<IngestWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the sibling step
+    // routes and the MCP twin (`scope_map.rs`) require (backlog 05eb8b4a). A
+    // request with no `AuthContext` is 401, never a skipped check.
+    let Some(axum::Extension(auth)) = auth_ctx.as_ref() else {
+        return Err(ApiError::Unauthorized {
+            reason: "ingest_workflow requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
     let IngestWorkflowRequest {
         mut extraction,
         tenancy,
@@ -2176,7 +2187,7 @@ pub async fn ingest_workflow(
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx =
         begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
-    let auth = auth_ctx.as_ref().map(|a| &a.0);
+    let auth = Some(auth);
     let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
         &mut tx,
