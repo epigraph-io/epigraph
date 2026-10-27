@@ -1724,7 +1724,12 @@ restart.
   row security; 077's `<t>_tenancy`, 115's restrictive `<t>_delete_owner`
   and `<t>_owner_immutable`. Existing rows are DERIVED, never defaulted: a
   report from its fragment, a source from its fragments when they agree on
-  one pair; anything else refuses with `HVT01` and changes nothing. A source
+  one pair; anything else refuses with `HVT01` and changes nothing. Before
+  deriving, it also refuses (`HVT01`, nothing changed) when either table holds
+  a row and the migrator cannot read every fragment (not a superuser, no
+  BYPASSRLS, not a maintenance member): `harvester_fragments` is FORCEd, and
+  a filtered read would derive a source from its public fragments only,
+  more readable than the rest. A source
   takes 074's root `harvester_sources_require_tenancy` (declare both columns,
   or the seed escape hatch, or 23502). A report always carries its
   fragment's pair: `harvester_audit_reports_inherit_tenancy` stamps it at
@@ -1743,8 +1748,9 @@ restart.
   `harvester_tenancy.rs` (as `epigraph_app`, with `harvester_fragments` as
   the control: a non-member cannot read another group's row in either
   table, a member can, public rows stay readable; the 172 -> 173 derivation
-  and refusal on seeded rows; the write side; a narrowed claim's report
-  follows its fragment) and by
+  and refusal on seeded rows, and the refusal of a migrator that reads only
+  some fragments; the write side; a report follows its fragment when a claim
+  is narrowed and when the fragment is re-owned) and by
   `tenancy_coverage.rs::the_harvester_neighbours_carry_the_fragment_row_security`
   (policy expressions compared with `harvester_fragments`'s own). Registered
   in every FORCE list (`epigraph_api::state::FORCE_PROTECTED_SET`,

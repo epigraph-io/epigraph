@@ -60,10 +60,20 @@
 -- where their tenancy admits it, which is narrower than `harvester_fragments`
 -- and is recorded as such in `elevation_arms_census.rs`.
 --
--- ROW SECURITY AND THE DERIVATION. `harvester_fragments` is FORCEd, so the
--- derivation's read of it is filtered for a migrator that is neither a
--- superuser nor a maintenance login. A filtered read derives nothing for a
--- private fragment's rows and HVT01 refuses; it cannot stamp a wrong owner.
+-- ROW SECURITY AND THE DERIVATION. `harvester_fragments` is FORCEd, so its
+-- owner reads it through row security like anyone else. A migrator that is
+-- not a superuser, has no BYPASSRLS and is not a member of
+-- `epigraph_maintenance` is either refused the read (42501: the policy calls
+-- `epigraph_definer_bypass()`, which PUBLIC cannot execute) or, holding the
+-- application role's grant on it, sees only public fragments. A filtered read
+-- is not merely incomplete: a source whose fragments are one public and one
+-- private would look as if they agreed on the public pair and be stamped MORE
+-- readable than its fragments. Section 0 therefore refuses (HVT01) before
+-- anything changes whenever either table holds a row and the migrator cannot
+-- read every fragment. (Where `epigraph_maintenance` exists, section 7's
+-- ownership transfer would also refuse such a migrator; section 0 does not
+-- rely on that, so the refusal holds on a database without the role too.)
+-- On empty tables there is nothing to derive and section 0 passes.
 --
 -- DEPLOY ORDER: apply before, or with, the API binary that lists both tables
 -- in `FORCE_PROTECTED_SET`. That binary refuses to serve on a database where
@@ -81,6 +91,37 @@
 -- `docs/runbooks/079-undo.sql`. The tables then have the posture they had
 -- before this file, with no registry row.
 SET LOCAL lock_timeout = '3s';
+
+-- ===================================================================
+-- 0. A DERIVATION NEEDS A MIGRATOR THAT READS EVERY FRAGMENT
+--
+-- The same three admissions `epigraph_session_is_privileged_writer` (114)
+-- makes, inlined: `epigraph_definer_bypass()` is not executable by PUBLIC,
+-- so calling it here would turn this refusal into a 42501.
+-- ===================================================================
+DO $$
+DECLARE reads_all boolean;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM public.harvester_sources)
+       AND NOT EXISTS (SELECT 1 FROM public.harvester_audit_reports) THEN
+        RETURN;
+    END IF;
+    SELECT r.rolsuper OR r.rolbypassrls INTO reads_all
+      FROM pg_catalog.pg_roles r WHERE r.rolname = current_user;
+    reads_all := COALESCE(reads_all, false)
+        OR public.epigraph_bypass()
+        OR COALESCE((SELECT pg_catalog.pg_has_role(current_user, 'epigraph_maintenance', 'MEMBER')
+                      WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles
+                                     WHERE rolname = 'epigraph_maintenance')), false);
+    IF NOT reads_all THEN
+        RAISE EXCEPTION 'HVT01: migration 173 derives harvester rows from harvester_fragments, '
+                        'which is FORCEd, and role % cannot read every fragment (not a '
+                        'superuser, no BYPASSRLS, not a member of epigraph_maintenance); '
+                        'nothing was changed. Run as a superuser or maintenance login.',
+                        current_user
+            USING ERRCODE = '23502';
+    END IF;
+END $$;
 
 -- ===================================================================
 -- 1. THE COLUMNS, NULLABLE UNTIL THE DERIVATION HAS RUN
