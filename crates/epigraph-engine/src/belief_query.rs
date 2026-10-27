@@ -121,51 +121,7 @@ pub async fn get_belief(
     frame_id: Option<Uuid>,
 ) -> Result<BeliefInterval, BeliefQueryError> {
     if let Some(frame_id) = frame_id {
-        // ── Framed path: live recomputation from stored BBAs ──────────────
-        let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
-            .await?
-            .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
-
-        let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
-
-        let assignment =
-            FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
-        let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
-            assignment.and_then(|a| a.hypothesis_index),
-            frame.hypothesis_count(),
-        );
-
-        let all_bbas =
-            MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
-
-        if all_bbas.is_empty() {
-            return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
-        }
-
-        // Discount each BBA by its calibrated reliability (evidence-type weight
-        // × locality, via the resolved belief profile) before combining, so the
-        // framed read agrees with the cached `claims.pignistic_prob` that the
-        // recompute path writes. No perspective → the served profile with this
-        // frame's overrides, exactly what the recompute resolves.
-        let (combined, fold_conflict) =
-            recompute_framed_belief(pool, viewer, &frame_row, &frame, &all_bbas, None)
-                .await?
-                .expect("all_bbas is non-empty so combination yields Some");
-
-        let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
-        let bel = epigraph_ds::measures::belief(&combined, &target);
-        let pl = epigraph_ds::measures::plausibility(&combined, &target);
-        let betp = epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index);
-
-        return Ok(BeliefInterval {
-            belief: bel,
-            plausibility: pl,
-            pignistic_prob: betp,
-            mass_on_conflict: fold_conflict,
-            mass_on_missing: combined.mass_of_missing(),
-            framed: true,
-            source: "recomputed".to_string(),
-        });
+        return framed_belief(pool, None, viewer, claim_id, frame_id).await;
     }
 
     // ── Unframed path: cached DS columns from claim row ───────────────────
@@ -216,6 +172,91 @@ pub async fn get_belief(
     Ok(BeliefInterval::cached_from_truth(claim.truth_value.value()))
 }
 
+/// [`get_belief`] with the caller's tenancy-aware pool, when it has one.
+///
+/// Ruling R-22: a framed read folds only the BBAs whose sources `viewer` can
+/// read, and that is decided by a read the SESSION's row security also
+/// filters. On an unstamped application pool every group-private source is
+/// invisible, so a group member's read would drop its own group's BBAs.
+/// With `scoped`, the framed path's derivation and source reads run on a
+/// connection stamped with `viewer`, so a member folds them; without it they
+/// run on `pool`, as before. The unframed path reads the cache and is
+/// [`get_belief`]'s own.
+///
+/// # Errors
+/// As [`get_belief`].
+pub async fn get_belief_scoped(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Option<Uuid>,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    match frame_id {
+        Some(frame_id) => framed_belief(pool, scoped, viewer, claim_id, frame_id).await,
+        None => get_belief(pool, viewer, claim_id, None).await,
+    }
+}
+
+/// The framed path of [`get_belief`] / [`get_belief_scoped`]: live
+/// recomputation from stored BBAs.
+async fn framed_belief(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    // ── Framed path: live recomputation from stored BBAs ──────────────
+    let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
+        .await?
+        .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
+
+    let frame = FrameOfDiscernment::new(frame_row.name.clone(), frame_row.hypotheses.clone())?;
+
+    let assignment =
+        FrameRepository::get_claim_assignment(pool, viewer, claim_id, frame_id).await?;
+    let hypothesis_index = crate::edge_factor::resolve_hypothesis_index(
+        assignment.and_then(|a| a.hypothesis_index),
+        frame.hypothesis_count(),
+    );
+
+    let all_bbas =
+        MassFunctionRepository::get_for_claim_frame(pool, viewer, claim_id, frame_id).await?;
+
+    if all_bbas.is_empty() {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    }
+
+    // Discount each BBA by its calibrated reliability (evidence-type weight
+    // × locality, via the resolved belief profile) before combining, so the
+    // framed read agrees with the cached `claims.pignistic_prob` that the
+    // recompute path writes. No perspective → the served profile with this
+    // frame's overrides, exactly what the recompute resolves.
+    // `None`: no BBA left once those whose sources this viewer cannot read
+    // are set aside (ruling R-22), which reads as an empty frame.
+    let Some((combined, fold_conflict)) =
+        recompute_framed_belief(pool, scoped, viewer, &frame_row, &frame, &all_bbas, None).await?
+    else {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    };
+
+    let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
+    let bel = epigraph_ds::measures::belief(&combined, &target);
+    let pl = epigraph_ds::measures::plausibility(&combined, &target);
+    let betp = epigraph_ds::measures::pignistic_probability(&combined, hypothesis_index);
+
+    Ok(BeliefInterval {
+        belief: bel,
+        plausibility: pl,
+        pignistic_prob: betp,
+        mass_on_conflict: fold_conflict,
+        mass_on_missing: combined.mass_of_missing(),
+        framed: true,
+        source: "recomputed".to_string(),
+    })
+}
+
 /// Compute a **perspective-scoped** belief on demand — the "frame function".
 ///
 /// This is `get_belief`'s framed path re-weighted from one observer's
@@ -236,6 +277,22 @@ pub async fn get_belief(
 /// query failure.
 pub async fn get_perspective_belief(
     pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<BeliefInterval, BeliefQueryError> {
+    get_perspective_belief_scoped(pool, None, viewer, claim_id, frame_id, perspective_id).await
+}
+
+/// [`get_perspective_belief`] with the caller's tenancy-aware pool, when it
+/// has one (see [`get_belief_scoped`]).
+///
+/// # Errors
+/// As [`get_perspective_belief`].
+pub async fn get_perspective_belief_scoped(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
@@ -277,8 +334,10 @@ pub async fn get_perspective_belief(
     // object, source-reliability (evidence type) and locality-reliability
     // (pathway). Absent/empty → no opinion → the computation reduces to the
     // global `get_belief`.
-    let (combined, fold_conflict) = recompute_framed_belief(
+    // `None`: no BBA whose sources this viewer can read (ruling R-22).
+    let Some((combined, fold_conflict)) = recompute_framed_belief(
         pool,
+        scoped,
         viewer,
         &frame_row,
         &frame,
@@ -286,7 +345,9 @@ pub async fn get_perspective_belief(
         Some(perspective_id),
     )
     .await?
-    .expect("all_bbas is non-empty so combination yields Some");
+    else {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    };
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
     Ok(BeliefInterval {
@@ -551,21 +612,22 @@ async fn perspective_tier_inputs(
 /// profile ([`effective_source_strength_profiled`]: perspective → per-frame →
 /// profile tables → stored `source_strength` → unknown-type weight, with
 /// locality applied) before the SAME combination the recompute/write path
-/// uses ([`crate::source_dependence::combine_with_source_dependence`], with
-/// the profile's conflict threshold). The rows' source keys arrive in
+/// uses ([`crate::source_dependence::combine_with_owner_dependence`], with
+/// the profile's conflict threshold). The rows' sources arrive in
 /// `source_keys` (one per row, from
-/// [`crate::source_dependence::source_keys_for_rows`]), so this function
-/// issues no queries.
+/// [`crate::source_dependence::bba_sources_for_rows`]; a bare
+/// `Option<SourceKey>` carries no owner and gets only the same-source rule),
+/// so this function issues no queries.
 ///
 /// Returns `Ok(None)` only when `rows` is empty.
 ///
 /// # Errors
 /// `ParseMasses` on a malformed stored BBA; `Ds` when discounting or the fold
 /// fails.
-pub fn combine_framed_bbas(
+pub fn combine_framed_bbas<S: Into<crate::source_dependence::BbaSource>>(
     frame: &FrameOfDiscernment,
     rows: &[MassFunctionRow],
-    source_keys: Vec<Option<crate::source_dependence::SourceKey>>,
+    source_keys: Vec<S>,
     ctx: &FramedBeliefContext,
 ) -> Result<Option<(MassFunction, f64)>, BeliefQueryError> {
     if rows.is_empty() {
@@ -575,6 +637,7 @@ pub fn combine_framed_bbas(
 
     let mut items = Vec::with_capacity(rows.len());
     for (row, key) in rows.iter().zip(source_keys) {
+        let key: crate::source_dependence::BbaSource = key.into();
         let mf = MassFunction::from_json_masses(frame.clone(), &row.masses)
             .map_err(BeliefQueryError::ParseMasses)?;
         let alpha = effective_source_strength_profiled(row, &ctx.profile);
@@ -586,7 +649,9 @@ pub fn combine_framed_bbas(
 
     // Combine via the SAME function the recompute/write path uses: same-source
     // repeats (one agent re-reading one `source_url`) are folded cautiously
-    // into one, then everything is Dempster-folded (`combine_multiple`). Using
+    // into one, agreeing BBAs of sibling agents of one human are folded
+    // cautiously (ruling R-36), then everything is Dempster-folded
+    // (`combine_multiple`). Using
     // that one function is what makes this compute-on-read result reproduce
     // the cached value for the same stored BBAs (backlog 4c42c0bf); a plain
     // `combine_multiple` here served the inflated same-source value while the
@@ -597,12 +662,51 @@ pub fn combine_framed_bbas(
     // fold's `aggregate_conflict`, because Dempster normalises it out of the
     // combined mass. A single BBA is not folded; its own empty-set mass is
     // the conflict.
-    let (combined, conflict) = crate::source_dependence::combine_with_source_dependence(
+    let (combined, conflict) = crate::source_dependence::combine_with_owner_dependence(
         items,
         ctx.profile.combination.conflict_threshold,
     )
     .map_err(BeliefQueryError::Ds)?;
     Ok(Some((combined, conflict)))
+}
+
+/// The connection a framed read's derivation-scope and source reads run on: a
+/// read stamped with `viewer` when the caller has a tenancy-aware pool (row
+/// security then admits the viewer's own groups' sources), else one from
+/// `pool`, as before (ruling R-22; see [`get_belief_scoped`]).
+enum ScopeConn<'a> {
+    Stamped(epigraph_db::ScopedRead<'a>),
+    Plain(sqlx::pool::PoolConnection<sqlx::Postgres>),
+}
+
+impl std::ops::Deref for ScopeConn<'_> {
+    type Target = sqlx::PgConnection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Stamped(r) => r,
+            Self::Plain(c) => c,
+        }
+    }
+}
+
+impl std::ops::DerefMut for ScopeConn<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Stamped(r) => r,
+            Self::Plain(c) => c,
+        }
+    }
+}
+
+async fn scope_conn<'a>(
+    pool: &PgPool,
+    scoped: Option<&'a epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<ScopeConn<'a>, BeliefQueryError> {
+    Ok(match scoped {
+        Some(sp) => ScopeConn::Stamped(sp.read_as(viewer).await?),
+        None => ScopeConn::Plain(pool.acquire().await.map_err(epigraph_db::DbError::from)?),
+    })
 }
 
 /// Recompute the combined mass function for a framed claim, discounting each
@@ -616,9 +720,12 @@ pub fn combine_framed_bbas(
 /// it across a whole page — that is the N+1 fix; both paths share
 /// `combine_framed_bbas`, so their values are identical.
 ///
-/// Returns `Ok(None)` only when `rows` is empty.
+/// Returns `Ok(None)` when no row is left once the rows whose derivation
+/// sources `viewer` cannot read are set aside (ruling R-22), `rows` empty
+/// included.
 async fn recompute_framed_belief(
     pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
     viewer: &epigraph_db::visibility::Viewer,
     frame_row: &FrameRow,
     frame: &FrameOfDiscernment,
@@ -629,8 +736,16 @@ async fn recompute_framed_belief(
         return Ok(None);
     }
     let ctx = FramedBeliefContext::resolve(pool, viewer, frame_row, perspective_id).await?;
-    let source_keys = crate::source_dependence::source_keys_for_rows(pool, viewer, rows).await?;
-    combine_framed_bbas(frame, rows, source_keys, &ctx)
+    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    // Ruling R-22: only the BBAs whose sources this viewer can read.
+    let rows =
+        crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, rows.to_vec()).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let sources = crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, &rows).await?;
+    drop(conn);
+    combine_framed_bbas(frame, &rows, sources, &ctx)
 }
 
 /// Batch sibling of [`get_perspective_belief`]: compute the lensed belief for a
@@ -662,6 +777,23 @@ pub async fn get_perspective_belief_batch(
     frame_id: Uuid,
     perspective_id: Uuid,
 ) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
+    get_perspective_belief_batch_scoped(pool, None, viewer, claim_ids, frame_id, perspective_id)
+        .await
+}
+
+/// [`get_perspective_belief_batch`] with the caller's tenancy-aware pool, when
+/// it has one (see [`get_belief_scoped`]).
+///
+/// # Errors
+/// As [`get_perspective_belief_batch`].
+pub async fn get_perspective_belief_batch_scoped(
+    pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+    frame_id: Uuid,
+    perspective_id: Uuid,
+) -> Result<Vec<(Uuid, Result<BeliefInterval, BeliefQueryError>)>, BeliefQueryError> {
     let frame_row = FrameRepository::get_by_id(pool, viewer, frame_id)
         .await?
         .ok_or(BeliefQueryError::FrameNotFound(frame_id))?;
@@ -675,7 +807,8 @@ pub async fn get_perspective_belief_batch(
     for &claim_id in claim_ids {
         out.push((
             claim_id,
-            perspective_belief_for_claim(pool, viewer, claim_id, frame_id, &frame, &ctx).await,
+            perspective_belief_for_claim(pool, scoped, viewer, claim_id, frame_id, &frame, &ctx)
+                .await,
         ));
     }
     Ok(out)
@@ -687,6 +820,7 @@ pub async fn get_perspective_belief_batch(
 /// [`get_perspective_belief`] exactly so the two produce identical intervals.
 async fn perspective_belief_for_claim(
     pool: &PgPool,
+    scoped: Option<&epigraph_db::ScopedPool>,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
@@ -708,8 +842,15 @@ async fn perspective_belief_for_claim(
 
     // Claim-scoped like the BBA fetch above (one query, skipped when no row
     // can carry a source key), so the page-level hoist is unchanged.
+    let mut conn = scope_conn(pool, scoped, viewer).await?;
+    // Ruling R-22: only the BBAs whose sources this viewer can read.
+    let all_bbas = crate::derivation_scope::retain_for_viewer(&mut *conn, viewer, all_bbas).await?;
+    if all_bbas.is_empty() {
+        return Ok(BeliefInterval::empty_frame(frame.hypothesis_count()));
+    }
     let source_keys =
-        crate::source_dependence::source_keys_for_rows(pool, viewer, &all_bbas).await?;
+        crate::source_dependence::bba_sources_for_rows(&mut conn, viewer, &all_bbas).await?;
+    drop(conn);
     let (combined, fold_conflict) = combine_framed_bbas(frame, &all_bbas, source_keys, ctx)?
         .expect("all_bbas is non-empty so combination yields Some");
 

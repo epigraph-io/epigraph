@@ -2489,6 +2489,25 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
+    (
+        "agent.rs",
+        "humans_of",
+        "READ through migration 149's definer `epigraph_human_of(agent, live)` over a list of \
+         agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
+         itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
+         `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "derivation_scope.rs",
+        "cache_admissible",
+        "READ that answers, for BBA rows the caller already read, which may enter THEIR \
+         claim's cached belief (ruling R-22, generalised): each row, its cited evidence, its \
+         edge and the edge's source claim are compared with the row's own claim (public, or \
+         the claim's owner group). It returns only a subset of the ids it was given, and the \
+         audience is the CLAIM's readers, not a viewer's, so there is no viewer predicate to \
+         splice; the viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
+    ),
     (
         "admin_scope_enforcement.rs",
         "read",

@@ -30,6 +30,7 @@ pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
 pub mod decomposition_priority;
+pub mod derivation_scope;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;

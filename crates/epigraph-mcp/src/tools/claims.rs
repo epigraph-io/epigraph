@@ -1042,8 +1042,9 @@ pub async fn get_claim(
     // page-degrade semantics).
     let lensed_belief = match lens {
         Some((frame_id, perspective_id)) => {
-            let interval = epigraph_engine::belief_query::get_perspective_belief(
+            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 id,
                 frame_id,

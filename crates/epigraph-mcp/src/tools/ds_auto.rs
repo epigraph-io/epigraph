@@ -804,6 +804,22 @@ pub async fn auto_wire_ds_update_filed_on(
         MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
             .await
             .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
+    // Ruling R-22: this fold is written to the claim's cache (and, by the
+    // callers, to its `truth_value`), so it folds only the BBAs whose every
+    // source is at least as widely readable as the claim, exactly as the
+    // recompute does (`epigraph_engine::derivation_scope`). The row just
+    // stored cites this call's own evidence; if even it is not admissible (an
+    // evidence row narrowed to another group), nothing may be cached from it.
+    let all_rows = epigraph_engine::derivation_scope::retain_for_cache(&mut *conn, all_rows)
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
+    if all_rows.is_empty() {
+        return Err(format!(
+            "none of claim {claim_id}'s BBAs is derived only from sources as widely readable \
+             as the claim (the cited evidence is narrower), so no cached belief can be written \
+             from them"
+        ));
+    }
 
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. Reliability is derived
@@ -852,12 +868,14 @@ pub async fn auto_wire_ds_update_filed_on(
     // function the recompute path uses (`edge_factor::compute_combined_belief`):
     // BBAs from one agent re-reading one `source_url` are folded cautiously into
     // one before the Dempster fold, so a re-worded re-observation of an
-    // unchanged source no longer counts as corroboration (backlog 4c42c0bf).
-    // Rows with no source identity fold exactly as before.
+    // unchanged source no longer counts as corroboration (backlog 4c42c0bf),
+    // and agreeing BBAs of sibling agents of one human are folded cautiously
+    // rather than multiplied (ruling R-36). Rows with no source identity fold
+    // exactly as before.
     let source_keys =
-        epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
             .await
-            .map_err(|e| format!("evidence source_url read: {e}"))?;
+            .map_err(|e| format!("BBA source read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
     let frame_overrides = frame_profile_overrides(&mut *conn, viewer, frame_id).await?;
     let profile = resolve_frame_profile(
@@ -873,7 +891,7 @@ pub async fn auto_wire_ds_update_filed_on(
         items.push((key, discounted));
     }
     let (combined, fold_conflict) =
-        epigraph_engine::source_dependence::combine_with_source_dependence(
+        epigraph_engine::source_dependence::combine_with_owner_dependence(
             items,
             profile.combination.conflict_threshold,
         )

@@ -710,8 +710,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// deleted with the k-means prototype, not converted (`routes/crud.rs`
 /// 31 -> 30, keeping sites), read off `the_scanner_is_not_vacuous`'s own
 /// failure (`left: 243, right: 244`).
-/// Staging union (integration/20261027): both deltas above from 244 -> 231.
-const HIGH_WATER: usize = 231;
+/// 244 -> 243 (rulings R-22 / R-36, backlogs fef24216 / fe3ec493):
+/// `propagate_beliefs` loads its CDST seed rows once (`bp_seed_rows`), not once
+/// for the auto-mode coverage check and again for the seed, and admits them on
+/// a viewer-stamped read (`routes/computation.rs` 7 -> 6), read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// (`recorded 7, measured 6`).
+/// Staging union (integration/20261027): the three deltas above from 244 -> 230.
+const HIGH_WATER: usize = 230;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -844,7 +850,8 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 8 -> 7 (atom-level belief): `propagate_beliefs`' factor load moved onto
     // `AppState::read_as`, because the `decomposes_to` exclusion's legacy arm
     // reads `edges` and must see the caller's own private edges.
-    ("routes/computation.rs", 7),
+    // 7 -> 6 (R-22 / R-36): the CDST seed rows are loaded once (`bp_seed_rows`).
+    ("routes/computation.rs", 6),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),

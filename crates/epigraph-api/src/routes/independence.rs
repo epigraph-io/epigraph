@@ -1,31 +1,45 @@
-//! Provenance-independence analysis for BBA combination (G1, G11)
+//! Same-human dependence analysis for BBA combination (G1, G11; ruling R-36)
 //!
 //! When multiple agents submit evidence (BBAs) for the same claim,
-//! Dempster's rule assumes independence. If agents share a common
-//! provenance ancestor (detected via LCA), their BBAs must be
-//! combined cautiously (Denoeux min-rule) before standard combination.
+//! Dempster's rule assumes independence. Agents that act for the SAME human
+//! are not independent sources: ruling Q-U027F-2 says they replace or
+//! contest, never aggregate, and ruling R-36 applies that to every
+//! BBA-combining path. Their BBAs are therefore reduced by Denoeux's cautious
+//! rule (`epigraph_engine::source_dependence::cautious_reduce`, built on
+//! `epigraph_ds::combination::cautious_rule`) before standard combination.
+//! The older min-commonality `combination::cautious_combine` is not used: it
+//! drops open-world mass, which every default-shaped assessment carries.
+//!
+//! The owner of an agent is the live human it resolves to (migration 149's
+//! `epigraph_human_of(agent, true)`), else the agent itself, exactly as
+//! `/claims/:id/assess` keys its owner slot. This replaced a provenance-LCA
+//! test that passed `mass_functions` row ids to `get_lca` (which walks claim
+//! lineage), so it never found a shared ancestor and every agent folded as
+//! independent.
 
 use epigraph_ds::mass::MassFunction;
 use uuid::Uuid;
 
-/// Result of provenance independence analysis
+/// Result of the same-human dependence analysis
 #[derive(Debug, Clone)]
 pub struct IndependenceAnalysis {
-    /// Groups of BBAs that share provenance (each group gets cautious_combine)
+    /// Groups of BBAs written by sibling agents of one owner (each group is
+    /// reduced by `source_dependence::cautious_reduce`)
     pub dependent_groups: Vec<Vec<MassFunction>>,
-    /// BBAs with no shared provenance (get standard combine_multiple)
+    /// BBAs whose owner has no other agent among the rows (get standard
+    /// combine_multiple)
     pub independent: Vec<MassFunction>,
-    /// Audit trail of LCA findings
-    pub lca_findings: Vec<LcaFinding>,
+    /// Audit trail: which owners' agents were grouped
+    pub owner_findings: Vec<OwnerFinding>,
 }
 
-/// Record of a discovered shared ancestor between two agents
+/// Record of agents found to act for one owner
 #[derive(Debug, Clone)]
-pub struct LcaFinding {
-    pub agent_a: Option<Uuid>,
-    pub agent_b: Option<Uuid>,
-    pub ancestor_id: Uuid,
-    pub total_depth: i32,
+pub struct OwnerFinding {
+    /// The live human the agents act for (or the agent itself)
+    pub owner_id: Uuid,
+    /// The distinct source agents grouped under it, in row order
+    pub agents: Vec<Uuid>,
 }
 
 impl IndependenceAnalysis {
@@ -34,7 +48,7 @@ impl IndependenceAnalysis {
         Self {
             dependent_groups: vec![],
             independent: masses,
-            lca_findings: vec![],
+            owner_findings: vec![],
         }
     }
 }
@@ -84,12 +98,12 @@ impl UnionFind {
 /// Build `IndependenceAnalysis` from a pre-computed dependency adjacency.
 ///
 /// This is the pure logic, separated from DB access for testability.
-/// `agent_indices` maps agent positions to their BBAs.
-/// `dependent_pairs` lists pairs of agent indices that share provenance.
+/// `agent_masses` holds each agent's BBAs, by agent position.
+/// `dependent_pairs` lists pairs of agent positions that act for one owner.
 pub fn build_analysis(
     agent_masses: &[Vec<MassFunction>],
     dependent_pairs: &[(usize, usize)],
-    lca_findings: Vec<LcaFinding>,
+    owner_findings: Vec<OwnerFinding>,
 ) -> IndependenceAnalysis {
     let n = agent_masses.len();
     if n == 0 {
@@ -121,7 +135,7 @@ pub fn build_analysis(
             // Single agent = independent
             independent.extend(group_masses);
         } else {
-            // Multiple agents sharing provenance = dependent group
+            // Multiple agents of one owner = dependent group
             dependent_groups.push(group_masses);
         }
     }
@@ -129,88 +143,64 @@ pub fn build_analysis(
     IndependenceAnalysis {
         dependent_groups,
         independent,
-        lca_findings,
+        owner_findings,
     }
 }
 
-/// Analyze provenance independence of a set of BBAs.
+/// Analyze the same-human dependence of a set of BBAs.
 ///
-/// Groups BBAs by source_agent_id, then for each pair of agent groups,
-/// calls get_lca() on representative claims. If LCA exists within max_depth,
-/// the pair is marked as dependent. Uses union-find for transitive closure.
+/// Groups BBAs by `source_agent_id`, resolves each agent's owner in one
+/// batched read (`AgentRepository::humans_of`, live bindings only), and marks
+/// every pair of distinct agents with the same owner as dependent. A row with
+/// no source agent is its own (independent) group.
 #[cfg(feature = "db")]
 pub async fn analyze_independence(
     pool: &sqlx::PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
     rows: &[(Uuid, Option<Uuid>, MassFunction)],
-    max_lca_depth: i32,
 ) -> Result<IndependenceAnalysis, crate::errors::ApiError> {
-    use std::collections::HashMap;
-
-    // Group BBAs by source_agent_id
-    let mut agent_groups: HashMap<Option<Uuid>, Vec<MassFunction>> = HashMap::new();
+    // Group BBAs by source_agent_id, in row order.
+    let mut agents: Vec<Option<Uuid>> = Vec::new();
+    let mut agent_masses: Vec<Vec<MassFunction>> = Vec::new();
     for (_, agent_id, mass) in rows {
-        agent_groups
-            .entry(*agent_id)
-            .or_default()
-            .push(mass.clone());
+        match agents.iter().position(|a| a == agent_id) {
+            Some(i) => agent_masses[i].push(mass.clone()),
+            None => {
+                agents.push(*agent_id);
+                agent_masses.push(vec![mass.clone()]);
+            }
+        }
     }
-
-    let agents: Vec<Option<Uuid>> = agent_groups.keys().copied().collect();
-    let agent_masses: Vec<Vec<MassFunction>> = agents
-        .iter()
-        .map(|a| agent_groups.get(a).cloned().unwrap_or_default())
-        .collect();
 
     if agents.len() <= 1 {
         let all: Vec<MassFunction> = agent_masses.into_iter().flatten().collect();
         return Ok(IndependenceAnalysis::all_independent(all));
     }
 
-    // For each pair of agents, find a representative claim and check LCA
-    // Representative claim = first claim_id from each agent's submissions
-    let mut agent_rep_claims: HashMap<Option<Uuid>, Uuid> = HashMap::new();
-    for (_, agent_id, _) in rows {
-        agent_rep_claims.entry(*agent_id).or_insert_with(|| {
-            rows.iter()
-                .find(|(_, a, _)| a == agent_id)
-                .map(|(id, _, _)| *id)
-                .unwrap_or_else(Uuid::nil)
-        });
-    }
+    let known: Vec<Uuid> = agents.iter().flatten().copied().collect();
+    let humans = epigraph_db::AgentRepository::humans_of(pool, &known, true)
+        .await
+        .map_err(|e| crate::errors::ApiError::DatabaseError {
+            message: format!("owner lookup failed: {e}"),
+        })?;
+    let owner_of = |agent: Option<Uuid>| agent.map(|a| humans.get(&a).copied().unwrap_or(a));
 
     let mut dependent_pairs = Vec::new();
-    let mut lca_findings = Vec::new();
-
+    let mut owner_findings: Vec<OwnerFinding> = Vec::new();
     for i in 0..agents.len() {
-        for j in (i + 1)..agents.len() {
-            let claim_a = agent_rep_claims
-                .get(&agents[i])
-                .copied()
-                .unwrap_or_else(Uuid::nil);
-            let claim_b = agent_rep_claims
-                .get(&agents[j])
-                .copied()
-                .unwrap_or_else(Uuid::nil);
-
-            if let Some(lca) = epigraph_db::LineageRepository::get_lca(
-                pool,
-                viewer,
-                claim_a,
-                claim_b,
-                Some(max_lca_depth),
-            )
-            .await
-            .map_err(|e| crate::errors::ApiError::DatabaseError {
-                message: format!("LCA query failed: {e}"),
-            })? {
-                dependent_pairs.push((i, j));
-                lca_findings.push(LcaFinding {
-                    agent_a: agents[i],
-                    agent_b: agents[j],
-                    ancestor_id: lca.ancestor_id,
-                    total_depth: lca.total_depth,
-                });
+        let Some(owner) = owner_of(agents[i]) else {
+            continue;
+        };
+        // The first earlier agent of the same owner, if any: one union per
+        // agent is enough for the transitive closure.
+        if let Some(j) = (0..i).find(|&j| owner_of(agents[j]) == Some(owner)) {
+            dependent_pairs.push((j, i));
+            let agent_i = agents[i].expect("an owner implies an agent");
+            match owner_findings.iter_mut().find(|f| f.owner_id == owner) {
+                Some(f) => f.agents.push(agent_i),
+                None => owner_findings.push(OwnerFinding {
+                    owner_id: owner,
+                    agents: vec![agents[j].expect("an owner implies an agent"), agent_i],
+                }),
             }
         }
     }
@@ -218,7 +208,7 @@ pub async fn analyze_independence(
     Ok(build_analysis(
         &agent_masses,
         &dependent_pairs,
-        lca_findings,
+        owner_findings,
     ))
 }
 
@@ -247,12 +237,12 @@ mod tests {
         let analysis = IndependenceAnalysis::all_independent(masses.clone());
         assert!(analysis.dependent_groups.is_empty());
         assert_eq!(analysis.independent.len(), 2);
-        assert!(analysis.lca_findings.is_empty());
+        assert!(analysis.owner_findings.is_empty());
     }
 
     #[test]
     fn test_independent_bbas_no_dependent_pairs() {
-        // Two agents, no shared provenance → all independent
+        // Two agents of different owners → all independent
         let agent_masses = vec![vec![make_bba(0.6, 0.1)], vec![make_bba(0.3, 0.4)]];
         let analysis = build_analysis(&agent_masses, &[], vec![]);
         assert!(analysis.dependent_groups.is_empty());
@@ -261,19 +251,17 @@ mod tests {
 
     #[test]
     fn test_dependent_bbas_grouped() {
-        // Two agents sharing LCA → grouped together
+        // Two agents of one owner → grouped together
         let agent_masses = vec![vec![make_bba(0.6, 0.1)], vec![make_bba(0.3, 0.4)]];
-        let finding = LcaFinding {
-            agent_a: Some(Uuid::nil()),
-            agent_b: Some(Uuid::nil()),
-            ancestor_id: Uuid::nil(),
-            total_depth: 2,
+        let finding = OwnerFinding {
+            owner_id: Uuid::nil(),
+            agents: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
         };
         let analysis = build_analysis(&agent_masses, &[(0, 1)], vec![finding]);
         assert_eq!(analysis.dependent_groups.len(), 1);
         assert_eq!(analysis.dependent_groups[0].len(), 2);
         assert!(analysis.independent.is_empty());
-        assert_eq!(analysis.lca_findings.len(), 1);
+        assert_eq!(analysis.owner_findings.len(), 1);
     }
 
     #[test]
