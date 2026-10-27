@@ -1058,6 +1058,74 @@ async fn compute_combined_belief_over(
         return Ok(None);
     }
 
+    let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+
+    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
+    // one `source_url`) are folded cautiously into one before the Dempster
+    // fold (backlog 4c42c0bf, `crate::source_dependence`), and so are the
+    // agreeing BBAs of sibling agents of one human (ruling R-36); the write
+    // path `ds_auto::auto_wire_ds_update` uses the same function, so a
+    // recompute cannot re-inflate what the write left honest.
+    //
+    // `fold_conflict` is the conflict the fold SAW. Since U025 every
+    // `combine_multiple` step is Dempster, which normalises conflict out of
+    // the combined mass (`combined.mass_of_conflict()` is 0), so the
+    // multi-BBA arm takes it from the per-step reports via
+    // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
+    // A single (or single-source) BBA is not folded: its own empty-set mass
+    // is the conflict.
+    let sources = crate::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
+        .await
+        .map_err(|e| format!("BBA source read: {e}"))?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    for (row, key) in all_rows.iter().zip(sources) {
+        let mf = parse_stored_bba(frame, &row.masses)?;
+        let reliability = effective_source_strength_profiled(row, &profile);
+        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        items.push((key, d));
+    }
+    let (combined, fold_conflict) = crate::source_dependence::combine_with_owner_dependence(
+        items,
+        profile.combination.conflict_threshold,
+    )
+    .map_err(|e| format!("combine_multiple: {e}"))?;
+
+    // has_opposing: does any single source BBA lean toward contradiction?
+    // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
+    // BBA on the target, so edge-borne AND directly-submitted opposition both
+    // surface here as a per-BBA betp_unsup — this replaces (and subsumes) the
+    // legacy CONTRADICTS-edge query, which only saw edge-borne opposition.
+    // Only the binary frame's classification reads it.
+    let opposing_threshold = profile.classifier.thresholds().has_opposing_threshold;
+    let has_opposing = all_rows.iter().any(|row| {
+        parse_stored_bba(frame, &row.masses)
+            .map(|bba| measures::pignistic_probability(&bba, 1) > opposing_threshold)
+            .unwrap_or(false)
+    });
+
+    preview_of_combined(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        &profile,
+        &combined,
+        fold_conflict,
+        has_opposing,
+    )
+    .await
+    .map(Some)
+}
+
+/// The belief profile the combine of (claim, `frame_id`) folds under: the
+/// served (default) profile, then this frame's tier (its `belief_profile`
+/// object, `frame_overrides`, and the per-frame keys read here).
+async fn fold_profile(
+    conn: &mut sqlx::PgConnection,
+    frame_id: Uuid,
+    frame_overrides: Option<&serde_json::Value>,
+) -> BeliefProfile {
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. Instead we compute
     // each BBA's effective reliability discount dynamically from
@@ -1107,36 +1175,25 @@ async fn compute_combined_belief_over(
         warn_on_unknown_evidence_type_keys(frame_id, map, &profile);
     }
 
-    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
-    // one `source_url`) are folded cautiously into one before the Dempster
-    // fold (backlog 4c42c0bf, `crate::source_dependence`), and so are the
-    // agreeing BBAs of sibling agents of one human (ruling R-36); the write
-    // path `ds_auto::auto_wire_ds_update` uses the same function, so a
-    // recompute cannot re-inflate what the write left honest.
-    //
-    // `fold_conflict` is the conflict the fold SAW. Since U025 every
-    // `combine_multiple` step is Dempster, which normalises conflict out of
-    // the combined mass (`combined.mass_of_conflict()` is 0), so the
-    // multi-BBA arm takes it from the per-step reports via
-    // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
-    // A single (or single-source) BBA is not folded: its own empty-set mass
-    // is the conflict.
-    let sources = crate::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
-        .await
-        .map_err(|e| format!("BBA source read: {e}"))?;
-    let mut items = Vec::with_capacity(all_rows.len());
-    for (row, key) in all_rows.iter().zip(sources) {
-        let mf = parse_stored_bba(frame, &row.masses)?;
-        let reliability = effective_source_strength_profiled(row, &profile);
-        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-        items.push((key, d));
-    }
-    let (combined, fold_conflict) = crate::source_dependence::combine_with_owner_dependence(
-        items,
-        profile.combination.conflict_threshold,
-    )
-    .map_err(|e| format!("combine_multiple: {e}"))?;
+    profile
+}
 
+/// The cached scalars (and the binary frame's classification) of `combined`,
+/// the fold of the claim's BBAs on `frame` with conflict `conflict`, about the
+/// hypothesis the claim is assigned on that frame. `has_opposing`: some
+/// single folded BBA leans toward contradiction.
+#[allow(clippy::too_many_arguments)]
+async fn preview_of_combined(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    profile: &BeliefProfile,
+    combined: &MassFunction,
+    conflict: f64,
+    has_opposing: bool,
+) -> Result<CombinedBeliefPreview, String> {
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
     // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.
     // On a multi-hypothesis frame — a declared labeled axis (issue #222), or any
@@ -1159,10 +1216,9 @@ async fn compute_combined_belief_over(
     );
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
-    let bel = measures::belief(&combined, &target);
-    let pl = measures::plausibility(&combined, &target);
-    let betp = measures::pignistic_probability(&combined, hypothesis_index);
-    let conflict = fold_conflict;
+    let bel = measures::belief(combined, &target);
+    let pl = measures::plausibility(combined, &target);
+    let betp = measures::pignistic_probability(combined, hypothesis_index);
     let missing = combined.mass_of_missing();
 
     // CDST classification — a verdict on the COMBINED belief via the
@@ -1182,20 +1238,8 @@ async fn compute_combined_belief_over(
         // normal binary claim (assigned index 0); they differ only for a claim
         // deliberately assigned index 1 on the binary frame, where feeding
         // pignistic(1) in as "supported" would invert the verdict.
-        let betp_supported = measures::pignistic_probability(&combined, 0);
-        let betp_unsup = measures::pignistic_probability(&combined, 1);
-        // has_opposing: does any single source BBA lean toward contradiction?
-        // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
-        // BBA on the target, so edge-borne AND directly-submitted opposition both
-        // surface here as a per-BBA betp_unsup — this replaces (and subsumes) the
-        // legacy CONTRADICTS-edge query, which only saw edge-borne opposition.
-        let has_opposing = all_rows.iter().any(|row| {
-            parse_stored_bba(frame, &row.masses)
-                .map(|bba| {
-                    measures::pignistic_probability(&bba, 1) > thresholds.has_opposing_threshold
-                })
-                .unwrap_or(false)
-        });
+        let betp_supported = measures::pignistic_probability(combined, 0);
+        let betp_unsup = measures::pignistic_probability(combined, 1);
         let label = crate::classifier::classify(
             conflict,
             theta,
@@ -1209,14 +1253,14 @@ async fn compute_combined_belief_over(
         None
     };
 
-    Ok(Some(CombinedBeliefPreview {
+    Ok(CombinedBeliefPreview {
         belief: bel,
         plausibility: pl,
         pignistic_prob: betp,
         conflict_k: conflict,
         missing_mass: missing,
         classification,
-    }))
+    })
 }
 
 /// Write half of the combine pipeline: run [`compute_combined_belief`] and
