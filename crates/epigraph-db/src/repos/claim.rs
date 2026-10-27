@@ -7879,6 +7879,22 @@ impl ClaimRepository {
     /// claims trigger sees the writing principal: once the database is armed
     /// it refuses a claim written by an application session with no
     /// principal.
+    ///
+    /// # Errors
+    /// Every refusal below writes nothing.
+    /// - `DbError::InvalidData` for an `edge_type` other than `supersedes` /
+    ///   `revises`, or a parent whose stored visibility is outside the
+    ///   vocabulary.
+    /// - `DbError::NotFound` for a parent that does not exist or that the
+    ///   parent's locked read does not return (row security hides it).
+    /// - `DbError::Conflict` for `supersedes` on a parent that is no longer
+    ///   current.
+    /// - `DbError::WriteRefused` for `supersedes` when the retire of a parent
+    ///   the locked read returned changed no row (for example a trigger
+    ///   skipped it). Defensive: the claims tenancy policy refuses a readable
+    ///   parent the session may not write by raising at its WITH CHECK
+    ///   (`QueryFailed`, SQLSTATE 42501, the transaction aborted), not by
+    ///   matching zero rows.
     #[instrument(skip(conn))]
     pub async fn evolve_step_conn(
         conn: &mut sqlx::PgConnection,
@@ -7954,6 +7970,39 @@ impl ClaimRepository {
                 reason: format!("evolve_step: cannot supersede a non-current step {parent_uuid}"),
             });
         }
+        if edge_type == "supersedes" {
+            // Retire the predecessor BEFORE any other write (the lineage
+            // back-fill, the successor, its edge), and refuse when the retire
+            // changed nothing (backlog d34f5096). An UPDATE that changes no
+            // row does not raise: it reports success. The locked read above
+            // already returned the parent current, so a zero-row retire means
+            // something skipped it (a trigger, say; the claims tenancy policy
+            // refuses an unwritable row by raising at WITH CHECK instead), and
+            // inserting the successor after it would leave the lineage with
+            // two current heads. Retiring first means a refusal has written
+            // nothing, as in `supersede_act_conn`.
+            //
+            // Also null both embedding columns so the retired step drops out
+            // of semantic search. Mirrors the invariant enforced by
+            // supersede() and mark_duplicate(): is_current=false → embedding
+            // (and embedding_3072) = NULL.
+            let retired = sqlx::query(
+                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
+                 updated_at = NOW() WHERE id = $1",
+            )
+            .bind(parent_uuid)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if retired != 1 {
+                return Err(DbError::WriteRefused {
+                    entity: "Claim".to_string(),
+                    id: parent_uuid,
+                    action: "supersede".to_string(),
+                });
+            }
+        }
+
         let lineage_id = match existing_lineage {
             Some(l) => l,
             None => {
@@ -8009,20 +8058,6 @@ impl ClaimRepository {
         .bind(reason.unwrap_or(""))
         .execute(&mut *tx)
         .await?;
-
-        if edge_type == "supersedes" {
-            // Also null both embedding columns so the retired step drops out
-            // of semantic search. Mirrors the invariant enforced by
-            // supersede() and mark_duplicate(): is_current=false → embedding
-            // (and embedding_3072) = NULL.
-            sqlx::query(
-                "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL, \
-                 updated_at = NOW() WHERE id = $1",
-            )
-            .bind(parent_uuid)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         Ok(EvolveStepResult {
             new_claim_id: new_uuid,
