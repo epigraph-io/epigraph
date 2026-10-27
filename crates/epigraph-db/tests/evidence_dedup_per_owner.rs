@@ -27,6 +27,10 @@
 //!   until migration 171 applies (the binary deploys first);
 //! * a claim on which two owners hold the same body can still be privatized,
 //!   and both rows survive (no key for the narrowing to collide on);
+//! * `batch_create` takes the same per-owner de-duplication: a same-tenancy
+//!   duplicate refuses the whole batch, another owner's identical body lands;
+//! * a row another group holds on an atom with the parent's text does not
+//!   suppress that atom's derivation row.
 //! * no unique index on `evidence` covers `(content_hash, claim_id)` (171's
 //!   effect).
 
@@ -387,6 +391,159 @@ async fn a_claim_two_owners_hold_one_body_on_can_still_be_privatized(pool: PgPoo
         rows_with_body(&pool, claim, &body).await.len(),
         2,
         "both rows survive the privatization"
+    );
+}
+
+/// Evidence on `claim` with `body`, held by `group` the way the operator
+/// `hide` holds a row: a visibility pin (migration 110), then owner and
+/// visibility. As the harness superuser.
+async fn seed_held_body(pool: &PgPool, claim: Uuid, group: Uuid, body: &str) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (content_hash, evidence_type, raw_content, claim_id) \
+         VALUES ($1, 'document', $2, $3) RETURNING id",
+    )
+    .bind(digest(body).as_slice())
+    .bind(body)
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("seed the held row");
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: held by another group')",
+    )
+    .bind(id)
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("pin the held row");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(id)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("hold the row in the other group");
+    id
+}
+
+/// `batch_create` de-duplicates per owner like `create`: a batch carrying a
+/// body already stored in the same tenancy is refused WHOLE (`DuplicateKey`,
+/// nothing written, the fresh row in it included), and a batch carrying a body
+/// another group holds on the claim lands beside that group's row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn batch_create_refuses_a_same_tenancy_duplicate_whole_and_lands_another_owners_body(
+    pool: PgPool,
+) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "dedup-batch-owner").await;
+    let (_other, other_group) = fixture::seed_agent_with_group(&pool, "dedup-batch-other").await;
+    let claim = seed_public_claim_owned_by(&pool, owner, owner_group).await;
+    let stored = format!("a body already stored {}", Uuid::new_v4());
+    let fresh = format!("a body nobody holds {}", Uuid::new_v4());
+    let held = format!("a body another group holds {}", Uuid::new_v4());
+
+    EvidenceRepository::batch_create(&pool, &[document(owner, claim, &stored)])
+        .await
+        .expect("control: the first batch lands");
+
+    let refused = EvidenceRepository::batch_create(
+        &pool,
+        &[
+            document(owner, claim, &fresh),
+            document(owner, claim, &stored),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(DbError::DuplicateKey { .. })),
+        "a batch carrying a same-tenancy duplicate is a duplicate: {refused:?}"
+    );
+    assert!(
+        rows_with_body(&pool, claim, &fresh).await.is_empty(),
+        "a refused batch writes nothing, its fresh row included"
+    );
+    assert_eq!(rows_with_body(&pool, claim, &stored).await.len(), 1);
+
+    let intra = EvidenceRepository::batch_create(
+        &pool,
+        &[
+            document(owner, claim, &fresh),
+            document(owner, claim, &fresh),
+        ],
+    )
+    .await;
+    assert!(
+        matches!(intra, Err(DbError::DuplicateKey { .. })),
+        "two identical rows in one batch are a duplicate: {intra:?}"
+    );
+    assert!(rows_with_body(&pool, claim, &fresh).await.is_empty());
+
+    let held_row = seed_held_body(&pool, claim, other_group, &held).await;
+    let landed = EvidenceRepository::batch_create(&pool, &[document(owner, claim, &held)])
+        .await
+        .unwrap_or_else(|e| {
+            panic!("a body another group holds on the claim must land like a fresh one: {e:?}")
+        });
+    assert_eq!(landed.len(), 1);
+    let rows = rows_with_body(&pool, claim, &held).await;
+    assert_eq!(rows.len(), 2, "both rows stand: {rows:?}");
+    assert!(
+        rows.contains(&(owner_group, false)),
+        "the new row is the claim's: {rows:?}"
+    );
+    let held_owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM evidence WHERE id = $1")
+        .bind(held_row)
+        .fetch_one(&pool)
+        .await
+        .expect("read the held row");
+    assert_eq!(held_owner, other_group, "the held row is untouched");
+}
+
+/// A row another group holds on the atom whose body is the parent's text is a
+/// different tenancy: it must not suppress the atom's own derivation row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_groups_row_with_the_parents_text_does_not_suppress_a_derivation(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "dedup-derive-x").await;
+    let (_other, other_group) = fixture::seed_agent_with_group(&pool, "dedup-derive-held").await;
+    let parent = seed_public_claim_owned_by(&pool, owner, owner_group).await;
+    let atom = seed_public_claim_owned_by(&pool, owner, owner_group).await;
+    let parent_text: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("read the parent's text");
+    let held = seed_held_body(&pool, atom, other_group, &parent_text).await;
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let recorded =
+        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, atom, parent, "test")
+            .await
+            .expect("the derivation write succeeds");
+    let DerivationEvidence::Recorded(id) = recorded else {
+        panic!(
+            "another group's row with the parent's text suppressed the atom's derivation: \
+             {recorded:?}"
+        );
+    };
+    assert_ne!(id, held);
+    let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT owner_group_id, properties->>'derived_from_claim' FROM evidence \
+          WHERE claim_id = $1 ORDER BY (id = $2)",
+    )
+    .bind(atom)
+    .bind(held)
+    .fetch_all(&pool)
+    .await
+    .expect("read the atom's evidence");
+    assert_eq!(
+        rows,
+        vec![(owner_group, Some(parent.to_string())), (other_group, None)],
+        "one new derivation row, the claim's, beside the held row"
+    );
+    assert_eq!(
+        rows_with_body(&pool, atom, &parent_text).await.len(),
+        2,
+        "both rows carry the parent text's digest, so only the tenancy told them apart"
     );
 }
 
