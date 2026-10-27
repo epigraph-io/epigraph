@@ -633,11 +633,18 @@ impl EpiGraphMcpFull {
 
         // A world-owned structural edge (both endpoints agents): attested at
         // INSERT by the server's key (R-50), the only point it can be signed.
+        // Best-effort, like `create_perspective`'s PERSPECTIVE_OF: without a
+        // key the edge is written UNSIGNED, as before R-50, and said so.
         let edge_key = match self.edge_signing_key().await {
-            Ok(k) => k,
+            Ok(k) => Some(k),
             Err(e) => {
-                tracing::warn!(error = ?e, "auth-lineage edge: no signing key; skipping");
-                return;
+                tracing::warn!(
+                    principal = %principal,
+                    error = ?e,
+                    "auth-lineage edge: the server's signing key is unavailable; \
+                     writing the edge UNSIGNED"
+                );
+                None
             }
         };
         let mut conn = match self.pool.acquire().await {
@@ -649,7 +656,7 @@ impl EpiGraphMcpFull {
         };
         match epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
             &mut conn,
-            Some(edge_key),
+            edge_key,
             mcp_agent,
             "agent",
             principal,

@@ -78,10 +78,25 @@ pub async fn create_perspective(
     // Materialize PERSPECTIVE_OF edge if owner specified, best-effort as
     // before. A world-owned structural edge (an `agent` target): attested at
     // INSERT by this server's key (R-49/R-50), the only point it can be signed.
+    // The policy for a best-effort structural edge (shared with
+    // `record_auth_lineage`): when the key cannot be resolved, write the edge
+    // UNSIGNED and say so, never degrade silently.
     if let Some(agent_id) = owner_agent_id {
+        let edge_key = match server.edge_signing_key().await {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(
+                    perspective = %row.id,
+                    error = ?e,
+                    "PERSPECTIVE_OF edge: the server's signing key is unavailable; \
+                     writing the edge UNSIGNED"
+                );
+                None
+            }
+        };
         let _ = EdgeRepository::create_signed(
             &server.pool,
-            server.edge_signing_key().await.ok(),
+            edge_key,
             row.id,
             "perspective",
             agent_id,
