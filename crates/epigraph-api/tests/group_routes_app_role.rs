@@ -726,42 +726,53 @@ async fn seeded_verb_made_group(pool: &PgPool, creator: Uuid, member: Uuid) -> U
 }
 
 /// When the DATABASE refuses the removal (SQLSTATE 42501), the route answers a
-/// clean 403 and commits nothing. A verb-made team group's roster and group row
-/// are written only by migration 164's maintenance verbs, so its own admin's
-/// REST removal is refused by the database itself; that refusal used to
-/// surface as a 500.
+/// clean 403 with `removal_db_error`'s reason and commits nothing. A verb-made
+/// team group's roster and group row are written only by migration 164's
+/// maintenance verbs, so its own admin's REST removal is refused by the
+/// database itself; that refusal used to surface as a 500.
+///
+/// The second arm pins a documented API change: the re-key mark is now taken
+/// before the guarded revoke, so removing a NON-member from a verb-made group
+/// is refused at the mark (403) rather than answered `NotAMember` (404). The
+/// caller is that group's admin, so the 403 discloses nothing a 404 did not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_database_refusal_of_the_removal_is_a_403_on_the_application_role(pool: PgPool) {
     let creator = seed_agent(&pool, "323773fe-k-creator").await;
     let reader = seed_agent(&pool, "323773fe-k-reader").await;
+    let outsider = seed_agent(&pool, "323773fe-k-outsider").await;
     let group = seeded_verb_made_group(&pool, creator, reader).await;
     let roster_before = live_roster(&pool, group).await;
 
-    let (status, body) = send(
-        app_role_router(&pool).await,
-        Method::DELETE,
-        &format!("/api/v1/groups/{group}/members/{reader}"),
-        creator,
-        None,
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a removal the database refuses is a 403, not a 500: {body}"
-    );
-    assert_eq!(
-        live_roster(&pool, group).await,
-        roster_before,
-        "the reader is still a live member"
-    );
-    let marked: bool =
-        sqlx::query_scalar("SELECT reseal_required_at IS NOT NULL FROM groups WHERE id = $1")
-            .bind(group)
-            .fetch_one(&pool)
-            .await
-            .expect("group");
-    assert!(!marked, "no re-key mark committed");
+    for (target, who) in [(reader, "a member"), (outsider, "a non-member")] {
+        let (status, body) = send(
+            app_role_router(&pool).await,
+            Method::DELETE,
+            &format!("/api/v1/groups/{group}/members/{target}"),
+            creator,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{who}: a removal the database refuses is a 403, not a 500: {body}"
+        );
+        assert!(
+            body.to_string()
+                .contains("the database refused this membership change for the caller"),
+            "{who}: the 403 is removal_db_error's, not another layer's: {body}"
+        );
+        assert_eq!(
+            live_roster(&pool, group).await,
+            roster_before,
+            "{who}: the roster is unchanged"
+        );
+        assert_eq!(
+            group_mark_and_epoch(&pool, group).await,
+            (false, None),
+            "{who}: no re-key mark committed (a keyless group has no epoch to move)"
+        );
+    }
 }
 
 /// `(reseal_required_at IS NOT NULL, epoch 0 status)` of `group`, read on the
