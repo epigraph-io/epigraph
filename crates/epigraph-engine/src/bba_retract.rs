@@ -17,13 +17,18 @@
 //! left is never vacated).
 //!
 //! **Which claims are vacated.** Only one whose cache-owning input DISAPPEARED
-//! with this retraction: [`RetractCacheBefore`] reads, before the retraction
-//! and in the same transaction, whether the claim had a cache-owner frame
+//! with this retraction and that HAD a cache: [`RetractCacheBefore`] reads,
+//! before the retraction and in the same transaction, whether the claim had a
+//! cache-owner frame
 //! ([`epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim`]: a
 //! live combine input that is not an ingest template row, on a claim that is
-//! not a frozen compound); the vacate runs only when it had one and has none
-//! after. A claim whose only rows are templates, or a compound, had no owner
-//! before and is left as it was.
+//! not a frozen compound) and a non-NULL cache on a non-compound
+//! ([`epigraph_db::repos::compound_valuation::atom_cache_batch`]); the vacate
+//! runs only when both held and no owner is left after. A claim whose only
+//! rows are templates, or a compound, had no owner before and is left as it
+//! was; a claim with no cache is not given one (as R-80's recompute vacate
+//! reads it: a vacuous value appearing would tell other readers a BBA
+//! existed).
 //!
 //! **Viewer.** As every legacy cache writer, the fold and the vacate read what
 //! the caller can see and offer the result to the one global cache under the
@@ -51,13 +56,15 @@ use epigraph_db::MassFunctionRepository;
 pub struct RetractCacheBefore {
     claim_id: Uuid,
     had_owner: bool,
+    had_cache: bool,
 }
 
 impl RetractCacheBefore {
     /// Read, on the transaction that will retract `mass_function_id` and
-    /// before it does, whether the BBA's claim has a cache-owner frame as
-    /// `viewer` sees it. `None` when the viewer cannot read the BBA (the
-    /// retraction then answers "not found", writing nothing).
+    /// before it does, whether the BBA's claim has a cache-owner frame and a
+    /// (non-compound) cache as `viewer` sees them. `None` when the viewer
+    /// cannot read the BBA (the retraction then answers "not found", writing
+    /// nothing).
     ///
     /// # Errors
     /// A database read.
@@ -76,9 +83,18 @@ impl RetractCacheBefore {
             MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, row.claim_id)
                 .await
                 .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
+        let had_cache = epigraph_db::repos::compound_valuation::atom_cache_batch(
+            &mut *conn,
+            viewer,
+            &[row.claim_id],
+        )
+        .await
+        .map_err(|e| format!("atom_cache_batch: {e}"))?
+        .contains_key(&row.claim_id);
         Ok(Some(Self {
             claim_id: row.claim_id,
             had_owner: owner.is_some(),
+            had_cache,
         }))
     }
 }
@@ -110,7 +126,7 @@ pub async fn refresh_cache_after_retract(
             vacated: false,
         });
     }
-    let lost_owner = before.is_some_and(|b| b.claim_id == claim_id && b.had_owner);
+    let lost_owner = before.is_some_and(|b| b.claim_id == claim_id && b.had_owner && b.had_cache);
     if !lost_owner {
         return Ok(RetractCacheOutcome::default());
     }

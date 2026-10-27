@@ -455,6 +455,64 @@ async fn retracting_a_claims_only_bba_over_mcp_vacates_its_cache(pool: PgPool) {
     assert_eq!(body["belief_vacated"], true, "{body}");
 }
 
+/// A claim that never had a cache is not given one: retracting its only BBA
+/// leaves the cache NULL (as R-80's recompute vacate reads it), and the reply
+/// says nothing was recomputed or vacated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracting_the_only_bba_of_a_claim_without_a_cache_leaves_it_without_one(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (owner, owner_auth, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let group = personal_group_of(&pool, owner).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("r79-mcp-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let claim = owned_public_claim(&pool, owner, group, "no cache").await;
+    let only = seed_bba(
+        &pool,
+        owner,
+        claim,
+        frame,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    let cache_of = |pool: PgPool| async move {
+        sqlx::query_as::<_, (Option<f64>, Option<f64>, Option<f64>)>(
+            "SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1",
+        )
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("read the cache")
+    };
+    assert_eq!(
+        cache_of(pool.clone()).await,
+        (None, None, None),
+        "calibration: the claim has no cache"
+    );
+
+    let res = retract_bba(
+        &server,
+        &owner_viewer,
+        params(only, "withdrawn"),
+        Some(&owner_auth),
+    )
+    .await
+    .expect("the owner retracts the claim's only BBA");
+    let body = first_text(&res);
+    assert_eq!(body["status"], "retracted", "{body}");
+    assert_eq!(
+        cache_of(pool.clone()).await,
+        (None, None, None),
+        "no cache is created"
+    );
+    assert_eq!(body["belief_recomputed"], false, "{body}");
+    assert_eq!(body["belief_vacated"], false, "{body}");
+}
+
 /// Refusals over MCP: a stranger that can read the owner's public BBA is
 /// refused; a BBA on a group-private claim it cannot read is "not found", in
 /// the SAME words as a random id; nothing is written. A `claims:admin` token
