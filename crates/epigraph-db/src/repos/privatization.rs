@@ -867,10 +867,16 @@ const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
 /// An evidence row names one claim, but what it records can bear on others,
 /// and a row another group holds on the claim is that group's: the seal leaves
 /// it as it is (no ciphertext row, body and digest untouched), rather than
-/// blanking it under the claim group's key. In practice, when a claim narrows,
-/// migration 168 already moves its inherited rows and its writers' own public
-/// rows onto the claim's group, so the rows this keeps out are the ones another
-/// group holds through a visibility pin (operator `hide`, migration 110).
+/// blanking it under the claim group's key.
+///
+/// Reach, as the schema stands (current behaviour, not part of the ruling):
+/// a restrict runs before the seal, and migration 168's narrowing
+/// (`epigraph_propagate_tenancy`) moves a claim's inherited rows and its
+/// writers' own (writer-owned) rows onto the claim's group, so at seal time
+/// the rows this keeps out are the ones another group holds through a
+/// visibility pin (operator `hide`, migration 110). Whether a writer's public
+/// row should instead stay its writer's through a narrowing is an open design
+/// question outside this predicate.
 ///
 /// The manifest ([`PrivatizationRepository::seal_manifest_page_conn`]), the
 /// commit's TCB shape ([`PrivatizationRepository::seal_tcb_shape_conn`]) and the

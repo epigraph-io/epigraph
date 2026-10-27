@@ -707,45 +707,102 @@ async fn seed_body(pool: &PgPool, claim: Uuid, body: &str) -> Uuid {
     .expect("seed evidence")
 }
 
+/// Evidence on `claim` with `body`, held by `group` the way the operator `hide`
+/// holds a row: a visibility pin (migration 110), then owner and visibility.
+async fn seed_held_body(pool: &PgPool, claim: Uuid, group: Uuid, body: &str) -> Uuid {
+    let id = seed_body(pool, claim, body).await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: held by another group')",
+    )
+    .bind(id)
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("pin the held row");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(id)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("hold the row in the other group");
+    id
+}
+
 /// A seal encrypts and blanks only the evidence its claim's OWNER holds
 /// (operator ruling R-78: "evidence can bear on multiple claims").
 ///
-/// Two foreign rows sit on the subject before the plan applies:
-///
-/// * another group's row, held there the way the operator `hide` holds one (a
-///   visibility pin, then owner and visibility). Pinned evidence keeps its
-///   owner through the restrict (migration 110), so at seal time it is not the
-///   claim owner's, and the seal must leave it exactly as it was: its body, its
-///   digest, no ciphertext row. The manifest, the commit's TCB shape and the
-///   mutation agree on that, or the commit's digest check would refuse.
-/// * a writer's own (writer-owned) public row. Migration 168 moves it onto the
-///   claim's group when the claim narrows, so by seal time it IS the claim
-///   owner's and is sealed with the claim, then restored by unseal.
+/// Another group's row sits on the subject before the plan applies, held there
+/// the way the operator `hide` holds one (a visibility pin, then owner and
+/// visibility). Pinned evidence keeps its owner through the restrict (migration
+/// 110), so at seal time it is not the claim owner's, and the seal must leave
+/// it exactly as it was: its body, its digest, no ciphertext row. The manifest,
+/// the commit's TCB shape and the mutation agree on that, or the commit's
+/// digest check would refuse. Unseal leaves it as it was too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_seal_encrypts_only_the_claim_owners_evidence(pool: PgPool) {
     let world = fx::World::seed(&pool).await;
     make_keyed(&pool, world.target_group).await;
     let claim = seed_subject(&pool, &world, "a subject with foreign evidence").await;
     let (_other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-other").await;
-    let (_writer, writer_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-writer").await;
-
     let held_body = format!("another group's evidence on this claim {}", Uuid::new_v4());
-    let held = seed_body(&pool, claim, &held_body).await;
-    sqlx::query(
-        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
-         VALUES ($1, $2, 'test: held by another group')",
-    )
-    .bind(held)
-    .bind(Uuid::new_v4())
-    .execute(&pool)
-    .await
-    .expect("pin the held row");
-    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
-        .bind(held)
-        .bind(other_group)
-        .execute(&pool)
+    let held = seed_held_body(&pool, claim, other_group, &held_body).await;
+
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+    let held_before = evidence_state(&pool, held).await;
+    assert_eq!(
+        (held_before.0, held_before.1),
+        (other_group, false),
+        "fixture: the pinned row keeps its owner through the restrict"
+    );
+
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
         .await
-        .expect("hold the row in the other group");
+        .expect("seal manifest");
+    let served: Vec<Uuid> = manifest.items[0].evidence.iter().map(|e| e.id).collect();
+    assert!(
+        !served.contains(&held),
+        "the manifest hands another group's evidence to the sealing client: {served:?}"
+    );
+    assert!(!served.is_empty(), "the claim owner's own row is served");
+    let body = seal_body(&manifest).await;
+    let resp = post_seal_commit(&pool, &world, plan, body)
+        .await
+        .expect("seal commit");
+    assert_eq!(resp.committed, 1);
+    for id in &served {
+        assert!(
+            evidence_state(&pool, *id).await.4,
+            "the claim owner's row {id} has a ciphertext row"
+        );
+    }
+
+    assert_eq!(
+        evidence_state(&pool, held).await,
+        held_before,
+        "the seal must leave another group's evidence exactly as it was: owner, body, \
+         digest, and no ciphertext row"
+    );
+    unseal_through_routes(&pool, &world, plan, 1).await;
+    assert_eq!(evidence_state(&pool, held).await, held_before);
+}
+
+/// CURRENT BEHAVIOUR, pinned so a change to it is deliberate; it is NOT a
+/// requirement of ruling R-78. A writer's own (writer-owned) public evidence
+/// row on a claim is moved onto the claim's group when the claim narrows
+/// (migration 168's `epigraph_propagate_tenancy`, writer-owned arm), so by seal
+/// time it IS the claim owner's, is sealed with the claim, and is restored by
+/// unseal. Whether such a row should instead stay its writer's (and public)
+/// through a narrowing is an open design question; if that changes, this test
+/// changes with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_into_the_seal(
+    pool: PgPool,
+) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let claim = seed_subject(&pool, &world, "a subject with a writer's evidence").await;
+    let (_writer, writer_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-writer").await;
 
     let writer_body = format!("a writer's own public evidence {}", Uuid::new_v4());
     let written = seed_body(&pool, claim, &writer_body).await;
@@ -757,17 +814,11 @@ async fn a_seal_encrypts_only_the_claim_owners_evidence(pool: PgPool) {
         .expect("make the row the writer's");
 
     let plan = applied_seal_plan(&pool, &world, &[claim]).await;
-    let held_before = evidence_state(&pool, held).await;
-    assert_eq!(
-        (held_before.0, held_before.1),
-        (other_group, false),
-        "fixture: the pinned row keeps its owner through the restrict"
-    );
     let written_before = evidence_state(&pool, written).await;
     assert_eq!(
         (written_before.0, written_before.1),
         (world.target_group, false),
-        "fixture: the writer's row followed the claim when it narrowed (168)"
+        "current behaviour: the writer's row followed the claim when it narrowed (168)"
     );
 
     let manifest = fetch_seal_manifest(&pool, &world, plan)
@@ -775,38 +826,23 @@ async fn a_seal_encrypts_only_the_claim_owners_evidence(pool: PgPool) {
         .expect("seal manifest");
     let served: Vec<Uuid> = manifest.items[0].evidence.iter().map(|e| e.id).collect();
     assert!(
-        !served.contains(&held),
-        "the manifest hands another group's evidence to the sealing client: {served:?}"
-    );
-    assert!(
         served.contains(&written),
-        "the claim owner's rows are served"
+        "current behaviour: the re-owned row is the claim owner's, so it is served"
     );
     let body = seal_body(&manifest).await;
     let resp = post_seal_commit(&pool, &world, plan, body)
         .await
         .expect("seal commit");
     assert_eq!(resp.committed, 1);
-
-    assert_eq!(
-        evidence_state(&pool, held).await,
-        held_before,
-        "the seal must leave another group's evidence exactly as it was: owner, body, \
-         digest, and no ciphertext row"
-    );
     let written_sealed = evidence_state(&pool, written).await;
-    assert!(
-        written_sealed.4,
-        "the claim owner's row has a ciphertext row"
-    );
+    assert!(written_sealed.4, "current behaviour: the row is sealed");
     assert_ne!(
         written_sealed.2.as_deref(),
         Some(writer_body.as_str()),
-        "and no plaintext"
+        "and keeps no plaintext"
     );
 
     unseal_through_routes(&pool, &world, plan, 1).await;
-    assert_eq!(evidence_state(&pool, held).await, held_before);
     let written_after = evidence_state(&pool, written).await;
     assert_eq!(written_after.2.as_deref(), Some(writer_body.as_str()));
     assert_eq!(

@@ -25,9 +25,8 @@
 //!   then `AlreadyPresent`, with no unique key to name in an `ON CONFLICT`, and
 //!   still `AlreadyPresent` (not an error) on a database that keeps 001's key
 //!   until migration 171 applies (the binary deploys first);
-//! * a claim on which two owners hold the same body can still be privatized:
-//!   migration 168 moves both rows onto the claim's group, and nothing
-//!   collides.
+//! * a claim on which two owners hold the same body can still be privatized,
+//!   and both rows survive (no key for the narrowing to collide on);
 //! * no unique index on `evidence` covers `(content_hash, claim_id)` (171's
 //!   effect).
 
@@ -381,10 +380,13 @@ async fn a_claim_two_owners_hold_one_body_on_can_still_be_privatized(pool: PgPoo
         });
     tx.commit().await.expect("commit");
     assert_eq!(moved, vec![claim]);
+    // Both rows survive. Which group then owns the writer's row is migration
+    // 168's narrowing, not this ruling's, and is deliberately not asserted
+    // here (privatization_seal.rs pins it as current behaviour).
     assert_eq!(
-        rows_with_body(&pool, claim, &body).await,
-        vec![(owner_group, false), (owner_group, false)],
-        "both rows survive, now the claim's (migration 168's narrowing)"
+        rows_with_body(&pool, claim, &body).await.len(),
+        2,
+        "both rows survive the privatization"
     );
 }
 
