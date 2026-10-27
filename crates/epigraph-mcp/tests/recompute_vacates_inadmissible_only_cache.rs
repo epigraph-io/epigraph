@@ -18,11 +18,20 @@
 //!
 //! * the vacate, on an `epigraph_app` session stamped as a member of the
 //!   evidence's group and as the claim's author (row security applies), and
-//!   through the MCP `recompute_beliefs` tool on the maintenance session;
+//!   through the MCP `recompute_beliefs` tool on the maintenance session,
+//!   read back as served by MCP `get_belief` and `get_claim`;
+//! * a GROUP claim whose evidence moves to another group is vacated, read
+//!   by a member of the claim's group (the R-80 reads are viewer-spliced);
 //! * the claim-wide gate: an admissible input on ANOTHER frame of the claim
-//!   means not every BBA is inadmissible, so nothing is vacated;
+//!   means not every BBA is inadmissible, so nothing is vacated (public and
+//!   group claims), and the cache is left exactly as it was;
+//! * a compound is never vacated (its cache is not a fold of its own BBAs);
 //! * a claim with no cache stays without one (writing a vacuous value there
 //!   would announce that an unseen BBA exists).
+//!
+//! The HTTP twin (`POST /api/v1/edges`' dependent propagation on the unstamped
+//! connection, read back through `GET /api/v1/claims/:id/belief`) is
+//! `crates/epigraph-api/tests/recompute_vacates_inadmissible_only_cache_http.rs`.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -31,9 +40,10 @@ use epigraph_crypto::AgentSigner;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
-    ensure_binary_frame, recompute_claim_cached_belief, resolve_claim_validity_frame,
+    ensure_binary_frame, recompute_claim_belief_on_frame, recompute_claim_cached_belief,
+    resolve_claim_validity_frame,
 };
-use epigraph_mcp::types::RecomputeBeliefsParams;
+use epigraph_mcp::types::{GetBeliefParams, GetClaimParams, RecomputeBeliefsParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
 use rmcp::model::ContentBlock;
 use sqlx::PgPool;
@@ -88,8 +98,8 @@ fn near(x: Option<f64>, y: f64) -> bool {
     x.is_some_and(|x| (x - y).abs() < 1e-9)
 }
 
-/// Full ignorance on `frame`: BetP 0.5, Bel 0, Pl 1, no conflict, no missing
-/// mass, `not_enough_info`.
+/// Full ignorance on the binary `frame`: BetP 0.5, Bel 0, Pl 1, no conflict,
+/// no missing mass, `not_enough_info`.
 fn is_vacuous(c: &Cache, frame: Uuid) -> bool {
     near(c.0, 0.5)
         && near(c.1, 0.0)
@@ -98,6 +108,65 @@ fn is_vacuous(c: &Cache, frame: Uuid) -> bool {
         && near(c.4, 0.0)
         && c.5 == Some(frame)
         && c.6.as_deref() == Some("not_enough_info")
+}
+
+/// The stale value the vacate tests start from where a test sets it by hand:
+/// the shape a fold of one supporting BBA leaves on `frame`.
+fn stale_on(frame: Uuid) -> Cache {
+    (
+        Some(0.9),
+        Some(0.8),
+        Some(1.0),
+        Some(0.0),
+        Some(0.0),
+        Some(frame),
+        Some("supported".to_string()),
+    )
+}
+
+/// The MCP server the tool and reader tests call.
+fn server(pool: &PgPool, scoped: ScopedPool) -> EpiGraphMcpFull {
+    let signer = AgentSigner::from_bytes(&[0x80u8; 32]).expect("signer");
+    EpiGraphMcpFull::new(
+        pool.clone(),
+        signer,
+        McpEmbedder::new(pool.clone(), None),
+        false,
+    )
+    .with_scoped_pool(scoped)
+}
+
+fn json_of(out: &rmcp::model::CallToolResult) -> serde_json::Value {
+    let text = match out.content.first().cloned().expect("content") {
+        ContentBlock::Text(t) => t.text,
+        other => panic!("expected text, got {other:?}"),
+    };
+    serde_json::from_str(&text).expect("JSON body")
+}
+
+/// `recompute_beliefs` over `claim` on the maintenance session; its report.
+async fn recompute_beliefs(
+    pool: &PgPool,
+    server: &EpiGraphMcpFull,
+    claim: Uuid,
+) -> serde_json::Value {
+    let out = tools::cdst_maintenance::recompute_beliefs(
+        server,
+        &mut fixture::scoped_pool(pool)
+            .await
+            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .expect("maintenance session"),
+        RecomputeBeliefsParams {
+            claim_ids: Some(vec![claim.to_string()]),
+            labels: None,
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("recompute_beliefs");
+    json_of(&out)
 }
 
 /// A BBA on (`claim`, `frame`) by `agent` citing `evidence`, with `t` on TRUE.
@@ -237,36 +306,9 @@ async fn a_claim_whose_every_bba_is_inadmissible_gets_a_vacuous_cache_on_recompu
 async fn recompute_beliefs_vacates_a_claim_whose_every_bba_is_inadmissible(pool: PgPool) {
     let w = world(&pool, "r80-tool").await;
     let (claim, stale) = stale_claim(&pool, &w, "r80 recompute_beliefs").await;
-    let signer = AgentSigner::from_bytes(&[0x80u8; 32]).expect("signer");
-    let server = EpiGraphMcpFull::new(
-        pool.clone(),
-        signer,
-        McpEmbedder::new(pool.clone(), None),
-        false,
-    )
-    .with_scoped_pool(fixture::scoped_pool(&pool).await);
+    let server = server(&pool, fixture::scoped_pool(&pool).await);
 
-    let out = tools::cdst_maintenance::recompute_beliefs(
-        &server,
-        &mut fixture::scoped_pool(&pool)
-            .await
-            .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
-            .await
-            .expect("maintenance session"),
-        RecomputeBeliefsParams {
-            claim_ids: Some(vec![claim.to_string()]),
-            labels: None,
-            limit: None,
-            offset: None,
-        },
-    )
-    .await
-    .expect("recompute_beliefs");
-    let text = match out.content.first().cloned().expect("content") {
-        ContentBlock::Text(t) => t.text,
-        other => panic!("expected text, got {other:?}"),
-    };
-    let report: serde_json::Value = serde_json::from_str(&text).expect("JSON report");
+    let report = recompute_beliefs(&pool, &server, claim).await;
 
     let after = cache(&pool, claim).await;
     assert!(
@@ -274,9 +316,93 @@ async fn recompute_beliefs_vacates_a_claim_whose_every_bba_is_inadmissible(pool:
         "recompute_beliefs must vacate the cache of a claim whose every BBA is inadmissible; \
          it left {after:?} (stale value {stale:?}) and reported {report}"
     );
+    // The report is the same before and after the fix (it counted the claim
+    // as recomputed even when nothing was written), so these do not tell the
+    // two apart: they pin that the vacate is reported as a write, not an
+    // error.
     assert_eq!(report["claims_recomputed"], 1, "{report}");
     assert_eq!(report["frame_writes"], 1, "{report}");
     assert_eq!(report["errors"], serde_json::json!([]), "{report}");
+
+    // What a reader outside the evidence's group is SERVED afterwards: the
+    // unframed MCP `get_belief` (the cached columns) and `get_claim`'s
+    // classification.
+    let belief = json_of(
+        &tools::ds::get_belief(
+            &server,
+            &w.author_viewer,
+            GetBeliefParams {
+                claim_id: claim.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+        .await
+        .expect("get_belief"),
+    );
+    assert_eq!(belief["source"], "cached", "{belief}");
+    for (field, want) in [
+        ("pignistic_prob", 0.5),
+        ("belief", 0.0),
+        ("plausibility", 1.0),
+        ("ignorance", 1.0),
+        ("mass_on_conflict", 0.0),
+        ("mass_on_missing", 0.0),
+    ] {
+        assert!(
+            near(belief[field].as_f64(), want),
+            "get_belief served {field} = {} after the vacate, not {want}: {belief}",
+            belief[field]
+        );
+    }
+    let got = json_of(
+        &tools::claims::get_claim(
+            &server,
+            &w.author_viewer,
+            GetClaimParams {
+                claim_id: claim.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+        .await
+        .expect("get_claim"),
+    );
+    assert_eq!(
+        got["classification"], "not_enough_info",
+        "get_claim served the old verdict after the vacate: {got}"
+    );
+}
+
+/// A claim with no cache whose every BBA is inadmissible, through the tool:
+/// it keeps no cache. The report still counts it as recomputed and as a
+/// frame write although nothing was written; that over-count is a KNOWN
+/// RESIDUAL pinned here as it stands (`recompute_claim_belief_on_frame`
+/// answers `true` whenever the frame had rows), not intended behaviour.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_beliefs_gives_a_claim_without_a_cache_none(pool: PgPool) {
+    let w = world(&pool, "r80-tool-null").await;
+    let claim = fixture::seed_public_claim(&pool, w.author, "r80 tool never cached").await;
+    let ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    hide(&pool, ev, w.group, w.member).await;
+    store(&pool, claim, w.binary, w.member, ev, 0.8).await;
+    let server = server(&pool, fixture::scoped_pool(&pool).await);
+
+    let report = recompute_beliefs(&pool, &server, claim).await;
+
+    let after = cache(&pool, claim).await;
+    assert!(
+        after.0.is_none() && after.1.is_none() && after.2.is_none() && after.6.is_none(),
+        "recompute_beliefs gave a claim whose only BBA is inadmissible a cache it never \
+         had: {after:?} ({report})"
+    );
+    assert_eq!(report["errors"], serde_json::json!([]), "{report}");
+    assert_eq!(
+        (&report["claims_recomputed"], &report["frame_writes"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "KNOWN RESIDUAL changed (the tool counts a frame whose fold emptied without a write); \
+         update this pin with the fix: {report}"
+    );
 }
 
 /// Not every BBA is inadmissible: the claim keeps an admissible input on
@@ -310,9 +436,18 @@ async fn an_admissible_input_on_another_frame_is_not_vacated(pool: PgPool) {
 
     recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
     let after = cache(&pool, claim).await;
-    assert!(
-        !is_vacuous(&after, w.binary) && after.0.is_some(),
-        "a claim with an admissible BBA on another frame was vacated: {after:?}"
+    // KNOWN RESIDUAL (R-71), not intended behaviour: the value kept here was
+    // folded from the now-hidden evidence. The cache owner rule
+    // (`MassFunctionRepository::cache_owner_frame_for_claim`) still picks
+    // `binary_truth`, whose inputs are all inadmissible, over
+    // `claim_validity`, which has an admissible one, so the claim is neither
+    // vacated (R-80 is claim-wide) nor refolded from its admissible input.
+    // The owner rule should skip a frame whose inputs are all inadmissible.
+    // What R-80 pins here is only that it does not vacate such a claim and
+    // leaves its cache exactly as it was.
+    assert_eq!(
+        after, before,
+        "a claim with an admissible BBA on another frame must keep its cache unchanged"
     );
 }
 
@@ -336,5 +471,114 @@ async fn a_claim_without_a_cache_is_not_given_one(pool: PgPool) {
     assert!(
         after.0.is_none() && after.1.is_none() && after.2.is_none(),
         "a claim whose only BBA is inadmissible was given a cache it never had: {after:?}"
+    );
+}
+
+/// A GROUP claim (R-71): its evidence is in its own group (admissible, the
+/// cache folds it), then moves to ANOTHER group. Recomputed by a member of the
+/// claim's group, on the application role, the cache is vacated. The R-80
+/// reads are spliced with the member's viewer, so this is where a splice that
+/// lost the member's group would leave the stale value.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_claim_whose_evidence_moves_to_another_group_is_vacated(pool: PgPool) {
+    let w = world(&pool, "r80-group").await;
+    let (outsider, other_group) = fixture::seed_agent_with_group(&pool, "r80-group-other").await;
+    let claim =
+        fixture::seed_group_claim(&pool, w.member, w.group, "r80 group claim narrowed").await;
+    let ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    store(&pool, claim, w.binary, w.member, ev, 0.8).await;
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let stale = cache(&pool, claim).await;
+    assert!(
+        stale.0.is_some_and(|b| b > 0.55) && stale.6.is_some(),
+        "PREMISE: the own-group evidence's fold is cached ({stale:?})"
+    );
+
+    hide(&pool, ev, other_group, outsider).await;
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let after = cache(&pool, claim).await;
+    assert!(
+        is_vacuous(&after, w.binary),
+        "a group claim whose every BBA cites another group's evidence must be vacated when \
+         a member recomputes it; it left {after:?} (stale value {stale:?})"
+    );
+}
+
+/// The claim-wide gate on a GROUP claim: its `binary_truth` BBA cites another
+/// group's evidence, but its `claim_validity` BBA cites evidence in the
+/// claim's own group, which is admissible. Not every BBA is inadmissible, so
+/// the cache is left exactly as it was (the same R-71 owner-rule residual as
+/// `an_admissible_input_on_another_frame_is_not_vacated`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_claim_with_own_group_input_elsewhere_is_not_vacated(pool: PgPool) {
+    let w = world(&pool, "r80-group-own").await;
+    let (outsider, other_group) =
+        fixture::seed_agent_with_group(&pool, "r80-group-own-other").await;
+    let validity =
+        resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
+            .await
+            .expect("claim_validity");
+    let claim =
+        fixture::seed_group_claim(&pool, w.member, w.group, "r80 group claim own input").await;
+    let own_ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    store(&pool, claim, validity, w.member, own_ev, 0.7).await;
+    let moved_ev = fixture::seed_evidence(&pool, claim, "document").await;
+    store(&pool, claim, w.binary, w.member, moved_ev, 0.9).await;
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let before = cache(&pool, claim).await;
+    assert!(
+        before.0.is_some() && before.5 == Some(w.binary),
+        "PREMISE: binary_truth owns a filled cache ({before:?})"
+    );
+
+    hide(&pool, moved_ev, other_group, outsider).await;
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let after = cache(&pool, claim).await;
+    assert_eq!(
+        after, before,
+        "a group claim with an own-group BBA on another frame must keep its cache unchanged"
+    );
+}
+
+/// A COMPOUND (an in-force `decomposes_to` out-edge to a current leaf) is
+/// never vacated: its cache is not a fold of its own BBAs. Driven through
+/// `recompute_claim_belief_on_frame`, the named-frame writer behind
+/// `auto_wire_ds_for_edge`, MCP `submit_ds_evidence` and REST
+/// `POST /api/v1/frames/:id/evidence`, which (unlike the cache owner rule)
+/// does not itself skip compounds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compound_whose_every_bba_is_inadmissible_keeps_its_cache(pool: PgPool) {
+    let w = world(&pool, "r80-compound").await;
+    let compound = fixture::seed_public_claim(&pool, w.author, "r80 compound").await;
+    let leaf = fixture::seed_public_claim(&pool, w.author, "r80 compound leaf").await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(compound)
+    .bind(leaf)
+    .execute(&pool)
+    .await
+    .expect("decompose the compound");
+    let ev = fixture::seed_evidence(&pool, compound, "observation").await;
+    store(&pool, compound, w.binary, w.author, ev, 0.8).await;
+    let stale = stale_on(w.binary);
+    restore(&pool, compound, &stale).await;
+    hide(&pool, ev, w.group, w.member).await;
+
+    let scoped = app_role(&pool).await;
+    let mut tx = scoped
+        .begin_as(&w.member_viewer)
+        .await
+        .expect("stamped app session");
+    recompute_claim_belief_on_frame(&mut tx, &w.member_viewer, compound, w.binary)
+        .await
+        .expect("recompute the compound's binary frame on the application role");
+    tx.commit().await.expect("commit");
+
+    assert_eq!(
+        cache(&pool, compound).await,
+        stale,
+        "a compound's cache must not be vacated (it is not a fold of its own BBAs)"
     );
 }
