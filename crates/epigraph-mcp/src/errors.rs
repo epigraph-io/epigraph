@@ -575,15 +575,29 @@ mod tests {
     /// not, and neither is its `?`-converted form (the test above).
     #[test]
     fn a_repo_authored_refusal_passes_and_a_bare_protocol_error_does_not() {
-        let designed = internal_error(epigraph_db::DbError::Refused {
-            kind: epigraph_db::RefusalKind::State,
-            message: "mark_duplicate: canonical c is not current; refusing".to_string(),
-        });
-        assert_eq!(designed.code, ErrorCode::INTERNAL_ERROR);
-        assert_eq!(
-            designed.message,
-            "mark_duplicate: canonical c is not current; refusing"
-        );
+        // Every kind passes as written (operator ruling R-55 keeps the #686
+        // passthrough for a refusal of any kind; the kind is not appended).
+        for (kind, message) in [
+            (
+                epigraph_db::RefusalKind::Input,
+                "mark_duplicate: dup == canonical",
+            ),
+            (
+                epigraph_db::RefusalKind::Authority,
+                "FA04: canonical c is not public and this session cannot write it",
+            ),
+            (
+                epigraph_db::RefusalKind::State,
+                "mark_duplicate: canonical c is not current; refusing",
+            ),
+        ] {
+            let designed = internal_error(epigraph_db::DbError::Refused {
+                kind,
+                message: message.to_string(),
+            });
+            assert_eq!(designed.code, ErrorCode::INTERNAL_ERROR, "{kind:?}");
+            assert_eq!(designed.message, message, "{kind:?}");
+        }
 
         let bare = internal_error(sqlx::Error::Protocol(
             "Check constraint chk_secret_7a1 violated".to_string(),
