@@ -763,3 +763,91 @@ async fn a_database_refusal_of_the_removal_is_a_403_on_the_application_role(pool
             .expect("group");
     assert!(!marked, "no re-key mark committed");
 }
+
+/// `(reseal_required_at IS NOT NULL, epoch 0 status)` of `group`, read on the
+/// superuser pool; usable when the target has no membership row at all. A
+/// keyless (verb-made) group has no epoch row: `None`.
+async fn group_mark_and_epoch(pool: &PgPool, group: Uuid) -> (bool, Option<String>) {
+    let marked: bool =
+        sqlx::query_scalar("SELECT reseal_required_at IS NOT NULL FROM groups WHERE id = $1")
+            .bind(group)
+            .fetch_one(pool)
+            .await
+            .expect("group");
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM group_key_epochs WHERE group_id = $1 AND epoch = 0")
+            .bind(group)
+            .fetch_optional(pool)
+            .await
+            .expect("epoch");
+    (marked, status)
+}
+
+/// A removal that revokes nothing marks nothing, on the application role and
+/// on a group with NO prior mark (the mark is COALESCEd and no rotation clears
+/// it, so a stray one would be a permanent false re-key obligation).
+///
+/// The removal takes the re-key mark BEFORE the guarded revoke (so an admin
+/// removing itself is still an admin when the mark is decided) and undoes it
+/// with a rollback to a savepoint when the guard revokes nothing. The route
+/// commits its transaction before it maps the outcome to 409 / 404, so that
+/// rollback is the only thing keeping the mark out of the committed state:
+/// here the sole admin removing itself is refused 409 (`LastAdmin`);
+/// [`a_non_member_removal_marks_nothing_on_the_application_role`] is the 404
+/// (`NotAMember`) half.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_last_admin_refusal_marks_nothing_on_the_application_role(pool: PgPool) {
+    let creator = seed_agent(&pool, "323773fe-l-creator").await;
+    let sole = seeded_group(&pool, creator, "323773fe-l-sole").await;
+    assert_eq!(
+        removal_state(&pool, sole, creator).await,
+        (false, false, "active".to_string()),
+        "fixture: a live sole admin, no re-key obligation, epoch 0 active"
+    );
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{sole}/members/{creator}"),
+        creator,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "the last admin stays: {body}");
+    assert_eq!(
+        removal_state(&pool, sole, creator).await,
+        (false, false, "active".to_string()),
+        "LastAdmin: still live, no re-key mark, epoch still active"
+    );
+}
+
+/// The `NotAMember` half of
+/// [`a_last_admin_refusal_marks_nothing_on_the_application_role`]: an admin
+/// removing an agent with no membership gets 404, and the rollback to the
+/// savepoint keeps the mark the removal took out of the committed state.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_member_removal_marks_nothing_on_the_application_role(pool: PgPool) {
+    let admin = seed_agent(&pool, "323773fe-l-admin").await;
+    let stranger = seed_agent(&pool, "323773fe-l-stranger").await;
+    let group = seeded_group(&pool, admin, "323773fe-l-other").await;
+    let roster_before = live_roster(&pool, group).await;
+    assert_eq!(
+        group_mark_and_epoch(&pool, group).await,
+        (false, Some("active".to_string())),
+        "fixture: no re-key obligation, epoch 0 active"
+    );
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::DELETE,
+        &format!("/api/v1/groups/{group}/members/{stranger}"),
+        admin,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not a member: {body}");
+    assert_eq!(live_roster(&pool, group).await, roster_before);
+    assert_eq!(
+        group_mark_and_epoch(&pool, group).await,
+        (false, Some("active".to_string())),
+        "NotAMember: no re-key mark, epoch still active"
+    );
+}
