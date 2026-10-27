@@ -8,7 +8,8 @@
 //! * `backfill_factors::EDGE_QUERY` (the agent an edge factor is wired under);
 //! * the operator's edge writer (`tables::fetch_attached`, read by
 //!   `reown-claims --derived keep-writer` and its spill report, and by
-//!   `restrict-claims`).
+//!   `restrict-claims`), and `restrict-claims`' read of edges with an
+//!   EVIDENCE endpoint (`restrict::fetch_evidence_edges`).
 //!
 //! The fixture's edge is signed by a third agent that authored neither
 //! endpoint, so the old reading returns the signer and the new one the author.
@@ -124,6 +125,92 @@ async fn the_operator_reads_an_edges_writer_as_its_source_author(pool: PgPool) {
         edge.writer,
         Some(fx.author),
         "the operator read the edge's signer {} as its writer",
+        fx.signer
+    );
+}
+
+/// An evidence row attached to `claim`.
+async fn evidence(pool: &PgPool, claim: Uuid, text: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO evidence (id, claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, $2, 'document', $3, $4)",
+    )
+    .bind(id)
+    .bind(claim)
+    .bind(epigraph_crypto::ContentHasher::hash(text.as_bytes()).as_slice())
+    .bind(text)
+    .execute(pool)
+    .await
+    .expect("seed evidence");
+    id
+}
+
+/// An edge between `(source_type, source)` and `(target_type, target)`,
+/// attested by `signer` (a placeholder signature, never verified here).
+async fn signed_node_edge(
+    pool: &PgPool,
+    (source_type, source): (&str, Uuid),
+    (target_type, target): (&str, Uuid),
+    signer: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            signer_id, signature) \
+         VALUES ($1, $2, $3, $4, $5, 'supports', $6, decode(repeat('cd', 64), 'hex'))",
+    )
+    .bind(id)
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(target_type)
+    .bind(signer)
+    .execute(pool)
+    .await
+    .expect("seed signed node edge");
+    id
+}
+
+/// `restrict-claims`' evidence-endpoint edge read: a claim -> evidence edge's
+/// writer is its source claim's author; an evidence -> claim edge has no
+/// source claim, so it is unattributed (`None`, it follows the claim). Never
+/// the third agent that signed both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn restrict_reads_an_evidence_edges_writer_as_its_source_author(pool: PgPool) {
+    use epigraph_cli::operator::restrict::fetch_evidence_edges;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let fx = seed(&pool).await;
+    let other_author = agent(&pool).await;
+    let other = claim(&pool, other_author, "R-49: a claim the evidence supports").await;
+    let ev = evidence(&pool, fx.source, "R-49: evidence on the source claim").await;
+    let from_claim =
+        signed_node_edge(&pool, ("claim", fx.source), ("evidence", ev), fx.signer).await;
+    let from_evidence =
+        signed_node_edge(&pool, ("evidence", ev), ("claim", other), fx.signer).await;
+
+    let ev_claim: BTreeMap<Uuid, Uuid> = [(ev, fx.source)].into_iter().collect();
+    let in_set: BTreeSet<Uuid> = [fx.source].into_iter().collect();
+    let mut conn = pool.acquire().await.expect("conn");
+    let read = fetch_evidence_edges(&mut conn, &ev_claim, &in_set, &BTreeSet::new())
+        .await
+        .expect("fetch_evidence_edges");
+    let writer = |edge: Uuid| {
+        read.get(&("edges".to_string(), edge.to_string()))
+            .unwrap_or_else(|| panic!("calibration: edge {edge} is read: {:?}", read.keys()))
+            .writer
+    };
+    assert_eq!(
+        writer(from_claim),
+        Some(fx.author),
+        "restrict read the claim -> evidence edge's signer {} as its writer",
+        fx.signer
+    );
+    assert_eq!(
+        writer(from_evidence),
+        None,
+        "restrict read the evidence -> claim edge's signer {} as its writer",
         fx.signer
     );
 }

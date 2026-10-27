@@ -635,7 +635,17 @@ pub fn narrowed(prior: &Tenancy, ends_meet: Option<Tenancy>) -> Tenancy {
 /// `claims` is every claim of `ev_claim` the edge touches through an evidence
 /// endpoint, plus any claim endpoint in `in_set`; `neighbours` is any claim
 /// endpoint outside `in_set`.
-async fn fetch_evidence_edges(
+///
+/// Each row's `writer` is its SOURCE claim's author
+/// ([`super::tables::EDGE_WRITER_SQL`], ruling R-49), so an evidence-sourced
+/// edge is unattributed (`None`). Nothing in `restrict-claims` decides on that
+/// writer (it narrows an edge by its endpoints' meet, [`narrowed`]; only
+/// `reown-claims --derived keep-writer` reads `Attached::writer`); public for
+/// the R-49 reader test (`tests/edge_author_not_signer.rs`).
+///
+/// # Errors
+/// When the read fails.
+pub async fn fetch_evidence_edges(
     conn: &mut PgConnection,
     ev_claim: &BTreeMap<Uuid, Uuid>,
     in_set: &BTreeSet<Uuid>,
