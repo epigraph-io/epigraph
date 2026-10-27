@@ -2035,6 +2035,11 @@ restart.
   **Deploy order:** none against the binaries (it only admits writes 153
   refused); it may apply before or after any lower-numbered migration that
   does not re-body this function.
+  **Predeploy check:** `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  to_regprocedure('public.epigraph_claims_require_operator_binding()')` must
+  print `292b24b3dfb6b342f6f60d7868666236` (153's body). Any other value
+  means 185 refuses (`55000`, nothing changed) and the migration run stops
+  there, so later migrations in the same run do not apply either.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 

@@ -2696,6 +2696,10 @@ Run it before `123-undo.sql`.
 If migration 185 is applied (an armed supersede act bound on its writer,
 ruling R-85), run `docs/runbooks/185-undo.sql` first: it restores 153's body
 of the same function. 185 has no ordering constraint against the binaries.
+Before applying 185, check that `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+to_regprocedure('public.epigraph_claims_require_operator_binding()')` prints
+`292b24b3dfb6b342f6f60d7868666236` (153's body); over any other body 185
+refuses with `55000`, changes nothing, and stops the migration run.
 
 ## `epigraph-operator restrict-claims` — the audited admin privatization act (no migration)
 
