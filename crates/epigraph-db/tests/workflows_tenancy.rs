@@ -382,7 +382,8 @@ async fn only_a_writer_inserts_and_nobody_retenants_a_row(pool: PgPool) {
         Err("42501".into()),
         "a member cannot publish its group's row"
     );
-    // Re-owning a public row into another group the member writes.
+    // Re-owning a public row into another agent's group (which the member
+    // neither reads nor writes).
     let (_, other) = fixture::seed_agent_with_group(&pool, "wf-app-other").await;
     let mut tx = w.scoped.begin_as(&w.m).await.expect("stamped tx");
     let reown = sqlx::query("UPDATE workflows SET owner_group_id = $2 WHERE id = $1")
@@ -414,4 +415,246 @@ async fn only_a_writer_inserts_and_nobody_retenants_a_row(pool: PgPool) {
         ("group".into(), w.g),
         "nothing above changed the row's tenancy"
     );
+}
+
+/// `(visibility, owner group)` of each row, as the backfill decides it, for
+/// the shapes the first backfill test does not reach:
+///
+/// * a group step whose `executes` edge is RETRACTED still makes the plan the
+///   group's (a plan that was ever declared private stays private);
+/// * two groups owning one group target each: the lowest group id;
+/// * a level stored as text the readers accept (`"+02"`, `" 2"`) counts as a
+///   step;
+/// * a public plan is owned by the group owning its EARLIEST public target,
+///   by edge creation time (inserted here in the other order, with the later
+///   edge holding the lower id).
+#[sqlx::test(migrations = false)]
+async fn migration_183_backfill_counts_retracted_edges_and_breaks_ties_by_rule(pool: PgPool) {
+    migrate(&pool, &up_to(182)).await;
+    let (a, g) = fixture::seed_agent_with_group(&pool, "wf-rule-a").await;
+    let (b, h) = fixture::seed_agent_with_group(&pool, "wf-rule-b").await;
+
+    let retracted = legacy_workflow(&pool, "wf-retracted").await;
+    executes(&pool, retracted, claim(&pool, a, 2, "public", g).await).await;
+    let private_step = claim(&pool, a, 2, "group", g).await;
+    executes(&pool, retracted, private_step).await;
+    let n = sqlx::query(
+        "UPDATE edges SET valid_to = now() \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+    )
+    .bind(retracted)
+    .bind(private_step)
+    .execute(&pool)
+    .await
+    .expect("retract the private step's edge")
+    .rows_affected();
+    assert_eq!(n, 1, "fixture: the private step's edge is retracted");
+
+    let tie = legacy_workflow(&pool, "wf-tie").await;
+    executes(&pool, tie, claim(&pool, a, 2, "group", g).await).await;
+    executes(&pool, tie, claim(&pool, b, 2, "group", h).await).await;
+
+    let mut text_levels = Vec::new();
+    for (i, level) in ["\"+02\"", "\" 2\""].into_iter().enumerate() {
+        let wf = legacy_workflow(&pool, &format!("wf-text-level-{i}")).await;
+        executes(&pool, wf, claim(&pool, a, 2, "public", g).await).await;
+        executes(
+            &pool,
+            wf,
+            claim_with_level(&pool, a, level, "group", g).await,
+        )
+        .await;
+        text_levels.push(wf);
+    }
+
+    let earliest = legacy_workflow(&pool, "wf-earliest").await;
+    let later = claim(&pool, a, 2, "public", g).await;
+    let older = claim(&pool, b, 2, "public", h).await;
+    executes_with(&pool, Uuid::from_u128(1), earliest, later, 0).await;
+    executes_with(&pool, Uuid::from_u128(2), earliest, older, 600).await;
+
+    migrate(&pool, &MIGRATOR).await;
+
+    // One comparison, so a run that breaks several rules shows each of them.
+    let group = |g: Uuid| ("group".to_string(), g);
+    assert_eq!(
+        (
+            tenancy(&pool, retracted).await,
+            tenancy(&pool, tie).await,
+            tenancy(&pool, text_levels[0]).await,
+            tenancy(&pool, text_levels[1]).await,
+            tenancy(&pool, earliest).await,
+        ),
+        (
+            group(g),
+            group(g.min(h)),
+            group(g),
+            group(g),
+            ("public".to_string(), h),
+        ),
+        "(retracted private step -> group; tie -> lowest group id; level \"+02\" and \" 2\" \
+         count as steps; public plan -> its earliest target's group)"
+    );
+}
+
+/// A claim whose `properties.level` is the JSON value `level_json`.
+async fn claim_with_level(
+    pool: &PgPool,
+    agent: Uuid,
+    level_json: &str,
+    visibility: &str,
+    owner: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, properties) \
+         VALUES ($1, $2, $3, 0.8, $4, true, $5, $6, jsonb_build_object('level', $7::jsonb))",
+    )
+    .bind(id)
+    .bind(format!("workflow tenancy fixture {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(agent)
+    .bind(visibility)
+    .bind(owner)
+    .bind(level_json)
+    .execute(pool)
+    .await
+    .expect("seed claim with a text level");
+    id
+}
+
+/// An `executes` edge with id `id`, created `age_secs` seconds ago.
+async fn executes_with(pool: &PgPool, id: Uuid, workflow: Uuid, claim: Uuid, age_secs: i64) {
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            created_at) \
+         VALUES ($1, $2, 'workflow', $3, 'claim', 'executes', \
+                 now() - make_interval(secs => $4::float8))",
+    )
+    .bind(id)
+    .bind(workflow)
+    .bind(claim)
+    .bind(age_secs as f64)
+    .execute(pool)
+    .await
+    .expect("executes edge with id and age");
+}
+
+/// 183's backfill reads `claims` and `edges` under FORCEd row security, so it
+/// is correct only on a session that reads every row. Run by a table owner
+/// that is neither a superuser, nor BYPASSRLS, nor a maintenance session, the
+/// migration refuses before the backfill instead of making a private plan
+/// public; the same owner run as a maintenance session migrates and backfills
+/// the plan as its group's.
+#[sqlx::test(migrations = false)]
+async fn migration_183_refuses_a_session_that_cannot_read_every_row(pool: PgPool) {
+    use sqlx::{Connection, Executor};
+    migrate(&pool, &up_to(182)).await;
+    let (a, g) = fixture::seed_agent_with_group(&pool, "wf-guard").await;
+    let private = legacy_workflow(&pool, "wf-guard-private").await;
+    executes(&pool, private, claim(&pool, a, 2, "group", g).await).await;
+
+    for stmt in [
+        "CREATE ROLE wf183_owner NOLOGIN NOSUPERUSER NOBYPASSRLS",
+        "ALTER TABLE public.workflows OWNER TO wf183_owner",
+        "GRANT USAGE, CREATE ON SCHEMA public TO wf183_owner",
+        "GRANT SELECT ON public.claims, public.edges TO wf183_owner",
+        "GRANT SELECT, REFERENCES ON public.groups TO wf183_owner",
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO wf183_owner",
+    ] {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    const M183: &str = include_str!("../../../migrations/183_workflows_tenancy.sql");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let refused = {
+        let mut tx = conn.begin().await.expect("begin");
+        tx.execute("SET SESSION AUTHORIZATION wf183_owner")
+            .await
+            .expect("become the owner");
+        let r = sqlx::raw_sql(M183).execute(&mut *tx).await.map(|_| ());
+        let tenancy: Option<(String, Uuid)> = if r.is_ok() {
+            sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+                .bind(private)
+                .fetch_optional(&mut *tx)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        drop(tx);
+        r.map(|()| tenancy)
+    };
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    match refused {
+        Err(e) => assert!(
+            e.to_string().contains("183: run as the maintenance role"),
+            "refused for the guard's reason: {e}"
+        ),
+        Ok(t) => panic!(
+            "183 ran on a session that cannot read every row; the private plan's row became \
+             {t:?}"
+        ),
+    }
+
+    sqlx::query("GRANT epigraph_maintenance TO wf183_owner")
+        .execute(&pool)
+        .await
+        .expect("make the owner a maintenance session");
+    let mut tx = conn.begin().await.expect("begin");
+    tx.execute("SET SESSION AUTHORIZATION wf183_owner")
+        .await
+        .expect("become the owner");
+    sqlx::raw_sql(M183)
+        .execute(&mut *tx)
+        .await
+        .expect("a maintenance session migrates");
+    tx.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    let t: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(private)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("row tenancy");
+    assert_eq!(
+        t,
+        ("group".into(), g),
+        "the maintenance run backfills the plan"
+    );
+    drop(tx);
+}
+
+/// The tenancy guard's positive control: a maintenance session re-tenants a
+/// row (publishes a group row, and re-owns it), which no application session
+/// can do (`only_a_writer_inserts_and_nobody_retenants_a_row`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_session_re_tenants_a_row(pool: PgPool) {
+    let w = app_world(&pool).await;
+    let (_, other) = fixture::seed_agent_with_group(&pool, "wf-app-retenant").await;
+    let private = w.private;
+    let r: Result<u64, String> =
+        fixture::as_role(&pool, "epigraph_maintenance", move |mut conn| async move {
+            let r = sqlx::query(
+                "UPDATE workflows SET visibility = 'public', owner_group_id = $2 WHERE id = $1",
+            )
+            .bind(private)
+            .bind(other)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| e.to_string());
+            (conn, r)
+        })
+        .await;
+    assert_eq!(r, Ok(1), "a maintenance session re-tenants the row");
+    assert_eq!(tenancy(&pool, private).await, ("public".into(), other));
 }
