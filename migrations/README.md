@@ -1755,6 +1755,10 @@ restart.
   (policy expressions compared with `harvester_fragments`'s own). Registered
   in every FORCE list (`epigraph_api::state::FORCE_PROTECTED_SET`,
   `locked_decisions.rs`, `rls_enforcement.rs`, `docs/runbooks/079-undo.sql`).
+  Its three triggers are a boot-check tier
+  (`epigraph_api::state::TENANCY_TRIGGERS_173`), required once either of its
+  two functions exists, so a dropped one refuses to serve
+  (`tenancy_trigger_boot_refusal.rs`).
   REWRITTEN IN PLACE: the earlier revision only declared the two tables
   exempt and was never applied to a deployed database; a throwaway database
   that applied it fails the checksum and must be recreated, not repaired.
