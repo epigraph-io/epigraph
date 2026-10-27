@@ -581,9 +581,14 @@ pub async fn remove_member(
 /// transaction, so nothing was changed. The writer-authority refusals the
 /// other write surfaces answer 403 ([`epigraph_db::DbError::is_write_authority_refusal`])
 /// keep their own mapping. Anything else is still a 500.
+///
+/// Logged at `warn`, with the database's message (server-side only): the same
+/// 42501 is also what a deploy fault looks like here (181's guarded `GRANT`
+/// no-opped, so EXECUTE on the mark is denied and every removal is a 403), and
+/// an operator alerting on warn must be able to tell that from a client denial.
 fn removal_db_error(e: epigraph_db::DbError, context: &str) -> ApiError {
     if crate::errors::db_is_insufficient_privilege(&e) {
-        tracing::info!(
+        tracing::warn!(
             target: "tenancy.scoped_write",
             error = %e,
             handler = "groups::remove_member",
