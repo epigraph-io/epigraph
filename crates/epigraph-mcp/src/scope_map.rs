@@ -99,6 +99,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
+    // The claim owner's twin of `POST /api/v1/challenges/:id/resolve`
+    // (ruling R-3): it writes the four resolution columns of a challenge
+    // through migration 168's definer, as the calling principal.
+    ("resolve_challenge", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
     ("decide_match_candidate", "claims:write"),
@@ -302,6 +306,9 @@ mod tests {
         assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
         assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
         assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+        // The claim owner's resolution of a challenge (R-3/R-13): the tool
+        // tests call it directly, past the router's scope check.
+        assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply

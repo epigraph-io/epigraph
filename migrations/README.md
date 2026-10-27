@@ -1698,6 +1698,31 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **170**: public `challenge_resolution_definer_only` (operator ruling R-13,
+  backlog c6e20f43). A challenge's resolution columns (`state`, `resolved_by`,
+  `resolved_at`, `resolution_details`) change only through 168's
+  `epigraph_resolve_challenge`, which stamps the real caller. Adds the invoker
+  guard `epigraph_challenge_resolution_guard()` (re-owned to
+  `epigraph_maintenance`, registered in `tenancy_backfill.rs`'s invoker
+  exemptions) on four ROW triggers: for an application session (not
+  114's `epigraph_session_is_privileged_writer()`), an UPDATE may only be the
+  CHALLENGER withdrawing its own UNRESOLVED challenge (`pending` /
+  `under_review` -> `withdrawn`, `challenger_id` = the session principal, the
+  other three columns unchanged), and an INSERT is born
+  `pending` with no resolver, time or details; anything else is refused
+  `CR07` (42501); `challenger_id` is the filer and fixed at filing (an
+  INSERT's must be the session principal, an UPDATE may not change it), else
+  `CR08` (42501); a DELETE is refused `CR09` (42501): the challenger retracts
+  by withdrawing, and no binary deletes a challenge on an application session
+  (the seal ceremony's delete runs on a maintenance connection). Closes the
+  forged-`resolved_by` gap 168 left: the outsider
+  owns its row, so 077 let it plain-UPDATE its own resolution columns. 168's
+  definer passes (its maintenance-owned frame reads as privileged), so R-14
+  (re-resolve, direct `pending` -> `accepted` / `rejected`, audited) is
+  unchanged. Pinned by `epigraph-db/tests/challenge_ownership.rs`. Undo: drop
+  the four triggers and the function. **Deploy order:** after 168; independent
+  of the binaries. **Applied to throwaway databases only, NOT to any deployed
+  database.**
 - **179**: public `role_binding_attached_agents`. A third mode for 165's
   role bindings: the role HOLDER plus the agents ATTACHED to the role (166's
   `role_agents`) only. Adds `group_role_bindings.attached_agents boolean NOT

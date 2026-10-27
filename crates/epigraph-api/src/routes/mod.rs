@@ -387,6 +387,10 @@ pub fn create_router_with_extensions(
             post(challenge::submit_challenge),
         )
         .route(
+            "/api/v1/challenges/:id/resolve",
+            post(challenge::resolve_challenge),
+        )
+        .route(
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
         )

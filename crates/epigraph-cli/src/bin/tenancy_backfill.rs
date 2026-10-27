@@ -3436,6 +3436,10 @@ mod definer_register_tests {
         // own transaction-local setting; EXECUTE is the maintenance role's
         // alone.
         "epigraph_team_group_actor",
+        // 170 (ruling R-13): the challenge resolution-column guard, read as
+        // the caller (or the maintenance owner of 168's resolution definer,
+        // which is what lets that definer through).
+        "epigraph_challenge_resolution_guard",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
