@@ -2024,6 +2024,11 @@ restart.
   '3s'`. Behaviour in `epigraph-db/tests/inherited_supersede_binds_the_actor.rs`
   (with the precondition and the rollback), HTTP
   `own_claim_authority_http.rs` and MCP `own_claim_authority_app_role.rs`.
+  The relief is keyed on the row's shape (a `BEFORE INSERT` trigger cannot
+  see the act edge the act writes after the claim), so
+  `epigraph-db/tests/inherited_successor_insert_lint.rs` pins that the only
+  non-test code inserting a claim that names `supersedes` is
+  `supersede_act_conn` and `evolve_step_conn` (which authors the caller).
   Undo: `docs/runbooks/185-undo.sql` (restores 153's body; run it before
   `153-undo.sql`). Slot: checked free on `main`, in every open PR, every
   remote branch and every local worktree (184 is held by an unpushed branch).
