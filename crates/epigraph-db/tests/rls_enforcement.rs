@@ -406,6 +406,8 @@ const PROTECTED: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
+    "harvester_sources",
+    "harvester_audit_reports",
 ];
 
 // ===========================================================================

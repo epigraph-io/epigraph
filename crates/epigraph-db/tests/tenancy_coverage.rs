@@ -31,12 +31,15 @@
 //! `public.tenancy_exempt`** with a stated residual. There is no third option
 //! and no silence.
 //!
-//! Since migration 173 (backlog 154efca2) the registry also holds the two FK
-//! neighbours of the manual addition `harvester_fragments` that no generator
-//! finds (`harvester_sources`, `harvester_audit_reports`).
+//! The two FK neighbours of the manual addition `harvester_fragments` that no
+//! generator finds (`harvester_sources`, `harvester_audit_reports`) are COVERED
+//! since migration 173 (ruling R-66, backlogs 90d7baf0 and 154efca2): both
+//! carry the tenancy columns and `harvester_fragments`'s row security, and
+//! neither keeps a registry row.
 //! `every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt` extends the
-//! covered-or-registered rule to that neighbourhood, and
-//! `the_registry_is_exactly_the_fourteen_measured_rows` pins the registry's
+//! covered-or-registered rule to that neighbourhood,
+//! `the_harvester_neighbours_carry_the_fragment_row_security` pins the posture,
+//! and `the_registry_is_exactly_the_twelve_measured_rows` pins the registry's
 //! whole membership, so a row for any other table is a visible diff.
 //!
 //! # Deliberately non-macro
@@ -394,7 +397,8 @@ async fn tenancy_exempt_rows_state_a_residual(pool: PgPool) {
 /// the harvester pipeline: no table in it has a `claim_id` except
 /// `harvester_claim_provenance`. Its FK neighbours are the rest of that
 /// pipeline, and two of them (`harvester_sources`, `harvester_audit_reports`)
-/// had no declared posture at all until migration 173 registered them. This
+/// had no declared posture at all until migration 173 gave them tenancy
+/// columns and row security (ruling R-66). This
 /// makes the rule apply to the neighbourhood, so a new pipeline table with
 /// neither tenancy columns nor a registry row fails here. `groups` is left out:
 /// it is the tenancy OWNER every tier-A row points at, not a derivation.
@@ -452,42 +456,72 @@ async fn every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt(pool: Pg
     );
 }
 
-/// Migration 173's two rows describe the tables as they are. Their residual
-/// says every application session reads every row and no application session
-/// writes one; if row security or a write grant arrives on either table, this
-/// fails until the row is rewritten in the same migration, which is the
-/// obligation 173's header states. Reviewed, not `PENDING`.
+/// Migration 173 (ruling R-66) gives both harvester neighbours the row
+/// security of the tier-A `harvester_fragments`, and this pins it as a
+/// COMPARISON with that table rather than a transcription: each table is
+/// FORCEd, and its `<t>_tenancy` policy (FOR ALL, permissive, read and write
+/// expressions) and `<t>_delete_owner` policy (RESTRICTIVE, FOR DELETE) have
+/// exactly the expressions `harvester_fragments`'s policies of the same names
+/// have. It also pins what 173 deliberately did not change: the application
+/// role reads both tables and writes neither (118 section 6).
+/// `harvester_tenancy.rs` is the behavioural half, as `epigraph_app`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_harvester_exemptions_describe_the_tables_as_they_are(pool: PgPool) {
+async fn the_harvester_neighbours_carry_the_fragment_row_security(pool: PgPool) {
+    async fn policy(
+        pool: &PgPool,
+        table: &str,
+        suffix: &str,
+    ) -> Option<(String, bool, String, String)> {
+        sqlx::query_as(
+            "SELECT p.polcmd::text, p.polpermissive, \
+                    coalesce(pg_get_expr(p.polqual, p.polrelid), '-'), \
+                    coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '-') \
+               FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+              WHERE c.relnamespace = 'public'::regnamespace AND c.relname = $1 \
+                AND p.polname = $1 || $2",
+        )
+        .bind(table)
+        .bind(suffix)
+        .fetch_optional(pool)
+        .await
+        .expect("policy read")
+    }
+
+    let control_tenancy = policy(&pool, "harvester_fragments", "_tenancy").await;
+    let control_delete = policy(&pool, "harvester_fragments", "_delete_owner").await;
+    assert!(
+        control_tenancy.is_some() && control_delete.is_some(),
+        "CALIBRATION: harvester_fragments lost its own policies, so the comparison is vacuous"
+    );
+
     for table in ["harvester_sources", "harvester_audit_reports"] {
-        let reviewed_by: Option<String> =
-            sqlx::query_scalar("SELECT reviewed_by FROM tenancy_exempt WHERE table_name = $1")
-                .bind(table)
-                .fetch_optional(&pool)
-                .await
-                .expect("registry read");
         assert_eq!(
-            reviewed_by.as_deref(),
-            Some("backlog 154efca2"),
-            "{table} carries 173's reviewed row"
+            policy(&pool, table, "_tenancy").await,
+            control_tenancy,
+            "{table}_tenancy must be harvester_fragments_tenancy's policy, for this table"
+        );
+        assert_eq!(
+            policy(&pool, table, "_delete_owner").await,
+            control_delete,
+            "{table}_delete_owner must be harvester_fragments_delete_owner's policy"
         );
 
-        let rls: bool = sqlx::query_scalar(
-            "SELECT relrowsecurity FROM pg_class \
+        let (rls, forced): (bool, bool) = sqlx::query_as(
+            "SELECT relrowsecurity, relforcerowsecurity FROM pg_class \
               WHERE relnamespace = 'public'::regnamespace AND relname = $1",
         )
         .bind(table)
         .fetch_one(&pool)
         .await
-        .expect("relrowsecurity");
+        .expect("row security flags");
         assert!(
-            !rls,
-            "{table} gained row security: rewrite its tenancy_exempt residual"
+            rls && forced,
+            "{table}: row security must be ENABLED and FORCEd"
         );
 
         // The application role is created by the migrations themselves (118),
-        // so its absence is a broken harness, not a reason to skip the half of
-        // this test that reads the grants.
+        // so its absence is a broken harness, not a reason to skip the grant
+        // half of this test.
         let app_role: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app')",
         )
@@ -510,25 +544,26 @@ async fn the_harvester_exemptions_describe_the_tables_as_they_are(pool: PgPool) 
         .expect("privileges");
         assert!(
             select,
-            "{table}: the residual says the application role reads it"
+            "{table}: the application role reads it, under row security"
         );
         assert!(
             !write,
-            "{table}: the reason says the application role writes nothing"
+            "{table}: the application role writes nothing (118 section 6)"
         );
     }
 }
 
 /// The registry's full membership, pinned (backlog 154efca2). 069 scoped the
-/// registry to the generated protected set and seeded twelve rows; 173 added
-/// the two FK neighbours of the manual tier-A addition `harvester_fragments`,
-/// which no generator finds. `the_generated_exemptions_are_exactly_the_nine_
-/// measured` sees only generator-found tables and
+/// registry to the generated protected set and seeded twelve rows. The two FK
+/// neighbours of the manual tier-A addition `harvester_fragments`, which no
+/// generator finds, are covered by migration 173 (ruling R-66) and carry no
+/// row. `the_generated_exemptions_are_exactly_the_nine_measured` sees only
+/// generator-found tables and
 /// `every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt` only that
 /// neighbourhood, so without this pin a row for any OTHER table would pass
 /// every test. Adding one is a diff to this constant, which a reviewer reads.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_registry_is_exactly_the_fourteen_measured_rows(pool: PgPool) {
+async fn the_registry_is_exactly_the_twelve_measured_rows(pool: PgPool) {
     const REGISTRY: &[&str] = &[
         "agents",
         "alt_set_decisions",
@@ -539,8 +574,6 @@ async fn the_registry_is_exactly_the_fourteen_measured_rows(pool: PgPool) {
         "claim_version_encryption",
         "counterfactual_scenarios",
         "experiments",
-        "harvester_audit_reports",
-        "harvester_sources",
         "jobs",
         "learning_events",
         "match_candidates",
@@ -831,7 +864,7 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
     // Measured BEFORE the replay as well as pinned: the replay must not change
     // the count, and the count itself is the registry's cardinality at head
-    // (069's twelve plus 173's two).
+    // (069's twelve; 173 covers the two harvester neighbours and adds none).
     let exempt_before: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM tenancy_exempt")
         .fetch_one(&mut *tx)
         .await
@@ -909,9 +942,10 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
         "the 069 seed must not double on replay"
     );
     assert_eq!(
-        exempt, 14,
-        "069 seeds twelve rows and 173 adds two; a new tenancy_exempt row anywhere is a \
-         visible diff to this number and to the_registry_is_exactly_the_fourteen_measured_rows"
+        exempt, 12,
+        "069 seeds twelve rows and 173 covers the two tables it once registered; a new \
+         tenancy_exempt row anywhere is a visible diff to this number and to \
+         the_registry_is_exactly_the_twelve_measured_rows"
     );
 }
 

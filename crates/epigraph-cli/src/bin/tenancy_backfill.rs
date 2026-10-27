@@ -2018,6 +2018,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
+    // 173 (ruling R-66), the audit report's tenancy stamp from its fragment.
+    // Under a non-member owner its read of the FORCEd `harvester_fragments` is
+    // filtered, so a report on a private fragment raises 23503 (loud).
+    ("epigraph_audit_report_inherit_tenancy", 173),
+    // 173, the reports-follow-their-fragment re-stamp. Only a privileged
+    // session changes a fragment's owner (115's owner guard; 115 limits 089's
+    // stamp to bypass sessions), and the reports' owner guard and row
+    // security admit that session itself, so a non-member owner does not
+    // stop a re-own. A visibility-only change from an application session
+    // (arm (d)) runs the report UPDATE under that session's row security;
+    // not measured under a non-member owner.
+    ("epigraph_fragment_audit_reports_follow", 173),
     // 180, legacy fleet parents. The rule reads `agents` (FORCEd, but its
     // SELECT policy admits every row), `operator_links` (FORCEd; read only
     // by a maintenance session or a maintenance-owned definer frame) and

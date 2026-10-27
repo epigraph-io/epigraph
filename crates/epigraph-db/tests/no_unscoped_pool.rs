@@ -613,8 +613,8 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          every server is built through with_scoped_pool and takes the stamped write_as branch, \
          and a claim written by an unstamped application session is refused by migration 122 \
          once armed (OPL01), so the fallback cannot fail open in production. The third site in \
-         assert_tenancy_triggers_armed is migration 089's marker probe, added with \
-         TENANCY_TRIGGERS_089: it reads pg_proc, which carries no tenancy columns and no rows a \
+         assert_tenancy_triggers_armed is the marker probe of the migration-gated tiers, \
+         added with TENANCY_TRIGGERS_089 and since shared by TENANCY_TRIGGERS_173: it reads pg_proc, which carries no tenancy columns and no rows a \
          Viewer could filter. VERIFIED BY CALL GRAPH, not \
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \

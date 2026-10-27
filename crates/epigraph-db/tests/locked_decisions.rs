@@ -198,11 +198,12 @@
 //!   generators, carries neither `visibility` nor `owner_group_id`, and gets no
 //!   `tenancy_exempt` row (the registry is for relations the generators DO
 //!   find; `migration_068_and_069_apply_twice` pinned its cardinality at 12).
-//!   AMENDED by migration 173 (backlog 154efca2): the registry now also holds
-//!   the two FK neighbours of the manual tier-A addition `harvester_fragments`
+//!   AMENDED by migration 173 (ruling R-66, backlog 154efca2): the two FK
+//!   neighbours of the manual tier-A addition `harvester_fragments`
 //!   (`harvester_sources`, `harvester_audit_reports`), which no generator
-//!   finds; the cardinality pin is 14 and
-//!   `tenancy_coverage.rs::the_registry_is_exactly_the_fourteen_measured_rows`
+//!   finds, are covered (tenancy columns and `harvester_fragments`'s row
+//!   security) and hold no registry row; the cardinality pin stays 12 and
+//!   `tenancy_coverage.rs::the_registry_is_exactly_the_twelve_measured_rows`
 //!   pins the membership. `webhook_subscriptions` is still not in it.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
@@ -408,8 +409,7 @@
 //!   almost certainly a leak being annotated rather than fixed.
 //! * **No tenancy column.** 086 adds no column to any relation, adds no table,
 //!   and therefore no `tenancy_exempt` row — `tenancy_coverage.rs`'s
-//!   cardinality-12 pin is untouched (14 since migration 173; see the PR-10
-//!   amendment above).
+//!   cardinality-12 pin is untouched.
 //! * **No route moved** between the `public` and `protected` chains, and no
 //!   route was added or removed. `public_router_allowlist.rs` and
 //!   `viewer_route_table_lint.rs` are untouched; PR-24 changes no handler
@@ -454,8 +454,7 @@
 //!   literal in one repo function, plus one new test and doc corrections. Zero
 //!   `pg_policy` rows read, added, removed or edited; no handler signature
 //!   changes; `public_router_allowlist.rs` and `viewer_route_table_lint.rs` are
-//!   untouched; `tenancy_coverage.rs`' cardinality-12 pin is untouched (14
-//!   since migration 173).
+//!   untouched; `tenancy_coverage.rs`' cardinality-12 pin is untouched.
 //! * **D1 — the residual is UNCHANGED IN KIND and WIDER IN BLAST RADIUS.**
 //!   Degraded definer authority is still fail-OPEN, and here it is worse than it
 //!   is for `hidden_claim_ids`. The mechanism is the same: if the frame loses
@@ -553,8 +552,7 @@
 //! * **No tenancy column.** `ownership` carried none — it is not in migration
 //!   062's `tier_a`, has no `claim_id` and no FK to `claims`, so it is in
 //!   neither §2.4 generator and needs no `tenancy_exempt` row. That registry's
-//!   cardinality-12 pin in `tenancy_coverage.rs` is untouched (14 since
-//!   migration 173).
+//!   cardinality-12 pin in `tenancy_coverage.rs` is untouched.
 //!   `schema_contract.rs` never referenced `ownership`; the three shapes it pins
 //!   (062's `tenancy_transcription_log`, `tenancy_backfill_progress`,
 //!   `tenancy_undeclared_writes`) all SURVIVE 084.
@@ -1918,16 +1916,25 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // the stamp's effect is independent of who writes the provenance row; that is
     // a separate question, recorded as finding F-089-F in
     // docs/tenancy/progress.json with its location and owner.
+    // 23 SINCE MIGRATION 173 (ruling R-66), AND ARM (c)'s TABLE SET DID NOT
+    // MOVE EITHER. 173's `harvester_audit_reports_inherit_tenancy` stamps an
+    // audit report with its FRAGMENT's tenancy at INSERT (a report has no
+    // `claim_id`), and `harvester_fragments_audit_reports_inherit_tenancy`
+    // re-stamps the reports when the fragment's pair changes; both are named
+    // inside the pattern so that a disabled one is visible here like every
+    // other stamping trigger.
     assert_eq!(
         rows.len(),
-        21,
-        "expected 21 tenancy triggers — 3 named (claims_require_tenancy, \
+        23,
+        "expected 23 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
-         089's harvester_claim_provenance_fragment_inherit_tenancy. Found {}: \
+         089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
+         migration 173's harvester_audit_reports_inherit_tenancy and \
+         harvester_fragments_audit_reports_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or 089's trigger is gone, which is a D1 change and needs a \
-         decision, not a silent edit.",
+         moved or an 089 or 173 trigger is gone, which is a D1 change and \
+         needs a decision, not a silent edit.",
         rows.len()
     );
 
@@ -1948,12 +1955,14 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .fetch_all(&pool)
     .await
     .expect("read pg_trigger for the PR-16 set");
+    // 26 SINCE MIGRATION 173: `harvester_sources_require_tenancy`, a seventh
+    // parentless root on 074's root body.
     assert_eq!(
         pr16.len(),
-        25,
-        "expected 25 after migration 074: 24 *_require_tenancy (claims, the 17 \
-         claim-derived tables, the 6 parentless roots) plus claims_block_widening. \
-         Found {}: {pr16:?}",
+        26,
+        "expected 26: after migration 074, 24 *_require_tenancy (claims, the 17 \
+         claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
+         migration 173 adds harvester_sources_require_tenancy. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2311,6 +2320,8 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
+    "harvester_sources",
+    "harvester_audit_reports",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2452,10 +2463,14 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     .expect("tier_a probe")
     .into_iter()
     .collect();
+    // 27 SINCE MIGRATION 173 (ruling R-66): 062's 25 plus the two harvester
+    // neighbours `harvester_sources` and `harvester_audit_reports`, which 173
+    // gives both tenancy columns and FORCEs itself, on 078's precedent.
     assert_eq!(
         tier_a.len(),
-        25,
-        "migration 062's tier_a is 25 relations; got {}: {tier_a:?}",
+        27,
+        "migration 062's tier_a is 25 relations and 173 adds the two harvester neighbours; \
+         got {}: {tier_a:?}",
         tier_a.len()
     );
 

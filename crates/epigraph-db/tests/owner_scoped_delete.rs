@@ -2051,9 +2051,11 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .fetch_all(&pool)
     .await
     .expect("catalog");
+    // 26 since migration 173 (ruling R-66): 115's 24 plus the two harvester
+    // neighbours, which 173 gives 115's policy and guard.
     assert_eq!(
         rows.len(),
-        24,
+        26,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2089,7 +2091,7 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .fetch_all(&pool)
     .await
     .expect("delete policy quals");
-    assert_eq!(quals.len(), 24, "{quals:?}");
+    assert_eq!(quals.len(), 26, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),
@@ -2237,7 +2239,10 @@ async fn every_unscoped_fk_cascade_into_tier_a_is_listed(pool: PgPool) {
     // experiment_entities -> experiment_entity_mentions / experiment_triples,
     // graph_neighborhoods -> claim_neighborhood_membership, and
     // harvester_sources -> harvester_fragments. Only the cluster
-    // materialization remains reachable.
+    // materialization remains reachable. (Since migration 173
+    // `harvester_sources` also carries 115's restrictive DELETE policy, and
+    // `harvester_fragments -> harvester_audit_reports` is a cascade between
+    // two tables that both do, so neither pair can appear here.)
     const ACCEPTED: &[(&str, &str)] = &[("graph_clusters", "claim_cluster_membership")];
     let pairs: Vec<(String, String)> = sqlx::query_as(
         "SELECT DISTINCT pc.relname::text, cc.relname::text \
