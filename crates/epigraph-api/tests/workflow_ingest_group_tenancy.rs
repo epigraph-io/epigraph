@@ -1666,3 +1666,350 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
         "the public re-ingest wrote nothing"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Backlog c0ab097a (2), ruling R-74: a workflow row has the plan's tenancy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `(use_count, number of behavioral_executions rows)` of `workflow_id`.
+async fn outcome_written(pool: &PgPool, workflow_id: Uuid) -> (Option<i64>, i64) {
+    let use_count: Option<i64> =
+        sqlx::query_scalar("SELECT (metadata->>'use_count')::bigint FROM workflows WHERE id = $1")
+            .bind(workflow_id)
+            .fetch_one(pool)
+            .await
+            .expect("metadata");
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM behavioral_executions WHERE workflow_id = $1")
+            .bind(workflow_id)
+            .fetch_one(pool)
+            .await
+            .expect("row count");
+    (use_count, rows)
+}
+
+/// A public generation 0 (`W1`) and a generation 1 (`W2`) declared into the
+/// operator group `og`, where W2 keeps W1's step 0 text and adds a step of its
+/// own: W2's plan has a public step (the one it shares with W1, through a
+/// public `executes` edge) and a group-private one. The fixture-shape
+/// assertions pin that mixed plan.
+async fn reused_step_generations(w: &World, pool: &PgPool, name: &str) -> (Uuid, Uuid) {
+    let h = token(w.h, WRITE_SCOPES);
+    let gen0 = w
+        .api
+        .ingest_ok(&h, &extraction(name, 0, &[&["acme reused-step op"]]))
+        .await;
+    let w1 = uuid_of(&gen0["workflow_id"]);
+    let mut gen1_body = extraction(name, 1, &[&["acme reused-step op"], &["acme private op"]]);
+    gen1_body["source"]["parent_canonical_name"] = json!(name);
+    let gen1 = w.api.ingest_ok(&h, &declared(gen1_body, w.og, None)).await;
+    let w2 = uuid_of(&gen1["workflow_id"]);
+
+    let shared_steps: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT c.id, c.visibility::text, e2.visibility::text \
+           FROM edges e1 JOIN edges e2 ON e2.target_id = e1.target_id \
+           JOIN claims c ON c.id = e1.target_id \
+          WHERE e1.source_id = $1 AND e2.source_id = $2 \
+            AND e1.relationship = 'executes' AND e2.relationship = 'executes' \
+            AND (c.properties->>'level')::int = 2",
+    )
+    .bind(w1)
+    .bind(w2)
+    .fetch_all(pool)
+    .await
+    .expect("shared steps");
+    assert_eq!(
+        shared_steps.len(),
+        1,
+        "fixture shape: W1 and W2 share step 0: {shared_steps:?}"
+    );
+    assert_eq!(
+        (shared_steps[0].1.as_str(), shared_steps[0].2.as_str()),
+        ("public", "public"),
+        "fixture shape: the shared step and W2's executes edge to it are public: {shared_steps:?}"
+    );
+    let own_private: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND (c.properties->>'level')::int = 2 \
+            AND c.visibility::text = 'group' AND c.owner_group_id = $2",
+    )
+    .bind(w2)
+    .bind(w.og)
+    .fetch_one(pool)
+    .await
+    .expect("W2's own steps");
+    assert_eq!(
+        own_private, 1,
+        "fixture shape: W2's new step is group-private"
+    );
+    (w1, w2)
+}
+
+/// The outcome-report body the REST tests send.
+fn outcome_body() -> Value {
+    json!({"success": true, "outcome_details": "probe", "step_executions": []})
+}
+
+/// Ruling R-74: the outcome-report gate decides on the PLAN's tenancy. A
+/// caller outside the group that W2 was declared into is refused with the
+/// unknown-id 404 and nothing is written, whatever of W2's plan it reads. The
+/// group's member reports on W2, and the non-member still reports on the
+/// public W1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_step_reused_by_a_private_generation_does_not_admit_a_non_member(pool: PgPool) {
+    let w = world(&pool).await;
+    let (w1, w2) = reused_step_generations(&w, &pool, "acme-reused-step-report").await;
+    let stranger = token(w.h2, WRITE_SCOPES);
+    let uri = |id: Uuid| format!("/api/v1/workflows/hierarchical/{id}/outcome");
+
+    let (status, out) = w
+        .api
+        .call(Method::POST, &uri(w2), &stranger, Some(&outcome_body()))
+        .await;
+    let (unknown_status, unknown_out) = w
+        .api
+        .call(
+            Method::POST,
+            &uri(Uuid::nil()),
+            &stranger,
+            Some(&outcome_body()),
+        )
+        .await;
+    assert_eq!(
+        (status, outcome_written(&pool, w2).await),
+        (StatusCode::NOT_FOUND, (None, 0)),
+        "a non-member of W2's group is refused and nothing is written: {out}"
+    );
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND, "{unknown_out}");
+    assert_eq!(
+        out.to_string().replace(&w2.to_string(), "<id>"),
+        unknown_out
+            .to_string()
+            .replace(&Uuid::nil().to_string(), "<id>"),
+        "the refusal is the unknown-id answer"
+    );
+
+    let (status, out) = w
+        .api
+        .call(
+            Method::POST,
+            &uri(w2),
+            &token(w.h, WRITE_SCOPES),
+            Some(&outcome_body()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "the group's member reports: {out}");
+    assert_eq!(outcome_written(&pool, w2).await, (Some(1), 0));
+
+    let (status, out) = w
+        .api
+        .call(Method::POST, &uri(w1), &stranger, Some(&outcome_body()))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a public plan stays reportable: {out}"
+    );
+    assert_eq!(outcome_written(&pool, w1).await, (Some(1), 0));
+}
+
+/// Both MCP entry points (`report_hierarchical_outcome` and
+/// `report_workflow_outcome`'s hierarchical branch), as `agent`, on
+/// `workflow_id`. Each call's result as `Ok(())` or `Err(message)`.
+async fn mcp_reports(
+    w: &World,
+    pool: &PgPool,
+    agent: Uuid,
+    workflow_id: Uuid,
+) -> Vec<Result<(), String>> {
+    let viewer = epigraph_db::Viewer::resolve(pool, agent)
+        .await
+        .expect("viewer");
+    let direct = epigraph_mcp::tools::workflow_hierarchical::report_hierarchical_outcome(
+        &w.c_server,
+        &viewer,
+        epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            workflow_id: workflow_id.to_string(),
+            success: true,
+            step_executions: Vec::new(),
+            outcome_details: "probe".to_string(),
+            quality: Some(0.9),
+            run_label: None,
+            goal_text: None,
+        },
+    )
+    .await;
+    let delegated = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &w.c_server,
+        &viewer,
+        epigraph_mcp::types::ReportWorkflowOutcomeParams {
+            workflow_id: workflow_id.to_string(),
+            success: true,
+            execution_log: Vec::new(),
+            outcome_details: "probe".to_string(),
+            quality: Some(0.9),
+            goal_text: None,
+        },
+        None,
+    )
+    .await;
+    [direct, delegated]
+        .into_iter()
+        .map(|r| {
+            r.map(|out| assert_ne!(out.is_error, Some(true), "{out:?}"))
+                .map_err(|e| e.message.replace(&workflow_id.to_string(), "<id>"))
+        })
+        .collect()
+}
+
+/// The MCP twin of
+/// [`a_public_step_reused_by_a_private_generation_does_not_admit_a_non_member`]:
+/// both MCP outcome tools refuse the non-member on W2 exactly as they refuse
+/// an unknown id, and write nothing; the member's reports and the
+/// non-member's reports on the public W1 are recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_mcp_a_public_step_reused_by_a_private_generation_does_not_admit_a_non_member(
+    pool: PgPool,
+) {
+    let w = world(&pool).await;
+    let (w1, w2) = reused_step_generations(&w, &pool, "acme-reused-step-mcp").await;
+
+    let refused = mcp_reports(&w, &pool, w.h2, w2).await;
+    let unknown = mcp_reports(&w, &pool, w.h2, Uuid::new_v4()).await;
+    assert!(
+        refused.iter().all(Result::is_err),
+        "a non-member of W2's group is refused on both tools: {refused:?}"
+    );
+    assert_eq!(
+        refused, unknown,
+        "each tool answers W2 exactly as it answers an unknown id"
+    );
+    assert_eq!(
+        outcome_written(&pool, w2).await,
+        (None, 0),
+        "a refused report writes nothing"
+    );
+
+    let member = mcp_reports(&w, &pool, w.h, w2).await;
+    assert!(
+        member.iter().all(Result::is_ok),
+        "the member reports: {member:?}"
+    );
+    assert_eq!(outcome_written(&pool, w2).await, (Some(2), 0));
+
+    let public = mcp_reports(&w, &pool, w.h2, w1).await;
+    assert!(
+        public.iter().all(Result::is_ok),
+        "a public plan stays reportable: {public:?}"
+    );
+    assert_eq!(outcome_written(&pool, w1).await, (Some(2), 0));
+}
+
+/// Ruling R-74: the `workflows` row of a declared generation is the group's.
+/// `GET /api/v1/workflows/:id` answers a non-member exactly as an unknown id
+/// (the typed 404), and the hierarchical search lists it for no non-member;
+/// the member reads both, and the public generation stays readable to anyone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_declared_generations_workflow_row_is_hidden_from_a_non_member(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-hidden-row";
+    let (w1, w2) = reused_step_generations(&w, &pool, name).await;
+    let stranger = token(w.h2, READ_SCOPES);
+    let member = token(w.h, READ_SCOPES);
+
+    let (status, out) = w
+        .api
+        .get(&format!("/api/v1/workflows/{w2}"), &stranger)
+        .await;
+    let (unknown_status, unknown) = w
+        .api
+        .get(&format!("/api/v1/workflows/{}", Uuid::nil()), &stranger)
+        .await;
+    assert_eq!(
+        (status, unknown_status),
+        (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+        "the non-member gets the unknown-id answer: {out}"
+    );
+    assert_eq!(
+        out.to_string().replace(&w2.to_string(), "<id>"),
+        unknown
+            .to_string()
+            .replace(&Uuid::nil().to_string(), "<id>"),
+        "the same typed body as an unknown id"
+    );
+    let (status, out) = w.api.get(&format!("/api/v1/workflows/{w2}"), &member).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["workflow_id"], json!(w2), "{out}");
+    let (status, out) = w
+        .api
+        .get(&format!("/api/v1/workflows/{w1}"), &stranger)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the public row stays readable: {out}"
+    );
+    assert_eq!(out["canonical_name"], json!(name), "{out}");
+
+    let ids = |out: &Value| -> BTreeSet<Uuid> {
+        out["workflows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("a workflows array: {out}"))
+            .iter()
+            .map(|r| uuid_of(&r["workflow_id"]))
+            .collect()
+    };
+    let search = format!("/api/v1/workflows/hierarchical/search?q={name}&limit=50&min_truth=0");
+    let (status, out) = w.api.get(&search, &stranger).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        ids(&out),
+        BTreeSet::from([w1]),
+        "a non-member's search lists the public generation only: {out}"
+    );
+    let (status, out) = w.api.get(&search, &member).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(ids(&out), BTreeSet::from([w1, w2]), "{out}");
+}
+
+/// Guard: a non-member cannot extend a lineage whose head is a generation
+/// declared into a group it does not read, by ingesting the next generation or
+/// by `add_step` on the lineage's name. Both decide on the head's authority on
+/// the ingest system agent's stamp, which reads the group, so the hidden head
+/// is the row checked; nothing is written. (It holds before and after
+/// migration 183: the change must not move the check to an older, public
+/// generation.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_member_cannot_extend_a_lineage_whose_head_is_private(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-private-head";
+    let (_w1, _w2) = reused_step_generations(&w, &pool, name).await;
+    let stranger = token(w.h2, WRITE_SCOPES);
+    let before = row_counts(&pool).await;
+
+    let mut gen2 = extraction(name, 2, &[&["acme next-generation op"]]);
+    gen2["source"]["parent_canonical_name"] = json!(name);
+    let (status, out) = w.api.ingest(&stranger, &gen2).await;
+    assert!(
+        status.is_client_error(),
+        "the next generation of a private head is refused: {status} {out}"
+    );
+    assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
+    assert_eq!(workflows_named(&pool, name).await, 2, "no generation 2");
+
+    let (status, out) = w
+        .api
+        .call(
+            Method::POST,
+            "/api/v1/workflows/steps",
+            &stranger,
+            Some(&json!({"canonical_name": name, "step_text": "acme appended step"})),
+        )
+        .await;
+    assert!(
+        status.is_client_error(),
+        "add_step on a private head is refused: {status} {out}"
+    );
+    assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
+}
