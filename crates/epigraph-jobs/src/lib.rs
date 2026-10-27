@@ -65,11 +65,8 @@ pub mod egress;
 pub use egress::is_internal_addr;
 pub mod coordination;
 pub mod privatization;
-pub mod theme_cluster_rebuild;
 
-pub use coordination::{
-    apply_job_connection_settings, run_serialized, CLUSTER_GRAPH_LOCK_KEY, THEME_REBUILD_LOCK_KEY,
-};
+pub use coordination::{apply_job_connection_settings, run_serialized, CLUSTER_GRAPH_LOCK_KEY};
 
 // ============================================================================
 // Job Identifier
@@ -736,22 +733,6 @@ pub enum EpiGraphJob {
         retain_runs: u32,
     },
 
-    /// Rebuild `claim_themes` from scratch via k-means over `claims.embedding`.
-    ///
-    /// Sibling cron to `ClusterGraph`. The handler calls
-    /// `epigraph_engine::theme_kmeans::run_theme_kmeans` with `wipe_first=true`,
-    /// so each successful run replaces the existing theme set wholesale.
-    ThemeClusterRebuild {
-        /// Wired through to `RunThemeKmeansConfig::k_max`.
-        max_themes: u32,
-        /// Drop clusters smaller than this (no theme created).
-        min_claims_per_theme: u32,
-        /// When `true`, skip the run if `MAX(claim_themes.updated_at) >=
-        /// MAX(claims.{created_at,updated_at})`. The cron caller sets this
-        /// to `true` to avoid redoing work on idle days.
-        skip_if_unchanged: bool,
-    },
-
     /// Apply a D4 privatization plan (FINAL-PLAN §6.5.5).
     ///
     /// **The three fields are not the authorization and must not be read as
@@ -824,7 +805,6 @@ impl EpiGraphJob {
             Self::WebhookNotification { .. } => "webhook_notification",
             Self::DataCleanup { .. } => "data_cleanup",
             Self::ClusterGraph { .. } => "cluster_graph",
-            Self::ThemeClusterRebuild { .. } => "theme_cluster_rebuild",
             // The three names migration 077's `jobs_app` WITH CHECK already
             // spells. They must agree EXACTLY or the policy arm that refuses an
             // app-role enqueue of privatization work stops matching.

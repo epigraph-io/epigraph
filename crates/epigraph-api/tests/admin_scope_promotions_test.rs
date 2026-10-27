@@ -31,58 +31,9 @@ fn admin_token() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// crud.rs — 8 handlers
+// crud.rs — 7 handlers (build_themes_from_corpus retired with the k-means
+// prototype, backlog a0ed0180: tests/theme_kmeans_retired.rs)
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_with_claims_write_returns_403() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .bearer_auth(write_token())
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "expected 403, got {}", resp.status());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_no_token_returns_401() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 401, "expected 401, got {}", resp.status());
-}
-
-/// Backlog 5abe23de: a wipe deletes EVERY theme, so even a `claims:admin`
-/// caller may wipe only to rebuild the canonical `"auto"` family. The refusal
-/// lives in the engine (`theme_kmeans::validate_config`, shared with the MCP
-/// tool and the scheduled job); this pins that the REST route reaches it, so
-/// the check cannot migrate into one caller and leave this one open. It runs
-/// before any read or write, so the shared DB's themes are not touched.
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_admin_wipe_under_a_probe_prefix_returns_400() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .bearer_auth(admin_token())
-        .json(&serde_json::json!({"wipe_first": true, "label_prefix": "sweep-probe"}))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = resp.text().await.unwrap();
-    assert_eq!(status, 400, "expected 400, got {status}: {body}");
-    assert!(
-        body.contains("canonical label_prefix") && body.contains("sweep-probe"),
-        "the refusal must name the canonical-prefix rule and the offered prefix: {body}"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reassign_claim_with_claims_write_returns_403() {

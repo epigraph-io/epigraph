@@ -13,6 +13,16 @@
 // the same response shapes as real data. Treat the no-db configuration as a
 // compile-time target, not a runnable mode, until that is resolved.
 // Re-audited 2026-09-01.
+//
+// OPERATOR RULING R-39 (2026-10, backlog ca927c3b): the no-db configuration IS
+// check-only, by decision rather than by caveat. The `server` binary declares
+// `required-features = ["db"]` (Cargo.toml; pinned by
+// tests/server_bin_requires_db.rs), so a `--no-default-features` build compiles
+// this library and skips the server: no `not(db)` arm here is ever reachable
+// from a request. Consequently the two `#[cfg]` arms of a split handler are NOT
+// held to extractor parity (finding F-PR28-route-arm-extractor-parity is closed
+// by this ruling, not by an audit of ~120 handlers). A `not(db)` arm only has to
+// compile.
 
 pub mod activities;
 pub mod admin;
@@ -364,10 +374,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/themes/create-with-centroid",
             post(crud::create_theme_with_centroid),
-        )
-        .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
         )
         .route(
             "/api/v1/clusters/build-from-bridges",
@@ -1278,10 +1284,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/themes/create-with-centroid",
             post(crud::create_theme_with_centroid),
-        )
-        .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
         )
         .route(
             "/api/v1/clusters/build-from-bridges",

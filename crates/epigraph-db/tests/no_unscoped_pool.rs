@@ -706,7 +706,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// caller's stamped connection (`write_as` for create / add / remove,
 /// `read_as` for `get_group`; `rotate_key` already did), so `routes/groups.rs`
 /// 12 -> 0 and its key is deleted, read off this test's own failure.
-const HIGH_WATER: usize = 232;
+/// 244 -> 243 (backlog a0ed0180, ruling R-29): `build_themes_from_corpus` was
+/// deleted with the k-means prototype, not converted (`routes/crud.rs`
+/// 31 -> 30, keeping sites), read off `the_scanner_is_not_vacuous`'s own
+/// failure (`left: 243, right: 244`).
+/// Staging union (integration/20261027): both deltas above from 244 -> 231.
+const HIGH_WATER: usize = 231;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -886,7 +891,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `get_split_candidates`, `get_distant_claims`, `get_theme_embeddings`) onto
     // `AppState::read_as`. Every one of the thirty-six that remain sits in a
     // WRITE handler; this is the densest write-blocked file in the series.
-    ("routes/crud.rs", 31),
+    // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
+    // write on `state.db_pool`) was deleted with the prototype, backlog
+    // a0ed0180. A removal, not a conversion.
+    ("routes/crud.rs", 30),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,

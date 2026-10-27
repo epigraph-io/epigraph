@@ -198,6 +198,13 @@ are usable.
 
 ## Step 2 — rewire the nightly (NOT DONE — the wipe path is still intact)
 
+> **Update (backlog a0ed0180):** the k-means `theme_cluster` path is retired.
+> The MCP tool name stays registered only to refuse (JSON-RPC -32600,
+> `data.status = "retired"`) with a pointer to `scripts/maintain_themes.py`, so a
+> re-enabled `theme-maintenance` task can no longer wipe themes through the
+> fallback below; it fails loudly instead. The two edits below are still needed
+> for the nightly to do useful work.
+
 **This step is outstanding.** On 2026-08-18 11:20 UTC the nightly fired against the
 completed 76-theme run and replaced it with 16 `auto-NN` rows over 500 claims. The task
 has been PAUSED as a stopgap; it has not been fixed. Re-enabling the cron before both

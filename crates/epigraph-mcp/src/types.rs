@@ -827,7 +827,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
+        description = "Zero-based index of the step in the workflow's plan order: its step_follows chain, so a step add_step inserted at slot i is step i (when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last)."
     )]
     pub step_index: usize,
 
@@ -959,7 +959,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (the level-2 steps in step_follows chain order, as find_workflow lists them; a step add_step inserted at slot i is step i, except when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last). An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
