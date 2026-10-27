@@ -2036,14 +2036,18 @@ restart.
   (`mass_functions_retract_guard`), no INSERT that arrives retracted
   (`mass_functions_retract_insert_guard`) and no bare clear
   (`mass_functions_unretract_guard`: the columns NULLed with masses and
-  `created_at` unchanged). Every clear is audited by
-  `mass_functions_unretract_audit` (AFTER UPDATE, the maintenance-owned
-  definer `epigraph_mass_function_unretract_audit()`, one
+  `created_at` unchanged). Ruling R-103: a retracted row HOLDS its upsert key;
+  `mass_functions_retracted_rewrite_guard` refuses any change to a retracted
+  row's assessment (masses, conflict_k, combination_method, source_strength,
+  locality_tag, evidence_id, created_at) with RT07 (42501), in every session
+  and frame, so a write to its key (the repository upsert, which no longer
+  touches the retract columns) is refused and changes nothing. Every clear is
+  audited by `mass_functions_unretract_audit` (AFTER UPDATE, the
+  maintenance-owned definer `epigraph_mass_function_unretract_audit()`, one
   `mass_functions.unretract` row). Every fold and belief reader excludes a
   retracted row (`not_retracted_predicate`, pinned by
-  `epigraph-db/tests/bba_retract_read_lint.rs`), and the repository upsert
-  clears the columns when the same key is written again (a new assessment,
-  audited). Pinned by `epigraph-db/tests/bba_retract.rs` and
+  `epigraph-db/tests/bba_retract_read_lint.rs`).
+  Pinned by `epigraph-db/tests/bba_retract.rs` and
   `bba_retract_elevated.rs`. Undo: in the file header. **Deploy order:**
   after 114 and 126; apply BEFORE a binary with the matching readers serves
   (they name `retracted_at`). **Applied to throwaway databases only, NOT to

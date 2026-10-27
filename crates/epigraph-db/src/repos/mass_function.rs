@@ -611,10 +611,12 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
     ///
-    /// A write to a RETRACTED row's key (migration 184) is a new assessment:
-    /// the update clears the three retract columns, so the new masses fold.
-    /// The retracted content is not lost: the retraction's audit row
-    /// (`security_events`, `mass_functions.retract`) holds the row as it was.
+    /// A RETRACTED row holds its key (migration 184, operator ruling R-103):
+    /// a write to that key is refused by the database (RT07) and changes
+    /// nothing, and the error is [`DbError::Refused`] with
+    /// [`crate::RefusalKind::State`], naming the row. The upsert never touches
+    /// the retract columns; only the explicit un-retract makes such a row
+    /// live again.
     ///
     /// # The executor is generic, and that is what makes this table writable
     ///
@@ -665,10 +667,7 @@ impl MassFunctionRepository {
                 evidence_type = EXCLUDED.evidence_type,
                 locality_tag = EXCLUDED.locality_tag,
                 evidence_id = EXCLUDED.evidence_id,
-                created_at = NOW(),
-                retracted_at = NULL,
-                retracted_by = NULL,
-                retract_reason = NULL
+                created_at = NOW()
             RETURNING id
             "#,
         )
@@ -1065,6 +1064,47 @@ impl MassFunctionRepository {
         let exists: bool = vq.fetch_one(executor).await?;
 
         Ok(exists)
+    }
+
+    /// The id of a RETRACTED row holding the upsert key `(claim_id, frame_id,
+    /// source_agent_id, perspective_id)` that `viewer` can read, if any.
+    ///
+    /// A retracted row holds its key (migration 184, operator ruling R-103):
+    /// [`Self::store_with_perspective`] onto it is refused. An AUTOMATED
+    /// writer whose write is a side effect (the evidence update's
+    /// truth-value seed) asks this first and skips the write, so the
+    /// retraction does not refuse the caller's own, unrelated write.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn retracted_row_at_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        frame_id: Uuid,
+        source_agent_id: Option<Uuid>,
+        perspective_id: Option<Uuid>,
+    ) -> Result<Option<Uuid>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT id FROM mass_functions
+             WHERE claim_id = $1 AND frame_id = $2
+               AND source_agent_id IS NOT DISTINCT FROM $3
+               AND perspective_id IS NOT DISTINCT FROM $4
+               AND retracted_at IS NOT NULL /* {VISIBILITY:mass_functions} */
+            "#,
+            5,
+        );
+        let mut q = sqlx::query_scalar(&sql)
+            .bind(claim_id)
+            .bind(frame_id)
+            .bind(source_agent_id)
+            .bind(perspective_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
     }
 
     /// Delete all mass functions for a claim

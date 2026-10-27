@@ -894,77 +894,148 @@ async fn no_principal_is_refused_and_a_stranger_learns_nothing_of_a_retracted_ro
     assert_eq!(audit[0].0, Some(owners.retracted_by));
 }
 
-/// A later write to a retracted row's upsert key is a NEW assessment: the
-/// upsert replaces the masses and clears the retraction, so the NEW masses
-/// fold; the retracted content survives in the retraction's audit snapshot,
-/// and the clear itself is audited (`mass_functions.unretract`, exactly one
-/// row, naming who cleared it and what replaced the retracted masses).
+/// `(masses, created_at)` of one row, read on the harness connection.
+async fn assessment_of(
+    pool: &PgPool,
+    id: Uuid,
+) -> (serde_json::Value, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as("SELECT masses, created_at FROM mass_functions WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("read mass function {id}: {e}"))
+}
+
+/// Operator ruling R-103: a retracted row HOLDS its upsert key. A later write
+/// to that key, here the owner resubmitting through the repository upsert
+/// every BBA writer goes through, is REFUSED (RT07, a state refusal the
+/// transports answer 409 / a tool error) and changes nothing: the row stays
+/// retracted with the retracted masses and `created_at`, no fold reads it,
+/// and no un-retraction is recorded. The same write on the harness
+/// connection, which passes every session bypass (`epigraph_bypass()`, as a
+/// backfill on the maintenance connection does), is refused the same way:
+/// the refusal has no bypass.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
+async fn a_write_to_a_retracted_key_is_refused_and_changes_nothing(pool: PgPool) {
     let w = world(&pool).await;
     let p = pool.clone();
     let (owner, claim, frame_a, perspective, id) =
         (w.owner, w.claim, w.frame_a, w.perspective, w.owner_bba);
-    let (retracted, rewritten, live) =
+    let resubmit = |support: f64| serde_json::json!({"0": support, "0,1": 1.0 - support});
+    let r1 = resubmit(0.4);
+    let (retracted, rewrite, live) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, owner).await;
             let r = MassFunctionRepository::retract_conn(&mut conn, id, "superseded", None).await;
-            let again =
-                store_bba(&mut conn, &p, owner, claim, frame_a, Some(perspective), 0.4).await;
+            stamp(&mut conn, &p, owner).await;
+            let again = MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame_a,
+                Some(owner),
+                Some(perspective),
+                &r1,
+                None,
+                None,
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await;
             let v = stamp(&mut conn, &p, owner).await;
-            let live: Vec<(Uuid, serde_json::Value)> =
+            let live: Vec<Uuid> =
                 MassFunctionRepository::get_for_claim_frame(&mut *conn, &v, claim, frame_a)
                     .await
                     .expect("get_for_claim_frame")
                     .into_iter()
-                    .map(|r| (r.id, r.masses))
+                    .map(|r| r.id)
                     .collect();
             (conn, (r, again, live))
         })
         .await;
     retracted.expect("the owner retracts its BBA");
+    let before = assessment_of(&pool, id).await;
+    match rewrite {
+        Err(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message,
+        }) => {
+            assert!(message.starts_with("RT07: "), "coded RT07: {message}");
+            assert!(
+                message.contains(&id.to_string()),
+                "names the retracted row: {message}"
+            );
+        }
+        other => panic!("a write to a retracted key must be refused RT07 (state): {other:?}"),
+    }
     assert_eq!(
-        rewritten, w.owner_bba,
-        "the key holds one row: the upsert reuses it"
+        retract_columns(&pool, id).await,
+        (true, Some(owner), Some("superseded".to_string())),
+        "the retraction stands"
     );
-    assert_eq!(live.len(), 1, "the new assessment folds again: {live:?}");
-    assert_eq!(live[0].0, w.owner_bba);
+    assert_eq!(before.0["0"], 0.9, "the retracted masses are untouched");
+    assert!(live.is_empty(), "no fold reads the row: {live:?}");
+    assert!(
+        unretract_rows(&pool, id).await.is_empty(),
+        "nothing un-retracted"
+    );
+
+    // The harness connection passes every session bypass; the refusal holds.
+    let privileged = MassFunctionRepository::store_with_perspective(
+        &pool,
+        claim,
+        frame_a,
+        Some(owner),
+        Some(perspective),
+        &resubmit(0.2),
+        None,
+        Some("backfill"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await;
+    assert!(
+        matches!(
+            &privileged,
+            Err(epigraph_db::DbError::Refused { message, .. }) if message.starts_with("RT07: ")
+        ),
+        "a privileged write to a retracted key is refused too: {privileged:?}"
+    );
     assert_eq!(
-        live[0].1["0"], 0.4,
-        "the fold reads the NEW masses, not the retracted ones: {live:?}"
+        assessment_of(&pool, id).await,
+        before,
+        "neither write changed the masses or created_at"
     );
     assert_eq!(
-        retract_columns(&pool, w.owner_bba).await,
-        (false, None, None)
+        retract_columns(&pool, id).await,
+        (true, Some(owner), Some("superseded".to_string()))
     );
-    let audit = audit_rows(&pool, w.owner_bba).await;
-    assert_eq!(audit.len(), 1);
-    assert_eq!(
-        audit[0].1["before"]["masses"]["0"], 0.9,
-        "the retracted masses survive in the audit snapshot"
-    );
-    let cleared = unretract_rows(&pool, w.owner_bba).await;
-    assert_eq!(cleared.len(), 1, "the clear is audited once: {cleared:#?}");
-    let (agent, details) = &cleared[0];
-    assert_eq!(
-        *agent,
-        Some(w.owner),
-        "the clear names the session principal"
-    );
-    assert_eq!(details["before"]["retract_reason"], "superseded");
-    assert_eq!(details["before"]["masses"]["0"], 0.9);
-    assert_eq!(details["after_masses"]["0"], 0.4);
+    let rows_at_key: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND source_agent_id = $3 AND perspective_id = $4",
+    )
+    .bind(claim)
+    .bind(frame_a)
+    .bind(owner)
+    .bind(perspective)
+    .fetch_one(&pool)
+    .await
+    .expect("count rows at the key");
+    assert_eq!(rows_at_key, 1, "no second row beside the retracted one");
 }
 
 /// R-79's motivating case is an ADMIN retracting somebody else's BBA, so the
 /// row's owner (which 077 lets UPDATE its own row) must not be able to undo
-/// that silently. A bare clear (the three columns NULLed, nothing else
-/// changed) is refused by the guard (RT06). A clear that comes with a new
-/// assessment (here a new `created_at`, as the upsert stamps one) is admitted
-/// and audited: exactly one `mass_functions.unretract` row, naming the owner
-/// and carrying the admin's retraction as it was.
+/// or overwrite that. A bare clear (the three columns NULLed, nothing else
+/// changed) is refused (RT06). A clear that comes with a new assessment (here
+/// a new `created_at`, as the upsert stamps one) is refused too (ruling R-103:
+/// RT07, which fires first). The admin's retraction stands, untouched, and
+/// no un-retraction is recorded.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_owner_cannot_silently_clear_an_admin_retraction(pool: PgPool) {
+async fn an_owner_can_neither_clear_nor_overwrite_an_admin_retraction(pool: PgPool) {
     let w = world(&pool).await;
     let live = seed_client(
         &pool,
@@ -1014,28 +1085,27 @@ async fn an_owner_cannot_silently_clear_an_admin_retraction(pool: PgPool) {
     let (code, message) = db_message(bare, "a bare clear of an admin retraction is refused");
     assert_eq!(code, "42501", "{message}");
     assert!(message.contains("RT06"), "refused by the guard: {message}");
-    let reassessed = reassessed.expect("a clear that comes with a new assessment is admitted");
-    assert_eq!(
-        reassessed.rows_affected(),
-        1,
-        "CALIBRATION: RLS admits the owner's UPDATE"
+    let (code, message) = db_message(
+        reassessed,
+        "a clear that comes with a new assessment is refused (R-103)",
     );
-    let cleared = unretract_rows(&pool, w.owner_bba).await;
-    assert_eq!(
-        cleared.len(),
-        1,
-        "the refused clear wrote nothing; the admitted one is audited once: {cleared:#?}"
+    assert_eq!(code, "42501", "{message}");
+    assert!(
+        message.starts_with("RT07: "),
+        "refused as a re-write: {message}"
     );
-    let (agent, details) = &cleared[0];
-    assert_eq!(*agent, Some(w.owner));
-    assert_eq!(
-        details["before"]["retracted_by"],
-        w.stranger.to_string(),
-        "the audit row carries the admin's retraction it cleared"
+    assert!(
+        unretract_rows(&pool, w.owner_bba).await.is_empty(),
+        "nothing was un-retracted"
     );
     assert_eq!(
-        details["before"]["retract_reason"],
-        "duplicate re-observation"
+        retract_columns(&pool, w.owner_bba).await,
+        (
+            true,
+            Some(w.stranger),
+            Some("duplicate re-observation".to_string())
+        ),
+        "the admin's retraction stands as it was"
     );
 }
 

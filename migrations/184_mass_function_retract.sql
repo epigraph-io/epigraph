@@ -24,12 +24,12 @@
 -- (`epigraph_db::repos::mass_function::not_retracted_predicate`) and pinned by
 -- the read ratchet `epigraph-db/tests/bba_retract_read_lint.rs`.
 --
--- A later write to the SAME upsert key `(claim, frame, source agent,
--- perspective)` (migration 034's unique key) is a new assessment: the
--- repository upsert (`MassFunctionRepository::store_with_perspective`) clears
--- the three columns as it replaces the masses. The retracted content is not
--- lost: the retraction's audit row carries a full snapshot of the row as it
--- was, and the clear itself is audited (section 3).
+-- A retracted row's upsert key `(claim, frame, source agent, perspective)`
+-- (migration 034's unique key) stays HELD by it (operator ruling R-103): a
+-- later write to that key, by the owner or by any automated writer (the
+-- repository upsert `MassFunctionRepository::store_with_perspective`, which
+-- every BBA writer goes through), is REFUSED with RT07 and changes nothing.
+-- The retracted row and its content stay exactly as retracted.
 --
 -- ===================================================================
 -- 2. THE DEFINER
@@ -93,28 +93,42 @@
 --
 -- The owner may UPDATE (and INSERT) its own rows under 077. Without guards it
 -- could mark a row retracted with no audit row and a `retracted_by` of its
--- choosing, or silently undo a retraction, including one a `claims:admin`
--- holder made. Three triggers close that, each refusing with RT06 (42501):
---   * `mass_functions_retract_guard` (BEFORE UPDATE) refuses SETTING or
---     CHANGING the retract columns to a retracted state;
---   * `mass_functions_retract_insert_guard` (BEFORE INSERT) refuses a new row
---     that arrives with any retract column set;
---   * `mass_functions_unretract_guard` (BEFORE UPDATE) refuses a BARE clear:
---     the three columns NULLed while the masses and `created_at` stay as they
---     were. A clear is admitted only with a new assessment, which is what the
---     repository upsert is (it always stamps a new `created_at`).
+-- choosing, silently undo a retraction (including one a `claims:admin`
+-- holder made), or overwrite what was retracted. Four row triggers close
+-- that (all plain `BEFORE` triggers, so none depends on which columns a
+-- statement's SET list names):
+--   * `mass_functions_retract_guard` (UPDATE) refuses SETTING or CHANGING the
+--     retract columns to a retracted state (RT06);
+--   * `mass_functions_retract_insert_guard` (INSERT) refuses a new row that
+--     arrives with any retract column set (RT06);
+--   * `mass_functions_retracted_rewrite_guard` (UPDATE, ruling R-103) refuses
+--     any change to a RETRACTED row's assessment: `masses`, `conflict_k`,
+--     `combination_method`, `source_strength`, `locality_tag`, `evidence_id`
+--     or `created_at` (RT07, SQLSTATE 42501, DETAIL = the row's id). This is
+--     what an upsert onto a retracted key is (the repository upsert always
+--     stamps a new `created_at`), whoever runs it: it has NO bypass, so an
+--     application session, a backfill on the maintenance connection and a
+--     maintenance-owned definer are all refused, and the statement (with the
+--     transaction it runs in) writes nothing. Moving a retracted row with its
+--     claim (114's dedup move, the dedup repair and restore), re-stamping its
+--     tenancy and back-filling its `evidence_type` tag change no assessment
+--     column and pass;
+--   * `mass_functions_unretract_guard` (UPDATE) refuses a BARE clear: the
+--     three columns NULLed while the masses and `created_at` stay as they
+--     were (RT06).
+-- Triggers of one event fire in name order, so a statement that both rewrites
+-- and clears a retracted row is answered RT07.
 -- A privileged session (`epigraph_bypass()`: the maintenance operator, and the
 -- dedup repair and restore, which run on the maintenance connection) and a
 -- maintenance-owned definer frame (`epigraph_definer_bypass()`: section 2's
--- definer, 114's dedup move) pass all three.
+-- definer, 114's dedup move) pass the three RT06 guards, never RT07.
 --
--- No guard condition can stop an owner from re-assessing its own row, so
--- EVERY clear is audited instead: `mass_functions_unretract_audit` (AFTER
--- UPDATE, a maintenance-owned SECURITY DEFINER, so it writes for any session)
--- appends one `security_events` row (`mass_functions.unretract`, `agent_id` =
--- the session principal, NULL on a session without one) whenever a retracted
--- row becomes live, naming the row, its claim and frame, `before` (the row
--- as it was, retraction included) and `after_masses`.
+-- Every clear that does happen is audited: `mass_functions_unretract_audit`
+-- (AFTER UPDATE, a maintenance-owned SECURITY DEFINER, so it writes for any
+-- session) appends one `security_events` row (`mass_functions.unretract`,
+-- `agent_id` = the session principal, NULL on a session without one) whenever
+-- a retracted row becomes live, naming the row, its claim and frame, `before`
+-- (the row as it was, retraction included) and `after_masses`.
 --
 -- ===================================================================
 -- 4. DEPLOY AND UNDO
@@ -136,6 +150,7 @@
 -- should become): REVOKE DELETE ON ds_combined_beliefs FROM epigraph_maintenance;
 -- DROP TRIGGER mass_functions_unretract_audit ON mass_functions;
 -- DROP TRIGGER mass_functions_unretract_guard ON mass_functions;
+-- DROP TRIGGER mass_functions_retracted_rewrite_guard ON mass_functions;
 -- DROP TRIGGER mass_functions_retract_insert_guard ON mass_functions;
 -- DROP TRIGGER mass_functions_retract_guard ON mass_functions;
 -- DROP FUNCTION epigraph_mass_function_unretract_audit();
@@ -325,13 +340,19 @@ RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public AS $$
 BEGIN
+    -- R-103: no session or frame re-writes a retracted row's assessment.
+    IF TG_ARGV[0] = 'rewrite' THEN
+        RAISE EXCEPTION 'RT07: mass function % is retracted; a write to its key (claim, frame, '
+            'source agent, perspective) is refused until it is un-retracted; nothing was written',
+            OLD.id
+            USING ERRCODE = '42501', DETAIL = OLD.id::text;
+    END IF;
     IF public.epigraph_bypass() OR public.epigraph_definer_bypass() THEN
         RETURN NEW;
     END IF;
     IF TG_ARGV[0] = 'clear' THEN
-        RAISE EXCEPTION 'RT06: a retracted mass function is made live again only by a new '
-            'assessment (new masses or a new write, which is audited); a bare clear of the '
-            'retract columns is refused; nothing was written'
+        RAISE EXCEPTION 'RT06: a bare clear of a mass function''s retract columns is refused; '
+            'nothing was written'
             USING ERRCODE = '42501';
     END IF;
     RAISE EXCEPTION 'RT06: a mass function is retracted only through '
@@ -342,7 +363,7 @@ END $$;
 
 DROP TRIGGER IF EXISTS mass_functions_retract_guard ON public.mass_functions;
 CREATE TRIGGER mass_functions_retract_guard
-    BEFORE UPDATE OF retracted_at, retracted_by, retract_reason ON public.mass_functions
+    BEFORE UPDATE ON public.mass_functions
     FOR EACH ROW
     WHEN (NEW.retracted_at IS NOT NULL
           AND (OLD.retracted_at, OLD.retracted_by, OLD.retract_reason)
@@ -357,9 +378,21 @@ CREATE TRIGGER mass_functions_retract_insert_guard
           OR NEW.retract_reason IS NOT NULL)
     EXECUTE FUNCTION public.epigraph_mass_function_retract_guard('mark');
 
+DROP TRIGGER IF EXISTS mass_functions_retracted_rewrite_guard ON public.mass_functions;
+CREATE TRIGGER mass_functions_retracted_rewrite_guard
+    BEFORE UPDATE ON public.mass_functions
+    FOR EACH ROW
+    WHEN (OLD.retracted_at IS NOT NULL
+          AND (NEW.masses, NEW.conflict_k, NEW.combination_method, NEW.source_strength,
+               NEW.locality_tag, NEW.evidence_id, NEW.created_at)
+              IS DISTINCT FROM
+              (OLD.masses, OLD.conflict_k, OLD.combination_method, OLD.source_strength,
+               OLD.locality_tag, OLD.evidence_id, OLD.created_at))
+    EXECUTE FUNCTION public.epigraph_mass_function_retract_guard('rewrite');
+
 DROP TRIGGER IF EXISTS mass_functions_unretract_guard ON public.mass_functions;
 CREATE TRIGGER mass_functions_unretract_guard
-    BEFORE UPDATE OF retracted_at, retracted_by, retract_reason ON public.mass_functions
+    BEFORE UPDATE ON public.mass_functions
     FOR EACH ROW
     WHEN (OLD.retracted_at IS NOT NULL AND NEW.retracted_at IS NULL
           AND NEW.masses IS NOT DISTINCT FROM OLD.masses

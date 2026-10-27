@@ -69,6 +69,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-db/src/repos/mass_function.rs", "exists_for_perspective", 1, "edge wake-up gate (\"has this edge ever been wired\"): a retracted edge BBA counts as wired, so a re-asserted edge does not silently re-derive it"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "get_by_id", 1, "one row by id, for audit and the retract target lookup; returns a retracted row as stored"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "list_claim_ids", 1, "recompute enumerator: a claim whose every BBA is retracted still enters, so its recompute reads the (filtered) empty fold"),
+    ("crates/epigraph-db/src/repos/mass_function.rs", "retracted_row_at_key", 1, "upsert-key probe for RETRACTED rows only (R-103): an automated side write skips a key a retracted row holds; no fold"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "untyped_provenance_page", 2, "evidence-type backfill of a metadata tag; masses untouched and no fold"),
 ];
 

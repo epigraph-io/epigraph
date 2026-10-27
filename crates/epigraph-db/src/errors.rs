@@ -46,6 +46,25 @@ pub const OPERATOR_SCOPE_REFUSED: &str = "OPL02";
 /// checks call once the database is armed; the valve does not relieve it.
 pub const ROLE_HOLDER_REQUIRED: &str = "ROL01";
 
+/// The message prefix of migration 184's RT07 refusal (SQLSTATE 42501): a
+/// write to the key of a RETRACTED mass function (operator ruling R-103).
+pub const RETRACTED_BBA_REWRITE_PREFIX: &str = "RT07: ";
+
+/// The caller-facing text of an RT07 refusal, naming the row when the
+/// database reported its id.
+#[must_use]
+pub fn retracted_bba_rewrite_message(id: Option<Uuid>) -> String {
+    let row = id.map_or_else(
+        || "a mass function".to_string(),
+        |id| format!("mass function {id}"),
+    );
+    format!(
+        "{RETRACTED_BBA_REWRITE_PREFIX}{row} is retracted, and a retracted BBA holds its key \
+         (claim, frame, source agent, perspective): a write to that key is refused until the BBA \
+         is un-retracted; nothing was written"
+    )
+}
+
 /// The remedy every surface prints with an [`DbError::OperatorLinkRequired`].
 /// One string, so the HTTP body, the MCP message and the CLI text cannot drift.
 ///
@@ -372,6 +391,25 @@ impl From<sqlx::Error> for DbError {
             {
                 Self::RoleHolderRequired {
                     message: db_err.message().to_string(),
+                }
+            }
+            // RT07, migration 184 (operator ruling R-103): a write to the key
+            // of a retracted BBA. A designed refusal of the target's STATE (the
+            // remedy is the explicit un-retract), so every surface answers it
+            // as one (HTTP 409, the MCP tool error) rather than as a redacted
+            // fault. The text is built here; only the row id is taken from the
+            // database, from DETAIL, parsed as a uuid.
+            sqlx::Error::Database(db_err)
+                if db_err.code().as_deref() == Some("42501")
+                    && db_err.message().starts_with(RETRACTED_BBA_REWRITE_PREFIX) =>
+            {
+                let id = db_err
+                    .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                    .and_then(sqlx::postgres::PgDatabaseError::detail)
+                    .and_then(|d| Uuid::parse_str(d.trim()).ok());
+                Self::Refused {
+                    kind: RefusalKind::State,
+                    message: retracted_bba_rewrite_message(id),
                 }
             }
             // All other database errors become QueryFailed

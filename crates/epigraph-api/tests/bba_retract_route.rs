@@ -579,3 +579,81 @@ async fn a_live_claims_admin_retracts_another_owners_bba(
     .expect("the admin retraction's audit row");
     assert_eq!(admin_client, client.to_string());
 }
+
+/// `(masses, created_at)` of one row, read on the harness pool.
+async fn assessment(w: &World, id: Uuid) -> (Value, chrono::DateTime<chrono::Utc>) {
+    sqlx::query_as("SELECT masses, created_at FROM mass_functions WHERE id = $1")
+        .bind(id)
+        .fetch_one(&w.pool)
+        .await
+        .expect("read the row")
+}
+
+/// Operator ruling R-103 on the HTTP writer: resubmitting through `POST
+/// /api/v1/frames/:id/evidence` to the key of a BBA its owner retracted
+/// (same claim, frame, agent and perspective) is refused with 409, naming
+/// RT07 and the retracted row, and changes nothing: the row stays retracted
+/// with its retracted masses and `created_at`, the claim's cached belief and
+/// stored scoped beliefs are what the retraction left, and no un-retraction
+/// is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_resubmission_to_a_retracted_bba_key_is_refused_409_and_changes_nothing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    let target = bba(&w, w.claim, w.p_support).await;
+    let owner = common::mint_token_with_agent(&["claims:write"], w.owner);
+    let (status, body) = retract(&w, &owner, target, "duplicate re-observation").await;
+    assert_eq!(status, 200, "{body}");
+    let cache_after_retract = cache(&w, w.claim).await;
+    let scoped_after_retract = stored_scoped(&w, w.claim).await;
+    let row_after_retract = assessment(&w, target).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/frames/{}/evidence",
+            w.addr, w.frame
+        ))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({
+            "claim_id": w.claim, "agent_id": w.owner, "perspective_id": w.p_support,
+            "reliability": 1.0, "masses": {"0": 0.4, "0,1": 0.6},
+        }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("body");
+    assert_eq!(
+        status, 409,
+        "a write to a retracted key is a conflict: {text}"
+    );
+    assert!(text.contains("RT07"), "the refusal names its code: {text}");
+    assert!(
+        text.contains(&target.to_string()),
+        "and the retracted row: {text}"
+    );
+
+    assert!(retracted(&w, target).await, "the retraction stands");
+    assert_eq!(
+        assessment(&w, target).await,
+        row_after_retract,
+        "masses and created_at untouched"
+    );
+    assert!(
+        close(cache(&w, w.claim).await, cache_after_retract),
+        "the cached belief is what the retraction left"
+    );
+    assert_eq!(stored_scoped(&w, w.claim).await, scoped_after_retract);
+    let unretracted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'mass_functions.unretract' \
+            AND details->>'mass_function_id' = $1::text",
+    )
+    .bind(target)
+    .fetch_one(&w.pool)
+    .await
+    .expect("count unretract rows");
+    assert_eq!(unretracted, 0, "nothing was un-retracted");
+}
