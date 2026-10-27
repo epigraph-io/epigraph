@@ -386,7 +386,7 @@ async fn generations_that_share_steps_keep_their_own_order(pool: PgPool) {
 
     for (id, want) in [(gen1_id, gen1), (gen2_id, gen2)] {
         let texts: Vec<String> = epigraph_db::WorkflowRepository::step_texts_for_hierarchical(
-            &mut *pool.acquire().await.expect("acquire"),
+            &mut pool.acquire().await.expect("acquire"),
             &viewer,
             &[id],
         )
