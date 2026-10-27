@@ -40,6 +40,11 @@
 //!   its rule without changing anything.
 //! * 180 refuses to re-state a registration body it was not written from, and
 //!   `docs/runbooks/180-undo.sql` returns the catalog to 166's.
+//! * The registration's role-attachment copy never copies a parent's row
+//!   back onto the child it came from (a revert): neither when the row's
+//!   chain reaches the child's own (detached) attachment nor when "the
+//!   parent succeeded the child" is on record; an ordinary successor is
+//!   still copied.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -1682,3 +1687,245 @@ async fn the_180_undo_restores_the_catalog_below_180(pool: PgPool) {
     assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The registration's role-attachment copy (166's step 5b) never copies a
+// grant back onto the identity it came from (180)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CYCLE_ROLE: &str = "role:test-180-cycle";
+
+async fn attach_role(pool: &PgPool, agent: Uuid) -> Uuid {
+    fixture::as_role(pool, MAINTENANCE, |mut conn| async move {
+        let r: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now(), NULL, 'cycle test')",
+        )
+        .bind(CYCLE_ROLE)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, r)
+    })
+    .await
+}
+
+async fn detach_role(pool: &PgPool, agent: Uuid) -> i32 {
+    fixture::as_role(pool, MAINTENANCE, |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role($1, $2, 'cycle test detach')",
+        )
+        .bind(CYCLE_ROLE)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role detaches");
+        (conn, n)
+    })
+    .await
+}
+
+/// `agent`'s un-detached attachments to the test role: `(id, inherited_from)`.
+async fn live_rows(pool: &PgPool, agent: Uuid) -> Vec<(Uuid, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT id, inherited_from FROM role_agents \
+          WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL ORDER BY created_at, id",
+    )
+    .bind(agent)
+    .bind(CYCLE_ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("live rows")
+}
+
+/// `role_attachments_withheld` of `agent`'s latest registration audit row.
+async fn withheld(pool: &PgPool, agent: Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT (details ->> 'role_attachments_withheld')::bigint FROM security_events \
+          WHERE event_type = 'agent.identity_registered' AND agent_id = $1 \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("registration audit row")
+}
+
+async fn register_id(pool: &PgPool, id: &Identity, parent: Option<Uuid>) -> Uuid {
+    try_register(pool, id, parent, GROUP)
+        .await
+        .expect("the attestor registers the identity")
+        .agent_id
+}
+
+/// THE REVERT. Attach A; a prompt change makes B, and the registration copies
+/// A's attachment to B; the operator detaches A; the job goes back to A's
+/// prompt, so the host registers A AGAIN, naming B as its parent. B's live
+/// row was copied FROM A's own (now detached) attachment, and the succession
+/// "B succeeded A" is on record, so nothing is copied back onto A: A holds no
+/// live attachment, and the registration audit row says what it withheld.
+/// The succession "A succeeded B" is still recorded. POSITIVE CONTROL: an
+/// ordinary successor of B, registered the same way, gets its copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_never_copies_an_attachment_back_onto_its_detached_source(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    let ra = attach_role(&pool, a).await;
+    let b = register_id(&pool, &new_identity(), Some(a)).await;
+    let b_rows = live_rows(&pool, b).await;
+    assert_eq!(b_rows.len(), 1, "PREMISE: B got a copy");
+    assert_eq!(b_rows[0].1, Some(ra), "PREMISE: copied from A's attachment");
+    assert_eq!(detach_role(&pool, a).await, 1, "A detached");
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    let reverse: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_succession WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("succession");
+    assert_eq!(reverse, 1, "the succession 'A succeeded B' is recorded");
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "nothing is copied back onto the detached source"
+    );
+    assert_eq!(
+        withheld(&pool, a).await,
+        Some(1),
+        "the audit row names the withheld copy"
+    );
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    assert_eq!(
+        live_rows(&pool, c).await.len(),
+        1,
+        "POSITIVE CONTROL: an ordinary successor of B is copied"
+    );
+    assert_eq!(
+        withheld(&pool, c).await,
+        Some(0),
+        "and nothing was withheld"
+    );
+}
+
+/// THE CYCLE GUARD ALONE (no reverse succession pair). A attached; X succeeds
+/// A, B succeeds X (B's row is a copy of X's, which is a copy of A's); A is
+/// detached; A is registered with B as its parent. "B succeeded A" is NOT on
+/// record (B's parent is X), but A's own attachment is in the chain of B's
+/// row, so nothing is copied back onto A. The same through 166's attach-time
+/// lineage follow, where B's row names A's (detached) row DIRECTLY. POSITIVE
+/// CONTROL: a fresh successor of B is copied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    attach_role(&pool, a).await;
+    let x = register_id(&pool, &new_identity(), Some(a)).await;
+    let b = register_id(&pool, &new_identity(), Some(x)).await;
+    assert_eq!(live_rows(&pool, b).await.len(), 1, "PREMISE: B got a copy");
+    let direct: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_succession WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(b)
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("succession");
+    assert_eq!(direct, 0, "PREMISE: no direct reverse pair");
+    assert_eq!(detach_role(&pool, a).await, 1, "A detached");
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "a copy whose chain reaches A's own attachment is not copied onto A"
+    );
+    assert_eq!(withheld(&pool, a).await, Some(1));
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    assert_eq!(
+        live_rows(&pool, c).await.len(),
+        1,
+        "POSITIVE CONTROL: a fresh successor of B is copied"
+    );
+
+    // The attach-time follow: the lineage is registered first, then A2 is
+    // attached, and 166 copies A2's row to B2 directly (no row of X2 between).
+    let a2_id = new_identity();
+    let a2 = register_id(&pool, &a2_id, None).await;
+    let x2 = register_id(&pool, &new_identity(), Some(a2)).await;
+    let b2 = register_id(&pool, &new_identity(), Some(x2)).await;
+    let ra2 = attach_role(&pool, a2).await;
+    let b2_rows = live_rows(&pool, b2).await;
+    assert_eq!(b2_rows.len(), 1, "PREMISE: B2 got a copy");
+    assert_eq!(b2_rows[0].1, Some(ra2), "PREMISE: naming A2's row directly");
+    assert_eq!(detach_role(&pool, a2).await, 1, "A2 detached");
+    assert_eq!(
+        register_id(&pool, &a2_id, Some(b2)).await,
+        a2,
+        "the revert is A2"
+    );
+    assert!(
+        live_rows(&pool, a2).await.is_empty(),
+        "a copy of A2's own detached row is not copied back onto A2"
+    );
+    assert_eq!(withheld(&pool, a2).await, Some(1));
+}
+
+/// THE REVERSE-PAIR GUARD ALONE (the chain does not reach the child). B
+/// succeeded A while nothing was attached; the operator then attaches B
+/// itself (its own root row); the job reverts, so A is registered with B as
+/// its parent. B's row names no row of A, but "B succeeded A" is on record,
+/// so nothing is copied onto A. POSITIVE CONTROL: a fresh successor of B is
+/// copied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    let b = register_id(&pool, &new_identity(), Some(a)).await;
+    assert!(
+        live_rows(&pool, b).await.is_empty(),
+        "PREMISE: nothing to copy yet"
+    );
+    let rb = attach_role(&pool, b).await;
+    assert_eq!(
+        live_rows(&pool, b).await,
+        vec![(rb, None)],
+        "PREMISE: B's own row"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "PREMISE: A holds nothing"
+    );
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "nothing is copied onto the parent's own recorded predecessor"
+    );
+    assert_eq!(withheld(&pool, a).await, Some(1));
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    let c_rows = live_rows(&pool, c).await;
+    assert_eq!(
+        c_rows.len(),
+        1,
+        "POSITIVE CONTROL: a fresh successor of B is copied"
+    );
+    assert_eq!(c_rows[0].1, Some(rb), "from B's own row");
+}

@@ -1,6 +1,7 @@
 -- 180_aid03_legacy_fleet_parent.sql
--- Accept a legacy fleet identity as a registration parent (AID03), and record
--- after the fact the succession that the refusal skipped.
+-- Accept a legacy fleet identity as a registration parent (AID03), record
+-- after the fact the succession that the refusal skipped, and stop the
+-- registration copying a role attachment back onto the identity it came from.
 --
 -- ===================================================================
 -- 1. WHY
@@ -91,12 +92,35 @@
 -- 3. REGISTRATION, RE-STATED
 --
 -- `epigraph_register_agent_identity` is re-stated from 166's body (the latest;
--- a precondition below checks its md5) with exactly one delta, marked `180`:
--- the AID03 test accepts a parent for which the rule above holds. The AID03
--- message, code and HINT are unchanged (the host matches on the code).
+-- a precondition below checks its md5) with two deltas, each line marked
+-- `180`:
+--   * the AID03 test accepts a parent for which the rule above holds. The
+--     AID03 message, code and HINT are unchanged (the host matches on the
+--     code);
+--   * step 5b (166's copy of the parent's role attachments to the child)
+--     NEVER COPIES BACK ONTO ITS SOURCE: a parent row is not copied when its
+--     `inherited_from` chain, detached rows included, reaches a row of the
+--     child, or when the succession "the parent succeeded the child" is
+--     already on record. Both are a REVERT: the job went back to an earlier
+--     prompt or model, so the host names the later identity as the earlier
+--     one's parent (the host cannot tell a revert from a new identity: agent
+--     ids are database-assigned). Without this, the earlier identity got
+--     back, as a copy of its successor's row, the attachment the operator
+--     had DETACHED from it. Where an attachment is a grant (a role binding
+--     that admits the role's attached agents), that is a revoked identity
+--     regaining the group. The guards hold whether or not such a binding
+--     mode is applied; a withheld row is counted in the registration's
+--     audit row (`role_attachments_withheld`). Not covered, by design: a
+--     revert to an identity two or more successions back whose parent was
+--     attached directly (the chain names no row of the child and no direct
+--     reverse pair is on record); the copy then follows the operator's own
+--     attachment of the parent, as an attach-time lineage follow would.
 -- Signature, owner and ACL are unchanged (CREATE OR REPLACE keeps them; the
 -- ACL stays the attestor's alone). A later migration that re-bodies the
--- registration starts from this body.
+-- registration starts from this body. The precondition reads only 166's
+-- body, which no other migration in flight re-states (179 re-states the
+-- group-role derivation, not the registration), so it holds whether 179 is
+-- applied before this file, after it, or not at all.
 --
 -- ===================================================================
 -- 4. THE AFTER-THE-FACT RECORD:
@@ -150,7 +174,9 @@
 -- `docs/runbooks/180-undo.sql` restores 166's registration body byte for byte
 -- and drops the two functions this file creates. Run it before
 -- `166-undo.sql`. Succession rows it recorded stay (the table is
--- append-only), as do their audit rows.
+-- append-only), as do their audit rows. The undo also removes step 5b's
+-- never-back-onto-its-source guard: a revert then copies the successor's
+-- row back onto the earlier identity again.
 
 SET LOCAL lock_timeout = '3s';
 
@@ -271,6 +297,8 @@ DECLARE
     v_rec_hash   text;
     v_roles_new  integer := 0;  -- 166
     v_shared     boolean := false;  -- 166
+    v_reverse    boolean := false;  -- 180
+    v_withheld   integer := 0;  -- 180
     i            integer;
 BEGIN
     -- Inputs.
@@ -661,7 +689,36 @@ BEGIN
     -- identity is dormant in every group it runs in while the role has no
     -- holder, so the audit row below FLAGS it (`role_attachments_shared =
     -- 'shared_identity'`) for the host to alert every group affected.
+    -- 180: NEVER BACK ONTO ITS SOURCE. A parent row is not copied when the
+    -- child is that row's own source: when its `inherited_from` chain
+    -- (detached rows included: a detached source is exactly the case) reaches
+    -- a row of the child, or when "the parent succeeded the child" is already
+    -- on record. That is a REVERT (the job went back to an earlier prompt or
+    -- model, so the host names the later identity as the earlier one's
+    -- parent), and copying would hand the earlier identity back the
+    -- attachment the operator may have detached from it. Withheld rows are
+    -- counted in the audit row (`role_attachments_withheld`).
     IF v_parent IS NOT NULL THEN
+        v_reverse := EXISTS (SELECT 1 FROM public.agent_succession s
+                              WHERE s.child_agent_id = v_parent
+                                AND s.parent_agent_id = v_child);  -- 180
+        SELECT count(*) INTO v_withheld  -- 180
+          FROM public.role_agents pr
+         WHERE pr.agent_id = v_parent AND pr.detached_at IS NULL
+           AND (pr.valid_to IS NULL OR pr.valid_to > now())
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+           AND (v_reverse
+                OR EXISTS (
+                       WITH RECURSIVE up (hop_id, hop_agent, hop_source) AS (
+                           SELECT u.id, u.agent_id, u.inherited_from
+                             FROM public.role_agents u WHERE u.id = pr.inherited_from
+                           UNION
+                           SELECT u.id, u.agent_id, u.inherited_from
+                             FROM public.role_agents u JOIN up ON u.id = up.hop_source
+                       )
+                       SELECT 1 FROM up WHERE up.hop_agent = v_child));
         INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
                                         inherited_from)
         SELECT pr.role, v_child, lower(g.gap), upper(g.gap),
@@ -679,6 +736,17 @@ BEGIN
            AND NOT EXISTS (
                    SELECT 1 FROM public.role_agents c
                     WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+           -- 180: never back onto its source (above).
+           AND NOT v_reverse
+           AND NOT EXISTS (
+                   WITH RECURSIVE up (hop_id, hop_agent, hop_source) AS (
+                       SELECT u.id, u.agent_id, u.inherited_from
+                         FROM public.role_agents u WHERE u.id = pr.inherited_from
+                       UNION
+                       SELECT u.id, u.agent_id, u.inherited_from
+                         FROM public.role_agents u JOIN up ON u.id = up.hop_source
+                   )
+                   SELECT 1 FROM up WHERE up.hop_agent = v_child)
          ORDER BY pr.role, lower(g.gap);
         GET DIAGNOSTICS v_roles_new = ROW_COUNT;
         v_shared := v_roles_new > 0
@@ -708,6 +776,7 @@ BEGIN
                                    'role_attachments_copied', v_roles_new,
                                    'role_attachments_shared',
                                    CASE WHEN v_shared THEN 'shared_identity' END,
+                                   'role_attachments_withheld', v_withheld,  -- 180
                                    'recorded_by', session_user));
     END IF;
 

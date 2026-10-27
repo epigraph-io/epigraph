@@ -1654,9 +1654,14 @@ restart.
   not a keyless OAuth human (`key_kind 'derived'` or the `oauth-principal`
   label), never a `human_operators` row (revoked included), and no
   `client_type 'human'` OAuth client naming it as `agent_id` (any status).
-  Re-states `epigraph_register_agent_identity` from 166's body with one
-  marked delta: AID03 also accepts a parent for which that holds (161's live
-  human-operator refusal still applies to every parent). Adds
+  Re-states `epigraph_register_agent_identity` from 166's body with two
+  marked deltas: AID03 also accepts a parent for which that holds (161's live
+  human-operator refusal still applies to every parent); and step 5b never
+  copies a parent's role attachment back onto its source, i.e. when the
+  row's `inherited_from` chain (detached rows included) reaches a row of the
+  child, or "the parent succeeded the child" is on record (a revert to an
+  earlier, possibly detached identity), counting withheld rows in the audit
+  row (`role_attachments_withheld`). Adds
   `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
   maintenance-session only and audited (`agent.identity_succession_recorded`):
   for a child the host registered parentless in that folder, with no
@@ -1680,7 +1685,8 @@ restart.
   links are retired, a cut-over naming a legacy parent falls back to a
   parentless registration plus an alert, and the record refuses it: record
   any skipped succession first. **Deploy order:** after 166; independent of
-  179. Run `180-undo.sql` before `166-undo.sql`. **Applied to
+  179 (179 does not touch the registration, so 180's precondition holds
+  either way). Run `180-undo.sql` before `166-undo.sql`. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
 - **166**: public `role_attached_agents` (agent identity lineage design D6:
