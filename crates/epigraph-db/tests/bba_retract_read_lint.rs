@@ -60,7 +60,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-cli/src/recompute_betp.rs", "template_row_ids", 1, "ids of ingest-template rows, used only to drop them from rows a filtered reader already returned"),
     ("crates/epigraph-cli/src/shadow_report.rs", "attributed_rows", 1, "narrows ids a filtered reader already returned to the attributed_v1 ones; it cannot add a row"),
     // --- epigraph-db --------------------------------------------------------
-    ("crates/epigraph-db/src/repos/claim.rs", "const CANONICAL_HOLDS_KEY_SQL", 1, "dedup move: the upsert key collision test; a retracted row holds its key (migration 034's unique constraint)"),
+    ("crates/epigraph-db/src/repos/claim.rs", "const CANONICAL_HOLDS_KEY_SQL", 1, "dedup move: the upsert key collision test; a retracted row holds its key (migration 034's unique constraint), so a duplicate's LIVE row at that key stays on the duplicate and the merged claim folds neither (known limit, pinned by bba_retract.rs::a_dedup_keeps_a_live_row_whose_key_a_retracted_canonical_row_holds)"),
     ("crates/epigraph-db/src/repos/claim.rs", "mark_duplicate_act_attributed_conn", 1, "dedup guard: whether the duplicate holds ANY stored BBA the repair will move; retracted rows move with their marks"),
     ("crates/epigraph-db/src/repos/claim.rs", "repair_marked_duplicate", 7, "dedup repair: moves, snapshots and collision-checks stored rows, retracted ones included with their marks; no fold"),
     ("crates/epigraph-db/src/repos/claim.rs", "reverse_marked_duplicate", 3, "dedup undo: puts the repair's rows back, retracted ones included with their marks; no fold"),
