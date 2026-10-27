@@ -309,3 +309,94 @@ async fn the_mark_is_a_maintenance_owned_definer_the_app_role_executes(pool: PgP
         "(PUBLIC, epigraph_app, epigraph_maintenance) EXECUTE"
     );
 }
+
+/// "Live" admin: an admin whose membership has been revoked (`revoked_at`
+/// set) is refused like a stranger, and nothing changes. The CONTROL is a live
+/// admin of the same group marking it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_admin_cannot_mark(pool: PgPool) {
+    let creator = seed_agent(&pool, "181-revoked-creator").await;
+    let former = seed_agent(&pool, "181-revoked-former").await;
+    let group = seed_group(&pool, creator).await;
+    seed_member(&pool, group, former, "admin").await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(group)
+    .bind(former)
+    .execute(&pool)
+    .await
+    .expect("revoke the former admin");
+    let before = row(&pool, group).await;
+
+    assert_refused(
+        call_as_app(&pool, Some(former), group).await,
+        "a revoked admin",
+    );
+    assert_eq!(
+        row(&pool, group).await,
+        before,
+        "the group row is unchanged"
+    );
+
+    call_as_app(&pool, Some(creator), group)
+        .await
+        .expect("CONTROL: a live admin of the same group marks it");
+    assert!(row(&pool, group).await["reseal_required_at"].is_string());
+}
+
+/// The privileged arm: a session whose LOGIN is a non-superuser member of
+/// `epigraph_maintenance` (`epigraph_bypass()`) marks a group it holds no
+/// membership in. That session already writes the column directly; the arm
+/// keeps the repository's pool form usable on the maintenance pool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_session_marks_without_a_membership(pool: PgPool) {
+    use sqlx::Executor;
+    let creator = seed_agent(&pool, "181-maint-creator").await;
+    let group = seed_group(&pool, creator).await;
+    let before = row(&pool, group).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .expect("downgrade to the maintenance role");
+    let (superuser, bypass): (bool, bool) = sqlx::query_as(
+        "SELECT r.rolsuper, public.epigraph_bypass() FROM pg_roles r \
+          WHERE r.rolname = session_user",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("session state");
+    assert_eq!(
+        (superuser, bypass),
+        (false, true),
+        "CALIBRATION: a non-superuser maintenance session, admitted by epigraph_bypass()"
+    );
+    let r = sqlx::query(CALL).bind(group).execute(&mut *conn).await;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset the connection");
+    r.expect("a maintenance session marks the group");
+
+    let after = row(&pool, group).await;
+    assert!(after["reseal_required_at"].is_string(), "marked: {after}");
+    assert_eq!(other_columns(after), other_columns(before));
+}
+
+/// A privileged call on a group id that matches no row is refused with
+/// `GRA02` / 42501 rather than succeeding silently: an obligation not
+/// recorded is the failure the definer exists to prevent. (An application
+/// session never reaches this arm for a nonexistent id: it is no admin of it,
+/// so `GRA01` refuses first.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mark_on_no_group_is_refused_with_gra02(pool: PgPool) {
+    let missing = Uuid::new_v4();
+    let err = sqlx::query(CALL)
+        .bind(missing)
+        .execute(&pool)
+        .await
+        .expect_err("a mark that matched no row must be refused");
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("42501"), "{db}");
+    assert!(db.message().starts_with("GRA02:"), "{}", db.message());
+}
