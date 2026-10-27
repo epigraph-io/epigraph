@@ -173,7 +173,31 @@ async fn the_http_edge_writers_attest_their_edges_with_the_api_key() {
             }),
         )
         .await;
-        assert_attested(&pool, id_of(&out, "id"), signer_id, &format!("edges {rel}")).await;
+        let e = id_of(&out, "id");
+        assert_attested(&pool, e, signer_id, &format!("edges {rel}")).await;
+        // The same link again (the symmetric arm from the reverse direction):
+        // a dedup hit returns the edge and writes nothing onto it.
+        let before = stored_attestation(&pool, e).await;
+        let (s, t) = if rel == "CONTRADICTS" {
+            (c[3 + 2 * i], c[2 + 2 * i])
+        } else {
+            (c[2 + 2 * i], c[3 + 2 * i])
+        };
+        if rel != "supports" {
+            let again = post(
+                addr,
+                &token,
+                "/api/v1/edges",
+                serde_json::json!({
+                    "source_id": s, "target_id": t,
+                    "source_type": "claim", "target_type": "claim",
+                    "relationship": rel, "if_not_exists": if_not_exists,
+                }),
+            )
+            .await;
+            assert_eq!(id_of(&again, "id"), e, "edges {rel} dedup: {again}");
+            assert_eq!(stored_attestation(&pool, e).await, before, "edges {rel}");
+        }
     }
 
     // POST /api/v1/claims/:id/relate: both RELATES_TO edges.

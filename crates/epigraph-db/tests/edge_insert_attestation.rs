@@ -235,6 +235,23 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
         s,
         "create_if_absent_including_retracted (with valid_from)",
     );
+    let before = stored_attestation(&pool, row.id).await;
+    let (again, created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        &mut conn,
+        key,
+        c[2],
+        "claim",
+        c[3],
+        "claim",
+        "decomposes_to",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("dedup");
+    assert!(!created && again.id == row.id);
+    assert_eq!(stored_attestation(&pool, row.id).await, before);
 
     // create_processed_by_stamp_if_absent_signed_conn.
     assert!(
@@ -252,6 +269,16 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
     .await
     .expect("stamp row");
     assert_attested(&verify(&pool, stamp_id).await, s, "processed_by stamp");
+    let before = stored_attestation(&pool, stamp_id).await;
+    assert!(
+        !EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(
+            &mut conn, key, paper, s, "r50:v1", "r50",
+        )
+        .await
+        .expect("stamp again"),
+        "the same stamp again is a dedup hit"
+    );
+    assert_eq!(stored_attestation(&pool, stamp_id).await, before);
 
     // The symmetric family: returning, oriented, row; each then deduped from
     // the reverse direction.
@@ -293,6 +320,7 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
     .expect("oriented");
     assert!(up.was_created && up.source_id == c[6] && up.target_id == c[7]);
     assert_attested(&verify(&pool, up.edge_id).await, s, "symmetric oriented");
+    let before = stored_attestation(&pool, up.edge_id).await;
     let reverse = EdgeRepository::create_symmetric_if_absent_oriented_signed_conn(
         &mut conn,
         key,
@@ -309,6 +337,7 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
         (c[6], c[7]),
         "the stored orientation"
     );
+    assert_eq!(stored_attestation(&pool, up.edge_id).await, before);
 
     let (row, created) = EdgeRepository::create_symmetric_if_absent_row_signed_conn(
         &mut conn,
@@ -324,6 +353,140 @@ async fn every_signed_primitive_attests_its_insert_and_not_a_dedup_hit(pool: PgP
     .expect("row");
     assert!(created);
     assert_attested(&verify(&pool, row.id).await, s, "symmetric row");
+    let before = stored_attestation(&pool, row.id).await;
+    let (again, created) = EdgeRepository::create_symmetric_if_absent_row_signed_conn(
+        &mut conn,
+        key,
+        c[2],
+        c[1],
+        "corroborates",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("row dedup");
+    assert!(!created && again.id == row.id);
+    assert_eq!(stored_attestation(&pool, row.id).await, before);
+}
+
+/// A dedup hit onto ANOTHER writer's UNSIGNED edge writes nothing onto it, in
+/// every symmetric twin and the directed one: the signer attests only an edge
+/// its own INSERT created, never a row it found.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_hit_onto_another_writers_unsigned_edge_stays_unsigned(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x54; 32]).expect("signer");
+    let s = seed_signer_agent(&pool, "r50-foreign", &signer).await;
+    let key = Some(EdgeSigningKey {
+        signer: &signer,
+        signer_id: s,
+    });
+    let mut c = Vec::new();
+    for i in 0..8 {
+        c.push(fixture::seed_public_claim(&pool, s, &format!("R-50 foreign {i}")).await);
+    }
+    let mut conn = pool.acquire().await.expect("conn");
+    // Another writer's edges, unsigned (no key).
+    let (alt, _) = EdgeRepository::create_symmetric_if_absent_returning_signed_conn(
+        &mut conn,
+        None,
+        c[0],
+        c[1],
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("unsigned alternative_of");
+    let contra = EdgeRepository::create_symmetric_if_absent_oriented_signed_conn(
+        &mut conn,
+        None,
+        c[2],
+        c[3],
+        "contradicts",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("unsigned contradicts")
+    .edge_id;
+    let (corro, _) = EdgeRepository::create_symmetric_if_absent_row_signed_conn(
+        &mut conn,
+        None,
+        c[4],
+        c[5],
+        "corroborates",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("unsigned corroborates");
+    let (sup, _) = EdgeRepository::create_if_not_exists_signed_conn(
+        &mut conn, None, c[6], "claim", c[7], "claim", "supports", None, None, None,
+    )
+    .await
+    .expect("unsigned supports");
+    for e in [alt, contra, corro.id, sup.id] {
+        assert_eq!(
+            stored_attestation(&pool, e).await,
+            (None, None),
+            "calibration"
+        );
+    }
+
+    // The keyed writer asserts each again (the symmetric ones reversed).
+    let (hit, created) = EdgeRepository::create_symmetric_if_absent_returning_signed_conn(
+        &mut conn,
+        key,
+        c[1],
+        c[0],
+        "alternative_of",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("returning dedup");
+    assert!(!created && hit == alt);
+    let hit = EdgeRepository::create_symmetric_if_absent_oriented_signed_conn(
+        &mut conn,
+        key,
+        c[3],
+        c[2],
+        "contradicts",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("oriented dedup");
+    assert!(!hit.was_created && hit.edge_id == contra);
+    let (hit, created) = EdgeRepository::create_symmetric_if_absent_row_signed_conn(
+        &mut conn,
+        key,
+        c[5],
+        c[4],
+        "corroborates",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("row dedup");
+    assert!(!created && hit.id == corro.id);
+    let (hit, created) = EdgeRepository::create_if_not_exists_signed_conn(
+        &mut conn, key, c[6], "claim", c[7], "claim", "supports", None, None, None,
+    )
+    .await
+    .expect("directed dedup");
+    assert!(!created && hit.id == sup.id);
+    for (e, what) in [
+        (alt, "alternative_of"),
+        (contra, "contradicts"),
+        (corro.id, "corroborates"),
+        (sup.id, "supports"),
+    ] {
+        assert_eq!(
+            stored_attestation(&pool, e).await,
+            (None, None),
+            "{what}: a dedup hit signed another writer's edge"
+        );
+    }
 }
 
 /// The signature is over the row AS STORED. A database that rewrites a column

@@ -163,7 +163,7 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let c: Vec<Uuid> = {
         let mut v = Vec::new();
-        for i in 0..8 {
+        for i in 0..10 {
             v.push(submit(&server, &pool, &format!("R-49 link endpoint {i}")).await);
         }
         v
@@ -209,6 +209,39 @@ async fn the_link_tools_attest_their_edges_and_not_a_dedup_hit(pool: PgPool) {
     .expect("link_epistemic contradicts");
     let contradicts = uuid_field(&common::first_text(&out), "edge_id");
     assert_server_attested(&pool, contradicts, "link_epistemic contradicts").await;
+    // The symmetric arm's dedup hit, from the reverse direction.
+    let before = stored_attestation(&pool, contradicts).await;
+    let again = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
+        &server,
+        &viewer,
+        epistemic(c[3], c[2], "contradicts"),
+        None,
+    )
+    .await
+    .expect("link_epistemic contradicts reversed");
+    assert_eq!(
+        uuid_field(&common::first_text(&again), "edge_id"),
+        contradicts
+    );
+    assert_eq!(stored_attestation(&pool, contradicts).await, before);
+    // And onto another writer's UNSIGNED symmetric edge: returned, not signed.
+    common::insert_claim_edge(&pool, c[8], c[9], "contradicts").await;
+    let foreign = edges_of(&pool, c[8], "contradicts").await;
+    assert_eq!(foreign.len(), 1, "{foreign:?}");
+    let out = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
+        &server,
+        &viewer,
+        epistemic(c[9], c[8], "contradicts"),
+        None,
+    )
+    .await
+    .expect("link_epistemic onto an unsigned symmetric edge");
+    assert_eq!(uuid_field(&common::first_text(&out), "edge_id"), foreign[0]);
+    assert_eq!(
+        stored_attestation(&pool, foreign[0]).await,
+        (None, None),
+        "a symmetric dedup hit signed another writer's edge"
+    );
 
     // link_alternative.
     let out = epigraph_mcp::tools::link_alternative::do_link_alternative(
