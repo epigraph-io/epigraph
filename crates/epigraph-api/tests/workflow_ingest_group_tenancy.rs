@@ -2013,3 +2013,106 @@ async fn a_non_member_cannot_extend_a_lineage_whose_head_is_private(pool: PgPool
     );
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
 }
+
+/// The MCP twin of the search half of
+/// [`a_declared_generations_workflow_row_is_hidden_from_a_non_member`]:
+/// `find_workflow_hierarchical` reads as its caller, so the non-member finds
+/// the public generation only and the member finds both. The goal embeddings
+/// are cleared first so both callers take the same (text) path; the stamp
+/// applies to the embedding path identically.
+#[sqlx::test(migrations = "../../migrations")]
+async fn over_mcp_a_declared_generation_is_found_only_by_its_group(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-hidden-mcp-search";
+    let (w1, w2) = reused_step_generations(&w, &pool, name).await;
+    sqlx::query("UPDATE workflows SET goal_embedding = NULL")
+        .execute(&pool)
+        .await
+        .expect("clear goal embeddings");
+    let found = |agent: Uuid| {
+        let pool = pool.clone();
+        let server = &w.c_server;
+        async move {
+            let viewer = epigraph_db::Viewer::resolve(&pool, agent)
+                .await
+                .expect("viewer");
+            let out = epigraph_mcp::tools::workflow_hierarchical::find_workflow_hierarchical(
+                server,
+                &viewer,
+                epigraph_mcp::types::FindWorkflowHierarchicalParams {
+                    query: name.to_string(),
+                    limit: Some(50),
+                    resolve_to_latest: None,
+                    min_truth: Some(0.0),
+                },
+            )
+            .await
+            .expect("the search runs");
+            let body = tool_json(&out);
+            body["workflows"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a workflows array: {body}"))
+                .iter()
+                .map(|r| uuid_of(&r["workflow_id"]))
+                .filter(|id| *id == w1 || *id == w2)
+                .collect::<BTreeSet<Uuid>>()
+        }
+    };
+    assert_eq!(
+        found(w.h2).await,
+        BTreeSet::from([w1]),
+        "a non-member finds the public generation only"
+    );
+    assert_eq!(found(w.h).await, BTreeSet::from([w1, w2]));
+}
+
+/// CHARACTERIZATION (operator question, R-74 residual): a member improves a
+/// lineage whose only generation is declared into its group. The new
+/// generation is numbered past the group's head (`new_generation` 1, read on
+/// the ingest system agent's stamp, which reads the group), and the call
+/// succeeds; the new generation is NOT declared into the group, so its row is
+/// public, as before migration 183. Whether a new generation should inherit
+/// its head's group (as a superseding claim does) is the open question.
+#[sqlx::test(migrations = "../../migrations")]
+async fn characterization_improving_a_group_lineage_numbers_past_its_head(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-improve-group-head";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(extraction(name, 0, &[&["acme improve op"]]), Some(w.g)),
+    )
+    .await
+    .expect("the curator declares generation 0 into the team group");
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let params: epigraph_mcp::types::ImproveWorkflowHierarchyParams =
+        serde_json::from_value(json!({
+            "parent_canonical_name": name,
+            "extraction": extraction(name, 0, &[&["acme improve op"], &["acme improved op"]]),
+        }))
+        .expect("the tool's parameters");
+    let out = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy(
+        &w.c_server,
+        &viewer,
+        params,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the improvement is accepted: {}", e.message));
+    let body = tool_json(&out);
+    assert_eq!(body["new_generation"], json!(1), "{body}");
+    let tenancy: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT generation, visibility::text FROM workflows \
+          WHERE canonical_name = $1 ORDER BY generation",
+    )
+    .bind(name)
+    .fetch_all(&pool)
+    .await
+    .expect("lineage rows");
+    assert_eq!(
+        tenancy,
+        vec![(0, "group".to_string()), (1, "public".to_string())],
+        "CHARACTERIZATION: the new generation is public (operator question)"
+    );
+}
