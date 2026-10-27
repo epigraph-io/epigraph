@@ -20,11 +20,13 @@
 //!
 //! # What is under test
 //!
-//! * The legacy fleet parent (operator-linked) is accepted, its operator is
-//!   inherited, and the succession is recorded.
+//! * The legacy fleet parent (operator-linked, LIVE) is accepted, its
+//!   operator is inherited, and the succession is recorded.
 //! * A row no operator linked is refused, even when it set `llm_model` on
 //!   itself and the backfill keyed it: the parent is found by a key anyone
-//!   can compute, so only attested state may admit it.
+//!   can compute, so only attested state may admit it. So is a row whose
+//!   only link is RETIRED: a bulk ownership tie or a retired legacy link,
+//!   on the registration and on the record.
 //! * A REAL human keeps being refused even when it carries the full legacy
 //!   shape (`llm_model`, an operator link, a backfilled legacy key,
 //!   `agent_type 'human'`): a registered human operator, a revoked one, a
@@ -791,14 +793,99 @@ async fn a_self_described_llm_row_no_operator_linked_is_refused_aid03(pool: PgPo
     assert!(child.succession_created, "{child:?}");
 }
 
+/// A BULK OWNERSHIP TIE IS NOT AN ATTESTATION. `epigraph_link_legacy_authors`
+/// ties every unlinked AUTHOR (here of one recall event) to an operator with
+/// a RETIRED link, which says "this author's rows belong to that operator",
+/// not "the operator linked this row as one of its agents". A planted,
+/// self-described row tied that way, and keyed by a later backfill run, must
+/// stay refused AID03, by the registration and by the record. CONTROL: a
+/// legacy fleet row the operator live-linked, in the same database, passes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bulk_retired_ownership_tie_does_not_make_a_planted_row_a_parent_aid03(pool: PgPool) {
+    let planted = self_described_llm_row(&pool).await;
+    sqlx::query(
+        "INSERT INTO recall_events (agent_id, tool, query_text) VALUES ($1, 'recall', 'x')",
+    )
+    .bind(planted)
+    .execute(&pool)
+    .await
+    .expect("the planted row authors a recall event");
+    let operator = human_operator(&pool).await;
+    let outcomes: Vec<(Uuid, String)> =
+        fixture::as_role(&pool, MAINTENANCE, |mut conn| async move {
+            let r: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT agent_id, outcome FROM public.epigraph_link_legacy_authors( \
+                     $1, '{}', now() - interval '30 days')",
+            )
+            .bind(operator)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("the maintenance role runs link-legacy-authors");
+            (conn, r)
+        })
+        .await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .find(|(a, _)| *a == planted)
+            .map(|x| x.1.as_str()),
+        Some("linked"),
+        "CALIBRATION: the bulk run tied the planted row: {outcomes:?}"
+    );
+    let retired: Option<bool> =
+        sqlx::query_scalar("SELECT retired FROM operator_links WHERE agent_id = $1")
+            .bind(planted)
+            .fetch_optional(&pool)
+            .await
+            .expect("link row");
+    assert_eq!(
+        retired,
+        Some(true),
+        "CALIBRATION: the tie is a RETIRED link"
+    );
+    backfill_legacy_keys(&pool).await;
+    assert!(
+        has_legacy_key(&pool, planted).await,
+        "CALIBRATION: a later backfill keyed it"
+    );
+
+    let before = footprint(&pool).await;
+    let err = try_register(&pool, &new_identity(), Some(planted), GROUP)
+        .await
+        .expect_err("a bulk-tied planted row is not a parent");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+
+    // The record path: a parentless child of the same operator, live-linked.
+    let child = try_register(&pool, &new_identity(), None, GROUP)
+        .await
+        .expect("a parentless registration");
+    link(&pool, child.agent_id, operator).await;
+    let err = try_record(&pool, child.agent_id, planted, GROUP)
+        .await
+        .expect_err("the record refuses the bulk-tied row");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID10"), "{err}");
+
+    // CONTROL: an operator-linked (live) legacy row passes in this database.
+    let fleet = legacy_fleet_row(&pool).await;
+    backfill_legacy_keys(&pool).await;
+    link(&pool, fleet, operator).await;
+    let ok = try_register(&pool, &new_identity(), Some(fleet), GROUP)
+        .await
+        .expect("a live-linked legacy parent is accepted");
+    assert!(ok.succession_created, "{ok:?}");
+}
+
 /// The shape of a real cut-over parent: three legacy fleet identities of ONE
 /// operator, each `agent_type 'human'` (the old default) with `llm_model`, a
 /// live operator link, an `identity-legacy` key for its own public key, key
 /// kind `ed25519`, no `oauth-principal` label, no `human_operators` row and
 /// no human OAuth client. Each is accepted as a parent and passes its
-/// operator on. A link the operator has since RETIRED still attests the
-/// parent (the legacy links are scheduled for retirement), so a parent
-/// retired before its group registers is accepted too.
+/// operator on. Only a LIVE link attests: once the operator RETIRES a
+/// parent's link (the legacy links are scheduled for retirement), that
+/// parent is refused AID03 and the host falls back to a parentless
+/// registration and alerts. A retired row also results from bulk ownership
+/// ties, which attest nothing about the row being a fleet identity.
 #[sqlx::test(migrations = "../../migrations")]
 async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPool) {
     let operator = human_operator(&pool).await;
@@ -856,11 +943,17 @@ async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPoo
     }
 
     retire_link(&pool, parents[0]).await;
-    let child = try_register(&pool, &new_identity(), Some(parents[0]), GROUP)
+    let before = footprint(&pool).await;
+    let err = try_register(&pool, &new_identity(), Some(parents[0]), GROUP)
         .await
-        .expect("a parent whose link was retired is still attested");
+        .expect_err("a parent whose link was retired no longer attests");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+    // CONTROL: the operator's other parents, still live-linked, still pass.
+    let child = try_register(&pool, &new_identity(), Some(parents[1]), GROUP)
+        .await
+        .expect("a live-linked legacy parent is still accepted");
     assert!(child.succession_created, "{child:?}");
-    assert_eq!(child.inherit_reason.as_deref(), Some("parent_link_retired"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -977,17 +1070,35 @@ async fn the_maintenance_role_records_a_skipped_legacy_succession(pool: PgPool) 
     );
 }
 
-/// A parent whose link the operator has since RETIRED still names the same
-/// operator (122's `human_of(.., false)`), so the record is still accepted:
-/// the legacy links are scheduled for retirement.
+/// The record path asks the same rule: once the operator RETIRES the legacy
+/// parent's link, the after-the-fact record is refused AID10 and writes
+/// nothing (record it BEFORE the legacy links are retired). CONTROL: the
+/// same record is accepted while the link is live (a fresh incident).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_retired_legacy_parent_link_still_names_the_operator(pool: PgPool) {
+async fn a_legacy_parent_whose_link_was_retired_is_refused_aid10(pool: PgPool) {
     let inc = incident(&pool).await;
     retire_link(&pool, inc.parent).await;
-    assert_eq!(human_of(&pool, inc.parent, true).await, None);
-    let r = try_record(&pool, inc.child, inc.parent, GROUP)
+    assert_eq!(human_of(&pool, inc.parent, true).await, None, "PREMISE");
+    assert_eq!(
+        human_of(&pool, inc.parent, false).await,
+        Some(inc.operator),
+        "PREMISE: the retired link still names the operator"
+    );
+    let before = footprint(&pool).await;
+    let err = try_record(&pool, inc.child, inc.parent, GROUP)
         .await
-        .expect("a retired parent link still names the operator");
+        .expect_err("a retired legacy parent link is refused");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID10"), "{err}");
+    assert!(
+        err.to_string().contains("not a legacy fleet parent"),
+        "the rule refused it: {err}"
+    );
+    assert_eq!(footprint(&pool).await, before, "nothing was recorded");
+
+    let live = incident(&pool).await;
+    let r = try_record(&pool, live.child, live.parent, GROUP)
+        .await
+        .expect("CONTROL: a live-linked legacy parent is recorded");
     assert!(r.recorded);
 }
 
@@ -1570,3 +1681,4 @@ async fn the_180_undo_restores_the_catalog_below_180(pool: PgPool) {
         .expect_err("after the undo the legacy parent is refused again");
     assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
 }
+

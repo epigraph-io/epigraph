@@ -25,15 +25,25 @@
 --       default, which is the only shape this repairs. Every other type (a
 --       role node, a `system` or `software_agent` row) stays on 161's test,
 --       unchanged, even though the backfill keyed it too;
---   (a) an operator linked it: an `operator_links` row of any state names
---       it as the AGENT. Only a maintenance session or a maintenance-owned
---       definer writes one (107), so this is attested: an operator linked
---       it as one of its agents (a link retired since still attests that).
---       `llm_model` is NOT read: the row may set it on itself, and the old
---       create path recorded it best-effort only. This is the conjunct that
---       refuses a keyed (ed25519) human with no OAuth client and no link,
---       and a row that described itself as an LLM, which nothing below
---       catches;
+--   (a) an operator linked it, LIVE: an `operator_links` row that is NOT
+--       retired names it as the AGENT. Only a maintenance session or a
+--       maintenance-owned definer writes one (107), and a live link is the
+--       operator's act "this is one of my agents". A RETIRED link does not
+--       count, because it does not say that: 123's
+--       `epigraph_link_legacy_authors` writes retired links IN BULK for every
+--       unlinked author of a claim, evidence, recall event, perspective and
+--       so on (an ownership tie: "its rows belong to this operator"), with
+--       no look at whether the row is a fleet identity, and 107's
+--       `epigraph_link_retired_agent` retires an identity whose key may be
+--       exposed. So once the legacy links are retired, a cut-over that
+--       names a legacy parent is refused and falls back to a parentless
+--       registration and an alert, by design; record any skipped
+--       succession BEFORE the links retire. `llm_model` is NOT read: the
+--       row may set it on itself, and the old create path recorded it
+--       best-effort only. This is the conjunct that refuses a keyed
+--       (ed25519) human with no OAuth client and no link, a row that
+--       described itself as an LLM, and a planted row a bulk tie reached,
+--       none of which anything below catches;
 --   (b) it holds an `identity-legacy` key for its own public key: 161's
 --       backfill (`epigraph_backfill_legacy_agent_keys`) gives one to every
 --       agent that exists at the cut-over and none to a host-registered
@@ -60,18 +70,22 @@
 -- can plant a row under it and wait for the host to name that row as a
 -- parent: the API create path gives a `'human'` ed25519 row, the row may
 -- set `llm_model` and `labels` on itself (118's column grant, 077's
--- `agents_self_update`), and a later run of the re-runnable key backfill
--- gives it an `identity-legacy` key, because the backfill keys every agent
--- that exists when it runs (humans included). So the ACCEPT side must rest
--- on attested state only, and the operator link (a) is that: without it a
--- planted row would be accepted silently and named, permanently, in the
--- append-only `agent_succession` row and the display parent, where the
--- refusal instead alerts. The legacy key (b) and the human markers (c)-(e)
--- narrow the attested set further. The REFUSE side includes inputs the
--- application role can write (it may INSERT `oauth_clients` by dynamic
--- registration, and may relabel its own row): forging one of those can only
--- make AID03 refuse, which falls back to what happened before this migration
--- (the host registers the child with no parent and alerts). It never admits.
+-- `agents_self_update`), a later run of the re-runnable key backfill gives
+-- it an `identity-legacy` key, because the backfill keys every agent that
+-- exists when it runs (humans included), and if it authored anything a
+-- later bulk `link-legacy-authors` run ties it to an operator with a
+-- RETIRED link. So the ACCEPT side must rest on attested state only, and
+-- the LIVE operator link (a) is that: without it a planted row would be
+-- accepted silently and named, permanently, in the append-only
+-- `agent_succession` row and the display parent, where the refusal instead
+-- alerts. (The `operator.link_recorded` audit row is not used instead: that
+-- event family is not reserved to privileged sessions.) The legacy key (b)
+-- and the human markers (c)-(e) narrow the attested set further. The REFUSE
+-- side includes inputs the application role can write (it may INSERT
+-- `oauth_clients` by dynamic registration, and may relabel its own row):
+-- forging one of those can only make AID03 refuse, which falls back to what
+-- happened before this migration (the host registers the child with no
+-- parent and alerts). It never admits.
 --
 -- ===================================================================
 -- 3. REGISTRATION, RE-STATED
@@ -112,9 +126,10 @@
 --     second, conflicting parent is refused: the first record stands);
 --   * the parent is a legacy fleet parent (the rule above) and is not a live
 --     human operator, and was created no later than the child;
---   * the child is live-linked, and the parent names the SAME operator
---     (`epigraph_human_of(parent, false)`: a parent link retired since still
---     names its operator);
+--   * the child is live-linked, and the parent is live-linked to the SAME
+--     operator (`epigraph_human_of(parent, true)`; the rule above already
+--     refuses a parent whose link is retired, so run the record before the
+--     legacy links retire);
 --   * the parent holds no un-detached, unended role attachment. 166 copies a
 --     parent's attachments to its successor at registration; a legacy
 --     (`'human'`-typed) parent cannot be attached (166's ROL02), so this only
@@ -177,10 +192,11 @@ SET search_path = public, pg_temp AS $$
             WHERE a.id = p_agent
               -- (0) the legacy create path's default type, and only that
               AND a.agent_type = 'human'
-              -- (a) an attested operator link, of any state (never the
+              -- (a) an attested, LIVE operator link (never a retired one,
+              -- which bulk ownership ties also write, and never the
               -- self-writable `llm_model`)
               AND EXISTS (SELECT 1 FROM public.operator_links l
-                           WHERE l.agent_id = a.id)
+                           WHERE l.agent_id = a.id AND NOT l.retired)
               -- (c) not a keyless (OAuth placeholder) human
               AND a.key_kind <> 'derived'
               AND NOT ('oauth-principal' = ANY (COALESCE(a.labels, '{}'::text[])))
@@ -314,7 +330,7 @@ BEGIN
                     WHERE a.id = v_parent AND a.public_key = p_identity_pubkey) THEN
             v_parent := NULL;
         -- 180: a legacy fleet identity (agent_type 'human' by the old create
-        -- path's column default, an operator link, a backfilled
+        -- path's column default, a LIVE operator link, a backfilled
         -- identity-legacy key, and no human marker) is an LLM agent too; see
         -- `epigraph_is_legacy_fleet_parent`.
         ELSIF (NOT EXISTS (SELECT 1 FROM public.agents a
@@ -810,9 +826,9 @@ BEGIN
     -- The parent: a legacy fleet identity that preceded the child.
     IF NOT public.epigraph_is_legacy_fleet_parent(p_parent)
        OR public.epigraph_is_human_operator(p_parent) THEN
-        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, an '
-                        'operator link, an identity-legacy key, and no human marker); nothing '
-                        'was recorded', p_parent
+        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, a '
+                        'live operator link, an identity-legacy key, and no human marker); '
+                        'nothing was recorded', p_parent
             USING ERRCODE = 'AID10';
     END IF;
     IF v_parent_at > v_child_at THEN
@@ -823,7 +839,7 @@ BEGIN
 
     -- One operator for both.
     v_child_op := public.epigraph_human_of(p_child, true);
-    v_parent_op := public.epigraph_human_of(p_parent, false);
+    v_parent_op := public.epigraph_human_of(p_parent, true);
     IF v_child_op IS NULL THEN
         RAISE EXCEPTION 'AID10: agent % has no live operator link; link it first; nothing was '
                         'recorded', p_child

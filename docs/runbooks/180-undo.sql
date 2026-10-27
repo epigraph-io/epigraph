@@ -36,7 +36,7 @@ BEGIN
      WHERE p.oid = to_regprocedure('public.epigraph_register_agent_identity('
                                    'bytea, uuid, text, text, text, bytea, jsonb)');
     IF v_found IS NULL
-       OR v_found NOT IN ('2fc3e7ee64fa3110c48aebc2432b2d95',   -- 180's
+       OR v_found NOT IN ('44a9f5b2474842e644edcbe774135505',   -- 180's
                           '9e195fdea9cf424aa5d6941c20f40651') THEN  -- 166's
         RAISE EXCEPTION '180-undo: the registration is neither 180''s nor 166''s body (md5 %); '
                         'a later migration re-stated it; undo that one first. Nothing was '
