@@ -43,7 +43,7 @@ use crate::visibility::Viewer;
 /// edge is readable by the members of BOTH groups, fewer than the claim's).
 const CACHE_ADMISSIBLE_SQL: &str = "SELECT mf.id FROM mass_functions mf \
        JOIN claims c ON c.id = mf.claim_id \
-     WHERE mf.id = ANY($1) \
+     WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL \
        AND (mf.visibility = 'public' \
             OR (c.visibility <> 'public' AND mf.owner_group_id = c.owner_group_id)) \
        AND (mf.evidence_id IS NULL \
@@ -167,7 +167,7 @@ impl DerivationScopeRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT mf.id FROM mass_functions mf \
-                 WHERE mf.id = ANY($1) /* {{VISIBILITY:mf}} */ \
+                 WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
                    AND {VIEWER_DERIVED_PREDICATE}"
             ),
             2,
@@ -198,7 +198,7 @@ impl DerivationScopeRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT COUNT(*) FROM mass_functions mf \
-                 WHERE mf.claim_id = $1 /* {{VISIBILITY:mf}} */ \
+                 WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
                    AND {VIEWER_DERIVED_PREDICATE}"
             ),
             2,

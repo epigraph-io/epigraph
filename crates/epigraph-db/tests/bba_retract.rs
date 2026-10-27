@@ -17,6 +17,8 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_db::repos::atom_axiom::atom_input_rows;
+use epigraph_db::repos::compound_valuation::compound_own_rows;
 use epigraph_db::repos::mass_function::{
     BbaRetractArm, BbaRetractError, BbaRetractStatus, MassFunctionRepository,
 };
@@ -164,6 +166,21 @@ async fn audit_rows(pool: &PgPool, id: Uuid) -> Vec<(Option<Uuid>, serde_json::V
     .expect("read retract audit rows")
 }
 
+/// Mark `id` retracted on the harness (superuser) connection, independently
+/// of the definer, so the reader arm tests the readers alone.
+async fn mark_retracted_directly(pool: &PgPool, id: Uuid, by: Uuid) {
+    sqlx::query(
+        "UPDATE mass_functions \
+            SET retracted_at = now(), retracted_by = $2, retract_reason = 'fixture' \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(by)
+    .execute(pool)
+    .await
+    .expect("mark retracted on the harness connection");
+}
+
 struct World {
     owner: Uuid,
     other: Uuid,
@@ -174,7 +191,6 @@ struct World {
     frame_a: Uuid,
     /// The other writer's (writer-owned, migration 114) BBA sits on `frame_b`.
     frame_b: Uuid,
-    #[allow(dead_code)] // read by the reader arm added with the fold exclusion
     perspective: Uuid,
     owner_bba: Uuid,
     other_bba: Uuid,
@@ -208,6 +224,196 @@ async fn world(pool: &PgPool) -> World {
         owner_bba,
         other_bba,
     }
+}
+
+/// Every repository reader that folds or counts a claim's BBAs, as the
+/// owner's stamped app session sees them: the ids each returns for the
+/// world's claim.
+#[derive(Debug, PartialEq)]
+struct ReaderView {
+    for_claim_frame_a: Vec<Uuid>,
+    for_claim: Vec<Uuid>,
+    for_claims: Vec<Uuid>,
+    binary_frames: Vec<Uuid>,
+    frame_perspective: Vec<Uuid>,
+    frame_perspectives: Vec<Uuid>,
+    all_for_frame_a: Vec<Uuid>,
+    count_for_claim: i64,
+    count_for_claim_frame_a: i64,
+    derived_count: i64,
+    frames: Vec<Uuid>,
+    cache_owner: Option<Uuid>,
+    atom_inputs: Vec<Uuid>,
+    compound_own: Vec<Uuid>,
+}
+
+async fn readers(pool: &PgPool, w: &World) -> ReaderView {
+    let p = pool.clone();
+    let (owner, claim, frame_a, perspective) = (w.owner, w.claim, w.frame_a, w.perspective);
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let v = stamp(&mut conn, &p, owner).await;
+        let ids = |rows: Vec<epigraph_db::MassFunctionRow>| {
+            let mut v: Vec<Uuid> = rows.into_iter().map(|r| r.id).collect();
+            v.sort();
+            v
+        };
+        let r = MassFunctionRepository::get_for_claim_frame(&mut *conn, &v, claim, frame_a)
+            .await
+            .expect("get_for_claim_frame");
+        let for_claim_frame_a = ids(r);
+        let for_claim = ids(MassFunctionRepository::get_for_claim(&mut *conn, &v, claim)
+            .await
+            .expect("get_for_claim"));
+        let for_claims = ids(
+            MassFunctionRepository::get_for_claims(&mut *conn, &v, &[claim])
+                .await
+                .expect("get_for_claims"),
+        );
+        let binary_frames = ids(MassFunctionRepository::get_for_claim_binary_frames(
+            &mut *conn, &v, claim,
+        )
+        .await
+        .expect("get_for_claim_binary_frames"));
+        let frame_perspective = ids(MassFunctionRepository::get_for_claim_frame_perspective(
+            &mut *conn,
+            &v,
+            claim,
+            frame_a,
+            perspective,
+        )
+        .await
+        .expect("get_for_claim_frame_perspective"));
+        let frame_perspectives = ids(MassFunctionRepository::get_for_claim_frame_perspectives(
+            &mut *conn,
+            &v,
+            claim,
+            frame_a,
+            &[perspective],
+        )
+        .await
+        .expect("get_for_claim_frame_perspectives"));
+        let all_for_frame_a = ids(MassFunctionRepository::get_all_for_frame(
+            &mut *conn, &v, frame_a,
+        )
+        .await
+        .expect("get_all_for_frame"));
+        let count_for_claim = MassFunctionRepository::count_for_claim(&mut *conn, &v, claim)
+            .await
+            .expect("count_for_claim");
+        let count_for_claim_frame_a =
+            MassFunctionRepository::count_for_claim_frame(&mut *conn, &v, claim, frame_a)
+                .await
+                .expect("count_for_claim_frame");
+        let derived_count =
+            epigraph_db::repos::derivation_scope::DerivationScopeRepository::count_viewer_derived_for_claim(
+                &mut *conn, &v, claim,
+            )
+            .await
+            .expect("count_viewer_derived_for_claim");
+        let mut frames: Vec<Uuid> =
+            MassFunctionRepository::list_frames_for_claim(&mut *conn, &v, claim)
+                .await
+                .expect("list_frames_for_claim")
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+        frames.sort();
+        let cache_owner =
+            MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, &v, claim)
+                .await
+                .expect("cache_owner_frame_for_claim");
+        let mut atom_inputs: Vec<Uuid> = atom_input_rows(&mut *conn, &v, &[claim], Uuid::nil())
+            .await
+            .expect("atom_input_rows")
+            .into_iter()
+            .map(|r| r.row.id)
+            .collect();
+        atom_inputs.sort();
+        let mut compound_own: Vec<Uuid> = compound_own_rows(&mut *conn, &v, &[claim], Uuid::nil())
+            .await
+            .expect("compound_own_rows")
+            .into_iter()
+            .map(|r| r.input.row.id)
+            .collect();
+        compound_own.sort();
+        (
+            conn,
+            ReaderView {
+                for_claim_frame_a,
+                for_claim,
+                for_claims,
+                binary_frames,
+                frame_perspective,
+                frame_perspectives,
+                all_for_frame_a,
+                count_for_claim,
+                count_for_claim_frame_a,
+                derived_count,
+                frames,
+                cache_owner,
+                atom_inputs,
+                compound_own,
+            },
+        )
+    })
+    .await
+}
+
+fn sorted(mut v: Vec<Uuid>) -> Vec<Uuid> {
+    v.sort();
+    v
+}
+
+/// R-79's core: a retracted BBA leaves EVERY fold and belief reader, and the
+/// row itself stays. Measured against the same readers before the
+/// retraction, so the "after" assertions cannot pass on a reader that never
+/// returned the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_bba_leaves_every_fold_reader_and_stays_stored(pool: PgPool) {
+    let w = world(&pool).await;
+    let before = readers(&pool, &w).await;
+    let both = sorted(vec![w.owner_bba, w.other_bba]);
+    assert_eq!(before.for_claim_frame_a, vec![w.owner_bba], "calibration");
+    assert_eq!(before.for_claim, both, "calibration");
+    assert_eq!(before.count_for_claim, 2, "calibration");
+    assert_eq!(before.derived_count, 2, "calibration");
+    assert_eq!(
+        before.cache_owner,
+        Some(w.frame_a),
+        "calibration: the earliest input's frame owns the cache before the retraction"
+    );
+    assert_eq!(
+        before.atom_inputs, both,
+        "calibration: the atom fold reads both rows"
+    );
+
+    mark_retracted_directly(&pool, w.owner_bba, w.owner).await;
+    let after = readers(&pool, &w).await;
+    assert_eq!(
+        after,
+        ReaderView {
+            for_claim_frame_a: vec![],
+            for_claim: vec![w.other_bba],
+            for_claims: vec![w.other_bba],
+            binary_frames: vec![w.other_bba],
+            frame_perspective: vec![],
+            frame_perspectives: vec![],
+            all_for_frame_a: vec![],
+            count_for_claim: 1,
+            count_for_claim_frame_a: 0,
+            derived_count: 1,
+            frames: vec![w.frame_b],
+            cache_owner: Some(w.frame_b),
+            atom_inputs: vec![w.other_bba],
+            compound_own: vec![w.other_bba],
+        },
+        "a retracted BBA must leave every fold, count and cache-owner read"
+    );
+    assert_eq!(
+        retract_columns(&pool, w.owner_bba).await,
+        (true, Some(w.owner), Some("fixture".to_string())),
+        "the retracted row is kept, with its retract columns, for audit"
+    );
 }
 
 /// The owner retracts its own BBA: the columns name the owner, ONE audit row

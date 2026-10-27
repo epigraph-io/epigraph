@@ -165,12 +165,19 @@ const NOT_CACHED_COMBINATION_MARKER: &str = "/* {NOT_CACHED_COMBINATION} */";
 /// The agent test is what keeps real inputs: `submit_ds_evidence` stores an
 /// input labelled `"Dempster"` too, but always with its agent. `COALESCE`
 /// keeps a row whose label is NULL (`NOT NULL` would drop it).
+///
+/// The predicate also excludes RETRACTED rows ([`not_retracted_predicate`],
+/// migration 184): a combine input is a live, non-cached row.
 fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
     assert!(
         sql.contains(NOT_CACHED_COMBINATION_MARKER),
         "combine-input query has no {NOT_CACHED_COMBINATION_MARKER} marker:\n{sql}"
     );
-    let predicate = format!("AND NOT {}", cached_combination_predicate(qualifier));
+    let predicate = format!(
+        "AND NOT {} AND {}",
+        cached_combination_predicate(qualifier),
+        not_retracted_predicate(qualifier)
+    );
     sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
 }
 
@@ -221,6 +228,37 @@ pub fn cached_combination_predicate(qualifier: &str) -> String {
          AND ({q}combination_method IN ({labels}) \
               OR {q}combination_method LIKE '{CACHED_COMBINATION_CAUTIOUS_PREFIX}%'), false)"
     )
+}
+
+/// A boolean SQL expression, TRUE exactly for a row that is NOT retracted
+/// (migration 184, ruling R-79), with the column qualified by `qualifier`
+/// (`""` or `"mf."`). Never NULL.
+///
+/// A retracted BBA is kept for audit and excluded from every fold and belief
+/// read. This is the ONE spelling: every reader that folds, counts or
+/// otherwise reads BBAs as evidence carries it (directly, through
+/// [`with_retracted_excluded`], or through the combine-input predicate of
+/// [`with_cached_combination_excluded`]), and
+/// `epigraph-db/tests/bba_retract_read_lint.rs` refuses a new reader that
+/// carries none of them.
+#[must_use]
+pub fn not_retracted_predicate(qualifier: &str) -> String {
+    format!("{qualifier}retracted_at IS NULL")
+}
+
+/// The placeholder a BBA read carries where [`with_retracted_excluded`]
+/// installs [`not_retracted_predicate`].
+const NOT_RETRACTED_MARKER: &str = "/* {NOT_RETRACTED} */";
+
+/// Replace [`NOT_RETRACTED_MARKER`] in `sql` with `AND <predicate>`
+/// ([`not_retracted_predicate`] qualified by `qualifier`).
+fn with_retracted_excluded(sql: &str, qualifier: &str) -> String {
+    assert!(
+        sql.contains(NOT_RETRACTED_MARKER),
+        "BBA read has no {NOT_RETRACTED_MARKER} marker:\n{sql}"
+    );
+    let predicate = format!("AND {}", not_retracted_predicate(qualifier));
+    sql.replace(NOT_RETRACTED_MARKER, &predicate)
 }
 
 /// What [`MassFunctionRepository::retract_conn`] did.
@@ -839,13 +877,17 @@ impl MassFunctionRepository {
         claim_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_retracted_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1
+              /* {NOT_RETRACTED} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY frame_id, created_at ASC
             "#,
+                "",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id);
@@ -918,13 +960,17 @@ impl MassFunctionRepository {
         perspective_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_retracted_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = $3
+              /* {NOT_RETRACTED} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
+                "",
+            ),
             4,
         );
         let mut vq = sqlx::query_as(&sql)
@@ -952,13 +998,17 @@ impl MassFunctionRepository {
         perspective_ids: &[Uuid],
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_retracted_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = ANY($3)
+              /* {NOT_RETRACTED} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY created_at ASC
             "#,
+                "",
+            ),
             4,
         );
         let mut vq = sqlx::query_as(&sql)
@@ -1321,7 +1371,11 @@ impl MassFunctionRepository {
         frame_id: Uuid,
     ) -> Result<i64, DbError> {
         let sql = viewer.splice(
-            "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 /* {VISIBILITY:mass_functions} */",
+            &with_retracted_excluded(
+                "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
+                 /* {NOT_RETRACTED} */ /* {VISIBILITY:mass_functions} */",
+                "",
+            ),
             3,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id).bind(frame_id);
@@ -1355,8 +1409,11 @@ impl MassFunctionRepository {
         claim_id: Uuid,
     ) -> Result<i64, DbError> {
         let sql = viewer.splice(
-            "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 \
-             /* {VISIBILITY:mass_functions} */",
+            &with_retracted_excluded(
+                "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 \
+                 /* {NOT_RETRACTED} */ /* {VISIBILITY:mass_functions} */",
+                "",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id);
@@ -1381,13 +1438,17 @@ impl MassFunctionRepository {
         frame_id: Uuid,
     ) -> Result<Vec<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_retracted_excluded(
+                r#"
             SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE frame_id = $1
+              /* {NOT_RETRACTED} */
               /* {VISIBILITY:mass_functions} */
             ORDER BY claim_id, created_at ASC
             "#,
+                "",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(frame_id);
@@ -1452,14 +1513,18 @@ impl MassFunctionRepository {
         claim_id: Uuid,
     ) -> Result<Vec<(Uuid, String)>, DbError> {
         let sql = viewer.splice(
-            r#"
+            &with_retracted_excluded(
+                r#"
             SELECT DISTINCT mf.frame_id, f.name
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
             WHERE mf.claim_id = $1
+              /* {NOT_RETRACTED} */
               /* {VISIBILITY:mf} */ /* {VISIBILITY:f} */
             ORDER BY f.name
             "#,
+                "mf.",
+            ),
             2,
         );
         let mut vq = sqlx::query_as(&sql).bind(claim_id);

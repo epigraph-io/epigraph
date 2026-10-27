@@ -926,7 +926,7 @@ pub async fn frame_conflict(
         r#"
         SELECT COUNT(*), AVG(conflict_k), MAX(conflict_k)
         FROM mass_functions
-        WHERE frame_id = $1 AND conflict_k IS NOT NULL
+        WHERE frame_id = $1 AND conflict_k IS NOT NULL AND retracted_at IS NULL
         "#,
     )
     .bind(frame_id)
@@ -2222,7 +2222,7 @@ pub async fn submit_evidence(
                 "SELECT COALESCE((masses->>$3)::float8, 0.0) AS support \
                  FROM mass_functions \
                  WHERE claim_id = $1 AND frame_id = $2 \
-                 AND combination_method = 'discount' \
+                 AND combination_method = 'discount' AND retracted_at IS NULL \
                  ORDER BY created_at DESC \
                  LIMIT 10",
             )

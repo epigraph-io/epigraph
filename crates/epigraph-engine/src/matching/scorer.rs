@@ -334,13 +334,13 @@ pub async fn score_pair(
         WITH
             ma AS (
                 SELECT masses FROM mass_functions
-                WHERE claim_id = $1
+                WHERE claim_id = $1 AND retracted_at IS NULL
                 ORDER BY created_at DESC
                 LIMIT 1
             ),
             mb AS (
                 SELECT masses FROM mass_functions
-                WHERE claim_id = $2
+                WHERE claim_id = $2 AND retracted_at IS NULL
                 ORDER BY created_at DESC
                 LIMIT 1
             )
