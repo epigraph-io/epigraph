@@ -171,6 +171,47 @@ impl World {
     }
 }
 
+/// The `workflows` rows whose goal is `goal`.
+async fn workflows_with_goal(pool: &PgPool, goal: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM workflows WHERE goal = $1")
+        .bind(goal)
+        .fetch_one(pool)
+        .await
+        .expect("count workflows")
+}
+
+/// `POST /api/v1/workflows` creates a workflow; a read-only token creates none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn storing_a_workflow_requires_the_claims_write_scope(pool: PgPool) {
+    let w = world(pool, "scope-store").await;
+    let goal = format!("scope-store goal {}", Uuid::new_v4());
+    let body = json!({ "goal": goal, "steps": ["scope-store only step"] });
+
+    w.assert_read_only_refused("store", Method::POST, "/api/v1/workflows", Some(&body))
+        .await;
+    assert_eq!(
+        workflows_with_goal(&w.pool, &goal).await,
+        0,
+        "a refused store writes no workflow"
+    );
+
+    let (status, out) = w
+        .call(
+            Method::POST,
+            "/api/v1/workflows",
+            w.owner,
+            READ_WRITE,
+            Some(&body),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the same owner with claims:write: {out}"
+    );
+    assert_eq!(workflows_with_goal(&w.pool, &goal).await, 1);
+}
+
 /// `POST /api/v1/workflows/:id/outcome` moves the truth value and the usage
 /// counters and appends a behavioral row; a read-only token moves nothing.
 #[sqlx::test(migrations = "../../migrations")]

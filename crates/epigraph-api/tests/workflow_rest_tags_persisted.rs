@@ -125,6 +125,7 @@ async fn rest_store_workflow_persists_tags(pool: PgPool) {
     let Json(body) = epigraph_api::routes::workflows::store_workflow(
         ViewerExtractor(Viewer::resolve(&pool, caller).await.expect("viewer")),
         State(state),
+        claims_writer(caller),
         Json(req),
     )
     .await
