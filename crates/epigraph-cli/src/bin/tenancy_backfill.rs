@@ -2022,6 +2022,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Under a non-member owner its read of the FORCEd `harvester_fragments` is
     // filtered, so a report on a private fragment raises 23503 (loud).
     ("epigraph_audit_report_inherit_tenancy", 173),
+    // 173, the reports-follow-their-fragment re-stamp. Under a non-member
+    // owner its UPDATE meets the reports' owner guard and is refused (42501),
+    // which fails the fragment UPDATE that fired it (loud).
+    ("epigraph_fragment_audit_reports_follow", 173),
     // 181 (ruling R-56), the group admin's re-key mark. Under a non-member
     // owner its `groups` UPDATE meets `groups_tenancy` as the session and is
     // refused for every admin who did not create the group (42501, loud: the

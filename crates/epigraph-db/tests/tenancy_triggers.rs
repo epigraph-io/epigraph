@@ -1022,15 +1022,17 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
     // `AppState::assert_tenancy_triggers_armed`, so a DISABLED stamping trigger
     // would be indistinguishable from an armed one everywhere at once.
     //
-    // 22 SINCE MIGRATION 173 (ruling R-66): `harvester_audit_reports_inherit_
-    // tenancy` stamps an audit report from its fragment at INSERT, named inside
-    // the pattern for the same reason as 089's.
+    // 23 SINCE MIGRATION 173 (ruling R-66): `harvester_audit_reports_inherit_
+    // tenancy` stamps an audit report from its fragment at INSERT, and
+    // `harvester_fragments_audit_reports_inherit_tenancy` re-stamps the reports
+    // when the fragment's pair changes; both are named inside the pattern for
+    // the same reason as 089's.
     assert_eq!(
-        armed, 22,
-        "expected 22 tenancy triggers (3 named + 17 claim-derived inheritors + \
-         migration 089's provenance→fragment inheritor + migration 173's \
-         fragment→audit-report inheritor); found {armed}. A changed count means \
-         arm (c)'s table set moved, or the 089 or 173 trigger is gone."
+        armed, 23,
+        "expected 23 tenancy triggers (3 named + 17 claim-derived inheritors + \
+         migration 089's provenance→fragment inheritor + migration 173's two \
+         fragment→audit-report inheritors); found {armed}. A changed count means \
+         arm (c)'s table set moved, or an 089 or 173 trigger is gone."
     );
 }
 

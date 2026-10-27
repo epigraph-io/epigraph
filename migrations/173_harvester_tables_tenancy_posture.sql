@@ -42,7 +42,11 @@
 --      derivation of its fragment, so `harvester_audit_reports_inherit_tenancy`
 --      stamps the fragment's pair on every INSERT, over any declaration, as
 --      070 arm (c) does for the claim-derived tables: a report is never more
---      readable than the fragment it audits.
+--      readable than the fragment it audits. And it STAYS no more readable:
+--      `harvester_fragments_audit_reports_inherit_tenancy` re-stamps a
+--      fragment's reports whenever the fragment's own pair changes (070 arm
+--      (d)'s propagation from a narrowed claim, 089's stamp, an operator
+--      re-own or restrict), as arm (d) re-stamps the claim-derived tables.
 --   4. Row security (077, 079, 115): ENABLE and FORCE; `<t>_tenancy`, the
 --      FOR ALL policy 077 gives the owned tier-A tables (read: public or a
 --      session group; write: a writable group; both bypass disjuncts first);
@@ -66,10 +70,14 @@
 -- the two tables exist and are not FORCEd (`rls_verdict`'s partial-FORCE
 -- refusal); an older binary on a migrated database is unaffected.
 --
--- UNDO (as the table owner, in one transaction): drop the two triggers, the
--- three policies and the owner guard per table, `NO FORCE` and `DISABLE` row
--- security, drop the three constraints and both columns per table, drop
--- `epigraph_audit_report_inherit_tenancy()`, and drop both names from
+-- UNDO (as the table owner, in one transaction): drop
+-- `harvester_sources_require_tenancy` and
+-- `harvester_audit_reports_inherit_tenancy`, the two policies and the owner
+-- guard per table, `NO FORCE` and `DISABLE` row
+-- security, drop the three constraints and both columns per table, drop the
+-- trigger on `harvester_fragments` and the two functions
+-- (`epigraph_audit_report_inherit_tenancy()`,
+-- `epigraph_fragment_audit_reports_follow()`), and drop both names from
 -- `docs/runbooks/079-undo.sql`. The tables then have the posture they had
 -- before this file, with no registry row.
 SET LOCAL lock_timeout = '3s';
@@ -229,6 +237,35 @@ CREATE TRIGGER harvester_audit_reports_inherit_tenancy
     BEFORE INSERT ON public.harvester_audit_reports
     FOR EACH ROW EXECUTE FUNCTION public.epigraph_audit_report_inherit_tenancy();
 
+-- And when the fragment's pair changes, its reports follow. AFTER UPDATE, on
+-- the FRAGMENT, so no audit-report trigger restamps its own row (115's
+-- owner guard and `no_other_table_restamps_its_owner_on_update` keep that
+-- property). A maintenance-owned definer, because the session that changes a
+-- fragment (arm (d)'s definer, a backfill, an operator) is not one the
+-- application role's grants or the reports' owner guard would admit, and the
+-- report must follow whoever moved the fragment.
+CREATE OR REPLACE FUNCTION public.epigraph_fragment_audit_reports_follow() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    UPDATE public.harvester_audit_reports r
+       SET owner_group_id = NEW.owner_group_id,
+           visibility     = NEW.visibility
+     WHERE r.fragment_id = NEW.id
+       AND (r.owner_group_id, r.visibility)
+           IS DISTINCT FROM (NEW.owner_group_id, NEW.visibility);
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_fragment_audit_reports_follow() FROM PUBLIC;
+DROP TRIGGER IF EXISTS harvester_fragments_audit_reports_inherit_tenancy
+    ON public.harvester_fragments;
+CREATE TRIGGER harvester_fragments_audit_reports_inherit_tenancy
+    AFTER UPDATE OF owner_group_id, visibility ON public.harvester_fragments
+    FOR EACH ROW
+    WHEN ((OLD.owner_group_id, OLD.visibility)
+          IS DISTINCT FROM (NEW.owner_group_id, NEW.visibility))
+    EXECUTE FUNCTION public.epigraph_fragment_audit_reports_follow();
+
 -- ===================================================================
 -- 5. ROW SECURITY: 077's owned policy, 079's FORCE, 115's DELETE rule and
 --    owner guard, per table, in their words.
@@ -285,6 +322,8 @@ DELETE FROM public.tenancy_exempt
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_audit_report_inherit_tenancy() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_fragment_audit_reports_follow() '
                 'OWNER TO epigraph_maintenance';
     END IF;
 END $$;

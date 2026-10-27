@@ -1916,21 +1916,24 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // the stamp's effect is independent of who writes the provenance row; that is
     // a separate question, recorded as finding F-089-F in
     // docs/tenancy/progress.json with its location and owner.
-    // 22 SINCE MIGRATION 173 (ruling R-66), AND ARM (c)'s TABLE SET DID NOT
+    // 23 SINCE MIGRATION 173 (ruling R-66), AND ARM (c)'s TABLE SET DID NOT
     // MOVE EITHER. 173's `harvester_audit_reports_inherit_tenancy` stamps an
     // audit report with its FRAGMENT's tenancy at INSERT (a report has no
-    // `claim_id`); it is named inside the pattern so that a disabled one is
-    // visible here like every other stamping trigger.
+    // `claim_id`), and `harvester_fragments_audit_reports_inherit_tenancy`
+    // re-stamps the reports when the fragment's pair changes; both are named
+    // inside the pattern so that a disabled one is visible here like every
+    // other stamping trigger.
     assert_eq!(
         rows.len(),
-        22,
-        "expected 22 tenancy triggers — 3 named (claims_require_tenancy, \
+        23,
+        "expected 23 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
          089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
-         migration 173's harvester_audit_reports_inherit_tenancy. Found {}: \
+         migration 173's harvester_audit_reports_inherit_tenancy and \
+         harvester_fragments_audit_reports_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or the 089 or 173 trigger is gone, which is a D1 change and \
+         moved or an 089 or 173 trigger is gone, which is a D1 change and \
          needs a decision, not a silent edit.",
         rows.len()
     );
