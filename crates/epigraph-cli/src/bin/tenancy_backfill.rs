@@ -2759,6 +2759,20 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_role_agent_write_check()",
             false,
         ),
+        // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
+        // own maintenance-owned frame, so an app grant would be an existence
+        // oracle over links the application role cannot read; recording a
+        // succession after the fact is a maintenance act.
+        (
+            "epigraph_is_legacy_fleet_parent",
+            "public.epigraph_is_legacy_fleet_parent(uuid)",
+            false,
+        ),
+        (
+            "epigraph_record_legacy_succession",
+            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+            false,
+        ),
     ];
 
     let app_exists: bool =
@@ -3995,5 +4009,41 @@ mod definer_register_tests {
             1,
             "a table whose trigger was dropped is reported"
         );
+    }
+
+    /// `verify`'s app-grant check covers migration 180's two definers: a
+    /// stray EXECUTE grant to the application role on the legacy-parent rule
+    /// (an existence oracle over the FORCEd `operator_links`) or on the
+    /// after-the-fact record is reported. CONTROL: at head both pass.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_reports_an_app_grant_on_a_180_definer(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for (n, signature) in [
+            "public.epigraph_is_legacy_fleet_parent(uuid)",
+            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(&format!(
+                "GRANT EXECUTE ON FUNCTION {signature} TO epigraph_app"
+            ))
+            .execute(&pool)
+            .await
+            .expect("stray grant");
+            assert_eq!(
+                super::verify_operator_function_grants(&pool)
+                    .await
+                    .expect("check"),
+                n + 1,
+                "a stray app grant on {signature} is reported"
+            );
+        }
     }
 }
