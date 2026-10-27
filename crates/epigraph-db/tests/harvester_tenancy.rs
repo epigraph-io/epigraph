@@ -266,3 +266,184 @@ async fn the_harvester_tables_carry_no_tenancy_exemption(pool: PgPool) {
         .expect("registry count");
     assert!(total > 0, "the tenancy_exempt registry is empty");
 }
+
+// ===========================================================================
+// Migration 173 on a database that already holds harvester rows
+// ===========================================================================
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// The migrator cut at `max`.
+fn up_to(max: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version <= max)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Run `migrator` on one connection; 001's pg_dump header leaves session-level
+/// SETs behind, so a successful run is followed by `RESET ALL`.
+async fn migrate(
+    pool: &PgPool,
+    migrator: &sqlx::migrate::Migrator,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await?;
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    Ok(())
+}
+
+async fn tenancy_of(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
+    sqlx::query_as(&format!(
+        "SELECT owner_group_id, visibility::text FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("tenancy of {table} {id}: {e}"))
+}
+
+/// Migration 173 is safe on non-empty tables. Rows written at 172 (no tenancy
+/// columns) are DERIVED, never defaulted: an audit report takes its fragment's
+/// pair, a source its fragments' pair when they agree. A source with no
+/// fragment, or with fragments of two owners, has no owner the migration can
+/// name: it refuses with HVT01, names the count, and leaves the schema as it
+/// was; once those sources are resolved, a re-run derives the rest.
+#[sqlx::test(migrations = false)]
+async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(pool: PgPool) {
+    migrate(&pool, &up_to(172)).await.expect("migrate to 172");
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "harv-173-a").await;
+    let (_b, group_b) = fixture::seed_agent_with_group(&pool, "harv-173-b").await;
+
+    // Written at 172, so `seed_source` takes its undeclared arm.
+    let agreeing = seed_source(&pool, group_a, "group").await;
+    seed_fragment(&pool, agreeing, group_a, "group").await;
+    let agreeing_frag = seed_fragment(&pool, agreeing, group_a, "group").await;
+    let report = seed_report(&pool, agreeing_frag).await;
+    let public = seed_source(&pool, group_b, "public").await;
+    let public_frag = seed_fragment(&pool, public, group_b, "public").await;
+    let public_report = seed_report(&pool, public_frag).await;
+    let orphan = seed_source(&pool, group_a, "group").await;
+    let mixed = seed_source(&pool, group_a, "group").await;
+    seed_fragment(&pool, mixed, group_a, "group").await;
+    let mixed_frag_b = seed_fragment(&pool, mixed, group_b, "group").await;
+
+    let refused = migrate(&pool, &up_to(173))
+        .await
+        .expect_err("173 must refuse a source it cannot derive an owner for");
+    let msg = refused.to_string();
+    assert!(
+        msg.contains("HVT01")
+            && msg.contains("2 harvester_sources")
+            && msg.contains("0 harvester_audit_reports"),
+        "the refusal names the two underivable sources and no report: {msg}"
+    );
+    assert!(
+        !has_tenancy_columns(&pool, "harvester_sources").await
+            && !has_tenancy_columns(&pool, "harvester_audit_reports").await,
+        "a refused 173 changes nothing"
+    );
+
+    // Resolve the two: the orphan goes, the mixed source's fragments agree.
+    sqlx::query("DELETE FROM harvester_sources WHERE id = $1")
+        .bind(orphan)
+        .execute(&pool)
+        .await
+        .expect("delete the orphan source");
+    sqlx::query("UPDATE harvester_fragments SET owner_group_id = $1 WHERE id = $2")
+        .bind(group_a)
+        .bind(mixed_frag_b)
+        .execute(&pool)
+        .await
+        .expect("make the mixed source's fragments agree");
+
+    migrate(&pool, &up_to(173))
+        .await
+        .expect("173 applies once every source is derivable");
+    let group = "group".to_string();
+    let public_vis = "public".to_string();
+    assert_eq!(
+        tenancy_of(&pool, "harvester_sources", agreeing).await,
+        (group_a, group.clone())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_audit_reports", report).await,
+        (group_a, group.clone())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_sources", public).await,
+        (group_b, public_vis.clone())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_audit_reports", public_report).await,
+        (group_b, public_vis)
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_sources", mixed).await,
+        (group_a, group)
+    );
+}
+
+/// After 173 an audit report takes its fragment's tenancy whatever its writer
+/// declared, and a source is declared or refused like `harvester_fragments`:
+/// an undeclared INSERT outside the seed escape hatch raises 23502.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_write_side_stamps_a_report_and_requires_a_declared_source(pool: PgPool) {
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "harv-write").await;
+    let world = fixture::world_group(&pool).await;
+    let source = seed_source(&pool, group_a, "group").await;
+    let fragment = seed_fragment(&pool, source, group_a, "group").await;
+
+    let declared_public: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_audit_reports \
+             (fragment_id, extraction_id, owner_group_id, visibility) \
+         VALUES ($1, $2, $3, 'public') RETURNING id",
+    )
+    .bind(fragment)
+    .bind(Uuid::new_v4())
+    .bind(world)
+    .fetch_one(&pool)
+    .await
+    .expect("insert a report declared public");
+    assert_eq!(
+        tenancy_of(&pool, "harvester_audit_reports", declared_public).await,
+        (group_a, "group".to_string()),
+        "a report is never more readable than the fragment it audits"
+    );
+
+    // Outside the seed escape hatch (`SET SESSION AUTHORIZATION` makes the
+    // session a non-member of `epigraph_seed`), an undeclared source is refused
+    // by 074's root body. The maintenance role holds INSERT, so the refusal is
+    // the trigger's and not a missing grant.
+    let code = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let err = sqlx::query(
+            "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text')",
+        )
+        .bind(Uuid::new_v4().as_bytes().to_vec())
+        .execute(&mut *conn)
+        .await
+        .expect_err("an undeclared source must be refused");
+        let code = err
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()));
+        (conn, code)
+    })
+    .await;
+    assert_eq!(
+        code.as_deref(),
+        Some("23502"),
+        "undeclared source: {code:?}"
+    );
+}

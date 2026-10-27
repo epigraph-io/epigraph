@@ -119,8 +119,9 @@ async fn a1_no_tier_a_tenancy_column_has_a_default_or_is_nullable(pool: PgPool) 
     .await
     .expect("coverage probe");
     assert_eq!(
-        covered, 25,
-        "expected the 25 tier-A tables from migration 062's tier_a array to carry \
+        covered, 27,
+        "expected the 25 tier-A tables from migration 062's tier_a array, plus the two \
+         harvester neighbours migration 173 brings under tenancy (ruling R-66), to carry \
          owner_group_id; found {covered}. A different number means the tier-A set \
          moved, which is a D1 change and needs a decision, not a silent edit — and \
          it means A1 above was measured over the wrong population."
@@ -280,9 +281,10 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
         .collect();
     assert_eq!(
         require.len(),
-        24,
-        "expected 24 *_require_tenancy triggers after migration 074: claims (from \
-         070) plus the 17 claim-derived tables plus the 6 parentless roots. Found \
+        25,
+        "expected 25 *_require_tenancy triggers: after migration 074, claims (from \
+         070) plus the 17 claim-derived tables plus the 6 parentless roots, and \
+         migration 173's harvester_sources_require_tenancy (a seventh root). Found \
          {}: {require:?}. `edges` is deliberately absent — edges_tenancy is already \
          BEFORE ROW and 072's body assigns both columns on every branch.",
         require.len()

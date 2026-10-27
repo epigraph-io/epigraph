@@ -2018,6 +2018,10 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
+    // 173 (ruling R-66), the audit report's tenancy stamp from its fragment.
+    // Under a non-member owner its read of the FORCEd `harvester_fragments` is
+    // filtered, so a report on a private fragment raises 23503 (loud).
+    ("epigraph_audit_report_inherit_tenancy", 173),
     // 181 (ruling R-56), the group admin's re-key mark. Under a non-member
     // owner its `groups` UPDATE meets `groups_tenancy` as the session and is
     // refused for every admin who did not create the group (42501, loud: the

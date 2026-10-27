@@ -703,6 +703,11 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Role-attached agents (166), FORCEd by the migration that creates it, on
     // the same precedent.
     "role_agents",
+    // The two harvester neighbours of `harvester_fragments` (173, ruling
+    // R-66), brought under tenancy and FORCEd by that migration, on the same
+    // precedent. Apply 173 before or with a binary carrying these two names.
+    "harvester_sources",
+    "harvester_audit_reports",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
