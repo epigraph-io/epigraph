@@ -287,13 +287,19 @@ async fn claim_filter_finds_queries_that_returned_a_claim(pool: PgPool) {
     assert_eq!(found[0].query_text, "hit");
 }
 
-/// An unauthenticated / library-level recall logs with a NULL agent rather
-/// than being dropped.
+/// An agent-less event is accepted ON A BYPASS CONNECTION rather than dropped.
 ///
-/// It is also the one path with no group to own the row, so it keeps the
-/// instance-wide declaration — see `RecallEventRepository::log` for why a
-/// memberless sentinel group cannot stand in. A `public_viewer` therefore still
-/// reads it, and that is the recorded residual rather than an oversight.
+/// It has no group to own the row, so it keeps the instance-wide declaration —
+/// see `RecallEventRepository::log` for why a memberless sentinel group cannot
+/// stand in — and a `public_viewer` reads it back.
+///
+/// This runs on the superuser `#[sqlx::test]` pool, where no row policy
+/// applies, so it pins the repo contract and NOTHING about the application
+/// role: as `epigraph_app`, `recall_events_tenancy` refuses an agent-less row
+/// outright (backlog 41841f7b). The engine path that used to send one from the
+/// episcience worker now threads its caller's principal;
+/// `epigraph-engine/tests/recall_audit_app_role.rs` pins that as
+/// `epigraph_app`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn agentless_event_is_accepted(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;

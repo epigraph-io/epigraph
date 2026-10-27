@@ -149,6 +149,9 @@ pub struct EpiGraphMcpFull {
     /// has no root and no pin, so stdio `profile_path` is refused until `main`
     /// sets one.
     pub(crate) label_dedup: Arc<crate::tools::label_dedup::LabelDedupConfig>,
+    /// `recall_with_context`'s `frac_3072` auto-detect read, behind a short
+    /// per-scope cache shared by every session (backlog be28f3d2).
+    pub(crate) centroid_population: Arc<crate::tools::recall::CentroidPopulationCache>,
 }
 
 impl EpiGraphMcpFull {
@@ -1105,6 +1108,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
@@ -1244,6 +1248,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
