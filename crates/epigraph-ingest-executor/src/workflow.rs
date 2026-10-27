@@ -667,10 +667,10 @@ async fn execute_plan(
         .await?
         .is_none()
     {
-        return Err(IngestExecutorError::WorkflowInsert(format!(
-            "workflow ({canonical_name}, {generation}) exists outside this ingest's view; \
-             nothing was written"
-        )));
+        return Err(IngestExecutorError::WorkflowOutsideView {
+            canonical_name: canonical_name.to_string(),
+            generation,
+        });
     }
 
     // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────

@@ -283,6 +283,14 @@ pub fn executor_caller_error(
             message: Cow::from(format!("{context}: {e}")),
             data: None,
         },
+        // The plan's (canonical_name, generation) is held by a `workflows` row
+        // the ingest cannot read (migration 183): a caller conflict, so an
+        // agent reads the reason instead of a logged internal error.
+        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(format!("{context}: {e}")),
+            data: None,
+        },
         // Migration 148's armed-and-unregistered refusal: its text is the
         // operator's remedy (no driver error in it), so the caller reads it.
         e @ epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { .. } => {

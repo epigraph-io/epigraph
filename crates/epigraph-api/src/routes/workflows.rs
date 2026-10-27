@@ -2765,6 +2765,15 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         e if e.is_declared_tenancy_refusal() => ApiError::Forbidden {
             reason: format!("workflow ingest: {e}"),
         },
+        // The plan's (canonical_name, generation) is held by a `workflows` row
+        // the ingest cannot read (migration 183): the payload conflicts with a
+        // row outside the caller's view. 409, not a 500 that reads as
+        // transient and invites a retry.
+        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => {
+            ApiError::Conflict {
+                reason: format!("workflow ingest: {e}"),
+            }
+        }
         epigraph_ingest_executor::IngestExecutorError::SystemAgentUnregistered { role } => {
             system_agent_unregistered(role)
         }
