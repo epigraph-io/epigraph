@@ -628,8 +628,48 @@ pub async fn auto_wire_ds_update(
     evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
     seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
+    auto_wire_ds_update_filed_on(
+        conn,
+        viewer,
+        claim_id,
+        agent_id,
+        confidence,
+        weight,
+        supports,
+        evidence_type_str,
+        evidence_id,
+        seed_truth_prior,
+        None,
+    )
+    .await
+}
+
+/// [`auto_wire_ds_update`], with the evidence BBA filed on `file_on` instead
+/// of `binary_truth` when it is `Some`: a two-hypothesis frame the claim's
+/// readers read (a promoted hypothesis's `research_validity`, operator ruling
+/// R-17; `epigraph_engine::promotion::promoted_hypothesis_filing_frame`), whose
+/// index 0 is the claim's own hypothesis, as on `binary_truth`. The claim is
+/// bound to it at index 0. Only the row's frame changes: the truth_value seed,
+/// the frame-scoped calibration and the cache (`belief_frame_id`) stay on
+/// `binary_truth`, and the fold below reads every two-hypothesis frame, so the
+/// evidence is combined exactly once either way.
+#[allow(clippy::too_many_arguments)]
+pub async fn auto_wire_ds_update_filed_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    agent_id: Uuid,
+    confidence: f64,
+    weight: f64,
+    supports: bool,
+    evidence_type_str: Option<&str>,
+    evidence_id: Option<Uuid>,
+    seed_truth_prior: bool,
+    file_on: Option<Uuid>,
+) -> Result<DsAutoResult, String> {
     let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
     let frame = binary_frame()?;
+    let store_frame_id = file_on.unwrap_or(frame_id);
 
     // Build BBA for this evidence
     let bba = build_binary_bba(&frame, confidence, weight, supports)?;
@@ -639,6 +679,11 @@ pub async fn auto_wire_ds_update(
     FrameRepository::assign_claim(&mut *conn, claim_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
+    if store_frame_id != frame_id {
+        FrameRepository::assign_claim(&mut *conn, claim_id, store_frame_id, Some(0))
+            .await
+            .map_err(|e| format!("assign_claim: {e}"))?;
+    }
 
     // Materialize a synthetic perspective with id=evidence_id so the
     // mass_functions.perspective_id FK is satisfied. Without this, every
@@ -731,7 +776,7 @@ pub async fn auto_wire_ds_update(
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
         claim_id,
-        frame_id,
+        store_frame_id, // binary_truth, or the frame the caller files on (R-17)
         Some(agent_id),
         evidence_id, // C-1: unique perspective per evidence prevents overwrite
         &masses_json,
@@ -759,6 +804,22 @@ pub async fn auto_wire_ds_update(
         MassFunctionRepository::get_for_claim_binary_frames(&mut *conn, viewer, claim_id)
             .await
             .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
+    // Ruling R-22: this fold is written to the claim's cache (and, by the
+    // callers, to its `truth_value`), so it folds only the BBAs whose every
+    // source is at least as widely readable as the claim, exactly as the
+    // recompute does (`epigraph_engine::derivation_scope`). The row just
+    // stored cites this call's own evidence; if even it is not admissible (an
+    // evidence row narrowed to another group), nothing may be cached from it.
+    let all_rows = epigraph_engine::derivation_scope::retain_for_cache(&mut *conn, all_rows)
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
+    if all_rows.is_empty() {
+        return Err(format!(
+            "none of claim {claim_id}'s BBAs is derived only from sources as widely readable \
+             as the claim (the cited evidence is narrower), so no cached belief can be written \
+             from them"
+        ));
+    }
 
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. Reliability is derived
@@ -807,12 +868,14 @@ pub async fn auto_wire_ds_update(
     // function the recompute path uses (`edge_factor::compute_combined_belief`):
     // BBAs from one agent re-reading one `source_url` are folded cautiously into
     // one before the Dempster fold, so a re-worded re-observation of an
-    // unchanged source no longer counts as corroboration (backlog 4c42c0bf).
-    // Rows with no source identity fold exactly as before.
+    // unchanged source no longer counts as corroboration (backlog 4c42c0bf),
+    // and agreeing BBAs of sibling agents of one human are folded cautiously
+    // rather than multiplied (ruling R-36). Rows with no source identity fold
+    // exactly as before.
     let source_keys =
-        epigraph_engine::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
             .await
-            .map_err(|e| format!("evidence source_url read: {e}"))?;
+            .map_err(|e| format!("BBA source read: {e}"))?;
     let mut items = Vec::with_capacity(all_rows.len());
     let frame_overrides = frame_profile_overrides(&mut *conn, viewer, frame_id).await?;
     let profile = resolve_frame_profile(
@@ -828,7 +891,7 @@ pub async fn auto_wire_ds_update(
         items.push((key, discounted));
     }
     let (combined, fold_conflict) =
-        epigraph_engine::source_dependence::combine_with_source_dependence(
+        epigraph_engine::source_dependence::combine_with_owner_dependence(
             items,
             profile.combination.conflict_threshold,
         )

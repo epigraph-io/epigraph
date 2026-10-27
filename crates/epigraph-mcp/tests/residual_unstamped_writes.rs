@@ -191,18 +191,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the static `instance_wide()` arm admits it unstamped.",
     ),
     (
-        "tools/themes.rs",
-        "run_theme_kmeans",
-        1,
-        "`theme_cluster`. Surfaced when `run_theme` joined WRITE_TOKENS (batch H-a review). A \
-         corpus-wide clustering: its `bulk_assign` (`UPDATE claims SET theme_id`) spans every \
-         claim's owner group, so no single author stamp covers it. Since 5cafc60a the whole \
-         run is ONE transaction (wipe, themes, assignment), so on a clean migrate it fails \
-         loudly with nothing written (MEASURED: ERR 42501, the previous themes intact) instead \
-         of leaving an orphan theme. Not moved behind the maintenance gate: production runs it \
-         today with no maintenance DSN, and gating it would refuse it there.",
-    ),
-    (
         "tools/workflow_ingest.rs",
         "WorkflowRepository::set_goal_embedding",
         2,
@@ -331,8 +319,10 @@ const WRITE_TOKENS: &[&str] = &[
     // Added by the batch H-a review, which found three unstamped write sites
     // this register did not list because no token matched their callee:
     // `ClaimRepository::evolve_step`, `ClaimRepository::merge_properties` and
-    // `run_theme_kmeans`. The register GREW when these landed because the
-    // earlier count was wrong, not because a write was added.
+    // `run_theme_kmeans` (since retired with the k-means prototype, backlog
+    // a0ed0180, which took its register row with it). The register GREW when
+    // these landed because the earlier count was wrong, not because a write
+    // was added.
     "evolve",
     "merge",
     "run_theme",

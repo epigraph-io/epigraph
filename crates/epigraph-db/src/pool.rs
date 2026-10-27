@@ -686,8 +686,10 @@ fn plain_role_identifier(role: &str) -> Result<(), DbError> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
     {
-        return Err(DbError::QueryFailed {
-            source: sqlx::Error::Protocol(format!("not a plain role identifier: {role}")),
+        // Input: the role name is not one this statement can splice.
+        return Err(DbError::Refused {
+            kind: crate::RefusalKind::Input,
+            message: format!("not a plain role identifier: {role}"),
         });
     }
     Ok(())
@@ -909,7 +911,7 @@ impl ScopedPool {
     ///
     /// # Errors
     /// `DbError::ConnectionFailed` if the pool cannot be established, or
-    /// `DbError::QueryFailed` for a `role` that is not a plain lower-case
+    /// `DbError::Refused` for a `role` that is not a plain lower-case
     /// identifier (it is spliced into a statement that takes no bind).
     #[cfg(feature = "test-support")]
     #[doc(hidden)]

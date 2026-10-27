@@ -258,6 +258,11 @@ pub async fn evolve_step(
 ///
 /// stdio (no token) is unchanged, as for every workflow tool (the batch H-b
 /// bar; see `workflow_authority.rs`): the lineage is not even read.
+///
+/// Accepted residual (operator ruling R-21): the set is read under the
+/// caller's row security, so a workflow the caller cannot see that executes
+/// the same lineage (a lineage split across tenancies) is not checked. See the
+/// REST twin, `routes/workflows.rs::require_api_lineage_authority`.
 async fn require_lineage_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,

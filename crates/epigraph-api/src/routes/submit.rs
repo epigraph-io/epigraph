@@ -1506,10 +1506,11 @@ async fn persist_packet(
             )
         })?;
 
-            // Materialize graph edges: evidence --SUPPORTS--> claim
+            // Materialize graph edges: evidence --supports--> claim (the canonical
+            // spelling, `epigraph_core::edge::relationships::canonical_relationship`)
             sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
+             VALUES ($1, 'evidence', $2, 'claim', 'supports', '{}'::jsonb) \
              RETURNING 1"
         )
         .bind(evidence_uuid)

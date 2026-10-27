@@ -119,8 +119,9 @@ async fn a1_no_tier_a_tenancy_column_has_a_default_or_is_nullable(pool: PgPool) 
     .await
     .expect("coverage probe");
     assert_eq!(
-        covered, 25,
-        "expected the 25 tier-A tables from migration 062's tier_a array to carry \
+        covered, 27,
+        "expected the 25 tier-A tables from migration 062's tier_a array, plus the two \
+         harvester neighbours migration 173 brings under tenancy (ruling R-66), to carry \
          owner_group_id; found {covered}. A different number means the tier-A set \
          moved, which is a D1 change and needs a decision, not a silent edit — and \
          it means A1 above was measured over the wrong population."
@@ -280,9 +281,10 @@ async fn a5_every_tenancy_trigger_is_enabled(pool: PgPool) {
         .collect();
     assert_eq!(
         require.len(),
-        24,
-        "expected 24 *_require_tenancy triggers after migration 074: claims (from \
-         070) plus the 17 claim-derived tables plus the 6 parentless roots. Found \
+        25,
+        "expected 25 *_require_tenancy triggers: after migration 074, claims (from \
+         070) plus the 17 claim-derived tables plus the 6 parentless roots, and \
+         migration 173's harvester_sources_require_tenancy (a seventh root). Found \
          {}: {require:?}. `edges` is deliberately absent — edges_tenancy is already \
          BEFORE ROW and 072's body assigns both columns on every branch.",
         require.len()
@@ -450,12 +452,24 @@ async fn a_successor_of_a_group_private_claim_is_group_private(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "sup").await;
     let old = group_claim(&pool, agent, group, "private original").await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (_old, new) = ClaimRepository::supersede(
         &pool,
         epigraph_core::ClaimId::from_uuid(old),
         "private correction",
         epigraph_core::TruthValue::clamped(0.9),
         "test",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede");

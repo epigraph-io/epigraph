@@ -276,7 +276,7 @@ required-features = ["db"]
 #
 # `required-features = ["db"]` matches its sibling. `db` IS in this crate's
 # default feature set, so `--workspace --all-targets` builds this target; the
-# `genai`-gated targets are the ones the four gates miss, and this is not one.
+# `genai`-gated targets are built only by the lint job's genai check.
 [[bin]]
 name = "epigraph-instance-admin"
 path = "src/bin/instance_admin.rs"

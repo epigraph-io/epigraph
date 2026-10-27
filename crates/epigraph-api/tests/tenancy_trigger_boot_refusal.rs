@@ -93,3 +93,83 @@ async fn a_database_without_089_at_all_still_boots(pool: PgPool) {
          staged-deploy outage the tier split exists to prevent"
     );
 }
+
+// ===========================================================================
+// Migration 173's tier: the harvester neighbours' stamping triggers
+// ===========================================================================
+//
+// The same three cases for 173. Its triggers keep `harvester_sources` and
+// `harvester_audit_reports` no more readable than their fragments; losing the
+// follow trigger in particular re-opens the audit of a narrowed fragment
+// without any error. 173 installs two functions, and either one present means
+// 173 ran: a revert that drops one trigger with its own function still leaves
+// the other behind.
+
+/// 173's triggers as `(relation, trigger)`, spelled here for the same reason as
+/// [`TRIGGER`].
+const TRIGGERS_173: &[(&str, &str)] = &[
+    ("harvester_sources", "harvester_sources_require_tenancy"),
+    (
+        "harvester_audit_reports",
+        "harvester_audit_reports_inherit_tenancy",
+    ),
+    (
+        "harvester_fragments",
+        "harvester_fragments_audit_reports_inherit_tenancy",
+    ),
+];
+const STAMP_FN_173: &str = "epigraph_audit_report_inherit_tenancy";
+const FOLLOW_FN_173: &str = "epigraph_fragment_audit_reports_follow";
+
+async fn drop_173_triggers(pool: &PgPool) {
+    for (rel, tg) in TRIGGERS_173 {
+        sqlx::query(&format!("DROP TRIGGER {tg} ON public.{rel}"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop 173 trigger {tg}: {e}"));
+    }
+}
+
+async fn drop_173_fn(pool: &PgPool, name: &str) {
+    sqlx::query(&format!("DROP FUNCTION public.{name}()"))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("drop 173 function {name}: {e}"));
+}
+
+/// The finding: dropped 173 triggers are refused, each one named. The follow
+/// function is dropped too, so the refusal also holds when only one of 173's
+/// two functions is left to say that 173 ran.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dropped_173_triggers_are_refused(pool: PgPool) {
+    drop_173_triggers(&pool).await;
+    drop_173_fn(&pool, FOLLOW_FN_173).await;
+
+    let state = AppState::with_db(pool, ApiConfig::default());
+    let err = state
+        .assert_tenancy_triggers_armed()
+        .await
+        .expect_err("a database at 173 with its stamping triggers removed must not serve");
+    let msg = err.to_string();
+    for (rel, tg) in TRIGGERS_173 {
+        assert!(
+            msg.contains(&format!("{rel}.{tg}")),
+            "the refusal must name {rel}.{tg}; got: {msg}"
+        );
+    }
+}
+
+/// The discriminator: a database without 173 (both functions gone, as 173's
+/// documented undo leaves it) is behind, not broken, and boots.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_without_173_at_all_still_boots(pool: PgPool) {
+    drop_173_triggers(&pool).await;
+    drop_173_fn(&pool, FOLLOW_FN_173).await;
+    drop_173_fn(&pool, STAMP_FN_173).await;
+
+    let state = AppState::with_db(pool, ApiConfig::default());
+    assert!(
+        state.assert_tenancy_triggers_armed().await.is_ok(),
+        "173's triggers must be required only where one of 173's functions says 173 ran"
+    );
+}

@@ -39,7 +39,9 @@ const ADMIN_ONLY: &[&str] = &[
 /// Lower it when a literal goes away; never raise it. 73 -> 69: the five
 /// `claims:admin` rows of `epigraph-mcp`'s `SCOPE_MAP` name
 /// `scope_map::CLAIMS_ADMIN` (one literal) instead of spelling it (X04).
-const HIGH_WATER: usize = 69;
+/// 69 -> 68: `build_themes_from_corpus`'s `check_scopes(&auth, &["claims:admin"])`
+/// went with the retired k-means route (backlog a0ed0180).
+const HIGH_WATER: usize = 68;
 
 /// The gate module: the chokepoint itself spells the scopes.
 const GATE: &str = "epigraph-auth/src/lib.rs";

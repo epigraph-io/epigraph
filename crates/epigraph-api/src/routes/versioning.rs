@@ -208,12 +208,13 @@ pub struct VersionHistoryResponse {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Validation failures or claim already superseded
+/// - 400 Bad Request: Validation failures
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the claim but does not write its
 ///   owning group (authorship alone is not enough) and lacks `claims:admin`
 /// - 404 Not Found: Claim does not exist, or the caller cannot read it (the two
 ///   are indistinguishable)
+/// - 409 Conflict: the claim is already superseded (operator ruling R-55)
 /// - 201 Created: New claim created successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -227,6 +228,7 @@ pub struct VersionHistoryResponse {
         (status = 401),
         (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -376,6 +378,16 @@ pub async fn supersede_claim(
     //    Stamped, the owner's supersede commits, and a caller whose writable set
     //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
+    // The ACTING agent, recorded as the replacement's `AUTHORED` edge (backlog
+    // 73085534, ruling R-23): the replacement keeps the retired claim's author,
+    // so this edge is the only record in the graph of who restated it.
+    // `ViewerExtractor` already refuses an agentless token, so a principal-less
+    // viewer does not reach here; it is refused rather than recorded as nobody.
+    let Some(acting_agent) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "supersede requires an authenticated principal".into(),
+        });
+    };
     let mut tx = state.write_as(&viewer, "supersede_claim").await?;
     //
     //    Migration 117: this is the supersession's ACT only (retire, insert the
@@ -388,6 +400,7 @@ pub async fn supersede_claim(
         &request.content,
         truth_value,
         &request.reason,
+        epigraph_db::SupersedeActor::new(acting_agent, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .map_err(|e| {
@@ -414,6 +427,11 @@ pub async fn supersede_claim(
             );
             return ApiError::from(e);
         }
+        // A repo-authored refusal (e.g. the claim is already superseded) is
+        // answered by its kind (operator ruling R-55), not by its text.
+        if matches!(e, epigraph_db::DbError::Refused { .. }) {
+            return ApiError::from(e);
+        }
         // Map DB errors to appropriate API errors
         let msg = e.to_string();
         if msg.contains("not found") {
@@ -421,8 +439,6 @@ pub async fn supersede_claim(
                 entity: "Claim".to_string(),
                 id: claim_id.to_string(),
             }
-        } else if msg.contains("already been superseded") {
-            ApiError::BadRequest { message: msg }
         } else {
             ApiError::InternalError {
                 message: format!("Supersession failed: {msg}"),
@@ -662,14 +678,17 @@ pub async fn supersede_claim(
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
+/// - 400 Bad Request: duplicate_id == canonical_id
 /// - 401 Unauthorized: no bearer token
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the duplicate (or the canonical)
 ///   but does not write its owning group (authorship alone is not enough) and
-///   lacks `claims:admin`; `claim_id` names the claim refused
+///   lacks `claims:admin`; `claim_id` names the claim refused; or the act's
+///   own authority refusal (FA04/FA07), with its reason
 /// - 404 Not Found: the claim or the canonical does not exist, or the caller
 ///   cannot read it (the two are indistinguishable)
+/// - 409 Conflict: the duplicate is already superseded, or the canonical is
+///   not current (operator ruling R-55: a state refusal, with its reason)
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -824,6 +843,9 @@ pub async fn mark_duplicate(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        // The act's own refusals by kind (operator ruling R-55): FA04/FA07
+        // are 403, a retired canonical or an already-superseded duplicate 409.
+        e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
         epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
             reason: "claim already superseded or invalid input".into(),
         },
@@ -1404,8 +1426,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        // Not compiled (this module is `not(feature = "db")`); kept in step
+        // with the db route, which answers a STATE refusal 409 (ruling R-55).
         #[tokio::test]
-        async fn test_supersede_already_superseded_claim_returns_400() {
+        async fn test_supersede_already_superseded_claim_returns_409() {
             let claim_id = Uuid::new_v4();
             let (state, _) = state_with_claim(claim_id).await;
 
@@ -1443,7 +1467,7 @@ mod tests {
                 .unwrap();
 
             let response2 = router.oneshot(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response2.status(), StatusCode::CONFLICT);
         }
 
         #[tokio::test]

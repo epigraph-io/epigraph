@@ -86,6 +86,9 @@ pub async fn memorize(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            // memorize's `tags` ARE its labels (persisted below), so a
+            // status-tagged memory gets the same bypass as submit_claim.
+            &tags,
         )
         .await
         {
@@ -800,8 +803,9 @@ async fn recall_post_embed(
             .iter()
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match epigraph_engine::belief_query::get_perspective_belief_batch(
+        match epigraph_engine::belief_query::get_perspective_belief_batch_scoped(
             &server.pool,
+            server.scoped.as_ref(),
             viewer,
             &claim_ids,
             frame_id,

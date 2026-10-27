@@ -268,8 +268,8 @@ async fn list_summaries_filters_by_prefix_and_orders_by_live_count(pool: PgPool)
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn find_by_label_surfaces_duplicate_labels_instead_of_picking_one(pool: PgPool) {
-    // `claim_themes` has no UNIQUE(label); `theme_cluster(wipe_first=false)`
-    // produces exactly this state. A resolver that returned Option would
+    // `claim_themes` has no UNIQUE(label); the retired k-means tool's additive
+    // runs (`theme_cluster(wipe_first=false)`) left exactly this state. A resolver that returned Option would
     // silently pick one of two distinct themes.
     let a = seed_theme(&pool, "auto-00", 0, None).await;
     let b = seed_theme(&pool, "auto-00", 0, None).await;

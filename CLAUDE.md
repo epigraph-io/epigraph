@@ -109,6 +109,32 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
   for the pattern).
 
+## Status claims bypass the novelty gate
+
+MCP `submit_claim` / `memorize` / `batch_submit_claims` run a write-side
+semantic novelty gate (`epigraph-mcp/src/tools/novelty_gate.rs`): a new claim
+within `novelty_threshold` (default 0.05) cosine distance of an existing
+`is_current` claim is SUPPRESSED and the existing claim's id is returned
+instead. Recurring reports are templated (only numbers and dates move), so
+each run used to collapse into the prior run's claim and the time series was
+lost (backlog `a3e63a12`, `0a97ba24`).
+
+A claim carrying any label in `novelty_gate::STATUS_CLAIM_LABELS` (`telemetry`,
+the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels, and
+the older bare `gen-status`, `generator-summary`, `review-status`,
+`revise-status`, `research-scan`) is exempt: `novelty_gate::decide` pins its
+effective threshold to 0.0. Suppression only; the fixed 0.15 `near-duplicate`
+soft-flag still applies.
+
+- Writing a recurring reporter? **Label its per-run summary claim** with a
+  status label, and add a new label to `STATUS_CLAIM_LABELS` (exact match).
+  Do not rely on passing `novelty_threshold=0` on every call.
+- Keep the list to *shape* labels. Topic labels (`graph-integrity`,
+  `maintenance`, `rfp`) stay out: exempting a topic disables dedup for genuine
+  content on that topic.
+- Adding a gated write path? `decide` takes `labels` as a required argument.
+  Pass the caller's real labels, never `&[]` as a placeholder.
+
 ## Test database
 
 Integration tests against the live `epigraph` DB fan out for 30+ minutes
@@ -131,7 +157,7 @@ DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo 
 have an embedding; every claim with `is_current = false` should have
 `embedding = NULL` AND `embedding_3072 = NULL` (enforced by
 `chk_deprecated_no_embedding`, migrations 052 and 144). Semantic recall
-(`recall()`, `recall_with_context()`, `theme_cluster`, `find_workflow`'s
+(`recall()`, `recall_with_context()`, the UMAP theme pipeline, `find_workflow`'s
 semantic path) reads from `embedding`, so violations either hide live claims
 or surface stale ones.
 

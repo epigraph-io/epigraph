@@ -317,3 +317,54 @@ async fn a_retracted_symmetric_link_asserted_again_is_a_new_edge(pool: PgPool) {
     let alt3 = alternative(&w, a, b).await;
     assert_eq!((alt3.edge_id, alt3.created), (alt2.edge_id, false));
 }
+
+/// `properties.supersede_act` marks a supersession's own `AUTHORED` edge (its
+/// acting agent), which the arming census and the edge migration key on, so
+/// only the act writes it: `patch_edge` refuses a merge carrying it, with the
+/// edge unchanged, on W's own edge, which W may patch otherwise (the
+/// calibration merge, spelling a supersession `tool`, lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn patch_edge_cannot_set_the_supersede_act_marker(pool: PgPool) {
+    let (plain, scoped) = app_role_pools(&pool).await;
+    let w = side(&pool, build_scoped_test_server(plain, scoped)).await;
+    let author = fixture::seed_agent_with_group(&pool, "author").await.0;
+    let a = fixture::seed_public_claim(&pool, author, "act marker mcp a").await;
+    let b = fixture::seed_public_claim(&pool, author, "act marker mcp b").await;
+    let edge = link(&w, a, b).await.edge_id;
+    let merge = |properties: serde_json::Value| PatchEdgeParams {
+        edge_id: edge.to_string(),
+        valid_to: None,
+        properties: Some(properties),
+    };
+
+    do_patch_edge(
+        &w.server,
+        &w.viewer,
+        merge(serde_json::json!({"tool": "supersede_claim"})),
+        None,
+    )
+    .await
+    .expect("CALIBRATION: W patches its own edge");
+
+    let e = do_patch_edge(
+        &w.server,
+        &w.viewer,
+        merge(serde_json::json!({"supersede_act": "supersede_claim"})),
+        None,
+    )
+    .await
+    .expect_err("the act marker is reserved");
+    assert!(
+        e.message.contains("supersede_act") && e.message.contains("reserved"),
+        "the refusal names the reserved key: {e:?}"
+    );
+    let (_, _, _, props) = state(&pool, edge).await;
+    assert_eq!(
+        props["tool"], "supersede_claim",
+        "the calibration merge landed"
+    );
+    assert!(
+        props.get("supersede_act").is_none(),
+        "nothing merged: {props}"
+    );
+}

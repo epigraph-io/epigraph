@@ -1031,9 +1031,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "claim_theme.rs",
         "delete_all_conn",
         "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
-         caller-owned connection so `run_theme_kmeans` can wipe and rebuild in ONE transaction \
-         (batch H-a). A corpus-wide maintenance statement with no row to filter; the SQL is \
-         unchanged.",
+         caller-owned connection so the k-means rebuild could wipe and rebuild in ONE transaction \
+         (batch H-a; that caller is retired, backlog a0ed0180). A corpus-wide maintenance \
+         statement with no row to filter; the SQL is unchanged.",
     ),
     (
         "claim.rs",
@@ -1126,9 +1126,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `group_memberships`, which carries neither `visibility` nor `owner_group_id` — it \
          is not in migration 062's tier_a array and schema_contract.rs pins its eight columns — so \
          there is no predicate a Viewer could be spent on. It answers the authorization question \
-         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate, on the \
-         same ScopedPool::begin_as transaction that performs the rotation, so the decision and \
-         the write cannot be taken on different connections. Its tenancy backstop is migration \
+         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate and the \
+         two member routes, on the same ScopedPool::begin_as transaction that performs the \
+         write, so the decision and the write cannot be taken on different connections. Its tenancy backstop is migration \
          077 section 7's group_memberships_tenancy policy, which selects on the CONNECTION.",
     ),
     (
@@ -2247,6 +2247,73 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
          `IngestTx::owner_decl`, which refuses the ingest when it is false.",
     ),
+    // ── Backlog 323773fe: the group management routes moved off the raw pool
+    // onto the caller's stamped connection. None of the three group tables
+    // carries `visibility` / `owner_group_id` (they are not in migration 062's
+    // tier_a array), so no Viewer predicate exists to splice; each one's control
+    // is its own migration-077 policy, evaluated on the CONNECTION. The pool
+    // forms now delegate here.
+    (
+        "group.rs",
+        "create_with_admin_conn",
+        "WRITE. The group row, its epoch 0 and the creator's admin membership for POST \
+         /api/v1/groups, on the caller's stamped transaction. groups_tenancy's WITH CHECK admits \
+         `created_by_agent_id = epigraph_principal_id()` and the two child rows are admitted by \
+         `epigraph_is_group_creator`'s empty-roster arm (migrations 077/092), all against the \
+         CONNECTION's stamp; an INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "group.rs",
+        "get_by_id_conn",
+        "READ of one `groups` row by id. `groups` has neither `visibility` nor `owner_group_id` \
+         (schema_contract.rs pins its columns), so there is no predicate a Viewer could be spent \
+         on; groups_tenancy on the CONNECTION shows a stamped session the groups it is a live \
+         member of, and the group routes have already checked that membership on the same \
+         connection.",
+    ),
+    (
+        "group_key_epoch.rs",
+        "get_current_epoch_conn",
+        "READ of `group_key_epochs`, which carries neither `visibility` nor `owner_group_id`. Its \
+         control is migration 077 section 8's group_key_epochs_tenancy policy (live members of \
+         the group), which selects on the CONNECTION; the member and read routes call it on the \
+         stamped connection their membership check ran on.",
+    ),
+    (
+        "group_membership.rs",
+        "add_member_conn",
+        "WRITE. One `group_memberships` INSERT for POST /api/v1/groups/:id/members, on the \
+         caller's stamped transaction after `require_group_admin_conn` on the same connection. \
+         group_memberships_tenancy's WITH CHECK (`epigraph_is_group_admin`, keyed on the \
+         stamped principal) is the control; an INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "group_membership.rs",
+        "get_members_conn",
+        "READ of a group's live roster for GET /api/v1/groups/:id. `group_memberships` carries \
+         neither `visibility` nor `owner_group_id`, and narrowing the roster to the viewer's own \
+         row would make `member_count` wrong; the route has checked live membership on the same \
+         stamped connection, and group_memberships_tenancy selects on that CONNECTION.",
+    ),
+    (
+        "group_membership.rs",
+        "is_member_conn",
+        "READ answering the authorization question itself (is this agent a live member of THIS \
+         group) for GET /api/v1/groups/:id, on the caller's stamped connection. \
+         `group_memberships` has no tenancy column for a Viewer to filter on; on an unstamped \
+         connection group_memberships_tenancy shows no row and the answer fails closed.",
+    ),
+    (
+        "group_membership.rs",
+        "revoke_member_unless_last_admin_conn",
+        "WRITE. The last-admin-guarded revoke and its re-key mark (`group_memberships`, \
+         `groups`, `group_key_epochs`) on the caller's stamped transaction, with the roster \
+         lock held until that caller commits. None of the three tables carries a tenancy column \
+         for a Viewer to filter on; the membership and epoch writes are controlled by their \
+         migration-077 policies, evaluated on the CONNECTION, and the `groups` mark by migration \
+         181's definer, which admits only a live admin of that group (keyed on the stamped \
+         principal). The route has checked the caller's admin role on the same connection.",
+    ),
     // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
     // the raw pool onto the route's stamped transaction.
     (
@@ -2422,6 +2489,25 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
+    (
+        "agent.rs",
+        "humans_of",
+        "READ through migration 149's definer `epigraph_human_of(agent, live)` over a list of \
+         agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
+         itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
+         `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "derivation_scope.rs",
+        "cache_admissible",
+        "READ that answers, for BBA rows the caller already read, which may enter THEIR \
+         claim's cached belief (ruling R-22, generalised): each row, its cited evidence, its \
+         edge and the edge's source claim are compared with the row's own claim (public, or \
+         the claim's owner group). It returns only a subset of the ids it was given, and the \
+         audience is the CLAIM's readers, not a viewer's, so there is no viewer predicate to \
+         splice; the viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
+    ),
     (
         "admin_scope_enforcement.rs",
         "read",

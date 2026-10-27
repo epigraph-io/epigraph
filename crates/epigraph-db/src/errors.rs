@@ -58,6 +58,27 @@ pub const OPERATOR_LINK_FIX: &str = "an operator records a live link for the age
      allow-author-binding-client --client <oauth client id> --operator <human operator agent \
      id> --reason <text> --apply`";
 
+/// What a repo-authored refusal ([`DbError::Refused`]) refuses, which decides
+/// the answer a transport gives it (operator ruling R-55).
+///
+/// A refusal whose answer must not reveal that its target exists is not a
+/// `Refused` of any kind: such a site returns [`DbError::NotFound`], exactly as
+/// it would for a missing row, so it stays indistinguishable from one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The request itself is malformed or out of bounds, whatever the state
+    /// of the graph (an empty merge, too many ids, a claim deduped onto
+    /// itself). HTTP 400.
+    Input,
+    /// The caller may not do this to a target it can see (it may read the
+    /// target but not write it). HTTP 403.
+    Authority,
+    /// The request is well formed and permitted, but the target's current
+    /// state does not admit it (already superseded, not current, not a
+    /// duplicate). HTTP 409.
+    State,
+}
+
 /// Database operation errors
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -154,6 +175,29 @@ pub enum DbError {
     /// refusing is the only answer that is not.
     #[error("Conflict: {reason}")]
     Conflict { reason: String },
+
+    /// A refusal the repo layer AUTHORED: literal text and ids it wrote
+    /// itself, naming why the request is not carried out and, usually, that
+    /// nothing was written ("mark_duplicate: canonical ... is not current",
+    /// "consolidate: duplicate source ids", "FA07: ...").
+    ///
+    /// Its own variant so that a surface can send `message` to the caller as
+    /// written WITHOUT trusting a shape that other errors also take. These
+    /// refusals used to be built as `QueryFailed { source: sqlx::Error::Protocol
+    /// (msg) }`, and `From<sqlx::Error>` wraps ANY `Protocol` error into that
+    /// same shape (sqlx's own protocol errors, an engine stringification of
+    /// another error), so the MCP layer could not tell a designed refusal
+    /// from a server fault (backlog e0f0cb68). Never construct it from an
+    /// error's `Display`.
+    ///
+    /// `kind` says what is refused ([`RefusalKind`]); every construction site
+    /// names it, with no default, so a new refusal cannot skip the choice.
+    ///
+    /// The MCP layer sends `message` as written (`errors::designed_refusal`).
+    /// The HTTP layer answers by `kind` (input 400, authority 403, state 409,
+    /// operator ruling R-55) with `message` as the body's reason, and logs it.
+    #[error("{message}")]
+    Refused { kind: RefusalKind, message: String },
 
     /// A write that row security let the session SEE but not CHANGE: the
     /// statement matched fewer rows than the session can read, so a row it had

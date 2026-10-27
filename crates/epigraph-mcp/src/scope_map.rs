@@ -8,8 +8,8 @@
 
 /// The admin tier of this map, named once. It gates the `claims:admin` rows of
 /// [`SCOPE_MAP`] at dispatch, and inside a tool the admin-only half of a tool
-/// whose ordinary use is `claims:write` (`theme_cluster`'s `wipe_first`, backlog
-/// 5abe23de). Checked only through `AuthContext::has_scope`, the admin-scope
+/// whose ordinary use is `claims:write`. Checked only through
+/// `AuthContext::has_scope`, the admin-scope
 /// chokepoint (`epigraph-api/tests/admin_scope_literals.rs`).
 pub const CLAIMS_ADMIN: &str = "claims:admin";
 
@@ -48,11 +48,16 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("get_provenance_chain", "claims:read"),
     ("get_recall_events", "claims:read"),
     // The theme READ path. `claims:read`, deliberately NOT the `claims:write`
-    // its sibling `theme_cluster` carries: these two issue only SELECTs, and
-    // gating them at write level would preserve exactly the gap they close —
-    // a read-only principal unable to see what topics the corpus holds.
+    // the retired k-means `theme_cluster` carried: these two issue only
+    // SELECTs, and gating them at write level would recreate exactly the gap
+    // they closed — a read-only principal unable to see what topics the corpus
+    // holds.
     ("get_theme", "claims:read"),
     ("list_themes", "claims:read"),
+    // RETIRED (backlog a0ed0180): every call is refused with the retirement
+    // message and nothing is read or written, so the lowest scope lets any
+    // caller (a stale scheduled prompt included) see WHY, rather than a 403.
+    ("theme_cluster", "claims:read"),
     ("consolidate_claims", "claims:write"),
     ("get_workflow_executions", "claims:read"),
     ("get_workflow_plan", "claims:read"),
@@ -99,6 +104,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
+    // The claim owner's twin of `POST /api/v1/challenges/:id/resolve`
+    // (ruling R-3): it writes the four resolution columns of a challenge
+    // through migration 168's definer, as the calling principal.
+    ("resolve_challenge", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
     ("decide_match_candidate", "claims:write"),
@@ -144,7 +153,6 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
-    ("theme_cluster", "claims:write"),
     ("update_labels", "claims:write"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.
@@ -246,8 +254,8 @@ mod tests {
         );
     }
 
-    /// The theme READ tools must sit at `claims:read`, not inherit
-    /// `theme_cluster`'s `claims:write`.
+    /// The theme READ tools must sit at `claims:read`, not the `claims:write`
+    /// the retired k-means `theme_cluster` carried.
     ///
     /// Backlog `ac4d02b9`: the whole point of adding them is that a
     /// read-scoped principal (pre-access sensitivity screening, partition
@@ -260,8 +268,9 @@ mod tests {
     fn theme_read_tools_are_read_scoped() {
         assert_eq!(required_scope("list_themes"), Some("claims:read"));
         assert_eq!(required_scope("get_theme"), Some("claims:read"));
-        // And the writer is still a writer.
-        assert_eq!(required_scope("theme_cluster"), Some("claims:write"));
+        // The k-means writer is retired (backlog a0ed0180): what remains is a
+        // refusal, mapped at the read scope so every caller sees the reason.
+        assert_eq!(required_scope("theme_cluster"), Some("claims:read"));
     }
 
     /// Sanity-check the known mutation tools cited in issue #122 are gated on
@@ -302,6 +311,9 @@ mod tests {
         assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
         assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
         assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+        // The claim owner's resolution of a challenge (R-3/R-13): the tool
+        // tests call it directly, past the router's scope check.
+        assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply
