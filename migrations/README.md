@@ -1715,22 +1715,52 @@ restart.
   are free on `main` and in every open PR. **Deploy order:** after 140; no
   binary change. **Applied to throwaway databases only, NOT to any deployed
   database.**
-- **173**: public `harvester_tables_tenancy_posture` (backlog 154efca2,
-  ledger F-089-B). Two `tenancy_exempt` rows, `harvester_sources` and
-  `harvester_audit_reports`, each with its reason, a class-level residual
-  (NOT CLOSED) and `reviewed_by = 'backlog 154efca2'`. No column, policy or
-  grant changes: it declares the posture the tables already had, which no
-  register recorded. Both are FK
-  neighbours of the hand-registered tier-A `harvester_fragments` and found by
-  neither generator; `tenancy_coverage.rs::every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt`
-  now requires every such neighbour to be covered or registered, and
-  `the_harvester_exemptions_describe_the_tables_as_they_are` fails if row
-  security or an application write arrives without the row being rewritten.
-  `migration_068_and_069_apply_twice` pins the count at 14 (was 12) and
-  `the_registry_is_exactly_the_fourteen_measured_rows` pins the full
-  membership. Undo: delete the two rows. Slot:
-  see 172. **Deploy order:** independent; no binary change. **Applied to
-  throwaway databases only, NOT to any deployed database.**
+- **173**: public `harvester_tables_tenancy_posture` (ruling R-66, backlog
+  90d7baf0; closes 154efca2, ledger F-089-B). Brings `harvester_sources` and
+  `harvester_audit_reports`, the two FK neighbours of the hand-registered
+  tier-A `harvester_fragments` that neither generator finds, under tenancy
+  with `harvester_fragments`'s posture: `owner_group_id` and `visibility` NOT
+  NULL with no default; 062's three constraints, validated; ENABLE + FORCE
+  row security; 077's `<t>_tenancy`, 115's restrictive `<t>_delete_owner`
+  and `<t>_owner_immutable`. Existing rows are DERIVED, never defaulted: a
+  report from its fragment, a source from its fragments when they agree on
+  one pair; anything else refuses with `HVT01` and changes nothing. A source
+  takes 074's root `harvester_sources_require_tenancy` (declare both columns,
+  or the seed escape hatch, or 23502). A report always carries its
+  fragment's pair: `harvester_audit_reports_inherit_tenancy` stamps it at
+  INSERT over any declaration, and
+  `harvester_fragments_audit_reports_inherit_tenancy` re-stamps a fragment's
+  reports whenever the fragment's own pair changes (arm (d), 089, operator
+  re-own or restrict). Two new maintenance-owned definers
+  (`epigraph_audit_report_inherit_tenancy`,
+  `epigraph_fragment_audit_reports_follow`), registered in
+  `tenancy_backfill.rs`. The two `tenancy_exempt` rows an earlier revision
+  of this file added are gone (the registry is back to 069's twelve). Grants
+  are unchanged: the application role reads both tables and writes neither
+  (118 section 6). No elevated read arm (126) is added, so a custodian's
+  elevated session reads these rows only where tenancy admits; both are on
+  `elevation_arms_census.rs`'s excluded list with that reason. Pinned by
+  `harvester_tenancy.rs` (as `epigraph_app`, with `harvester_fragments` as
+  the control: a non-member cannot read another group's row in either
+  table, a member can, public rows stay readable; the 172 -> 173 derivation
+  and refusal on seeded rows; the write side; a narrowed claim's report
+  follows its fragment) and by
+  `tenancy_coverage.rs::the_harvester_neighbours_carry_the_fragment_row_security`
+  (policy expressions compared with `harvester_fragments`'s own). Registered
+  in every FORCE list (`epigraph_api::state::FORCE_PROTECTED_SET`,
+  `locked_decisions.rs`, `rls_enforcement.rs`, `docs/runbooks/079-undo.sql`).
+  REWRITTEN IN PLACE: the earlier revision only declared the two tables
+  exempt and was never applied to a deployed database; a throwaway database
+  that applied it fails the checksum and must be recreated, not repaired.
+  Undo: the steps in the file's header (drop the triggers, policies, guards,
+  constraints, columns and the two functions; remove the two names from
+  `079-undo.sql`). Slot: see 172. **Deploy order:** apply 173 before, or
+  with, the API binary carrying the two names in `FORCE_PROTECTED_SET`; that
+  binary refuses to serve on a database where the two tables exist but are
+  not FORCEd (partial FORCE). An older binary on a migrated database is
+  unaffected. Any external writer of either table must declare a source's
+  tenancy from 173 on. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 - **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
   R-56). One SECURITY DEFINER, `epigraph_mark_group_reseal_required(p_group
   uuid) RETURNS void`, that writes only `groups.reseal_required_at =
