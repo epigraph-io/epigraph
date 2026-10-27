@@ -691,3 +691,47 @@ async fn a_blank_reason_and_a_direct_update_are_refused(pool: PgPool) {
     );
     assert!(audit_rows(&pool, w.owner_bba).await.is_empty());
 }
+
+/// A later write to a retracted row's upsert key is a NEW assessment: the
+/// upsert replaces the masses and clears the retraction, so the new BBA folds;
+/// the retracted content survives in the audit row's snapshot.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
+    let w = world(&pool).await;
+    let p = pool.clone();
+    let (owner, claim, frame_a, perspective, id) =
+        (w.owner, w.claim, w.frame_a, w.perspective, w.owner_bba);
+    let (retracted, rewritten, live) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, owner).await;
+            let r = MassFunctionRepository::retract_conn(&mut conn, id, "superseded", None).await;
+            let again =
+                store_bba(&mut conn, &p, owner, claim, frame_a, Some(perspective), 0.4).await;
+            let v = stamp(&mut conn, &p, owner).await;
+            let live: Vec<Uuid> =
+                MassFunctionRepository::get_for_claim_frame(&mut *conn, &v, claim, frame_a)
+                    .await
+                    .expect("get_for_claim_frame")
+                    .into_iter()
+                    .map(|r| r.id)
+                    .collect();
+            (conn, (r, again, live))
+        })
+        .await;
+    retracted.expect("the owner retracts its BBA");
+    assert_eq!(
+        rewritten, w.owner_bba,
+        "the key holds one row: the upsert reuses it"
+    );
+    assert_eq!(live, vec![w.owner_bba], "the new assessment folds again");
+    assert_eq!(
+        retract_columns(&pool, w.owner_bba).await,
+        (false, None, None)
+    );
+    let audit = audit_rows(&pool, w.owner_bba).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!(
+        audit[0].1["before"]["masses"]["0"], 0.9,
+        "the retracted masses survive in the audit snapshot"
+    );
+}

@@ -611,6 +611,11 @@ impl MassFunctionRepository {
     ///
     /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
     ///
+    /// A write to a RETRACTED row's key (migration 184) is a new assessment:
+    /// the update clears the three retract columns, so the new masses fold.
+    /// The retracted content is not lost: the retraction's audit row
+    /// (`security_events`, `mass_functions.retract`) holds the row as it was.
+    ///
     /// # The executor is generic, and that is what makes this table writable
     ///
     /// `mass_functions` is tier-A with 077's strict
@@ -660,7 +665,10 @@ impl MassFunctionRepository {
                 evidence_type = EXCLUDED.evidence_type,
                 locality_tag = EXCLUDED.locality_tag,
                 evidence_id = EXCLUDED.evidence_id,
-                created_at = NOW()
+                created_at = NOW(),
+                retracted_at = NULL,
+                retracted_by = NULL,
+                retract_reason = NULL
             RETURNING id
             "#,
         )
