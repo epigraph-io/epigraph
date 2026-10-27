@@ -109,11 +109,13 @@ pub async fn unregistered_system_roles(
 /// Only a claim that records a supersession (`supersedes` set) is a
 /// successor; every other claim keeps its author whatever edges it carries.
 /// On such a claim the act's OWN edge is picked out by two facts together:
-/// * its `tool` property is one of the supersession write paths
-///   (`epigraph_db::SUPERSEDE_ACT_TOOLS`), so a claim that merely gained a
+/// * it carries the act's reserved marker (`epigraph_db::SUPERSEDE_ACT_PROPERTY`)
+///   naming one of the supersession write paths
+///   (`epigraph_db::SUPERSEDE_ACT_TOOLS`). Only the act writes that key (every
+///   application edge write refuses it), so a claim that merely gained a
 ///   `supersedes` pointer (a marked duplicate, a consolidated source) keeps
 ///   its author even when it carries some other agent's `AUTHORED` edge (the
-///   #600 caller-authorship shape);
+///   #600 caller-authorship shape), whatever `tool` that edge spells;
 /// * its `created_at` equals the claim's: the act writes it in the SAME
 ///   transaction as the successor (both are that transaction's `now()`), so an
 ///   `AUTHORED` edge added later, whatever properties it spells, is not it.
@@ -121,8 +123,10 @@ pub async fn unregistered_system_roles(
 /// A later supersession leaves the act's edge on the claim it records (the
 /// edge migration exempts it), so every claim of a chain keeps its own actor. A
 /// successor with no such edge (one written before the act recorded it) keeps
-/// its author, as before. The tool literals are constants, never caller data.
+/// its author, as before. The key and tool literals are constants, never
+/// caller data.
 fn census_writes() -> String {
+    let marker = epigraph_db::SUPERSEDE_ACT_PROPERTY;
     let act_tools = epigraph_db::SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|t| format!("'{t}'"))
@@ -137,7 +141,7 @@ fn census_writes() -> String {
                  WHERE c.supersedes IS NOT NULL \
                    AND e.target_id = c.id AND e.target_type = 'claim' \
                    AND e.source_type = 'agent' AND e.relationship = 'AUTHORED' \
-                   AND e.properties->>'tool' IN ({act_tools}) \
+                   AND e.properties->>'{marker}' IN ({act_tools}) \
                    AND e.created_at = c.created_at \
                  ORDER BY e.created_at, e.id LIMIT 1) act ON true \
           WHERE c.created_at > now() - make_interval(days => $1)"

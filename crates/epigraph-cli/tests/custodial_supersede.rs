@@ -229,7 +229,7 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
         authored,
         vec![(
             a,
-            serde_json::json!({"tool": "custodial-supersede", "was_created": true})
+            serde_json::json!({"tool": "custodial-supersede", "was_created": true, "supersede_act": "custodial-supersede"})
         )],
         "the acting custodian, not the inherited author, authored the restatement"
     );

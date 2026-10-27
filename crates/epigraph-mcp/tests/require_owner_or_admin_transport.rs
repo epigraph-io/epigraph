@@ -134,7 +134,7 @@ async fn a_stdio_supersede_records_the_servers_write_identity_as_the_actor(pool:
         vec![(
             server_agent,
             "agent".to_string(),
-            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
         )],
         "the server's write identity performed the act and is recorded"
     );

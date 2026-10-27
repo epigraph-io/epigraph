@@ -379,7 +379,7 @@ async fn a_writers_supersede_records_the_writer_as_the_successors_author_edge(po
         vec![(
             w,
             "agent".to_string(),
-            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
         )],
         "the acting writer is recorded as the successor's AUTHORED edge"
     );

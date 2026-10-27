@@ -522,3 +522,156 @@ async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
         "exactly one REFUTES edge, the caller's"
     );
 }
+
+/// `W`'s `AUTHORED` edge to `claim` with `properties`, as `POST /api/v1/edges`
+/// takes it.
+fn authored_body(w: Uuid, claim: Uuid, properties: serde_json::Value) -> CreateEdgeRequest {
+    CreateEdgeRequest {
+        source_id: w,
+        target_id: claim,
+        source_type: "agent".to_string(),
+        target_type: "claim".to_string(),
+        relationship: "AUTHORED".to_string(),
+        properties: Some(properties),
+        labels: None,
+        valid_from: None,
+        valid_to: None,
+        if_not_exists: false,
+    }
+}
+
+/// Edges into `claim` whose properties carry the act marker.
+async fn marked_into(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND properties ? 'supersede_act'",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count marked edges")
+}
+
+/// `properties.supersede_act` marks a supersession's own `AUTHORED` edge (its
+/// acting agent), which the arming census and the edge migration key on, so
+/// only the act writes it: `POST /api/v1/edges` refuses a body carrying it
+/// (400, nothing written). The same AUTHORED shape without the marker, even
+/// spelling a supersession `tool`, is written (201), so the refusal is the
+/// key's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_edge_create_cannot_carry_the_supersede_act_marker(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (w, _) = seed_agent_with_group(&pool, "http-act-marker-w").await;
+    let plain = seed_public_claim(&pool, w, "act marker calibration target").await;
+    let forged = seed_public_claim(&pool, w, "act marker forged target").await;
+
+    let (status, _) = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Json(authored_body(
+            w,
+            plain,
+            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+        )),
+    )
+    .await
+    .expect("CALIBRATION: W writes an AUTHORED edge spelling a supersession tool");
+    assert_eq!(status.as_u16(), 201);
+
+    let refused = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Json(authored_body(
+            w,
+            forged,
+            serde_json::json!({
+                "tool": "supersede_claim",
+                "was_created": true,
+                "supersede_act": "supersede_claim",
+            }),
+        )),
+    )
+    .await
+    .expect_err("the act marker is reserved");
+    let (status, body) = rendered(refused).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("supersede_act") && body.to_string().contains("reserved"),
+        "the refusal names the reserved key: {body}"
+    );
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE target_id = $1")
+        .bind(forged)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(written, 0, "nothing written");
+}
+
+/// `PATCH /api/v1/edges/:id` refuses a merge carrying `properties.supersede_act`
+/// (400, the edge unchanged), on W's own `AUTHORED` edge (to a claim of W's
+/// group), which W may patch otherwise (the calibration merge, spelling a supersession `tool`, lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_edge_patch_cannot_set_the_supersede_act_marker(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (w, w_g) = seed_agent_with_group(&pool, "http-act-marker-patch-w").await;
+    // A claim of W's own group, so W's AUTHORED edge to it is W's to patch (an
+    // agent -> public-claim edge is world-owned, administrative).
+    let claim = seed_group_claim(&pool, w, w_g, "act marker patch target").await;
+    let (_, Json(created)) = create_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Json(authored_body(
+            w,
+            claim,
+            serde_json::json!({"tool": "submit_claim", "was_created": true}),
+        )),
+    )
+    .await
+    .expect("W writes its AUTHORED edge");
+    let edge = created.edge.id;
+
+    let Json(patched) = patch_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Path(edge),
+        Json(PatchEdgeRequest {
+            valid_to: None,
+            properties: Some(serde_json::json!({"tool": "supersede_claim"})),
+        }),
+    )
+    .await
+    .expect("CALIBRATION: W patches its own edge");
+    assert_eq!(patched.properties["tool"], "supersede_claim");
+
+    let refused = patch_edge(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        auth(w),
+        Path(edge),
+        Json(PatchEdgeRequest {
+            valid_to: None,
+            properties: Some(serde_json::json!({"supersede_act": "supersede_claim"})),
+        }),
+    )
+    .await
+    .expect_err("the act marker is reserved");
+    let (status, body) = rendered(refused).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.to_string().contains("supersede_act") && body.to_string().contains("reserved"),
+        "the refusal names the reserved key: {body}"
+    );
+    let props = row(&pool, edge).await.5;
+    assert_eq!(
+        props["tool"], "supersede_claim",
+        "the calibration merge landed"
+    );
+    assert_eq!(
+        marked_into(&pool, claim).await,
+        0,
+        "nothing merged: {props}"
+    );
+}

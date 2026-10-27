@@ -89,9 +89,10 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
-    carries_dedup_identity_key, ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken,
-    AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow,
-    AlternativeSetRepository, AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
+    carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
+    AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
+    AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
+    AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
@@ -132,6 +133,7 @@ pub use repos::{
     WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
     WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
     DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};

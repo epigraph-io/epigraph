@@ -87,9 +87,10 @@ async fn the_successor_keeps_its_author_and_records_the_acting_agent(pool: PgPoo
         vec![(
             b,
             "agent".to_string(),
-            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
         )],
-        "exactly one AUTHORED edge, from the acting agent B, with the #600 properties"
+        "exactly one AUTHORED edge, from the acting agent B, with the #600 properties \
+         and the act's reserved marker"
     );
 }
 
@@ -191,7 +192,7 @@ async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrot
         (
             who,
             "agent".to_string(),
-            serde_json::json!({"tool": "supersede_claim", "was_created": true}),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
         )
     };
     assert_eq!(
@@ -210,4 +211,51 @@ async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrot
         .await
         .expect("v2");
     assert_eq!(author, a, "v2 still inherits the chain's author");
+}
+
+/// The edge migration leaves an `AUTHORED` edge on the retired claim only when
+/// it carries the act's reserved marker (`supersede_act`), which no caller can
+/// write. An edge that merely spells a supersession `tool` (a property any
+/// edge writer could set) is an ordinary authorship edge of the retired claim
+/// and moves onto the successor like every other.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_retired_claim(
+    pool: PgPool,
+) {
+    let a = seed_agent(&pool, "author-a").await;
+    let x = seed_agent(&pool, "tool-speller-x").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let old = seed_claim(&pool, a).await;
+    let spelled: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true}') RETURNING id",
+    )
+    .bind(x)
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .expect("an AUTHORED edge spelling the act's tool");
+
+    let new = supersede_through_the_cascade(&pool, old, b).await;
+
+    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(spelled)
+        .fetch_one(&pool)
+        .await
+        .expect("the spelled edge");
+    assert_eq!(
+        target, new,
+        "an edge without the act's marker moves onto the successor"
+    );
+    let on_old: Vec<Uuid> = authored_into(&pool, old)
+        .await
+        .into_iter()
+        .map(|(source, _, _)| source)
+        .collect();
+    assert!(
+        on_old.is_empty(),
+        "nothing is pinned to the retired claim: {on_old:?}"
+    );
 }

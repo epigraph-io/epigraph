@@ -1061,7 +1061,8 @@ pub struct PromoteStagedEdgesRequest {
 ///
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
 /// Refuses (400, nothing written) when a selected row's `properties` carry
-/// the reserved `dedup` key.
+/// a reserved key (`epigraph_db::RESERVED_EDGE_PROPERTIES`: `dedup`,
+/// `supersede_act`).
 #[cfg(feature = "db")]
 pub async fn promote_staged_edges(
     State(state): State<AppState>,
@@ -1076,12 +1077,13 @@ pub async fn promote_staged_edges(
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Build the query based on whether specific IDs were provided. Each arm is
-    // ONE statement ($1 = the reserved dedup key), so the reserved-key check and
+    // ONE statement ($1 = the reserved keys), so the reserved-key check and
     // the copy read the same snapshot. `reserved` lists the selected rows whose
-    // `properties` carry `dedup`; when any does, `to_promote` is empty and
-    // nothing is written. That key marks a dedup act's identity edge, which only
-    // the act writes (create and patch refuse it too); a staged row is copied
-    // verbatim, so promoting it would publish a forged dedup record. The whole
+    // `properties` carry `dedup` or `supersede_act`; when any does,
+    // `to_promote` is empty and nothing is written. Those keys mark a dedup
+    // act's identity edge and a supersession's act edge, which only the acts
+    // write (create and patch refuse them too); a staged row is copied
+    // verbatim, so promoting it would publish a forged act record. The whole
     // request is refused rather than silently promoting the rest.
     let (promoted_count, reserved): (i64, Vec<Uuid>) = if let Some(ref ids) = request.edge_ids {
         if ids.is_empty() {
@@ -1100,7 +1102,7 @@ pub async fn promote_staged_edges(
                 WHERE id = ANY($2) AND review_status = 'approved'
             ),
             reserved AS (
-                SELECT id FROM selected WHERE properties ? $1
+                SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
             to_promote AS (
                 SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
@@ -1120,7 +1122,7 @@ pub async fn promote_staged_edges(
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
-        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
+        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(ids)
         .fetch_one(&state.db_pool)
         .await
@@ -1137,7 +1139,7 @@ pub async fn promote_staged_edges(
                 WHERE review_status = 'approved'
             ),
             reserved AS (
-                SELECT id FROM selected WHERE properties ? $1
+                SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
             to_promote AS (
                 SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
@@ -1157,7 +1159,7 @@ pub async fn promote_staged_edges(
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
-        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
+        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
@@ -1170,8 +1172,9 @@ pub async fn promote_staged_edges(
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
             reason: format!(
-                "{} (staged edges carrying it: {})",
+                "{} {} (staged edges carrying a reserved key: {})",
                 epigraph_db::DEDUP_IDENTITY_KEY_RESERVED,
+                epigraph_db::SUPERSEDE_ACT_KEY_RESERVED,
                 ids.join(", ")
             ),
         });

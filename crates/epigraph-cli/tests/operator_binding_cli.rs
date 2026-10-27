@@ -578,7 +578,8 @@ async fn census_does_not_reattribute_a_marked_duplicate_to_its_calling_agent(poo
 
 /// The act's edge is the one written in the act's OWN transaction. An
 /// `AUTHORED` edge added onto the successor LATER (here by another unbound
-/// agent C, even one spelling the act's tool) does not re-attribute it: the
+/// agent C, even one carrying the act's tool and marker, as only a direct
+/// database writer could) does not re-attribute it: the
 /// census counts B, who superseded, and not C.
 #[sqlx::test(migrations = "../../migrations")]
 async fn census_ignores_an_authored_edge_added_after_the_act(pool: PgPool) {
@@ -592,7 +593,8 @@ async fn census_ignores_an_authored_edge_added_after_the_act(pool: PgPool) {
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                             properties, created_at) \
          VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', \
-                 '{\"tool\": \"supersede_claim\", \"was_created\": true}', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true, \
+                   \"supersede_act\": \"supersede_claim\"}', \
                  now() + interval '1 minute')",
     )
     .bind(c)
@@ -639,6 +641,50 @@ async fn census_does_not_reattribute_a_claim_that_supersedes_nothing(pool: PgPoo
     assert!(
         !dry.stdout.contains(&c.to_string()),
         "a claim that supersedes nothing keeps its author: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// The act's edge is told apart by its reserved marker (`supersede_act`), not
+/// by its `tool` spelling, which any edge writer can set. A marked duplicate
+/// (it carries a `supersedes` pointer) whose same-transaction `AUTHORED` edge
+/// from C spells `tool = supersede_claim` without the marker is still its
+/// author's write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_take_a_tool_spelling_for_the_act_marker(pool: PgPool) {
+    let (s, group) = fixture::seed_agent_with_group(&pool, "census-spelled-author").await;
+    make_human(&pool, s).await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "census-spelled-caller").await;
+    let canonical = submitted_claim(&pool, s, group, 0).await;
+    let dup = claim_with_authored_edge(&pool, s, c, "supersede_claim", group, 0).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("the dedup's act");
+    }
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("the duplicate");
+    assert_eq!(supersedes, Some(canonical), "CALIBRATION: marked");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&c.to_string()),
+        "a tool spelling is not the act's marker: {}",
         dry.show()
     );
     assert!(

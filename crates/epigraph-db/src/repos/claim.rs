@@ -967,13 +967,15 @@ pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
 /// claims authored by someone other than the agent that called (#600,
 /// `epigraph_ingest_executor::record_caller_authorship`): one `AUTHORED` edge,
 /// `agent` -> `claim`, from `agent` to the replacement, with properties
-/// `{"tool": tool, "was_created": true}`, written in the act's own transaction.
+/// `{"tool": tool, "was_created": true}`, written in the act's own transaction,
+/// plus the act's reserved marker ([`SUPERSEDE_ACT_PROPERTY`]: `tool`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupersedeActor {
     /// The acting agent (`agents.id`): the caller's agent over HTTP and MCP,
     /// the named custodian on the operator CLI.
     pub agent: Uuid,
-    /// The write path, recorded as the edge's `tool` property.
+    /// The write path, recorded as the edge's `tool` property and its
+    /// [`SUPERSEDE_ACT_PROPERTY`] marker.
     pub tool: SupersedeTool,
 }
 
@@ -986,11 +988,12 @@ impl SupersedeActor {
 }
 
 /// The write paths a supersession comes through, spelled as its act's
-/// `AUTHORED` edge records them (`properties.tool`).
+/// `AUTHORED` edge records them (`properties.tool`, and the reserved
+/// [`SUPERSEDE_ACT_PROPERTY`] marker).
 ///
-/// A CLOSED set, because that spelling is how the act's edge is told apart
-/// from every other `AUTHORED` edge on a claim while keeping the #600
-/// properties byte-for-byte: the edge records who wrote THAT claim, so a later
+/// A CLOSED set, because the marker's value is how the act's edge is told
+/// apart from every other `AUTHORED` edge on a claim (the #600 properties
+/// stay as they are beside it): the edge records who wrote THAT claim, so a later
 /// supersession's edge migration leaves it where it is
 /// ([`SUPERSEDE_ACT_TOOLS`] in `migrate_superseded_edges`), and the operator
 /// arming census reads it to attribute the successor to its actor.
@@ -1016,12 +1019,44 @@ impl SupersedeTool {
     }
 }
 
-/// [`SupersedeTool::ALL`] spelled: the `tool` values that mark an `AUTHORED`
-/// edge as a supersession's act edge.
+/// [`SupersedeTool::ALL`] spelled: the [`SUPERSEDE_ACT_PROPERTY`] values that
+/// mark an `AUTHORED` edge as a supersession's act edge.
 pub const SUPERSEDE_ACT_TOOLS: &[&str] = &[
     SupersedeTool::SupersedeClaim.as_str(),
     SupersedeTool::CustodialSupersede.as_str(),
 ];
+
+/// The key under which a supersession's act edge carries its write path
+/// ([`SupersedeTool::as_str`]), beside the #600 properties. It is what tells
+/// the act's `AUTHORED` edge apart (the operator arming census, and the edge
+/// migration that leaves it on the claim it records): `tool` alone is an
+/// ordinary property any edge writer can spell, so only the act writes this
+/// key and every application surface that writes edge `properties` (create,
+/// patch and the staged promote, HTTP and MCP) refuses a body that carries it.
+pub const SUPERSEDE_ACT_PROPERTY: &str = "supersede_act";
+
+/// The refusal text for a body carrying [`SUPERSEDE_ACT_PROPERTY`].
+pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
+    "properties.supersede_act is reserved for the AUTHORED edge a supersession \
+     writes (supersede_claim, custodial-supersede); nothing was written";
+
+/// The edge `properties` keys only an act writes:
+/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
+pub const RESERVED_EDGE_PROPERTIES: &[&str] =
+    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+
+/// The refusal for an application edge write whose `properties` carry a key
+/// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
+#[must_use]
+pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<&'static str> {
+    if carries_dedup_identity_key(properties) {
+        Some(DEDUP_IDENTITY_KEY_RESERVED)
+    } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
+        Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else {
+        None
+    }
+}
 
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1220,7 +1255,9 @@ async fn migrate_superseded_edges(
     // wrote the claim it points at, so it stays on that claim when the claim
     // is itself superseded: carried onto the successor it would credit the
     // earlier actor with a claim it never wrote and strip the retired claim of
-    // the record of its writer.
+    // the record of its writer. It is told apart by its reserved marker
+    // (`SUPERSEDE_ACT_PROPERTY`, $7), never by `tool`, which any edge writer
+    // can spell.
     let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
@@ -1239,7 +1276,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT (source_type = 'agent' AND relationship = 'AUTHORED' \
-                    AND COALESCE(properties->>'tool' = ANY($6), false)) \
+                    AND COALESCE(properties->>$7 = ANY($6), false)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
@@ -1250,6 +1287,7 @@ async fn migrate_superseded_edges(
     .bind(&frozen)
     .bind(&agent_authorship)
     .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -6532,10 +6570,11 @@ impl ClaimRepository {
         // The acting agent (backlog 73085534, ruling R-23): the replacement
         // above is authored as the RETIRED claim's author, so without this
         // edge the agent that restated it appears nowhere in the graph. The
-        // #600 convention, spelled exactly as
+        // #600 convention, spelled as
         // `epigraph_ingest_executor::record_caller_authorship` writes it (that
         // crate depends on this one, so the call is the repo function it
-        // uses). Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
+        // uses), plus the reserved `SUPERSEDE_ACT_PROPERTY` marker that tells
+        // this edge apart from any other `AUTHORED` edge. Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
         // A failure is an error: the act rolls back rather than land a
         // successor with no record of who wrote it.
         crate::repos::edge::EdgeRepository::create_if_not_exists_conn(
@@ -6545,7 +6584,11 @@ impl ClaimRepository {
             new_uuid,
             "claim",
             "AUTHORED",
-            Some(serde_json::json!({"tool": actor.tool.as_str(), "was_created": true})),
+            Some(serde_json::json!({
+                "tool": actor.tool.as_str(),
+                "was_created": true,
+                SUPERSEDE_ACT_PROPERTY: actor.tool.as_str(),
+            })),
             None,
             None,
         )

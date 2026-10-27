@@ -373,6 +373,62 @@ async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
     assert_eq!(staging_status(&pool, clean).await, "promoted");
 }
 
+/// `properties.supersede_act` marks a supersession's own `AUTHORED` edge,
+/// which the arming census and the edge migration key on; create and patch
+/// (HTTP and MCP) refuse it, and so does the promote route, on BOTH branches
+/// (named rows and promote-all): nothing is written and the row stays
+/// `approved`. The clean-row positive controls of the dedup tests above run
+/// the same statements.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_staged_edges_refuses_the_supersede_act_marker() {
+    let _serial = PROMOTE_SERIAL.lock().await;
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (forged, f_src, f_tgt) = stage_approved_edge(
+        &pool,
+        "CORROBORATES",
+        serde_json::json!({"supersede_act": "supersede_claim"}),
+    )
+    .await;
+    for body in [
+        serde_json::json!({"edge_ids": [forged]}),
+        serde_json::json!({}),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+            .bearer_auth(admin_token())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 400, "{body}: expected 400, got {status}: {text}");
+        assert!(
+            text.contains("supersede_act") && text.contains(&forged.to_string()),
+            "{body}: the refusal names the reserved key and the staged row: {text}"
+        );
+        assert_eq!(
+            edges_between(&pool, f_src, f_tgt).await,
+            0,
+            "{body}: no forged edge"
+        );
+        assert_eq!(staging_status(&pool, forged).await, "approved");
+    }
+
+    sqlx::query("DELETE FROM edges_staging WHERE id = $1")
+        .bind(forged)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // clusters.rs — 1 handler
 // ---------------------------------------------------------------------------
