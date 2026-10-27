@@ -1,32 +1,33 @@
 #![cfg(feature = "db")]
-//! GET /api/v1/claims/:id/history walks `claims.supersedes` backward to a
-//! root and then forward. `mark_duplicate` writes `dup.supersedes = canonical`
-//! and checks neither side for cycles, so two calls in opposite directions
-//! make an X↔Y loop; the walk used to follow it forever, holding a pooled
-//! connection and growing the version list without bound.
+//! GET /api/v1/claims/:id/history walks `claims.supersedes` backward to a root
+//! and then forward. This file used to build the two loop shapes that walk
+//! could follow — a self-supersede, and an X<->Y pair via `mark_duplicate` —
+//! and assert it terminated on them.
 //!
-//! # What these arms assert now, and why it is weaker than it was
+//! # Both shapes are now refused at the write path, so both arms are inverted
 //!
-//! The inline three-statement walk this branch guarded with two visited-sets is
-//! gone. `ClaimRepository::version_history` replaces it with ONE viewer-filtered
-//! recursive CTE that stops a loop with `depth < 100` on both recursive terms,
-//! so an X↔Y cycle terminates at roughly 101 entries with duplicated ids rather
-//! than at 2 distinct ones. The DoS is stopped either way — which is what these
-//! arms exist for — but the response shape is main's, so the cycle arms assert
-//! BOUNDED AND TERMINATING rather than an exact set. Reintroducing the exact
-//! shape would mean reintroducing three unfiltered inline reads, and this branch
-//! is not trading a tenancy filter for a cosmetic wart on data that is already
-//! malformed.
+//! - A self-supersede raises `OPL02` from the claims-path trigger added by
+//!   migration 123 (`custodian_role.sql:1058-1063`), on INSERT and on any
+//!   UPDATE that sets `supersedes` to the row's own id.
+//! - An X<->Y dedup loop is refused by `mark_duplicate` itself: the first call
+//!   retires X, and the second is rejected with "canonical <id> is not current;
+//!   refusing to build a dedup chain onto a retired claim".
+//!
+//! So the arms assert the REFUSALS, and the walk's own protection —
+//! `ClaimRepository::version_history`'s single viewer-filtered recursive CTE
+//! with `depth < 100` on both recursive terms — is now defence for LEGACY rows
+//! written before those guards rather than for anything a caller can create.
+//! If either guard is ever removed, these arms fail and the cycle question
+//! reopens explicitly instead of silently.
 //!
 //! `history_of_a_linear_chain_is_unchanged` is kept VERBATIM: it is a genuine
-//! non-regression over main's new CTE, which derives `superseded_by` from
+//! non-regression over main's CTE, which derives `superseded_by` from
 //! `claims.supersedes` rather than positionally.
 mod common;
 
 use epigraph_core::ClaimId;
 use epigraph_db::ClaimRepository;
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 async fn pool_and_app() -> (
@@ -107,39 +108,50 @@ fn version_ids(body: &serde_json::Value) -> Vec<Uuid> {
         .collect()
 }
 
+/// The `mark_duplicate` arm of this file, inverted — for the same reason as the
+/// self-supersedes arm below.
+///
+/// This test used to build X -> Y then Y -> X and assert the walk survived the
+/// loop. Main's `mark_duplicate` now refuses the second call outright:
+/// "canonical <id> is not current; refusing to build a dedup chain onto a
+/// retired claim". The first call retires X, so the call that would close the
+/// loop can no longer be made, and the comment this arm used to carry — "both
+/// calls pass mark_duplicate's own checks" — is no longer true of the tree.
+///
+/// With BOTH loop shapes refused at the write path, `version_history`'s
+/// `depth < 100` cap is now defence for LEGACY rows written before these
+/// guards, not for anything a caller can still create. That is worth stating
+/// rather than deleting, because a future reader finding the cap with no
+/// reachable cycle would reasonably wonder whether it is dead code.
 #[tokio::test(flavor = "multi_thread")]
-async fn history_terminates_on_a_mark_duplicate_cycle() {
+async fn a_mark_duplicate_cycle_cannot_be_created() {
     let (pool, addr, _shutdown, client) = pool_and_app().await;
     let x = common::seed_claim(&pool, "history cycle X").await;
     let y = common::seed_claim(&pool, "history cycle Y").await;
 
-    // X → Y, then Y → X: both calls pass mark_duplicate's own checks.
+    // X -> Y retires X. This one still succeeds.
     ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(x), ClaimId::from_uuid(y))
         .await
-        .unwrap();
-    ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(y), ClaimId::from_uuid(x))
-        .await
-        .unwrap();
+        .expect("the first dedup is legitimate");
 
-    for start in [x, y] {
-        // Answering at all is half the assertion: the client carries a 20s
-        // timeout, so a walk that follows the loop fails here rather than
-        // hanging the suite.
-        let body = history(&client, addr, start).await;
-        let ids = version_ids(&body);
-        let total = body["total_versions"].as_i64().expect("total_versions");
-        assert!(
-            total <= 101,
-            "start {start}: the CTE's depth<100 cap must bound the walk, got {total}"
-        );
-        assert_eq!(ids.len() as i64, total, "start {start}: {ids:?}");
-        assert_eq!(
-            ids.iter().copied().collect::<HashSet<_>>(),
-            HashSet::from([x, y]),
-            "start {start}: the loop may repeat ids but must not invent any"
-        );
-        assert_eq!(body["claim_id"], start.to_string());
-    }
+    // Y -> X would close the loop onto the now-retired X, and is refused.
+    let err = ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(y), ClaimId::from_uuid(x))
+        .await
+        .expect_err("a dedup chain onto a retired claim must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("not current") && text.contains("mark_duplicate"),
+        "expected mark_duplicate's retired-canonical refusal, got {text}"
+    );
+
+    // And the history of the one legitimate dedup still answers, bounded.
+    let body = history(&client, addr, y).await;
+    let ids = version_ids(&body);
+    assert!(
+        !ids.is_empty() && ids.len() <= 101,
+        "the surviving chain must still answer within the cap, got {ids:?}"
+    );
+
     unlink(&pool, &[x, y]).await;
 }
 
