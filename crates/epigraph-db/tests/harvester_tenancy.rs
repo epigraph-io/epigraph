@@ -318,7 +318,8 @@ async fn tenancy_of(pool: &PgPool, table: &str, id: Uuid) -> (Uuid, String) {
 /// Migration 173 is safe on non-empty tables. Rows written at 172 (no tenancy
 /// columns) are DERIVED, never defaulted: an audit report takes its fragment's
 /// pair, a source its fragments' pair when they agree. A source with no
-/// fragment, or with fragments of two owners, has no owner the migration can
+/// fragment, or with fragments of two owners or of one owner and two
+/// visibilities, has no pair the migration can
 /// name: it refuses with HVT01, names the count, and leaves the schema as it
 /// was; once those sources are resolved, a re-run derives the rest.
 #[sqlx::test(migrations = false)]
@@ -339,6 +340,10 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
     let mixed = seed_source(&pool, group_a, "group").await;
     seed_fragment(&pool, mixed, group_a, "group").await;
     let mixed_frag_b = seed_fragment(&pool, mixed, group_b, "group").await;
+    // One owner, two visibilities: the pair, not the owner alone, must agree.
+    let split = seed_source(&pool, group_a, "group").await;
+    let split_public_frag = seed_fragment(&pool, split, group_a, "public").await;
+    seed_fragment(&pool, split, group_a, "group").await;
 
     let refused = migrate(&pool, &up_to(173))
         .await
@@ -346,9 +351,9 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
     let msg = refused.to_string();
     assert!(
         msg.contains("HVT01")
-            && msg.contains("2 harvester_sources")
-            && msg.contains("0 harvester_audit_reports"),
-        "the refusal names the two underivable sources and no report: {msg}"
+            && msg.contains("for 3 harvester_sources")
+            && msg.contains("and 0 harvester_audit_reports"),
+        "the refusal names the three underivable sources and no report: {msg}"
     );
     assert!(
         !has_tenancy_columns(&pool, "harvester_sources").await
@@ -356,7 +361,8 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
         "a refused 173 changes nothing"
     );
 
-    // Resolve the two: the orphan goes, the mixed source's fragments agree.
+    // Resolve the three: the orphan goes, the mixed source's fragments agree
+    // on an owner and the split source's on a visibility.
     sqlx::query("DELETE FROM harvester_sources WHERE id = $1")
         .bind(orphan)
         .execute(&pool)
@@ -368,6 +374,11 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
         .execute(&pool)
         .await
         .expect("make the mixed source's fragments agree");
+    sqlx::query("UPDATE harvester_fragments SET visibility = 'group' WHERE id = $1")
+        .bind(split_public_frag)
+        .execute(&pool)
+        .await
+        .expect("make the split source's fragments agree");
 
     migrate(&pool, &up_to(173))
         .await
@@ -392,6 +403,10 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
     );
     assert_eq!(
         tenancy_of(&pool, "harvester_sources", mixed).await,
+        (group_a, group.clone())
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_sources", split).await,
         (group_a, group)
     );
 }
@@ -427,7 +442,7 @@ async fn the_write_side_stamps_a_report_and_requires_a_declared_source(pool: PgP
     // session a non-member of `epigraph_seed`), an undeclared source is refused
     // by 074's root body. The maintenance role holds INSERT, so the refusal is
     // the trigger's and not a missing grant.
-    let code = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+    let refusal = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
         let err = sqlx::query(
             "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text')",
         )
@@ -435,16 +450,23 @@ async fn the_write_side_stamps_a_report_and_requires_a_declared_source(pool: PgP
         .execute(&mut *conn)
         .await
         .expect_err("an undeclared source must be refused");
-        let code = err
-            .as_database_error()
-            .and_then(|d| d.code().map(|c| c.to_string()));
-        (conn, code)
+        let db = err.as_database_error();
+        let code = db.and_then(|d| d.code().map(|c| c.to_string()));
+        let message = db.map(|d| d.message().to_string()).unwrap_or_default();
+        (conn, (code, message))
     })
     .await;
+    let (code, message) = refusal;
     assert_eq!(
         code.as_deref(),
         Some("23502"),
-        "undeclared source: {code:?}"
+        "undeclared source: {code:?} {message}"
+    );
+    // 23502 alone is also what the NOT NULL columns raise with no trigger at
+    // all; the text is 074's root body's.
+    assert!(
+        message.contains("epigraph tenancy: INSERT INTO harvester_sources without an explicit"),
+        "the refusal is 074's root trigger, not the NOT NULL backstop: {message}"
     );
 }
 
