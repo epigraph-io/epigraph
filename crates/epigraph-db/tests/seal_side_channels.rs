@@ -645,6 +645,20 @@ async fn a_sealed_claim_keeps_no_plaintext_derived_column(pool: PgPool) {
 async fn sealed_with_embedding_is_zero_on_claims_and_on_evidence(pool: PgPool) {
     let world = seed_world(&pool).await;
     let claim = seed_sealable_claim(&pool, &world, "an embedded confidential finding").await;
+    // Another group's row on the claim, with its own embedding. The seal leaves
+    // it in plaintext (ruling R-78), so its vector is legitimate and the
+    // evidence clause must not count it.
+    let (_other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "audit-held").await;
+    let held = seed_held_evidence(&pool, claim, other_group, "another group's embedded row").await;
+    sqlx::query(
+        "UPDATE evidence SET embedding = $2::vector, embedding_3072 = $3::vector WHERE id = $1",
+    )
+    .bind(held)
+    .bind(vector_literal(1536, 0.5))
+    .bind(vector_literal(3072, 0.25))
+    .execute(&pool)
+    .await
+    .expect("embed the held row");
 
     // CALIBRATION. Before the seal both clauses must be NON-zero, or a green
     // result after it proves only that the fixture never embedded anything.
@@ -665,7 +679,10 @@ async fn sealed_with_embedding_is_zero_on_claims_and_on_evidence(pool: PgPool) {
     .await
     .expect("calibrate evidence");
     assert_eq!(before_claims, 1, "the fixture must embed the claim");
-    assert_eq!(before_evidence, 1, "the fixture must embed the evidence");
+    assert_eq!(
+        before_evidence, 2,
+        "the fixture must embed the owner's evidence and the held row"
+    );
 
     let payload = seal_payload(&pool, claim).await;
     commit_seal(&pool, &world, &[payload]).await;
@@ -682,14 +699,29 @@ async fn sealed_with_embedding_is_zero_on_claims_and_on_evidence(pool: PgPool) {
     let evidence_gap: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM evidence e \
           WHERE (e.embedding IS NOT NULL OR e.embedding_3072 IS NOT NULL) \
-            AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = e.claim_id)",
+            AND EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id)",
     )
     .fetch_one(&pool)
     .await
     .expect("sealed_with_embedding over evidence");
 
     assert_eq!(claims_gap, 0);
-    assert_eq!(evidence_gap, 0);
+    assert_eq!(
+        evidence_gap, 0,
+        "the evidence clause counts only rows that are themselves sealed; another group's \
+         plaintext row on a sealed claim keeps its vector legitimately"
+    );
+    let held_embedded: bool = sqlx::query_scalar(
+        "SELECT embedding IS NOT NULL AND embedding_3072 IS NOT NULL FROM evidence WHERE id = $1",
+    )
+    .bind(held)
+    .fetch_one(&pool)
+    .await
+    .expect("read the held row");
+    assert!(
+        held_embedded,
+        "fixture: the held row kept its vectors through the seal"
+    );
 }
 
 /// Length and hash: the two properties the sentinel format exists to give.
