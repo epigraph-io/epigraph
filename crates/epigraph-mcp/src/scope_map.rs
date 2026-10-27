@@ -318,6 +318,8 @@ mod tests {
         // The claim owner's resolution of a challenge (R-3/R-13): the tool
         // tests call it directly, past the router's scope check.
         assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
+        // Retracting one BBA (R-79): the tool tests call it directly too.
+        assert_eq!(required_scope("retract_bba"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply

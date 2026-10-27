@@ -249,10 +249,68 @@ async fn retracted(w: &World, id: Uuid) -> bool {
         .expect("read the row")
 }
 
+/// Stored scoped beliefs of (claim, `w.frame`) in one scope (`scope_id`
+/// `None` = the global scope).
+async fn stored_in_scope(w: &World, claim: Uuid, scope: &str, scope_id: Option<Uuid>) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND frame_id = $2 AND scope_type = $3 \
+            AND scope_id IS NOT DISTINCT FROM $4",
+    )
+    .bind(claim)
+    .bind(w.frame)
+    .bind(scope)
+    .bind(scope_id)
+    .fetch_one(&w.pool)
+    .await
+    .expect("count stored scoped beliefs in a scope")
+}
+
+/// `GET /api/v1/claims/:id/belief/scoped` as `token`: the served entry
+/// (`null` when nothing is stored for the scope).
+async fn scoped_read(
+    w: &World,
+    token: &str,
+    claim: Uuid,
+    scope: &str,
+    scope_id: Option<Uuid>,
+) -> Value {
+    let mut url = format!(
+        "http://{}/api/v1/claims/{claim}/belief/scoped?scope={scope}",
+        w.addr
+    );
+    if let Some(id) = scope_id {
+        url.push_str(&format!("&scope_id={id}"));
+    }
+    let resp = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status();
+    let text = resp.text().await.expect("body");
+    assert_eq!(status, 200, "GET scoped belief ({scope}): {text}");
+    serde_json::from_str(&text).expect("JSON body")
+}
+
+/// `(belief, plausibility, pignistic_prob)` of a served scoped entry.
+fn interval_of(entry: &Value) -> (f64, f64, f64) {
+    (
+        entry["belief"].as_f64().expect("belief"),
+        entry["plausibility"].as_f64().expect("plausibility"),
+        entry["pignistic_prob"].as_f64().expect("pignistic_prob"),
+    )
+}
+
 /// R-79's acceptance: once the owner retracts one of the claim's two BBAs,
 /// the claim's cached belief is exactly the belief of a control claim that
-/// only ever held the other BBA, and no longer the two-BBA fold. A repeat
-/// retraction answers `already_retracted` and writes no second audit row.
+/// only ever held the other BBA, and no longer the two-BBA fold. The stored
+/// scoped beliefs that folded the retracted BBA (the global scope and its own
+/// perspective's) stop being served; the other perspective's, which never
+/// folded it, is still served and equals the control's. A repeat retraction
+/// answers `already_retracted`, writes no second audit row and changes
+/// nothing served.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_retracted_bba_no_longer_moves_the_claims_belief(
     pool_opts: PgPoolOptions,
@@ -267,13 +325,40 @@ async fn a_retracted_bba_no_longer_moves_the_claims_belief(
     );
 
     let target = bba(&w, w.claim, w.p_support).await;
-    let stored_before = stored_scoped(&w, w.claim).await;
+    let global_before = stored_in_scope(&w, w.claim, "global", None).await;
+    let support_before = stored_in_scope(&w, w.claim, "perspective", Some(w.p_support)).await;
+    let refute_before = stored_in_scope(&w, w.claim, "perspective", Some(w.p_refute)).await;
     assert!(
-        stored_before > 0,
-        "calibration: the evidence route stored a scoped belief for the claim"
+        global_before > 0 && support_before > 0 && refute_before > 0,
+        "calibration: the evidence route stored global and both perspective scopes \
+         ({global_before}, {support_before}, {refute_before})"
     );
     let control_stored = stored_scoped(&w, w.control).await;
     let token = common::mint_token_with_agent(&["claims:write"], w.owner);
+
+    // What the scoped reads serve before: the global fold includes both BBAs
+    // (it is not the control's), and the p_refute perspective's fold is the
+    // control's own p_refute fold (both hold only the refuting BBA there).
+    let global_read = scoped_read(&w, &token, w.claim, "global", None).await;
+    let control_global = scoped_read(&w, &token, w.control, "global", None).await;
+    assert!(
+        !close(interval_of(&global_read), interval_of(&control_global)),
+        "calibration: the stored global fold {global_read} folds both BBAs, unlike the \
+         control's {control_global}"
+    );
+    assert!(
+        !scoped_read(&w, &token, w.claim, "perspective", Some(w.p_support))
+            .await
+            .is_null(),
+        "calibration: the retracted BBA's perspective fold is served"
+    );
+    let control_refute = scoped_read(&w, &token, w.control, "perspective", Some(w.p_refute)).await;
+    let refute_read = scoped_read(&w, &token, w.claim, "perspective", Some(w.p_refute)).await;
+    assert!(
+        close(interval_of(&refute_read), interval_of(&control_refute)),
+        "calibration: the p_refute fold {refute_read} is the control's {control_refute}"
+    );
+
     let (status, body) = retract(&w, &token, target, "duplicate re-observation").await;
     assert_eq!(status, 200, "the owner retracts its BBA: {body}");
     assert_eq!(body["status"], "retracted", "{body}");
@@ -281,16 +366,44 @@ async fn a_retracted_bba_no_longer_moves_the_claims_belief(
     assert_eq!(body["claim_id"], w.claim.to_string(), "{body}");
     assert_eq!(body["retracted_by"], w.owner.to_string(), "{body}");
     assert_eq!(body["belief_recomputed"], true, "{body}");
-    assert_eq!(body["scoped_beliefs_cleared"], stored_before, "{body}");
     assert_eq!(
-        stored_scoped(&w, w.claim).await,
-        0,
-        "the stored scoped beliefs that folded the retracted BBA are gone"
+        body["scoped_beliefs_cleared"],
+        global_before + support_before,
+        "{body}"
+    );
+    assert_eq!(stored_in_scope(&w, w.claim, "global", None).await, 0);
+    assert_eq!(
+        stored_in_scope(&w, w.claim, "perspective", Some(w.p_support)).await,
+        0
+    );
+    assert_eq!(
+        stored_in_scope(&w, w.claim, "perspective", Some(w.p_refute)).await,
+        refute_before,
+        "a perspective that never folded the retracted BBA keeps its stored fold"
     );
     assert_eq!(
         stored_scoped(&w, w.control).await,
         control_stored,
         "another claim's are untouched"
+    );
+
+    // What the scoped reads serve after: nothing stale.
+    assert!(
+        scoped_read(&w, &token, w.claim, "global", None)
+            .await
+            .is_null(),
+        "the two-BBA global fold is no longer served"
+    );
+    assert!(
+        scoped_read(&w, &token, w.claim, "perspective", Some(w.p_support))
+            .await
+            .is_null(),
+        "the retracted BBA's perspective fold is no longer served"
+    );
+    let refute_after = scoped_read(&w, &token, w.claim, "perspective", Some(w.p_refute)).await;
+    assert!(
+        close(interval_of(&refute_after), interval_of(&control_refute)),
+        "the remaining perspective serves the control's fold: {refute_after}"
     );
 
     let after = cache(&w, w.claim).await;
@@ -304,13 +417,90 @@ async fn a_retracted_bba_no_longer_moves_the_claims_belief(
         "the row is kept, marked retracted"
     );
     assert_eq!(audit_count(&w, target).await, 1);
+    assert_eq!(
+        body["belief_vacated"], false,
+        "a BBA remains, so the cache is refolded, not vacated: {body}"
+    );
 
     let (status, body) = retract(&w, &token, target, "again").await;
     assert_eq!(status, 200, "a repeat is not an error: {body}");
     assert_eq!(body["status"], "already_retracted", "{body}");
     assert_eq!(body["retract_reason"], "duplicate re-observation", "{body}");
+    assert_eq!(body["belief_recomputed"], false, "{body}");
+    assert_eq!(body["belief_vacated"], false, "{body}");
+    assert_eq!(body["scoped_beliefs_cleared"], 0, "{body}");
     assert_eq!(audit_count(&w, target).await, 1, "no second audit row");
     assert!(close(cache(&w, w.claim).await, control));
+    assert_eq!(
+        stored_in_scope(&w, w.claim, "perspective", Some(w.p_refute)).await,
+        refute_before,
+        "a repeat deletes nothing"
+    );
+}
+
+/// `(belief, plausibility, pignistic_prob, classification)` of a claim's cache,
+/// each as stored (NULL stays None).
+async fn cache_with_label(
+    w: &World,
+    claim: Uuid,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<String>) {
+    sqlx::query_as(
+        "SELECT belief, plausibility, pignistic_prob, classification FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(&w.pool)
+    .await
+    .expect("read the cache")
+}
+
+/// Ruling R-80 applied to a retraction: when the owner retracts a claim's
+/// ONLY BBA, no BBA remains to refold, and the claim's cache must not keep
+/// serving the retracted BBA's fold. It becomes the explicit vacuous value
+/// (Bel 0, Pl 1, BetP 0.5, `not_enough_info`), never NULL, and the response
+/// says so (`belief_vacated`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracting_a_claims_only_bba_leaves_an_explicit_vacuous_cache(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    // The control holds exactly one BBA (the refuting one).
+    let only = bba(&w, w.control, w.p_refute).await;
+    let (b, p, t, label) = cache_with_label(&w, w.control).await;
+    let before = (
+        b.expect("calibration: a cached belief"),
+        p.expect("calibration: a cached plausibility"),
+        t.expect("calibration: a cached pignistic"),
+    );
+    assert!(
+        !close(before, (0.0, 1.0, 0.5)),
+        "calibration: the cache {before:?} ({label:?}) is the BBA's fold, not vacuous"
+    );
+
+    let token = common::mint_token_with_agent(&["claims:write"], w.owner);
+    let (status, body) = retract(&w, &token, only, "withdrawn").await;
+    assert_eq!(
+        status, 200,
+        "the owner retracts the claim's only BBA: {body}"
+    );
+    assert_eq!(body["status"], "retracted", "{body}");
+    assert_eq!(
+        body["belief_recomputed"], false,
+        "no BBA remains to fold: {body}"
+    );
+    let (b, p, t, label) = cache_with_label(&w, w.control).await;
+    let after = (
+        b.expect("the cache is not NULLed"),
+        p.expect("the cache is not NULLed"),
+        t.expect("the cache is not NULLed"),
+    );
+    assert!(
+        close(after, (0.0, 1.0, 0.5)),
+        "the cache is the explicit vacuous value, not the retracted BBA's fold {before:?}: \
+         {after:?}"
+    );
+    assert_eq!(label.as_deref(), Some("not_enough_info"));
+    assert_eq!(body["belief_vacated"], true, "{body}");
 }
 
 /// Who is refused, and with which status: a stranger that can read the

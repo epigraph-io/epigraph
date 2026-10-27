@@ -181,6 +181,109 @@ async fn mark_retracted_directly(pool: &PgPool, id: Uuid, by: Uuid) {
     .expect("mark retracted on the harness connection");
 }
 
+/// A community whose members are `perspectives`, on the harness connection.
+async fn seed_community(pool: &PgPool, perspectives: &[Uuid]) -> Uuid {
+    let id: Uuid = sqlx::query_scalar("INSERT INTO communities (name) VALUES ($1) RETURNING id")
+        .bind(format!("r79-community-{}", Uuid::new_v4()))
+        .fetch_one(pool)
+        .await
+        .expect("seed community");
+    for p in perspectives {
+        sqlx::query("INSERT INTO community_members (community_id, perspective_id) VALUES ($1, $2)")
+            .bind(id)
+            .bind(p)
+            .execute(pool)
+            .await
+            .expect("seed community member");
+    }
+    id
+}
+
+/// One stored scoped belief of (claim, frame), as the evidence routes write
+/// them, on the harness connection.
+async fn seed_scoped_belief(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    scope_type: &str,
+    scope_id: Option<Uuid>,
+    strategy: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs \
+                (frame_id, claim_id, scope_type, scope_id, belief, plausibility, strategy_used) \
+         VALUES ($1, $2, $3, $4, 0.9, 1.0, $5)",
+    )
+    .bind(frame)
+    .bind(claim)
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(strategy)
+    .execute(pool)
+    .await
+    .expect("seed a stored scoped belief");
+}
+
+/// `(frame, scope_type, scope_id)` of every stored scoped belief of `claim`,
+/// sorted.
+async fn stored_scopes(pool: &PgPool, claim: Uuid) -> Vec<(Uuid, String, Option<Uuid>)> {
+    let mut rows: Vec<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT frame_id, scope_type, scope_id FROM ds_combined_beliefs WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read stored scoped beliefs");
+    rows.sort();
+    rows
+}
+
+/// The `mass_functions.unretract` audit rows naming `id`.
+async fn unretract_rows(pool: &PgPool, id: Uuid) -> Vec<(Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'mass_functions.unretract' \
+            AND details->>'mass_function_id' = $1::text \
+          ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .expect("read unretract audit rows")
+}
+
+/// The message of a refused statement, or a panic naming what was expected.
+fn db_message<T: std::fmt::Debug>(r: Result<T, sqlx::Error>, what: &str) -> (String, String) {
+    let e = r.expect_err(what);
+    let d = e
+        .as_database_error()
+        .unwrap_or_else(|| panic!("{what}: not a database error: {e}"));
+    (
+        d.code().map(|c| c.to_string()).unwrap_or_default(),
+        d.message().to_string(),
+    )
+}
+
+/// An `oauth_clients` row bound to `agent` with `scopes` granted and `status`.
+async fn seed_client(pool: &PgPool, agent: Uuid, scopes: &[&str], status: &str) -> Uuid {
+    let client = Uuid::new_v4();
+    let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, $2, 'r79 admin client', 'human', $3, $3, $4, $5)",
+    )
+    .bind(client)
+    .bind(format!("r79-admin-{client}"))
+    .bind(&scopes)
+    .bind(status)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed an oauth client");
+    client
+}
+
 struct World {
     owner: Uuid,
     other: Uuid,
@@ -422,20 +525,40 @@ async fn a_retracted_bba_leaves_every_fold_reader_and_stays_stored(pool: PgPool)
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_owner_retracts_once_with_one_audit_row_and_a_re_retract_is_idempotent(pool: PgPool) {
     let w = world(&pool).await;
-    // A stored scoped belief on each frame, as the evidence routes write them.
-    for frame in [w.frame_a, w.frame_b] {
-        sqlx::query(
-            "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, belief, plausibility) \
-             VALUES ($1, $2, 'global', 0.9, 1.0)",
-        )
-        .bind(frame)
-        .bind(w.claim)
-        .execute(&pool)
-        .await
-        .expect("seed a stored scoped belief");
+    // Stored scoped beliefs, as the evidence routes write them. The retracted
+    // row (frame_a, under `w.perspective`) was folded by exactly three of
+    // them: frame_a's global scope, its own perspective scope, and a
+    // community that counts its perspective. The others never included it.
+    let other_perspective = seed_perspective(&pool, w.owner).await;
+    let community_in = seed_community(&pool, &[w.perspective]).await;
+    let community_out = seed_community(&pool, &[other_perspective]).await;
+    let community_override = seed_community(&pool, &[w.perspective]).await;
+    let folded_it = [
+        (w.frame_a, "global", None),
+        (w.frame_a, "perspective", Some(w.perspective)),
+        (w.frame_a, "community", Some(community_in)),
+    ];
+    let never_folded_it = [
+        (w.frame_b, "global", None),
+        (w.frame_a, "perspective", Some(other_perspective)),
+        (w.frame_a, "community", Some(community_out)),
+    ];
+    for (frame, scope, scope_id) in folded_it.iter().chain(never_folded_it.iter()) {
+        seed_scoped_belief(&pool, w.claim, *frame, scope, *scope_id, None).await;
     }
+    // A community's mass override is the community's own assessment, not a
+    // fold of its members' BBAs: it stays.
+    seed_scoped_belief(
+        &pool,
+        w.claim,
+        w.frame_a,
+        "community",
+        Some(community_override),
+        Some("override"),
+    )
+    .await;
     let p = pool.clone();
-    let (owner, id) = (w.owner, w.owner_bba);
+    let (owner, id, claim, frame_a) = (w.owner, w.owner_bba, w.claim, w.frame_a);
     let (first, second) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, owner).await;
         let a = MassFunctionRepository::retract_conn(
@@ -445,6 +568,9 @@ async fn the_owner_retracts_once_with_one_audit_row_and_a_re_retract_is_idempote
             None,
         )
         .await;
+        // A fresh stored fold written after the retraction (the next
+        // evidence write stores one): a repeat must not touch it.
+        seed_scoped_belief(&p, claim, frame_a, "global", None, None).await;
         let b = MassFunctionRepository::retract_conn(&mut conn, id, "a second reason", None).await;
         (conn, (a, b))
     })
@@ -461,24 +587,29 @@ async fn the_owner_retracts_once_with_one_audit_row_and_a_re_retract_is_idempote
         "the reason is trimmed"
     );
     assert_eq!(
-        first.scoped_beliefs_cleared, 1,
-        "the retracted row's frame loses its stale stored scoped belief"
+        first.scoped_beliefs_cleared, 3,
+        "exactly the three stored folds that included the retracted row are cleared"
     );
-    let stored: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT frame_id FROM ds_combined_beliefs WHERE claim_id = $1 ORDER BY frame_id",
-    )
-    .bind(w.claim)
-    .fetch_all(&pool)
-    .await
-    .expect("read stored scoped beliefs");
+    let mut expected: Vec<(Uuid, String, Option<Uuid>)> = never_folded_it
+        .iter()
+        .map(|(f, s, id)| (*f, (*s).to_string(), *id))
+        .collect();
+    expected.push((w.frame_a, "community".to_string(), Some(community_override)));
+    expected.push((w.frame_a, "global".to_string(), None));
+    expected.sort();
     assert_eq!(
-        stored,
-        vec![w.frame_b],
-        "only the retracted row's (claim, frame) is cleared"
+        stored_scopes(&pool, w.claim).await,
+        expected,
+        "the scopes that never folded the row, the override, and the fold written after \
+         the retraction all survive"
     );
 
     let second = second.expect("a re-retraction is not an error");
     assert_eq!(second.status, BbaRetractStatus::AlreadyRetracted);
+    assert_eq!(
+        second.scoped_beliefs_cleared, 0,
+        "a repeat deletes no stored belief"
+    );
     assert_eq!(
         (second.retracted_at, second.retract_reason.as_str()),
         (first.retracted_at, "duplicate re-observation"),
@@ -578,46 +709,42 @@ async fn a_non_owner_is_refused_and_an_unreadable_bba_is_not_found(pool: PgPool)
 
 /// The admin arm: a stranger whose token's client holds a LIVE `claims:admin`
 /// grant retracts another writer's BBA, and the audit row records the admin
-/// arm and its client; the same stranger presenting a SUSPENDED client is
-/// refused.
+/// arm and its client. Each conjunct of the grant re-check refuses on its
+/// own, with nothing written: a SUSPENDED client, an active admin client
+/// bound to ANOTHER agent (a session may not present someone else's grant),
+/// and the caller's own active client whose granted scopes lack
+/// `claims:admin` (a token scope the client record no longer backs).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_live_claims_admin_retracts_and_a_suspended_one_is_refused(pool: PgPool) {
+async fn a_live_claims_admin_retracts_and_each_failed_grant_check_is_refused(pool: PgPool) {
     let w = world(&pool).await;
-    let mut clients = Vec::new();
-    for status in ["active", "suspended"] {
-        let client = Uuid::new_v4();
-        let scopes = vec!["claims:write".to_string(), "claims:admin".to_string()];
-        sqlx::query(
-            "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
-                                        granted_scopes, status, agent_id) \
-             VALUES ($1, $2, 'r79 admin client', 'human', $3, $3, $4, $5)",
-        )
-        .bind(client)
-        .bind(format!("r79-admin-{client}"))
-        .bind(&scopes)
-        .bind(status)
-        .bind(w.stranger)
-        .execute(&pool)
-        .await
-        .expect("seed the admin's oauth client");
-        clients.push(client);
-    }
-    let (live, suspended) = (clients[0], clients[1]);
+    let admin_scopes = ["claims:write", "claims:admin"];
+    let live = seed_client(&pool, w.stranger, &admin_scopes, "active").await;
+    let suspended = seed_client(&pool, w.stranger, &admin_scopes, "suspended").await;
+    let foreign = seed_client(&pool, w.other, &admin_scopes, "active").await;
+    let ungranted = seed_client(&pool, w.stranger, &["claims:write"], "active").await;
     let jti = Uuid::new_v4();
     let p = pool.clone();
     let (stranger, owner_bba, other_bba) = (w.stranger, w.owner_bba, w.other_bba);
     let (refused, admitted) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, stranger).await;
-        let r = MassFunctionRepository::retract_conn(
-            &mut conn,
-            owner_bba,
-            "suspended admin",
-            Some(AdminToken {
-                client_id: suspended,
-                jti,
-            }),
-        )
-        .await;
+        let mut refused = Vec::new();
+        for (label, client) in [
+            ("suspended", suspended),
+            ("bound to another agent", foreign),
+            ("without the claims:admin grant", ungranted),
+        ] {
+            let r = MassFunctionRepository::retract_conn(
+                &mut conn,
+                owner_bba,
+                label,
+                Some(AdminToken {
+                    client_id: client,
+                    jti,
+                }),
+            )
+            .await;
+            refused.push((label, r));
+        }
         let a = MassFunctionRepository::retract_conn(
             &mut conn,
             other_bba,
@@ -628,17 +755,21 @@ async fn a_live_claims_admin_retracts_and_a_suspended_one_is_refused(pool: PgPoo
             }),
         )
         .await;
-        (conn, (r, a))
+        (conn, (refused, a))
     })
     .await;
-    assert!(
-        matches!(refused, Err(BbaRetractError::Forbidden(_))),
-        "a suspended admin client is refused: {refused:?}"
-    );
+    for (label, r) in &refused {
+        assert!(
+            matches!(r, Err(BbaRetractError::Forbidden(_))),
+            "an admin client {label} is refused: {r:?}"
+        );
+    }
     assert_eq!(
         retract_columns(&pool, w.owner_bba).await,
-        (false, None, None)
+        (false, None, None),
+        "no refused admin call wrote anything"
     );
+    assert!(audit_rows(&pool, w.owner_bba).await.is_empty());
     let admitted = admitted.expect("a live claims:admin grant retracts another writer's BBA");
     assert_eq!(admitted.arm, BbaRetractArm::Admin);
     assert_eq!(
@@ -653,48 +784,121 @@ async fn a_live_claims_admin_retracts_and_a_suspended_one_is_refused(pool: PgPoo
     assert_eq!(audit[0].1["admin_token_jti"], jti.to_string());
 }
 
-/// The reason is required (blank after trimming is refused, nothing written),
-/// and an application session cannot mark a row retracted by a direct UPDATE,
-/// even its own: only the definer records a retraction, with its audit row.
+/// The reason is required: blank after trimming, or longer than 2000
+/// characters, is refused with nothing written. An application session cannot
+/// mark a row retracted by a direct UPDATE either, even its own: only the
+/// definer records a retraction, with its audit row, and the guard says so
+/// (RT06, not a row-security failure).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_blank_reason_and_a_direct_update_are_refused(pool: PgPool) {
+async fn a_bad_reason_and_a_direct_update_are_refused(pool: PgPool) {
     let w = world(&pool).await;
     let p = pool.clone();
     let (owner, id) = (w.owner, w.owner_bba);
-    let (blank, direct) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, owner).await;
-        let b = MassFunctionRepository::retract_conn(&mut conn, id, "   ", None).await;
-        let d = sqlx::query(
-            "UPDATE mass_functions SET retracted_at = now(), retracted_by = $2, \
-                    retract_reason = 'no audit' WHERE id = $1",
-        )
-        .bind(id)
-        .bind(owner)
-        .execute(&mut *conn)
+    let long = "x".repeat(2001);
+    let longest = "y".repeat(2000);
+    let (blank, too_long, direct, at_limit) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, owner).await;
+            let b = MassFunctionRepository::retract_conn(&mut conn, id, "   ", None).await;
+            let l = MassFunctionRepository::retract_conn(&mut conn, id, &long, None).await;
+            let d = sqlx::query(
+                "UPDATE mass_functions SET retracted_at = now(), retracted_by = $2, \
+                        retract_reason = 'no audit' WHERE id = $1",
+            )
+            .bind(id)
+            .bind(owner)
+            .execute(&mut *conn)
+            .await;
+            // Calibration last: a 2000-character reason is admitted, so the
+            // 2001 refusal is the bound and not the call's shape.
+            let ok = MassFunctionRepository::retract_conn(&mut conn, id, &longest, None).await;
+            (conn, (b, l, d, ok))
+        })
         .await;
-        (conn, (b, d))
-    })
-    .await;
     assert!(
         matches!(blank, Err(BbaRetractError::InvalidReason(_))),
         "a blank reason is refused: {blank:?}"
     );
-    let direct = direct.expect_err("a direct UPDATE of the retract columns is refused");
+    assert!(
+        matches!(too_long, Err(BbaRetractError::InvalidReason(_))),
+        "a 2001-character reason is refused: {too_long:?}"
+    );
+    let (code, message) = db_message(direct, "a direct UPDATE of the retract columns is refused");
+    assert_eq!(code, "42501", "refused as a privilege error: {message}");
+    assert!(
+        message.contains("RT06"),
+        "refused by the retract guard, not by row security: {message}"
+    );
+    let at_limit = at_limit.expect("CALIBRATION: a 2000-character reason is admitted");
+    assert_eq!(at_limit.status, BbaRetractStatus::Retracted);
+    let audit = audit_rows(&pool, w.owner_bba).await;
     assert_eq!(
-        direct.as_database_error().and_then(|e| e.code()).as_deref(),
-        Some("42501"),
-        "refused as a privilege error: {direct}"
+        audit.len(),
+        1,
+        "only the admitted call wrote an audit row: {audit:#?}"
+    );
+    assert_eq!(audit[0].1["reason"], "y".repeat(2000));
+}
+
+/// The refusals that come before any row is read. A session with no
+/// principal has nobody to record as the retractor (RT01). And authority is
+/// decided before state: a stranger retracting a public row the owner has
+/// ALREADY retracted is refused, not told `already_retracted`, so a caller
+/// that may not retract a row learns nothing of its state. Nothing is written
+/// by either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_principal_is_refused_and_a_stranger_learns_nothing_of_a_retracted_row(pool: PgPool) {
+    let w = world(&pool).await;
+    let p = pool.clone();
+    let (owner, stranger, id) = (w.owner, w.stranger, w.owner_bba);
+    let (unstamped, owners, strangers) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            sqlx::query(
+                "SELECT set_config('epigraph.group_ids', '', false), \
+                        set_config('epigraph.writable_group_ids', '', false), \
+                        set_config('epigraph.principal_id', '', false)",
+            )
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+            let u = sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT public.epigraph_retract_mass_function($1, 'no principal', NULL, NULL)",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await;
+            stamp(&mut conn, &p, owner).await;
+            let o = MassFunctionRepository::retract_conn(&mut conn, id, "owner first", None).await;
+            stamp(&mut conn, &p, stranger).await;
+            let s =
+                MassFunctionRepository::retract_conn(&mut conn, id, "stranger second", None).await;
+            (conn, (u, o, s))
+        })
+        .await;
+    let (code, message) = db_message(unstamped, "an unstamped session retracts nothing");
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("RT01"), "no principal: {message}");
+    let owners = owners.expect("the owner retracts its BBA");
+    assert!(
+        matches!(strangers, Err(BbaRetractError::Forbidden(_))),
+        "a stranger on an already-retracted row is refused, not answered \
+         already_retracted: {strangers:?}"
     );
     assert_eq!(
         retract_columns(&pool, w.owner_bba).await,
-        (false, None, None)
+        (true, Some(w.owner), Some("owner first".to_string())),
+        "the owner's retraction stands as it was"
     );
-    assert!(audit_rows(&pool, w.owner_bba).await.is_empty());
+    let audit = audit_rows(&pool, w.owner_bba).await;
+    assert_eq!(audit.len(), 1, "only the owner's call wrote: {audit:#?}");
+    assert_eq!(audit[0].0, Some(owners.retracted_by));
 }
 
 /// A later write to a retracted row's upsert key is a NEW assessment: the
-/// upsert replaces the masses and clears the retraction, so the new BBA folds;
-/// the retracted content survives in the audit row's snapshot.
+/// upsert replaces the masses and clears the retraction, so the NEW masses
+/// fold; the retracted content survives in the retraction's audit snapshot,
+/// and the clear itself is audited (`mass_functions.unretract`, exactly one
+/// row, naming who cleared it and what replaced the retracted masses).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
     let w = world(&pool).await;
@@ -708,12 +912,12 @@ async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
             let again =
                 store_bba(&mut conn, &p, owner, claim, frame_a, Some(perspective), 0.4).await;
             let v = stamp(&mut conn, &p, owner).await;
-            let live: Vec<Uuid> =
+            let live: Vec<(Uuid, serde_json::Value)> =
                 MassFunctionRepository::get_for_claim_frame(&mut *conn, &v, claim, frame_a)
                     .await
                     .expect("get_for_claim_frame")
                     .into_iter()
-                    .map(|r| r.id)
+                    .map(|r| (r.id, r.masses))
                     .collect();
             (conn, (r, again, live))
         })
@@ -723,7 +927,12 @@ async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
         rewritten, w.owner_bba,
         "the key holds one row: the upsert reuses it"
     );
-    assert_eq!(live, vec![w.owner_bba], "the new assessment folds again");
+    assert_eq!(live.len(), 1, "the new assessment folds again: {live:?}");
+    assert_eq!(live[0].0, w.owner_bba);
+    assert_eq!(
+        live[0].1["0"], 0.4,
+        "the fold reads the NEW masses, not the retracted ones: {live:?}"
+    );
     assert_eq!(
         retract_columns(&pool, w.owner_bba).await,
         (false, None, None)
@@ -733,5 +942,302 @@ async fn a_new_write_to_a_retracted_key_replaces_it_and_folds(pool: PgPool) {
     assert_eq!(
         audit[0].1["before"]["masses"]["0"], 0.9,
         "the retracted masses survive in the audit snapshot"
+    );
+    let cleared = unretract_rows(&pool, w.owner_bba).await;
+    assert_eq!(cleared.len(), 1, "the clear is audited once: {cleared:#?}");
+    let (agent, details) = &cleared[0];
+    assert_eq!(
+        *agent,
+        Some(w.owner),
+        "the clear names the session principal"
+    );
+    assert_eq!(details["before"]["retract_reason"], "superseded");
+    assert_eq!(details["before"]["masses"]["0"], 0.9);
+    assert_eq!(details["after_masses"]["0"], 0.4);
+}
+
+/// R-79's motivating case is an ADMIN retracting somebody else's BBA, so the
+/// row's owner (which 077 lets UPDATE its own row) must not be able to undo
+/// that silently. A bare clear (the three columns NULLed, nothing else
+/// changed) is refused by the guard (RT06). A clear that comes with a new
+/// assessment (here a new `created_at`, as the upsert stamps one) is admitted
+/// and audited: exactly one `mass_functions.unretract` row, naming the owner
+/// and carrying the admin's retraction as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_owner_cannot_silently_clear_an_admin_retraction(pool: PgPool) {
+    let w = world(&pool).await;
+    let live = seed_client(
+        &pool,
+        w.stranger,
+        &["claims:write", "claims:admin"],
+        "active",
+    )
+    .await;
+    let p = pool.clone();
+    let (owner, stranger, id) = (w.owner, w.stranger, w.owner_bba);
+    let (admin, bare, reassessed) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, stranger).await;
+            let a = MassFunctionRepository::retract_conn(
+                &mut conn,
+                id,
+                "duplicate re-observation",
+                Some(AdminToken {
+                    client_id: live,
+                    jti: Uuid::new_v4(),
+                }),
+            )
+            .await;
+            stamp(&mut conn, &p, owner).await;
+            let b = sqlx::query(
+                "UPDATE mass_functions \
+                    SET retracted_at = NULL, retracted_by = NULL, retract_reason = NULL \
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *conn)
+            .await;
+            let r = sqlx::query(
+                "UPDATE mass_functions \
+                    SET retracted_at = NULL, retracted_by = NULL, retract_reason = NULL, \
+                        created_at = clock_timestamp() \
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *conn)
+            .await;
+            (conn, (a, b, r))
+        })
+        .await;
+    let admin = admin.expect("the admin retracts the owner's BBA");
+    assert_eq!(admin.arm, BbaRetractArm::Admin);
+    let (code, message) = db_message(bare, "a bare clear of an admin retraction is refused");
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("RT06"), "refused by the guard: {message}");
+    let reassessed = reassessed.expect("a clear that comes with a new assessment is admitted");
+    assert_eq!(
+        reassessed.rows_affected(),
+        1,
+        "CALIBRATION: RLS admits the owner's UPDATE"
+    );
+    let cleared = unretract_rows(&pool, w.owner_bba).await;
+    assert_eq!(
+        cleared.len(),
+        1,
+        "the refused clear wrote nothing; the admitted one is audited once: {cleared:#?}"
+    );
+    let (agent, details) = &cleared[0];
+    assert_eq!(*agent, Some(w.owner));
+    assert_eq!(
+        details["before"]["retracted_by"],
+        w.stranger.to_string(),
+        "the audit row carries the admin's retraction it cleared"
+    );
+    assert_eq!(
+        details["before"]["retract_reason"],
+        "duplicate re-observation"
+    );
+}
+
+/// The guard covers INSERT too: an application session cannot write a new
+/// row that is already retracted (with a `retracted_by` of its choosing and
+/// no audit row). The same INSERT without the retract columns lands, so the
+/// refusal is the guard's and not row security's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_insert_that_arrives_retracted_is_refused(pool: PgPool) {
+    let w = world(&pool).await;
+    let frame = seed_frame(&pool, "insert").await;
+    let p = pool.clone();
+    let (owner, stranger, claim) = (w.owner, w.stranger, w.claim);
+    let (forged, plain) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let f = sqlx::query(
+            "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
+                                         retracted_at, retracted_by, retract_reason) \
+             VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb, now(), $4, 'forged')",
+        )
+        .bind(claim)
+        .bind(frame)
+        .bind(owner)
+        .bind(stranger)
+        .execute(&mut *conn)
+        .await;
+        let ok = sqlx::query(
+            "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
+             VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb)",
+        )
+        .bind(claim)
+        .bind(frame)
+        .bind(owner)
+        .execute(&mut *conn)
+        .await;
+        (conn, (f, ok))
+    })
+    .await;
+    let (code, message) = db_message(forged, "an INSERT that arrives retracted is refused");
+    assert_eq!(code, "42501", "{message}");
+    assert!(message.contains("RT06"), "refused by the guard: {message}");
+    plain.expect("CALIBRATION: the same INSERT without retract columns lands");
+    let retracted_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND frame_id = $2 AND retracted_at IS NOT NULL",
+    )
+    .bind(w.claim)
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(retracted_rows, 0, "no forged retracted row exists");
+}
+
+/// The edge wake-up gate counts a retracted row as present (its register
+/// entry in `bba_retract_read_lint.rs`): a re-asserted edge must not silently
+/// re-derive a BBA somebody retracted. Pinned with the perspective's ONLY row
+/// retracted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_perspective_whose_only_bba_is_retracted_still_exists(pool: PgPool) {
+    let w = world(&pool).await;
+    let before = exists_for(&pool, w.owner, w.perspective).await;
+    assert!(before, "CALIBRATION: the perspective holds the owner's row");
+    mark_retracted_directly(&pool, w.owner_bba, w.owner).await;
+    assert!(
+        exists_for(&pool, w.owner, w.perspective).await,
+        "a retracted row still counts as wired"
+    );
+}
+
+async fn exists_for(pool: &PgPool, agent: Uuid, perspective: Uuid) -> bool {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        let v = stamp(&mut conn, &p, agent).await;
+        let e = MassFunctionRepository::exists_for_perspective(&mut *conn, &v, perspective)
+            .await
+            .expect("exists_for_perspective");
+        (conn, e)
+    })
+    .await
+}
+
+/// `compound_own_rows` reads each own row's refuting citers in a subquery
+/// over `mass_functions` beside the outer read; the retracted-row filter must
+/// sit on the CITER (`ar`), not only on the outer row. A retracted
+/// `attributed_v1` row that refutes the owner's row stops counting as a
+/// citer, while the cited row itself stays.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_refuting_citer_drops_out_of_compound_own_rows(pool: PgPool) {
+    let w = world(&pool).await;
+    let owner_group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.claim)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim's group");
+    let citer_claim = public_claim_owned_by(&pool, w.owner, owner_group, "citer").await;
+    let citer = MassFunctionRepository::store_with_perspective(
+        &pool,
+        citer_claim,
+        w.frame_a,
+        Some(w.owner),
+        Some(w.perspective),
+        &serde_json::json!({"1": 0.6, "0,1": 0.4}),
+        None,
+        Some("attributed_v1"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store the attributed citer");
+    let citers = |pool: PgPool, owner: Uuid, claim: Uuid| async move {
+        let p = pool.clone();
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            let v = stamp(&mut conn, &p, owner).await;
+            let rows = compound_own_rows(&mut *conn, &v, &[claim], Uuid::nil())
+                .await
+                .expect("compound_own_rows");
+            let out: Vec<(Uuid, Vec<Uuid>)> = rows
+                .into_iter()
+                .map(|r| (r.input.row.id, r.refuting_citers))
+                .collect();
+            (conn, out)
+        })
+        .await
+    };
+    let before = citers(pool.clone(), w.owner, w.claim).await;
+    let own = before
+        .iter()
+        .find(|(id, _)| *id == w.owner_bba)
+        .unwrap_or_else(|| panic!("CALIBRATION: the owner's row is read: {before:?}"));
+    assert_eq!(own.1, vec![citer_claim], "CALIBRATION: the citer counts");
+
+    mark_retracted_directly(&pool, citer, w.owner).await;
+    let after = citers(pool.clone(), w.owner, w.claim).await;
+    let own = after
+        .iter()
+        .find(|(id, _)| *id == w.owner_bba)
+        .unwrap_or_else(|| panic!("the cited row itself stays: {after:?}"));
+    assert!(
+        own.1.is_empty(),
+        "a retracted citer no longer refutes: {after:?}"
+    );
+}
+
+/// Known limit, pinned so a change is deliberate: in a dedup repair a
+/// canonical's RETRACTED row still holds its upsert key (migration 034's
+/// unique key covers it), so the duplicate's LIVE row at the same key is kept
+/// on the duplicate and the merged claim folds neither. The retracted row is
+/// not displaced by the repair; the source re-submits on the canonical to
+/// count again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_keeps_a_live_row_whose_key_a_retracted_canonical_row_holds(pool: PgPool) {
+    let w = world(&pool).await;
+    let owner_group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.claim)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim's group");
+    let canonical = w.claim;
+    let dup = public_claim_owned_by(&pool, w.owner, owner_group, "duplicate").await;
+    let on_dup = MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        w.frame_a,
+        Some(w.owner),
+        Some(w.perspective),
+        &serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        None,
+        None,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("the duplicate's live row at the canonical's key");
+    mark_retracted_directly(&pool, w.owner_bba, w.owner).await;
+
+    let repair = epigraph_db::ClaimRepository::mark_duplicate_with_repair(
+        &pool,
+        epigraph_core::ClaimId::from_uuid(dup),
+        epigraph_core::ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup");
+    assert_eq!(
+        repair.kept_on_duplicate,
+        vec![on_dup],
+        "the live row stays on the duplicate"
+    );
+    let on_dup_claim: Uuid =
+        sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+            .bind(on_dup)
+            .fetch_one(&pool)
+            .await
+            .expect("read");
+    assert_eq!(on_dup_claim, dup);
+    let canonical_frame_a: Vec<Uuid> = readers(&pool, &w).await.for_claim_frame_a;
+    assert!(
+        canonical_frame_a.is_empty(),
+        "the canonical folds neither row at that key: {canonical_frame_a:?}"
     );
 }
