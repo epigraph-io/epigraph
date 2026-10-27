@@ -1390,9 +1390,20 @@ member while:
   in a different folder, and later copies of those do not: they stay attached
   for 166's refusals only.
 
-A detach does not follow the lineage. To take the group from a job's lineage,
-detach each attached identity in it (`epigraph_detach_agent_from_role`), or
-end the binding.
+A detach DOES revoke the lineage's grant: a succession copy counts only while
+every row it was copied through, the operator's own attachment included, is
+un-detached and inside its window. So detaching the identity you attached
+(`epigraph_detach_agent_from_role`) takes the group from every successor
+copied from it at once, and detaching a middle identity takes it from the
+copies below that one. A revert (the job goes back to an earlier prompt or
+model, so the host registers the earlier, detached identity again with its
+successor as the parent) regains nothing. The copies themselves stay
+attached, for 166's write refusal.
+
+To give the group back after a detach, attach the identity that runs NOW.
+Re-attaching the old root alone does not bring back a successor whose old
+copy still covers the window (166's lineage follow copies only into gaps):
+detach the running identity's old copy first, then attach it by name.
 
 #### Recipe: a role-private group for a scheduled job
 
@@ -1461,8 +1472,9 @@ What to know before relying on it:
   drops the group for the copies; attach the new identity explicitly if that
   is intended.
 * Membership is computed at each resolve, like 165's: it lapses at the
-  assignment's end, the attachment's end or detach, and the binding's end,
-  with no job.
+  assignment's end, the attachment's end or detach (of the identity itself
+  or of any identity its attachment was copied from), and the binding's
+  end, with no job.
 * "Private" means non-public to every API and MCP principal outside the
   group. A process holding the application database DSN is not bound by it
   (see "Arming, and the valve").
