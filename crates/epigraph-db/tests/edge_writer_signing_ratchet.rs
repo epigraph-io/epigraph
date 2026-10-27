@@ -44,7 +44,10 @@
 //!   edge THIS act created and the session may update).
 //! * A [`Signed`] entry's function must call `sign_created_edge_conn`, or a
 //!   signed twin and name its key ([`signs`]), so a signed writer cannot
-//!   silently stop signing.
+//!   silently stop signing. And PER SITE ([`site_problems`]): in a function
+//!   that signs at INSERT, every primitive call must be a signed twin whose
+//!   key argument is not a literal `None`, so one site of a multi-site writer
+//!   cannot revert unseen.
 //! * A site that disappears must have its entry REMOVED (exact match both ways).
 //! * [`UNSIGNED_SITES_HIGH_WATER`] is the exact number of unsigned sites
 //!   (Rust and database). It should only go down: signing a writer lowers it
@@ -116,6 +119,94 @@ fn signs(body: &str) -> bool {
         || body.contains(SIGN_AT_INSERT)
         || (SIGNED_TWINS.iter().any(|t| body.contains(t))
             && KEY_MARKERS.iter().any(|k| body.contains(k)))
+}
+
+/// The text of the call starting at `at` in `body`: from the primitive's name
+/// through its balanced argument list (the key argument sits on a later line
+/// than the name in most writers).
+fn call_span(body: &str, at: usize) -> &str {
+    let Some(open) = body[at..].find('(').map(|i| at + i) else {
+        return &body[at..];
+    };
+    let mut depth = 0i64;
+    for (i, c) in body[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[at..=open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    &body[at..]
+}
+
+/// The top-level arguments of a call span (`Name(a, b(c, d), e)` -> `a`,
+/// `b(c, d)`, `e`), trimmed.
+fn call_args(span: &str) -> Vec<String> {
+    let Some(open) = span.find('(') else {
+        return Vec::new();
+    };
+    let inner = &span[open + 1..span.len().saturating_sub(1)];
+    let mut out = Vec::new();
+    let mut depth = 0i64;
+    let mut cur = String::new();
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// PER-SITE checks of a [`Signed`] function's body (backlog `dae795f8`): the
+/// body-level [`signs`] cannot see ONE site of a multi-site writer reverting
+/// to the unsigned primitive, or passing a literal `None` key. Every
+/// primitive call in a function that signs at INSERT must be a signed twin
+/// whose key argument (the second) is not `None`. A function that signs
+/// after the INSERT (`sign_created_edge_conn`) or is the attested INSERT
+/// itself is exempt: its sites are unsigned calls by design.
+fn site_problems(body: &str) -> Vec<String> {
+    if body.contains(SIGN_CALL) || body.contains(SIGN_AT_INSERT) {
+        return Vec::new();
+    }
+    let mut starts: Vec<usize> = CALLS
+        .iter()
+        .flat_map(|c| body.match_indices(c).map(|(i, _)| i))
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut problems = Vec::new();
+    for (n, at) in starts.into_iter().enumerate() {
+        let span = call_span(body, at);
+        let name = &span[..span.find('(').unwrap_or(span.len())];
+        let twin = name.ends_with("_signed_conn") || name == "EdgeRepository::create_signed";
+        if !twin {
+            problems.push(format!(
+                "site {} calls the UNSIGNED primitive {name}",
+                n + 1
+            ));
+            continue;
+        }
+        if call_args(span).get(1).map(String::as_str) == Some("None") {
+            problems.push(format!("site {} passes a None key to {name}", n + 1));
+        }
+    }
+    problems
 }
 
 /// Why an unsigned site does not sign. Each is a measured property of the
@@ -974,6 +1065,10 @@ fn check(
                         "{file}::{func} is registered Signed but no longer calls {SIGN_CALL} \
                          or a signed twin with its key"
                     ));
+                } else if s.status == Signed {
+                    for p in site_problems(body) {
+                        problems.push(format!("{file}::{func} is registered Signed but {p}"));
+                    }
                 }
             }
         }
@@ -1093,6 +1188,42 @@ fn the_register_rules_hold_on_a_synthetic_register() {
     assert!(signs(
         "let s = key.signer.sign_entity(SignedEntity::Edge, &digest);\n"
     ));
+
+    // Per site: one of two sites reverting to the unsigned primitive, or one
+    // passing a literal `None` key, fails although the body still names a
+    // signed twin and a key; a key bound to a local passes.
+    let keyed =
+        "EdgeRepository::create_signed(\n    pool,\n    state.edge_signing_key(),\n    a,\n);\n";
+    let reverted = format!("{keyed}let _ = EdgeRepository::create(\n    pool, a, \"claim\",\n);\n");
+    let none_key = format!(
+        "{keyed}EdgeRepository::create_if_not_exists_signed_conn(\n    &mut tx,\n    None,\n    a,\n);\n"
+    );
+    let local = "let k = Some(key);\nEdgeRepository::create_symmetric_if_absent_row_signed_conn(conn, k, a, json!({\"x\": 1}), b)\n";
+    assert_eq!(site_problems(keyed), Vec::<String>::new());
+    assert_eq!(site_problems(local), Vec::<String>::new());
+    assert_eq!(
+        site_problems(&reverted),
+        vec!["site 2 calls the UNSIGNED primitive EdgeRepository::create".to_string()]
+    );
+    assert_eq!(
+        site_problems(&none_key),
+        vec![
+            "site 2 passes a None key to EdgeRepository::create_if_not_exists_signed_conn"
+                .to_string()
+        ]
+    );
+    let multi: BTreeMap<(String, String), (usize, String)> =
+        [(("m.rs".to_string(), "multi".to_string()), (2, reverted))]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        check(&multi, &[site("m.rs", "multi", 2, Signed)], &no_db, &[], 0),
+        vec![
+            "m.rs::multi is registered Signed but site 2 calls the UNSIGNED primitive \
+             EdgeRepository::create"
+                .to_string()
+        ]
+    );
 
     let register = [
         site("a.rs", "signs", 1, Signed),
