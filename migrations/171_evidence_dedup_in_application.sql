@@ -55,6 +55,24 @@
 -- `evidence` still covers both `content_hash` and `claim_id`, whatever its
 -- name; it does not require that 001's key ever existed.
 --
+-- ===================================================================
+-- 3. EVIDENCE ROWS SEALED BEFORE THE DIGEST SENTINEL (statement below)
+-- ===================================================================
+--
+-- The seal now replaces a sealed row's `content_hash` with a per-row sentinel
+-- (`privatization::SEAL_EVIDENCE_DIGEST_SENTINEL`), because BLAKE3 of the
+-- plaintext body confirms a guessed body to anyone who can read the row. Rows
+-- sealed before that change still carry it; section 3 gives them the same
+-- sentinel. Unseal rebuilds such a row's digest as BLAKE3 of the restored body,
+-- recognising the sentinel in the column. IRREVERSIBLE for a sealed row whose
+-- body was NULL (external evidence): its writer-supplied digest exists nowhere
+-- else and stays the sentinel after unseal. Count the sealed rows first,
+-- read-only: `SELECT count(*) FROM evidence_encryption;` (which of them had no
+-- body is recorded only inside the ciphertext). The long-lived database had no
+-- sealed evidence when this was written, so there the statement changes
+-- nothing. A closing DO block refuses (55000) if any sealed row is left
+-- without the sentinel, so a filtered UPDATE cannot pass silently.
+--
 -- DEPLOY ORDER: the matching binaries FIRST (the epigraph-api server, with
 -- the hosted jobs it runs, and epigraph-mcp), then this migration. A binary
 -- built before this file names `ON CONFLICT (content_hash, claim_id)` in
@@ -62,13 +80,16 @@
 -- unique constraint) once the key is gone; that is already the case on any
 -- database that never had the key. Its other evidence writes are not
 -- de-duplicated at all against this file (an identical retry adds a row, as on
--- the long-lived database today). The new binaries work on either side: where
--- the key is still present, a re-applied derivation is answered
--- `AlreadyPresent` as before, but a write that collides with another owner's
--- row is still refused by the key, so the cross-owner refusal ends when this
--- file applies, not when the binary ships.
+-- the long-lived database today), and after section 3 its seal would leave the
+-- plaintext digest on rows it seals while its unseal would keep the sentinel on
+-- rows it restores. No seal or unseal may be in flight while this applies. The
+-- new binaries work on either side: where the key is still present, a
+-- re-applied derivation is answered `AlreadyPresent` as before, but a write
+-- that collides with another owner's row is still refused by the key, so the
+-- cross-owner refusal ends when this file applies, not when the binary ships.
 --
--- UNDO (only on a database with no duplicate (content_hash, claim_id) rows;
+-- UNDO of section 1 (only on a database with no duplicate (content_hash,
+-- claim_id) rows;
 -- count them first, read-only, with
 --   SELECT count(*) FROM (SELECT 1 FROM evidence GROUP BY content_hash, claim_id
 --                          HAVING count(*) > 1) d;):
@@ -96,6 +117,37 @@ BEGIN
     IF offending IS NOT NULL THEN
         RAISE EXCEPTION '171: a unique index on evidence still covers (content_hash, claim_id): %',
                         offending
+            USING ERRCODE = '55000';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- 3. ROWS SEALED BEFORE THE DIGEST SENTINEL
+-- ===================================================================
+--
+-- An `evidence_encryption` row exists exactly while its evidence row is
+-- sealed. The expression is the seal's `SEAL_EVIDENCE_DIGEST_SENTINEL`
+-- verbatim (alias `e`); the two must not drift, or unseal stops recognising a
+-- backfilled row and keeps the sentinel instead of recomputing the digest
+-- (`epigraph-db/tests/evidence_seal_digest_backfill.rs` round-trips it).
+-- Idempotent: a row already holding the sentinel is not touched. Runs as the
+-- migration owner, so row security does not filter it.
+UPDATE public.evidence e
+   SET content_hash = sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'))
+ WHERE EXISTS (SELECT 1 FROM public.evidence_encryption ee WHERE ee.evidence_id = e.id)
+   AND e.content_hash IS DISTINCT FROM
+       sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'));
+
+DO $$
+DECLARE left_over bigint;
+BEGIN
+    SELECT count(*) INTO left_over
+      FROM public.evidence e
+     WHERE EXISTS (SELECT 1 FROM public.evidence_encryption ee WHERE ee.evidence_id = e.id)
+       AND e.content_hash IS DISTINCT FROM
+           sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'));
+    IF left_over > 0 THEN
+        RAISE EXCEPTION '171: % sealed evidence row(s) still carry a plaintext digest', left_over
             USING ERRCODE = '55000';
     END IF;
 END $$;

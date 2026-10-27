@@ -1797,18 +1797,30 @@ restart.
   `epigraph-db/tests/evidence_dedup_per_owner.rs` (including the race and
   `migrated_evidence_carries_no_unique_key_over_body_and_claim`),
   `epigraph-api/tests/evidence_content_oracle_test.rs` and
-  `epigraph-mcp/tests/evidence_content_oracle_app_role.rs`. Slot 171 assigned
+  `epigraph-mcp/tests/evidence_content_oracle_app_role.rs`. Section 3 gives
+  evidence rows sealed before the seal wrote a digest sentinel (an
+  `evidence_encryption` row exists) that per-row sentinel
+  (`privatization::SEAL_EVIDENCE_DIGEST_SENTINEL`, same expression), so a
+  sealed row's plaintext digest stops confirming a guessed body; unseal
+  rebuilds such a row's digest as BLAKE3 of the restored body. IRREVERSIBLE
+  for a sealed row whose body was NULL (external evidence): its
+  writer-supplied digest stays the sentinel after unseal (count first:
+  `SELECT count(*) FROM evidence_encryption`). A second DO block refuses
+  (`55000`) if a sealed row is left without the sentinel. Pinned by
+  `epigraph-db/tests/evidence_seal_digest_backfill.rs`. Slot 171 assigned
   by the bug-wave plan; free on `main` and in every open PR when committed.
   **Deploy order:** the matching binaries FIRST (the epigraph-api server,
   with the hosted jobs it runs, and epigraph-mcp), then 171. Against 171 an
   older binary's `ON CONFLICT (content_hash, claim_id)` in
   `record_derivation_conn` fails 42P10 (as it already does on any database
   without the key), and its other evidence writes are not de-duplicated at
-  all (an identical retry adds a row, as on the long-lived database today).
-  The new binaries work on either side, but while a database still has the
-  key a write that collides with another owner's row is still refused: the
-  cross-owner refusal ends when 171 applies, not when the binary ships.
-  Undo is in the file's header.
+  all (an identical retry adds a row, as on the long-lived database today);
+  after section 3 its seal would leave the plaintext digest on rows it seals
+  and its unseal would keep the sentinel on rows it restores. No seal or
+  unseal may be in flight while 171 applies. The new binaries work on either
+  side, but while a database still has the key a write that collides with
+  another owner's row is still refused: the cross-owner refusal ends when 171
+  applies, not when the binary ships. Undo is in the file's header.
   **Applied to throwaway databases only, NOT to any deployed database.**
 - **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
   Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
