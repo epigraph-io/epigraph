@@ -449,6 +449,7 @@ async fn prepare_submission(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            &params.labels,
         )
         .await
         {
