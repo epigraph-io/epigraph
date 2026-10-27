@@ -573,6 +573,112 @@ async fn the_evidence_url_is_sealed_with_its_row_and_restored_on_unseal(pool: Pg
     );
 }
 
+/// A sealed evidence row's `content_hash` is no longer a digest of its body,
+/// and unseal puts the original digest back (backlog 12b68201). Scoped to the
+/// column: a signature made over the pre-seal digest is a separate residual.
+///
+/// The seal replaced `raw_content` with a sentinel and left `content_hash` as
+/// the digest of the plaintext. Anyone who can read the row, or whose evidence
+/// write on the claim collides with it, can confirm a guessed body against
+/// that digest. So the seal stores a per-row sentinel digest instead: unequal
+/// to the original, and unequal between two sealed rows whose bodies are the
+/// same. Unseal restores the original digest exactly, including the
+/// caller-supplied digest of a body-less (external) row, which no server-side
+/// recomputation could rebuild.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sealed_evidence_digest_is_not_its_bodys_and_unseal_restores_it(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let first = seed_subject(&pool, &world, "a first confidential result").await;
+    let second = seed_subject(&pool, &world, "a second confidential result").await;
+    let both = vec![first, second];
+
+    // The same body on both claims, with its real digest.
+    let shared = format!("one confidential body on two claims {}", Uuid::new_v4());
+    let shared_digest = blake3::hash(shared.as_bytes()).as_bytes().to_vec();
+    sqlx::query("UPDATE evidence SET raw_content = $2, content_hash = $3 WHERE claim_id = ANY($1)")
+        .bind(&both)
+        .bind(&shared)
+        .bind(&shared_digest)
+        .execute(&pool)
+        .await
+        .expect("give both evidence rows the same body");
+    // External evidence: no body, and a digest only the caller could supply.
+    let external = blake3::hash(format!("external artefact {}", Uuid::new_v4()).as_bytes())
+        .as_bytes()
+        .to_vec();
+    let bodiless: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, 'document', $2, NULL) RETURNING id",
+    )
+    .bind(first)
+    .bind(&external)
+    .fetch_one(&pool)
+    .await
+    .expect("seed body-less evidence");
+
+    let digests = |pool: PgPool, both: Vec<Uuid>| async move {
+        sqlx::query_as::<_, (Uuid, Vec<u8>, Option<String>)>(
+            "SELECT id, content_hash, raw_content FROM evidence \
+              WHERE claim_id = ANY($1) ORDER BY id",
+        )
+        .bind(&both)
+        .fetch_all(&pool)
+        .await
+        .expect("read evidence digests")
+    };
+    let before = digests(pool.clone(), both.clone()).await;
+    assert_eq!(
+        before.len(),
+        3,
+        "fixture: two shared-body rows and one body-less row"
+    );
+
+    let plan = applied_seal_plan(&pool, &world, &[first, second]).await;
+    seal_through_routes(&pool, &world, plan, 2).await;
+
+    let sealed = digests(pool.clone(), both.clone()).await;
+    for ((id, original, _), (_, now, _)) in before.iter().zip(&sealed) {
+        assert_eq!(now.len(), 32, "evidence_content_hash_length");
+        assert_ne!(
+            now, original,
+            "sealed evidence {id} still carries its pre-seal digest, which confirms a \
+             guessed body (or a guessed external artefact)"
+        );
+    }
+    let shared_sealed: Vec<&Vec<u8>> = sealed
+        .iter()
+        .filter(|(id, ..)| *id != bodiless)
+        .map(|(_, h, _)| h)
+        .collect();
+    assert_eq!(shared_sealed.len(), 2);
+    assert_ne!(
+        shared_sealed[0], shared_sealed[1],
+        "two sealed rows with the same body must not share a digest"
+    );
+    assert!(
+        !shared_sealed.contains(&&shared_digest),
+        "no sealed row may hold BLAKE3 of its body"
+    );
+
+    unseal_through_routes(&pool, &world, plan, 2).await;
+
+    let restored = digests(pool.clone(), both.clone()).await;
+    assert_eq!(
+        restored, before,
+        "unseal restores every row's original digest and body, including the body-less \
+         row's caller-supplied digest and its NULL body"
+    );
+    let carriers: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE claim_id = ANY($1) AND properties ? '$sealed_content_hash'",
+    )
+    .bind(&both)
+    .fetch_one(&pool)
+    .await
+    .expect("count carrier keys");
+    assert_eq!(carriers, 0, "the carrier key is the seal's, not the row's");
+}
+
 /// A commit that omits a TCB member is refused, and NOTHING is sealed.
 ///
 /// The second half is the assertion that matters: §6.5.4's indictment of the
