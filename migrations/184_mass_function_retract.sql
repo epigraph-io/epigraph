@@ -90,13 +90,17 @@
 -- 4. DEPLOY AND UNDO
 -- ===================================================================
 --
--- `ADD COLUMN` of nullable columns with no default is catalog-only. The CHECK
--- constraint is added NOT VALID and validated in a second statement, which
--- scans `mass_functions` under a SHARE UPDATE EXCLUSIVE lock (writes keep
--- flowing). Apply BEFORE a binary with the matching readers serves: that
--- binary selects `retracted_at` in its predicates. A binary WITHOUT this change
--- against a database WITH it keeps working, and folds every row, as no row is
--- retracted until a new binary's route or tool retracts one.
+-- The migration runs in ONE transaction and holds ACCESS EXCLUSIVE on
+-- `mass_functions` from the first `ALTER TABLE` to the commit: every read and
+-- write of the table waits for it. `ADD COLUMN` of nullable columns with no
+-- default is catalog-only; adding the CHECK constraint scans the table once
+-- (sequentially, sized by its row count) under that same lock, as every
+-- existing row has the three columns NULL and passes. Measure the row count
+-- before the deploy window. Apply BEFORE a binary with the matching readers
+-- serves: that binary selects `retracted_at` in its predicates. A binary
+-- WITHOUT this change against a database WITH it keeps working, and folds
+-- every row, as no row is retracted until a new binary's route or tool
+-- retracts one.
 --
 -- UNDO (only while no row is retracted, or after deciding what a retracted row
 -- should become): REVOKE DELETE ON ds_combined_beliefs FROM epigraph_maintenance;
@@ -121,12 +125,12 @@ ALTER TABLE public.mass_functions
 
 ALTER TABLE public.mass_functions
     DROP CONSTRAINT IF EXISTS mass_functions_retract_columns_together;
+-- Validated as it is added: the table is already ACCESS EXCLUSIVE locked by
+-- the ADD COLUMN above, so a NOT VALID / VALIDATE pair would gain nothing.
 ALTER TABLE public.mass_functions
     ADD CONSTRAINT mass_functions_retract_columns_together
     CHECK ((retracted_at IS NULL) = (retracted_by IS NULL)
-           AND (retracted_at IS NULL) = (retract_reason IS NULL)) NOT VALID;
-ALTER TABLE public.mass_functions
-    VALIDATE CONSTRAINT mass_functions_retract_columns_together;
+           AND (retracted_at IS NULL) = (retract_reason IS NULL));
 
 COMMENT ON COLUMN public.mass_functions.retracted_at IS
     'Migration 184 (ruling R-79): when this BBA was retracted. A retracted row is excluded from '
