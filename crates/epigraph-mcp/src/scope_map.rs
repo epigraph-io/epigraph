@@ -153,6 +153,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
+    // Retracts ONE BBA (ruling R-79). The per-row rule (a writer of the BBA's
+    // owning group, or a live claims:admin grant on the token's own client
+    // record) is migration 184's definer, behind `tools/bba_retract.rs`.
+    ("retract_bba", "claims:write"),
     ("update_labels", "claims:write"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.

@@ -2382,6 +2382,20 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Retract ONE mass function (BBA) by its id, with a reason. A retracted BBA is excluded from every belief fold and read (DS combine, scoped and perspective belief, the atom cache, BetP) and is kept, with who retracted it, when and why, for audit; the claim's cached belief is then recomputed from the BBAs that remain, in the same transaction (belief_recomputed says whether a cache was written), and the stored scoped beliefs of that claim and frame, which folded the retracted BBA, are deleted (scoped_beliefs_cleared; the next evidence write on that claim and frame stores fresh ones). Only a writer of the BBA's owning group may retract it, or a caller whose token carries claims:admin and whose token's own client record still holds that grant (recorded as arm=admin). A BBA you cannot read reports not found, exactly like a random id; one you can read but may not retract is refused; neither writes anything. The first retraction writes one security_events audit row (mass_functions.retract) holding the row as it was; retracting it again changes nothing and answers status=already_retracted. A later write of the same claim, frame, source agent and perspective_id (for example resubmitting through submit_ds_evidence) is a new assessment: it replaces the retracted masses and folds again. Written with the calling agent's write authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)."
+    )]
+    async fn retract_bba(
+        &self,
+        Parameters(params): Parameters<crate::tools::bba_retract::RetractBbaParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::bba_retract::retract_bba(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation. A `shadow` object appears only when the server runs with EPIGRAPH_COMPOUND_BELIEF=shadow: the claim's atom-level view beside the served values, which it does not change. basis=derived: computed from N visible atoms (shadow.derived.leaves_used); not evidence about this claim; never cite or resubmit as evidence."
     )]
     async fn get_belief(
