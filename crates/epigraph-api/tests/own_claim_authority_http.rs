@@ -430,23 +430,29 @@ async fn a_writers_supersede_records_the_writer_as_the_version_rows_creator(pool
 }
 
 /// Backlog 1a54283d (ruling R-85 (a)) over HTTP on the application role, with
-/// the operator binding ARMED: the binding checks the agent that performed the
-/// supersede, not the author its successor inherits. Human B's live agent Y, a
-/// writer of human A's group (B writes it too), restates a claim there by A's
-/// live agent X; and X restates a claim there by an unlinked legacy identity
-/// L. Both land: each successor keeps the inherited author and its act edge
-/// names the caller.
-///
-/// Red before migration 185: the database refuses Y's act (OPL02, X belongs
-/// to A, not to Y's human) and X's (OPL01, L is bound to no human).
-#[sqlx::test(migrations = "../../migrations")]
-async fn an_armed_supersede_is_bound_on_the_caller_not_the_inherited_author(pool: PgPool) {
-    let state = app_role_state(&pool).await;
-    let (a, ag) = viewer_fixture::seed_human_operator(&pool, "r85-http-human-a").await;
-    let (b, _) = viewer_fixture::seed_human_operator(&pool, "r85-http-human-b").await;
-    let (x, _) = seed_agent_with_group(&pool, "r85-http-a-agent-x").await;
-    let (y, _) = seed_agent_with_group(&pool, "r85-http-b-agent-y").await;
-    let (legacy, _) = seed_agent_with_group(&pool, "r85-http-unlinked-legacy").await;
+/// the operator binding ARMED. Human A's live agent X, human B's live agent Y
+/// (a writer of A's group, which B writes too), an unlinked legacy identity L,
+/// and an unbound agent U holding a `writer` membership of A's group; one
+/// claim in A's group by X and one by L. Armed after seeding.
+struct ArmedHttp {
+    state: AppState,
+    a: Uuid,
+    x: Uuid,
+    y: Uuid,
+    u: Uuid,
+    legacy: Uuid,
+    x_claim: Uuid,
+    legacy_claim: Uuid,
+}
+
+async fn armed_two_humans_over_http(pool: &PgPool) -> ArmedHttp {
+    let state = app_role_state(pool).await;
+    let (a, ag) = viewer_fixture::seed_human_operator(pool, "r85-http-human-a").await;
+    let (b, _) = viewer_fixture::seed_human_operator(pool, "r85-http-human-b").await;
+    let (x, _) = seed_agent_with_group(pool, "r85-http-a-agent-x").await;
+    let (y, _) = seed_agent_with_group(pool, "r85-http-b-agent-y").await;
+    let (u, _) = seed_agent_with_group(pool, "r85-http-unbound-u").await;
+    let (legacy, _) = seed_agent_with_group(pool, "r85-http-unlinked-legacy").await;
     {
         let mut conn = pool.acquire().await.expect("acquire");
         epigraph_db::AgentRepository::link_operator(&mut conn, x, a)
@@ -456,61 +462,135 @@ async fn an_armed_supersede_is_bound_on_the_caller_not_the_inherited_author(pool
             .await
             .expect("Y's live link");
     }
-    add_member(&pool, ag, b, "writer").await;
-    add_member(&pool, ag, y, "writer").await;
-    let x_claim = claim_of(&pool, x, ag, "public", "X's claim").await;
-    let legacy_claim = claim_of(&pool, legacy, ag, "public", "the legacy claim").await;
+    add_member(pool, ag, b, "writer").await;
+    add_member(pool, ag, y, "writer").await;
+    add_member(pool, ag, u, "writer").await;
+    let x_claim = claim_of(pool, x, ag, "public", "X's claim").await;
+    let legacy_claim = claim_of(pool, legacy, ag, "public", "the legacy claim").await;
     sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
-        .execute(&pool)
+        .execute(pool)
         .await
         .expect("arm (the harness stands in for the maintenance role)");
-
-    for (caller, old, author, what) in [
-        (y, x_claim, x, "B's agent Y restates A's agent X's claim"),
-        (
-            x,
-            legacy_claim,
-            legacy,
-            "X restates the unbound legacy author's claim",
-        ),
-    ] {
-        let result = supersede_claim(
-            ViewerExtractor(viewer(&pool, caller).await),
-            State(state.clone()),
-            human(caller, &["claims:write"]),
-            Path(old),
-            supersede_body(old),
-        )
-        .await;
-        let (_, Json(resp)) = match result {
-            Ok(ok) => ok,
-            Err(e) => panic!("{what}: the caller is bound and writes the group: {e:?}"),
-        };
-        let new = resp.new_claim_id;
-        let inherited: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-            .bind(new)
-            .fetch_one(&pool)
-            .await
-            .expect("the successor");
-        assert_eq!(
-            inherited, author,
-            "{what}: the successor inherits the author"
-        );
-        let actors: Vec<Uuid> = authored_into(&pool, new)
-            .await
-            .into_iter()
-            .map(|(source, _, _)| source)
-            .collect();
-        assert_eq!(
-            actors,
-            vec![caller],
-            "{what}: the act edge names the caller"
-        );
-        assert!(
-            !is_current(&pool, old).await,
-            "{what}: the predecessor is retired"
-        );
+    ArmedHttp {
+        state,
+        a,
+        x,
+        y,
+        u,
+        legacy,
+        x_claim,
+        legacy_claim,
     }
+}
+
+/// `caller` supersedes `old` over HTTP with `claims:write`.
+async fn http_supersede(
+    pool: &PgPool,
+    state: &AppState,
+    caller: Uuid,
+    old: Uuid,
+) -> Result<Uuid, ApiError> {
+    supersede_claim(
+        ViewerExtractor(viewer(pool, caller).await),
+        State(state.clone()),
+        human(caller, &["claims:write"]),
+        Path(old),
+        supersede_body(old),
+    )
+    .await
+    .map(|(_, Json(resp))| resp.new_claim_id)
+}
+
+/// The supersede landed: the successor `new` of `old` keeps `author`, its one
+/// act edge names `caller`, and `old` is retired.
+async fn assert_landed_for(pool: &PgPool, new: Uuid, old: Uuid, author: Uuid, caller: Uuid) {
+    let inherited: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(pool)
+        .await
+        .expect("the successor");
+    assert_eq!(inherited, author, "the successor inherits the author");
+    let actors: Vec<Uuid> = authored_into(pool, new)
+        .await
+        .into_iter()
+        .map(|(source, _, _)| source)
+        .collect();
+    assert_eq!(actors, vec![caller], "the act edge names the caller");
+    assert!(!is_current(pool, old).await, "the predecessor is retired");
+}
+
+async fn successors(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("successors")
+}
+
+/// R-85 (a) over HTTP, armed: B's agent Y restates A's agent X's claim. It
+/// lands; the successor keeps X and its act edge names Y.
+///
+/// Red before migration 185: the database refuses the act (OPL02: X belongs
+/// to A, not to Y's human).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_of_another_humans_agent_is_bound_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_http(&pool).await;
+    let new = http_supersede(&pool, &s.state, s.y, s.x_claim)
+        .await
+        .unwrap_or_else(|e| panic!("Y is bound and writes the group: {e:?}"));
+    assert_landed_for(&pool, new, s.x_claim, s.x, s.y).await;
+}
+
+/// R-85 (a) over HTTP, armed: A's agent X restates the unlinked legacy
+/// identity L's claim. It lands; the successor keeps L and its act edge names
+/// X.
+///
+/// Red before migration 185: the database refuses the act (OPL01: L is bound
+/// to no human).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_of_an_unbound_legacy_author_is_bound_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_http(&pool).await;
+    let new = http_supersede(&pool, &s.state, s.x, s.legacy_claim)
+        .await
+        .unwrap_or_else(|e| panic!("X is bound and writes the group: {e:?}"));
+    assert_landed_for(&pool, new, s.legacy_claim, s.legacy, s.x).await;
+}
+
+/// R-85 (a) over HTTP, armed: the binding is still checked on the CALLER. U
+/// holds a `writer` membership of A's group, so the route's act authority
+/// admits it, but U is bound to no human: its supersede of X's claim is
+/// refused by the database's writer binding (OPL01), and nothing is written.
+/// A transport that stamped the act as the inherited author, or ran it on a
+/// privileged session, would land it.
+///
+/// CONTROL: once U is linked to A (X's own human), the same supersede lands
+/// with the act edge naming U, so the refusal was U's binding and nothing
+/// else. The status the refusal maps to is not pinned here (a separate
+/// follow-up).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_by_an_unbound_caller_is_refused_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_http(&pool).await;
+    let err = http_supersede(&pool, &s.state, s.u, s.x_claim)
+        .await
+        .expect_err("an unbound caller may not supersede once armed");
+    let shown = format!("{err:?}");
+    assert!(
+        shown.contains("OPL01"),
+        "the writer's binding refuses: {shown}"
+    );
+    assert!(is_current(&pool, s.x_claim).await, "nothing retired");
+    assert_eq!(successors(&pool, s.x_claim).await, 0, "no successor");
+
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, s.u, s.a)
+            .await
+            .expect("U's live link to A");
+    }
+    let new = http_supersede(&pool, &s.state, s.u, s.x_claim)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: U, now bound to A, supersedes: {e:?}"));
+    assert_landed_for(&pool, new, s.x_claim, s.x, s.u).await;
 }
 
 /// Authorship is not write authority, over HTTP as over MCP: the author of a
