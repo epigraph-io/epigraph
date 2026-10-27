@@ -39,8 +39,9 @@
 mod viewer_fixture;
 
 use epigraph_db::repos::privatization::{
-    seal_manifest_evidence_properties, PrivatizationRepository, SealCommitEvidence, SealCommitItem,
-    SealCommitVersion, UnsealCommitEvidence, UnsealCommitItem, UnsealCommitVersion,
+    seal_manifest_evidence_properties, split_unsealed_evidence_properties, PrivatizationRepository,
+    SealCommitEvidence, SealCommitItem, SealCommitVersion, UnsealCommitEvidence, UnsealCommitItem,
+    UnsealCommitVersion, SEALED_EVIDENCE_CONTENT_HASH_KEY,
 };
 use epigraph_privacy::{encryptor::FieldTag, pad, unpad};
 use sqlx::PgPool;
@@ -957,6 +958,135 @@ async fn unseal_restores_the_row_and_the_generated_tsvector(pool: PgPool) {
             .await
             .expect("read embedding");
     assert!(!embedding_present);
+}
+
+/// The seal writes the per-row digest sentinel exactly, and unseal takes a
+/// restored body row's digest from the BODY, not from the carrier the client
+/// sends back (backlog 12b68201).
+///
+/// The carrier (`$sealed_content_hash` inside the encrypted properties) exists
+/// for a body-less row, whose writer-supplied digest the server cannot rebuild.
+/// For a row with a body it is redundant, and trusting it lets an unsealing
+/// client store a digest that is not BLAKE3 of the body it restores: the
+/// `content_hash` = BLAKE3(`raw_content`) convention every evidence row keeps
+/// (`POST /api/v1/evidence` refuses a mismatch) would be false for that row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unseal_derives_a_body_rows_digest_from_the_body_not_the_carrier(pool: PgPool) {
+    use sha2::Digest;
+    let world = seed_world(&pool).await;
+    let plaintext = "a confidential finding whose digest follows its body";
+    let claim = seed_sealable_claim(&pool, &world, plaintext).await;
+    let payload = seal_payload(&pool, claim).await;
+    commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+
+    let sealed: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT id, content_hash FROM evidence WHERE claim_id = $1 ORDER BY id")
+            .bind(claim)
+            .fetch_all(&pool)
+            .await
+            .expect("read sealed digests");
+    assert!(!sealed.is_empty(), "fixture: the claim has evidence");
+    for (id, hash) in &sealed {
+        let token = format!("[sealed:x{}]", id.simple());
+        assert_eq!(
+            hash.as_slice(),
+            sha2::Sha256::digest(token.as_bytes()).as_slice(),
+            "the seal writes SHA-256 of the row's id token, the expression 171's backfill uses"
+        );
+    }
+
+    let forged = hex::encode(blake3::hash(b"a digest of some other body").as_bytes());
+    let (scoped, _viewer) = viewer_fixture::bypass(&pool).await;
+    let (mut conn, _lease) = scoped
+        .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::PrivatizationApply)
+        .await
+        .expect("maintenance connection");
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .expect("begin unseal tx");
+    PrivatizationRepository::unseal_claims_conn(
+        &mut tx,
+        world.group,
+        &[UnsealCommitItem {
+            claim_id: claim,
+            content: plaintext.to_string(),
+            content_hash: blake3::hash(plaintext.as_bytes()).as_bytes().to_vec(),
+            labels: vec![],
+            properties: serde_json::json!({}),
+            versions: payload
+                .versions
+                .iter()
+                .map(|v| UnsealCommitVersion {
+                    id: v.id,
+                    content: plaintext.to_string(),
+                })
+                .collect(),
+            evidence: payload
+                .evidence
+                .iter()
+                .map(|e| UnsealCommitEvidence {
+                    id: e.id,
+                    raw_content: Some(plaintext.to_string()),
+                    properties: serde_json::json!({
+                        "source": plaintext,
+                        SEALED_EVIDENCE_CONTENT_HASH_KEY: forged,
+                    }),
+                })
+                .collect(),
+        }],
+    )
+    .await
+    .expect("unseal");
+    tx.commit().await.expect("commit unseal");
+    drop(conn);
+
+    let restored: Vec<(Vec<u8>, serde_json::Value)> = sqlx::query_as(
+        "SELECT content_hash, properties FROM evidence WHERE claim_id = $1 ORDER BY id",
+    )
+    .bind(claim)
+    .fetch_all(&pool)
+    .await
+    .expect("read restored evidence");
+    for (hash, properties) in restored {
+        assert_eq!(
+            hash,
+            blake3::hash(plaintext.as_bytes()).as_bytes().to_vec(),
+            "a restored body row's digest is BLAKE3 of its body, whatever digest the \
+             unsealing client carried"
+        );
+        assert!(
+            properties.get(SEALED_EVIDENCE_CONTENT_HASH_KEY).is_none(),
+            "the carrier key is stripped: {properties}"
+        );
+    }
+}
+
+/// A `properties` value that is not a JSON object has no key to carry the URL
+/// or the digest under: the manifest serves it unchanged and the split finds
+/// neither (so unseal falls back to the body's digest, or keeps the sentinel).
+#[test]
+fn non_object_evidence_properties_carry_nothing_through_a_seal() {
+    let props = serde_json::json!(["not", "an", "object"]);
+    let served = seal_manifest_evidence_properties(&props, Some("https://x.test/a"), &[7u8; 32]);
+    assert_eq!(served, props, "served unchanged");
+    let split = split_unsealed_evidence_properties(&served);
+    assert_eq!(split.properties, props);
+    assert_eq!(split.source_url, None);
+    assert_eq!(split.content_hash, None);
+
+    let object = seal_manifest_evidence_properties(
+        &serde_json::json!({ "k": 1 }),
+        Some("https://x.test/a"),
+        &[7u8; 32],
+    );
+    let split = split_unsealed_evidence_properties(&object);
+    assert_eq!(split.properties, serde_json::json!({ "k": 1 }));
+    assert_eq!(split.source_url.as_deref(), Some("https://x.test/a"));
+    assert_eq!(
+        split.content_hash,
+        Some(vec![7u8; 32]),
+        "an object carries both"
+    );
 }
 
 /// A second keyed `team` group, admin'd by the same author, old enough to be a
