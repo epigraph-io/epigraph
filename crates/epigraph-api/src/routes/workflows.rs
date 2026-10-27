@@ -857,9 +857,20 @@ pub async fn get_workflow_plan(
 pub async fn report_outcome(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "report_outcome requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // ── The target, read through the CALLER's viewer ──
     //
     // An unreadable workflow is 404, exactly like a missing one. The read also
