@@ -491,6 +491,53 @@ mod tests {
         }
     }
 
+    /// The caller-facing tool schemas of `submit_claim` and `memorize` list the
+    /// exempt labels in their `novelty_threshold` descriptions. Those strings
+    /// are hand-written, so this pins them to [`STATUS_CLAIM_LABELS`]: adding a
+    /// label to the constant without updating both descriptions fails here.
+    /// Whole-token match, not substring: `gen-status` is a substring of
+    /// `norcal-rfp-gen-status`, so `contains` would not notice the bare form
+    /// going missing.
+    #[test]
+    fn tool_schema_descriptions_list_every_status_label() {
+        fn novelty_threshold_description(schema: schemars::Schema, tool: &str) -> String {
+            let value = serde_json::to_value(schema).expect("schema serializes");
+            value["properties"]["novelty_threshold"]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}: novelty_threshold has a description: {value}"))
+                .to_string()
+        }
+        for (tool, description) in [
+            (
+                "submit_claim",
+                novelty_threshold_description(
+                    schemars::schema_for!(crate::types::SubmitClaimParams),
+                    "submit_claim",
+                ),
+            ),
+            (
+                "memorize",
+                novelty_threshold_description(
+                    schemars::schema_for!(crate::types::MemorizeParams),
+                    "memorize",
+                ),
+            ),
+        ] {
+            let tokens: Vec<&str> = description
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(|t| t.trim_matches(|c: char| c == '.' || c == '(' || c == ')'))
+                .filter(|t| !t.is_empty())
+                .collect();
+            for label in STATUS_CLAIM_LABELS {
+                assert!(
+                    tokens.contains(&label),
+                    "{tool}'s novelty_threshold description must list the exempt label \
+                     `{label}` (STATUS_CLAIM_LABELS changed?): {description}"
+                );
+            }
+        }
+    }
+
     /// A status label pins the effective threshold to 0.0 whatever the caller
     /// passed, including a deliberately raised one; any other label set passes
     /// the caller's value through untouched.
