@@ -979,6 +979,106 @@ impl DuplicateProvenance {
 /// new, it would read as pointing at its own predecessor.
 pub const NON_CARRIED_LABELS: &[&str] = &["near-duplicate"];
 
+/// The agent that PERFORMS a supersession, and the write path it came through
+/// (backlog 73085534, operator ruling R-23).
+///
+/// The replacement keeps the documented contract: it inherits the retired
+/// claim's author (`claims.agent_id`) and owner. The acting agent is recorded
+/// as a graph relationship instead, the convention the workflow writes use for
+/// claims authored by someone other than the agent that called (#600,
+/// `epigraph_ingest_executor::record_caller_authorship`): one `AUTHORED` edge,
+/// `agent` -> `claim`, from `agent` to the replacement, with properties
+/// `{"tool": tool, "was_created": true}`, written in the act's own transaction,
+/// plus the act's reserved marker ([`SUPERSEDE_ACT_PROPERTY`]: `tool`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupersedeActor {
+    /// The acting agent (`agents.id`): the caller's agent over HTTP and MCP,
+    /// the named custodian on the operator CLI.
+    pub agent: Uuid,
+    /// The write path, recorded as the edge's `tool` property and its
+    /// [`SUPERSEDE_ACT_PROPERTY`] marker.
+    pub tool: SupersedeTool,
+}
+
+impl SupersedeActor {
+    /// `agent` acting through `tool`.
+    #[must_use]
+    pub const fn new(agent: Uuid, tool: SupersedeTool) -> Self {
+        Self { agent, tool }
+    }
+}
+
+/// The write paths a supersession comes through, spelled as its act's
+/// `AUTHORED` edge records them (`properties.tool`, and the reserved
+/// [`SUPERSEDE_ACT_PROPERTY`] marker).
+///
+/// A CLOSED set, because the marker's value is how the act's edge is told
+/// apart from every other `AUTHORED` edge on a claim (the #600 properties
+/// stay as they are beside it): the edge records who wrote THAT claim, so a later
+/// supersession's edge migration leaves it where it is
+/// ([`SUPERSEDE_ACT_TOOLS`] in `migrate_superseded_edges`), and the operator
+/// arming census reads it to attribute the successor to its actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersedeTool {
+    /// HTTP `POST /api/v1/claims/:id/supersede` and MCP `supersede_claim`.
+    SupersedeClaim,
+    /// The operator CLI's `custodial-supersede`.
+    CustodialSupersede,
+}
+
+impl SupersedeTool {
+    /// Every write path, in declaration order.
+    pub const ALL: [Self; 2] = [Self::SupersedeClaim, Self::CustodialSupersede];
+
+    /// The `tool` property the act's edge carries.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SupersedeClaim => "supersede_claim",
+            Self::CustodialSupersede => "custodial-supersede",
+        }
+    }
+}
+
+/// [`SupersedeTool::ALL`] spelled: the [`SUPERSEDE_ACT_PROPERTY`] values that
+/// mark an `AUTHORED` edge as a supersession's act edge.
+pub const SUPERSEDE_ACT_TOOLS: &[&str] = &[
+    SupersedeTool::SupersedeClaim.as_str(),
+    SupersedeTool::CustodialSupersede.as_str(),
+];
+
+/// The key under which a supersession's act edge carries its write path
+/// ([`SupersedeTool::as_str`]), beside the #600 properties. It is what tells
+/// the act's `AUTHORED` edge apart (the operator arming census, and the edge
+/// migration that leaves it on the claim it records): `tool` alone is an
+/// ordinary property any edge writer can spell, so only the act writes this
+/// key and every application surface that writes edge `properties` (create,
+/// patch and the staged promote, HTTP and MCP) refuses a body that carries it.
+pub const SUPERSEDE_ACT_PROPERTY: &str = "supersede_act";
+
+/// The refusal text for a body carrying [`SUPERSEDE_ACT_PROPERTY`].
+pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
+    "properties.supersede_act is reserved for the AUTHORED edge a supersession \
+     writes (supersede_claim, custodial-supersede); nothing was written";
+
+/// The edge `properties` keys only an act writes:
+/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
+pub const RESERVED_EDGE_PROPERTIES: &[&str] =
+    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+
+/// The refusal for an application edge write whose `properties` carry a key
+/// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
+#[must_use]
+pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<&'static str> {
+    if carries_dedup_identity_key(properties) {
+        Some(DEDUP_IDENTITY_KEY_RESERVED)
+    } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
+        Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else {
+        None
+    }
+}
+
 /// What [`ClaimRepository::migrate_superseded_edges_conn`] re-pointed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersedeEdgeMigration {
@@ -1172,6 +1272,17 @@ async fn migrate_superseded_edges(
         }
     }
     let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
+    // A supersession's own act edge (backlog 73085534, R-23) records who
+    // wrote the claim it points at, so it stays on that claim when the claim
+    // is itself superseded: carried onto the successor it would credit the
+    // earlier actor with a claim it never wrote and strip the retired claim of
+    // the record of its writer. It is told apart by its reserved marker
+    // (`SUPERSEDE_ACT_PROPERTY`, $7), never by `tool`, which any edge writer
+    // can spell.
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
     // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
@@ -1185,6 +1296,8 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
+           AND NOT (source_type = 'agent' AND relationship = 'AUTHORED' \
+                    AND COALESCE(properties->>$7 = ANY($6), false)) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
@@ -1194,6 +1307,8 @@ async fn migrate_superseded_edges(
     .bind(&weakening)
     .bind(&frozen)
     .bind(&agent_authorship)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -6275,10 +6390,12 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         let mut tx = pool.begin().await?;
         let ids =
-            Self::supersede_conn(&mut tx, old_claim_id, new_content, new_truth, reason).await?;
+            Self::supersede_conn(&mut tx, old_claim_id, new_content, new_truth, reason, actor)
+                .await?;
         tx.commit().await?;
         Ok(ids)
     }
@@ -6317,22 +6434,31 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         require_privileged_session(
             &mut *conn,
             "supersede_conn (its edge migration re-points other writers' edges)",
         )
         .await?;
-        let (new_uuid, old_uuid) =
-            Self::supersede_act_conn(&mut *conn, old_claim_id, new_content, new_truth, reason)
-                .await?;
+        let (new_uuid, old_uuid) = Self::supersede_act_conn(
+            &mut *conn,
+            old_claim_id,
+            new_content,
+            new_truth,
+            reason,
+            actor,
+        )
+        .await?;
         migrate_superseded_edges(&mut *conn, old_uuid, new_uuid).await?;
         Ok((new_uuid, old_uuid))
     }
 
     /// The supersession's own act, and nothing else: retire `old_claim_id`,
-    /// insert its replacement and the `supersedes` edge between them. Returns
-    /// `(new_id, old_id)`.
+    /// insert its replacement and the `supersedes` edge between them, and
+    /// record `actor` as the replacement's `AUTHORED` edge (the replacement
+    /// itself keeps the retired claim's author; see [`SupersedeActor`]).
+    /// Returns `(new_id, old_id)`.
     ///
     /// Every row it writes is a row the superseder authors (its own claim, the
     /// replacement, which inherits the old claim's tenancy, and the edge
@@ -6351,6 +6477,7 @@ impl ClaimRepository {
         new_content: &str,
         new_truth: TruthValue,
         reason: &str,
+        actor: SupersedeActor,
     ) -> Result<(Uuid, Uuid), DbError> {
         let old_uuid: Uuid = old_claim_id.into();
         let new_uuid = Uuid::new_v4();
@@ -6458,6 +6585,33 @@ impl ClaimRepository {
         .bind(old_uuid)
         .bind(reason)
         .execute(&mut *conn)
+        .await?;
+
+        // The acting agent (backlog 73085534, ruling R-23): the replacement
+        // above is authored as the RETIRED claim's author, so without this
+        // edge the agent that restated it appears nowhere in the graph. The
+        // #600 convention, spelled as
+        // `epigraph_ingest_executor::record_caller_authorship` writes it (that
+        // crate depends on this one, so the call is the repo function it
+        // uses), plus the reserved `SUPERSEDE_ACT_PROPERTY` marker that tells
+        // this edge apart from any other `AUTHORED` edge. Tenancy comes from the endpoints (`epigraph_edges_tenancy`).
+        // A failure is an error: the act rolls back rather than land a
+        // successor with no record of who wrote it.
+        crate::repos::edge::EdgeRepository::create_if_not_exists_conn(
+            &mut *conn,
+            actor.agent,
+            "agent",
+            new_uuid,
+            "claim",
+            "AUTHORED",
+            Some(serde_json::json!({
+                "tool": actor.tool.as_str(),
+                "was_created": true,
+                SUPERSEDE_ACT_PROPERTY: actor.tool.as_str(),
+            })),
+            None,
+            None,
+        )
         .await?;
 
         Ok((new_uuid, old_uuid))

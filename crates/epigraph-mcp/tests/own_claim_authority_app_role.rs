@@ -570,6 +570,109 @@ async fn a_writer_of_the_owning_group_may_retire_its_claim_and_a_reader_may_not(
     assert!(!is_current(&pool, c).await);
 }
 
+/// Every `AUTHORED` edge into `claim`: `(source_id, source_type, properties)`.
+async fn authored_into(pool: &PgPool, claim: Uuid) -> Vec<(Uuid, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT source_id, source_type, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND target_type = 'claim' \
+          ORDER BY source_id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read AUTHORED edges")
+}
+
+/// `(successor id, its author)` of the supersession `r` reported.
+async fn successor_of(pool: &PgPool, r: &rmcp::model::CallToolResult) -> (Uuid, Uuid) {
+    let body = first_text(r);
+    let new: Uuid = body["new_claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("new_claim_id");
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(pool)
+        .await
+        .expect("the successor");
+    (new, author)
+}
+
+/// Backlog 73085534 (ruling R-23) over MCP on the application role: a group
+/// writer W supersedes the human H's claim. The successor keeps H as its
+/// author; W, the agent that performed the act, is recorded by exactly one
+/// `AUTHORED` edge to the successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writers_supersede_records_the_writer_as_the_successors_author_edge(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "r23-human").await;
+    let (w, _) = fixture::seed_agent_with_group(&pool, "r23-group-writer").await;
+    add_member(&pool, hg, w, "writer").await;
+    let c = claim_of(&pool, h, hg, "group", "the group's claim").await;
+
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, w).await,
+        supersede_params(c),
+        Some(&human(w, &["claims:write"])),
+    )
+    .await
+    .expect("a writer of the owning group retires its claim");
+    let (new, author) = successor_of(&pool, &r).await;
+    assert_eq!(author, h, "the successor inherits the predecessor's author");
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            w,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "the acting writer is recorded as the successor's AUTHORED edge"
+    );
+}
+
+/// The `claims:admin` borrow: the act runs on the SERVER agent's stamp (the
+/// caller cannot write the group), but the agent that performed it is the
+/// CALLER, so the `AUTHORED` edge names the caller, never the borrowed stamp
+/// (crediting the server agent would misattribute the act exactly as the
+/// inherited author did).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_borrowed_supersede_records_the_caller_not_the_server_agent(pool: PgPool) {
+    let (server, server_agent) = app_role_server(&pool).await;
+    let server_group = personal_group_of(&pool, server_agent).await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "r23-author-x").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r23-admin").await;
+    let c = claim_of(&pool, x, server_group, "public", "X's claim, server group").await;
+    let token = human(a, &["claims:write", "claims:admin"]);
+    seed_admin_grant(&pool, &token).await;
+
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, a).await,
+        supersede_params(c),
+        Some(&token),
+    )
+    .await
+    .expect("claims:admin admits it");
+    let (who, _) = deferral(&pool, &first_text(&r)).await;
+    assert_eq!(
+        who,
+        Some(server_agent),
+        "calibration: the stamp was borrowed"
+    );
+    let (new, author) = successor_of(&pool, &r).await;
+    assert_eq!(author, x, "the successor inherits the predecessor's author");
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            a,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "the caller, not the borrowed server stamp, is recorded"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // A bystander
 // ─────────────────────────────────────────────────────────────────────────────

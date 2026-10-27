@@ -215,6 +215,24 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
         "world/public, the inherited author, current"
     );
     assert!(!current(&pool, c_ret).await, "the predecessor is retired");
+    // Backlog 73085534 (ruling R-23): the custodian who restated the claim is
+    // recorded as the successor's AUTHORED edge, in the act's transaction.
+    let authored: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
+        "SELECT source_id, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND source_type = 'agent' AND target_id = $1",
+    )
+    .bind(new)
+    .fetch_all(&pool)
+    .await
+    .expect("AUTHORED edges");
+    assert_eq!(
+        authored,
+        vec![(
+            a,
+            serde_json::json!({"tool": "custodial-supersede", "was_created": true, "supersede_act": "custodial-supersede"})
+        )],
+        "the acting custodian, not the inherited author, authored the restatement"
+    );
     let supersedes_edges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE relationship = 'supersedes' \
             AND source_id = $1 AND target_id = $2",

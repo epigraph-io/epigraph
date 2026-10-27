@@ -683,14 +683,14 @@ pub async fn create_edge(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
-    if request
+    if let Some(reason) = request
         .properties
         .as_ref()
-        .is_some_and(epigraph_db::carries_dedup_identity_key)
+        .and_then(epigraph_db::reserved_edge_property_refusal)
     {
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
-            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+            reason: reason.to_string(),
         });
     }
 
@@ -1358,14 +1358,14 @@ pub async fn patch_edge(
     // — the column changes from object to array with no error. The downstream
     // SQL update relies on object-||-object shallow merge semantics; rejecting
     // non-objects up front is the only safe option.
-    if request
+    if let Some(reason) = request
         .properties
         .as_ref()
-        .is_some_and(epigraph_db::carries_dedup_identity_key)
+        .and_then(epigraph_db::reserved_edge_property_refusal)
     {
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
-            reason: epigraph_db::DEDUP_IDENTITY_KEY_RESERVED.to_string(),
+            reason: reason.to_string(),
         });
     }
     if let Some(ref props) = request.properties {

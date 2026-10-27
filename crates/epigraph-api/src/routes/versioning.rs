@@ -378,6 +378,16 @@ pub async fn supersede_claim(
     //    Stamped, the owner's supersede commits, and a caller whose writable set
     //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
+    // The ACTING agent, recorded as the replacement's `AUTHORED` edge (backlog
+    // 73085534, ruling R-23): the replacement keeps the retired claim's author,
+    // so this edge is the only record in the graph of who restated it.
+    // `ViewerExtractor` already refuses an agentless token, so a principal-less
+    // viewer does not reach here; it is refused rather than recorded as nobody.
+    let Some(acting_agent) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "supersede requires an authenticated principal".into(),
+        });
+    };
     let mut tx = state.write_as(&viewer, "supersede_claim").await?;
     //
     //    Migration 117: this is the supersession's ACT only (retire, insert the
@@ -390,6 +400,7 @@ pub async fn supersede_claim(
         &request.content,
         truth_value,
         &request.reason,
+        epigraph_db::SupersedeActor::new(acting_agent, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .map_err(|e| {
