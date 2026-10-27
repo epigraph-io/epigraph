@@ -10468,7 +10468,20 @@ mod label_tests {
             result.is_err(),
             "should return Err when claim_ids exceeds MAX_PAIRWISE_IDS"
         );
-        let err_msg = format!("{:?}", result.unwrap_err());
+        let err = result.unwrap_err();
+        // An INPUT refusal (operator ruling R-55): the id list is over the
+        // bound whatever the graph holds.
+        assert!(
+            matches!(
+                err,
+                DbError::Refused {
+                    kind: crate::RefusalKind::Input,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let err_msg = format!("{err:?}");
         assert!(
             err_msg.contains("MAX_PAIRWISE_IDS"),
             "error message should mention MAX_PAIRWISE_IDS; got: {err_msg}"
