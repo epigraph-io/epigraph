@@ -33,9 +33,18 @@
 //! 1. the key is carried by an attested `agent_keys` row: it must be an ACTIVE `signing`
 //!    key, inside its window now, of exactly one agent, and that agent signs
 //!    (the separate-signing-key shape the MCP server uses);
-//! 2. otherwise the agent whose `agents.public_key` is the key;
+//! 2. otherwise the agent whose `agents.public_key` is the key. When that is
+//!    not a signer agent step 3 registered (display name
+//!    [`SIGNER_DISPLAY_NAME`]), the key is another agent's (the MCP server's,
+//!    an author's) and the API would sign as it: boot logs a WARNING
+//!    ([`NOT_A_DEDICATED_SIGNER`]) and still starts;
 //! 3. otherwise a new agent is registered with that public key (as the MCP
-//!    server does for its own key), named [`SIGNER_DISPLAY_NAME`].
+//!    server does for its own key), named [`SIGNER_DISPLAY_NAME`], and boot
+//!    logs a WARNING ([`REGISTERED_A_SIGNER`]), so an unplanned rotation that
+//!    mints a second signer agent is visible.
+//!
+//! The key's admission is checked at boot only: after revoking or rotating
+//! the API's key, restart the API.
 //!
 //! Rotation needs no code change, but it is a maintenance act (`signing` rows
 //! are attested state, refused to the application role by migration 161).
@@ -135,12 +144,38 @@ pub fn parse_key_text(text: &str) -> Result<AgentSigner, String> {
     signer
 }
 
+/// How [`resolve_signer`] found the signer agent (the module docs' steps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerResolution {
+    /// Step 1: the key is an active, in-window `signing` row of one agent.
+    SigningKeyRow,
+    /// Step 2: the agent whose `agents.public_key` is the key. `dedicated`
+    /// when it is a signer agent this module registered (display name
+    /// [`SIGNER_DISPLAY_NAME`]); otherwise the key is some other agent's
+    /// (the MCP server's, an author's) and the API would sign AS that agent.
+    AgentPublicKey { dedicated: bool },
+    /// Step 3: no agent had the key; a new signer agent was registered.
+    Created,
+}
+
 /// The agent `signer` signs for (see the module docs, "The signer agent").
 ///
 /// # Errors
-/// When the key is registered in `agent_keys` but is not an active, in-window
-/// `signing` key of exactly one agent, or a database call fails.
+/// When the key is carried by an attested `agent_keys` row but is not an
+/// active, in-window `signing` key of exactly one agent, or a database call
+/// fails.
 pub async fn resolve_signer_agent(pool: &PgPool, signer: &AgentSigner) -> Result<Uuid, String> {
+    resolve_signer(pool, signer).await.map(|(id, _)| id)
+}
+
+/// [`resolve_signer_agent`], saying which step resolved it.
+///
+/// # Errors
+/// As [`resolve_signer_agent`].
+pub async fn resolve_signer(
+    pool: &PgPool,
+    signer: &AgentSigner,
+) -> Result<(Uuid, SignerResolution), String> {
     let public_key = signer.public_key();
     // Only ATTESTED rows (`signing`, `identity-legacy`) are a key's recorded
     // lifecycle: a row of any other type is application-insertable, and the
@@ -166,7 +201,7 @@ pub async fn resolve_signer_agent(pool: &PgPool, signer: &AgentSigner) -> Result
         agents.sort_unstable();
         agents.dedup();
         return match agents.as_slice() {
-            [agent] => Ok(*agent),
+            [agent] => Ok((*agent, SignerResolution::SigningKeyRow)),
             [] => Err(format!(
                 "{ENV_KEY_FILE}: the key ({}) is registered in agent_keys but is not an \
                  active, in-window signing key of any agent; register it as the signer \
@@ -185,7 +220,11 @@ pub async fn resolve_signer_agent(pool: &PgPool, signer: &AgentSigner) -> Result
         .await
         .map_err(|e| format!("{ENV_KEY_FILE}: could not read agents: {e}"))?
     {
-        return Ok(agent.id.as_uuid());
+        let dedicated = agent.display_name.as_deref() == Some(SIGNER_DISPLAY_NAME);
+        return Ok((
+            agent.id.as_uuid(),
+            SignerResolution::AgentPublicKey { dedicated },
+        ));
     }
     let created = AgentRepository::create(
         pool,
@@ -193,17 +232,42 @@ pub async fn resolve_signer_agent(pool: &PgPool, signer: &AgentSigner) -> Result
     )
     .await
     .map_err(|e| format!("{ENV_KEY_FILE}: could not register the signer agent: {e}"))?;
-    Ok(created.id.as_uuid())
+    Ok((created.id.as_uuid(), SignerResolution::Created))
 }
 
-/// The API's signer from `key_file` (the value of [`ENV_KEY_FILE`]).
-/// `Ok(None)` when unset or empty.
+/// What the server does about its edge signing key at boot: the signer (or
+/// none: HTTP edges are written unsigned) and the warnings to log, once each.
+/// [`boot`] logs them; tests read them.
+#[derive(Debug)]
+pub struct BootDecision {
+    pub signer: Option<ApiEdgeSigner>,
+    pub warnings: Vec<String>,
+}
+
+/// The warning when the key resolves to an agent that is not a dedicated API
+/// signer (step 2 with `dedicated: false`). Not a refusal: refusing to start
+/// over database state is an operator decision, not this module's default.
+pub const NOT_A_DEDICATED_SIGNER: &str = "is not a dedicated API signer agent: the API signs its \
+     HTTP edges AS that agent. Ruling R-50 gives the API a SEPARATE signer agent; point the \
+     variable at a key of the API's own";
+
+/// The warning when boot registered a new signer agent (step 3).
+pub const REGISTERED_A_SIGNER: &str = "registered a NEW signer agent for the configured key. On \
+     a first deploy this is expected; on a key rotation it splits attribution across two \
+     signer agents: register the new key as the existing signer's active signing row first \
+     (docs/architecture/noun-claims-and-verb-edges.md, rotation)";
+
+/// The boot decision for `key_file` (the value of [`ENV_KEY_FILE`]; unset or
+/// empty means no key).
 ///
 /// # Errors
 /// When a key is configured and cannot be used (see the module docs).
-pub async fn load(pool: &PgPool, key_file: Option<&str>) -> Result<Option<ApiEdgeSigner>, String> {
+pub async fn decide(pool: &PgPool, key_file: Option<&str>) -> Result<BootDecision, String> {
     let Some(path) = key_file.map(str::trim).filter(|p| !p.is_empty()) else {
-        return Ok(None);
+        return Ok(BootDecision {
+            signer: None,
+            warnings: vec![UNSIGNED_AT_BOOT.to_string()],
+        });
     };
     let mut text = std::fs::read_to_string(path)
         .map_err(|e| format!("{ENV_KEY_FILE}: cannot read the key file: {}", e.kind()))?;
@@ -214,25 +278,50 @@ pub async fn load(pool: &PgPool, key_file: Option<&str>) -> Result<Option<ApiEdg
     text.clear();
     text.extend(std::iter::repeat_n('0', len));
     let signer = signer?;
-    let signer_id = resolve_signer_agent(pool, &signer).await?;
-    Ok(Some(ApiEdgeSigner::new(signer, signer_id)))
+    let (signer_id, how) = resolve_signer(pool, &signer).await?;
+    let mut warnings = Vec::new();
+    match how {
+        SignerResolution::AgentPublicKey { dedicated: false } => warnings.push(format!(
+            "{ENV_KEY_FILE}: the key is the public key of agent {signer_id}, which \
+             {NOT_A_DEDICATED_SIGNER}"
+        )),
+        SignerResolution::Created => warnings.push(format!(
+            "{ENV_KEY_FILE}: {REGISTERED_A_SIGNER} (agent {signer_id})"
+        )),
+        SignerResolution::SigningKeyRow | SignerResolution::AgentPublicKey { dedicated: true } => {}
+    }
+    Ok(BootDecision {
+        signer: Some(ApiEdgeSigner::new(signer, signer_id)),
+        warnings,
+    })
 }
 
-/// [`load`] from the environment, for `bin/server.rs`: logs the outcome once,
-/// and exits the process non-zero on a configured key it cannot use.
+/// The API's signer from `key_file` (the value of [`ENV_KEY_FILE`]).
+/// `Ok(None)` when unset or empty. [`decide`] without its warnings.
+///
+/// # Errors
+/// When a key is configured and cannot be used (see the module docs).
+pub async fn load(pool: &PgPool, key_file: Option<&str>) -> Result<Option<ApiEdgeSigner>, String> {
+    decide(pool, key_file).await.map(|d| d.signer)
+}
+
+/// [`decide`] from the environment, for `bin/server.rs`: logs the outcome and
+/// each warning once, and exits the process non-zero on a configured key it
+/// cannot use. The only part not under test: the logging and the exit.
 pub async fn boot(pool: &PgPool) -> Option<Arc<ApiEdgeSigner>> {
-    match load(pool, std::env::var(ENV_KEY_FILE).ok().as_deref()).await {
-        Ok(Some(s)) => {
-            tracing::info!(
-                signer_id = %s.signer_id(),
-                public_key = %hex::encode(s.signer.public_key()),
-                "HTTP edge writers attest their edges with the API's signing key"
-            );
-            Some(Arc::new(s))
-        }
-        Ok(None) => {
-            tracing::warn!("{UNSIGNED_AT_BOOT}");
-            None
+    match decide(pool, std::env::var(ENV_KEY_FILE).ok().as_deref()).await {
+        Ok(decision) => {
+            for w in &decision.warnings {
+                tracing::warn!("{w}");
+            }
+            decision.signer.map(|s| {
+                tracing::info!(
+                    signer_id = %s.signer_id(),
+                    public_key = %hex::encode(s.signer.public_key()),
+                    "HTTP edge writers attest their edges with the API's signing key"
+                );
+                Arc::new(s)
+            })
         }
         Err(refusal) => {
             eprintln!("ERROR: refusing to start: {refusal}");

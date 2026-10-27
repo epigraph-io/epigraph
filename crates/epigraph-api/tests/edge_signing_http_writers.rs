@@ -374,6 +374,155 @@ async fn a_non_attested_row_carrying_the_key_does_not_block_the_loader() {
     assert_eq!(pk, key.public_key().to_vec());
 }
 
+fn key_file(dir: &std::path::Path, name: &str, key: &AgentSigner) -> String {
+    let file = dir.join(name);
+    std::fs::write(&file, format!("{}\n", hex::encode(key.secret_key()))).unwrap();
+    file.to_str().unwrap().to_string()
+}
+
+/// R-50's boot clauses, through the decision `bin/server.rs` logs and acts on
+/// (`edge_signer::boot` only logs it and exits on `Err`): UNSET is no signer
+/// and exactly the one "unsigned" warning; a malformed file is a refusal; a
+/// fresh key registers a signer agent and WARNS that it did (an unplanned
+/// rotation would mint a second signer); the same key again resolves to that
+/// dedicated agent with no warning; a key that is ANOTHER agent's public key
+/// (the shape of the MCP server's key reused) starts, signs as that agent, and
+/// WARNS that it is not a dedicated signer (R-50: a SEPARATE signer agent).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_boot_decision_says_what_it_logs() {
+    let (_url, pool) = pool().await;
+    let unset = edge_signer::decide(&pool, None).await.expect("unset");
+    assert!(unset.signer.is_none());
+    assert_eq!(
+        unset.warnings,
+        vec![edge_signer::UNSIGNED_AT_BOOT.to_string()]
+    );
+
+    let dir = std::env::temp_dir().join(format!("r50-boot-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.key");
+    std::fs::write(&bad, "11".repeat(31)).unwrap();
+    let err = edge_signer::decide(&pool, Some(bad.to_str().unwrap()))
+        .await
+        .expect_err("a malformed key file refuses to start");
+    assert!(err.contains("31 bytes"), "{err}");
+
+    let fresh = AgentSigner::generate();
+    let path = key_file(&dir, "fresh.key", &fresh);
+    let first = edge_signer::decide(&pool, Some(&path))
+        .await
+        .expect("fresh");
+    let signer_id = first.signer.as_ref().expect("configured").signer_id();
+    assert_eq!(first.warnings.len(), 1, "{:?}", first.warnings);
+    assert!(
+        first.warnings[0].contains(edge_signer::REGISTERED_A_SIGNER)
+            && first.warnings[0].contains(&signer_id.to_string()),
+        "{:?}",
+        first.warnings
+    );
+    let again = edge_signer::decide(&pool, Some(&path))
+        .await
+        .expect("again");
+    assert_eq!(again.signer.expect("configured").signer_id(), signer_id);
+    assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+
+    // Another agent's key: its agents.public_key, under another name.
+    let reused = AgentSigner::generate();
+    let other = epigraph_db::AgentRepository::create(
+        &pool,
+        &epigraph_core::Agent::new(reused.public_key(), Some("epigraph-mcp".to_string())),
+    )
+    .await
+    .expect("another agent")
+    .id
+    .as_uuid();
+    let path = key_file(&dir, "reused.key", &reused);
+    let d = edge_signer::decide(&pool, Some(&path))
+        .await
+        .expect("starts");
+    assert_eq!(d.signer.expect("configured").signer_id(), other);
+    assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+    assert!(
+        d.warnings[0].contains(edge_signer::NOT_A_DEDICATED_SIGNER)
+            && d.warnings[0].contains(&other.to_string()),
+        "{:?}",
+        d.warnings
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A key carried by an attested `signing` row resolves only while that row is
+/// ACTIVE and inside its window, and only for exactly one agent: a rotated row
+/// (even with its window still open), an expired row, a row whose window
+/// opens tomorrow, and an active row held by two agents are all refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_key_loader_refuses_every_inadmissible_signing_row() {
+    let (_url, pool) = pool().await;
+    let row = |pool: PgPool,
+               agent: Uuid,
+               key: [u8; 32],
+               status: &'static str,
+               from: &'static str,
+               until: Option<&'static str>| async move {
+        sqlx::query(&format!(
+            "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, valid_until) \
+             VALUES ($1, $2, 'signing', $3, now() + interval '{from}', {})",
+            until.map_or("NULL".to_string(), |u| format!("now() + interval '{u}'"))
+        ))
+        .bind(agent)
+        .bind(key.as_slice())
+        .bind(status)
+        .execute(&pool)
+        .await
+        .expect("seed a signing row (test superuser)");
+    };
+    for (status, from, until, what) in [
+        (
+            "rotated",
+            "-1 day",
+            Some("1 day"),
+            "a rotated row with an open window",
+        ),
+        ("rotated", "-2 days", Some("-1 day"), "a rotated row"),
+        ("expired", "-2 days", Some("-1 day"), "an expired row"),
+        (
+            "active",
+            "1 day",
+            None,
+            "an active row whose window opens tomorrow",
+        ),
+    ] {
+        let key = AgentSigner::generate();
+        let owner = common::seed_system_agent(&pool).await;
+        row(pool.clone(), owner, key.public_key(), status, from, until).await;
+        let err = edge_signer::resolve_signer_agent(&pool, &key)
+            .await
+            .expect_err(what);
+        assert!(
+            err.contains("not an active, in-window signing key"),
+            "{what}: {err}"
+        );
+    }
+
+    let shared = AgentSigner::generate();
+    for _ in 0..2 {
+        let owner = common::seed_system_agent(&pool).await;
+        row(
+            pool.clone(),
+            owner,
+            shared.public_key(),
+            "active",
+            "-1 minute",
+            None,
+        )
+        .await;
+    }
+    let err = edge_signer::resolve_signer_agent(&pool, &shared)
+        .await
+        .expect_err("an active signing key of two agents");
+    assert!(err.contains("of 2 agents"), "{err}");
+}
+
 /// The ids of `claim`'s edges with `relationship` (either endpoint).
 async fn edges_of(pool: &PgPool, endpoint: Uuid, relationship: &str) -> Vec<Uuid> {
     sqlx::query_scalar(
