@@ -1862,6 +1862,8 @@ pub async fn evolve_step(
     ),
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write"),
         (status = 404),
         (status = 500),
     ),
@@ -1871,9 +1873,20 @@ pub async fn evolve_step(
 pub async fn deprecate_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(workflow_id): Path<Uuid>,
     Query(params): Query<DeprecateQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "deprecate_workflow requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     let cascade = params.cascade.unwrap_or(false);
 
     // The existence gate, read through the CALLER's viewer on a viewer-stamped

@@ -208,3 +208,34 @@ async fn reporting_an_outcome_requires_the_claims_write_scope(pool: PgPool) {
         "the report writes one behavioral row"
     );
 }
+
+/// `DELETE /api/v1/workflows/:id` retires the workflow; a read-only token
+/// leaves it current.
+#[sqlx::test(migrations = "../../migrations")]
+async fn deprecating_a_workflow_requires_the_claims_write_scope(pool: PgPool) {
+    let w = world(pool, "scope-deprecate").await;
+    let uri = format!("/api/v1/workflows/{}?reason=scope-arm", w.workflow);
+    let before = w.footprint().await;
+    assert!(before.1, "the fixture's workflow starts current");
+
+    w.assert_read_only_refused("deprecate", Method::DELETE, &uri, None)
+        .await;
+    assert_eq!(
+        w.footprint().await,
+        before,
+        "a refused deprecation leaves the workflow current and its truth unchanged"
+    );
+
+    let (status, out) = w
+        .call(Method::DELETE, &uri, w.owner, READ_WRITE, None)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the same owner with claims:write: {out}"
+    );
+    assert!(
+        !w.footprint().await.1,
+        "the deprecation retires the workflow"
+    );
+}
