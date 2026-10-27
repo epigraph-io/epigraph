@@ -2018,6 +2018,28 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
+    // 180, legacy fleet parents. The rule reads `agents` (FORCEd, but its
+    // SELECT policy admits every row), `operator_links` (FORCEd; read only
+    // by a maintenance session or a maintenance-owned definer frame) and
+    // `agent_keys`, `human_operators` and `oauth_clients` (no RLS). The
+    // registration calls it on the attestor's session, which is not a
+    // maintenance session, so under a non-member owner the `operator_links`
+    // read sees no row, the operator-link conjunct is false and every legacy
+    // parent is refused AID03: fail CLOSED (quiet, the host falls back to a
+    // parentless registration and alerts). The `human_operators` and
+    // `oauth_clients` legs are NOT EXISTS reads: no owner filters them today
+    // (no RLS; an owner without SELECT fails loudly, 42501), but they would
+    // fail OPEN on their own if those tables were ever put under RLS. The
+    // link leg still fails the whole rule closed in that case.
+    ("epigraph_is_legacy_fleet_parent", 180),
+    // The record runs only for a maintenance session, whose own
+    // `epigraph_bypass()` (keyed on `session_user`) admits its reads of the
+    // FORCEd `operator_links`, `agent_prompt_snapshots` and
+    // `agent_succession` under any owner. Its `agent_succession` INSERT is
+    // admitted only by `epigraph_definer_bypass()` (the owner), so under a
+    // non-member owner every record is refused and the transaction writes
+    // nothing: fail CLOSED (loud).
+    ("epigraph_record_legacy_succession", 180),
     // 181 (ruling R-56), the group admin's re-key mark. Under a non-member
     // owner its `groups` UPDATE meets `groups_tenancy` as the session and is
     // refused for every admin who did not create the group (42501, loud: the
