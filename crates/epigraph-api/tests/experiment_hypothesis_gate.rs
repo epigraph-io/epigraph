@@ -399,14 +399,27 @@ async fn adding_measurements_needs_the_hypothesis_writable_and_the_result_under_
         status, 404,
         "hidden hypothesis must be 404, got {status} {body}"
     );
-    let missing = Uuid::new_v4();
-    let (missing_status, missing_body) = add(w.stranger, experiment, missing).await;
-    assert_eq!(missing_status, 404, "calibration: a missing result is 404");
+    // Compared with a pair that does not exist at all, both ids random: a
+    // comparison with (hidden experiment, random result) would take the same
+    // branch as the hidden pair and show nothing.
+    let (absent_experiment, absent_result) = (Uuid::new_v4(), Uuid::new_v4());
+    let (absent_status, absent_body) = add(w.stranger, absent_experiment, absent_result).await;
+    assert_eq!(
+        absent_status, 404,
+        "calibration: a pair that does not exist is 404"
+    );
     assert_eq!(
         masked(&body, result),
-        masked(&missing_body, missing),
-        "a result on a hidden hypothesis must be indistinguishable from a missing one"
+        masked(&absent_body, absent_result),
+        "a result on a hidden hypothesis must be indistinguishable from a pair that does not \
+         exist"
     );
+    assert!(
+        !body.to_string().contains(&experiment.to_string())
+            && !body.to_string().contains(&w.hypothesis.to_string()),
+        "the refusal must name neither the hidden experiment nor its hypothesis: {body}"
+    );
+    let missing = Uuid::new_v4();
 
     let (status, body) = add(w.reader, experiment, result).await;
     assert_not_owner(status, &body, "measurements");
