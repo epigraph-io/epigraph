@@ -2214,6 +2214,10 @@ impl WorkflowRepository {
     ///   viewer is not in, so a head that edge retired can still count and
     ///   the flag can read `true` spuriously. It is informational (a resolver
     ///   warns on it and never refuses), so the over-report is accepted.
+    /// * `chain_order` is a second read of the same plan, its level-2 steps in
+    ///   the plan-order readers' `step_follows` order, under the same
+    ///   predicates (`Self::plan_chain_order` says where it differs from the
+    ///   edges above).
     ///
     /// Takes the ONE viewer-stamped connection of the request, so the in-query
     /// predicate and the session's tenancy GUCs agree under forced RLS.
@@ -2274,7 +2278,58 @@ impl WorkflowRepository {
             q = q.bind(g);
         }
         let edges = q.fetch_all(&mut *conn).await?;
-        Ok(Some(FrozenPlanRead { row, edges }))
+        let chain_order = Self::plan_chain_order(&mut *conn, viewer, workflow_id).await?;
+        Ok(Some(FrozenPlanRead {
+            row,
+            edges,
+            chain_order,
+        }))
+    }
+
+    /// The plan's level-2 steps in the order the plan-order readers list them
+    /// (ruling R-81, backlog ca30e645): the `executes` targets the viewer can
+    /// read whose claim `level` is 2, in `plan_index` order (an index that is
+    /// not 1 to 9 digits sorts last, then `e.created_at`, then the id), walked
+    /// by [`Self::order_by_step_follows`] over the `step_follows` pairs the
+    /// viewer can see. The same step set, base order and walk as
+    /// [`Self::plan_step_claim_ids`] and [`Self::resolve_steps_to_heads`], so
+    /// slot `i` here is `find_workflow`'s step `i`.
+    ///
+    /// Like those readers it does not drop a retracted `executes` edge's step
+    /// and reads retracted `step_follows` pairs (a surviving retracted pair
+    /// beside a live one is a fork). It is NOT cut at the first step whose
+    /// position a hidden item leaves unproven, as the outcome reports'
+    /// `step_index` resolution is: a hidden step splits the chain, and its
+    /// pieces are concatenated in plan order.
+    async fn plan_chain_order(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.properties->>'level' \
+             FROM edges e \
+             JOIN claims c ON c.id = e.target_id \
+             WHERE e.source_id = $1 AND e.relationship = 'executes' \
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<String>)>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows: Vec<(Uuid, Option<String>)> = q.fetch_all(&mut *conn).await?;
+        let steps: Vec<Uuid> = rows
+            .into_iter()
+            .filter(|(_, lvl)| lvl.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) == Some(2))
+            .map(|(id, _)| id)
+            .collect();
+        let follows = step_follows_among(&mut *conn, viewer, &steps).await?;
+        Ok(Self::order_by_step_follows(&steps, &follows))
     }
 }
 
@@ -2336,6 +2391,9 @@ pub struct FrozenPlanEdgeRow {
 pub struct FrozenPlanRead {
     pub row: FrozenPlanRow,
     pub edges: Vec<FrozenPlanEdgeRow>,
+    /// The level-2 steps in `step_follows` chain order, as the plan-order
+    /// readers list them (`WorkflowRepository::plan_chain_order`).
+    pub chain_order: Vec<Uuid>,
 }
 
 /// One row of [`WorkflowRepository::executed_structural_claims`].

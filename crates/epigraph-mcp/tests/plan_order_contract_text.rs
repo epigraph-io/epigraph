@@ -136,3 +136,25 @@ fn add_step_position_schema_names_the_exceptions() {
         );
     }
 }
+
+/// Ruling R-81: `get_workflow_plan` names its `chain_order` field, says it is
+/// the readers' step order and outside the digest, and names where it does
+/// not hold. `add_step` points at it.
+#[test]
+fn get_workflow_plan_names_chain_order_outside_the_digest() {
+    let d = description("get_workflow_plan");
+    for needle in [
+        "chain_order lists the plan's level-2 step ids in step_follows chain order",
+        "so chain_order[i] is step i there",
+        "It is outside the digest: not digested, not attested, and items stay in plan_index order",
+        "when add_step inserted a step (unindexed: listed at its slot, not an item)",
+        "it falls back to stored plan_index order",
+        "it is not cut at a hidden item",
+    ] {
+        assert!(d.contains(needle), "missing {needle:?}; got: {d}");
+    }
+    assert!(
+        description("add_step").contains("its chain_order field lists the step_follows chain"),
+        "add_step points at chain_order"
+    );
+}

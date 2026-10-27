@@ -796,6 +796,12 @@ pub async fn get_workflow(
 /// stored and never repairs it. A caller that pins a plan compares its own
 /// digest; the echo is informational.
 ///
+/// `chain_order` lists the plan's level-2 step ids in `step_follows` chain
+/// order, the order `find_workflow`, `find_workflow_hierarchical` and the
+/// outcome reports' `step_index` use (ruling R-81). It is outside the digest
+/// and never orders `items`; `FrozenPlan::chain_order` says where it differs
+/// from the items' step order and where there is no single chain.
+///
 /// 404 when the row does not exist and when the caller can see none of its
 /// `executes` edges (a non-member of a group-private plan); see
 /// `epigraph_ingest_executor::workflow_plan::frozen_plan` for why that is not a
