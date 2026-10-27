@@ -244,6 +244,15 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
          `memorize` runs on `begin_author_stamped_tx`.",
     ),
     (
+        "tools/workflows.rs",
+        "server.pool.acquire",
+        "`CallerRead::open`'s fallback for a server with no tenancy-aware pool (a development \
+         superuser): the connection carries the READS of `workflows` rows that find_workflow, \
+         recall's include_workflows leg and verify_claim's digest seed make as the caller \
+         (migration 183). With a `ScopedPool` the same reads run on `read_as(viewer)`; nothing \
+         is written on either connection.",
+    ),
+    (
     "claim_helper.rs",
     "store_embedding_author_stamped",
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
