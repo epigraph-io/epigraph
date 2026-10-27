@@ -3910,6 +3910,13 @@ impl PrivatizationRepository {
             // it is. A body-less row sealed without the fold therefore keeps
             // the sentinel: its digest is not recoverable.
             //
+            // Only rows that hold a ciphertext row are restored. After ruling
+            // R-78 a sealed claim can also carry another group's row the seal
+            // never covered, still in plaintext; an item naming it must not
+            // rewrite it. The route's exact-cover check refuses such a commit
+            // first; this keeps the mutation correct on its own, as
+            // `seal_claims_conn` re-filters by owner.
+            //
             // A restored digest may equal a row the same owner wrote on the
             // claim while it was sealed. Evidence has no unique key (migration
             // 171), so both rows stay, as any stored duplicate does; the unseal
@@ -3926,6 +3933,8 @@ impl PrivatizationRepository {
                     AS t(evidence_id, claim_id, raw_content, properties, source_url,
                          content_hash, body_hash)
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
+                   AND EXISTS (SELECT 1 FROM public.evidence_encryption ee
+                                WHERE ee.evidence_id = e.id)
                 ",
             )
             .bind(&evidence_ids)
