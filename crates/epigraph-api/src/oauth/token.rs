@@ -2,7 +2,7 @@
 //!
 //! Supports:
 //! - client_credentials with Ed25519 proof (agents) or client_secret (services)
-//! - refresh_token (all client types)
+//! - refresh_token (all client types; agents and services authenticate on it too)
 //! - external provider grant types (registered via providers.toml; e.g. google_id_token, cloudflare_access_jwt)
 //! - `urn:epigraph:grant:elevate`: a confirmed grant-mode elevation ticket, redeemed once
 //!   for a short, refreshless, elevated access token (elevation plan EL-5)
@@ -524,6 +524,93 @@ fn verify_agent_assertion(
     Ok(())
 }
 
+/// Whether `client_type` is a CONFIDENTIAL client: one that holds a credential
+/// of its own (an agent's Ed25519 key, a service's secret) and so must present
+/// it on the `client_credentials` grant and on the refresh grant (RFC 6749
+/// section 6). Human clients are public: their chains come from a consent.
+#[cfg(feature = "db")]
+fn is_confidential_client(client_type: &str) -> bool {
+    matches!(client_type, "agent" | "service")
+}
+
+/// Verify the credential a confidential client presents on `req`: a fresh
+/// Ed25519 assertion under the agent's key (its `client_id` is the hex public
+/// key), or the service's secret, compared in constant time against the
+/// stored hash. The ONE credential check, shared by the `client_credentials`
+/// grant and the refresh grant, so a later secret rotation or key change cuts
+/// both.
+///
+/// # Errors
+/// `ApiError::BadRequest` for a missing or malformed credential,
+/// `ApiError::Unauthorized` for a wrong one, and `ApiError::Unauthorized` for
+/// a client that is not confidential (see [`is_confidential_client`]).
+#[cfg(feature = "db")]
+fn authenticate_confidential_client(
+    client: &epigraph_db::repos::oauth_client::OAuthClientRow,
+    req: &TokenRequest,
+) -> Result<(), ApiError> {
+    match client.client_type.as_str() {
+        "agent" => {
+            let assertion_type =
+                req.client_assertion_type
+                    .as_deref()
+                    .ok_or(ApiError::BadRequest {
+                        message: "client_assertion_type required for agents".to_string(),
+                    })?;
+            if assertion_type != "urn:epigraph:ed25519" {
+                return Err(ApiError::BadRequest {
+                    message: "Agents must use urn:epigraph:ed25519 assertion type".to_string(),
+                });
+            }
+            let assertion = req
+                .client_assertion
+                .as_deref()
+                .ok_or(ApiError::BadRequest {
+                    message: "client_assertion required for agents".to_string(),
+                })?;
+            let assertion_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, assertion)
+                    .map_err(|_| ApiError::BadRequest {
+                        message: "Invalid base64 in client_assertion".to_string(),
+                    })?;
+            let pub_key_bytes =
+                hex::decode(&client.client_id).map_err(|_| ApiError::BadRequest {
+                    message: "client_id must be hex-encoded public key for agents".to_string(),
+                })?;
+            verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
+        }
+        "service" => {
+            let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
+                message: "client_secret required for service clients".to_string(),
+            })?;
+            let secret_bytes = hex::decode(secret).map_err(|_| ApiError::BadRequest {
+                message: "client_secret must be hex-encoded".to_string(),
+            })?;
+            let hash = blake3::hash(&secret_bytes);
+            let stored_hash =
+                client
+                    .client_secret_hash
+                    .as_deref()
+                    .ok_or(ApiError::InternalError {
+                        message: "Service client has no stored secret hash".to_string(),
+                    })?;
+            let ct_eq: bool =
+                subtle::ConstantTimeEq::ct_eq(hash.as_bytes().as_slice(), stored_hash).into();
+            if !ct_eq {
+                return Err(ApiError::Unauthorized {
+                    reason: "Invalid client_secret".to_string(),
+                });
+            }
+        }
+        _ => {
+            return Err(ApiError::Unauthorized {
+                reason: "not a confidential client".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "db")]
 async fn handle_client_credentials(
     state: &AppState,
@@ -550,65 +637,14 @@ async fn handle_client_credentials(
         });
     }
 
-    // Credential verification based on client type
-    match client.client_type.as_str() {
-        "agent" => {
-            let assertion_type =
-                req.client_assertion_type
-                    .as_deref()
-                    .ok_or(ApiError::BadRequest {
-                        message: "client_assertion_type required for agents".to_string(),
-                    })?;
-            if assertion_type != "urn:epigraph:ed25519" {
-                return Err(ApiError::BadRequest {
-                    message: "Agents must use urn:epigraph:ed25519 assertion type".to_string(),
-                });
-            }
-            let assertion = req
-                .client_assertion
-                .as_deref()
-                .ok_or(ApiError::BadRequest {
-                    message: "client_assertion required for agents".to_string(),
-                })?;
-            let assertion_bytes =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, assertion)
-                    .map_err(|_| ApiError::BadRequest {
-                        message: "Invalid base64 in client_assertion".to_string(),
-                    })?;
-            let pub_key_bytes = hex::decode(client_id_str).map_err(|_| ApiError::BadRequest {
-                message: "client_id must be hex-encoded public key for agents".to_string(),
-            })?;
-            verify_agent_assertion(&assertion_bytes, &pub_key_bytes, client_id_str)?;
-        }
-        "service" => {
-            let secret = req.client_secret.as_deref().ok_or(ApiError::BadRequest {
-                message: "client_secret required for service clients".to_string(),
-            })?;
-            let secret_bytes = hex::decode(secret).map_err(|_| ApiError::BadRequest {
-                message: "client_secret must be hex-encoded".to_string(),
-            })?;
-            let hash = blake3::hash(&secret_bytes);
-            let stored_hash =
-                client
-                    .client_secret_hash
-                    .as_deref()
-                    .ok_or(ApiError::InternalError {
-                        message: "Service client has no stored secret hash".to_string(),
-                    })?;
-            let ct_eq: bool =
-                subtle::ConstantTimeEq::ct_eq(hash.as_bytes().as_slice(), stored_hash).into();
-            if !ct_eq {
-                return Err(ApiError::Unauthorized {
-                    reason: "Invalid client_secret".to_string(),
-                });
-            }
-        }
-        _ => {
-            return Err(ApiError::BadRequest {
-                message: "client_credentials grant not supported for this client type".to_string(),
-            });
-        }
+    // Credential verification based on client type (the same check the
+    // refresh grant runs for these two types).
+    if !is_confidential_client(&client.client_type) {
+        return Err(ApiError::BadRequest {
+            message: "client_credentials grant not supported for this client type".to_string(),
+        });
     }
+    authenticate_confidential_client(&client, req)?;
 
     let ttl = match client.client_type.as_str() {
         "agent" => Duration::minutes(15),
@@ -633,6 +669,9 @@ async fn handle_client_credentials(
             None => granted.clone(),
         }
     };
+    // The refresh chain stores the consent, not the chokepoint's output; see
+    // [`crate::oauth::scopes::chain_scopes`].
+    let chain_scopes = crate::oauth::scopes::chain_scopes(requested_scopes.clone());
     let effective_scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
@@ -680,7 +719,7 @@ async fn handle_client_credentials(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
-            &effective_scopes,
+            &chain_scopes,
             Utc::now() + refresh_ttl,
         )
         .await
@@ -754,10 +793,12 @@ async fn handle_refresh_token(
             id,
             client_id,
             scopes,
+            issued_to_client_id,
         } => StoredRefresh {
             id,
             client_id,
             scopes,
+            issued_to_client_id,
         },
         RefreshCheck::Grace => {
             tracing::info!(
@@ -793,11 +834,53 @@ async fn handle_refresh_token(
             message: "Client not found for refresh token".to_string(),
         })?;
 
+    // RFC 6749 section 6: a CONFIDENTIAL client (agent, service) authenticates
+    // on the refresh grant, with the same credential `client_credentials`
+    // verifies; possession of the refresh token alone is not enough. A
+    // `client_id` on the request must be the chain's own. Both run first, so a
+    // presenter that cannot authenticate changes nothing: no burn, no
+    // rotation, and the chain stays usable by its client. A public (human)
+    // chain has no credential to check, and its request's `client_id` names
+    // the connector app, not the chain's per-user client.
+    if is_confidential_client(&client.client_type) {
+        if req
+            .client_id
+            .as_deref()
+            .is_some_and(|presented| presented != client.client_id)
+        {
+            return Err(invalid_refresh());
+        }
+        authenticate_confidential_client(&client, req)?;
+    }
+
     if client.status != "active" {
         burn_refresh_token(state, stored.id).await?;
         return Err(ApiError::Forbidden {
             reason: "Client has been suspended or revoked".to_string(),
         });
+    }
+
+    // Migration 174: a chain from the authorization-code exchange is bound to
+    // the connector app that obtained it. Suspending (or deleting) that app
+    // cuts its chains, and only its chains: the same person's chains through
+    // another app are untouched. A DENIAL, so the token is burned; an app row
+    // that cannot be found reads as not active (fail closed). A failure to
+    // READ the app is not a denial and leaves the token intact.
+    if let Some(app_id) = stored.issued_to_client_id.filter(|app| *app != client.id) {
+        let app_active = OAuthClientRepository::get_by_id(&state.db_pool, app_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+            .is_some_and(|app| app.status == "active");
+        if !app_active {
+            burn_refresh_token(state, stored.id).await?;
+            return Err(ApiError::Forbidden {
+                reason: "The client application this refresh token was issued to has been \
+                         suspended or revoked"
+                    .to_string(),
+            });
+        }
     }
 
     // Re-run the provider email allowlist for external (`{provider}:{subject}`)
@@ -850,14 +933,15 @@ async fn handle_refresh_token(
     // scopes (narrowed to the grant by the rotation definer, migration 140).
     //
     // A `scope` that names nothing this token can issue is `invalid_scope`
-    // (RFC 6749 section 5.2), answered BEFORE the chain is spent: a 200 with an
-    // empty-scope access token would rotate the chain and authorize nothing.
+    // (RFC 6749 section 5.2, in its `{"error":"invalid_scope"}` shape),
+    // answered BEFORE the chain is spent: a 200 with an empty-scope access
+    // token would rotate the chain and authorize nothing. "Nothing it can
+    // issue" is decided twice: against the stored and granted sets here, and
+    // again after the mint chokepoint below, which can strip what a request
+    // named (an admin-only scope while migration 128's switch is armed, or
+    // when the switch cannot be read).
     let consented = refresh_scopes(&stored.scopes, &client.granted_scopes, req.scope.as_deref())
-        .ok_or_else(|| ApiError::BadRequest {
-            message: "invalid_scope: the requested scope names none of the scopes \
-                          this refresh token was granted"
-                .into(),
-        })?;
+        .ok_or_else(refresh_invalid_scope)?;
     // Then through the mint chokepoint (never the elevation scope; the
     // admin-only scopes per migration 128's switch), which only ever removes.
     let effective_scopes = crate::oauth::scopes::grantable(
@@ -867,6 +951,9 @@ async fn handle_refresh_token(
         crate::oauth::scopes::MintGrant::RefreshToken,
     )
     .await;
+    if effective_scopes.is_empty() && names_a_scope(req.scope.as_deref()) {
+        return Err(refresh_invalid_scope());
+    }
 
     // Every authenticated principal gets an `agents.id`. Materialised at MINT
     // time (not at registration) so clients that predate PR-02 acquire theirs on
@@ -994,6 +1081,8 @@ struct StoredRefresh {
     client_id: uuid::Uuid,
     /// The scopes the presented token was minted with.
     scopes: Vec<String>,
+    /// The connector app the chain was issued to (migration 174), if any.
+    issued_to_client_id: Option<uuid::Uuid>,
 }
 
 /// The scopes a refresh issues: the presented token's `stored` scopes that the
@@ -1022,6 +1111,26 @@ fn refresh_scopes(
         return None;
     }
     Some(issued)
+}
+
+/// Whether a request's `scope` parameter names any scope (an absent or blank
+/// one means "as originally granted", RFC 6749 section 6).
+#[cfg(feature = "db")]
+fn names_a_scope(requested: Option<&str>) -> bool {
+    requested.is_some_and(|r| r.split_whitespace().next().is_some())
+}
+
+/// The refresh grant's refusal of a `scope` that names nothing the presented
+/// token can issue: RFC 6749 section 5.2's `invalid_scope`, in that section's
+/// body shape. The chain is left untouched.
+#[cfg(feature = "db")]
+fn refresh_invalid_scope() -> ApiError {
+    ApiError::OAuthGrantError {
+        error: "invalid_scope",
+        description: "the requested scope names none of the scopes this refresh token can \
+                      issue"
+            .to_string(),
+    }
 }
 
 /// One 401 for every refresh that cannot proceed (unknown, expired, revoked,
@@ -1122,6 +1231,23 @@ async fn handle_authorization_code(
         });
     }
 
+    // The connector app that obtained the code (`row.client_id`, checked
+    // against the request above). The chain is bound to it (migration 174), so
+    // suspending the app cuts this chain at its next refresh; an app that is
+    // already not active, or cannot be found, gets no chain at all (fail
+    // closed). Checked after the per-user client's own status, which answers
+    // first when the two are one row.
+    let issuing_app =
+        OAuthClientRepository::get_by_client_id_any_status(&state.db_pool, &row.client_id)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?
+            .filter(|app| app.status == "active")
+            .ok_or(ApiError::Forbidden {
+                reason: "The client application that obtained this code is not active".to_string(),
+            })?;
+
     // Re-run the provider email allowlist before issuing tokens, mirroring
     // handle_refresh_token, so the SAME invariant holds on every token-issuance
     // path: an identity de-listed between consent (when the provision gate ran and
@@ -1164,7 +1290,10 @@ async fn handle_authorization_code(
         _ => Duration::minutes(15),
     };
     // The code's consented scopes, through the mint chokepoint (never the
-    // elevation scope; the admin-only scopes per migration 128's switch).
+    // elevation scope; the admin-only scopes per migration 128's switch). The
+    // refresh chain stores the consent itself; see
+    // [`crate::oauth::scopes::chain_scopes`].
+    let chain_scopes = crate::oauth::scopes::chain_scopes(row.scopes.clone());
     let effective_scopes = crate::oauth::scopes::grantable(
         state,
         client.id,
@@ -1193,17 +1322,19 @@ async fn handle_authorization_code(
             "service" => Duration::days(90),
             _ => Duration::hours(24),
         };
-        let refresh_id = epigraph_db::repos::refresh_token::RefreshTokenRepository::create(
-            &state.db_pool,
-            hash.as_bytes(),
-            client.id,
-            &effective_scopes,
-            Utc::now() + refresh_ttl,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
+        let refresh_id =
+            epigraph_db::repos::refresh_token::RefreshTokenRepository::create_issued_to(
+                &state.db_pool,
+                hash.as_bytes(),
+                client.id,
+                &chain_scopes,
+                Utc::now() + refresh_ttl,
+                Some(issuing_app.id),
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: e.to_string(),
+            })?;
         (token_str, refresh_id)
     };
 

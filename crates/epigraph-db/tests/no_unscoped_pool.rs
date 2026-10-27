@@ -554,7 +554,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
     ),
     (
         "oauth/token.rs",
-        17,
+        19,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -569,7 +569,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          EL-5): the client lookup by its `client_id`, as every other grant does, and the one \
          connection for migration 125's `epigraph_redeem_elevation_ticket`, an app-callable \
          definer keyed by the ticket and its redeem secret's hash (the credential), which needs \
-         no stamp. Both run before the elevated principal's token is minted.",
+         no stamp. Both run before the elevated principal's token is minted. The eighteenth \
+         and nineteenth are migration 174's connector-app binding: the code exchange's lookup of \
+         the app that obtained the code (by its `client_id`, any status, as `register` does), \
+         and the refresh grant's lookup of the app a chain was issued to (by id), each reading \
+         one `oauth_clients` row's status before anything is minted, the same \
+         pre-authentication reason.",
     ),
     (
         "routes/elevate.rs",

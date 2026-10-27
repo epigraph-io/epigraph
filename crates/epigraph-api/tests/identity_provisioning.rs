@@ -154,7 +154,12 @@ async fn refresh_token_grant_also_carries_the_agent_id(pool: PgPool) {
     let (status, body) = post_json(
         app(pool.clone()),
         "/oauth/token",
-        json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+        json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+            "client_secret": secret,
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
