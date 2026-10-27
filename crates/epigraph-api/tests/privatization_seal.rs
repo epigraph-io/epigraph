@@ -1297,6 +1297,67 @@ async fn an_unseal_commit_that_omits_a_sealed_row_is_refused(pool: PgPool) {
     assert_eq!(content, format!("[sealed:x{}]", claim.simple()));
 }
 
+/// An unseal-commit that names another group's evidence row on the claim is
+/// refused, and that row is left as it was.
+///
+/// After ruling R-78 a sealed claim can carry a row the seal did not cover:
+/// another group's, still in plaintext. The route's cover check refuses a
+/// commit whose evidence set is not exactly the sealed set, so a commit that
+/// adds that row (with a substitute body) never reaches the mutation; the
+/// repository also skips a row with no ciphertext
+/// (`seal_side_channels::an_unseal_leaves_evidence_another_group_holds_untouched`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unseal_commit_naming_another_groups_evidence_is_refused(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let claim = seed_subject(&pool, &world, "a sealed subject with another group's row").await;
+    let (_other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-unseal").await;
+    let held_body = format!("another group's evidence, never sealed {}", Uuid::new_v4());
+    let held = seed_held_body(&pool, claim, other_group, &held_body).await;
+    let plan = applied_seal_plan(&pool, &world, &[claim]).await;
+    seal_through_routes(&pool, &world, plan, 1).await;
+    let held_before = evidence_state(&pool, held).await;
+    assert!(!held_before.4, "fixture: the held row was not sealed");
+
+    let manifest = fetch_unseal_manifest(&pool, &world, plan).await;
+    assert_eq!(manifest.items.len(), 1);
+    let mut entry = unseal_entry(&manifest.items[0]);
+    assert!(
+        entry.evidence.iter().all(|e| e.id != held),
+        "fixture: the unseal manifest does not serve the held row"
+    );
+    entry.evidence.push(routes::UnsealCommitEvidenceEntry {
+        id: held,
+        raw_content: Some("a substitute body".to_string()),
+        properties: serde_json::json!({}),
+    });
+
+    let err = post_unseal_commit(
+        &pool,
+        &world,
+        plan,
+        routes::UnsealCommitRequest { items: vec![entry] },
+    )
+    .await
+    .expect_err("an unseal-commit naming a row outside the sealed set must be refused");
+    assert!(
+        matches!(&err, ApiError::BadRequest { message } if message.contains("evidence_encryption")),
+        "expected a refusal naming the evidence cover, got {err:?}"
+    );
+    assert_eq!(
+        evidence_state(&pool, held).await,
+        held_before,
+        "a refused unseal must leave another group's evidence exactly as it was"
+    );
+    let heads: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claim_encryption WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("count ciphertext rows");
+    assert_eq!(heads, 1, "and the claim stays sealed");
+}
+
 /// Unseal a whole plan through the routes, and assert it restored everything.
 async fn unseal_through_routes(pool: &PgPool, world: &fx::World, plan: Uuid, expect: usize) {
     let manifest = fetch_unseal_manifest(pool, world, plan).await;

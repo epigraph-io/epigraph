@@ -1178,6 +1178,156 @@ async fn the_seal_skips_evidence_another_group_holds_on_the_claim(pool: PgPool) 
     assert_eq!(owners_rows_sealed, 1, "the owner's own row is sealed");
 }
 
+/// Evidence on `claim` with `body`, held by `group` the way the operator
+/// `hide` holds a row: a visibility pin (migration 110), then owner and
+/// visibility.
+async fn seed_held_evidence(pool: &PgPool, claim: Uuid, group: Uuid, body: &str) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (content_hash, evidence_type, raw_content, claim_id) \
+         VALUES ($1, 'document', $2, $3) RETURNING id",
+    )
+    .bind(blake3::hash(body.as_bytes()).as_bytes().as_slice())
+    .bind(body)
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("seed the held row");
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: held by another group')",
+    )
+    .bind(id)
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .expect("pin the held row");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(id)
+        .bind(group)
+        .execute(pool)
+        .await
+        .expect("hold the row in the other group");
+    id
+}
+
+/// Evidence row `id`'s `(raw_content, properties, content_hash, sealed)`,
+/// where `sealed` is "has an `evidence_encryption` row".
+async fn evidence_row_state(
+    pool: &PgPool,
+    id: Uuid,
+) -> (Option<String>, serde_json::Value, Vec<u8>, bool) {
+    sqlx::query_as(
+        "SELECT e.raw_content, e.properties, e.content_hash, \
+                EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id) \
+           FROM evidence e WHERE e.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the evidence row")
+}
+
+/// The unseal mutation restores only evidence rows that hold a ciphertext row,
+/// so an unseal item naming another group's (never sealed) row on the claim
+/// leaves that row as it was: body, properties, digest.
+///
+/// The mirror of [`the_seal_skips_evidence_another_group_holds_on_the_claim`]
+/// at the repository layer. Through the route the commit's exact-cover check
+/// already refuses such an item (the API twin,
+/// `privatization_seal.rs::an_unseal_commit_naming_another_groups_evidence_is_refused`);
+/// this pins the mutation on its own terms.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unseal_leaves_evidence_another_group_holds_untouched(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let plaintext = "a sealed claim with another group's plaintext row";
+    let claim = seed_sealable_claim(&pool, &world, plaintext).await;
+    let (_other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-unseal").await;
+    let body = format!("another group's evidence, never sealed {}", Uuid::new_v4());
+    let held = seed_held_evidence(&pool, claim, other_group, &body).await;
+
+    let payload = seal_payload(&pool, claim).await;
+    commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+    let before = evidence_row_state(&pool, held).await;
+    assert_eq!(
+        before.0.as_deref(),
+        Some(body.as_str()),
+        "fixture: the seal left the held row's body"
+    );
+    assert!(!before.3, "fixture: the held row has no ciphertext row");
+
+    let (scoped, _viewer) = viewer_fixture::bypass(&pool).await;
+    let (mut conn, _lease) = scoped
+        .unscoped_for_maintenance(epigraph_db::visibility::SystemReason::PrivatizationApply)
+        .await
+        .expect("maintenance connection");
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .expect("begin unseal tx");
+    let mut evidence: Vec<UnsealCommitEvidence> = payload
+        .evidence
+        .iter()
+        .filter(|e| e.id != held)
+        .map(|e| UnsealCommitEvidence {
+            id: e.id,
+            raw_content: Some(plaintext.to_string()),
+            properties: serde_json::json!({ "source": plaintext }),
+        })
+        .collect();
+    evidence.push(UnsealCommitEvidence {
+        id: held,
+        raw_content: Some("a substitute body".to_string()),
+        properties: serde_json::json!({ "substituted": true }),
+    });
+    let restored = PrivatizationRepository::unseal_claims_conn(
+        &mut tx,
+        world.group,
+        &[UnsealCommitItem {
+            claim_id: claim,
+            content: plaintext.to_string(),
+            content_hash: blake3::hash(plaintext.as_bytes()).as_bytes().to_vec(),
+            labels: vec![],
+            properties: serde_json::json!({}),
+            versions: payload
+                .versions
+                .iter()
+                .map(|v| UnsealCommitVersion {
+                    id: v.id,
+                    content: plaintext.to_string(),
+                })
+                .collect(),
+            evidence,
+        }],
+    )
+    .await
+    .expect("unseal");
+    tx.commit().await.expect("commit unseal");
+    drop(conn);
+    assert_eq!(
+        restored,
+        vec![claim],
+        "control: the claim itself is unsealed"
+    );
+
+    assert_eq!(
+        evidence_row_state(&pool, held).await,
+        before,
+        "an unseal item naming another group's unsealed row must not rewrite it"
+    );
+    let owners_restored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE claim_id = $1 AND id <> $2 AND raw_content = $3",
+    )
+    .bind(claim)
+    .bind(held)
+    .bind(plaintext)
+    .fetch_one(&pool)
+    .await
+    .expect("count the owner's restored rows");
+    assert_eq!(
+        owners_restored, 1,
+        "control: the owner's own row is restored"
+    );
+}
+
 /// A second keyed `team` group, admin'd by the same author, old enough to be a
 /// seal target.
 ///
