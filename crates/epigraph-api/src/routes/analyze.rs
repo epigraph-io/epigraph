@@ -140,8 +140,9 @@ pub async fn unconstrained_analysis(
 /// response names only the stage: a provider error can name the provider's
 /// endpoint or echo its response body, and the client-init error names the
 /// server's configured provider (backlog 49863d2c). Compiled under `test` as
-/// well as `genai`, so its unit test runs in every build: CI never compiles
-/// the `genai` handler that calls it.
+/// well as `genai`, so its unit test runs in the default-feature test builds
+/// too; the `genai` handler that calls it is compiled and linted by CI's
+/// lint-job step "Genai feature build check".
 #[cfg(any(feature = "genai", test))]
 fn llm_unavailable(stage: &'static str, e: impl std::fmt::Display) -> ApiError {
     tracing::warn!(target: "api.analyze", stage, error = %e, "LLM provider failure");
@@ -223,11 +224,12 @@ mod tests {
         assert!(logs_contain("llm-provider-6e2a"));
     }
 
-    /// CI never compiles the `genai` handler, so its wiring is pinned on the
-    /// source: both LLM failure sites go through `llm_unavailable`, and the
-    /// only `service: format!(` outside these tests is the helper's own fixed
-    /// reason, so no provider error is interpolated into a 503 (backlog
-    /// 49863d2c).
+    /// Compiling the `genai` handler (CI's "Genai feature build check") does
+    /// not stop a provider error being interpolated with `format!`, so the
+    /// no-interpolation rule is pinned on the source: both LLM failure sites go
+    /// through `llm_unavailable`, and the only `service: format!(` outside
+    /// these tests is the helper's own fixed reason, so no provider error
+    /// reaches a 503 (backlog 49863d2c).
     #[test]
     fn the_genai_handler_routes_every_provider_error_through_llm_unavailable() {
         let src = include_str!("analyze.rs");
