@@ -869,14 +869,16 @@ const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
 /// it as it is (no ciphertext row, body and digest untouched), rather than
 /// blanking it under the claim group's key.
 ///
-/// Reach, as the schema stands (current behaviour, not part of the ruling):
-/// a restrict runs before the seal, and migration 168's narrowing
-/// (`epigraph_propagate_tenancy`) moves a claim's inherited rows and its
-/// writers' own (writer-owned) rows onto the claim's group, so at seal time
-/// the rows this keeps out are the ones another group holds through a
-/// visibility pin (operator `hide`, migration 110). Whether a writer's public
-/// row should instead stay its writer's through a narrowing is an open design
-/// question outside this predicate.
+/// Reach (operator ruling R-101): evidence rows are per claim, so a claim's
+/// rows are its own copies. A restrict runs before the seal, and migration
+/// 168's narrowing (`epigraph_propagate_tenancy`) moves the narrowing claim's
+/// inherited rows and its writers' own (writer-owned) rows onto the claim's
+/// group, so at seal time the rows this keeps out are the ones another group
+/// holds through a visibility pin (operator `hide`, migration 110). The same
+/// body on ANOTHER public claim is that claim's own row: neither the narrowing
+/// nor the seal touches it, so public evidence supporting a public claim stays
+/// public. Backlog c2fffbc9 (ruling R-102) later replaces the per-claim row
+/// with a de-duplicated evidence node linked through the generic edges table.
 ///
 /// The manifest ([`PrivatizationRepository::seal_manifest_page_conn`]), the
 /// commit's TCB shape ([`PrivatizationRepository::seal_tcb_shape_conn`]) and the
