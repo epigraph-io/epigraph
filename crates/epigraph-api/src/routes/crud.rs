@@ -309,9 +309,8 @@ pub async fn create_evidence(
     //
     // A provided hash is verified whenever there is raw_content to verify it
     // against: the stored digest must be the digest of the stored body, or the
-    // row's integrity claim is false (and, through the
-    // (content_hash, claim_id) uniqueness, a chosen digest could block a later
-    // legitimate row). With no raw_content the evidence is external and the
+    // row's integrity claim is false (and, through the same-owner evidence
+    // de-duplication, a chosen digest could block a later legitimate row). With no raw_content the evidence is external and the
     // caller's hash is the only one there is, as on `/api/v1/submit`.
     let content_hash: [u8; 32] = if let Some(ref hex_hash) = request.content_hash {
         let bytes = hex::decode(hex_hash).map_err(|e| ApiError::ValidationError {
