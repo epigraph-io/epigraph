@@ -1089,6 +1089,95 @@ fn non_object_evidence_properties_carry_nothing_through_a_seal() {
     );
 }
 
+/// The seal mutation and the commit's TCB shape skip evidence a group other
+/// than the claim's owner holds on the claim (operator ruling R-78: "evidence
+/// can bear on multiple claims"), even when the commit names that row.
+///
+/// The route's own manifest never serves such a row (the API twin,
+/// `privatization_seal.rs::a_seal_encrypts_only_the_claim_owners_evidence`);
+/// this pins the two repository halves on their own, so a client that builds
+/// its commit some other way still cannot seal another group's row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seal_skips_evidence_another_group_holds_on_the_claim(pool: PgPool) {
+    let world = seed_world(&pool).await;
+    let claim = seed_sealable_claim(&pool, &world, "a claim with another group's evidence").await;
+    let (_other, other_group) = viewer_fixture::seed_agent_with_group(&pool, "r78-held").await;
+    let body = format!("another group's evidence {}", Uuid::new_v4());
+    let held: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (content_hash, evidence_type, raw_content, claim_id) \
+         VALUES ($1, 'document', $2, $3) RETURNING id",
+    )
+    .bind(blake3::hash(body.as_bytes()).as_bytes().as_slice())
+    .bind(&body)
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the held row");
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: held by another group')",
+    )
+    .bind(held)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("pin the held row");
+    sqlx::query("UPDATE evidence SET owner_group_id = $2 WHERE id = $1")
+        .bind(held)
+        .bind(other_group)
+        .execute(&pool)
+        .await
+        .expect("hold the row in the other group");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let shape = PrivatizationRepository::seal_tcb_shape_conn(&mut conn, &[claim])
+        .await
+        .expect("tcb shape");
+    drop(conn);
+    assert_eq!(shape.len(), 1);
+    assert!(
+        !shape[0].evidence_ids.contains(&held),
+        "the commit's TCB must not require another group's evidence"
+    );
+    assert_eq!(
+        shape[0].evidence_ids.len(),
+        1,
+        "the owner's own row is in it"
+    );
+
+    // `seal_payload` reads every evidence row of the claim, the held one too.
+    let payload = seal_payload(&pool, claim).await;
+    assert!(payload.evidence.iter().any(|e| e.id == held));
+    commit_seal(&pool, &world, std::slice::from_ref(&payload)).await;
+
+    let (raw, hash, sealed): (Option<String>, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT e.raw_content, e.content_hash, \
+                EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id) \
+           FROM evidence e WHERE e.id = $1",
+    )
+    .bind(held)
+    .fetch_one(&pool)
+    .await
+    .expect("read the held row");
+    assert_eq!(
+        raw.as_deref(),
+        Some(body.as_str()),
+        "the seal blanked another group's evidence"
+    );
+    assert_eq!(hash, blake3::hash(body.as_bytes()).as_bytes().to_vec());
+    assert!(!sealed, "the seal encrypted another group's evidence");
+    let owners_rows_sealed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence e WHERE e.claim_id = $1 AND e.id <> $2 \
+            AND EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id)",
+    )
+    .bind(claim)
+    .bind(held)
+    .fetch_one(&pool)
+    .await
+    .expect("count the owner's sealed rows");
+    assert_eq!(owners_rows_sealed, 1, "the owner's own row is sealed");
+}
+
 /// A second keyed `team` group, admin'd by the same author, old enough to be a
 /// seal target.
 ///
