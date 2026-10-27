@@ -66,7 +66,7 @@ async fn seed_claim(pool: &PgPool, agent: Uuid, labels: &[&str]) -> Uuid {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
+async fn default_mode_reports_the_five_corpus_counts_and_the_belief_mode_report(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let viewer = viewer_fixture::public_viewer(&pool).await;
 
@@ -77,7 +77,14 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
     );
     assert_eq!(
         keys(&before),
-        vec!["agents", "claims", "edges", "evidence", "frames"],
+        vec![
+            "agents",
+            "belief_modes",
+            "claims",
+            "edges",
+            "evidence",
+            "frames"
+        ],
         "the un-detailed key set is part of this tool's contract"
     );
 
@@ -101,7 +108,7 @@ async fn default_mode_reports_exactly_the_five_corpus_counts(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
+async fn detailed_mode_adds_the_six_extra_counts_beside_the_same_mode_report(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let viewer = viewer_fixture::public_viewer(&pool).await;
 
@@ -120,6 +127,7 @@ async fn detailed_mode_adds_the_six_extra_counts(pool: PgPool) {
         keys(&before),
         vec![
             "agents",
+            "belief_modes",
             "challenges",
             "claims",
             "edges",
