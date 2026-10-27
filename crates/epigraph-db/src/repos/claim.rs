@@ -8104,10 +8104,11 @@ impl ClaimRepository {
     /// repair will move.
     ///
     /// # Errors
-    /// `DbError::NotFound` for a missing canonical or duplicate,
-    /// `DbError::QueryFailed` for a duplicate already superseded, for
-    /// `dup == canonical`, for the FA04 and FA07 refusals and for any refused
-    /// statement.
+    /// `DbError::NotFound` for a missing canonical or duplicate;
+    /// `DbError::Refused` (operator ruling R-55) of kind `Input` for
+    /// `dup == canonical`, `State` for a duplicate already superseded or a
+    /// canonical that is not current, and `Authority` for the FA04 and FA07
+    /// refusals; `DbError::QueryFailed` for any refused statement.
     pub async fn mark_duplicate_act_conn(
         conn: &mut sqlx::PgConnection,
         dup: ClaimId,

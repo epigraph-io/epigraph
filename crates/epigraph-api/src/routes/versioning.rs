@@ -1415,8 +1415,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        // Not compiled (this module is `not(feature = "db")`); kept in step
+        // with the db route, which answers a STATE refusal 409 (ruling R-55).
         #[tokio::test]
-        async fn test_supersede_already_superseded_claim_returns_400() {
+        async fn test_supersede_already_superseded_claim_returns_409() {
             let claim_id = Uuid::new_v4();
             let (state, _) = state_with_claim(claim_id).await;
 
@@ -1454,7 +1456,7 @@ mod tests {
                 .unwrap();
 
             let response2 = router.oneshot(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response2.status(), StatusCode::CONFLICT);
         }
 
         #[tokio::test]
