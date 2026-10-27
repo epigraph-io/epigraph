@@ -146,7 +146,7 @@ async fn hierarchical_workflow_with_no_steps_is_withheld(pool: PgPool) {
     // Precondition: the row really exists and really has no step claims, so a
     // "not returned" result below cannot be explained by the row being absent.
     let steps_map = epigraph_db::WorkflowRepository::step_texts_for_hierarchical(
-        &pool,
+        &mut *pool.acquire().await.expect("acquire"),
         &viewer,
         &[workflow_id],
     )

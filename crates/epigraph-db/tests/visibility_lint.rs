@@ -2727,9 +2727,10 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          FROM is `workflows` alone. `workflows` is the HIERARCHICAL root table, a different \
          relation from the `claims` rows labelled `workflow` that `list`/`find_by_embedding` \
          read and splice a viewer into. Since migration 183 (ruling R-74) the row carries its \
-         plan's tenancy under FORCEd row security, and both production callers run this on the \
+         plan's tenancy under FORCEd row security, and every production caller runs this on the \
          CALLER's viewer-stamped read (REST `find_workflow_hierarchical`, MCP \
-         `find_workflow_hierarchical` when the server has a tenancy-aware pool), so the policy \
+         `find_workflow_hierarchical` and `find_workflow` when the server has a tenancy-aware \
+         pool), so the policy \
          returns exactly the rows the caller may read; an in-query predicate would restate it. \
          A development server without a tenancy-aware pool reads its plain pool, where the \
          policy admits public rows only.",
@@ -2750,14 +2751,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "behavioral_execution.rs",
         "behavioral_affinity_hierarchical",
         "U033: scores hierarchical outcome reports. FROM `behavioral_executions` JOIN `workflows` \
-         and nothing else -- no `claims`, no `edges`. Neither relation carries a `visibility` or \
-         `owner_group_id` column, and row security is off on both (`residual_unstamped_writes.rs` \
-         records `workflows` as MEASURED `relrowsecurity = false`; `behavioral_executions` as \
-         not claim-derived with no `owner_group_id`). It projects only `(workflows.id, float8, \
-         bigint)` -- no content column. The `workflows` ids it can return are the same ones the \
-         viewer-less `search_hierarchical_by_embedding_scored` already returns to every caller of \
-         `find_workflow`. The flat (claim-rooted) twin, `behavioral_affinity_lineage`, keeps its \
-         Viewer and its markers; this is a separate fn precisely so the claim arm is unchanged.",
+         and nothing else -- no `claims`, no `edges`. `behavioral_executions` is not \
+         claim-derived and has no `owner_group_id`; since migration 183 (ruling R-74) the joined \
+         `workflows` row carries its plan's tenancy under FORCEd row security, and the \
+         production caller (MCP `find_workflow`) runs this on the CALLER's viewer-stamped read, \
+         so the join keeps exactly the rows the caller may read. It projects only \
+         `(workflows.id, float8, bigint)` -- no content column. The flat (claim-rooted) twin, \
+         `behavioral_affinity_lineage`, keeps its Viewer and its markers; this is a separate fn \
+         precisely so the claim arm is unchanged.",
     ),
     (
         "behavioral_execution.rs",
@@ -3237,10 +3238,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "max_generation_by_canonical",
         "READ of `workflows` only: the highest generation of one `canonical_name`, which \
          numbers the generation `improve_workflow_hierarchy` creates (executor-generic since \
-         migration 183). Its production caller runs it on the ingest system agent's stamp, the \
+         migration 183). Its numbering caller runs it on the ingest system agent's stamp, the \
          identity whose plan walk writes that generation, so `workflows`' row security bounds it \
          to the groups that agent ingests into; a caller viewer predicate could hide a \
-         group-private head and number a generation below it. Returns one integer.",
+         group-private head and number a generation below it. MCP `find_workflow`'s \
+         `latest_generation` disclosure runs it on the CALLER's stamped read, where the same \
+         row security bounds it to the rows the caller reads. Returns one integer.",
     ),
     (
         "workflow.rs",

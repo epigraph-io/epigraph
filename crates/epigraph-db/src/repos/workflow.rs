@@ -443,9 +443,12 @@ impl WorkflowRepository {
     /// sound — and an empty result (no edge, or none visible to `viewer`) means
     /// the seed is unrecoverable, which the caller reports as undecided.
     ///
-    /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the joined
-    /// `workflows` row is bounded by its own row security (migration 183) on
-    /// the pool this runs on.
+    /// Viewer-scoped on the edge like `resolve_steps_to_heads`, and on the
+    /// joined `workflows` row, which carries its plan's tenancy since
+    /// migration 183 (ruling R-74): run it on the caller's STAMPED connection
+    /// so the in-query predicate and the row security agree. A step executed
+    /// only by workflows the caller does not read has no recoverable seed for
+    /// that caller (an empty result).
     ///
     /// RETRACTED edges are included ON PURPOSE — there is deliberately no
     /// `e.valid_to IS NULL` filter here, unlike the house-style edge read. The
@@ -459,8 +462,8 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    pub async fn executing_canonical_names(
-        pool: &PgPool,
+    pub async fn executing_canonical_names<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> Result<Vec<String>, DbError> {
@@ -471,6 +474,7 @@ impl WorkflowRepository {
              WHERE e.target_id = $1 AND e.relationship = 'executes' \
                AND e.source_type = 'workflow' AND e.target_type = 'claim' \
                /* {EDGE_VISIBILITY:e} */ \
+               /* {VISIBILITY:w} */ \
              ORDER BY w.canonical_name",
             2,
         );
@@ -478,7 +482,7 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(pool).await.map_err(DbError::from)
+        q.fetch_all(executor).await.map_err(DbError::from)
     }
 
     /// The ids of every workflow that EXECUTES the step lineage of `claim_id`:
@@ -1667,12 +1671,20 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_by_goal_embedding(
-        pool: &PgPool,
+    pub async fn search_by_goal_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
     ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
-        Self::search_by_goal_embedding_since(pool, query_embedding_pgvector, limit, None).await
+        Self::search_by_goal_embedding_since(
+            executor,
+            viewer,
+            query_embedding_pgvector,
+            limit,
+            None,
+        )
+        .await
     }
 
     /// [`Self::search_by_goal_embedding`] plus an optional
@@ -1684,29 +1696,40 @@ impl WorkflowRepository {
     /// window for real rather than taking the "omit the field and exclude the
     /// row" fallback.
     ///
+    /// Viewer-scoped on the `workflows` row, which carries its plan's tenancy
+    /// since migration 183 (ruling R-74): run it on the caller's STAMPED
+    /// connection, so a member finds its group's workflows and nobody else
+    /// does.
+    ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn search_by_goal_embedding_since(
-        pool: &PgPool,
+    pub async fn search_by_goal_embedding_since<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         limit: i64,
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<WorkflowGoalEmbeddingHit>, sqlx::Error> {
-        sqlx::query_as::<_, WorkflowGoalEmbeddingHit>(
-            "SELECT id AS workflow_id, goal AS content, truth_value, \
-                    (1 - (goal_embedding <=> $1::vector))::float8 AS similarity, \
-                    created_at \
-             FROM workflows \
-             WHERE goal_embedding IS NOT NULL \
-               AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz) \
-             ORDER BY goal_embedding <=> $1::vector \
+        let sql = viewer.splice(
+            "SELECT w.id AS workflow_id, w.goal AS content, w.truth_value, \
+                    (1 - (w.goal_embedding <=> $1::vector))::float8 AS similarity, \
+                    w.created_at \
+             FROM workflows w \
+             WHERE w.goal_embedding IS NOT NULL \
+               AND ($3::timestamptz IS NULL OR w.created_at >= $3::timestamptz) \
+               /* {VISIBILITY:w} */ \
+             ORDER BY w.goal_embedding <=> $1::vector \
              LIMIT $2",
-        )
-        .bind(query_embedding_pgvector)
-        .bind(limit)
-        .bind(since)
-        .fetch_all(pool)
-        .await
+            4,
+        );
+        let mut q = sqlx::query_as::<_, WorkflowGoalEmbeddingHit>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(limit)
+            .bind(since);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 
     /// Cosine-similarity search over `workflows.goal_embedding` that keeps BOTH
@@ -1723,37 +1746,37 @@ impl WorkflowRepository {
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
     ///
-    /// Takes NO `&Viewer`, and no lint sees it either — it takes a `&PgPool`,
-    /// which is neither of the two spellings `visibility_lint.rs` scans. The
-    /// reason is recorded here so the next reader does not have to re-derive
-    /// it: the statement's `FROM` is `workflows` alone and it joins no other
-    /// relation, and `workflows` carries neither a `visibility` nor an
-    /// `owner_group_id` column, so there is no predicate to write. This is the
-    /// scored sibling of `find_hierarchical_by_embedding`, whose identical
-    /// posture is registered in `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`.
-    /// Contrast `step_texts_for_hierarchical` below, which joins `claims` and
-    /// therefore DOES take a viewer.
-    pub async fn search_hierarchical_by_embedding_scored(
-        pool: &PgPool,
+    /// Viewer-scoped on the `workflows` row, which carries its plan's tenancy
+    /// since migration 183 (ruling R-74): run it on the caller's STAMPED
+    /// connection (MCP `find_workflow`), so the in-query predicate and the row
+    /// security agree and a member finds its group's workflows.
+    pub async fn search_hierarchical_by_embedding_scored<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
         query_embedding_pgvector: &str,
         min_truth: f64,
         limit: i64,
     ) -> Result<Vec<ScoredHierarchicalWorkflowRow>, sqlx::Error> {
-        sqlx::query_as::<_, ScoredHierarchicalWorkflowRow>(
-            "SELECT id, canonical_name, generation, goal, parent_id, metadata, created_at, \
-                    truth_value, \
-                    (1 - (goal_embedding <=> $1::vector))::float8 AS similarity \
-             FROM workflows \
-             WHERE goal_embedding IS NOT NULL \
-               AND truth_value >= $2 \
-             ORDER BY goal_embedding <=> $1::vector \
+        let sql = viewer.splice(
+            "SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, w.metadata, \
+                    w.created_at, w.truth_value, \
+                    (1 - (w.goal_embedding <=> $1::vector))::float8 AS similarity \
+             FROM workflows w \
+             WHERE w.goal_embedding IS NOT NULL \
+               AND w.truth_value >= $2 \
+               /* {VISIBILITY:w} */ \
+             ORDER BY w.goal_embedding <=> $1::vector \
              LIMIT $3",
-        )
-        .bind(query_embedding_pgvector)
-        .bind(min_truth)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
+            4,
+        );
+        let mut q = sqlx::query_as::<_, ScoredHierarchicalWorkflowRow>(&sql)
+            .bind(query_embedding_pgvector)
+            .bind(min_truth)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 
     /// Step texts for hierarchical workflows, in plan order, keyed by workflow.
@@ -1779,10 +1802,15 @@ impl WorkflowRepository {
     /// need head resolution have `find_workflow_hierarchical(resolve_to_latest)`.
     /// Workflows with no steps are simply absent from the map.
     ///
+    /// Run it on the caller's STAMPED connection (MCP `find_workflow`): the
+    /// claim and edge predicates below only narrow what row security admits,
+    /// and on an unstamped application session that is public rows only, so a
+    /// group plan's own steps would be missing for the group's members.
+    ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
     pub async fn step_texts_for_hierarchical(
-        pool: &PgPool,
+        conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
         workflow_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<String>>, sqlx::Error> {
@@ -1816,13 +1844,13 @@ impl WorkflowRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(pool).await?;
+        let rows: Vec<(Uuid, Uuid, String)> = q.fetch_all(&mut *conn).await?;
 
         // Then each workflow's `step_follows` chain (ruling R-38), as in
         // `resolve_steps_to_heads`. The chain read DOES carry the edge
         // predicate: it is new, and has no prior shape to preserve.
         let all_ids: Vec<Uuid> = rows.iter().map(|(_, id, _)| *id).collect();
-        let follows = step_follows_among(pool, viewer, &all_ids).await?;
+        let follows = step_follows_among(&mut *conn, viewer, &all_ids).await?;
         let mut by_workflow: HashMap<Uuid, Vec<(Uuid, String)>> = HashMap::new();
         for (workflow_id, id, content) in rows {
             by_workflow

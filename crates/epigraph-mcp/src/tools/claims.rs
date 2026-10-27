@@ -1179,13 +1179,14 @@ pub async fn verify_claim(
         if epigraph_ingest::document::stored_content_hash_is_canonical_name_scoped(&properties) {
             // Workflow structural row: the seed is the canonical_name of the
             // workflow that executes it — recovered from the edge, not guessed.
-            let names = epigraph_db::WorkflowRepository::executing_canonical_names(
-                &server.pool,
-                viewer,
-                id,
-            )
-            .await
-            .map_err(internal_error)?;
+            // On the caller's read: the executing `workflows` rows carry
+            // their plan's tenancy (migration 183, ruling R-74).
+            let mut read = super::workflows::CallerRead::open(server, viewer).await?;
+            let names =
+                epigraph_db::WorkflowRepository::executing_canonical_names(read.conn(), viewer, id)
+                    .await
+                    .map_err(internal_error)?;
+            read.close().await?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
                 &claim.content,
                 &claim.content_hash,
