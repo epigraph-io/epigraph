@@ -14,10 +14,11 @@
 //! The discriminating pair:
 //!
 //! * a body another group holds and a body nobody holds both land;
-//! * the SAME writer's identical retry is still refused, so evidence is still
-//!   de-duplicated within one owner (MCP redacts the refusal's text, so the
-//!   row count is what pins it; `epigraph-db/tests/evidence_dedup_per_owner.rs`
-//!   pins the `DuplicateKey` itself).
+//! * the SAME writer's identical retry is still refused while that writer's
+//!   different body lands, so evidence is still de-duplicated within one owner
+//!   (MCP redacts the refusal's text, so the row count and the control are what
+//!   pin it; `epigraph-db/tests/evidence_dedup_per_owner.rs` pins the
+//!   `DuplicateKey` itself).
 //!
 //! Both pools are downgraded to `epigraph_app` exactly as in
 //! `writer_owned_attach_app_role.rs`, whose header says why.
@@ -231,4 +232,22 @@ async fn the_same_writers_identical_retry_is_still_refused(pool: PgPool) {
     .await
     .expect("read rows");
     assert_eq!(owners, vec![group], "exactly one row, the writer's");
+
+    // Control: the same writer's DIFFERENT body on the same claim still lands,
+    // so the refusal above is the duplicate's and not some other failure of a
+    // second submission (MCP redacts the error text, so this is what tells
+    // them apart).
+    let other = format!("the writer's second observation {}", Uuid::new_v4());
+    epigraph_mcp::tools::claims::update_with_evidence(&server, &viewer, uwe(claim, &other), None)
+        .await
+        .expect("control: the same writer's different body lands");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM evidence WHERE claim_id = $1 AND owner_group_id = $2",
+    )
+    .bind(claim)
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("count the writer's rows");
+    assert_eq!(rows, 2, "the first body and the different one");
 }
