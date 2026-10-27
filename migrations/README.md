@@ -1661,7 +1661,10 @@ restart.
   row's `inherited_from` chain (detached rows included) reaches a row of the
   child, or "the parent succeeded the child" is on record (a revert to an
   earlier, possibly detached identity), counting withheld rows in the audit
-  row (`role_attachments_withheld`). Adds
+  row (`role_attachments_withheld`). The cost: the reverted identity then
+  holds no attachment, so 166's restriction (ROL01, may-run) no longer
+  applies to it; attach the running identity by name after a revert if it
+  must hold. Adds
   `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
   maintenance-session only and audited (`agent.identity_succession_recorded`):
   for a child the host registered parentless in that folder, with no

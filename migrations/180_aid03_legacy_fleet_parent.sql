@@ -105,12 +105,19 @@
 --     prompt or model, so the host names the later identity as the earlier
 --     one's parent (the host cannot tell a revert from a new identity: agent
 --     ids are database-assigned). Without this, the earlier identity got
---     back, as a copy of its successor's row, the attachment the operator
---     had DETACHED from it. Where an attachment is a grant (a role binding
---     that admits the role's attached agents), that is a revoked identity
---     regaining the group. The guards hold whether or not such a binding
---     mode is applied; a withheld row is counted in the registration's
---     audit row (`role_attachments_withheld`). Not covered, by design: a
+--     back, as a copy of its successor's row, an attachment: when the
+--     operator had DETACHED the earlier identity, the very attachment it
+--     took away. Where an attachment is a grant (a role binding that admits
+--     the role's attached agents), that is a revoked identity regaining the
+--     group. The guards hold whether or not such a binding mode is applied;
+--     a withheld row is counted in the registration's audit row
+--     (`role_attachments_withheld`; the function's result columns do not
+--     carry it). THE COST: an attachment is also 166's RESTRICTION, so the
+--     reverted identity, holding no attachment, is no longer held by it:
+--     while the role has no holder it may run and write wherever its link
+--     allows, although the identity it reverted from may not. After a
+--     revert, attach the running identity by name if the restriction must
+--     hold. Not covered, by design: a
 --     revert to an identity two or more successions back whose parent was
 --     attached directly (the chain names no row of the child and no direct
 --     reverse pair is on record); the copy then follows the operator's own

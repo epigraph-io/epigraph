@@ -1750,6 +1750,21 @@ async fn withheld(pool: &PgPool, agent: Uuid) -> Option<i64> {
     .expect("registration audit row")
 }
 
+/// 166's may-run answer for `agent`, on the attestor's session (as the host
+/// asks it).
+async fn may_run(pool: &PgPool, agent: Uuid) -> bool {
+    fixture::as_role(pool, ATTESTOR, |mut conn| async move {
+        let r: bool =
+            sqlx::query_scalar("SELECT may_run FROM public.epigraph_role_agent_may_run($1)")
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("may_run");
+        (conn, r)
+    })
+    .await
+}
+
 async fn register_id(pool: &PgPool, id: &Identity, parent: Option<Uuid>) -> Uuid {
     try_register(pool, id, parent, GROUP)
         .await
@@ -1886,7 +1901,9 @@ async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
 /// succeeded A while nothing was attached; the operator then attaches B
 /// itself (its own root row); the job reverts, so A is registered with B as
 /// its parent. B's row names no row of A, but "B succeeded A" is on record,
-/// so nothing is copied onto A. POSITIVE CONTROL: a fresh successor of B is
+/// so nothing is copied onto A. DOCUMENTED COST: an attachment is also 166's
+/// restriction, so with the role unheld B may not run while the reverted A,
+/// holding no attachment, may. POSITIVE CONTROL: a fresh successor of B is
 /// copied.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
@@ -1919,6 +1936,14 @@ async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
         "nothing is copied onto the parent's own recorded predecessor"
     );
     assert_eq!(withheld(&pool, a).await, Some(1));
+    assert!(
+        !may_run(&pool, b).await,
+        "PREMISE: B is held (the role is unheld)"
+    );
+    assert!(
+        may_run(&pool, a).await,
+        "DOCUMENTED COST: the reverted A holds no attachment, so 166's restriction no longer holds it"
+    );
 
     let c = register_id(&pool, &new_identity(), Some(b)).await;
     let c_rows = live_rows(&pool, c).await;
