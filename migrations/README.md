@@ -1723,6 +1723,39 @@ restart.
   the four triggers and the function. **Deploy order:** after 168; independent
   of the binaries. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
+  Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
+  pg_catalog, pg_temp` (was `pg_catalog, public`) and its `unnest(` and
+  `now()` calls written `pg_catalog.`-qualified; nothing else changes. A
+  `public.unnest(text[])` is an exact argument-type match and wins over
+  `pg_catalog.unnest(anyarray)` whatever the path order, so 140's pin did not
+  keep the call in `pg_catalog`. Owner and grant re-asserted as 140 does.
+  Pinned by `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`
+  (reads the body at head) and
+  `app_role_table_lockdown.rs::rotation_ignores_a_public_overload_of_the_builtins_it_calls`.
+  A later re-statement of this function must start from 172's body. The other
+  definers that call unqualified built-ins under a path including `public`
+  are the same class and are not changed here. Undo: re-run 140's `CREATE OR
+  REPLACE FUNCTION` block. Slot: 172 and 173 are assigned to this batch and
+  are free on `main` and in every open PR. **Deploy order:** after 140; no
+  binary change. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+- **173**: public `harvester_tables_tenancy_posture` (backlog 154efca2,
+  ledger F-089-B). Two `tenancy_exempt` rows, `harvester_sources` and
+  `harvester_audit_reports`, each with its reason, a class-level residual
+  (NOT CLOSED) and `reviewed_by = 'backlog 154efca2'`. No column, policy or
+  grant changes: it declares the posture the tables already had, which no
+  register recorded. Both are FK
+  neighbours of the hand-registered tier-A `harvester_fragments` and found by
+  neither generator; `tenancy_coverage.rs::every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt`
+  now requires every such neighbour to be covered or registered, and
+  `the_harvester_exemptions_describe_the_tables_as_they_are` fails if row
+  security or an application write arrives without the row being rewritten.
+  `migration_068_and_069_apply_twice` pins the count at 14 (was 12) and
+  `the_registry_is_exactly_the_fourteen_measured_rows` pins the full
+  membership. Undo: delete the two rows. Slot:
+  see 172. **Deploy order:** independent; no binary change. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 - **179**: public `role_binding_attached_agents`. A third mode for 165's
   role bindings: the role HOLDER plus the agents ATTACHED to the role (166's
   `role_agents`) only. Adds `group_role_bindings.attached_agents boolean NOT
@@ -1769,6 +1802,36 @@ restart.
   otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
   **Deploy order:** after 165 and 166; before any operator CLI call with
   `--agent-mode attached_agents` (the other modes work without it).
+- **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
+  R-56). One SECURITY DEFINER, `epigraph_mark_group_reseal_required(p_group
+  uuid) RETURNS void`, that writes only `groups.reseal_required_at =
+  COALESCE(reseal_required_at, now())` on that one row. It admits a caller
+  whose session principal is a live admin of the group
+  (`epigraph_is_group_admin`), or a privileged session (which can already
+  write the column directly); an ELEVATED session gets `GRA03` / 42501 first
+  (126's `groups_elevated_no_update` is an `epigraph_app` policy and does not
+  apply inside the maintenance-owned frame, so the definer refuses it itself,
+  as 168's CR05 does), anyone else gets `GRA01` / 42501, and an UPDATE that
+  matched no row gets `GRA02` / 42501. Path pinned as 172
+  (`pg_catalog, pg_temp`, built-ins qualified); owner
+  `epigraph_maintenance`; EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app`. `GroupMembershipRepository::revoke_member_unless_last_admin_conn`
+  calls it under the roster lock and before the guarded revoke, so a group
+  admin who did not create the group can remove a member (before this,
+  `groups_tenancy`'s creator-only WITH CHECK refused the mark and the whole
+  removal). Pinned by `group_reseal_mark.rs` (direct calls on the application
+  role, catalog shape), `elevated_arms.rs` (`GRA03`) and
+  `group_routes_app_role.rs`; registered in
+  `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS`, grant list). Undo:
+  `DROP FUNCTION public.epigraph_mark_group_reseal_required(uuid)` with the
+  repository change reverted. Slot: 181 is assigned to this batch (moved from
+  179, which an open PR holds) and is free on `main` and in every open PR.
+  **Deploy order:** with or after 172, and before (or with) the API binary
+  that calls it. Without 181 that binary's call raises 42883 (function does
+  not exist), so EVERY member removal is a 500, the creator's included. A
+  grant that no-opped (role absent when 181 ran) shows on that route as a 403
+  for every removal instead; `epigraph-tenancy-backfill verify` reports both
+  the owner and the grant, so run it after 181.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

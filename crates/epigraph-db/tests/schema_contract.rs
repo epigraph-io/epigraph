@@ -2063,33 +2063,67 @@ async fn migration_149_author_binding_allowlist_definers_are_owned_and_granted(p
 }
 
 /// Migration 140 redefines `epigraph_refresh_token_rotate` (the successor keeps
-/// the presented token's scopes, narrowed to the client's grant). `CREATE OR
-/// REPLACE` keeps the owner and ACL, and 140 re-asserts both; this pins them,
-/// because the harness migrates as a superuser and a definer silently left
-/// superuser-owned, or granted back to PUBLIC, would pass every behavioural
-/// test. The pinned `search_path` keeps the body's unqualified `unnest` and
-/// `ANY` resolving in `pg_catalog`.
+/// the presented token's scopes, narrowed to the client's grant), and 172
+/// re-states it with its built-ins pinned. `CREATE OR REPLACE` keeps the owner
+/// and ACL, and both files re-assert them; this pins them, because the harness
+/// migrates as a superuser and a definer silently left superuser-owned, or
+/// granted back to PUBLIC, would pass every behavioural test.
+///
+/// The search_path half, corrected (backlog 1228c284). 140's
+/// `pg_catalog, public` did NOT keep the body's unqualified `unnest` in
+/// `pg_catalog`, which this comment used to claim: a `public.unnest(text[])`
+/// is an exact argument-type match and beats `pg_catalog.unnest(anyarray)`
+/// wherever `public` sits in the path. So this reads the body AT HEAD and
+/// requires both that `public` is off the path and that every `unnest(` and
+/// `now(` call is written `pg_catalog.`-qualified. A later migration that
+/// re-states the function from 140's body fails here.
+/// `app_role_table_lockdown.rs::rotation_ignores_a_public_overload_of_the_builtins_it_calls`
+/// is the behavioural half.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_140_rotate_definer_keeps_owner_grant_and_search_path(pool: PgPool) {
     let signature = "public.epigraph_refresh_token_rotate(bytea, bytea, timestamp with time zone)";
-    let (secdef, owner, acl, config): (bool, String, Option<String>, Option<Vec<String>>) =
-        sqlx::query_as(
-            "SELECT p.prosecdef, r.rolname::text, p.proacl::text, p.proconfig \
-               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
-              WHERE p.oid = $1::regprocedure",
-        )
-        .bind(signature)
-        .fetch_one(&pool)
-        .await
-        .expect("the rotate definer exists");
+    let (secdef, owner, acl, config, src): (
+        bool,
+        String,
+        Option<String>,
+        Option<Vec<String>>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.proacl::text, p.proconfig, p.prosrc \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = $1::regprocedure",
+    )
+    .bind(signature)
+    .fetch_one(&pool)
+    .await
+    .expect("the rotate definer exists");
     assert!(secdef, "the rotation must stay SECURITY DEFINER");
     assert_eq!(owner, "epigraph_maintenance", "rotate definer owner");
     assert!(acl.is_some(), "an EXPLICIT ACL; NULL is the PUBLIC default");
     assert_eq!(
         config,
-        Some(vec!["search_path=pg_catalog, public".to_string()]),
-        "the definer pins its search_path"
+        Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+        "the definer pins its search_path to pg_catalog, with public off the path"
     );
+    // Whitespace is stripped before counting, so a re-statement that writes
+    // `unnest (` or `pg_catalog . now (` is counted like the compact spelling.
+    let lowered: String = src
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for builtin in ["unnest(", "now("] {
+        let qualified = format!("pg_catalog.{builtin}");
+        assert!(
+            lowered.contains(&qualified),
+            "the body calls {qualified}; a vacuous pass would hide a renamed call"
+        );
+        assert_eq!(
+            lowered.matches(builtin).count(),
+            lowered.matches(qualified.as_str()).count(),
+            "every {builtin} call in the rotate definer is pg_catalog-qualified"
+        );
+    }
     for (role, expected) in [
         ("public", false),
         ("epigraph_app", true),

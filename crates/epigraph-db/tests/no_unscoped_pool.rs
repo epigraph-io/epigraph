@@ -332,7 +332,6 @@
 //!   connection primitive that `visibility_lint.rs`'s two connection rules
 //!   cannot see, because their scan root is `crates/epigraph-db/src/repos`.
 //!   Enumerated so no shard author mistakes this table for complete —
-//!   `middleware/group_authz.rs::require_group_admin`,
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
 //!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,
@@ -697,7 +696,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// challenge and its event on one `AppState::write_as` transaction, so
 /// `routes/challenge.rs` 2 -> 0 and its key is deleted, read off
 /// `the_scanner_is_not_vacuous`'s own failure (`left: 244, right: 246`).
-const HIGH_WATER: usize = 244;
+///
+/// 244 -> 232 (backlog 323773fe): the five group management routes run on the
+/// caller's stamped connection (`write_as` for create / add / remove,
+/// `read_as` for `get_group`; `rotate_key` already did), so `routes/groups.rs`
+/// 12 -> 0 and its key is deleted, read off this test's own failure.
+const HIGH_WATER: usize = 232;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -761,7 +765,8 @@ const HIGH_WATER: usize = 244;
 /// 44 -> 43 when `routes/reasoning.rs` reached zero (see [`HIGH_WATER`]).
 /// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
 /// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
-const HIGH_WATER_FILES: usize = 41;
+/// 41 -> 40 when `routes/groups.rs` reached zero (backlog 323773fe).
+const HIGH_WATER_FILES: usize = 40;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -929,7 +934,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
     ("routes/graph_query.rs", 1),
-    ("routes/groups.rs", 12),
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
