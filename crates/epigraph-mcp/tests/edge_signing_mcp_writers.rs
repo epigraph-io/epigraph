@@ -320,9 +320,21 @@ fn extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
                 "atoms": [format!("dae795f8 {tag}: an atom's edges are signed.")],
                 "generality": [1],
                 "confidence": 0.9
+            }, {
+                "text": format!("dae795f8 {tag}: a second paragraph supports the first."),
+                "atoms": [format!("dae795f8 {tag}: the plan's relationships are signed too.")],
+                "generality": [1],
+                "confidence": 0.9
             }]
         }],
-        "relationships": []
+        // An extraction relationship between two paragraphs, so the walks'
+        // plan-relationship INSERT sites write a row (the spine skips atom
+        // edges, not paragraph ones).
+        "relationships": [{
+            "source_path": "sections/0/paragraphs/1",
+            "target_path": "sections/0/paragraphs/0",
+            "relationship": "supports"
+        }]
     }))
     .expect("fixture parses")
 }
@@ -361,7 +373,13 @@ async fn ingest_document_attests_every_edge_it_writes(pool: PgPool) {
     assert_every_edge_attested(
         &pool,
         "ingest_document",
-        &["authored", "asserts", "decomposes_to", "processed_by"],
+        &[
+            "authored",
+            "asserts",
+            "decomposes_to",
+            "supports",
+            "processed_by",
+        ],
     )
     .await;
 }
@@ -381,7 +399,13 @@ async fn ingest_document_spine_attests_every_edge_it_writes(pool: PgPool) {
     assert_every_edge_attested(
         &pool,
         "ingest_document_spine",
-        &["authored", "asserts", "processed_by"],
+        &[
+            "authored",
+            "asserts",
+            "decomposes_to",
+            "supports",
+            "processed_by",
+        ],
     )
     .await;
 }
@@ -463,4 +487,153 @@ async fn the_auth_lineage_edge_is_attested(pool: PgPool) {
     .await;
     assert_eq!(edges.len(), 1, "{edges:?}");
     assert_server_attested(&pool, edges[0], "auth lineage OPERATED_BY").await;
+}
+
+/// The claim was AUTHORED by `caller` (the precondition that makes "the signer
+/// is the server, not the caller" mean something: with no token the author IS
+/// the server agent, and author and signer collapse).
+async fn assert_authored_by(pool: &PgPool, claim: Uuid, caller: Uuid) {
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim");
+    assert_eq!(author, caller, "claim {claim} is not caller-authored");
+}
+
+/// The edge is attested by the server's signer agent, which is not `caller`.
+async fn assert_server_not_caller(pool: &PgPool, edge: Uuid, caller: Uuid, what: &str) {
+    assert_server_attested(pool, edge, what).await;
+    let (_, signer) = stored_attestation(pool, edge).await;
+    assert_ne!(
+        signer,
+        Some(caller),
+        "{what}: the caller signed edge {edge}"
+    );
+}
+
+/// R-49's distinguishing clause on the MCP transport: an authenticated
+/// CALLER's writes are authored by the caller, and their edges are signed by
+/// the SERVER's signer agent, never by the caller. submit_claim's AUTHORED
+/// (caller -> claim) and DERIVED_FROM, and link_epistemic's edge between two
+/// caller-authored claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_callers_edges_are_signed_by_the_server_not_the_caller(pool: PgPool) {
+    use epigraph_mcp::types::LinkEpistemicParams;
+    let server = server(&pool).await;
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (caller, token, viewer) =
+        common::seed_caller(&pool, &["claims:read", "claims:write"]).await;
+    assert_ne!(caller, server_agent);
+
+    let mut claims = Vec::new();
+    for i in 0..2 {
+        let out = epigraph_mcp::tools::claims::submit_claim(
+            &server,
+            &viewer,
+            epigraph_mcp::types::SubmitClaimParams {
+                content: format!("R-49 caller-authored claim {i}"),
+                methodology: "deductive_logic".into(),
+                evidence_data: format!("evidence for caller claim {i}"),
+                evidence_type: "logical".into(),
+                confidence: 0.6,
+                source_url: None,
+                reasoning: Some("because".into()),
+                labels: vec![],
+                novelty_threshold: Some(0.0),
+            },
+            Some(&token),
+        )
+        .await
+        .expect("submit_claim as the caller");
+        let claim = uuid_field(&common::first_text(&out), "claim_id");
+        assert_authored_by(&pool, claim, caller).await;
+        claims.push(claim);
+    }
+    let authored = edges_of(&pool, claims[0], "AUTHORED").await;
+    assert_eq!(authored.len(), 1, "{authored:?}");
+    let (source,): (Uuid,) = sqlx::query_as("SELECT source_id FROM edges WHERE id = $1")
+        .bind(authored[0])
+        .fetch_one(&pool)
+        .await
+        .expect("AUTHORED");
+    assert_eq!(source, caller, "the AUTHORED edge names the caller");
+    assert_server_not_caller(&pool, authored[0], caller, "caller submit_claim AUTHORED").await;
+    let derived = edges_of(&pool, claims[0], "DERIVED_FROM").await;
+    assert_eq!(derived.len(), 1, "{derived:?}");
+    assert_server_not_caller(
+        &pool,
+        derived[0],
+        caller,
+        "caller submit_claim DERIVED_FROM",
+    )
+    .await;
+
+    let out = epigraph_mcp::tools::link_epistemic::do_link_epistemic(
+        &server,
+        &viewer,
+        LinkEpistemicParams {
+            source_claim_id: claims[0].to_string(),
+            target_claim_id: claims[1].to_string(),
+            relationship: "supports".into(),
+            properties: None,
+        },
+        Some(&token),
+    )
+    .await
+    .expect("link_epistemic as the caller");
+    let link = uuid_field(&common::first_text(&out), "edge_id");
+    assert_server_not_caller(&pool, link, caller, "caller link_epistemic").await;
+}
+
+/// ingest_document by an authenticated caller: the ingested claims are
+/// authored by the caller, every edge the walk wrote is signed by the server
+/// (not the caller), and verify_claim reports a caller-authored, server-signed
+/// claim valid (author != signer, through the shared admission rule).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_callers_ingest_is_signed_by_the_server_not_the_caller(pool: PgPool) {
+    let server = server(&pool).await;
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let (caller, token, viewer) =
+        common::seed_caller(&pool, &["claims:read", "claims:write"]).await;
+    epigraph_mcp::tools::ingestion::do_ingest_document(
+        &server,
+        &viewer,
+        &extraction("caller"),
+        Some(&token),
+    )
+    .await
+    .expect("document ingests as the caller");
+
+    let ingested: Vec<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id, agent_id, signer_id FROM claims WHERE content LIKE 'dae795f8 caller:%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("ingested claims");
+    assert!(!ingested.is_empty(), "nothing ingested");
+    for (id, author, signer) in &ingested {
+        assert_eq!(*author, caller, "claim {id} is not caller-authored");
+        assert_eq!(*signer, Some(server_agent), "claim {id}'s signer");
+    }
+    let edges: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM edges ORDER BY created_at, id")
+        .fetch_all(&pool)
+        .await
+        .expect("edges");
+    assert!(!edges.is_empty(), "the walk wrote no edge");
+    for e in edges {
+        assert_server_not_caller(&pool, e, caller, "caller ingest_document").await;
+    }
+
+    let out = epigraph_mcp::tools::claims::verify_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::VerifyClaimParams {
+            claim_id: ingested[0].0.to_string(),
+        },
+    )
+    .await
+    .expect("verify_claim");
+    let resp = common::first_text(&out);
+    assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
 }
