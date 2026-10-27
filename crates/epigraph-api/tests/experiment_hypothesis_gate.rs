@@ -1,7 +1,9 @@
 #![cfg(feature = "db")]
 //! Every experiment route gates on the HYPOTHESIS claim through the caller's
-//! viewer (operator ruling R-51, follow-up of backlog 4815dcf7), and the
-//! analyze route requires `claims:write` (R-52).
+//! viewer (operator ruling R-51, follow-up of backlog 4815dcf7), the analyze
+//! route requires `claims:write` (R-52), and so does every other experiment
+//! write route and `POST /api/v1/methods` (R-52a), checked before anything is
+//! read.
 //!
 //! An experiment, its results and their analyses carry no tenancy of their
 //! own; what they belong to is the hypothesis they test. So:
@@ -860,4 +862,242 @@ async fn listing_experiments_needs_the_hypothesis_readable() {
             .collect();
         assert_eq!(ids, vec![experiment.to_string()], "calibration: {body}");
     }
+}
+
+// ── R-52a: every experiment write route requires `claims:write` ───────────
+//
+// Each arm sends a `claims:read` token for three callers whose refusal would
+// differ if the hypothesis gate ran first: the owner (the gate admits it), a
+// `reader` member (the gate answers `403 not_owner`) and a stranger (the gate
+// answers 404). All three must get the same scope refusal, so the scope is
+// checked before the hypothesis is read and a read-only token learns nothing
+// about it. The footprint is unchanged after the refusals, and the same owner
+// with `claims:write` then writes.
+
+const READ_ONLY: &[&str] = &["claims:read"];
+
+/// The refusal is the scope check: `403 Forbidden` naming `claims:write`, not
+/// the hypothesis gate's `not_owner` and not its 404.
+fn assert_scope_refusal(status: u16, body: &serde_json::Value, what: &str) {
+    assert_eq!(
+        status, 403,
+        "{what}: a token without claims:write must be refused 403, got {status} {body}"
+    );
+    assert_eq!(
+        body["error"], "Forbidden",
+        "{what}: the 403 is the scope check, not the hypothesis write gate: {body}"
+    );
+    assert!(
+        body.to_string().contains("claims:write"),
+        "{what}: the refusal names the missing scope: {body}"
+    );
+}
+
+/// Send `call` for the owner, the reader and the stranger with a read-only
+/// token; each must be the scope refusal, with one body for all three.
+async fn assert_read_only_refused<F, Fut>(w: &World, what: &str, call: F)
+where
+    F: Fn(Uuid) -> Fut,
+    Fut: std::future::Future<Output = (u16, serde_json::Value)>,
+{
+    let mut bodies = Vec::new();
+    for (agent, who) in [
+        (w.owner, "the owner"),
+        (w.reader, "a reader member"),
+        (w.stranger, "a stranger"),
+    ] {
+        let (status, body) = call(agent).await;
+        assert_scope_refusal(status, &body, &format!("{what}, by {who}"));
+        bodies.push(body);
+    }
+    assert!(
+        bodies.windows(2).all(|p| p[0] == p[1]),
+        "{what}: the scope refusal must not depend on the caller's access to the hypothesis: \
+         {bodies:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creating_an_experiment_requires_the_claims_write_scope() {
+    let w = world("r52a-new").await;
+    let create = |agent: Uuid, scopes: &'static [&'static str]| {
+        post(
+            w.addr,
+            agent,
+            scopes,
+            "/api/v1/experiments/new".to_string(),
+            serde_json::json!({ "hypothesis_id": w.hypothesis, "agent_id": agent }),
+        )
+    };
+
+    assert_read_only_refused(&w, "new", |agent| create(agent, READ_ONLY)).await;
+    assert_eq!(
+        experiments_on(&w.pool, w.hypothesis).await,
+        0,
+        "a refused create must record no experiment"
+    );
+
+    let (status, body) = create(w.owner, RW).await;
+    assert_eq!(
+        status, 200,
+        "calibration: the same owner with claims:write: {body}"
+    );
+    assert_eq!(experiments_on(&w.pool, w.hypothesis).await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_an_experiment_requires_the_claims_write_scope() {
+    let w = world("r52a-start").await;
+    let (experiment, _) = seed_experiment(&w.pool, w.hypothesis, w.owner, "designed").await;
+    let start = |agent: Uuid, scopes: &'static [&'static str]| {
+        post(
+            w.addr,
+            agent,
+            scopes,
+            format!("/api/v1/experiments/{experiment}/start"),
+            serde_json::json!({}),
+        )
+    };
+
+    assert_read_only_refused(&w, "start", |agent| start(agent, READ_ONLY)).await;
+    assert_eq!(
+        experiment_status(&w.pool, experiment).await,
+        "designed",
+        "a refused start must not change the experiment"
+    );
+
+    let (status, body) = start(w.owner, RW).await;
+    assert_eq!(
+        status, 200,
+        "calibration: the same owner with claims:write: {body}"
+    );
+    assert_eq!(experiment_status(&w.pool, experiment).await, "running");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submitting_results_requires_the_claims_write_scope() {
+    let w = world("r52a-results").await;
+    let (experiment, _) = seed_experiment(&w.pool, w.hypothesis, w.owner, "running").await;
+    let submit = |agent: Uuid, scopes: &'static [&'static str]| {
+        post(
+            w.addr,
+            agent,
+            scopes,
+            format!("/api/v1/experiments/{experiment}/results"),
+            serde_json::json!({
+                "data_source": "instrument",
+                "measurements": [{"value": 1.0, "random_error": 0.1}],
+            }),
+        )
+    };
+
+    assert_read_only_refused(&w, "results", |agent| submit(agent, READ_ONLY)).await;
+    assert_eq!(
+        (
+            results_of(&w.pool, experiment).await,
+            experiment_status(&w.pool, experiment).await
+        ),
+        (1, "running".to_string()),
+        "a refused submit must record no result and change no status"
+    );
+
+    let (status, body) = submit(w.owner, RW).await;
+    assert_eq!(
+        status, 200,
+        "calibration: the same owner with claims:write: {body}"
+    );
+    assert_eq!(results_of(&w.pool, experiment).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_measurements_requires_the_claims_write_scope() {
+    let w = world("r52a-measure").await;
+    let (experiment, result) = seed_experiment(&w.pool, w.hypothesis, w.owner, "collecting").await;
+    let add = |agent: Uuid, scopes: &'static [&'static str]| {
+        post(
+            w.addr,
+            agent,
+            scopes,
+            format!("/api/v1/experiments/{experiment}/results/{result}/measurements"),
+            serde_json::json!({ "measurements": [{"value": 1.0, "random_error": 0.1}] }),
+        )
+    };
+
+    assert_read_only_refused(&w, "measurements", |agent| add(agent, READ_ONLY)).await;
+    assert_eq!(
+        measurement_count(&w.pool, result).await,
+        2,
+        "a refused add must append no measurement"
+    );
+
+    let (status, body) = add(w.owner, RW).await;
+    assert_eq!(
+        status, 200,
+        "calibration: the same owner with claims:write: {body}"
+    );
+    assert_eq!(measurement_count(&w.pool, result).await, 3);
+}
+
+// ── POST /api/v1/methods ──────────────────────────────────────────────────
+
+/// (method rows with `canonical_name`, capability links on them).
+async fn method_footprint(pool: &PgPool, canonical_name: &str) -> (i64, i64) {
+    let methods: i64 = sqlx::query_scalar("SELECT count(*) FROM methods WHERE canonical_name = $1")
+        .bind(canonical_name)
+        .fetch_one(pool)
+        .await
+        .expect("count methods");
+    let links: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM method_capabilities mc JOIN methods m ON m.id = mc.method_id \
+         WHERE m.canonical_name = $1",
+    )
+    .bind(canonical_name)
+    .fetch_one(pool)
+    .await
+    .expect("count capability links");
+    (methods, links)
+}
+
+/// R-52a: adding a method writes the shared method catalog (a method row and
+/// its capability links), so it takes `claims:write` like the experiment
+/// writes. A read-only token is refused and nothing is written; the same agent
+/// with `claims:write` adds the method and its capability.
+#[tokio::test(flavor = "multi_thread")]
+async fn adding_a_method_requires_the_claims_write_scope() {
+    let w = world("r52a-method").await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let name = format!("r52a method {tag}");
+    let canonical = name.to_lowercase().replace(' ', "_");
+    let add = |scopes: &'static [&'static str]| {
+        post(
+            w.addr,
+            w.owner,
+            scopes,
+            "/api/v1/methods".to_string(),
+            serde_json::json!({
+                "name": name,
+                "technique_type": "characterization",
+                "capabilities": [format!("r52a-capability-{tag}")],
+            }),
+        )
+    };
+
+    let (status, body) = add(READ_ONLY).await;
+    assert_scope_refusal(status, &body, "add_method");
+    assert_eq!(
+        method_footprint(&w.pool, &canonical).await,
+        (0, 0),
+        "a refused add_method must write no method and no capability link"
+    );
+
+    let (status, body) = add(RW).await;
+    assert_eq!(
+        status, 200,
+        "calibration: the same agent with claims:write: {body}"
+    );
+    assert_eq!(
+        method_footprint(&w.pool, &canonical).await,
+        (1, 1),
+        "calibration: the method and its capability link land"
+    );
 }
