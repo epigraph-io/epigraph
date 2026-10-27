@@ -1746,9 +1746,9 @@ async fn deprecate_hierarchical_workflow(
         }
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("{TOOL}: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged(format!("{TOOL}: could not commit"), e)
+    })?;
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,

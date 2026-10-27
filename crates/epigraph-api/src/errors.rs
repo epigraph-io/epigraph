@@ -794,6 +794,19 @@ impl From<DbError> for ApiError {
                     message: "A database error occurred".to_string(),
                 }
             }
+            // A repo-authored refusal (backlog e0f0cb68), answered by its
+            // kind (operator ruling R-55). Its message is text the repo layer
+            // wrote for the caller (MCP sends it as written), so it is the
+            // body's reason. A refusal that must not confirm its target
+            // exists is never a `Refused`: such a site returns `NotFound`.
+            DbError::Refused { kind, message } => {
+                tracing::warn!(?kind, detail = %message, "the repository refused the request");
+                match kind {
+                    epigraph_db::RefusalKind::Input => ApiError::BadRequest { message },
+                    epigraph_db::RefusalKind::Authority => ApiError::Forbidden { reason: message },
+                    epigraph_db::RefusalKind::State => ApiError::Conflict { reason: message },
+                }
+            }
             // Fail-closed (elevation plan EL-8): an elevated read that could
             // not be recorded is withheld. A server-side failure, never the
             // caller's; the reason is logged, not sent.
@@ -877,6 +890,59 @@ mod tests {
             other => panic!("23514 must not be a DatabaseError: {other:?}"),
         }
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A repo-authored refusal (`DbError::Refused`, backlog e0f0cb68) is
+    /// answered by its kind (operator ruling R-55): input 400, authority 403,
+    /// state 409, each with the refusal's own words in the body (the repo
+    /// layer authored them for the caller; MCP sends them as written too),
+    /// and each still logged. Before R-55 every kind was the redacted 500.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_repo_refusal_is_answered_by_its_kind_with_its_words() {
+        use epigraph_db::RefusalKind;
+        const ID: &str = "00000000-0000-0000-0000-00000000e0f0";
+        let cases = [
+            (
+                RefusalKind::Input,
+                StatusCode::BAD_REQUEST,
+                "consolidate: duplicate source ids",
+            ),
+            (
+                RefusalKind::Authority,
+                StatusCode::FORBIDDEN,
+                "FA07: canonical 00000000-0000-0000-0000-00000000e0f0 (which this session cannot write) has no binding",
+            ),
+            (
+                RefusalKind::State,
+                StatusCode::CONFLICT,
+                "consolidate: source 00000000-0000-0000-0000-00000000e0f0 is not current",
+            ),
+        ];
+        for (kind, want, message) in cases {
+            let (status, body) = rendered(ApiError::from(DbError::Refused {
+                kind,
+                message: message.to_string(),
+            }))
+            .await;
+            assert_eq!(status, want, "{kind:?}: {body}");
+            assert!(
+                body.contains(message),
+                "{kind:?}: the refusal's words reach the caller: {body}"
+            );
+            assert!(
+                !body.contains("database error occurred"),
+                "{kind:?}: not the redacted database-error body: {body}"
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| l.contains("the repository refused the request") && l.contains(ID))
+                .then_some(())
+                .ok_or_else(|| "no refusal warn line carries the refusal's text".to_string())
+        });
     }
 
     /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its
