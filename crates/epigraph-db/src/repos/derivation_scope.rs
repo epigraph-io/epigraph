@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
 use crate::repos::mass_function::{cached_combination_predicate, ingest_template_predicate};
 use crate::visibility::Viewer;
 
@@ -245,23 +246,30 @@ impl DerivationScopeRepository {
         Ok(q.fetch_all(executor).await?)
     }
 
-    /// Whether `claim_id`, as `viewer` reads it, has a cached belief at all
-    /// (any of `belief`, `plausibility`, `pignistic_prob` set). A claim the
-    /// viewer cannot read has none.
+    /// Whether `claim_id`, as `viewer` reads it, is a NON-compound claim with
+    /// a cached belief (any of `belief`, `plausibility`, `pignistic_prob`
+    /// set): a cache that is a fold of the claim's own BBAs. A compound's
+    /// cache is not (its belief is a query over its leaves, and the cache
+    /// owner rule never refolds it), so it is never a fold cache here. A claim
+    /// the viewer cannot read has none.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
-    pub async fn claim_has_cached_belief<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn claim_has_fold_cache<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
         let sql = viewer.splice(
-            "SELECT EXISTS (SELECT 1 FROM claims c \
-                 WHERE c.id = $1 \
-                   AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
-                        OR c.pignistic_prob IS NOT NULL) \
-                   /* {VISIBILITY:c} */)",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM claims c \
+                     WHERE c.id = $1 \
+                       AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
+                            OR c.pignistic_prob IS NOT NULL) \
+                       AND NOT {compound} \
+                       /* {{VISIBILITY:c}} */)",
+                compound = is_compound_sql("c"),
+            ),
             2,
         );
         let mut q = sqlx::query_scalar(&sql).bind(claim_id);

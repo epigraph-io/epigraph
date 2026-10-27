@@ -68,7 +68,9 @@ pub async fn retain_for_viewer<'e, E: sqlx::PgExecutor<'e>>(
 ///
 /// A claim with an admissible input on any frame is not vacated, and neither
 /// is a claim with no cache: a vacuous value written where there was none
-/// would tell its readers that an unseen BBA exists.
+/// would tell its readers that an unseen BBA exists. Nor is a compound, whose
+/// cache is not a fold of its own BBAs (the cache owner rule never refolds
+/// one either).
 ///
 /// # Errors
 /// `DbError` if a read fails.
@@ -89,5 +91,5 @@ pub async fn must_vacate_cache(
     {
         return Ok(false);
     }
-    DerivationScopeRepository::claim_has_cached_belief(&mut *conn, viewer, claim_id).await
+    DerivationScopeRepository::claim_has_fold_cache(&mut *conn, viewer, claim_id).await
 }
