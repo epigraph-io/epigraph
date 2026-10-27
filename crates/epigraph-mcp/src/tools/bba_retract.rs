@@ -2,8 +2,10 @@
 //! migration 184). The MCP twin of
 //! `POST /api/v1/mass-functions/:id/retract`
 //! (`epigraph-api/src/routes/bba_retract.rs`); both call
-//! `MassFunctionRepository::retract_conn` and recompute the claim's cached
-//! belief on the same transaction.
+//! `MassFunctionRepository::retract_conn` and refresh the claim's cached
+//! belief on the same transaction (`epigraph_engine::bba_retract`: refolded
+//! from the BBAs that remain, or the explicit vacuous value when none does,
+//! ruling R-80).
 //!
 //! The transaction is stamped from the calling agent's own write identity
 //! (`EpiGraphMcpFull::write_identity`: the caller's OAuth agent over HTTP,
@@ -51,6 +53,9 @@ pub struct RetractBbaResponse {
     /// Whether the claim's cached belief was rewritten from the BBAs that
     /// remain.
     pub belief_recomputed: bool,
+    /// Whether the claim's cache was set to the explicit vacuous value
+    /// because no BBA remained to fold (ruling R-80).
+    pub belief_vacated: bool,
     /// Stored scoped beliefs of the BBA's (claim, frame) deleted as stale
     /// (they folded the retracted BBA); 0 on a repeat.
     pub scoped_beliefs_cleared: i64,
@@ -78,6 +83,9 @@ pub async fn retract_bba(
     let author = server.write_identity(auth, viewer).await?;
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, author, "retract_bba").await?;
+    let before = epigraph_engine::bba_retract::RetractCacheBefore::read(&mut tx, viewer, id)
+        .await
+        .map_err(internal_error)?;
     let out = MassFunctionRepository::retract_conn(&mut tx, id, &params.reason, admin)
         .await
         .map_err(|e| match e {
@@ -88,12 +96,17 @@ pub async fn retract_bba(
             BbaRetractError::InvalidReason(reason) => invalid_params(reason),
             BbaRetractError::Db(e) => internal_error(e),
         })?;
-    let belief_recomputed = if out.status == BbaRetractStatus::Retracted {
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut tx, viewer, out.claim_id)
-            .await
-            .map_err(internal_error)?
+    let cache = if out.status == BbaRetractStatus::Retracted {
+        epigraph_engine::bba_retract::refresh_cache_after_retract(
+            &mut tx,
+            viewer,
+            out.claim_id,
+            before,
+        )
+        .await
+        .map_err(internal_error)?
     } else {
-        false
+        epigraph_engine::bba_retract::RetractCacheOutcome::default()
     };
     tx.commit().await.map_err(internal_error)?;
 
@@ -106,7 +119,8 @@ pub async fn retract_bba(
         retracted_at: out.retracted_at,
         retracted_by: out.retracted_by,
         retract_reason: out.retract_reason,
-        belief_recomputed,
+        belief_recomputed: cache.recomputed,
+        belief_vacated: cache.vacated,
         scoped_beliefs_cleared: out.scoped_beliefs_cleared,
     };
     Ok(CallToolResult::success(vec![ContentBlock::text(

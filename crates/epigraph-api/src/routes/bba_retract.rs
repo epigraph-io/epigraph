@@ -20,9 +20,11 @@
 //!
 //! After a first retraction the claim's cached belief is recomputed on the
 //! same transaction from the BBAs that remain (`belief_recomputed` says
-//! whether a cache was written), and the stored scoped beliefs of the BBA's
-//! (claim, frame) are deleted as stale (`scoped_beliefs_cleared`). The MCP twin is `retract_bba`
-//! (`epigraph-mcp/src/tools/bba_retract.rs`).
+//! whether a cache was written); when none remains, the cache becomes the
+//! explicit vacuous value (ruling R-80, `belief_vacated`;
+//! `epigraph_engine::bba_retract`). The stored scoped beliefs that folded the
+//! BBA are deleted as stale (`scoped_beliefs_cleared`). The MCP twin is
+//! `retract_bba` (`epigraph-mcp/src/tools/bba_retract.rs`).
 
 use axum::{
     extract::{Path, State},
@@ -59,6 +61,10 @@ pub struct RetractBbaResponse {
     /// Whether the claim's cached belief was rewritten from the BBAs that
     /// remain. `false` on a repeat, and when no remaining BBA owns the cache.
     pub belief_recomputed: bool,
+    /// Whether the claim's cache was set to the explicit vacuous value
+    /// (Bel 0, Pl 1, BetP 0.5, `not_enough_info`) because no BBA remained to
+    /// fold (ruling R-80). `false` on a repeat.
+    pub belief_vacated: bool,
     /// Stored scoped beliefs of the BBA's (claim, frame) deleted as stale
     /// (they folded the retracted BBA); 0 on a repeat.
     pub scoped_beliefs_cleared: i64,
@@ -93,6 +99,11 @@ pub async fn retract_bba(
         });
 
     let mut tx = state.write_as(&viewer, "retract_bba").await?;
+    let before = epigraph_engine::bba_retract::RetractCacheBefore::read(&mut tx, &viewer, id)
+        .await
+        .map_err(|message| ApiError::InternalError {
+            message: format!("read before retraction: {message}"),
+        })?;
     let out = MassFunctionRepository::retract_conn(&mut tx, id, &body.reason, admin)
         .await
         .map_err(|e| match e {
@@ -109,14 +120,19 @@ pub async fn retract_bba(
                 message: e.to_string(),
             },
         })?;
-    let belief_recomputed = if out.status == BbaRetractStatus::Retracted {
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut tx, &viewer, out.claim_id)
-            .await
-            .map_err(|message| ApiError::InternalError {
-                message: format!("recompute after retraction: {message}"),
-            })?
+    let cache = if out.status == BbaRetractStatus::Retracted {
+        epigraph_engine::bba_retract::refresh_cache_after_retract(
+            &mut tx,
+            &viewer,
+            out.claim_id,
+            before,
+        )
+        .await
+        .map_err(|message| ApiError::InternalError {
+            message: format!("recompute after retraction: {message}"),
+        })?
     } else {
-        false
+        epigraph_engine::bba_retract::RetractCacheOutcome::default()
     };
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit transaction: {e}"),
@@ -131,7 +147,8 @@ pub async fn retract_bba(
         retracted_at: out.retracted_at,
         retracted_by: out.retracted_by,
         retract_reason: out.retract_reason,
-        belief_recomputed,
+        belief_recomputed: cache.recomputed,
+        belief_vacated: cache.vacated,
         scoped_beliefs_cleared: out.scoped_beliefs_cleared,
     }))
 }

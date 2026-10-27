@@ -21,6 +21,7 @@ pub mod agent_assessment;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
+pub mod bba_retract;
 pub mod belief_gate;
 pub mod belief_modes;
 pub mod belief_profile;
