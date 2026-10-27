@@ -3490,8 +3490,9 @@ async fn migration_179_attached_mode_definers_are_owned_and_granted(pool: PgPool
 /// the role's attached agents lose the group). Keep these fragments when
 /// re-stating it. They are a text tripwire only; each conjunct is pinned by
 /// BEHAVIOUR in `group_role_membership.rs` (the bound role, the window's
-/// start, the copy rule), so a reformatted but equivalent re-statement fails
-/// here and passes there, and a semantically different one fails there.
+/// start, the copy rule, every hop live), so a reformatted but equivalent
+/// re-statement fails here and passes there, and a semantically different
+/// one fails there.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
     let body: Option<String> = sqlx::query_scalar(
@@ -3522,6 +3523,13 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "WHERE root.inherited_from IS NULL",
         "FROM public.agent_prompt_snapshots s",
         "(SELECT count(*) FROM folders) = 1",
+        // A detach (or a closed window) anywhere in the copy chain, the root
+        // included, revokes what was copied through it: every hop is live
+        // at `p_at`. Losing it lets a successor keep the group after the
+        // operator detached the identity it was copied from.
+        "hop.detached_at IS NULL",
+        "hop.valid_from <= p_at",
+        "(hop.valid_to IS NULL OR p_at < hop.valid_to)",
     ] {
         assert!(
             body.contains(fragment),

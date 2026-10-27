@@ -31,16 +31,21 @@
 --     lineage follow; `inherited_from` set) counts only when P runs in ONE
 --     group folder (`agent_prompt_snapshots`), and that folder is one that
 --     the identity the operator attached runs in: the agent of the ROOT row
---     of the `inherited_from` chain (the operator's own attachment).
+--     of the `inherited_from` chain (the operator's own attachment);
+--   * and, for a copy, EVERY row of its `inherited_from` chain, the root
+--     included, is live at t (not detached, `valid_from <= t < valid_to`):
+--     a copy never outlives any row it was copied through.
 -- So a successor in the same folder (a prompt or model change of the job
--- the operator attached) keeps the group; and these admit nothing, although
--- 166 attaches them all (an attachment there only ever refuses):
+-- the operator attached) keeps the group while the operator's attachment
+-- stands; and these admit nothing, although 166 attaches them all (an
+-- attachment there only ever refuses):
 --   * a SHARED successor: an identity that also runs in another group folder
 --     (a fleet container of the same human registered as a successor; 166
 --     flags it `shared_identity`), now or at any later registration;
 --   * a successor registered in a DIFFERENT folder than the attached
 --     identity's, shared or not;
---   * any later copy of such a copy outside the attached identity's folder.
+--   * any later copy of such a copy outside the attached identity's folder;
+--   * any copy once a row of its chain is detached or past its window.
 -- The folder test reads every snapshot P has, at any time (not only up to
 -- t): a successor that once ran elsewhere does not count again.
 --
@@ -70,9 +75,25 @@
 -- for a binding in the attached mode; the copy rule above is what bounds it.
 -- 166's registration and lineage follow are not changed: every copy still
 -- refuses (ROL01) as 166 says; only which copies also grant is decided here.
--- A DETACH does not follow the lineage (166): to take the group from a
--- whole lineage, detach every attached identity of it (each copy included),
--- or end the binding.
+--
+-- A DETACH REVOKES THE LINEAGE'S GRANT. 166 does not detach the copies (a
+-- copy only refuses there), so this mode reads the chain instead: a copy
+-- counts only while every row it was copied through, the operator's own
+-- attachment included, is un-detached and inside its window at t. A detached
+-- hop counts at no instant, exactly as a detached row of the agent's own
+-- does. So detaching the identity the operator attached takes the group from
+-- every successor copied from it, at once, with no job; detaching a middle
+-- identity takes it from the copies below that one. A REVERT (the job goes
+-- back to an earlier prompt or model, so the host registers the earlier,
+-- detached identity again with its successor as the parent) regains nothing:
+-- whatever the registration copies back onto it runs through its own
+-- detached row.
+-- The copies stay un-detached (they still refuse under ROL01), and that has
+-- one consequence: RE-ATTACHING the root afterwards does not bring a
+-- successor back while its old copy still covers the window, because 166's
+-- lineage follow copies only into gaps. To restore the job, detach the
+-- running identity's old copy and attach that identity itself (or end the
+-- binding and bind anew).
 --
 -- ===================================================================
 -- 2. WHERE THE RULE LIVES
@@ -136,8 +157,8 @@
 --   * `role_agents` grants nothing outside this mode: an attachment admits
 --     an agent to a group only through a binding in this mode, only while
 --     the agent's own human holds the role, and a succession copy only under
---     the folder rule (section 1). Under 165's modes and in 166's ROL01 it
---     still only refuses.
+--     the folder rule and while its whole chain is live (section 1). Under
+--     165's modes and in 166's ROL01 it still only refuses.
 --   * 166's ROL01 write refusal, its may-run question and its registration
 --     copy are untouched.
 --   * The membership door (122's `epigraph_operator_writes_group`) stays
@@ -389,7 +410,9 @@ REVOKE EXECUTE ON FUNCTION
 -- maintenance-owned definer frame; under any other owner they read no row
 -- and the arm admits nobody (fail-closed). The copy chain is acyclic (166's
 -- guard refuses an `inherited_from` that does not exist yet, so a row never
--- names itself); UNION stops the walk regardless.
+-- names itself); UNION stops the walk regardless. The walk follows only hops
+-- that are live at `p_at`, so a detached or closed hop ends it before the
+-- root, and a copy whose root is not reached counts for nothing.
 -- -------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.epigraph_role_derived_memberships(
     p_agent uuid, p_at timestamptz)
@@ -417,7 +440,9 @@ SET search_path = public, pg_temp AS $$
             -- group folder, and that folder is one the identity the operator
             -- attached (the root of the copy chain) runs in: a shared
             -- successor, a successor in another folder and a copy of their
-            -- copies admit nothing (section 1).
+            -- copies admit nothing (section 1). Every row of the copy
+            -- chain, the root included, must be live at `p_at`: a detach
+            -- anywhere above a copy revokes it.
             OR (b.attached_agents
                 AND EXISTS (SELECT 1 FROM public.role_agents ra
                              WHERE ra.agent_id = p_agent AND ra.role = b.role
@@ -426,14 +451,26 @@ SET search_path = public, pg_temp AS $$
                                AND (ra.valid_to IS NULL OR p_at < ra.valid_to)
                                AND (ra.inherited_from IS NULL
                                     OR EXISTS (
+                                        -- Every hop must be live at `p_at`
+                                        -- (not detached, inside its window),
+                                        -- the root included: a dead hop ends
+                                        -- the walk before the root, and a
+                                        -- walk that reaches no root admits
+                                        -- nothing.
                                         WITH RECURSIVE chain (id, agent_id, inherited_from) AS (
-                                            SELECT r.id, r.agent_id, r.inherited_from
-                                              FROM public.role_agents r
-                                             WHERE r.id = ra.inherited_from
+                                            SELECT hop.id, hop.agent_id, hop.inherited_from
+                                              FROM public.role_agents hop
+                                             WHERE hop.id = ra.inherited_from
+                                               AND hop.detached_at IS NULL
+                                               AND hop.valid_from <= p_at
+                                               AND (hop.valid_to IS NULL OR p_at < hop.valid_to)
                                             UNION
-                                            SELECT r.id, r.agent_id, r.inherited_from
-                                              FROM public.role_agents r
-                                              JOIN chain ch ON r.id = ch.inherited_from
+                                            SELECT hop.id, hop.agent_id, hop.inherited_from
+                                              FROM public.role_agents hop
+                                              JOIN chain ch ON hop.id = ch.inherited_from
+                                             WHERE hop.detached_at IS NULL
+                                               AND hop.valid_from <= p_at
+                                               AND (hop.valid_to IS NULL OR p_at < hop.valid_to)
                                         ),
                                         folders AS (
                                             SELECT DISTINCT s.group_folder
