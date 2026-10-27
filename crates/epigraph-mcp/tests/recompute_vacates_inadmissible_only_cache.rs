@@ -20,6 +20,9 @@
 //!   evidence's group and as the claim's author (row security applies), and
 //!   through the MCP `recompute_beliefs` tool on the maintenance session,
 //!   read back as served by MCP `get_belief` and `get_claim`;
+//! * the write-free preview (`preview_claim_belief_on_frame`, behind
+//!   `recompute_betp --dry-run`, `shadow_report`, MCP `submit_ds_evidence`
+//!   and REST `submit_evidence`) returns the value the write leaves;
 //! * a GROUP claim whose evidence moves to another group is vacated, read
 //!   by a member of the claim's group (the R-80 reads are viewer-spliced);
 //! * the claim-wide gate: an admissible input on ANOTHER frame of the claim
@@ -40,8 +43,8 @@ use epigraph_crypto::AgentSigner;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
-    ensure_binary_frame, recompute_claim_belief_on_frame, recompute_claim_cached_belief,
-    resolve_claim_validity_frame,
+    ensure_binary_frame, preview_claim_belief_on_frame, recompute_claim_belief_on_frame,
+    recompute_claim_cached_belief, resolve_claim_validity_frame,
 };
 use epigraph_mcp::types::{GetBeliefParams, GetClaimParams, RecomputeBeliefsParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -287,6 +290,40 @@ async fn a_claim_whose_every_bba_is_inadmissible_gets_a_vacuous_cache_on_recompu
     let w = world(&pool, "r80-vacate").await;
     let (claim, stale) = stale_claim(&pool, &w, "r80 every bba inadmissible").await;
     let scoped = app_role(&pool).await;
+
+    // The write-free preview a dry run reads (`recompute_betp --dry-run`,
+    // `shadow_report`) reports the value the write is about to leave, not
+    // "no input".
+    {
+        let mut tx = scoped
+            .begin_as(&w.member_viewer)
+            .await
+            .expect("stamped app session");
+        let preview = preview_claim_belief_on_frame(&mut tx, &w.member_viewer, claim, w.binary)
+            .await
+            .expect("preview on the application role");
+        tx.rollback().await.expect("rollback");
+        let p = preview.unwrap_or_else(|| {
+            panic!(
+                "the preview of a claim whose recompute vacates its cache said there is \
+                 nothing to write (stale value {stale:?})"
+            )
+        });
+        assert!(
+            near(Some(p.pignistic_prob), 0.5)
+                && near(Some(p.belief), 0.0)
+                && near(Some(p.plausibility), 1.0)
+                && near(Some(p.conflict_k), 0.0)
+                && near(Some(p.missing_mass), 0.0)
+                && p.classification.as_deref() == Some("not_enough_info"),
+            "the preview must be the full-ignorance value the write leaves: {p:?}"
+        );
+        assert_eq!(
+            cache(&pool, claim).await,
+            stale,
+            "the preview wrote nothing"
+        );
+    }
 
     // The member can read the hidden evidence; the author cannot. Neither may
     // leave the claim's readers a belief folded from it.

@@ -483,9 +483,10 @@ pub async fn recompute_claim_belief_on_frame(
 }
 
 /// Write-free variant of [`recompute_claim_belief_on_frame`]: loads the frame
-/// and every BBA on (claim, frame), runs the identical discount+combine
-/// pipeline as [`recompute_combined_belief`], and returns the resulting
-/// scalars instead of writing them to `claims`.
+/// and every BBA on (claim, frame), runs the identical pipeline as
+/// [`recompute_combined_belief`] (the same [`compute_combined_belief`],
+/// ruling R-80's vacate included), and returns the resulting scalars instead
+/// of writing them to `claims`.
 ///
 /// Added for `epigraph-cli/src/bin/recompute_betp.rs`'s `--dry-run` mode: it
 /// needs to show "recomputed value if we wrote it" without mutating state.
@@ -497,7 +498,10 @@ pub async fn recompute_claim_belief_on_frame(
 /// the only reliable way to preview without a DB side effect.
 ///
 /// Returns `Ok(None)` if the claim has no BBAs on `frame_id` (mirrors
-/// `recompute_claim_belief_on_frame`'s `Ok(false)`).
+/// `recompute_claim_belief_on_frame`'s `Ok(false)`), or when a real run would
+/// leave the cache as it was because the derivation scope rule admits none
+/// of the frame's BBAs and there is nothing to vacate. When a real run would
+/// VACATE the cache (ruling R-80), this returns that full-ignorance value.
 ///
 /// # Errors
 /// Same failure modes as [`recompute_claim_belief_on_frame`].
@@ -513,7 +517,7 @@ pub async fn preview_claim_belief_on_frame(
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    compute_combined_belief(
+    Ok(compute_combined_belief(
         &mut *conn,
         viewer,
         claim_id,
@@ -521,7 +525,8 @@ pub async fn preview_claim_belief_on_frame(
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
     )
-    .await
+    .await?
+    .map(|(preview, _vacated)| preview))
 }
 
 /// [`preview_claim_belief_on_frame`] over the frame's stored rows as `adjust`
@@ -531,7 +536,10 @@ pub async fn preview_claim_belief_on_frame(
 /// Added for `recompute_betp`'s drift decomposition (SPEC §10.4), whose
 /// stages are counterfactual folds of the owner frame: without the ingest
 /// template's rows (2), or with the `evidence_type` a manifest names reset to
-/// its pre-backfill value (1'). `None` when no row is left.
+/// its pre-backfill value (1'). `None` when no row is left, including when
+/// the derivation scope rule admits none of them: a counterfactual fold has
+/// no cache to vacate, so ruling R-80's vacate (which
+/// [`preview_claim_belief_on_frame`] models) does not apply here.
 ///
 /// # Errors
 /// Same failure modes as [`preview_claim_belief_on_frame`].
@@ -991,48 +999,6 @@ pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) ->
         .unwrap_or(0)
 }
 
-/// Pure compute half of the combine pipeline: load every BBA on (claim,
-/// frame), discount + combine, and derive the resulting Bel/Pl/BetP/
-/// conflict/missing scalars (plus the CDST classification label on the
-/// binary frame). Does not touch the database beyond the read-only loads
-/// (`mass_functions`, calibration, per-frame overrides).
-///
-/// Factored out of [`recompute_combined_belief`] so
-/// [`preview_claim_belief_on_frame`] can share the exact same combine
-/// pipeline (same calibration lookups, same reliability derivation, same
-/// classifier) without also performing the `UPDATE claims ...` write —
-/// see that function's doc comment for why a caller-side rolled-back
-/// transaction can't substitute for this split.
-///
-/// `frame_overrides` is the frame's `belief_profile` object, taken from the
-/// frame row the caller already loaded under `viewer` (every caller loads it
-/// before combining and stops when the frame is invisible), so the frame tier
-/// costs no query here and always comes from the same visible row as the
-/// per-frame keys.
-async fn compute_combined_belief(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    frame_id: Uuid,
-    frame: &FrameOfDiscernment,
-    frame_overrides: Option<&serde_json::Value>,
-) -> Result<Option<CombinedBeliefPreview>, String> {
-    let all_rows =
-        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
-            .await
-            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
-    compute_combined_belief_over(
-        conn,
-        viewer,
-        claim_id,
-        frame_id,
-        frame,
-        frame_overrides,
-        all_rows,
-    )
-    .await
-}
-
 /// [`compute_combined_belief`] over the given rows of (claim, frame) instead
 /// of the stored ones, under the same frame tier (`frame_overrides`). `None`
 /// when `all_rows` is empty.
@@ -1263,28 +1229,48 @@ async fn preview_of_combined(
     })
 }
 
-/// Write half of the combine pipeline: run [`compute_combined_belief`] and
-/// persist the result to `claims.{belief, plausibility, pignistic_prob,
-/// conflict_k, missing_mass}` (and `classification` on the binary frame).
-/// No-ops (does not write) when the claim has no BBAs on `frame_id`.
+/// Pure compute half of the combine pipeline: the value a recompute of
+/// (claim, `frame_id`) leaves in the claim's cache, computed without writing
+/// anything. `Some((preview, vacated))`, or `None` when the recompute leaves
+/// the cache as it was. Does not touch the database beyond read-only loads
+/// (`mass_functions`, calibration, per-frame overrides, the derivation scope
+/// reads).
 ///
-/// **Every BBA inadmissible (ruling R-80).** When the frame's BBAs are all
-/// left out of the fold by the derivation scope rule (R-22 / R-71) and
-/// [`crate::derivation_scope::must_vacate_cache`] holds (no admissible input on
-/// ANY frame of the claim, and a cache to replace), the cache is set to full
-/// ignorance on this frame instead of being left as it was: Bel 0, Pl 1, BetP
-/// 1/|frame| (0.5 on the binary frame), no conflict or missing mass, and the
-/// classification that ignorance gets (`not_enough_info`). The old value was
-/// folded from sources narrower than the claim, so keeping it would go on
-/// serving their direction and weight to every reader.
-async fn recompute_combined_belief(
+/// Factored out of [`recompute_combined_belief`], which writes exactly this,
+/// so [`preview_claim_belief_on_frame`] can return it without also performing
+/// the `UPDATE claims ...` write (see that function's doc comment for why a
+/// caller-side rolled-back transaction can't substitute for this split). A
+/// dry run and a real run therefore cannot disagree.
+///
+/// * The frame has BBAs the derivation scope rule admits: their fold
+///   (discount + combine + classifier; `vacated` false).
+/// * **Every BBA inadmissible (ruling R-80).** The frame has BBAs, the
+///   derivation scope rule (R-22 / R-71) leaves none of them in the fold, and
+///   [`crate::derivation_scope::must_vacate_cache`] holds (no admissible input
+///   on ANY frame of the claim, a non-compound claim, and a cache to
+///   replace): full ignorance on this frame (`vacated` true). Bel 0, Pl 1,
+///   BetP 1/|frame| (0.5 on the binary frame), no conflict or missing mass,
+///   and on the binary frame the classification that ignorance gets
+///   (`not_enough_info`). The old value was folded from sources narrower than the
+///   claim, so keeping it would go on serving their direction and weight to
+///   every reader.
+/// * Otherwise (no BBA on the frame, or every BBA inadmissible but the claim
+///   has no cache, is a compound, or has admissible input on another frame):
+///   `None`.
+///
+/// `frame_overrides` is the frame's `belief_profile` object, taken from the
+/// frame row the caller already loaded under `viewer` (every caller loads it
+/// before combining and stops when the frame is invisible), so the frame tier
+/// costs no query here and always comes from the same visible row as the
+/// per-frame keys.
+async fn compute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<Option<(CombinedBeliefPreview, bool)>, String> {
     let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
         .await
         .map_err(|e| format!("get_for_claim_frame: {e}"))?;
@@ -1300,8 +1286,8 @@ async fn recompute_combined_belief(
     )
     .await?;
     // `None` with input on the frame: the scope rule left none of it.
-    let (preview, vacated) = match folded {
-        Some(preview) => (preview, false),
+    match folded {
+        Some(preview) => Ok(Some((preview, false))),
         None if had_input
             && crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id)
                 .await
@@ -1313,9 +1299,36 @@ async fn recompute_combined_belief(
                 &mut *conn, viewer, claim_id, frame_id, frame, &profile, &ignorance, 0.0, false,
             )
             .await?;
-            (preview, true)
+            Ok(Some((preview, true)))
         }
-        None => return Ok(()),
+        None => Ok(None),
+    }
+}
+
+/// Write half of the combine pipeline: persist what [`compute_combined_belief`]
+/// computes to `claims.{belief, plausibility, pignistic_prob, conflict_k,
+/// missing_mass}` (and `classification` on the binary frame). No-ops (does not
+/// write) when the claim has no BBAs on `frame_id`, or none the scope rule
+/// admits and nothing to vacate.
+async fn recompute_combined_belief(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some((preview, vacated)) = compute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        frame_overrides,
+    )
+    .await?
+    else {
+        return Ok(());
     };
 
     let written = MassFunctionRepository::update_claim_belief(
