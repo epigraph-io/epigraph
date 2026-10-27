@@ -1720,8 +1720,13 @@ restart.
   successor registered in another folder, and copies of their copies admit
   nothing. This overturns 166's "a copy never grants" premise for this mode
   only; 166 itself is unchanged (every copy still refuses under `ROL01`). A
-  detach does not follow the lineage: to take the group from a lineage,
-  detach each attached identity in it, or end the binding. Re-states `epigraph_role_derived_memberships` (165's body
+  copy also counts only while EVERY row of its `inherited_from` chain, the
+  root included, is un-detached and inside its window: detaching the
+  attached identity revokes every successor copied from it, and a revert to
+  a detached identity (registered again with its successor as parent)
+  regains nothing. Re-attaching the root does not bring back a successor
+  whose old copy still covers the window (166 copies into gaps only): detach
+  that copy and attach the running identity itself. Re-states `epigraph_role_derived_memberships` (165's body
   plus the attached arm; the viewer set, the writer scope and the roster all
   ask it, none is re-stated), `epigraph_group_role_bindings_guard_update`
   (the mode joins the immutable tuple) and `epigraph_group_role_bindings_audit`
