@@ -10,6 +10,10 @@
 //! Every route gates on the HYPOTHESIS claim through the caller's viewer
 //! (operator ruling R-51): reads need it readable, writes need it writable,
 //! and a hypothesis the caller cannot read is the same 404 as a missing one.
+//!
+//! Every WRITE route also requires the `claims:write` scope (R-52, extended to
+//! all of them by R-52a), checked before the hypothesis is read so a token
+//! without it learns nothing about the hypothesis.
 
 #[cfg(feature = "db")]
 use axum::{
@@ -68,6 +72,22 @@ pub struct AnalyzeRequest {
 // or writes anything else. A read needs the hypothesis readable; a write needs
 // it writable (its owning group in the caller's writable set). A hypothesis the
 // caller cannot read is the same 404 as a missing one, on every route.
+
+/// The scope every experiment write takes (operator rulings R-52, R-52a):
+/// `claims:write`, checked before the hypothesis is read, so a token without
+/// it gets the same refusal whatever the hypothesis.
+#[cfg(feature = "db")]
+fn require_write_scope(
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    route: &str,
+) -> Result<(), ApiError> {
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: format!("{route} requires authentication"),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])
+}
 
 /// What a route does with the hypothesis it reaches.
 #[cfg(feature = "db")]
@@ -184,8 +204,10 @@ async fn require_experiment_hypothesis(
 pub async fn create_experiment(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<CreateExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_write_scope(auth_ctx, "POST /api/v1/experiments/new")?;
     require_hypothesis(
         &state,
         &viewer,
@@ -231,8 +253,10 @@ pub async fn create_experiment(
 pub async fn start_experiment(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_write_scope(auth_ctx, "POST /api/v1/experiments/:id/start")?;
     require_experiment_hypothesis(
         &state,
         &viewer,
@@ -257,9 +281,11 @@ pub async fn start_experiment(
 pub async fn submit_results(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(experiment_id): Path<Uuid>,
     Json(req): Json<SubmitResultsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_write_scope(auth_ctx, "POST /api/v1/experiments/:id/results")?;
     require_experiment_hypothesis(
         &state,
         &viewer,
@@ -319,9 +345,14 @@ pub async fn submit_results(
 pub async fn add_measurements(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path((experiment_id, result_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<AddMeasurementsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_write_scope(
+        auth_ctx,
+        "POST /api/v1/experiments/:eid/results/:rid/measurements",
+    )?;
     // The two path segments name ONE resource: a result of another experiment
     // is the same 404 as a missing result (R-51), checked with the hypothesis.
     require_experiment_hypothesis(
