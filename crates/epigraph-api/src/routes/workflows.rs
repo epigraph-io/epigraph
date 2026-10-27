@@ -2051,8 +2051,19 @@ pub async fn deprecate_workflow(
 pub async fn record_behavioral_execution(
     Path(workflow_id): Path<Uuid>,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(body): Json<RecordBehavioralExecutionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "record_behavioral_execution requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // Verify the referenced workflow exists
     let _exists = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",

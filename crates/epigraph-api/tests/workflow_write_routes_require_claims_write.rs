@@ -239,3 +239,43 @@ async fn deprecating_a_workflow_requires_the_claims_write_scope(pool: PgPool) {
         "the deprecation retires the workflow"
     );
 }
+
+/// `POST /api/v1/workflows/:id/behavioral-executions` appends a row; a
+/// read-only token appends none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recording_a_behavioral_execution_requires_the_claims_write_scope(pool: PgPool) {
+    let w = world(pool, "scope-behavioral").await;
+    let uri = format!("/api/v1/workflows/{}/behavioral-executions", w.workflow);
+    let body = json!({
+        "goal_text": "scope arm goal",
+        "success": true,
+        "step_beliefs": {},
+        "tool_pattern": ["first step"],
+        "quality": 0.9,
+        "deviation_count": 0,
+        "total_steps": 1,
+    });
+    let before = w.footprint().await;
+
+    w.assert_read_only_refused("behavioral-executions", Method::POST, &uri, Some(&body))
+        .await;
+    assert_eq!(
+        w.footprint().await,
+        before,
+        "a refused record writes no behavioral row"
+    );
+
+    let (status, out) = w
+        .call(Method::POST, &uri, w.owner, READ_WRITE, Some(&body))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the same owner with claims:write: {out}"
+    );
+    assert_eq!(
+        w.footprint().await.3,
+        before.3 + 1,
+        "the record writes one row"
+    );
+}
