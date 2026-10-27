@@ -1114,6 +1114,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          no rows to filter.",
     ),
     (
+        "evidence.rs",
+        "same_tenancy_duplicate",
+        "READ inside an evidence write's own transaction (migration 171, backlog 12b68201): the \
+         owner and visibility of the row the caller just wrote, an advisory lock, then whether \
+         another row with the same digest, claim, owner AND visibility exists. Private, and the \
+         match is restricted to the tenancy of the row the caller was allowed to write, so it \
+         can only find a row the caller could read; a viewer predicate would add nothing and \
+         must not widen the match. Returns one boolean.",
+    ),
+    (
         "group_key_epoch.rs",
         "create_epoch_conn",
         "WRITE. Creates a key epoch for a group inside the membership/rotation transaction that \
@@ -2659,7 +2669,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "evidence.rs",
         "create",
-        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
+        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged. LATER (migration 171, backlog          12b68201): the parameter is `sqlx::Acquire` rather than an executor, because the INSERT          and the same-tenancy de-duplication after it (`same_tenancy_duplicate`) are one unit, a          transaction on a pool or a savepoint in the caller's transaction; still no viewer, for          the same reason.",
     ),
     (
         "evidence.rs",
@@ -3366,7 +3376,16 @@ fn every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt() {
         // Both spellings of the bound: the explicit generic PR-27 used, and
         // `impl PgExecutor<'_>` in argument position, which is equivalent for a
         // single use and would otherwise slip past a generics-only check.
-        if !(f.generics.contains("PgExecutor") || f.params.contains("PgExecutor")) {
+        //
+        // And `sqlx::Acquire`, which accepts a `&mut PgConnection` (and a
+        // `&PgPool`) the same way: `EvidenceRepository::create` takes it so its
+        // write and the de-duplication after it run in one transaction or
+        // savepoint (migration 171). Same capability, same rule.
+        if !(f.generics.contains("PgExecutor")
+            || f.params.contains("PgExecutor")
+            || f.generics.contains("Acquire<")
+            || f.params.contains("Acquire<"))
+        {
             continue;
         }
         if f.params.contains("Viewer") {

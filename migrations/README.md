@@ -1778,6 +1778,38 @@ restart.
   the four triggers and the function. **Deploy order:** after 168; independent
   of the binaries. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **171**: public `evidence_dedup_in_application` (backlog 12b68201,
+  operator ruling R-77). `ALTER TABLE evidence DROP CONSTRAINT IF EXISTS
+  evidence_content_hash_claim_unique`, 001's `UNIQUE (content_hash,
+  claim_id)`, so every database matches the long-lived one, which never
+  carried it (only `evidence_pkey`) and holds same-owner duplicate rows. The
+  key spanned owners: an evidence write whose body equalled a row another
+  group holds on the same claim was refused, and the refusal confirmed that
+  unreadable row and its content. The de-duplication is now the
+  application's, as 150 did for claims: `EvidenceRepository` writes the row,
+  reads back its owner and visibility, takes a transaction-scoped advisory
+  lock on `(content_hash, claim_id, owner)` and refuses (`DuplicateKey`, a
+  savepoint undoes the write) only a row with the same digest, claim, owner
+  and visibility; another owner's body is never consulted. A no-op on the
+  long-lived database; cannot fail on data (it builds no index). A closing DO
+  block refuses (`55000`) if any unique index on `evidence` still covers both
+  columns. Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/evidence_dedup_per_owner.rs` (including the race and
+  `migrated_evidence_carries_no_unique_key_over_body_and_claim`),
+  `epigraph-api/tests/evidence_content_oracle_test.rs` and
+  `epigraph-mcp/tests/evidence_content_oracle_app_role.rs`. Slot 171 assigned
+  by the bug-wave plan; free on `main` and in every open PR when committed.
+  **Deploy order:** the matching binaries FIRST (the epigraph-api server,
+  with the hosted jobs it runs, and epigraph-mcp), then 171. Against 171 an
+  older binary's `ON CONFLICT (content_hash, claim_id)` in
+  `record_derivation_conn` fails 42P10 (as it already does on any database
+  without the key), and its other evidence writes are not de-duplicated at
+  all (an identical retry adds a row, as on the long-lived database today).
+  The new binaries work on either side, but while a database still has the
+  key a write that collides with another owner's row is still refused: the
+  cross-owner refusal ends when 171 applies, not when the binary ships.
+  Undo is in the file's header.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 - **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
   Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
   pg_catalog, pg_temp` (was `pg_catalog, public`) and its `unnest(` and
