@@ -320,6 +320,12 @@ pub struct AppState {
     /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
     #[cfg(feature = "db")]
     pub run_tokens: epigraph_db::RunTokens,
+    /// The LLM models the run-token grant may mint for
+    /// (`crate::oauth::run_token`). EMPTY in every constructor, which refuses
+    /// every mint; `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKEN_MODELS` at
+    /// boot.
+    #[cfg(feature = "db")]
+    pub run_token_models: crate::oauth::run_token::RunTokenModels,
     /// Whether `POST /api/v1/bp/propagate` may WRITE its results
     /// (`apply_updates: true`). OFF in every constructor; `bin/server.rs` sets
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
@@ -1165,6 +1171,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1246,6 +1254,18 @@ impl AppState {
     #[must_use]
     pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
         self.run_tokens = run_tokens;
+        self
+    }
+
+    /// Set the models the run-token grant may mint for; see
+    /// [`Self::run_token_models`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_run_token_models(
+        mut self,
+        models: crate::oauth::run_token::RunTokenModels,
+    ) -> Self {
+        self.run_token_models = models;
         self
     }
 
@@ -1546,6 +1566,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1617,6 +1639,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
