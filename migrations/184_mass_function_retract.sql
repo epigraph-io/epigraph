@@ -62,14 +62,26 @@
 -- used, the reason, and `before` (the full row as `to_jsonb`).
 --
 -- A first retraction also DELETES the stored scoped beliefs of the row's
--- (claim, frame) in `ds_combined_beliefs` (global, perspective and community
--- scopes, written by `POST /frames/:id/evidence` and `/claims/:id/assess`):
--- they are folds that included the retracted row, and the scoped-belief reads
--- serve them as stored. No row is better than a stale one; the next evidence
--- write on that (claim, frame) stores fresh ones. The count is in the audit
--- row and the return value (`scoped_beliefs_cleared`). This is why the file
--- grants `epigraph_maintenance` DELETE on `ds_combined_beliefs` (the
--- definer's owner; 115's restrictive DELETE policy admits its frame).
+-- (claim, frame) in `ds_combined_beliefs` (written by `POST
+-- /frames/:id/evidence` and `/claims/:id/assess`) that FOLDED the retracted
+-- row, and only those: the global scope, the perspective scope of the row's
+-- own `perspective_id`, and each community scope whose community counts that
+-- perspective as a member (a community's `override` row is its own
+-- assessment, not a fold of members, and stays). The scoped-belief reads
+-- serve those rows as stored; no row is better than a stale one, and the next
+-- evidence write on that (claim, frame) stores fresh ones. A perspective or
+-- community that never included the row keeps its stored fold. The count is
+-- in the audit row and the return value (`scoped_beliefs_cleared`).
+--
+-- EFFECTIVE REACH. That DELETE is why this file grants `epigraph_maintenance`
+-- DELETE on `ds_combined_beliefs` (the definer's owner; 115's restrictive
+-- DELETE policy admits its frame). The grant is on the role, not on the
+-- definer: any session that acts as `epigraph_maintenance` (jobs, scripts and
+-- logins on the maintenance DSN) can now DELETE any `ds_combined_beliefs` row.
+-- Those rows are derived caches (each is rewritten by the next evidence write
+-- that recomputes its scope), so the loss such a delete can cause is a stored
+-- scoped belief served as absent until then. No application role
+-- gains anything: `epigraph_app` holds no DELETE on the table.
 --
 -- The caller recomputes the claim's cached belief afterwards, on the same
 -- transaction (the HTTP route and the MCP tool both do).
@@ -220,8 +232,18 @@ BEGIN
      WHERE id = p_id
     RETURNING retracted_at INTO v_at;
 
+    -- Only the stored folds that included this row: the global scope, its
+    -- own perspective's, and each community counting that perspective (not
+    -- a community's mass override, which folds no member row).
     DELETE FROM public.ds_combined_beliefs d
-     WHERE d.claim_id = v_row.claim_id AND d.frame_id = v_row.frame_id;
+     WHERE d.claim_id = v_row.claim_id AND d.frame_id = v_row.frame_id
+       AND (d.scope_type = 'global'
+            OR (d.scope_type = 'perspective' AND d.scope_id = v_row.perspective_id)
+            OR (d.scope_type = 'community'
+                AND COALESCE(d.strategy_used, '') <> 'override'
+                AND d.scope_id IN (SELECT cm.community_id
+                                     FROM public.community_members cm
+                                    WHERE cm.perspective_id = v_row.perspective_id)));
     GET DIAGNOSTICS v_scoped = ROW_COUNT;
 
     INSERT INTO public.security_events (event_type, agent_id, success, details, correlation_id)
