@@ -35,7 +35,9 @@ use common::*;
 
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
-use epigraph_mcp::types::{BatchSubmitClaimsParams, MemorizeParams, SubmitClaimParams};
+use epigraph_mcp::types::{
+    BatchSubmitClaimsParams, MemorizeParams, QueryClaimsByLabelParams, SubmitClaimParams,
+};
 use epigraph_mcp::{tools, EpiGraphMcpFull};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -138,6 +140,39 @@ fn submit(content: &str, labels: &[&str]) -> SubmitClaimParams {
     }
 }
 
+/// The ids `query_claims_by_label([label])` returns: the read the scheduled
+/// writers use to rebuild their roster of completed cycles.
+async fn roster_ids(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    label: &str,
+) -> Vec<String> {
+    let json = first_text(
+        &tools::paper_queries::query_claims_by_label(
+            server,
+            viewer,
+            QueryClaimsByLabelParams {
+                labels: vec![label.to_string()],
+                exclude_labels: vec![],
+                current_only: false,
+                min_truth: None,
+                limit: Some(50),
+                offset: None,
+                include_source_urls: false,
+                // Legacy bare-array response, as the scheduled writers read it.
+                after: None,
+            },
+        )
+        .await
+        .expect("query_claims_by_label"),
+    );
+    json.as_array()
+        .unwrap_or_else(|| panic!("query_claims_by_label returns an array: {json}"))
+        .iter()
+        .map(|c| c["id"].as_str().expect("claim id").to_string())
+        .collect()
+}
+
 async fn labels_of(pool: &PgPool, id: &str) -> Vec<String> {
     sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
         .bind(Uuid::parse_str(id).expect("claim_id is a uuid"))
@@ -185,6 +220,7 @@ async fn submit_claim_keeps_every_run_of_a_status_labelled_report(pool: PgPool) 
     );
     assert_eq!(w2["claim_id"], w1["claim_id"], "{w2}");
 
+    let mut gen_status_run_ids = None;
     for label in STATUS_LABELS_IN_USE {
         let kind = format!("{label} bucket-aggregators status");
         let labels = [label, "bucket-aggregators"];
@@ -226,7 +262,27 @@ async fn submit_claim_keeps_every_run_of_a_status_labelled_report(pool: PgPool) 
             "`{label}`: the bypass lifts suppression only; the near-duplicate soft-flag stays: \
              {stored:?}"
         );
+        if label == "norcal-rfp-gen-status" {
+            let w1_id = w1["claim_id"].as_str().expect("claim_id").to_string();
+            gen_status_run_ids = Some((w1_id, w2_id.to_string()));
+        }
     }
+
+    // The symptom in 0a97ba24 is a week with "no retrievable status claim":
+    // the generators rebuild their roster with
+    // query_claims_by_label(["norcal-rfp-gen-status"]). Both runs must come
+    // back through that read, not only exist as rows.
+    let (w1_id, w2_id) = gen_status_run_ids.expect("norcal-rfp-gen-status is in the label list");
+    let roster = roster_ids(&server, &viewer, "norcal-rfp-gen-status").await;
+    assert_eq!(
+        roster.len(),
+        2,
+        "the roster read returns exactly the two weekly runs: {roster:?}"
+    );
+    assert!(
+        roster.contains(&w1_id) && roster.contains(&w2_id),
+        "the roster read must return week 1 ({w1_id}) AND week 2 ({w2_id}): {roster:?}"
+    );
 }
 
 /// `memorize`: its tags are its labels, so a status-tagged memory gets the same
@@ -296,6 +352,27 @@ async fn memorize_keeps_every_run_of_a_status_tagged_memory(pool: PgPool) {
         "a status-tagged memory must insert as its own claim: {s2}"
     );
     assert_ne!(s2["claim_id"], s1["claim_id"], "{s2}");
+
+    // memorize wires the gate separately from submit_claim, so pin the full
+    // contract here too: the week-2 row keeps its tag, and the bypass lifts
+    // suppression only (the 0.15 near-duplicate soft-flag still applies).
+    let s1_id = s1["claim_id"].as_str().expect("claim_id").to_string();
+    let s2_id = s2["claim_id"].as_str().expect("claim_id").to_string();
+    let stored = labels_of(&pool, &s2_id).await;
+    assert!(
+        stored.iter().any(|l| l == "norcal-rfp-gen-status"),
+        "the week-2 memory is stored with its status tag: {stored:?}"
+    );
+    assert!(
+        stored.iter().any(|l| l == "near-duplicate"),
+        "memorize: the bypass lifts suppression only; the near-duplicate soft-flag stays: \
+         {stored:?}"
+    );
+    let roster = roster_ids(&server, &viewer, "norcal-rfp-gen-status").await;
+    assert!(
+        roster.contains(&s1_id) && roster.contains(&s2_id),
+        "the roster read must return both memorized runs: {roster:?}"
+    );
 }
 
 /// `batch_submit_claims`: each entry reaches the gate with its own labels. In
@@ -346,4 +423,11 @@ async fn batch_submit_claims_keeps_every_run_of_a_status_labelled_entry(pool: Pg
         "a status-labelled batch entry must insert as its own claim: {json}"
     );
     assert_ne!(r[1]["claim_id"], r[0]["claim_id"], "{json}");
+    let stored = labels_of(&pool, r[1]["claim_id"].as_str().expect("claim_id")).await;
+    assert!(
+        stored.iter().any(|l| l == "grant-run-status")
+            && stored.iter().any(|l| l == "near-duplicate"),
+        "batch: the week-2 entry keeps its status label and is still soft-flagged \
+         near-duplicate: {stored:?}"
+    );
 }
