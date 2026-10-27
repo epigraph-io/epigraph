@@ -101,9 +101,20 @@ use crate::middleware::bearer::ViewerExtractor;
 #[cfg(feature = "db")]
 use epigraph_db::EdgeRepository;
 
-/// Valid relationship types for edge creation
+/// Valid relationship types for edge creation.
+///
+/// Matched byte-exactly EXCEPT for the case-folded relationships
+/// (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`:
+/// `supports`, `contradicts`, `corroborates`, `refutes`), which are listed in
+/// their lower-case canonical spelling, accepted in any ASCII case and STORED
+/// lower case ([`is_valid_relationship`], `create_edge`). Before, this list held
+/// `SUPPORTS` / `CONTRADICTS` / `CORROBORATES` and refused the lower-case
+/// `contradicts` / `corroborates` MCP `link_epistemic` writes, so one
+/// relationship lived in two spellings (backlog 3ce5e00c).
 const VALID_RELATIONSHIPS: &[&str] = &[
     "supports",
+    "contradicts",
+    "corroborates",
     "refutes",
     "relates_to",
     "generalizes",
@@ -118,8 +129,6 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "attributed_to",   // prov:wasAttributedTo — Claim → Author Agent
     "associated_with", // prov:wasAssociatedWith — Activity → Author Agent
     // DS/DEKG edge types (created by submit_evidence, perspective/community handlers)
-    "SUPPORTS",
-    "CONTRADICTS",
     "WITHIN_FRAME",
     "SCOPED_BY",
     "PERSPECTIVE_OF",
@@ -148,19 +157,17 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     // backlog item. Written by MCP `resolve_backlog_item`; registered here so
     // the same edge can be asserted and inspected over HTTP. The byte string
     // must stay identical to `epigraph_mcp::tools::claims::JUSTIFIES_RELATIONSHIP`
-    // — this list is matched case-sensitively.
+    // — this list is matched case-sensitively outside the case-folded four.
     "justifies",             // claim → claim (closure basis; reopenable via supersede)
     "section_follows",       // claim → claim (sibling section ordering within a document)
     "continues_argument",    // claim → claim (sibling paragraph ordering within a section)
     "same_as",               // claim → claim (deduplication identity)
-    "CORROBORATES",          // claim → claim (cross-source corroboration)
     "AUTHORED",              // agent → claim (materialized authorship)
     "ATTRIBUTED_TO",         // claim → agent (prov:wasAttributedTo)
     "refines",               // claim → claim (refinement)
     "cites",                 // claim → claim (citation link)
     "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
-    "CONTRADICTS",           // claim → claim (contradiction)
     "supersedes",            // claim → claim (version chain)
     "revises",               // claim → claim (concurrent branch from common ancestor)
     "enables",               // claim → claim (enablement)
@@ -322,8 +329,13 @@ pub(crate) fn is_registrable_target(schema: &str, table: &str) -> bool {
     schema == "public" && !SENSITIVE_TABLES.contains(&table)
 }
 
+/// Whether `POST /api/v1/edges` accepts `s`: byte-exact against
+/// [`VALID_RELATIONSHIPS`], except that a case-folded relationship is accepted
+/// in any ASCII case (it is stored as `canonical_relationship(s)`).
 pub fn is_valid_relationship(s: &str) -> bool {
-    VALID_RELATIONSHIPS.contains(&s)
+    VALID_RELATIONSHIPS.contains(&epigraph_core::edge::relationships::canonical_relationship(
+        s,
+    ))
 }
 
 /// Trigger DS recomputation on the target claim when an epistemic edge is
@@ -661,7 +673,7 @@ pub async fn create_edge(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Json(request): Json<CreateEdgeRequest>,
+    Json(mut request): Json<CreateEdgeRequest>,
 ) -> Result<(StatusCode, Json<CreateEdgeResponse>), ApiError> {
     // The scope check is unconditional: `ViewerExtractor` has already refused a
     // request with no `AuthContext`, so there is always one to check (W12b).
@@ -724,6 +736,13 @@ pub async fn create_edge(
             ),
         });
     }
+    // Store, dedup, wire, record provenance and emit events under ONE spelling
+    // (backlog 3ce5e00c): `SUPPORTS` and `supports` are the same relationship.
+    // Done here rather than left to the repository so the default path's
+    // synthesized response row and the `edge.added` event say what is stored.
+    request.relationship =
+        epigraph_core::edge::relationships::canonical_relationship(&request.relationship)
+            .to_string();
 
     // Validate no self-loops (same ID AND same type)
     if request.source_id == request.target_id && request.source_type == request.target_type {
@@ -2986,7 +3005,7 @@ mod tests {
     /// `qualifies` (backlog 99582af7, a belief-neutral scope caveat) is
     /// accepted in its lower-case canonical spelling ONLY, per the U014 casing
     /// ruling. The whitelist already mixes cases for older relations
-    /// (`CONTRADICTS`, `EQUIVALENT_TO`, `derived_from`/`DERIVED_FROM`); an
+    /// (`EQUIVALENT_TO`, `derived_from`/`DERIVED_FROM`); an
     /// upper-case `QUALIFIES` alias would split one relation into two
     /// spellings that readers and the MCP twin treat differently.
     #[test]
@@ -3431,18 +3450,22 @@ mod db_tests {
         (status, parse_body(resp).await)
     }
 
-    /// In-force rows over the UNORDERED pair `{a, b}` with `relationship`.
+    /// In-force rows over the UNORDERED pair `{a, b}` with `relationship`, in
+    /// any stored spelling of it (`relationship_spellings`), so a row written
+    /// in another spelling is counted rather than hidden.
     async fn unordered_pair_count(pool: &PgPool, a: Uuid, b: Uuid, relationship: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM edges \
              WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
                AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
-               AND relationship = $3 \
+               AND relationship = ANY($3) \
                AND (valid_to IS NULL OR valid_to > now())",
         )
         .bind(a)
         .bind(b)
-        .bind(relationship)
+        .bind(epigraph_core::edge::relationships::relationship_spellings(
+            relationship,
+        ))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -3465,11 +3488,13 @@ mod db_tests {
             "SELECT COUNT(*) FROM edges \
              WHERE LEAST(source_id, target_id) = LEAST($1, $2) \
                AND GREATEST(source_id, target_id) = GREATEST($1, $2) \
-               AND relationship = $3",
+               AND relationship = ANY($3)",
         )
         .bind(a)
         .bind(b)
-        .bind(relationship)
+        .bind(epigraph_core::edge::relationships::relationship_spellings(
+            relationship,
+        ))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -3505,6 +3530,175 @@ mod db_tests {
         chrono::DateTime::parse_from_rfc3339(rfc3339)
             .unwrap()
             .with_timezone(&chrono::Utc)
+    }
+
+    /// The stored `relationship` of edge `id`.
+    async fn stored_relationship(pool: &PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT relationship FROM edges WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Backlog 3ce5e00c: `POST /api/v1/edges` accepts a case-folded
+    /// relationship in ANY ASCII case and stores (and answers with) the
+    /// lower-case canonical spelling, the one MCP `link_epistemic` writes.
+    /// Before, the whitelist was case-sensitive: `Contradicts` and the
+    /// lower-case `corroborates` were 400s, and `SUPPORTS` was stored as sent,
+    /// so one relationship lived in two spellings. A relationship outside the
+    /// folded list keeps its exact spelling (`REFINES` is not `refines`).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_accepts_and_canonicalises_mixed_case(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+        // The event store is a process-wide singleton; read only this test's window.
+        let since = chrono::Utc::now();
+
+        for (asked, stored, if_not_exists) in [
+            ("Contradicts", "contradicts", false),
+            ("corroborates", "corroborates", false),
+            ("SUPPORTS", "supports", false),
+            ("SUPPORTS", "supports", true),
+            ("REFUTES", "refutes", false),
+            ("REFINES", "REFINES", false),
+        ] {
+            let a = seed_claim(&pool, agent_id, &format!("canon {asked} {if_not_exists} A")).await;
+            let b = seed_claim(&pool, agent_id, &format!("canon {asked} {if_not_exists} B")).await;
+            let (status, body) =
+                post_edge(&router, create_edge_body(a, b, asked, if_not_exists)).await;
+            assert_eq!(status, StatusCode::CREATED, "{asked}: {body}");
+            assert_eq!(
+                body["relationship"], stored,
+                "{asked}: the response says what is stored"
+            );
+            let id = body_id(&body, "id");
+            assert_eq!(
+                stored_relationship(&pool, id).await,
+                stored,
+                "{asked} (if_not_exists={if_not_exists}) must be stored as {stored}"
+            );
+            // The `edge.added` staleness event names the stored spelling too:
+            // a subscriber filtering on `supports` must see a `SUPPORTS` POST.
+            let events = crate::routes::events::global_event_store()
+                .list(&crate::routes::events::EventFilter {
+                    since: Some(since),
+                    after_id: None,
+                    event_type: Some("edge.added".to_string()),
+                    limit: Some(1000),
+                    offset: None,
+                })
+                .await
+                .0;
+            let event = events
+                .iter()
+                .find(|e| e.payload["edge_id"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("{asked}: no edge.added event for {id}"));
+            assert_eq!(
+                event.payload["relationship"], stored,
+                "{asked}: the edge.added event says what is stored"
+            );
+        }
+        // Still refused: not a relationship in any spelling.
+        let a = seed_claim(&pool, agent_id, "canon refused A").await;
+        let b = seed_claim(&pool, agent_id, "canon refused B").await;
+        let (status, body) = post_edge(&router, create_edge_body(a, b, "Supporting", false)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// Re-asserting a LEGACY upper-case link (a row written before the
+    /// canonical spelling) in either spelling is a dedup hit on that row, not a
+    /// second row: directional `SUPPORTS` with `if_not_exists`, and a symmetric
+    /// `contradicts` over a reverse `CONTRADICTS`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_edge_dedups_against_a_legacy_upper_case_row(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "legacy A").await;
+        let b = seed_claim(&pool, agent_id, "legacy B").await;
+        let legacy = |src: Uuid, tgt: Uuid, rel: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                        relationship) \
+                     VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+                )
+                .bind(src)
+                .bind(tgt)
+                .bind(rel)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let supports = legacy(a, b, "SUPPORTS").await;
+        let contradicts = legacy(b, a, "CONTRADICTS").await;
+        let router = edges_router_with_auth(test_state(pool.clone()).await, auth_ctx(agent_id));
+
+        let (s1, body1) = post_edge(&router, create_edge_body(a, b, "supports", true)).await;
+        assert_eq!(s1, StatusCode::OK, "a dedup hit is 200: {body1}");
+        assert_eq!(body_id(&body1, "id"), supports);
+
+        let (s2, body2) = post_edge(&router, create_edge_body(a, b, "contradicts", false)).await;
+        assert_eq!(s2, StatusCode::OK, "a dedup hit is 200: {body2}");
+        assert_eq!(body_id(&body2, "id"), contradicts);
+        assert_eq!(
+            unordered_pair_count_all(&pool, a, b, "contradicts").await,
+            1
+        );
+    }
+
+    /// `GET /api/v1/edges?relationship=` returns a legacy upper-case row and a
+    /// canonical lower-case row whichever spelling the filter names (backlog
+    /// 3ce5e00c), through the route rather than only at the repository.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_edges_relationship_filter_matches_both_spellings(pool: PgPool) {
+        let agent_id = ensure_system_agent(&pool).await;
+        let a = seed_claim(&pool, agent_id, "list spelling A").await;
+        let b = seed_claim(&pool, agent_id, "list spelling B").await;
+        let c = seed_claim(&pool, agent_id, "list spelling C").await;
+        let mut want = Vec::new();
+        for (tgt, rel) in [(b, "SUPPORTS"), (c, "supports"), (c, "elaborates")] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                    relationship) \
+                 VALUES ($1, 'claim', $2, 'claim', $3) RETURNING id",
+            )
+            .bind(a)
+            .bind(tgt)
+            .bind(rel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if rel != "elaborates" {
+                want.push(id);
+            }
+        }
+        want.sort();
+        let state = test_state(pool.clone()).await;
+
+        for asked in ["supports", "SUPPORTS"] {
+            let router = edges_router_with_auth(state.clone(), auth_ctx(agent_id));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/edges?source_id={a}&relationship={asked}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{asked}");
+            let body: serde_json::Value = parse_body(response).await;
+            let mut got: Vec<Uuid> = body
+                .as_array()
+                .expect("response is an array")
+                .iter()
+                .map(|e| body_id(e, "id"))
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "relationship={asked} must return both spellings");
+        }
     }
 
     /// Shared body of the reverse-direction tests: `A <relationship> B`, then
@@ -3837,7 +4031,8 @@ mod db_tests {
         );
         assert_eq!(edges[0]["source_id"], serde_json::json!(a));
         assert_eq!(edges[0]["target_id"], serde_json::json!(b));
-        assert_eq!(edges[0]["relationship"], serde_json::json!("SUPPORTS"));
+        // Stored, and so returned, in the canonical spelling (backlog 3ce5e00c).
+        assert_eq!(edges[0]["relationship"], serde_json::json!("supports"));
     }
 
     /// 0.C — PATCH /edges/:id sets `valid_to` on the targeted edge.

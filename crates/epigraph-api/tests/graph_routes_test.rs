@@ -485,6 +485,81 @@ async fn expand_returns_cluster_members_with_induced_edges(pool: PgPool) {
     assert_eq!(body["truncated"], false);
 }
 
+/// `?relationships=` on expand matches every stored spelling of a case-folded
+/// relationship (backlog 3ce5e00c): a legacy upper-case `SUPPORTS` row and a
+/// canonical lower-case `supports` row are both returned whichever spelling the
+/// caller names, and only the unrelated edge is counted as filtered out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn expand_relationship_override_matches_both_spellings(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let cluster_id = common::seed_one_cluster(&pool, 3).await;
+    let mut members: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT claim_id FROM claim_cluster_membership WHERE cluster_id = $1")
+            .bind(cluster_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    members.sort();
+    let (a, b, c) = (members[0], members[1], members[2]);
+    for (source, target, rel) in [(a, b, "SUPPORTS"), (b, c, "supports"), (a, c, "elaborates")] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                                properties) \
+             VALUES ($1, 'claim', $2, 'claim', $3, '{}'::jsonb)",
+        )
+        .bind(source)
+        .bind(target)
+        .bind(rel)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let expand = |relationships: &'static str| async move {
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/v1/graph/communities/{cluster_id}/expand\
+                     ?budget=10&relationships={relationships}"
+            ))
+            .header(
+                "Authorization",
+                format!("Bearer {}", common::test_bearer_token()),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{relationships}");
+        let body: Value = resp.json().await.unwrap();
+        let mut rels: Vec<String> = body["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["relationship"].as_str().unwrap().to_string())
+            .collect();
+        rels.sort();
+        (rels, body["filtered_edge_count"].as_i64().unwrap())
+    };
+
+    // Calibration: with no filter the viewer sees all three seeded edges.
+    let (all, filtered) = expand("*").await;
+    assert_eq!(all, ["SUPPORTS", "elaborates", "supports"]);
+    assert_eq!(filtered, 0);
+
+    for asked in ["supports", "SUPPORTS"] {
+        let (rels, filtered) = expand(asked).await;
+        assert_eq!(
+            rels,
+            ["SUPPORTS", "supports"],
+            "relationships={asked} must return both spellings"
+        );
+        assert_eq!(
+            filtered, 1,
+            "relationships={asked}: only `elaborates` is filtered"
+        );
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn expand_returns_404_for_unknown_cluster(pool: PgPool) {
     let url = fixture::database_url_for(&pool).await;

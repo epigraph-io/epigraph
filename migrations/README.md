@@ -1854,6 +1854,31 @@ restart.
   and every refresh fails). **Applied to throwaway databases only, NOT to any
   deployed database.**
 
+- **175**: public `edge_relationship_canonical_spelling` (backlog 3ce5e00c,
+  U014 PR-2). The schema half of one lower-case spelling for the case-folded
+  relationships `supports` / `contradicts` / `corroborates` / `refutes`
+  (writers store `canonical_relationship`; readers match
+  `relationship_spellings`). Re-states 011's `edge_to_factor_type` verbatim
+  plus `corroborates` (evidential_support 0.85/0.85) and `refutes`
+  (mutual_exclusion), so a lower-case claim/claim edge of either gets the
+  factor its upper-case spelling always got (new MCP `link_epistemic`
+  `corroborates` / `refutes` edges now get one too). Rebuilds 090's
+  `edges_symmetric_relationship_uniq` keyed and filtered on
+  `lower(relationship)`, so a legacy matcher `CORROBORATES` and a new matcher
+  `corroborates` over one pair are one key. Pinned by
+  `epigraph-db/tests/edge_relationship_canonical_write.rs`. Existing rows are
+  NOT rewritten here: the fold is the operator runbook
+  `docs/runbooks/edge-relationship-casefold.sql` (backup table, undo in
+  `edge-relationship-casefold-undo.sql`), run after this migration. **Deploy
+  order (binding):** epigraph-api first (only it applies migrations), THEN
+  epigraph-mcp / epigraph-jobs / `decompose_claims`, THEN the operator fold. A
+  matcher binary running against a database without 175 writes `corroborates`
+  edges that get no factor (AFTER INSERT trigger, no backfill) and fall outside
+  090's index; see the file header. **Deploy precondition:** the census in the
+  file header (expected zero rows). Undo:
+  re-run 011's function body and 090's index statement. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`
