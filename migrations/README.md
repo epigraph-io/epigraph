@@ -2006,6 +2006,31 @@ restart.
   for every removal instead; `epigraph-tenancy-backfill verify` reports both
   the owner and the grant, so run it after 181.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **185**: public `supersede_binds_the_actor` (ruling R-85, backlog
+  1a54283d). Once the operator binding is armed, the supersede act's INSERT
+  (the inherited-author shape only `ClaimRepository::supersede_act_conn`
+  writes, which also records the writer as the successor's `AUTHORED` act
+  edge) is checked on its WRITER alone: bound (`OPL01`) and a writer of the
+  owner group (`OPL02`), as before. The inherited author is no longer
+  attributed to the writer's human, so a bound writer of the group may
+  restate a claim whose author is bound to no human (was `OPL01`) or belongs
+  to another human (was `OPL02`). 166's `ROL01` on that author is kept (a
+  live role-attached author is checked, a retired identity is not). A
+  re-open of an inherited successor, and every fresh claim, are still
+  attributed. Re-bodies 153's `epigraph_claims_require_operator_binding`
+  (`CREATE OR REPLACE`, same signature, owner re-asserted; still registered
+  at 122 in `tenancy_backfill.rs`) behind an md5 precondition on 153's body
+  (`55000` over any other body, nothing changed). Sets `lock_timeout =
+  '3s'`. Behaviour in `epigraph-db/tests/inherited_supersede_binds_the_actor.rs`
+  (with the precondition and the rollback), HTTP
+  `own_claim_authority_http.rs` and MCP `own_claim_authority_app_role.rs`.
+  Undo: `docs/runbooks/185-undo.sql` (restores 153's body; run it before
+  `153-undo.sql`). Slot: checked free on `main`, in every open PR, every
+  remote branch and every local worktree (184 is held by an unpushed branch).
+  **Deploy order:** none against the binaries (it only admits writes 153
+  refused); it may apply before or after any lower-numbered migration that
+  does not re-body this function.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 
 ## `-- no-transaction` migrations
