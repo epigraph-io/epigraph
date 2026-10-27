@@ -17,8 +17,10 @@
 //! * **Unset**: the API writes its edges unsigned, as before, and says so ONCE
 //!   at boot (the ruling: no fail-closed boot on an absent key).
 //! * **Set but unusable** (unreadable file, not 64 hex characters, or a key
-//!   registered in `agent_keys` that is not an active, in-window `signing` key
-//!   of exactly one agent): the server refuses to start. An operator who
+//!   carried by an ATTESTED `agent_keys` row (`signing`, `identity-legacy`)
+//!   that is not an active, in-window `signing` key of exactly one agent): the
+//!   server refuses to start. A row of another type is ignored, as the
+//!   verifiers ignore it. An operator who
 //!   configured a key believes HTTP edges are being signed; serving unsigned
 //!   would make that silently false.
 //!
@@ -28,7 +30,7 @@
 //! by the same admission rule the edge verifier applies
 //! (`agent_key::key_window_admits` / `admitted_signature_keys`):
 //!
-//! 1. the key is registered in `agent_keys`: it must be an ACTIVE `signing`
+//! 1. the key is carried by an attested `agent_keys` row: it must be an ACTIVE `signing`
 //!    key, inside its window now, of exactly one agent, and that agent signs
 //!    (the separate-signing-key shape the MCP server uses);
 //! 2. otherwise the agent whose `agents.public_key` is the key;
@@ -140,9 +142,16 @@ pub fn parse_key_text(text: &str) -> Result<AgentSigner, String> {
 /// `signing` key of exactly one agent, or a database call fails.
 pub async fn resolve_signer_agent(pool: &PgPool, signer: &AgentSigner) -> Result<Uuid, String> {
     let public_key = signer.public_key();
-    let rows = AgentKeyRepository::rows_with_public_key(pool, &public_key)
+    // Only ATTESTED rows (`signing`, `identity-legacy`) are a key's recorded
+    // lifecycle: a row of any other type is application-insertable, and the
+    // verifiers ignore it (`agent_key::admitted_signature_keys`), so it must
+    // neither refuse the key here nor name its signer.
+    let rows: Vec<_> = AgentKeyRepository::rows_with_public_key(pool, &public_key)
         .await
-        .map_err(|e| format!("{ENV_KEY_FILE}: could not read agent_keys: {e}"))?;
+        .map_err(|e| format!("{ENV_KEY_FILE}: could not read agent_keys: {e}"))?
+        .into_iter()
+        .filter(|r| r.key_type == "signing" || r.key_type == "identity-legacy")
+        .collect();
     if !rows.is_empty() {
         let now = Utc::now();
         let mut agents: Vec<Uuid> = rows

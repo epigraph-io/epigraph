@@ -115,26 +115,34 @@ pub struct AdmittedKey {
 ///   admit `at` ([`key_window_admits`]). Any other key type is application-
 ///   insertable (migration 161's guard covers these two only) and admits
 ///   nothing.
-/// * The signer's bare `agents.public_key` ("unattested") only when NO row in
-///   `rows` carries those bytes: a key with a recorded lifecycle is governed by
-///   it, so a revoked, pending or out-of-window key cannot come back in as the
-///   bare agent key.
+/// * The signer's bare `agents.public_key` ("unattested") only when no
+///   ATTESTED row in `rows` carries those bytes: a key with a recorded
+///   lifecycle is governed by it, so a revoked, pending or out-of-window key
+///   cannot come back in as the bare agent key. A row of any other type is not
+///   a recorded lifecycle (anyone on the application role can write one), so
+///   it neither admits nor suppresses: the verdict does not depend on whether
+///   the caller fetched non-attested rows at all.
 ///
 /// Which MESSAGE a key must have signed is the caller's rule, not this one's:
 /// claims accept the v1 claim message then the legacy bare digest, edges the
-/// v1 edge message only.
+/// v1 edge message only. So is which ROWS it passes: the claim verifier passes
+/// the attested rows of the claim's author AND signer, the edge verifier every
+/// row of the edge's signer (an edge has no author agent).
 #[must_use]
 pub fn admitted_signature_keys(
     rows: &[KeyLifecycle<'_>],
     agent_key: Option<&[u8]>,
     at: DateTime<Utc>,
 ) -> Vec<AdmittedKey> {
+    let attested_kind = |key_type: &str| match key_type {
+        "signing" => Some("signing"),
+        "identity-legacy" => Some("identity-legacy"),
+        _ => None,
+    };
     let mut out = Vec::new();
     for (i, row) in rows.iter().enumerate() {
-        let kind = match row.key_type {
-            "signing" => "signing",
-            "identity-legacy" => "identity-legacy",
-            _ => continue,
+        let Some(kind) = attested_kind(row.key_type) else {
+            continue;
         };
         if key_window_admits(row.status, row.valid_from, row.valid_until, at) {
             if let Ok(key) = <[u8; 32]>::try_from(row.public_key) {
@@ -147,7 +155,11 @@ pub fn admitted_signature_keys(
         }
     }
     if let Some(key) = agent_key
-        .filter(|k| !rows.iter().any(|r| r.public_key == *k))
+        .filter(|k| {
+            !rows
+                .iter()
+                .any(|r| attested_kind(r.key_type).is_some() && r.public_key == *k)
+        })
         .and_then(|k| <[u8; 32]>::try_from(k).ok())
     {
         out.push(AdmittedKey {
@@ -535,6 +547,41 @@ impl AgentKeyRepository {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Backlog 06a50a30: only an ATTESTED row governs the bare agent key. The
+    /// same revoked row suppresses it as `identity-legacy` and is ignored as
+    /// `encryption`, so the verdict does not depend on whether the caller
+    /// fetched non-attested rows.
+    #[test]
+    fn only_an_attested_row_governs_the_bare_agent_key() {
+        let key = [3u8; 32];
+        let at = Utc::now();
+        let row = |key_type| KeyLifecycle {
+            public_key: &key,
+            key_type,
+            status: "revoked",
+            valid_from: at - chrono::Duration::days(1),
+            valid_until: None,
+        };
+        let bare = AdmittedKey {
+            key,
+            kind: "unattested",
+            row: None,
+        };
+        assert_eq!(admitted_signature_keys(&[], Some(&key), at), vec![bare]);
+        assert_eq!(
+            admitted_signature_keys(&[row("encryption")], Some(&key), at),
+            vec![bare],
+            "a non-attested row suppressed the bare key"
+        );
+        assert_eq!(
+            admitted_signature_keys(&[row("identity-legacy")], Some(&key), at),
+            vec![],
+            "a revoked attested row did not govern the bare key"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn test_agent_key_placeholder(_pool: sqlx::PgPool) {
         // Integration tests live in tests/agent_key_tests.rs once migrations exist

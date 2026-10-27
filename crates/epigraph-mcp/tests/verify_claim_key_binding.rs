@@ -847,3 +847,91 @@ async fn a_signing_key_outside_its_window_does_not_verify(pool: PgPool) {
         "a revoked signing key verified: {resp}"
     );
 }
+
+/// Backlog 06a50a30, the ONE admission rule: only an ATTESTED row
+/// (`signing`, `identity-legacy`) governs an agent's bare `agents.public_key`.
+/// A row of an application-insertable type (`encryption` here; migration 161's
+/// guard covers the two attested types only) carrying the agent's bare key is
+/// not a recorded lifecycle, so it neither suppresses the bare key nor admits
+/// anything. The claim verifier and the edge verifier read different row sets
+/// (the claim's author and signer's ATTESTED rows; the edge signer's rows of
+/// every type), so this is where they could disagree: the same agent, the same
+/// bare key and the same planted row must give the same verdict from both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_attested_row_carrying_the_bare_key_gives_one_verdict_for_claims_and_edges(
+    pool: PgPool,
+) {
+    use epigraph_db::repos::{EdgeRepository, EdgeSignatureRepository, EdgeSigningKey};
+
+    let t0 = Utc::now() - Duration::days(10);
+    let bare = signer(0xC1);
+    let agent = seed_agent(&pool, &bare.public_key(), t0).await;
+    seed_key(
+        &pool,
+        agent,
+        &bare.public_key(),
+        "encryption",
+        "revoked",
+        t0,
+        None,
+    )
+    .await;
+
+    let claim = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &bare,
+        "06a50a30: a claim by a bare key that a non-attested row also carries",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let other = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &bare,
+        "06a50a30: the edge's target",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let edge = EdgeRepository::create_signed_conn(
+        &mut conn,
+        Some(EdgeSigningKey {
+            signer: &bare,
+            signer_id: agent,
+        }),
+        claim,
+        "claim",
+        other,
+        "claim",
+        "supports",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("signed edge");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+    let edge_check = EdgeSignatureRepository::verify_conn(&mut conn, &viewer, edge)
+        .await
+        .expect("verify edge")
+        .expect("edge readable");
+    drop(conn);
+
+    let resp = verify(&pool, claim).await;
+    assert_eq!(
+        (resp["signature_valid"].clone(), resp["key_kind"].clone()),
+        (Value::Bool(true), Value::from("unattested")),
+        "the claim verifier: {resp}"
+    );
+    assert_eq!(
+        (edge_check.signature_valid, edge_check.key_kind),
+        (true, Some("unattested")),
+        "the edge verifier disagrees with the claim verifier over a non-attested row \
+         carrying the bare key: {edge_check:?}"
+    );
+}

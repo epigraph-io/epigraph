@@ -342,6 +342,38 @@ async fn the_key_loader_admits_only_a_usable_key() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Backlog 06a50a30, the one admission rule at boot: only an ATTESTED row
+/// (`signing`, `identity-legacy`) is a recorded lifecycle of a key. A row of an
+/// application-insertable type (`encryption`) carrying the API key's public
+/// bytes, which any application session can plant (the boot log prints the
+/// public key), is ignored as the verifiers ignore it: it neither refuses the
+/// key at boot nor names its signer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_attested_row_carrying_the_key_does_not_block_the_loader() {
+    let (_url, pool) = pool().await;
+    let key = AgentSigner::generate();
+    let planter = common::seed_system_agent(&pool).await;
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, 'encryption', 'active', now() - interval '1 minute')",
+    )
+    .bind(planter)
+    .bind(key.public_key().as_slice())
+    .execute(&pool)
+    .await
+    .expect("plant a non-attested row");
+    let resolved = edge_signer::resolve_signer_agent(&pool, &key)
+        .await
+        .expect("a non-attested row must not refuse the key");
+    assert_ne!(resolved, planter, "the planted row named the signer");
+    let pk: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+        .bind(resolved)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pk, key.public_key().to_vec());
+}
+
 /// The ids of `claim`'s edges with `relationship` (either endpoint).
 async fn edges_of(pool: &PgPool, endpoint: Uuid, relationship: &str) -> Vec<Uuid> {
     sqlx::query_scalar(

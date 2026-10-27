@@ -329,7 +329,8 @@ pub struct EdgeSignatureCheck {
     /// The kind of key that verified: `signing` / `identity-legacy` (an
     /// attested `agent_keys` row whose status and window admit the edge's
     /// `created_at`) or `unattested` (the signer's `agents.public_key`, only
-    /// when no `agent_keys` row carries it). `None` when nothing verifies.
+    /// when no attested `agent_keys` row carries it). `None` when nothing
+    /// verifies.
     pub key_kind: Option<&'static str>,
     /// The row recomputes to its stored `content_hash`; `None` when no digest
     /// is stored, or when the edge is `pre_attestation` (its stored digest is

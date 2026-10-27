@@ -198,9 +198,12 @@ fn window_admits(
 /// `06a50a30`): an attested key only when its status and window admit
 /// `created_at`, and `signer_key` only when no row of `keys` carries those
 /// bytes. A revoked, pending or out-of-window key therefore verifies nothing,
-/// under its row or as the bare agent key. Only the message rule differs from
-/// the edge verifier's: a claim accepts the v1 claim message, then the legacy
-/// bare digest (ruling R-34).
+/// under its row or as the bare agent key. The message rule differs from the
+/// edge verifier's (a claim accepts the v1 claim message, then the legacy bare
+/// digest, ruling R-34), and so do the rows: `keys` are the attested rows of
+/// the claim's author AND signer, so an author's attested row carrying the
+/// signer's bare key governs it here, where the edge verifier reads the
+/// signer's rows only.
 #[must_use]
 pub fn bind_signature(
     digest: &[u8; 32],
