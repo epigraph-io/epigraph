@@ -615,6 +615,39 @@ async fn census_ignores_an_authored_edge_added_after_the_act(pool: PgPool) {
     );
 }
 
+/// Only a claim that records a supersession (`supersedes` set) can be
+/// re-attributed. A claim that supersedes nothing, authored as the bound
+/// human S, whose same-transaction `AUTHORED` edge from C spells a
+/// supersession tool, is still S's write: the edge's properties alone do not
+/// make the claim a successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_reattribute_a_claim_that_supersedes_nothing(pool: PgPool) {
+    let (s, group) = fixture::seed_agent_with_group(&pool, "census-plain-author").await;
+    make_human(&pool, s).await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "census-plain-caller").await;
+    let plain = claim_with_authored_edge(&pool, s, c, "supersede_claim", group, 0).await;
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(plain)
+            .fetch_one(&pool)
+            .await
+            .expect("the claim");
+    assert_eq!(supersedes, None, "CALIBRATION: no supersession");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&c.to_string()),
+        "a claim that supersedes nothing keeps its author: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // link-legacy-authors
 // ─────────────────────────────────────────────────────────────────────────────

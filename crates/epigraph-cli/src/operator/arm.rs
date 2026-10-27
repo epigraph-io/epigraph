@@ -106,7 +106,9 @@ pub async fn unregistered_system_roles(
 /// the claim's author, except a supersession's successor, whose writer is the
 /// agent that performed the act (backlog 73085534, ruling R-23).
 ///
-/// The act's OWN edge is picked out by two facts together:
+/// Only a claim that records a supersession (`supersedes` set) is a
+/// successor; every other claim keeps its author whatever edges it carries.
+/// On such a claim the act's OWN edge is picked out by two facts together:
 /// * its `tool` property is one of the supersession write paths
 ///   (`epigraph_db::SUPERSEDE_ACT_TOOLS`), so a claim that merely gained a
 ///   `supersedes` pointer (a marked duplicate, a consolidated source) keeps
@@ -132,7 +134,8 @@ fn census_writes() -> String {
            FROM claims c \
            LEFT JOIN LATERAL ( \
                 SELECT e.source_id FROM edges e \
-                 WHERE e.target_id = c.id AND e.target_type = 'claim' \
+                 WHERE c.supersedes IS NOT NULL \
+                   AND e.target_id = c.id AND e.target_type = 'claim' \
                    AND e.source_type = 'agent' AND e.relationship = 'AUTHORED' \
                    AND e.properties->>'tool' IN ({act_tools}) \
                    AND e.created_at = c.created_at \
