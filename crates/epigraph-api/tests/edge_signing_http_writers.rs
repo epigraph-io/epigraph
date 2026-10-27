@@ -596,8 +596,9 @@ async fn submit_packet_attests_its_structural_edges() {
 }
 
 /// `POST /api/v1/frames/:id/evidence` (`submit_evidence`): its WITHIN_FRAME
-/// edge (claim -> frame, structural), under the stamped transaction's
-/// savepoint. Its `evidence`-typed SUPPORTS / CONTRADICTS / GENERATED_BY edges
+/// edge (claim -> frame, structural), SCOPED_BY (claim -> an applied context)
+/// and CONTRIBUTES_TO (perspective -> claim), each under the stamped
+/// transaction's savepoint. Its `evidence`-typed SUPPORTS / CONTRADICTS / GENERATED_BY edges
 /// (and `assess_claim`'s) name a `mass_functions` id as `evidence`, which
 /// `edges_validate_refs` refuses: dead writes (`unstamped_http_edge_writes.rs`),
 /// so there is no row to check.
@@ -617,7 +618,32 @@ async fn submit_evidence_attests_its_edges() {
     .fetch_one(&pool)
     .await
     .expect("seed frame");
+    // A context scoped to this frame only, whose (identity) filter modifier
+    // applies, so the submission writes its SCOPED_BY edge.
+    let context: Uuid = sqlx::query_scalar(
+        "INSERT INTO contexts (name, context_type, applicable_frame_ids, modifier_type, parameters) \
+         VALUES ($1, 'test', ARRAY[$2]::uuid[], 'filter', '{\"keep_indices\": [0, 1]}'::jsonb) \
+         RETURNING id",
+    )
+    .bind(format!("r50-context-{}", Uuid::new_v4()))
+    .bind(frame)
+    .fetch_one(&pool)
+    .await
+    .expect("seed context");
     let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+    let perspective = id_of(
+        &post(
+            addr,
+            &token,
+            "/api/v1/perspectives",
+            serde_json::json!({
+                "name": format!("R-50 evidence perspective {}", Uuid::new_v4()),
+                "owner_agent_id": agent,
+            }),
+        )
+        .await,
+        "id",
+    );
     post(
         addr,
         &token,
@@ -626,9 +652,27 @@ async fn submit_evidence_attests_its_edges() {
             "claim_id": claim, "agent_id": agent,
             "masses": {"0": 0.8, "0,1": 0.2},
             "reliability": 1.0,
+            "perspective_id": perspective,
         }),
     )
     .await;
+    for (source, target, rel) in [
+        (claim, context, "SCOPED_BY"),
+        (perspective, claim, "CONTRIBUTES_TO"),
+    ] {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+                AND relationship = $3",
+        )
+        .bind(source)
+        .bind(target)
+        .bind(rel)
+        .fetch_all(&pool)
+        .await
+        .expect(rel);
+        assert_eq!(ids.len(), 1, "{rel}: {ids:?}");
+        assert_attested(&pool, ids[0], signer_id, &format!("submit_evidence {rel}")).await;
+    }
     let within: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
             AND relationship = 'WITHIN_FRAME'",
@@ -745,7 +789,7 @@ async fn the_evidence_trace_and_span_writers_attest_their_edges() {
     let resp = reqwest::Client::new()
         .put(format!("http://{addr}/api/v1/spans/{span_id}/close"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "generated_ids": [claim] }))
+        .json(&serde_json::json!({ "generated_ids": [claim], "consumed_ids": [claim] }))
         .send()
         .await
         .unwrap();
@@ -757,4 +801,108 @@ async fn the_evidence_trace_and_span_writers_attest_their_edges() {
     );
     let e = between(span_id, claim, "generated").await;
     assert_attested(&pool, e, signer_id, "spans/close generated").await;
+    let e = between(span_id, claim, "uses_evidence").await;
+    assert_attested(&pool, e, signer_id, "spans/close uses_evidence").await;
+}
+
+/// The experiment loop (`POST /api/v1/experiments/new`, `.../:id/results`,
+/// `.../:eid/results/:rid/analyze`): its four edges moved from raw `INSERT`
+/// SQL to `EdgeRepository::create_signed`, so the write path itself changed.
+/// Each handler swallows (`.ok()`) or maps the edge error, so the test pins the
+/// exact count per relationship, the `properties` each raw INSERT wrote
+/// (`'{}'`, or the JSON it bound), and the attestation.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_experiment_loop_attests_its_edges() {
+    let (url, pool) = pool().await;
+    let (signer, signer_id) = api_signer(&pool).await;
+    let (addr, _shutdown) = spawn_signed(&url, signer).await;
+    let agent = common::seed_system_agent(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:read", "claims:write"], agent);
+    let hypothesis = common::seed_claim(
+        &pool,
+        &format!("R-50 experiment hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('hypothesis_assessment', \
+         ARRAY['true','false']::text[]) ON CONFLICT (name) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("hypothesis_assessment frame");
+
+    let created = post(
+        addr,
+        &token,
+        "/api/v1/experiments/new",
+        serde_json::json!({ "hypothesis_id": hypothesis, "agent_id": agent }),
+    )
+    .await;
+    let experiment = id_of(&created, "experiment_id");
+    let submitted = post(
+        addr,
+        &token,
+        &format!("/api/v1/experiments/{experiment}/results"),
+        serde_json::json!({
+            "data_source": "instrument",
+            "measurements": [
+                {"value": 1.2, "random_error": 0.05, "systematic_error": 0.02},
+                {"value": 1.1, "random_error": 0.05, "systematic_error": 0.02}
+            ],
+        }),
+    )
+    .await;
+    let result = id_of(&submitted, "result_id");
+    post(
+        addr,
+        &token,
+        &format!("/api/v1/experiments/{experiment}/results/{result}/analyze"),
+        serde_json::json!({
+            "agent_id": agent, "direction": "supports",
+            "scope_limitations": [], "expected_value": 0.0,
+        }),
+    )
+    .await;
+
+    let one = |source_type: &'static str, target: Uuid, rel: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let rows: Vec<(Uuid, Uuid, serde_json::Value)> = sqlx::query_as(
+                "SELECT id, source_id, properties FROM edges \
+                  WHERE source_type = $1 AND target_id = $2 AND relationship = $3",
+            )
+            .bind(source_type)
+            .bind(target)
+            .bind(rel)
+            .fetch_all(&pool)
+            .await
+            .expect(rel);
+            assert_eq!(rows.len(), 1, "{rel}: {rows:?}");
+            rows.into_iter().next().unwrap()
+        }
+    };
+    let (e, source, props) = one("experiment", hypothesis, "tests_hypothesis").await;
+    assert_eq!(source, experiment);
+    assert_eq!(props, serde_json::json!({}));
+    assert_attested(&pool, e, signer_id, "tests_hypothesis").await;
+
+    let (e, source, props) = one("experiment_result", experiment, "result_of").await;
+    assert_eq!(source, result);
+    assert_eq!(props, serde_json::json!({"data_source": "instrument"}));
+    assert_attested(&pool, e, signer_id, "result_of").await;
+
+    let (e, analysis, props) = one("analysis", result, "analyzes").await;
+    assert_eq!(props, serde_json::json!({}));
+    assert_attested(&pool, e, signer_id, "analyzes").await;
+
+    let (e, source, props) = one("analysis", hypothesis, "provides_evidence").await;
+    assert_eq!(
+        source, analysis,
+        "provides_evidence comes from the same analysis"
+    );
+    assert_eq!(props["direction"], serde_json::json!("supports"), "{props}");
+    for k in ["precision_ratio", "evidence_strength"] {
+        assert!(props[k].is_number(), "{k} in {props}");
+    }
+    assert_attested(&pool, e, signer_id, "provides_evidence").await;
 }
