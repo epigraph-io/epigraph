@@ -709,6 +709,21 @@ pub struct DedupRevert {
     /// on that frame beyond these (a later writer's input needs it).
     #[serde(default)]
     pub canonical_frame_inputs: Vec<Uuid>,
+    /// The BP factor slots (`factor_type:lo,hi`) the repair minted on the
+    /// canonical for the edges it moved there: slots that were EMPTY before
+    /// the mark (an occupied slot keeps its factor and the repair mints
+    /// nothing into it). Informational, for the audit record: the un-mark
+    /// reads [`Self::slot_edges_without_factor`], which is derived from it.
+    #[serde(default)]
+    pub minted_factor_slots: Vec<String>,
+    /// The canonical's own edges that mapped to one of those slots at the
+    /// mark and had no factor there (something had removed it). When the
+    /// un-mark frees such a slot it does not re-fill it from these, so a
+    /// mark/un-mark round trip leaves them unfactored, as it found them
+    /// (backlog 5272d890). Empty in a record written before this field: the
+    /// un-mark then re-fills a freed slot from any canonical edge, as before.
+    #[serde(default)]
+    pub slot_edges_without_factor: Vec<Uuid>,
 }
 
 /// What [`ClaimRepository::reverse_marked_duplicate_conn`] put back, and what
@@ -771,6 +786,12 @@ pub struct UnmarkedDuplicate {
     /// Read from the edge's reserved `properties.dedup` (only the act and the
     /// backfill write it), never from the claim's patchable properties.
     pub legacy_backfill: bool,
+    /// For a [`Self::legacy_backfill`] mark, what the act stripped from the
+    /// restored claim (operator ruling R-18): `{"labels": [...], "properties":
+    /// {...}}`, the stale `deduped` label and the `deduped_*` properties the
+    /// raw-SQL `fuzzy_dedup_claims` wrote, with their values, for the audit
+    /// row. `None` for every other mark.
+    pub legacy_stripped: Option<serde_json::Value>,
 }
 
 impl UnmarkedDuplicate {
@@ -8648,16 +8669,42 @@ impl ClaimRepository {
         // Both writes carry the write predicate: on an application session the
         // viewer's writable groups, on the maintenance session (a bypass
         // viewer) nothing, as row security decides there too.
+        // A legacy mark's restored claim also loses what the raw-SQL script
+        // wrote to say it was deduplicated (operator ruling R-18): the
+        // `deduped` label and every `deduped_*` property. `o` is the row as it
+        // was, so the act returns what it stripped, for the audit row.
         let claim_sql = viewer.splice_write(
-            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW() \
-              WHERE c.id = $1 /* {WRITABLE:c} */",
-            2,
+            "UPDATE claims AS c SET supersedes = NULL, is_current = true, updated_at = NOW(), \
+                    labels = CASE WHEN $2 THEN array_remove(c.labels, 'deduped') \
+                                  ELSE c.labels END, \
+                    properties = CASE WHEN $2 THEN \
+                                   (SELECT COALESCE(jsonb_object_agg(p.k, p.v), '{}'::jsonb) \
+                                      FROM jsonb_each(c.properties) AS p(k, v) \
+                                     WHERE p.k NOT LIKE 'deduped\\_%') \
+                                 ELSE c.properties END \
+               FROM claims AS o \
+              WHERE c.id = $1 AND o.id = c.id /* {WRITABLE:c} */ \
+             RETURNING \
+               (SELECT COALESCE(array_agg(l), ARRAY[]::text[]) \
+                  FROM unnest(COALESCE(o.labels, ARRAY[]::text[])) AS l WHERE $2 AND l = 'deduped'), \
+               (SELECT COALESCE(jsonb_object_agg(p.k, p.v), '{}'::jsonb) \
+                  FROM jsonb_each(COALESCE(o.properties, '{}'::jsonb)) AS p(k, v) \
+                 WHERE $2 AND p.k LIKE 'deduped\\_%')",
+            3,
         );
-        let mut q = sqlx::query(&claim_sql).bind(dup_uuid);
+        let mut q = sqlx::query_as::<_, (Vec<String>, serde_json::Value)>(&claim_sql)
+            .bind(dup_uuid)
+            .bind(legacy_backfill);
         if let Some(w) = viewer.writable_bind() {
             q = q.bind(w);
         }
-        let restored = q.execute(&mut *tx).await?.rows_affected();
+        let stripped = q.fetch_optional(&mut *tx).await?;
+        let restored = u64::from(stripped.is_some());
+        let legacy_stripped = stripped
+            .filter(|_| legacy_backfill)
+            .map(|(labels, properties)| {
+                serde_json::json!({ "labels": labels, "properties": properties })
+            });
         let edge_sql = viewer.splice_write(
             "UPDATE edges AS e SET valid_to = now() WHERE e.id = $1 /* {WRITABLE:e} */",
             2,
@@ -8678,6 +8725,7 @@ impl ClaimRepository {
             chain,
             identity_edge,
             legacy_backfill,
+            legacy_stripped,
         })
     }
 
@@ -12357,14 +12405,47 @@ async fn repair_marked_duplicate(
         .chain(resourced_rows_ids.iter())
         .copied()
         .collect();
+    //
+    // The slots it mints are recorded, with the canonical's own edges that
+    // map to one of them and had no factor there (something had removed it),
+    // so the un-mark that frees such a slot leaves those edges as the mark
+    // found them (backlog 5272d890).
+    let mut minted_factor_slots: Vec<String> = Vec::new();
+    let mut slot_edges_without_factor: Vec<Uuid> = Vec::new();
     if !moved_edges.is_empty() {
-        sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
+        minted_factor_slots = sqlx::query_scalar(&format!(
+            "{REGENERATE_EDGE_FACTORS_SQL} \
+             RETURNING factor_type || ':' || array_to_string(variable_ids, ',')"
+        ))
+        .bind(canon_uuid)
+        .bind(canon_uuid)
+        .bind(Vec::<String>::new())
+        .bind(Some(&moved_edges))
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&mut *conn)
+        .await?;
+        minted_factor_slots.sort_unstable();
+        if !minted_factor_slots.is_empty() {
+            slot_edges_without_factor = sqlx::query_scalar(
+                r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+                 SELECT e.id FROM edges e
+                  CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+                  WHERE e.source_type = 'claim' AND e.target_type = 'claim'
+                    AND (e.source_id = $1 OR e.target_id = $1)
+                    AND NOT (e.id = ANY($2))
+                    AND ft.factor_type IS NOT NULL
+                    AND (ft.factor_type || ':' || array_to_string(
+                           CASE WHEN e.source_id < e.target_id
+                                THEN ARRAY[e.source_id, e.target_id]
+                                ELSE ARRAY[e.target_id, e.source_id] END, ',')) = ANY($3)
+                  ORDER BY e.id"#,
+            )
             .bind(canon_uuid)
-            .bind(canon_uuid)
-            .bind(Vec::<String>::new())
-            .bind(Some(&moved_edges))
-            .execute(&mut *conn)
+            .bind(&moved_edges)
+            .bind(&minted_factor_slots)
+            .fetch_all(&mut *conn)
             .await?;
+        }
     }
     let resourced_edges: Vec<(Uuid, Uuid, String)> = resourced_rows
         .into_iter()
@@ -12422,6 +12503,8 @@ async fn repair_marked_duplicate(
             deleted_bbas: deleted_rows,
             copied_frames,
             canonical_frame_inputs,
+            minted_factor_slots,
+            slot_edges_without_factor,
         },
     })
 }
@@ -12602,11 +12685,16 @@ async fn reverse_marked_duplicate(
         .fetch_all(&mut *conn)
         .await?
     };
+    // A freed slot is not re-filled from a canonical edge the mark found in it
+    // without a factor (`slot_edges_without_factor`, backlog 5272d890): the
+    // mark minted into an empty slot, and the round trip leaves it empty for
+    // that edge. A canonical edge that came since does get it.
     sqlx::query(REGENERATE_EDGE_FACTORS_SQL)
         .bind(dup_uuid)
         .bind(head_uuid)
         .bind(&freed_slots)
         .bind(None::<Vec<Uuid>>)
+        .bind(&record.slot_edges_without_factor)
         .execute(&mut *conn)
         .await?;
 
@@ -12790,17 +12878,20 @@ async fn reverse_marked_duplicate(
 /// endpoints are both current and that either touches the claim `$1` or
 /// touches the claim `$2` in a `(factor_type, pair)` slot listed in `$3`
 /// (as `type:lo,hi`), and, when `$4` (`uuid[]`) is not NULL, is one of the
-/// edges it lists. Both dedup directions move edges by UPDATE, which that
-/// INSERT trigger never sees:
+/// edges it lists, and is not one of the edges `$5` (`uuid[]`) lists. Both
+/// dedup directions move edges by UPDATE, which that INSERT trigger never
+/// sees:
 ///
 /// * the un-mark puts edges back onto a claim made current again: `$1` is the
 ///   duplicate, `$2` its canonical, `$3` the slots the stale-factor DELETE
-///   freed there, `$4` NULL;
+///   freed there, `$4` NULL, `$5` the canonical edges the mark found
+///   unfactored in a slot it minted into ([`DedupRevert::slot_edges_without_factor`]);
 /// * the mark's repair ([`repair_marked_duplicate`]) re-points the retired
 ///   duplicate's edges onto the canonical, whose factors the retirement
 ///   deleted (`claims_deactivate_factors`): `$1` and `$2` are the canonical,
-///   `$3` empty and `$4` the edges it moved, so only those are minted and a
-///   canonical edge whose factor something else removed stays without one.
+///   `$3` empty, `$4` the edges it moved and `$5` empty, so only those are
+///   minted and a canonical edge whose factor something else removed stays
+///   without one.
 ///
 /// It is the body of migration 038's `auto_create_factor_from_edge`, over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
@@ -12860,6 +12951,7 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                 AND (e.valid_to IS NULL OR e.valid_to > now())
                 AND (e.source_id IN ($1, $2) OR e.target_id IN ($1, $2))
                 AND ($4::uuid[] IS NULL OR e.id = ANY($4::uuid[]))
+                AND NOT (e.id = ANY($5::uuid[]))
                 AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
                 AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
                 AND m.ft IS NOT NULL

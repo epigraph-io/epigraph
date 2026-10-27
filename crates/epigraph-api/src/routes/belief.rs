@@ -1644,8 +1644,9 @@ pub async fn submit_evidence(
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged => warnings.push(
             "this BBA is identical to the one this agent already stored for this claim, frame \
              and perspective_id; its stored values are unchanged (the row's created_at is \
-             refreshed), so the claim's Dempster-Shafer belief did not move on its account \
-             (bayesian_posterior still applies this submission's Beta update)."
+             refreshed), so the claim's Dempster-Shafer belief did not move on its account, \
+             and bayesian_posterior did not move either (the Beta update counts a stored BBA \
+             once)."
                 .to_string(),
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(
@@ -1690,8 +1691,14 @@ pub async fn submit_evidence(
             .flatten()
             .unwrap_or((1.0, 1.0));
 
+        // An identical resubmission stored nothing new (backlog 33ce3f5d):
+        // its Beta update was applied when the BBA was first stored, and
+        // applying it again would count the same evidence twice. The
+        // posterior is reported from the parameters as they stand.
+        let counted = write_outcome != epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged;
+
         // Use the submitted evidence's singleton mass as the evidence strength
-        if let Some(h_i) = h_idx {
+        if let (true, Some(h_i)) = (counted, h_idx) {
             let singleton =
                 epigraph_ds::FocalElement::positive(std::iter::once(h_i as usize).collect());
             let m_support = modified.mass_of(&singleton);
@@ -1708,6 +1715,7 @@ pub async fn submit_evidence(
 
         // Store updated Beta parameters
         let stored = match beta_row {
+            Ok(_) if !counted => Ok(()),
             Ok(_) => sqlx::query(
                 "UPDATE claims SET beta_alpha = $2, beta_beta = $3, updated_at = NOW() WHERE id = $1",
             )
