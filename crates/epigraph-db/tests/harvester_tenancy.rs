@@ -517,3 +517,66 @@ async fn an_audit_report_follows_its_fragment_when_a_claim_is_narrowed(pool: PgP
         "a non-member no longer reads the audit of a now-private fragment: {seen:?}"
     );
 }
+
+/// Two `epigraph_app` reads of `p`, as the old and the new owner group, after
+/// `p`'s fragment changed owner: `(old, new)`.
+async fn read_as_old_and_new_owner(
+    pool: &PgPool,
+    old: (Uuid, Uuid),
+    new: (Uuid, Uuid),
+    p: &Pipeline,
+) -> (Vec<(&'static str, i64)>, Vec<(&'static str, i64)>) {
+    let old_seen = read_as_app(pool, old.1.to_string(), old.0.to_string(), p).await;
+    let new_seen = read_as_app(pool, new.1.to_string(), new.0.to_string(), p).await;
+    (old_seen, new_seen)
+}
+
+/// An audit report follows its fragment when the fragment changes OWNER, not
+/// only visibility. A maintenance session re-owns the fragment alone, as the
+/// operator's re-own and restrict commands and the tenancy backfill do: the
+/// report must move to the new group with it, or the old group keeps reading
+/// the audit of a fragment it no longer owns.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_audit_report_follows_its_fragment_when_the_fragment_is_re_owned(pool: PgPool) {
+    let old = fixture::seed_agent_with_group(&pool, "harv-reown-old").await;
+    let new = fixture::seed_agent_with_group(&pool, "harv-reown-new").await;
+    let pipeline = seed_pipeline(&pool, old.1, "group").await;
+
+    let fragment = pipeline.fragment;
+    let new_group = new.1;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("UPDATE harvester_fragments SET owner_group_id = $1 WHERE id = $2")
+            .bind(new_group)
+            .bind(fragment)
+            .execute(&mut *conn)
+            .await
+            .expect("a maintenance session re-owns the fragment");
+        (conn, ())
+    })
+    .await;
+
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", pipeline.fragment).await,
+        (new.1, "group".to_string()),
+        "CONTROL: the fragment was re-owned"
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_audit_reports", pipeline.report).await,
+        (new.1, "group".to_string()),
+        "the audit report moves to its fragment's new owner"
+    );
+    let (old_seen, new_seen) = read_as_old_and_new_owner(&pool, old, new, &pipeline).await;
+    assert_eq!(
+        (old_seen[0], new_seen[0]),
+        (("harvester_fragments", 0), ("harvester_fragments", 1)),
+        "CONTROL: the fragment is read by its new owner only"
+    );
+    assert_eq!(
+        (old_seen[2], new_seen[2]),
+        (
+            ("harvester_audit_reports", 0),
+            ("harvester_audit_reports", 1)
+        ),
+        "the old owner no longer reads the audit report and the new owner does"
+    );
+}
