@@ -860,6 +860,24 @@ pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
 const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
     "sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'))";
 
+/// Which of a sealed claim's evidence rows the seal covers: those owned by the
+/// claim's OWNER (operator ruling R-78). A SQL predicate over the aliases `e`
+/// (evidence) and `c` (its claim).
+///
+/// An evidence row names one claim, but what it records can bear on others,
+/// and a row another group holds on the claim is that group's: the seal leaves
+/// it as it is (no ciphertext row, body and digest untouched), rather than
+/// blanking it under the claim group's key. In practice, when a claim narrows,
+/// migration 168 already moves its inherited rows and its writers' own public
+/// rows onto the claim's group, so the rows this keeps out are the ones another
+/// group holds through a visibility pin (operator `hide`, migration 110).
+///
+/// The manifest ([`PrivatizationRepository::seal_manifest_page_conn`]), the
+/// commit's TCB shape ([`PrivatizationRepository::seal_tcb_shape_conn`]) and the
+/// mutation ([`PrivatizationRepository::seal_claims_conn`]) all apply it, so the
+/// set served, the set the commit must cover and the set sealed are one set.
+const SEAL_EVIDENCE_OWNER_PREDICATE: &str = "e.owner_group_id = c.owner_group_id";
+
 /// The key under which a seal manifest carries an evidence row's
 /// `evidence.content_hash` (lowercase hex) inside that row's `properties`.
 ///
@@ -1020,7 +1038,8 @@ pub struct SealManifestItem {
     pub properties: serde_json::Value,
     /// Every `claim_versions` row for this claim.
     pub versions: Vec<SealManifestVersion>,
-    /// Every `evidence` row for this claim.
+    /// Every `evidence` row for this claim that the claim's owner holds
+    /// ([`SEAL_EVIDENCE_OWNER_PREDICATE`]).
     pub evidence: Vec<SealManifestEvidence>,
 }
 
@@ -1103,7 +1122,8 @@ pub struct SealTcbShape {
     pub claim_id: Uuid,
     /// Every live `claim_versions.id` for it.
     pub version_ids: Vec<Uuid>,
-    /// Every live `evidence.id` for it.
+    /// Every live `evidence.id` for it that the claim's owner holds
+    /// ([`SEAL_EVIDENCE_OWNER_PREDICATE`]).
     pub evidence_ids: Vec<Uuid>,
 }
 
@@ -3151,14 +3171,17 @@ impl PrivatizationRepository {
                 Option<String>,
                 Vec<u8>,
             ),
-        >(
+        >(&format!(
             r"
-            SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url, e.content_hash
-              FROM public.evidence e
-             WHERE e.claim_id = ANY($1)
-             ORDER BY e.claim_id, e.id
-            ",
-        )
+                SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url,
+                       e.content_hash
+                  FROM public.evidence e
+                  JOIN public.claims c ON c.id = e.claim_id
+                 WHERE e.claim_id = ANY($1)
+                   AND {SEAL_EVIDENCE_OWNER_PREDICATE}
+                 ORDER BY e.claim_id, e.id
+                "
+        ))
         .bind(&claim_ids)
         .fetch_all(&mut *conn)
         .await
@@ -3222,19 +3245,21 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(
+        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(&format!(
             r"
             SELECT ids.claim_id,
                    COALESCE(ARRAY(SELECT v.id FROM public.claim_versions v
                                    WHERE v.claim_id = ids.claim_id
                                    ORDER BY v.id), ARRAY[]::uuid[]) AS version_ids,
                    COALESCE(ARRAY(SELECT e.id FROM public.evidence e
+                                   JOIN public.claims c ON c.id = e.claim_id
                                    WHERE e.claim_id = ids.claim_id
+                                     AND {SEAL_EVIDENCE_OWNER_PREDICATE}
                                    ORDER BY e.id), ARRAY[]::uuid[]) AS evidence_ids
               FROM unnest($1::uuid[]) AS ids(claim_id)
              ORDER BY ids.claim_id
-            ",
-        )
+            "
+        ))
         .bind(claim_ids)
         .fetch_all(&mut *conn)
         .await
@@ -3287,7 +3312,9 @@ impl PrivatizationRepository {
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
     ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
-    ///    this table omits and the applied schema requires.
+    ///    this table omits and the applied schema requires. Only the rows the
+    ///    claim's owner holds ([`SEAL_EVIDENCE_OWNER_PREDICATE`], ruling R-78),
+    ///    selected by one read first, whatever evidence the commit names.
     /// 7. The derived-extraction DELETEs, over
     ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
     ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
@@ -3412,12 +3439,41 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 5/6. Evidence.
+        // 5/6. Evidence: only the rows the claim's owner holds (ruling R-78,
+        //      [`SEAL_EVIDENCE_OWNER_PREDICATE`]), whatever the commit names.
+        //      Read once, so the ciphertext INSERT and the blanking UPDATE
+        //      cover the same set.
+        let named: Vec<Uuid> = items
+            .iter()
+            .filter(|i| sealed.contains(&i.claim_id))
+            .flat_map(|i| i.evidence.iter().map(|e| e.id))
+            .collect();
+        let owners: std::collections::HashSet<Uuid> = if named.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            sqlx::query_scalar::<_, Uuid>(&format!(
+                r"
+                SELECT e.id
+                  FROM public.evidence e
+                  JOIN public.claims c ON c.id = e.claim_id
+                 WHERE e.id = ANY($1)
+                   AND e.claim_id = ANY($2)
+                   AND {SEAL_EVIDENCE_OWNER_PREDICATE}
+                "
+            ))
+            .bind(&named)
+            .bind(&sealed)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?
+            .into_iter()
+            .collect()
+        };
         let mut evidence_ids: Vec<Uuid> = Vec::new();
         let mut evidence_cts: Vec<Vec<u8>> = Vec::new();
         let mut evidence_prop_cts: Vec<Vec<u8>> = Vec::new();
         for item in items.iter().filter(|i| sealed.contains(&i.claim_id)) {
-            for e in &item.evidence {
+            for e in item.evidence.iter().filter(|e| owners.contains(&e.id)) {
                 evidence_ids.push(e.id);
                 evidence_cts.push(e.content_ct.clone());
                 evidence_prop_cts.push(e.properties_ct.clone());
