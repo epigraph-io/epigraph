@@ -29,6 +29,12 @@
 --     A privileged session already writes this column directly (it bypasses
 --     row security), so that arm grants nothing it did not have; it keeps the
 --     repository's pool form usable on the maintenance and superuser pools;
+--   * refuses an ELEVATED session first, with `GRA03` / 42501, whoever it is.
+--     126's RESTRICTIVE `groups_elevated_no_update` is a policy on
+--     `epigraph_app` and so is not applied inside this maintenance-owned
+--     frame; before 181 it is what refused an elevated session's direct
+--     mark. The definer refuses it itself, as 168's challenge definer does
+--     (CR05);
 --   * refuses everyone else with `GRA01` / SQLSTATE 42501 and changes nothing,
 --     and refuses with `GRA02` / 42501 if the UPDATE matched no row (a group
 --     that does not exist, or a body re-owned so that row security filters
@@ -66,6 +72,10 @@ RETURNS void
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'GRA03: an elevated session marks no re-key obligation; nothing was changed'
+            USING ERRCODE = '42501';
+    END IF;
     IF NOT (public.epigraph_bypass()
             OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
                         WHERE r.rolname = session_user AND r.rolsuper)

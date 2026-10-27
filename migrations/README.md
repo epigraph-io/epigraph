@@ -1737,8 +1737,11 @@ restart.
   COALESCE(reseal_required_at, now())` on that one row. It admits a caller
   whose session principal is a live admin of the group
   (`epigraph_is_group_admin`), or a privileged session (which can already
-  write the column directly); anyone else gets `GRA01` / 42501, and an UPDATE
-  that matched no row gets `GRA02` / 42501. Path pinned as 172
+  write the column directly); an ELEVATED session gets `GRA03` / 42501 first
+  (126's `groups_elevated_no_update` is an `epigraph_app` policy and does not
+  apply inside the maintenance-owned frame, so the definer refuses it itself,
+  as 168's CR05 does), anyone else gets `GRA01` / 42501, and an UPDATE that
+  matched no row gets `GRA02` / 42501. Path pinned as 172
   (`pg_catalog, pg_temp`, built-ins qualified); owner
   `epigraph_maintenance`; EXECUTE revoked from PUBLIC and granted to
   `epigraph_app`. `GroupMembershipRepository::revoke_member_unless_last_admin_conn`
@@ -1746,7 +1749,8 @@ restart.
   admin who did not create the group can remove a member (before this,
   `groups_tenancy`'s creator-only WITH CHECK refused the mark and the whole
   removal). Pinned by `group_reseal_mark.rs` (direct calls on the application
-  role, catalog shape) and `group_routes_app_role.rs`; registered in
+  role, catalog shape), `elevated_arms.rs` (`GRA03`) and
+  `group_routes_app_role.rs`; registered in
   `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS`, grant list). Undo:
   `DROP FUNCTION public.epigraph_mark_group_reseal_required(uuid)` with the
   repository change reverted. Slot: 181 is assigned to this batch (moved from

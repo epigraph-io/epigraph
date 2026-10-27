@@ -210,7 +210,8 @@ impl GroupMembershipRepository {
     /// `WITH CHECK` admits only the group's CREATOR, so a direct write refused
     /// the whole removal for every other admin. The definer writes that one
     /// column for a live admin of the group (or a privileged session) and
-    /// refuses anyone else with 42501 (`GRA01`).
+    /// refuses anyone else with 42501 (`GRA01`), and an elevated session
+    /// with 42501 (`GRA03`).
     ///
     /// It is called BEFORE the guarded revoke, inside a savepoint, because the
     /// definer decides on the CALLER's admin row: an admin removing itself
