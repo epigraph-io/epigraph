@@ -2008,6 +2008,32 @@ restart.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 
+- **184**: public `mass_function_retract` (operator ruling R-79, backlog
+  f8ec73b7). Retracts ONE mass function (BBA) without deleting it. Adds
+  `mass_functions.retracted_at`, `retracted_by` and `retract_reason` (all
+  NULL on a live row, all set on a retracted one:
+  `mass_functions_retract_columns_together`, added NOT VALID then
+  validated). Adds `epigraph_retract_mass_function(uuid, text, uuid, uuid)`,
+  a maintenance-owned definer granted to `epigraph_app`: the session
+  principal retracts a row it can read when it writes the row's owning group,
+  or when it presents a token client with a live `claims:admin` grant bound to
+  it (111's re-check); an unreadable row is "not found" like a random id; a
+  re-retraction writes nothing and answers `already_retracted`; a first
+  retraction appends one `security_events` row (`mass_functions.retract`)
+  carrying the row as it was, and deletes the stored scoped beliefs
+  (`ds_combined_beliefs`) of the row's (claim, frame), which folded it (hence
+  `GRANT DELETE ON ds_combined_beliefs TO epigraph_maintenance`, the
+  definer's owner). Adds `mass_functions_retract_guard` (BEFORE
+  UPDATE OF the three columns): an application session cannot mark a row
+  retracted directly (RT06), only clear it. Every fold and belief reader
+  excludes a retracted row (`not_retracted_predicate`, pinned by
+  `epigraph-db/tests/bba_retract_read_lint.rs`), and the repository upsert
+  clears the columns when the same key is written again. Pinned by
+  `epigraph-db/tests/bba_retract.rs`. Undo: in the file header. **Deploy
+  order:** after 114 and 126; apply BEFORE a binary with the matching readers
+  serves (they name `retracted_at`). **Applied to throwaway databases only,
+  NOT to any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

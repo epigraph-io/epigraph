@@ -1,0 +1,295 @@
+-- 184: retract ONE mass function (BBA) without deleting it (operator ruling
+-- R-79, backlog f8ec73b7).
+--
+-- ===================================================================
+-- 0. WHY THIS FILE EXISTS
+-- ===================================================================
+--
+-- A single bad BBA (a duplicate re-observation folded as independent mass, a
+-- promotion copy left beside its original) had no remedy short of a hard
+-- DELETE, which loses the row an audit needs, or a counter-BBA, which adds
+-- mass instead of removing it. The ruling: mark that one row RETRACTED. A
+-- retracted row is excluded from every fold and belief read and is kept, with
+-- who retracted it, when and why, plus an audit row. Only the BBA's owner (a
+-- writer of its owning group) or a live `claims:admin` holder may retract it.
+--
+-- ===================================================================
+-- 1. THE COLUMNS
+-- ===================================================================
+--
+-- `retracted_at`, `retracted_by` (the session principal that retracted it)
+-- and `retract_reason`, all NULL on a live row and all set on a retracted
+-- one (`mass_functions_retract_columns_together`). Readers exclude a row with
+-- `retracted_at IS NULL`, spelled once in Rust
+-- (`epigraph_db::repos::mass_function::not_retracted_predicate`) and pinned by
+-- the read ratchet `epigraph-db/tests/bba_retract_read_lint.rs`.
+--
+-- A later write to the SAME upsert key `(claim, frame, source agent,
+-- perspective)` (migration 034's unique key) is a new assessment: the
+-- repository upsert (`MassFunctionRepository::store_with_perspective`) clears
+-- the three columns as it replaces the masses. The retracted content is not
+-- lost: the audit row below carries a full snapshot of the row as it was.
+--
+-- ===================================================================
+-- 2. THE DEFINER
+-- ===================================================================
+--
+-- `epigraph_retract_mass_function(p_id, p_reason, p_admin_client,
+-- p_admin_jti)` is the one path that sets the columns. It refuses, writing
+-- nothing:
+--   * RT01 (42501) no session principal: nobody to record as the retractor;
+--   * RT05 (42501) an ELEVATED session: 126's `mass_functions_elevated_no_update`
+--     refuses such a session every UPDATE of `mass_functions`, and this
+--     definer must not be the way around it;
+--   * RT04 (22023) an empty reason (after trimming) or one over 2000 chars;
+--   * RT02 (P0002) "mass function not found" when the id does not exist OR the
+--     session cannot read the row (public, or owned by one of
+--     `epigraph_session_groups()`): ONE answer for both, so this is no
+--     existence oracle. Readability filters the locking read, so such a
+--     caller takes and waits on no lock;
+--   * RT03 (42501) a readable row the caller may not retract: its owning
+--     group is not in `epigraph_writable_groups()` AND no live `claims:admin`
+--     grant is presented. The admin arm re-checks the grant against the token's
+--     client record exactly as migration 111 does: `oauth_clients` row
+--     `p_admin_client` is `active`, carries `claims:admin` in
+--     `granted_scopes`, and is bound to the session principal.
+-- Then, if the row is already retracted, it returns `already_retracted` with
+-- the existing columns and writes NOTHING (no second audit row): a re-retract
+-- is idempotent. Otherwise it sets the three columns and appends one
+-- `security_events` row (`event_type = 'mass_functions.retract'`, `agent_id` =
+-- the retractor) naming the row, its claim and frame, the owning group, the
+-- arm (`owner` or `admin`), the admin's client and token id when that arm was
+-- used, the reason, and `before` (the full row as `to_jsonb`).
+--
+-- A first retraction also DELETES the stored scoped beliefs of the row's
+-- (claim, frame) in `ds_combined_beliefs` (global, perspective and community
+-- scopes, written by `POST /frames/:id/evidence` and `/claims/:id/assess`):
+-- they are folds that included the retracted row, and the scoped-belief reads
+-- serve them as stored. No row is better than a stale one; the next evidence
+-- write on that (claim, frame) stores fresh ones. The count is in the audit
+-- row and the return value (`scoped_beliefs_cleared`). This is why the file
+-- grants `epigraph_maintenance` DELETE on `ds_combined_beliefs` (the
+-- definer's owner; 115's restrictive DELETE policy admits its frame).
+--
+-- The caller recomputes the claim's cached belief afterwards, on the same
+-- transaction (the HTTP route and the MCP tool both do).
+--
+-- ===================================================================
+-- 3. THE GUARD
+-- ===================================================================
+--
+-- `mass_functions_retract_guard` (BEFORE UPDATE ROW) refuses an application
+-- session that SETS or CHANGES the retract columns to a retracted state
+-- directly (RT06, 42501): the owner may UPDATE its own row under 077, and
+-- without the guard it could mark a row retracted with no audit row and a
+-- `retracted_by` of its choosing. Clearing the columns (the upsert above) is
+-- not refused. A privileged session (`epigraph_bypass()`, the maintenance
+-- operator) and the definer frame (`epigraph_definer_bypass()`) pass.
+--
+-- ===================================================================
+-- 4. DEPLOY AND UNDO
+-- ===================================================================
+--
+-- `ADD COLUMN` of nullable columns with no default is catalog-only. The CHECK
+-- constraint is added NOT VALID and validated in a second statement, which
+-- scans `mass_functions` under a SHARE UPDATE EXCLUSIVE lock (writes keep
+-- flowing). Apply BEFORE a binary with the matching readers serves: that
+-- binary selects `retracted_at` in its predicates. A binary WITHOUT this change
+-- against a database WITH it keeps working, and folds every row, as no row is
+-- retracted until a new binary's route or tool retracts one.
+--
+-- UNDO (only while no row is retracted, or after deciding what a retracted row
+-- should become): REVOKE DELETE ON ds_combined_beliefs FROM epigraph_maintenance;
+-- DROP TRIGGER mass_functions_retract_guard ON mass_functions;
+-- DROP FUNCTION epigraph_mass_function_retract_guard(); DROP FUNCTION
+-- epigraph_retract_mass_function(uuid, text, uuid, uuid); ALTER TABLE
+-- mass_functions DROP CONSTRAINT mass_functions_retract_columns_together, DROP
+-- COLUMN retract_reason, DROP COLUMN retracted_by, DROP COLUMN retracted_at.
+--
+-- Checked before claiming: no `origin/main` migration, open PR, origin branch
+-- or local worktree carries a `184`.
+
+SET LOCAL lock_timeout = '3s';
+
+-- ===================================================================
+-- 1. THE COLUMNS
+-- ===================================================================
+ALTER TABLE public.mass_functions
+    ADD COLUMN IF NOT EXISTS retracted_at   timestamptz,
+    ADD COLUMN IF NOT EXISTS retracted_by   uuid,
+    ADD COLUMN IF NOT EXISTS retract_reason text;
+
+ALTER TABLE public.mass_functions
+    DROP CONSTRAINT IF EXISTS mass_functions_retract_columns_together;
+ALTER TABLE public.mass_functions
+    ADD CONSTRAINT mass_functions_retract_columns_together
+    CHECK ((retracted_at IS NULL) = (retracted_by IS NULL)
+           AND (retracted_at IS NULL) = (retract_reason IS NULL)) NOT VALID;
+ALTER TABLE public.mass_functions
+    VALIDATE CONSTRAINT mass_functions_retract_columns_together;
+
+COMMENT ON COLUMN public.mass_functions.retracted_at IS
+    'Migration 184 (ruling R-79): when this BBA was retracted. A retracted row is excluded from '
+    'every fold and belief read and kept for audit. Set only by epigraph_retract_mass_function.';
+COMMENT ON COLUMN public.mass_functions.retracted_by IS
+    'Migration 184: the session principal that retracted this BBA (the owner''s writer or a '
+    'claims:admin holder).';
+COMMENT ON COLUMN public.mass_functions.retract_reason IS
+    'Migration 184: the reason given when this BBA was retracted.';
+
+-- ===================================================================
+-- 2. THE DEFINER
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_retract_mass_function(
+    p_id uuid, p_reason text, p_admin_client uuid, p_admin_jti uuid)
+RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE v_principal uuid := public.epigraph_principal_id();
+        v_reason text := btrim(COALESCE(p_reason, ''));
+        v_row public.mass_functions%ROWTYPE;
+        v_arm text;
+        v_at timestamptz;
+        v_scoped bigint;
+BEGIN
+    IF v_principal IS NULL THEN
+        RAISE EXCEPTION 'RT01: retracting a mass function needs a session principal '
+            '(epigraph.principal_id) to record as the retractor; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'RT05: an elevated session retracts no mass function; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    IF v_reason = '' OR length(v_reason) > 2000 THEN
+        RAISE EXCEPTION 'RT04: a retraction needs a reason of 1 to 2000 characters; '
+            'nothing was written'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Readability is in the WHERE: a caller that cannot read the row locks
+    -- nothing and gets the answer a random id gets.
+    SELECT mf.* INTO v_row
+      FROM public.mass_functions mf
+     WHERE mf.id = p_id
+       AND (mf.visibility = 'public'
+            OR mf.owner_group_id = ANY (public.epigraph_session_groups()))
+       FOR UPDATE OF mf;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'RT02: mass function not found' USING ERRCODE = 'P0002';
+    END IF;
+
+    IF v_row.owner_group_id = ANY (COALESCE(public.epigraph_writable_groups(),
+                                            ARRAY[]::uuid[])) THEN
+        v_arm := 'owner';
+    ELSIF p_admin_client IS NOT NULL AND EXISTS (
+            SELECT 1 FROM public.oauth_clients c
+             WHERE c.id = p_admin_client
+               AND c.agent_id = v_principal
+               AND c.status = 'active'
+               AND 'claims:admin' = ANY (c.granted_scopes)) THEN
+        v_arm := 'admin';
+    ELSE
+        RAISE EXCEPTION 'new row violates row-level security policy for table "mass_functions"'
+            USING ERRCODE = '42501',
+                  DETAIL = 'RT03: only a writer of the mass function''s owning group, or a '
+                           'live claims:admin holder, retracts it; nothing was written';
+    END IF;
+
+    -- After the authority checks, so a caller that may not retract the row
+    -- learns nothing of its state.
+    IF v_row.retracted_at IS NOT NULL THEN
+        RETURN jsonb_build_object(
+            'status',           'already_retracted',
+            'mass_function_id', v_row.id,
+            'claim_id',         v_row.claim_id,
+            'frame_id',         v_row.frame_id,
+            'retracted_at',     v_row.retracted_at,
+            'retracted_by',     v_row.retracted_by,
+            'retract_reason',   v_row.retract_reason,
+            'arm',              v_arm,
+            'scoped_beliefs_cleared', 0);
+    END IF;
+
+    UPDATE public.mass_functions
+       SET retracted_at = now(), retracted_by = v_principal, retract_reason = v_reason
+     WHERE id = p_id
+    RETURNING retracted_at INTO v_at;
+
+    DELETE FROM public.ds_combined_beliefs d
+     WHERE d.claim_id = v_row.claim_id AND d.frame_id = v_row.frame_id;
+    GET DIAGNOSTICS v_scoped = ROW_COUNT;
+
+    INSERT INTO public.security_events (event_type, agent_id, success, details, correlation_id)
+    VALUES ('mass_functions.retract', v_principal, true,
+            jsonb_build_object(
+                'mass_function_id', v_row.id,
+                'claim_id',         v_row.claim_id,
+                'frame_id',         v_row.frame_id,
+                'owner_group_id',   v_row.owner_group_id,
+                'arm',              v_arm,
+                'retractor_agent_id', v_principal,
+                'admin_client_id',  CASE WHEN v_arm = 'admin' THEN p_admin_client END,
+                'admin_token_jti',  CASE WHEN v_arm = 'admin' THEN p_admin_jti END,
+                'reason',           v_reason,
+                'before',           to_jsonb(v_row),
+                'scoped_beliefs_cleared', v_scoped,
+                'migration',        184),
+            CASE WHEN v_arm = 'admin' THEN left(p_admin_jti::text, 64) END);
+
+    RETURN jsonb_build_object(
+        'status',           'retracted',
+        'mass_function_id', v_row.id,
+        'claim_id',         v_row.claim_id,
+        'frame_id',         v_row.frame_id,
+        'retracted_at',     v_at,
+        'retracted_by',     v_principal,
+        'retract_reason',   v_reason,
+        'arm',              v_arm,
+        'scoped_beliefs_cleared', v_scoped);
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_retract_mass_function(uuid, text, uuid, uuid)
+    FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_retract_mass_function(uuid, text, uuid, uuid) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_retract_mass_function(uuid, text, uuid, uuid) '
+                'TO epigraph_maintenance';
+        EXECUTE 'GRANT DELETE ON public.ds_combined_beliefs TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_retract_mass_function(uuid, text, uuid, uuid) '
+                'TO epigraph_app';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- 3. THE GUARD
+-- ===================================================================
+-- SECURITY INVOKER on purpose: `epigraph_definer_bypass()` reads
+-- `current_user`, which is the definer's owner inside section 2's frame and
+-- the session role everywhere else.
+CREATE OR REPLACE FUNCTION public.epigraph_mass_function_retract_guard()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public AS $$
+BEGIN
+    IF public.epigraph_bypass() OR public.epigraph_definer_bypass() THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'RT06: a mass function is retracted only through '
+        'epigraph_retract_mass_function (which records the retractor and an audit row); '
+        'nothing was written'
+        USING ERRCODE = '42501';
+END $$;
+
+DROP TRIGGER IF EXISTS mass_functions_retract_guard ON public.mass_functions;
+CREATE TRIGGER mass_functions_retract_guard
+    BEFORE UPDATE OF retracted_at, retracted_by, retract_reason ON public.mass_functions
+    FOR EACH ROW
+    WHEN (NEW.retracted_at IS NOT NULL
+          AND (OLD.retracted_at, OLD.retracted_by, OLD.retract_reason)
+              IS DISTINCT FROM (NEW.retracted_at, NEW.retracted_by, NEW.retract_reason))
+    EXECUTE FUNCTION public.epigraph_mass_function_retract_guard();

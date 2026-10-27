@@ -223,6 +223,80 @@ pub fn cached_combination_predicate(qualifier: &str) -> String {
     )
 }
 
+/// What [`MassFunctionRepository::retract_conn`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BbaRetractStatus {
+    /// The row was live and is now retracted; one audit row was written.
+    Retracted,
+    /// The row was already retracted; nothing was written.
+    AlreadyRetracted,
+}
+
+impl BbaRetractStatus {
+    /// The wire value: `retracted` or `already_retracted`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retracted => "retracted",
+            Self::AlreadyRetracted => "already_retracted",
+        }
+    }
+}
+
+/// Which authority admitted a retraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BbaRetractArm {
+    /// The caller writes the BBA's owning group.
+    Owner,
+    /// The caller holds a live `claims:admin` grant on its token's client.
+    Admin,
+}
+
+impl BbaRetractArm {
+    /// The wire value: `owner` or `admin`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// The retracted row's identity and retract columns, as the definer returns
+/// them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BbaRetraction {
+    pub status: BbaRetractStatus,
+    pub mass_function_id: Uuid,
+    pub claim_id: Uuid,
+    pub frame_id: Uuid,
+    pub retracted_at: DateTime<Utc>,
+    pub retracted_by: Uuid,
+    pub retract_reason: String,
+    pub arm: BbaRetractArm,
+    /// Stored scoped beliefs (`ds_combined_beliefs`) of the row's (claim,
+    /// frame) the retraction deleted as stale; 0 on a repeat.
+    pub scoped_beliefs_cleared: i64,
+}
+
+/// Why [`MassFunctionRepository::retract_conn`] refused.
+#[derive(Debug, thiserror::Error)]
+pub enum BbaRetractError {
+    /// RT02: no such row, or the session cannot read it (one answer for both).
+    #[error("mass function {0} not found")]
+    NotFound(Uuid),
+    /// RT01 / RT03 / RT05: the session may not retract this row.
+    #[error("retraction refused: {0}")]
+    Forbidden(String),
+    /// RT04: the reason is empty or too long.
+    #[error("invalid retraction reason: {0}")]
+    InvalidReason(String),
+    /// Anything else.
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
 /// The frame every ingest template row sits on (see
 /// [`ingest_template_predicate`]).
 pub const INGEST_TEMPLATE_FRAME_NAME: &str = "research_validity";
@@ -567,6 +641,114 @@ impl MassFunctionRepository {
         .await?;
 
         Ok(row.0)
+    }
+
+    /// Retract ONE mass function (migration 184, ruling R-79): mark it
+    /// retracted with `reason`, so every fold and belief read excludes it,
+    /// and keep it for audit.
+    ///
+    /// Calls `public.epigraph_retract_mass_function`, a maintenance-owned
+    /// SECURITY DEFINER, on `conn`, which must be a transaction stamped from
+    /// the CALLER's own viewer (`ScopedPool::begin_as`): the retractor is the
+    /// session principal, never a parameter. The caller may retract a row it
+    /// can read when it writes the row's owning group, or when `admin` names
+    /// a token whose client record holds a live `claims:admin` grant bound to
+    /// the principal (re-checked by the definer, as migration 111 does). A
+    /// first retraction writes one `security_events` row
+    /// (`mass_functions.retract`) carrying the row as it was; a re-retraction
+    /// writes nothing and reports [`BbaRetractStatus::AlreadyRetracted`].
+    /// A first retraction also deletes the stored scoped beliefs
+    /// (`ds_combined_beliefs`) of the row's (claim, frame), which folded it.
+    ///
+    /// The caller recomputes the claim's cached belief afterwards.
+    ///
+    /// # Errors
+    /// [`BbaRetractError::NotFound`] for a missing or unreadable row (one
+    /// answer for both), [`BbaRetractError::Forbidden`] when the session may
+    /// not retract it, [`BbaRetractError::InvalidReason`] for an empty or
+    /// over-long reason, [`BbaRetractError::Db`] otherwise.
+    pub async fn retract_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        reason: &str,
+        admin: Option<super::claim::AdminToken>,
+    ) -> Result<BbaRetraction, BbaRetractError> {
+        let out: serde_json::Value =
+            sqlx::query_scalar("SELECT public.epigraph_retract_mass_function($1, $2, $3, $4)")
+                .bind(id)
+                .bind(reason)
+                .bind(admin.map(|a| a.client_id))
+                .bind(admin.map(|a| a.jti))
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| {
+                    let (code, message) = match &e {
+                        sqlx::Error::Database(d) => {
+                            (d.code().map(|c| c.to_string()), d.message().to_string())
+                        }
+                        _ => (None, String::new()),
+                    };
+                    match code.as_deref() {
+                        Some("P0002") => BbaRetractError::NotFound(id),
+                        Some("42501") => BbaRetractError::Forbidden(
+                            "only a writer of the mass function's owning group, or a live \
+                     claims:admin holder, retracts it; nothing was written"
+                                .to_string(),
+                        ),
+                        Some("22023") => BbaRetractError::InvalidReason(message),
+                        _ => BbaRetractError::Db(DbError::from(e)),
+                    }
+                })?;
+        let field = |k: &str| -> Result<&serde_json::Value, BbaRetractError> {
+            out.get(k).ok_or_else(|| {
+                BbaRetractError::Db(DbError::InvalidData {
+                    reason: format!("epigraph_retract_mass_function returned no `{k}`"),
+                })
+            })
+        };
+        let uuid = |k: &str| -> Result<Uuid, BbaRetractError> {
+            serde_json::from_value(field(k)?.clone()).map_err(|e| {
+                BbaRetractError::Db(DbError::InvalidData {
+                    reason: format!("epigraph_retract_mass_function `{k}`: {e}"),
+                })
+            })
+        };
+        let status = match field("status")?.as_str() {
+            Some("retracted") => BbaRetractStatus::Retracted,
+            Some("already_retracted") => BbaRetractStatus::AlreadyRetracted,
+            other => {
+                return Err(BbaRetractError::Db(DbError::InvalidData {
+                    reason: format!("epigraph_retract_mass_function status {other:?}"),
+                }))
+            }
+        };
+        let arm = match field("arm")?.as_str() {
+            Some("owner") => BbaRetractArm::Owner,
+            Some("admin") => BbaRetractArm::Admin,
+            other => {
+                return Err(BbaRetractError::Db(DbError::InvalidData {
+                    reason: format!("epigraph_retract_mass_function arm {other:?}"),
+                }))
+            }
+        };
+        Ok(BbaRetraction {
+            status,
+            mass_function_id: uuid("mass_function_id")?,
+            claim_id: uuid("claim_id")?,
+            frame_id: uuid("frame_id")?,
+            retracted_at: serde_json::from_value(field("retracted_at")?.clone()).map_err(|e| {
+                BbaRetractError::Db(DbError::InvalidData {
+                    reason: format!("epigraph_retract_mass_function `retracted_at`: {e}"),
+                })
+            })?,
+            retracted_by: uuid("retracted_by")?,
+            retract_reason: field("retract_reason")?
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            arm,
+            scoped_beliefs_cleared: field("scoped_beliefs_cleared")?.as_i64().unwrap_or(0),
+        })
     }
 
     /// Get all mass functions for a (claim, frame) pair
