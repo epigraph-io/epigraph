@@ -50,9 +50,28 @@ struct World {
     owner: Uuid,
     /// `reader` member of that group: may read it, may not write it.
     reader: Uuid,
+    /// `writer` member of that group, NOT its admin and NOT the hypothesis's
+    /// author: may write it, through the writable-group rule alone.
+    writer: Uuid,
     /// A member of its own group only: may not read it.
     stranger: Uuid,
+    /// The group that owns `hypothesis`.
+    group: Uuid,
     hypothesis: Uuid,
+}
+
+/// Add `agent` to `group` with `role`.
+async fn join(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, $3)",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|e| panic!("{role} membership: {e}"));
 }
 
 async fn world(label: &str) -> World {
@@ -62,17 +81,12 @@ async fn world(label: &str) -> World {
         viewer_fixture::seed_agent_with_group(&pool, &format!("{label}-owner")).await;
     let (reader, _) =
         viewer_fixture::seed_agent_with_group(&pool, &format!("{label}-reader")).await;
+    let (writer, _) =
+        viewer_fixture::seed_agent_with_group(&pool, &format!("{label}-writer")).await;
     let (stranger, _) =
         viewer_fixture::seed_agent_with_group(&pool, &format!("{label}-stranger")).await;
-    sqlx::query(
-        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
-         VALUES ($1, $2, ''::bytea, 0, 'reader')",
-    )
-    .bind(group)
-    .bind(reader)
-    .execute(&pool)
-    .await
-    .expect("reader membership");
+    join(&pool, group, reader, "reader").await;
+    join(&pool, group, writer, "writer").await;
     let hypothesis = viewer_fixture::seed_group_claim(
         &pool,
         owner,
@@ -86,7 +100,9 @@ async fn world(label: &str) -> World {
         _shutdown: shutdown,
         owner,
         reader,
+        writer,
         stranger,
+        group,
         hypothesis,
     }
 }
@@ -457,22 +473,31 @@ async fn analyze(
 /// (error-derived BBAs and `provides_evidence` edges on the hypothesis, the
 /// experiment's status).
 async fn analyze_footprint(w: &World, experiment: Uuid) -> (i64, i64, String) {
+    analyze_footprint_on(&w.pool, w.hypothesis, experiment).await
+}
+
+/// [`analyze_footprint`] for any `hypothesis`.
+async fn analyze_footprint_on(
+    pool: &PgPool,
+    hypothesis: Uuid,
+    experiment: Uuid,
+) -> (i64, i64, String) {
     let bbas: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions \
          WHERE claim_id = $1 AND combination_method = 'error_derived'",
     )
-    .bind(w.hypothesis)
-    .fetch_one(&w.pool)
+    .bind(hypothesis)
+    .fetch_one(pool)
     .await
     .expect("count BBAs");
     let edges: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'provides_evidence'",
     )
-    .bind(w.hypothesis)
-    .fetch_one(&w.pool)
+    .bind(hypothesis)
+    .fetch_one(pool)
     .await
     .expect("count edges");
-    (bbas, edges, experiment_status(&w.pool, experiment).await)
+    (bbas, edges, experiment_status(pool, experiment).await)
 }
 
 async fn ensure_hypothesis_frame(pool: &PgPool) {
@@ -579,6 +604,124 @@ async fn analyzing_requires_the_claims_write_scope() {
         status, 200,
         "calibration: the same owner with claims:write: {body}"
     );
+}
+
+// ── Who may write: the writable-group rule, and nothing else ──────────────
+//
+// Every other arm's admitted caller (`owner`) is the hypothesis's author AND
+// its group's admin AND in its writable set at once, so on their own those
+// arms would also pass an admin-only gate or an author-only gate. These two
+// arms tell the three apart: R-51's "writable by the caller" is the owning
+// group in the caller's writable set (`admin` OR `writer` role), with no
+// author arm and no admin requirement.
+
+/// A `writer` member of the owning group, who is neither its admin nor the
+/// hypothesis's author, may create an experiment and analyze a result, and the
+/// effect lands. An admin-only or author-only gate would refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_member_who_did_not_author_the_hypothesis_may_write_it() {
+    let w = world("r51-writer").await;
+    ensure_hypothesis_frame(&w.pool).await;
+
+    // new
+    let (status, body) = post(
+        w.addr,
+        w.writer,
+        RW,
+        "/api/v1/experiments/new".to_string(),
+        serde_json::json!({ "hypothesis_id": w.hypothesis, "agent_id": w.writer }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a writer member of the owning group creates an experiment: {body}"
+    );
+    assert_eq!(
+        experiments_on(&w.pool, w.hypothesis).await,
+        1,
+        "the writer's create records the experiment"
+    );
+
+    // analyze, on an experiment and result of its own so nothing else touches
+    // them.
+    let (experiment, result) = seed_experiment(&w.pool, w.hypothesis, w.writer, "collecting").await;
+    let before = analyze_footprint(&w, experiment).await;
+    let (status, body) = analyze(&w, w.writer, RW, experiment, result).await;
+    assert_eq!(
+        status, 200,
+        "a writer member of the owning group analyzes a result: {body}"
+    );
+    let (bbas, edges, exp_status) = analyze_footprint(&w, experiment).await;
+    assert!(
+        bbas == before.0 + 1 && edges == before.1 + 1 && exp_status == "complete",
+        "the writer's analyze lands one BBA and one provides_evidence edge and completes the \
+         experiment (bbas {bbas}, edges {edges}, status {exp_status})"
+    );
+}
+
+/// Authoring a hypothesis is not write access to it. An agent who wrote the
+/// claim but holds only a `reader` membership in its owning group is refused
+/// `403 not_owner` on create and on analyze, and nothing is written. An
+/// author-or-writable gate would admit it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_author_of_a_hypothesis_it_only_reads_may_not_write_it() {
+    let w = world("r51-author-reader").await;
+    ensure_hypothesis_frame(&w.pool).await;
+    // Authored by the `reader` member, owned by the group it only reads.
+    let hypothesis = viewer_fixture::seed_group_claim(
+        &w.pool,
+        w.reader,
+        w.group,
+        &format!("r51 hypothesis authored by a reader {}", Uuid::new_v4()),
+    )
+    .await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(hypothesis)
+        .fetch_one(&w.pool)
+        .await
+        .expect("hypothesis author");
+    assert_eq!(
+        author, w.reader,
+        "CALIBRATION: the refused caller is the author"
+    );
+    let create = |agent: Uuid| {
+        post(
+            w.addr,
+            agent,
+            RW,
+            "/api/v1/experiments/new".to_string(),
+            serde_json::json!({ "hypothesis_id": hypothesis, "agent_id": agent }),
+        )
+    };
+
+    let (status, body) = create(w.reader).await;
+    assert_not_owner(status, &body, "new, by the author with a reader membership");
+    assert_eq!(
+        experiments_on(&w.pool, hypothesis).await,
+        0,
+        "the author's refused create records no experiment"
+    );
+
+    let (experiment, result) = seed_experiment(&w.pool, hypothesis, w.owner, "collecting").await;
+    let before = analyze_footprint_on(&w.pool, hypothesis, experiment).await;
+    let (status, body) = analyze(&w, w.reader, RW, experiment, result).await;
+    assert_not_owner(
+        status,
+        &body,
+        "analyze, by the author with a reader membership",
+    );
+    assert_eq!(
+        analyze_footprint_on(&w.pool, hypothesis, experiment).await,
+        before,
+        "the author's refused analyze writes no BBA, no edge and no status change"
+    );
+
+    // CALIBRATION: the same hypothesis is writable by a member who may write
+    // its group, so the refusals above are about the caller.
+    let (status, body) = create(w.owner).await;
+    assert_eq!(status, 200, "calibration: the group admin creates: {body}");
+    let (status, body) = analyze(&w, w.owner, RW, experiment, result).await;
+    assert_eq!(status, 200, "calibration: the group admin analyzes: {body}");
 }
 
 // ── GET /api/v1/experiments?hypothesis_id= ─────────────────────────────────
