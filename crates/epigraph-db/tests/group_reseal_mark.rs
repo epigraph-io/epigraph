@@ -20,6 +20,9 @@ use uuid::Uuid;
 
 const SIGNATURE: &str = "public.epigraph_mark_group_reseal_required(uuid)";
 const CALL: &str = "SELECT public.epigraph_mark_group_reseal_required($1)";
+/// The world group every migrated database seeds: a bystander no test here
+/// marks.
+const WORLD_GROUP: Uuid = Uuid::nil();
 
 async fn seed_agent(pool: &PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -224,10 +227,30 @@ async fn an_admin_of_one_group_cannot_mark_another(pool: PgPool) {
     );
     assert_eq!(row(&pool, group_b).await, before_b, "B is unchanged");
 
+    let world_before = row(&pool, WORLD_GROUP).await;
+    assert!(
+        world_before["reseal_required_at"].is_null(),
+        "fixture: the migration-seeded world group is unmarked"
+    );
+
     call_as_app(&pool, Some(a_admin), group_a)
         .await
         .expect("CONTROL: the same principal marks its own group");
     assert!(row(&pool, group_a).await["reseal_required_at"].is_string());
+
+    // The mark is ONE group's. Inside the definer's frame `current_user` is the
+    // maintenance owner, which `groups_tenancy` admits on every row, so only
+    // the function's own `WHERE` keeps a successful mark off the bystanders.
+    assert_eq!(
+        row(&pool, group_b).await,
+        before_b,
+        "marking A leaves B's whole row unchanged"
+    );
+    assert_eq!(
+        row(&pool, WORLD_GROUP).await,
+        world_before,
+        "marking A leaves the world group's whole row unchanged"
+    );
 }
 
 /// `(prosecdef, owner, proacl, proconfig, prosrc)` of one function.
