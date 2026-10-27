@@ -114,6 +114,20 @@ ALTER TABLE public.workflows
 -- ===================================================================
 -- 2. Backfill (section 2 above)
 -- ===================================================================
+-- The backfill reads `claims` and `edges`, both under FORCEd row security. A
+-- session that does not bypass it would see no group-private claim and would
+-- make every plan public, so refuse unless this session reads every row: a
+-- maintenance session (`epigraph_bypass()`), a superuser, or a BYPASSRLS role.
+DO $$
+BEGIN
+    IF NOT (public.epigraph_bypass()
+            OR COALESCE((SELECT rolsuper OR rolbypassrls FROM pg_catalog.pg_roles
+                          WHERE rolname = current_user), false)) THEN
+        RAISE EXCEPTION '183: run as the maintenance role or a superuser; the backfill must '
+                        'read every group''s claims and edges';
+    END IF;
+END $$;
+
 WITH private_targets AS (
     SELECT e.source_id AS workflow_id, c.owner_group_id AS group_id, count(*) AS n
       FROM public.edges e
