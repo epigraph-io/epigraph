@@ -23,6 +23,8 @@
 //! * the write-free preview (`preview_claim_belief_on_frame`, behind
 //!   `recompute_betp --dry-run`, `shadow_report`, MCP `submit_ds_evidence`
 //!   and REST `submit_evidence`) returns the value the write leaves;
+//! * a vacate on a non-binary owner frame (`claim_validity`): BetP 1/|frame|
+//!   and the classification reset to `not_enough_info`;
 //! * a GROUP claim whose evidence moves to another group is vacated, read
 //!   by a member of the claim's group (the R-80 reads are viewer-spliced);
 //! * the claim-wide gate: an admissible input on ANOTHER frame of the claim
@@ -104,7 +106,12 @@ fn near(x: Option<f64>, y: f64) -> bool {
 /// Full ignorance on the binary `frame`: BetP 0.5, Bel 0, Pl 1, no conflict,
 /// no missing mass, `not_enough_info`.
 fn is_vacuous(c: &Cache, frame: Uuid) -> bool {
-    near(c.0, 0.5)
+    is_vacuous_over(c, frame, 2)
+}
+
+/// Full ignorance on `frame` of `hypotheses` hypotheses: BetP 1/|frame|.
+fn is_vacuous_over(c: &Cache, frame: Uuid, hypotheses: u32) -> bool {
+    near(c.0, 1.0 / f64::from(hypotheses))
         && near(c.1, 0.0)
         && near(c.2, 1.0)
         && near(c.3, 0.0)
@@ -508,6 +515,47 @@ async fn a_claim_without_a_cache_is_not_given_one(pool: PgPool) {
     assert!(
         after.0.is_none() && after.1.is_none() && after.2.is_none(),
         "a claim whose only BBA is inadmissible was given a cache it never had: {after:?}"
+    );
+}
+
+/// A vacate on a cache owned by a NON-binary frame: `claim_validity` (three
+/// hypotheses) owns the claim's cache, and its only BBA becomes inadmissible.
+/// Full ignorance there is BetP 1/3 on the claim's hypothesis, and the older
+/// classification label (which still carries the left-out evidence's
+/// direction) is reset to `not_enough_info` with it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_vacate_on_a_non_binary_owner_frame_resets_the_whole_cache(pool: PgPool) {
+    let w = world(&pool, "r80-validity").await;
+    let validity =
+        resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
+            .await
+            .expect("claim_validity");
+    let claim = fixture::seed_public_claim(&pool, w.author, "r80 validity owner").await;
+    let ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    store(&pool, claim, validity, w.author, ev, 0.8).await;
+    recompute_claim_cached_belief(
+        &mut pool.acquire().await.expect("acquire"),
+        &w.public,
+        claim,
+    )
+    .await
+    .expect("recompute while the evidence is public");
+    let mut stale = cache(&pool, claim).await;
+    assert!(
+        stale.0.is_some_and(|b| b > 0.5) && stale.5 == Some(validity),
+        "PREMISE: claim_validity owns a filled cache ({stale:?})"
+    );
+    // The verdict an earlier binary fold left beside it.
+    stale.6 = Some("supported".to_string());
+    restore(&pool, claim, &stale).await;
+    hide(&pool, ev, w.group, w.member).await;
+
+    recompute_as(&app_role(&pool).await, &w.member_viewer, claim).await;
+    let after = cache(&pool, claim).await;
+    assert!(
+        is_vacuous_over(&after, validity, 3),
+        "the vacate of a claim_validity-owned cache must be Bel 0, Pl 1, BetP 1/3 on \
+         claim_validity with not_enough_info; it left {after:?} (stale value {stale:?})"
     );
 }
 

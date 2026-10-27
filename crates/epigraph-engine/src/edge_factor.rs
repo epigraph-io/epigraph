@@ -577,7 +577,8 @@ where
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
 /// scalars [`recompute_combined_belief`] writes to `claims`, plus the CDST
-/// classification label when the frame is the canonical binary frame.
+/// classification label when the frame is the canonical binary frame (or
+/// `not_enough_info` on any frame when the cache is vacated, ruling R-80).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CombinedBeliefPreview {
     pub belief: f64,
@@ -587,7 +588,8 @@ pub struct CombinedBeliefPreview {
     pub missing_mass: f64,
     /// CDST classification label, only computed on the canonical binary
     /// frame (mirrors the `frame.id == BINARY_FRAME_NAME` gate in
-    /// `recompute_combined_belief`).
+    /// `recompute_combined_belief`), except that a vacated cache (ruling
+    /// R-80) carries `not_enough_info` on every frame.
     pub classification: Option<String>,
 }
 
@@ -1250,8 +1252,10 @@ async fn preview_of_combined(
 ///   on ANY frame of the claim, a non-compound claim, and a cache to
 ///   replace): full ignorance on this frame (`vacated` true). Bel 0, Pl 1,
 ///   BetP 1/|frame| (0.5 on the binary frame), no conflict or missing mass,
-///   and on the binary frame the classification that ignorance gets
-///   (`not_enough_info`). The old value was folded from sources narrower than the
+///   and the classification `not_enough_info` on every frame (the classifier
+///   gives ignorance that label on the binary frame; on any other frame an
+///   older label would still carry the direction of the evidence that was
+///   left out). The old value was folded from sources narrower than the
 ///   claim, so keeping it would go on serving their direction and weight to
 ///   every reader.
 /// * Otherwise (no BBA on the frame, or every BBA inadmissible but the claim
@@ -1295,19 +1299,27 @@ async fn compute_combined_belief(
         {
             let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
             let ignorance = MassFunction::vacuous(frame.clone());
-            let preview = preview_of_combined(
+            let mut preview = preview_of_combined(
                 &mut *conn, viewer, claim_id, frame_id, frame, &profile, &ignorance, 0.0, false,
             )
             .await?;
+            preview
+                .classification
+                .get_or_insert_with(|| VACATED_CLASSIFICATION.to_string());
             Ok(Some((preview, true)))
         }
         None => Ok(None),
     }
 }
 
+/// The classification a vacated cache carries on every frame (ruling R-80):
+/// the label the classifier gives full ignorance on the binary frame.
+const VACATED_CLASSIFICATION: &str = "not_enough_info";
+
 /// Write half of the combine pipeline: persist what [`compute_combined_belief`]
 /// computes to `claims.{belief, plausibility, pignistic_prob, conflict_k,
-/// missing_mass}` (and `classification` on the binary frame). No-ops (does not
+/// missing_mass}` (and `classification`: on the binary frame, or on any
+/// frame when the cache is vacated under ruling R-80). No-ops (does not
 /// write) when the claim has no BBAs on `frame_id`, or none the scope rule
 /// admits and nothing to vacate.
 async fn recompute_combined_belief(
