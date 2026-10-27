@@ -1820,7 +1820,12 @@ restart.
   unseal may be in flight while 171 applies. The new binaries work on either
   side, but while a database still has the key a write that collides with
   another owner's row is still refused: the cross-owner refusal ends when 171
-  applies, not when the binary ships. Undo is in the file's header.
+  applies, not when the binary ships. **Client-visible from the binary
+  deploy** on a database without the key: a same-owner, byte-identical
+  evidence write on a claim already holding that body (which stores a second
+  row today) is refused as a duplicate (HTTP 400; the MCP evidence-writing
+  tools answer an error and roll the whole submission back, label merges
+  included). Undo is in the file's header.
   **Applied to throwaway databases only, NOT to any deployed database.**
 - **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
   Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =

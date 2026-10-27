@@ -88,6 +88,16 @@
 -- that collides with another owner's row is still refused by the key, so the
 -- cross-owner refusal ends when this file applies, not when the binary ships.
 --
+-- CLIENT-VISIBLE FROM THE BINARY DEPLOY, before this file runs, on a database
+-- that never had the key (the long-lived one): a same-owner, byte-identical
+-- evidence write on a claim that already holds that body, which today stores a
+-- second row, is refused as a duplicate by the new binaries. HTTP evidence
+-- writes answer 400; the MCP tools that write evidence (submit_claim's
+-- evidence, update_with_evidence, memorize, report_workflow_outcome, the
+-- ingestion tools) answer an error and roll their whole submission back,
+-- label merges included. That is the de-duplication a keyed database always
+-- had; callers that resubmit identical evidence see it from the deploy on.
+--
 -- UNDO of section 1 (only on a database with no duplicate (content_hash,
 -- claim_id) rows;
 -- count them first, read-only, with
