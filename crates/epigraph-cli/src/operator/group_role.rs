@@ -4,10 +4,13 @@
 //!
 //! A binding makes every registered human holding a live assignment of the
 //! role (its `grant-role` window) a `reader` or `writer` of the group, and,
-//! with `--include-agents`, every agent registered to such a human (an acting
-//! live link or a live client allowance). Nothing is written to the group's
-//! roster: the membership is computed when a viewer is resolved, so it lapses
-//! at the window's end with no job.
+//! with `--include-agents` (`--agent-mode registered_agents`), every agent
+//! registered to such a human (an acting live link or a live client
+//! allowance), or, with `--agent-mode attached_agents` (migration 179), only
+//! the agents ATTACHED to the role (`role_agents`, migration 166) whose own
+//! human holds it. Nothing is written to the group's roster: the membership
+//! is computed when a viewer is resolved, so it lapses at the window's end
+//! with no job.
 //!
 //! Each write calls ONE maintenance-only definer in one transaction,
 //! committed under `--apply` and rolled back otherwise (the audit row with
@@ -43,6 +46,44 @@ pub fn validate_member_role(role: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The agent modes a binding takes (migration 179): the holder only, the
+/// holder and every agent registered to it (165's `include_agents`), or the
+/// holder and the role's attached agents only.
+pub const AGENT_MODES: [&str; 3] = ["holder_only", "registered_agents", "attached_agents"];
+
+/// The mode only migration 179's text overloads can record. The other two
+/// are bound through 165's boolean signatures, so they keep working on a
+/// database where 179 is not applied yet.
+pub const ATTACHED_AGENTS: &str = "attached_agents";
+
+/// The agent mode of a `define-group-role` / `bind-group-role` call:
+/// `--agent-mode` when given (validated), else 165's `--include-agents`
+/// (`registered_agents` when set, `holder_only` otherwise). Both at once is
+/// refused: the two flags would say the same thing twice, or contradict.
+///
+/// # Errors
+/// `agent_mode` is not one of [`AGENT_MODES`], or both flags were given.
+pub fn agent_mode(include_agents: bool, agent_mode: Option<&str>) -> anyhow::Result<&str> {
+    match agent_mode {
+        Some(_) if include_agents => bail!(
+            "--include-agents and --agent-mode are one choice; give --agent-mode only; nothing \
+             was done"
+        ),
+        Some(mode) => AGENT_MODES
+            .iter()
+            .copied()
+            .find(|m| *m == mode)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--agent-mode {mode:?} is not an agent mode (valid: {}); nothing was done",
+                    AGENT_MODES.join(", ")
+                )
+            }),
+        None if include_agents => Ok("registered_agents"),
+        None => Ok("holder_only"),
+    }
+}
+
 /// Refuse a role key that is not `role:<lowercase-key>` before any connection.
 ///
 /// # Errors
@@ -64,7 +105,8 @@ async fn finish(tx: sqlx::Transaction<'_, sqlx::Postgres>, apply: bool) -> anyho
 }
 
 /// Define the catalog role `key` (non-elevating, no audit read) and bind it
-/// to `group`, in one transaction. Returns the binding id.
+/// to `group` in `agent_mode` (one of [`AGENT_MODES`]), in one transaction.
+/// Returns the binding id.
 ///
 /// # Errors
 /// The definer refused (GRB03 the key is already in the catalog; GRB02 the
@@ -77,26 +119,44 @@ pub async fn define(
     description: &str,
     group: Uuid,
     member_role: &str,
-    include_agents: bool,
+    agent_mode: &str,
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<Uuid> {
     let mut tx = super::team_group::begin_audited(conn, "define-group-role").await?;
-    let binding: Uuid =
-        sqlx::query_scalar("SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5, $6)")
+    // The attached mode through 179's text overload; the other two through
+    // 165's boolean signature. Each call casts the mode argument, so the SQL
+    // text names the overload it means (and sqlx's statement cache, keyed by
+    // that text, never mixes the two).
+    let binding: Uuid = if agent_mode == ATTACHED_AGENTS {
+        sqlx::query_scalar("SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5::text, $6)")
             .bind(key)
             .bind(description)
             .bind(group)
             .bind(member_role)
-            .bind(include_agents)
+            .bind(agent_mode)
             .bind(reason)
             .fetch_one(&mut *tx)
-            .await?;
+            .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5::boolean, $6)",
+        )
+        .bind(key)
+        .bind(description)
+        .bind(group)
+        .bind(member_role)
+        .bind(agent_mode == "registered_agents")
+        .bind(reason)
+        .fetch_one(&mut *tx)
+        .await?
+    };
     finish(tx, apply).await?;
     Ok(binding)
 }
 
-/// Bind the existing catalog role `role` to `group`. Returns the binding id.
+/// Bind the existing catalog role `role` to `group` in `agent_mode` (one of
+/// [`AGENT_MODES`]). Returns the binding id.
 ///
 /// # Errors
 /// The definer or the table refused (GRB01 the role elevates or reads the
@@ -107,20 +167,30 @@ pub async fn bind(
     role: &str,
     group: Uuid,
     member_role: &str,
-    include_agents: bool,
+    agent_mode: &str,
     reason: &str,
     apply: bool,
 ) -> anyhow::Result<Uuid> {
     let mut tx = super::team_group::begin_audited(conn, "bind-group-role").await?;
-    let binding: Uuid =
-        sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4, $5)")
+    let binding: Uuid = if agent_mode == ATTACHED_AGENTS {
+        sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4::text, $5)")
             .bind(role)
             .bind(group)
             .bind(member_role)
-            .bind(include_agents)
+            .bind(agent_mode)
             .bind(reason)
             .fetch_one(&mut *tx)
-            .await?;
+            .await?
+    } else {
+        sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4::boolean, $5)")
+            .bind(role)
+            .bind(group)
+            .bind(member_role)
+            .bind(agent_mode == "registered_agents")
+            .bind(reason)
+            .fetch_one(&mut *tx)
+            .await?
+    };
     finish(tx, apply).await?;
     Ok(binding)
 }
@@ -194,6 +264,22 @@ mod tests {
         assert!(validate_member_role("owner").is_err());
         for ok in MEMBER_ROLES {
             assert!(validate_member_role(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn the_agent_mode_is_one_choice() {
+        assert_eq!(agent_mode(false, None).unwrap(), "holder_only");
+        assert_eq!(agent_mode(true, None).unwrap(), "registered_agents");
+        for mode in AGENT_MODES {
+            assert_eq!(agent_mode(false, Some(mode)).unwrap(), mode);
+            assert!(
+                agent_mode(true, Some(mode)).is_err(),
+                "{mode} with the old flag"
+            );
+        }
+        for bad in ["attached", "everyone", "true", "", "ATTACHED_AGENTS"] {
+            assert!(agent_mode(false, Some(bad)).is_err(), "{bad:?}");
         }
     }
 

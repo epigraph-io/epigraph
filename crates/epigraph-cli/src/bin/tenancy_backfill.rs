@@ -2148,6 +2148,12 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
         // ('epigraph_maintenance', ..) = true, ('epigraph', ..) = true
         // (superuser), ('epigraph_seed', ..) = false. So the app-owned case
         // this exists to catch still fails, which is the point.
+        //
+        // OVERLOADS (179 added mode-taking overloads of two registered
+        // verbs): the register names a function, not a signature, so every
+        // overload of the name is checked by reporting the WORST-owned one
+        // (`false` sorts first). A bare `LIMIT 1` would check whichever
+        // overload the catalog returned first and could pass a misowned one.
         // ==============================================================
         let owner: Option<(String, bool)> = sqlx::query_as(
             "SELECT r.rolname, pg_has_role(r.rolname, $2, 'MEMBER')
@@ -2155,6 +2161,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                JOIN pg_namespace n ON n.oid = p.pronamespace
                JOIN pg_roles r ON r.oid = p.proowner
               WHERE n.nspname = 'public' AND p.proname = $1
+              ORDER BY pg_has_role(r.rolname, $2, 'MEMBER') ASC, p.oid
               LIMIT 1",
         )
         .bind(f)
@@ -2679,6 +2686,18 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
             false,
         ),
+        // 179: the mode-taking overloads of the same two verbs (a binding
+        // that admits the holder and the role's attached agents only).
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+            false,
+        ),
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            false,
+        ),
         (
             "epigraph_end_group_role_binding",
             "public.epigraph_end_group_role_binding(uuid, text)",
@@ -2749,15 +2768,31 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
     }
     let mut failures = 0usize;
     for (name, signature, app_must_execute) in GRANTS {
-        let present: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_proc p
-                              JOIN pg_namespace n ON n.oid = p.pronamespace
-                             WHERE n.nspname = 'public' AND p.proname = $1)",
-        )
-        .bind(name)
-        .fetch_one(pool)
-        .await?;
+        // Presence by SIGNATURE, not by name: a name can exist through an
+        // older overload while the registered signature is installed by a
+        // migration not applied yet (179's text overloads beside 165's
+        // boolean verbs), and `has_function_privilege` RAISES on a signature
+        // it cannot resolve, which would abort this pre-flight.
+        let present: bool = sqlx::query_scalar("SELECT to_regprocedure($1) IS NOT NULL")
+            .bind(signature)
+            .fetch_one(pool)
+            .await?;
         if !present {
+            let name_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                                  JOIN pg_namespace n ON n.oid = p.pronamespace
+                                 WHERE n.nspname = 'public' AND p.proname = $1)",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+            if name_exists {
+                eprintln!(
+                    "NOTE: skipping the EXECUTE check for {signature}: public.{name} exists, but \
+                     not with that signature (the migration that installs it is not applied \
+                     yet, or the register drifted). That signature is UNCHECKED, not passing."
+                );
+            }
             continue;
         }
         let app_can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
@@ -3913,6 +3948,51 @@ mod definer_register_tests {
                 "public.{name} is exempt as dropped by {version}, but {recreated:?} name it again"
             );
         }
+    }
+
+    /// `verify`'s app-grant check runs as a PRE-FLIGHT, before later
+    /// migrations apply, so a database below 179 (which has 165's boolean
+    /// `epigraph_bind_group_role` / `epigraph_define_group_role` but not 179's
+    /// text overloads) must be CHECKED, not aborted: an entry whose SIGNATURE
+    /// is not installed is skipped, although a function of that NAME exists.
+    /// CONTROL: at head every entry is checked and passes, and a stray grant
+    /// on an overload that IS installed is still reported.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_skips_an_overload_whose_migration_is_not_applied(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for stmt in [
+            "DROP FUNCTION public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            "DROP FUNCTION public.epigraph_bind_group_role(text, uuid, text, text, text)",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("a database below 179 is checked, not aborted"),
+            0,
+            "the uninstalled overloads are skipped; every installed entry still passes"
+        );
+        sqlx::query(
+            "GRANT EXECUTE ON FUNCTION \
+             public.epigraph_bind_group_role(text, uuid, text, boolean, text) TO epigraph_app",
+        )
+        .execute(&pool)
+        .await
+        .expect("stray grant");
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check"),
+            1,
+            "CONTROL: the installed boolean overload is still checked"
+        );
     }
 
     /// `verify`'s 166 coverage check passes on a database migrated to head,

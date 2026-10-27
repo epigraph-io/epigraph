@@ -1309,6 +1309,109 @@ Two consequences to know:
   `group-member add` of a teammate's agent still requires the teammate's own
   explicit writer row (GRP03), so no explicit row outlives a window.
 
+### Only the role's ATTACHED agents (migration 179)
+
+`--include-agents` admits every agent registered to the holder, which is
+every container or job that human ever linked. To keep a group private to the
+holder and the few agents that work FOR the role, bind it with `--agent-mode
+attached_agents` instead (`holder_only` and `registered_agents` are the other
+two modes; `--include-agents` is `registered_agents`). An agent is then a
+member while:
+
+* it has a live attachment to the BOUND role (migration 166's `role_agents`:
+  not detached, inside its window; an attachment to another role, or one
+  whose window has not opened, admits nothing);
+* its OWN human (its acting live operator link, or its client allowance)
+  holds a live assignment of the role: an agent attached while another human
+  holds it is not a member, the same rule 166's `ROL01` applies to its
+  writes; and
+* the attachment COUNTS: one the operator made for this agent counts as it
+  is; a SUCCESSION COPY (166 attaches every registered successor of an
+  attached identity, at registration and at attach time) counts only when the
+  agent runs in one group folder, and that folder is one the identity the
+  operator attached runs in. A same-folder successor (a prompt or model
+  change of the same job) keeps the group. A successor that also runs in
+  another folder (a shared identity, which 166 flags), a successor registered
+  in a different folder, and later copies of those do not: they stay attached
+  for 166's refusals only.
+
+A detach does not follow the lineage. To take the group from a job's lineage,
+detach each attached identity in it (`epigraph_detach_agent_from_role`), or
+end the binding.
+
+#### Recipe: a role-private group for a scheduled job
+
+A role that ELEVATES or reads the audit trail (`role:platform-custodian`,
+`role:auditor`) is refused in every mode (GRB01), so the group is bound to a
+new, non-elevating role that the same human holds, here
+`role:platform-operations`. Everything runs on the maintenance DSN; every
+`epigraph-operator` command is a dry run until `--apply`.
+
+1. Create the group (it carries no key):
+
+   ```bash
+   epigraph-operator create-group --kind team --name "<name>" \
+       --admin <person agent id> --reason "<why>" --apply
+   ```
+
+2. Define the role and bind it in the attached mode. `define-group-role`
+   always writes a NON-elevating catalog row (`elevates = false`,
+   `reads_audit = false`):
+
+   ```bash
+   epigraph-operator define-group-role --key role:platform-operations \
+       --description "<what the role does>" --group <group id> \
+       --member-role writer --agent-mode attached_agents --reason "<why>" --apply
+   ```
+
+   `--agent-mode attached_agents` needs migration 179; the other modes work on
+   165.
+
+3. Grant the role to the human who runs the job:
+
+   ```bash
+   epigraph-operator grant-role --role role:platform-operations \
+       --holder <person agent id> (--valid-to <RFC3339> | --open-ended) \
+       --reason "<why>" --apply
+   ```
+
+   Add `--granted-by` (and `--act`) as "The custodian role" above requires
+   once a live custodian exists.
+
+4. Register the job's identity, through the host's identity attestor, in the
+   group folder the job runs in, and link it to that human. Do this BEFORE
+   step 5: an identity that already has an attachment when the host first
+   registers it is refused (`AID09`).
+
+5. Attach the identity to the role (166; no CLI verb yet):
+
+   ```sql
+   SELECT public.epigraph_attach_agent_to_role(
+       'role:platform-operations', '<identity agent id>', NULL, NULL, '<why>');
+   ```
+
+6. Check: `epigraph-operator group-roster --group <group id>` lists the holder
+   and the identity at `writer`, and no other agent of that human.
+
+What to know before relying on it:
+
+* 166's rule applies as well: an attached identity WRITES nothing anywhere
+  while the role has no holder, and it does not run (host skip, MCP boot
+  refusal). Attach the identity to `role:platform-operations` only. If it is
+  ALSO attached to another role (the custodian role, say), its human must
+  hold every role it is attached to before it may write at all.
+* The job's later identities (a prompt or model change in the same folder)
+  inherit the attachment and keep the group with no operator act. Moving the
+  job to another folder, or running the same identity in a second folder,
+  drops the group for the copies; attach the new identity explicitly if that
+  is intended.
+* Membership is computed at each resolve, like 165's: it lapses at the
+  assignment's end, the attachment's end or detach, and the binding's end,
+  with no job.
+* "Private" means non-public to every API and MCP principal outside the
+  group. A process holding the application database DSN is not bound by it
+  (see "Arming, and the valve").
+
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 
 `ownership` was the pre-tenancy ACL table: one row per node, naming an agent and
