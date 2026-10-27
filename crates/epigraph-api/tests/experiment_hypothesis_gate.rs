@@ -737,6 +737,82 @@ async fn the_author_of_a_hypothesis_it_only_reads_may_not_write_it() {
     assert_eq!(status, 200, "calibration: the group admin analyzes: {body}");
 }
 
+// ── A public hypothesis: readable by everyone, writable by no ordinary agent ─
+
+/// A PUBLIC hypothesis (owned by the memberless world group, the shape of the
+/// legacy corpus) is the second way a caller can read a hypothesis it may not
+/// write. R-51's consequence for it: any agent lists its experiments, but
+/// none outside the owning group's writable set may create an experiment on
+/// it or analyze a result onto it. That includes its author. The refusal is
+/// `403 not_owner`, not a 404 and not a 200, and nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_hypothesis_is_listed_by_anyone_and_written_by_no_ordinary_agent() {
+    let w = world("r51-public").await;
+    ensure_hypothesis_frame(&w.pool).await;
+    let hypothesis = viewer_fixture::seed_public_claim(
+        &w.pool,
+        w.owner,
+        &format!("r51 public hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    let (experiment, result) = seed_experiment(&w.pool, hypothesis, w.owner, "collecting").await;
+
+    // CALIBRATION: the hypothesis is readable by the stranger, so a refusal
+    // below is the write gate and not a hidden-hypothesis 404.
+    let (status, body) = get(
+        w.addr,
+        w.stranger,
+        format!("/api/v1/experiments?hypothesis_id={hypothesis}"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "anyone lists the experiments of a public hypothesis: {body}"
+    );
+    let ids: Vec<String> = body["experiments"]
+        .as_array()
+        .expect("experiments array")
+        .iter()
+        .map(|e| e["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ids, vec![experiment.to_string()], "{body}");
+
+    // The stranger, and the claim's own author: neither may write it.
+    for (agent, who) in [(w.stranger, "a stranger"), (w.owner, "its author")] {
+        let (status, body) = post(
+            w.addr,
+            agent,
+            RW,
+            "/api/v1/experiments/new".to_string(),
+            serde_json::json!({ "hypothesis_id": hypothesis, "agent_id": agent }),
+        )
+        .await;
+        assert_not_owner(
+            status,
+            &body,
+            &format!("new on a public hypothesis, by {who}"),
+        );
+
+        let before = analyze_footprint_on(&w.pool, hypothesis, experiment).await;
+        let (status, body) = analyze(&w, agent, RW, experiment, result).await;
+        assert_not_owner(
+            status,
+            &body,
+            &format!("analyze onto a public hypothesis, by {who}"),
+        );
+        assert_eq!(
+            analyze_footprint_on(&w.pool, hypothesis, experiment).await,
+            before,
+            "a refused analyze by {who} writes no BBA, no edge and no status change"
+        );
+    }
+    assert_eq!(
+        experiments_on(&w.pool, hypothesis).await,
+        1,
+        "the refused creates record no experiment beside the seeded one"
+    );
+}
+
 // ── GET /api/v1/experiments?hypothesis_id= ─────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
