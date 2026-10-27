@@ -1797,6 +1797,79 @@ restart.
   membership. Undo: delete the two rows. Slot:
   see 172. **Deploy order:** independent; no binary change. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **174**: public `refresh_chain_issuing_app` (backlog 7a2111e6, U002
+  follow-up). Adds `refresh_tokens.issued_to_client_id` (the connector app an
+  authorization-code chain was issued to; no foreign key, read as "not
+  active" when the app cannot be found), granted to `epigraph_app` as a
+  column SELECT. A `BEFORE INSERT` trigger,
+  `refresh_tokens_inherit_issuing_app` (SECURITY INVOKER), gives a rotated
+  successor its family's app, with a partial index over the bound rows for
+  the lookup. `epigraph_refresh_token_rotate` is NOT restated, so 174
+  commutes with any migration that restates it (172 included). Adds
+  `epigraph_refresh_token_revoke_client_app(uuid, uuid)`, a SECURITY INVOKER
+  operator revoke keyed by (per-user client, app), EXECUTE for
+  `epigraph_maintenance` only. Both functions pin `search_path = pg_catalog,
+  pg_temp`. Pinned by `epigraph-api/tests/oauth_refresh_hardening.rs` (app
+  role end to end, including a bound chain rotated twice before its app is
+  suspended; the revoke run as the maintenance role). Existing chains stay
+  unbound (NULL). Undo is in the file's header. **Deploy order:** before the
+  API binary built against it (without the column, every refresh-token mint
+  and every refresh fails). **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
+- **175**: public `edge_relationship_canonical_spelling` (backlog 3ce5e00c,
+  U014 PR-2). The schema half of one lower-case spelling for the case-folded
+  relationships `supports` / `contradicts` / `corroborates` / `refutes`
+  (writers store `canonical_relationship`; readers match
+  `relationship_spellings`). Re-states 011's `edge_to_factor_type` verbatim
+  plus `corroborates` (evidential_support 0.85/0.85) and `refutes`
+  (mutual_exclusion), so a lower-case claim/claim edge of either gets the
+  factor its upper-case spelling always got (new MCP `link_epistemic`
+  `corroborates` / `refutes` edges now get one too). Rebuilds 090's
+  `edges_symmetric_relationship_uniq` keyed and filtered on
+  `lower(relationship)`, so a legacy matcher `CORROBORATES` and a new matcher
+  `corroborates` over one pair are one key. Pinned by
+  `epigraph-db/tests/edge_relationship_canonical_write.rs`. Existing rows are
+  NOT rewritten here: the fold is the operator runbook
+  `docs/runbooks/edge-relationship-casefold.sql` (backup table, undo in
+  `edge-relationship-casefold-undo.sql`), run after this migration. **Deploy
+  order (binding):** epigraph-api first (only it applies migrations), THEN
+  epigraph-mcp / epigraph-jobs / `decompose_claims`, THEN the operator fold. A
+  matcher binary running against a database without 175 writes `corroborates`
+  edges that get no factor (AFTER INSERT trigger, no backfill) and fall outside
+  090's index; see the file header. **Deploy precondition:** the census in the
+  file header (expected zero rows). Undo:
+  re-run 011's function body and 090's index statement. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+- **176**: public `caller_refusal_codes` (backlog e2c22c7c, operator ruling
+  R-25). Re-states twelve functions from their latest definitions so that the
+  designed refusals in functions an application session runs on a caller's
+  write (EXECUTE-able by `epigraph_app`, or triggers on tables it may write)
+  open with a refusal code, which PR #686's fail-closed MCP `internal_error`
+  passes and the shared HTTP mapper maps (`epigraph_db::CALLER_REFUSAL_CODES`)
+  to a 4xx carrying the message:
+  `AAR01`-`AAR11` (`epigraph_admin_act_args`), `AAR12`
+  (`epigraph_propose_admin_act`), `TEN01` (`epigraph_owner_immutable_guard`),
+  `TEN02` (`epigraph_writer_owner_guard`), `GRM01`-`GRM06` (108, 109 and 164's
+  guards on `groups` and `group_memberships`), `PRV01`
+  (`epigraph_no_public_sealed`) and `AGK01`
+  (`epigraph_agents_refuse_registered_system_key`, whose system role moves to
+  DETAIL). Reach when written: AGK01 through `POST /api/v1/agents` and the MCP
+  document ingest (it answered the generic error before 176); AAR01-AAR12
+  through propose-admin-act (already relayed as text); the TEN, GRM and PRV
+  arms are reached by no shipped route or tool and are coded for a later
+  path that does. Only RAISE statements change, each keeping its SQLSTATE; owner,
+  ACL, SECURITY mode, search_path and volatility are kept by CREATE OR
+  REPLACE. Pinned by `epigraph-db/tests/caller_refusal_codes_restatement.rs`
+  (a database before 176 against the same database at 176) and the refusal
+  tests `epigraph-api/tests/caller_refusal_codes_http.rs` and
+  `epigraph-mcp/tests/caller_refusal_codes_mcp.rs` (AGK01 through the real
+  route and tool; the others through the mappers). The header lists what is
+  deliberately NOT coded and why. Undo: re-run each function's latest prior
+  definition (named in the file). **Deploy order:** after 168 (every body it
+  starts from is at or below 168). A LATER migration that re-states one of
+  these functions must start from 176's body or it drops the code. **Applied
+  to throwaway databases only, NOT to any deployed database.**
 - **179**: public `role_binding_attached_agents`. A third mode for 165's
   role bindings: the role HOLDER plus the agents ATTACHED to the role (166's
   `role_agents`) only. Adds `group_role_bindings.attached_agents boolean NOT
@@ -1875,50 +1948,6 @@ restart.
   the owner and the grant, so run it after 181.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
-- **174**: public `refresh_chain_issuing_app` (backlog 7a2111e6, U002
-  follow-up). Adds `refresh_tokens.issued_to_client_id` (the connector app an
-  authorization-code chain was issued to; no foreign key, read as "not
-  active" when the app cannot be found), granted to `epigraph_app` as a
-  column SELECT. A `BEFORE INSERT` trigger,
-  `refresh_tokens_inherit_issuing_app` (SECURITY INVOKER), gives a rotated
-  successor its family's app, with a partial index over the bound rows for
-  the lookup. `epigraph_refresh_token_rotate` is NOT restated, so 174
-  commutes with any migration that restates it (172 included). Adds
-  `epigraph_refresh_token_revoke_client_app(uuid, uuid)`, a SECURITY INVOKER
-  operator revoke keyed by (per-user client, app), EXECUTE for
-  `epigraph_maintenance` only. Both functions pin `search_path = pg_catalog,
-  pg_temp`. Pinned by `epigraph-api/tests/oauth_refresh_hardening.rs` (app
-  role end to end, including a bound chain rotated twice before its app is
-  suspended; the revoke run as the maintenance role). Existing chains stay
-  unbound (NULL). Undo is in the file's header. **Deploy order:** before the
-  API binary built against it (without the column, every refresh-token mint
-  and every refresh fails). **Applied to throwaway databases only, NOT to any
-  deployed database.**
-
-- **175**: public `edge_relationship_canonical_spelling` (backlog 3ce5e00c,
-  U014 PR-2). The schema half of one lower-case spelling for the case-folded
-  relationships `supports` / `contradicts` / `corroborates` / `refutes`
-  (writers store `canonical_relationship`; readers match
-  `relationship_spellings`). Re-states 011's `edge_to_factor_type` verbatim
-  plus `corroborates` (evidential_support 0.85/0.85) and `refutes`
-  (mutual_exclusion), so a lower-case claim/claim edge of either gets the
-  factor its upper-case spelling always got (new MCP `link_epistemic`
-  `corroborates` / `refutes` edges now get one too). Rebuilds 090's
-  `edges_symmetric_relationship_uniq` keyed and filtered on
-  `lower(relationship)`, so a legacy matcher `CORROBORATES` and a new matcher
-  `corroborates` over one pair are one key. Pinned by
-  `epigraph-db/tests/edge_relationship_canonical_write.rs`. Existing rows are
-  NOT rewritten here: the fold is the operator runbook
-  `docs/runbooks/edge-relationship-casefold.sql` (backup table, undo in
-  `edge-relationship-casefold-undo.sql`), run after this migration. **Deploy
-  order (binding):** epigraph-api first (only it applies migrations), THEN
-  epigraph-mcp / epigraph-jobs / `decompose_claims`, THEN the operator fold. A
-  matcher binary running against a database without 175 writes `corroborates`
-  edges that get no factor (AFTER INSERT trigger, no backfill) and fall outside
-  090's index; see the file header. **Deploy precondition:** the census in the
-  file header (expected zero rows). Undo:
-  re-run 011's function body and 090's index statement. **Applied to
-  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
