@@ -447,3 +447,73 @@ async fn the_write_side_stamps_a_report_and_requires_a_declared_source(pool: PgP
         "undeclared source: {code:?}"
     );
 }
+
+/// An audit report keeps its fragment's tenancy when the FRAGMENT's tenancy
+/// changes, not only at INSERT. Driven through the real path: a public claim
+/// is narrowed to its group, 070 arm (d) carries that to the fragment its
+/// provenance names, and the fragment's audit report must follow, or the
+/// first privatization leaves the audit of a now-private fragment readable to
+/// every application session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_audit_report_follows_its_fragment_when_a_claim_is_narrowed(pool: PgPool) {
+    let (owner, owner_group) = fixture::seed_agent_with_group(&pool, "harv-follow").await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "harv-follow-x").await;
+    let pipeline = seed_pipeline(&pool, owner_group, "public").await;
+
+    let claim = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'harvested claim', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(
+        claim
+            .as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(32)
+            .collect::<Vec<u8>>(),
+    )
+    .bind(owner)
+    .bind(owner_group)
+    .execute(&pool)
+    .await
+    .expect("seed a public claim of the owner's group");
+    sqlx::query("INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)")
+        .bind(claim)
+        .bind(pipeline.fragment)
+        .execute(&pool)
+        .await
+        .expect("link the fragment to the claim");
+
+    sqlx::query("UPDATE claims SET visibility = 'group' WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("narrow the claim to its group");
+
+    assert_eq!(
+        tenancy_of(&pool, "harvester_fragments", pipeline.fragment).await,
+        (owner_group, "group".to_string()),
+        "CONTROL: arm (d) carries the narrowing to the fragment"
+    );
+    assert_eq!(
+        tenancy_of(&pool, "harvester_audit_reports", pipeline.report).await,
+        (owner_group, "group".to_string()),
+        "the audit report follows its fragment"
+    );
+    let seen = read_as_app(
+        &pool,
+        stranger_group.to_string(),
+        stranger.to_string(),
+        &pipeline,
+    )
+    .await;
+    assert_eq!(
+        seen[2],
+        ("harvester_audit_reports", 0),
+        "a non-member no longer reads the audit of a now-private fragment: {seen:?}"
+    );
+}
