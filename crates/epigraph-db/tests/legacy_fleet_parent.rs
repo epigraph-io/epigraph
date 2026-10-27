@@ -20,11 +20,13 @@
 //!
 //! # What is under test
 //!
-//! * The legacy fleet parent (operator-linked) is accepted, its operator is
-//!   inherited, and the succession is recorded.
+//! * The legacy fleet parent (operator-linked, LIVE) is accepted, its
+//!   operator is inherited, and the succession is recorded.
 //! * A row no operator linked is refused, even when it set `llm_model` on
 //!   itself and the backfill keyed it: the parent is found by a key anyone
-//!   can compute, so only attested state may admit it.
+//!   can compute, so only attested state may admit it. So is a row whose
+//!   only link is RETIRED: a bulk ownership tie or a retired legacy link,
+//!   on the registration and on the record.
 //! * A REAL human keeps being refused even when it carries the full legacy
 //!   shape (`llm_model`, an operator link, a backfilled legacy key,
 //!   `agent_type 'human'`): a registered human operator, a revoked one, a
@@ -38,6 +40,11 @@
 //!   its rule without changing anything.
 //! * 180 refuses to re-state a registration body it was not written from, and
 //!   `docs/runbooks/180-undo.sql` returns the catalog to 166's.
+//! * The registration's role-attachment copy never copies a parent's row
+//!   back onto the child it came from (a revert): neither when the row's
+//!   chain reaches the child's own (detached) attachment nor when "the
+//!   parent succeeded the child" is on record; an ordinary successor is
+//!   still copied.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -791,14 +798,99 @@ async fn a_self_described_llm_row_no_operator_linked_is_refused_aid03(pool: PgPo
     assert!(child.succession_created, "{child:?}");
 }
 
+/// A BULK OWNERSHIP TIE IS NOT AN ATTESTATION. `epigraph_link_legacy_authors`
+/// ties every unlinked AUTHOR (here of one recall event) to an operator with
+/// a RETIRED link, which says "this author's rows belong to that operator",
+/// not "the operator linked this row as one of its agents". A planted,
+/// self-described row tied that way, and keyed by a later backfill run, must
+/// stay refused AID03, by the registration and by the record. CONTROL: a
+/// legacy fleet row the operator live-linked, in the same database, passes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bulk_retired_ownership_tie_does_not_make_a_planted_row_a_parent_aid03(pool: PgPool) {
+    let planted = self_described_llm_row(&pool).await;
+    sqlx::query(
+        "INSERT INTO recall_events (agent_id, tool, query_text) VALUES ($1, 'recall', 'x')",
+    )
+    .bind(planted)
+    .execute(&pool)
+    .await
+    .expect("the planted row authors a recall event");
+    let operator = human_operator(&pool).await;
+    let outcomes: Vec<(Uuid, String)> =
+        fixture::as_role(&pool, MAINTENANCE, |mut conn| async move {
+            let r: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT agent_id, outcome FROM public.epigraph_link_legacy_authors( \
+                     $1, '{}', now() - interval '30 days')",
+            )
+            .bind(operator)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("the maintenance role runs link-legacy-authors");
+            (conn, r)
+        })
+        .await;
+    assert_eq!(
+        outcomes
+            .iter()
+            .find(|(a, _)| *a == planted)
+            .map(|x| x.1.as_str()),
+        Some("linked"),
+        "CALIBRATION: the bulk run tied the planted row: {outcomes:?}"
+    );
+    let retired: Option<bool> =
+        sqlx::query_scalar("SELECT retired FROM operator_links WHERE agent_id = $1")
+            .bind(planted)
+            .fetch_optional(&pool)
+            .await
+            .expect("link row");
+    assert_eq!(
+        retired,
+        Some(true),
+        "CALIBRATION: the tie is a RETIRED link"
+    );
+    backfill_legacy_keys(&pool).await;
+    assert!(
+        has_legacy_key(&pool, planted).await,
+        "CALIBRATION: a later backfill keyed it"
+    );
+
+    let before = footprint(&pool).await;
+    let err = try_register(&pool, &new_identity(), Some(planted), GROUP)
+        .await
+        .expect_err("a bulk-tied planted row is not a parent");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+
+    // The record path: a parentless child of the same operator, live-linked.
+    let child = try_register(&pool, &new_identity(), None, GROUP)
+        .await
+        .expect("a parentless registration");
+    link(&pool, child.agent_id, operator).await;
+    let err = try_record(&pool, child.agent_id, planted, GROUP)
+        .await
+        .expect_err("the record refuses the bulk-tied row");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID10"), "{err}");
+
+    // CONTROL: an operator-linked (live) legacy row passes in this database.
+    let fleet = legacy_fleet_row(&pool).await;
+    backfill_legacy_keys(&pool).await;
+    link(&pool, fleet, operator).await;
+    let ok = try_register(&pool, &new_identity(), Some(fleet), GROUP)
+        .await
+        .expect("a live-linked legacy parent is accepted");
+    assert!(ok.succession_created, "{ok:?}");
+}
+
 /// The shape of a real cut-over parent: three legacy fleet identities of ONE
 /// operator, each `agent_type 'human'` (the old default) with `llm_model`, a
 /// live operator link, an `identity-legacy` key for its own public key, key
 /// kind `ed25519`, no `oauth-principal` label, no `human_operators` row and
 /// no human OAuth client. Each is accepted as a parent and passes its
-/// operator on. A link the operator has since RETIRED still attests the
-/// parent (the legacy links are scheduled for retirement), so a parent
-/// retired before its group registers is accepted too.
+/// operator on. Only a LIVE link attests: once the operator RETIRES a
+/// parent's link (the legacy links are scheduled for retirement), that
+/// parent is refused AID03 and the host falls back to a parentless
+/// registration and alerts. A retired row also results from bulk ownership
+/// ties, which attest nothing about the row being a fleet identity.
 #[sqlx::test(migrations = "../../migrations")]
 async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPool) {
     let operator = human_operator(&pool).await;
@@ -856,11 +948,17 @@ async fn operator_linked_legacy_parents_of_one_operator_are_accepted(pool: PgPoo
     }
 
     retire_link(&pool, parents[0]).await;
-    let child = try_register(&pool, &new_identity(), Some(parents[0]), GROUP)
+    let before = footprint(&pool).await;
+    let err = try_register(&pool, &new_identity(), Some(parents[0]), GROUP)
         .await
-        .expect("a parent whose link was retired is still attested");
+        .expect_err("a parent whose link was retired no longer attests");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+    assert_eq!(footprint(&pool).await, before, "AID03 changes nothing");
+    // CONTROL: the operator's other parents, still live-linked, still pass.
+    let child = try_register(&pool, &new_identity(), Some(parents[1]), GROUP)
+        .await
+        .expect("a live-linked legacy parent is still accepted");
     assert!(child.succession_created, "{child:?}");
-    assert_eq!(child.inherit_reason.as_deref(), Some("parent_link_retired"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -977,17 +1075,35 @@ async fn the_maintenance_role_records_a_skipped_legacy_succession(pool: PgPool) 
     );
 }
 
-/// A parent whose link the operator has since RETIRED still names the same
-/// operator (122's `human_of(.., false)`), so the record is still accepted:
-/// the legacy links are scheduled for retirement.
+/// The record path asks the same rule: once the operator RETIRES the legacy
+/// parent's link, the after-the-fact record is refused AID10 and writes
+/// nothing (record it BEFORE the legacy links are retired). CONTROL: the
+/// same record is accepted while the link is live (a fresh incident).
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_retired_legacy_parent_link_still_names_the_operator(pool: PgPool) {
+async fn a_legacy_parent_whose_link_was_retired_is_refused_aid10(pool: PgPool) {
     let inc = incident(&pool).await;
     retire_link(&pool, inc.parent).await;
-    assert_eq!(human_of(&pool, inc.parent, true).await, None);
-    let r = try_record(&pool, inc.child, inc.parent, GROUP)
+    assert_eq!(human_of(&pool, inc.parent, true).await, None, "PREMISE");
+    assert_eq!(
+        human_of(&pool, inc.parent, false).await,
+        Some(inc.operator),
+        "PREMISE: the retired link still names the operator"
+    );
+    let before = footprint(&pool).await;
+    let err = try_record(&pool, inc.child, inc.parent, GROUP)
         .await
-        .expect("a retired parent link still names the operator");
+        .expect_err("a retired legacy parent link is refused");
+    assert_eq!(sqlstate(&err).as_deref(), Some("AID10"), "{err}");
+    assert!(
+        err.to_string().contains("not a legacy fleet parent"),
+        "the rule refused it: {err}"
+    );
+    assert_eq!(footprint(&pool).await, before, "nothing was recorded");
+
+    let live = incident(&pool).await;
+    let r = try_record(&pool, live.child, live.parent, GROUP)
+        .await
+        .expect("CONTROL: a live-linked legacy parent is recorded");
     assert!(r.recorded);
 }
 
@@ -1569,4 +1685,272 @@ async fn the_180_undo_restores_the_catalog_below_180(pool: PgPool) {
         .await
         .expect_err("after the undo the legacy parent is refused again");
     assert_eq!(sqlstate(&err).as_deref(), Some("AID03"), "{err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The registration's role-attachment copy (166's step 5b) never copies a
+// grant back onto the identity it came from (180)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CYCLE_ROLE: &str = "role:test-180-cycle";
+
+async fn attach_role(pool: &PgPool, agent: Uuid) -> Uuid {
+    fixture::as_role(pool, MAINTENANCE, |mut conn| async move {
+        let r: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now(), NULL, 'cycle test')",
+        )
+        .bind(CYCLE_ROLE)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, r)
+    })
+    .await
+}
+
+async fn detach_role(pool: &PgPool, agent: Uuid) -> i32 {
+    fixture::as_role(pool, MAINTENANCE, |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role($1, $2, 'cycle test detach')",
+        )
+        .bind(CYCLE_ROLE)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role detaches");
+        (conn, n)
+    })
+    .await
+}
+
+/// `agent`'s un-detached attachments to the test role: `(id, inherited_from)`.
+async fn live_rows(pool: &PgPool, agent: Uuid) -> Vec<(Uuid, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT id, inherited_from FROM role_agents \
+          WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL ORDER BY created_at, id",
+    )
+    .bind(agent)
+    .bind(CYCLE_ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("live rows")
+}
+
+/// `role_attachments_withheld` of `agent`'s latest registration audit row.
+async fn withheld(pool: &PgPool, agent: Uuid) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT (details ->> 'role_attachments_withheld')::bigint FROM security_events \
+          WHERE event_type = 'agent.identity_registered' AND agent_id = $1 \
+          ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("registration audit row")
+}
+
+/// 166's may-run answer for `agent`, on the attestor's session (as the host
+/// asks it).
+async fn may_run(pool: &PgPool, agent: Uuid) -> bool {
+    fixture::as_role(pool, ATTESTOR, |mut conn| async move {
+        let r: bool =
+            sqlx::query_scalar("SELECT may_run FROM public.epigraph_role_agent_may_run($1)")
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("may_run");
+        (conn, r)
+    })
+    .await
+}
+
+async fn register_id(pool: &PgPool, id: &Identity, parent: Option<Uuid>) -> Uuid {
+    try_register(pool, id, parent, GROUP)
+        .await
+        .expect("the attestor registers the identity")
+        .agent_id
+}
+
+/// THE REVERT. Attach A; a prompt change makes B, and the registration copies
+/// A's attachment to B; the operator detaches A; the job goes back to A's
+/// prompt, so the host registers A AGAIN, naming B as its parent. B's live
+/// row was copied FROM A's own (now detached) attachment, and the succession
+/// "B succeeded A" is on record, so nothing is copied back onto A: A holds no
+/// live attachment, and the registration audit row says what it withheld.
+/// The succession "A succeeded B" is still recorded. POSITIVE CONTROL: an
+/// ordinary successor of B, registered the same way, gets its copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_never_copies_an_attachment_back_onto_its_detached_source(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    let ra = attach_role(&pool, a).await;
+    let b = register_id(&pool, &new_identity(), Some(a)).await;
+    let b_rows = live_rows(&pool, b).await;
+    assert_eq!(b_rows.len(), 1, "PREMISE: B got a copy");
+    assert_eq!(b_rows[0].1, Some(ra), "PREMISE: copied from A's attachment");
+    assert_eq!(detach_role(&pool, a).await, 1, "A detached");
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    let reverse: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_succession WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("succession");
+    assert_eq!(reverse, 1, "the succession 'A succeeded B' is recorded");
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "nothing is copied back onto the detached source"
+    );
+    assert_eq!(
+        withheld(&pool, a).await,
+        Some(1),
+        "the audit row names the withheld copy"
+    );
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    assert_eq!(
+        live_rows(&pool, c).await.len(),
+        1,
+        "POSITIVE CONTROL: an ordinary successor of B is copied"
+    );
+    assert_eq!(
+        withheld(&pool, c).await,
+        Some(0),
+        "and nothing was withheld"
+    );
+}
+
+/// THE CYCLE GUARD ALONE (no reverse succession pair). A attached; X succeeds
+/// A, B succeeds X (B's row is a copy of X's, which is a copy of A's); A is
+/// detached; A is registered with B as its parent. "B succeeded A" is NOT on
+/// record (B's parent is X), but A's own attachment is in the chain of B's
+/// row, so nothing is copied back onto A. The same through 166's attach-time
+/// lineage follow, where B's row names A's (detached) row DIRECTLY. POSITIVE
+/// CONTROL: a fresh successor of B is copied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    attach_role(&pool, a).await;
+    let x = register_id(&pool, &new_identity(), Some(a)).await;
+    let b = register_id(&pool, &new_identity(), Some(x)).await;
+    assert_eq!(live_rows(&pool, b).await.len(), 1, "PREMISE: B got a copy");
+    let direct: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_succession WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(b)
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("succession");
+    assert_eq!(direct, 0, "PREMISE: no direct reverse pair");
+    assert_eq!(detach_role(&pool, a).await, 1, "A detached");
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "a copy whose chain reaches A's own attachment is not copied onto A"
+    );
+    assert_eq!(withheld(&pool, a).await, Some(1));
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    assert_eq!(
+        live_rows(&pool, c).await.len(),
+        1,
+        "POSITIVE CONTROL: a fresh successor of B is copied"
+    );
+
+    // The attach-time follow: the lineage is registered first, then A2 is
+    // attached, and 166 copies A2's row to B2 directly (no row of X2 between).
+    let a2_id = new_identity();
+    let a2 = register_id(&pool, &a2_id, None).await;
+    let x2 = register_id(&pool, &new_identity(), Some(a2)).await;
+    let b2 = register_id(&pool, &new_identity(), Some(x2)).await;
+    let ra2 = attach_role(&pool, a2).await;
+    let b2_rows = live_rows(&pool, b2).await;
+    assert_eq!(b2_rows.len(), 1, "PREMISE: B2 got a copy");
+    assert_eq!(b2_rows[0].1, Some(ra2), "PREMISE: naming A2's row directly");
+    assert_eq!(detach_role(&pool, a2).await, 1, "A2 detached");
+    assert_eq!(
+        register_id(&pool, &a2_id, Some(b2)).await,
+        a2,
+        "the revert is A2"
+    );
+    assert!(
+        live_rows(&pool, a2).await.is_empty(),
+        "a copy of A2's own detached row is not copied back onto A2"
+    );
+    assert_eq!(withheld(&pool, a2).await, Some(1));
+}
+
+/// THE REVERSE-PAIR GUARD ALONE (the chain does not reach the child). B
+/// succeeded A while nothing was attached; the operator then attaches B
+/// itself (its own root row); the job reverts, so A is registered with B as
+/// its parent. B's row names no row of A, but "B succeeded A" is on record,
+/// so nothing is copied onto A. DOCUMENTED COST: an attachment is also 166's
+/// restriction, so with the role unheld B may not run while the reverted A,
+/// holding no attachment, may. POSITIVE CONTROL: a fresh successor of B is
+/// copied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
+    seed_role(&pool, CYCLE_ROLE).await;
+    let a_id = new_identity();
+    let a = register_id(&pool, &a_id, None).await;
+    let b = register_id(&pool, &new_identity(), Some(a)).await;
+    assert!(
+        live_rows(&pool, b).await.is_empty(),
+        "PREMISE: nothing to copy yet"
+    );
+    let rb = attach_role(&pool, b).await;
+    assert_eq!(
+        live_rows(&pool, b).await,
+        vec![(rb, None)],
+        "PREMISE: B's own row"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "PREMISE: A holds nothing"
+    );
+
+    assert_eq!(
+        register_id(&pool, &a_id, Some(b)).await,
+        a,
+        "the revert is A"
+    );
+    assert!(
+        live_rows(&pool, a).await.is_empty(),
+        "nothing is copied onto the parent's own recorded predecessor"
+    );
+    assert_eq!(withheld(&pool, a).await, Some(1));
+    assert!(
+        !may_run(&pool, b).await,
+        "PREMISE: B is held (the role is unheld)"
+    );
+    assert!(
+        may_run(&pool, a).await,
+        "DOCUMENTED COST: the reverted A holds no attachment, so 166's restriction no longer holds it"
+    );
+
+    let c = register_id(&pool, &new_identity(), Some(b)).await;
+    let c_rows = live_rows(&pool, c).await;
+    assert_eq!(
+        c_rows.len(),
+        1,
+        "POSITIVE CONTROL: a fresh successor of B is copied"
+    );
+    assert_eq!(c_rows[0].1, Some(rb), "from B's own row");
 }

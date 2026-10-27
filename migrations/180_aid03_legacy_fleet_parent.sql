@@ -1,6 +1,7 @@
 -- 180_aid03_legacy_fleet_parent.sql
--- Accept a legacy fleet identity as a registration parent (AID03), and record
--- after the fact the succession that the refusal skipped.
+-- Accept a legacy fleet identity as a registration parent (AID03), record
+-- after the fact the succession that the refusal skipped, and stop the
+-- registration copying a role attachment back onto the identity it came from.
 --
 -- ===================================================================
 -- 1. WHY
@@ -25,15 +26,25 @@
 --       default, which is the only shape this repairs. Every other type (a
 --       role node, a `system` or `software_agent` row) stays on 161's test,
 --       unchanged, even though the backfill keyed it too;
---   (a) an operator linked it: an `operator_links` row of any state names
---       it as the AGENT. Only a maintenance session or a maintenance-owned
---       definer writes one (107), so this is attested: an operator linked
---       it as one of its agents (a link retired since still attests that).
---       `llm_model` is NOT read: the row may set it on itself, and the old
---       create path recorded it best-effort only. This is the conjunct that
---       refuses a keyed (ed25519) human with no OAuth client and no link,
---       and a row that described itself as an LLM, which nothing below
---       catches;
+--   (a) an operator linked it, LIVE: an `operator_links` row that is NOT
+--       retired names it as the AGENT. Only a maintenance session or a
+--       maintenance-owned definer writes one (107), and a live link is the
+--       operator's act "this is one of my agents". A RETIRED link does not
+--       count, because it does not say that: 123's
+--       `epigraph_link_legacy_authors` writes retired links IN BULK for every
+--       unlinked author of a claim, evidence, recall event, perspective and
+--       so on (an ownership tie: "its rows belong to this operator"), with
+--       no look at whether the row is a fleet identity, and 107's
+--       `epigraph_link_retired_agent` retires an identity whose key may be
+--       exposed. So once the legacy links are retired, a cut-over that
+--       names a legacy parent is refused and falls back to a parentless
+--       registration and an alert, by design; record any skipped
+--       succession BEFORE the links retire. `llm_model` is NOT read: the
+--       row may set it on itself, and the old create path recorded it
+--       best-effort only. This is the conjunct that refuses a keyed
+--       (ed25519) human with no OAuth client and no link, a row that
+--       described itself as an LLM, and a planted row a bulk tie reached,
+--       none of which anything below catches;
 --   (b) it holds an `identity-legacy` key for its own public key: 161's
 --       backfill (`epigraph_backfill_legacy_agent_keys`) gives one to every
 --       agent that exists at the cut-over and none to a host-registered
@@ -60,29 +71,63 @@
 -- can plant a row under it and wait for the host to name that row as a
 -- parent: the API create path gives a `'human'` ed25519 row, the row may
 -- set `llm_model` and `labels` on itself (118's column grant, 077's
--- `agents_self_update`), and a later run of the re-runnable key backfill
--- gives it an `identity-legacy` key, because the backfill keys every agent
--- that exists when it runs (humans included). So the ACCEPT side must rest
--- on attested state only, and the operator link (a) is that: without it a
--- planted row would be accepted silently and named, permanently, in the
--- append-only `agent_succession` row and the display parent, where the
--- refusal instead alerts. The legacy key (b) and the human markers (c)-(e)
--- narrow the attested set further. The REFUSE side includes inputs the
--- application role can write (it may INSERT `oauth_clients` by dynamic
--- registration, and may relabel its own row): forging one of those can only
--- make AID03 refuse, which falls back to what happened before this migration
--- (the host registers the child with no parent and alerts). It never admits.
+-- `agents_self_update`), a later run of the re-runnable key backfill gives
+-- it an `identity-legacy` key, because the backfill keys every agent that
+-- exists when it runs (humans included), and if it authored anything a
+-- later bulk `link-legacy-authors` run ties it to an operator with a
+-- RETIRED link. So the ACCEPT side must rest on attested state only, and
+-- the LIVE operator link (a) is that: without it a planted row would be
+-- accepted silently and named, permanently, in the append-only
+-- `agent_succession` row and the display parent, where the refusal instead
+-- alerts. (The `operator.link_recorded` audit row is not used instead: that
+-- event family is not reserved to privileged sessions.) The legacy key (b)
+-- and the human markers (c)-(e) narrow the attested set further. The REFUSE
+-- side includes inputs the application role can write (it may INSERT
+-- `oauth_clients` by dynamic registration, and may relabel its own row):
+-- forging one of those can only make AID03 refuse, which falls back to what
+-- happened before this migration (the host registers the child with no
+-- parent and alerts). It never admits.
 --
 -- ===================================================================
 -- 3. REGISTRATION, RE-STATED
 --
 -- `epigraph_register_agent_identity` is re-stated from 166's body (the latest;
--- a precondition below checks its md5) with exactly one delta, marked `180`:
--- the AID03 test accepts a parent for which the rule above holds. The AID03
--- message, code and HINT are unchanged (the host matches on the code).
+-- a precondition below checks its md5) with two deltas, each line marked
+-- `180`:
+--   * the AID03 test accepts a parent for which the rule above holds. The
+--     AID03 message, code and HINT are unchanged (the host matches on the
+--     code);
+--   * step 5b (166's copy of the parent's role attachments to the child)
+--     NEVER COPIES BACK ONTO ITS SOURCE: a parent row is not copied when its
+--     `inherited_from` chain, detached rows included, reaches a row of the
+--     child, or when the succession "the parent succeeded the child" is
+--     already on record. Both are a REVERT: the job went back to an earlier
+--     prompt or model, so the host names the later identity as the earlier
+--     one's parent (the host cannot tell a revert from a new identity: agent
+--     ids are database-assigned). Without this, the earlier identity got
+--     back, as a copy of its successor's row, an attachment: when the
+--     operator had DETACHED the earlier identity, the very attachment it
+--     took away. Where an attachment is a grant (a role binding that admits
+--     the role's attached agents), that is a revoked identity regaining the
+--     group. The guards hold whether or not such a binding mode is applied;
+--     a withheld row is counted in the registration's audit row
+--     (`role_attachments_withheld`; the function's result columns do not
+--     carry it). THE COST: an attachment is also 166's RESTRICTION, so the
+--     reverted identity, holding no attachment, is no longer held by it:
+--     while the role has no holder it may run and write wherever its link
+--     allows, although the identity it reverted from may not. After a
+--     revert, attach the running identity by name if the restriction must
+--     hold. Not covered, by design: a
+--     revert to an identity two or more successions back whose parent was
+--     attached directly (the chain names no row of the child and no direct
+--     reverse pair is on record); the copy then follows the operator's own
+--     attachment of the parent, as an attach-time lineage follow would.
 -- Signature, owner and ACL are unchanged (CREATE OR REPLACE keeps them; the
 -- ACL stays the attestor's alone). A later migration that re-bodies the
--- registration starts from this body.
+-- registration starts from this body. The precondition reads only 166's
+-- body, which no other migration in flight re-states (179 re-states the
+-- group-role derivation, not the registration), so it holds whether 179 is
+-- applied before this file, after it, or not at all.
 --
 -- ===================================================================
 -- 4. THE AFTER-THE-FACT RECORD:
@@ -112,9 +157,10 @@
 --     second, conflicting parent is refused: the first record stands);
 --   * the parent is a legacy fleet parent (the rule above) and is not a live
 --     human operator, and was created no later than the child;
---   * the child is live-linked, and the parent names the SAME operator
---     (`epigraph_human_of(parent, false)`: a parent link retired since still
---     names its operator);
+--   * the child is live-linked, and the parent is live-linked to the SAME
+--     operator (`epigraph_human_of(parent, true)`; the rule above already
+--     refuses a parent whose link is retired, so run the record before the
+--     legacy links retire);
 --   * the parent holds no un-detached, unended role attachment. 166 copies a
 --     parent's attachments to its successor at registration; a legacy
 --     (`'human'`-typed) parent cannot be attached (166's ROL02), so this only
@@ -135,7 +181,9 @@
 -- `docs/runbooks/180-undo.sql` restores 166's registration body byte for byte
 -- and drops the two functions this file creates. Run it before
 -- `166-undo.sql`. Succession rows it recorded stay (the table is
--- append-only), as do their audit rows.
+-- append-only), as do their audit rows. The undo also removes step 5b's
+-- never-back-onto-its-source guard: a revert then copies the successor's
+-- row back onto the earlier identity again.
 
 SET LOCAL lock_timeout = '3s';
 
@@ -177,10 +225,11 @@ SET search_path = public, pg_temp AS $$
             WHERE a.id = p_agent
               -- (0) the legacy create path's default type, and only that
               AND a.agent_type = 'human'
-              -- (a) an attested operator link, of any state (never the
+              -- (a) an attested, LIVE operator link (never a retired one,
+              -- which bulk ownership ties also write, and never the
               -- self-writable `llm_model`)
               AND EXISTS (SELECT 1 FROM public.operator_links l
-                           WHERE l.agent_id = a.id)
+                           WHERE l.agent_id = a.id AND NOT l.retired)
               -- (c) not a keyless (OAuth placeholder) human
               AND a.key_kind <> 'derived'
               AND NOT ('oauth-principal' = ANY (COALESCE(a.labels, '{}'::text[])))
@@ -255,6 +304,8 @@ DECLARE
     v_rec_hash   text;
     v_roles_new  integer := 0;  -- 166
     v_shared     boolean := false;  -- 166
+    v_reverse    boolean := false;  -- 180
+    v_withheld   integer := 0;  -- 180
     i            integer;
 BEGIN
     -- Inputs.
@@ -314,7 +365,7 @@ BEGIN
                     WHERE a.id = v_parent AND a.public_key = p_identity_pubkey) THEN
             v_parent := NULL;
         -- 180: a legacy fleet identity (agent_type 'human' by the old create
-        -- path's column default, an operator link, a backfilled
+        -- path's column default, a LIVE operator link, a backfilled
         -- identity-legacy key, and no human marker) is an LLM agent too; see
         -- `epigraph_is_legacy_fleet_parent`.
         ELSIF (NOT EXISTS (SELECT 1 FROM public.agents a
@@ -645,7 +696,36 @@ BEGIN
     -- identity is dormant in every group it runs in while the role has no
     -- holder, so the audit row below FLAGS it (`role_attachments_shared =
     -- 'shared_identity'`) for the host to alert every group affected.
+    -- 180: NEVER BACK ONTO ITS SOURCE. A parent row is not copied when the
+    -- child is that row's own source: when its `inherited_from` chain
+    -- (detached rows included: a detached source is exactly the case) reaches
+    -- a row of the child, or when "the parent succeeded the child" is already
+    -- on record. That is a REVERT (the job went back to an earlier prompt or
+    -- model, so the host names the later identity as the earlier one's
+    -- parent), and copying would hand the earlier identity back the
+    -- attachment the operator may have detached from it. Withheld rows are
+    -- counted in the audit row (`role_attachments_withheld`).
     IF v_parent IS NOT NULL THEN
+        v_reverse := EXISTS (SELECT 1 FROM public.agent_succession s
+                              WHERE s.child_agent_id = v_parent
+                                AND s.parent_agent_id = v_child);  -- 180
+        SELECT count(*) INTO v_withheld  -- 180
+          FROM public.role_agents pr
+         WHERE pr.agent_id = v_parent AND pr.detached_at IS NULL
+           AND (pr.valid_to IS NULL OR pr.valid_to > now())
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+           AND (v_reverse
+                OR EXISTS (
+                       WITH RECURSIVE up (hop_id, hop_agent, hop_source) AS (
+                           SELECT u.id, u.agent_id, u.inherited_from
+                             FROM public.role_agents u WHERE u.id = pr.inherited_from
+                           UNION
+                           SELECT u.id, u.agent_id, u.inherited_from
+                             FROM public.role_agents u JOIN up ON u.id = up.hop_source
+                       )
+                       SELECT 1 FROM up WHERE up.hop_agent = v_child));
         INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
                                         inherited_from)
         SELECT pr.role, v_child, lower(g.gap), upper(g.gap),
@@ -663,6 +743,17 @@ BEGIN
            AND NOT EXISTS (
                    SELECT 1 FROM public.role_agents c
                     WHERE c.agent_id = v_child AND c.inherited_from = pr.id)
+           -- 180: never back onto its source (above).
+           AND NOT v_reverse
+           AND NOT EXISTS (
+                   WITH RECURSIVE up (hop_id, hop_agent, hop_source) AS (
+                       SELECT u.id, u.agent_id, u.inherited_from
+                         FROM public.role_agents u WHERE u.id = pr.inherited_from
+                       UNION
+                       SELECT u.id, u.agent_id, u.inherited_from
+                         FROM public.role_agents u JOIN up ON u.id = up.hop_source
+                   )
+                   SELECT 1 FROM up WHERE up.hop_agent = v_child)
          ORDER BY pr.role, lower(g.gap);
         GET DIAGNOSTICS v_roles_new = ROW_COUNT;
         v_shared := v_roles_new > 0
@@ -692,6 +783,7 @@ BEGIN
                                    'role_attachments_copied', v_roles_new,
                                    'role_attachments_shared',
                                    CASE WHEN v_shared THEN 'shared_identity' END,
+                                   'role_attachments_withheld', v_withheld,  -- 180
                                    'recorded_by', session_user));
     END IF;
 
@@ -810,9 +902,9 @@ BEGIN
     -- The parent: a legacy fleet identity that preceded the child.
     IF NOT public.epigraph_is_legacy_fleet_parent(p_parent)
        OR public.epigraph_is_human_operator(p_parent) THEN
-        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, an '
-                        'operator link, an identity-legacy key, and no human marker); nothing '
-                        'was recorded', p_parent
+        RAISE EXCEPTION 'AID10: agent % is not a legacy fleet parent (agent_type human, a '
+                        'live operator link, an identity-legacy key, and no human marker); '
+                        'nothing was recorded', p_parent
             USING ERRCODE = 'AID10';
     END IF;
     IF v_parent_at > v_child_at THEN
@@ -823,7 +915,7 @@ BEGIN
 
     -- One operator for both.
     v_child_op := public.epigraph_human_of(p_child, true);
-    v_parent_op := public.epigraph_human_of(p_parent, false);
+    v_parent_op := public.epigraph_human_of(p_parent, true);
     IF v_child_op IS NULL THEN
         RAISE EXCEPTION 'AID10: agent % has no live operator link; link it first; nothing was '
                         'recorded', p_child

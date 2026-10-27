@@ -1644,23 +1644,33 @@ restart.
   a group's successor was refused and fell back to registering it with NO
   parent (no succession, no inherited link). Adds
   `epigraph_is_legacy_fleet_parent(uuid)` (maintenance-owned definer, no
-  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, an
-  `operator_links` row of any state naming it as the agent (attested; the
-  self-writable `llm_model` is not read, because the host finds the parent
-  by a legacy key anyone can compute and plant a row under), an
+  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, a LIVE (not
+  retired) `operator_links` row naming it as the agent (attested; a retired
+  link does not count, because `epigraph_link_legacy_authors` writes retired
+  ownership ties in bulk for any author, and the self-writable `llm_model`
+  is not read, because the host finds the parent by a legacy key anyone can
+  compute and plant a row under), an
   `identity-legacy` key for its own public key (161's backfill),
   not a keyless OAuth human (`key_kind 'derived'` or the `oauth-principal`
   label), never a `human_operators` row (revoked included), and no
   `client_type 'human'` OAuth client naming it as `agent_id` (any status).
-  Re-states `epigraph_register_agent_identity` from 166's body with one
-  marked delta: AID03 also accepts a parent for which that holds (161's live
-  human-operator refusal still applies to every parent). Adds
+  Re-states `epigraph_register_agent_identity` from 166's body with two
+  marked deltas: AID03 also accepts a parent for which that holds (161's live
+  human-operator refusal still applies to every parent); and step 5b never
+  copies a parent's role attachment back onto its source, i.e. when the
+  row's `inherited_from` chain (detached rows included) reaches a row of the
+  child, or "the parent succeeded the child" is on record (a revert to an
+  earlier, possibly detached identity), counting withheld rows in the audit
+  row (`role_attachments_withheld`). The cost: the reverted identity then
+  holds no attachment, so 166's restriction (ROL01, may-run) no longer
+  applies to it; attach the running identity by name after a revert if it
+  must hold. Adds
   `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
   maintenance-session only and audited (`agent.identity_succession_recorded`):
   for a child the host registered parentless in that folder, with no
   succession row or display parent, a legacy parent created no later than it
-  and holding no live role attachment, both naming the same operator (child
-  live-linked), it writes the `agent_succession` row and the display parent,
+  and holding no live role attachment, both live-linked to the same
+  operator, it writes the `agent_succession` row and the display parent,
   and moves no link. The folder is checked first: a (child, parent) pair
   already on record in any folder, named for a folder the child also
   registered parentless in, is a repeat (`recorded = false`, nothing written;
@@ -1674,8 +1684,12 @@ restart.
   166's). A precondition checks the md5 of 166's registration body and
   RAISEs `55000` (changing nothing) over any other body; any later edit to
   that body must update 180's expected md5, and a later migration that
-  re-states the registration starts from 180's. **Deploy order:** after 166;
-  independent of 179. Run `180-undo.sql` before `166-undo.sql`. **Applied to
+  re-states the registration starts from 180's. Once the legacy operator
+  links are retired, a cut-over naming a legacy parent falls back to a
+  parentless registration plus an alert, and the record refuses it: record
+  any skipped succession first. **Deploy order:** after 166; independent of
+  179 (179 does not touch the registration, so 180's precondition holds
+  either way). Run `180-undo.sql` before `166-undo.sql`. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
 - **166**: public `role_attached_agents` (agent identity lineage design D6:

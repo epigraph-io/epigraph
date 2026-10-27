@@ -6,7 +6,13 @@
 -- READ FIRST. Once undone, AID03 refuses a legacy fleet parent again
 -- (agent_type 'human' from the pre-161 create path), so the host registers
 -- such a successor with no parent and it runs unlinked until an operator
--- links it by hand.
+-- links it by hand. The undo ALSO removes 180's guard on the registration's
+-- role-attachment copy: a revert (the host registering an earlier identity
+-- with its successor as the parent) then copies the successor's attachment
+-- back onto the earlier identity, even one the operator detached. If
+-- migration 179 (a binding that admits the role's attached agents) is
+-- applied, its rule still admits no copy whose chain holds a detached row;
+-- without it a copy only refuses. Detach any such copy after an undo.
 --
 -- WHAT IT DOES
 --   * Restores migration 166's body of `epigraph_register_agent_identity`,
@@ -36,7 +42,7 @@ BEGIN
      WHERE p.oid = to_regprocedure('public.epigraph_register_agent_identity('
                                    'bytea, uuid, text, text, text, bytea, jsonb)');
     IF v_found IS NULL
-       OR v_found NOT IN ('2fc3e7ee64fa3110c48aebc2432b2d95',   -- 180's
+       OR v_found NOT IN ('c31ae71f307a0573716e51fe17aa5dc8',   -- 180's
                           '9e195fdea9cf424aa5d6941c20f40651') THEN  -- 166's
         RAISE EXCEPTION '180-undo: the registration is neither 180''s nor 166''s body (md5 %); '
                         'a later migration re-stated it; undo that one first. Nothing was '
