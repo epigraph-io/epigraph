@@ -474,13 +474,16 @@ pub async fn supersede_claim(
         .await
         {
             Ok(latest) => {
+                // The version was created by the agent that performed the
+                // act, not by the author the replacement inherits (backlog
+                // 1a54283d, ruling R-85).
                 let version_row = ClaimVersionRow {
                     id: uuid::Uuid::new_v4(),
                     claim_id: new_uuid,
                     version_number: latest + 1,
                     content: request.content.clone(),
                     truth_value: request.truth_value,
-                    created_by: Some(agent_uuid),
+                    created_by: Some(acting_agent),
                     created_at: now,
                 };
                 ClaimVersionRepository::create(&mut *sp, &version_row).await

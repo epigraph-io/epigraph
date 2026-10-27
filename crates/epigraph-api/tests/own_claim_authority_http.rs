@@ -385,6 +385,50 @@ async fn a_writers_supersede_records_the_writer_as_the_successors_author_edge(po
     );
 }
 
+/// Backlog 1a54283d (ruling R-85 (b)), over HTTP on the application role: the
+/// version-history row the supersede route writes for the successor names
+/// the agent that PERFORMED the act (`claim_versions.created_by` = W), not the
+/// author the successor inherits (H). The row is supplementary (a refused
+/// insert is logged and the act still commits), so its existence and its
+/// creator are asserted, not only the act's success.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writers_supersede_records_the_writer_as_the_version_rows_creator(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, hg) = seed_agent_with_group(&pool, "r85-http-human").await;
+    let (w, _) = seed_agent_with_group(&pool, "r85-http-writer").await;
+    add_member(&pool, hg, w, "writer").await;
+    let c = claim_of(&pool, h, hg, "group", "the group's claim").await;
+
+    let (_, Json(resp)) = supersede_claim(
+        ViewerExtractor(viewer(&pool, w).await),
+        State(state.clone()),
+        human(w, &["claims:write"]),
+        Path(c),
+        supersede_body(c),
+    )
+    .await
+    .expect("a writer of the owning group supersedes");
+    let new = resp.new_claim_id;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(&pool)
+        .await
+        .expect("the successor");
+    assert_eq!(author, h, "the successor inherits the predecessor's author");
+    let rows: Vec<(Option<Uuid>, String)> =
+        sqlx::query_as("SELECT created_by, content FROM claim_versions WHERE claim_id = $1")
+            .bind(new)
+            .fetch_all(&pool)
+            .await
+            .expect("the successor's version rows");
+    assert_eq!(
+        rows,
+        vec![(Some(w), format!("a correction of {c}"))],
+        "one version row for the successor, created by the acting writer W, not the \
+         inherited author H"
+    );
+}
+
 /// Authorship is not write authority, over HTTP as over MCP: the author of a
 /// claim in a group whose `writer` membership it has lost is refused BY NAME on
 /// both routes (before OA1's shared rule it reached the database, whose row
