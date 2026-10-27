@@ -703,6 +703,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Role-attached agents (166), FORCEd by the migration that creates it, on
     // the same precedent.
     "role_agents",
+    // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
+    // that migration, on the same precedent.
+    "workflows",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

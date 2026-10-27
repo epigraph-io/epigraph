@@ -692,7 +692,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// deleted with the k-means prototype, not converted (`routes/crud.rs`
 /// 31 -> 30, keeping sites), read off `the_scanner_is_not_vacuous`'s own
 /// failure (`left: 243, right: 244`).
-const HIGH_WATER: usize = 243;
+///
+/// 243 -> 239 (ruling R-74, migration 183): `get_workflow`'s two reads moved
+/// to the caller's stamped read and both post-ingest goal embeds to the
+/// system-agent stamp (`routes/workflows.rs` 8 -> 4), read off
+/// `the_scanner_is_not_vacuous`'s own failure (`left: 239, right: 243`).
+const HIGH_WATER: usize = 239;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1086,7 +1091,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // does, or row security hides every group-private step from the group's
     // own members. Read off this test's failure output (`recorded 9, measured
     // 8`).
-    ("routes/workflows.rs", 8),
+    // 8 -> 4 (ruling R-74, migration 183): `get_workflow`'s two reads moved to
+    // the caller's stamped read, and both post-commit goal embeds to the
+    // system-agent stamp (`store_workflow_goal_embedding`).
+    ("routes/workflows.rs", 4),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

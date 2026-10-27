@@ -84,6 +84,7 @@ async fn seed_private_workflow(pool: &PgPool, name: &str) -> PrivateWorkflow {
         "A workflow whose steps only one group can read.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");

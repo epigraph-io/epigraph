@@ -152,21 +152,26 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
 pub struct WorkflowRepository;
 
 impl WorkflowRepository {
-    /// Insert a row into the new `workflows` table (added in migration 020).
-    /// Used by `epigraph-mcp::tools::workflow_ingest::do_ingest_workflow`.
+    /// Insert a row into the `workflows` table (added in migration 020) with
+    /// the tenancy `decl` names. Used by the workflow-ingest plan walk.
     /// Idempotent on `(canonical_name, generation)` UNIQUE — repeated inserts
     /// of the same identity are silently ignored.
+    ///
+    /// Since migration 183 a row carries its plan's tenancy
+    /// (`owner_group_id`, `visibility`), declared here and never defaulted
+    /// (`workflows_require_tenancy`): a declared ingest passes
+    /// `TenancyDecl::group(G)`, an undeclared one the public declaration its
+    /// claims get. `TenancyDecl::inherited()` binds neither column, which only
+    /// the seed role's escape hatch admits (test fixtures). The row-security
+    /// `WITH CHECK` asks that the session WRITES the owner group. It takes an
+    /// executor so the plan walk runs it on the SAME transaction as the tier-A
+    /// `claims` and `edges` writes it is atomic with, which leaves no
+    /// `workflows` row behind when the claim walk rolls back.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails for reasons other
     /// than a duplicate-key conflict on the UNIQUE constraint.
-    /// `workflows` is MEASURED `relrowsecurity = false` with no policy at
-    /// migration head 101, so this write needs no stamp to be admitted. It takes
-    /// an executor anyway so the workflow-ingest plan walk can run it on the SAME
-    /// connection as the tier-A `claims` and `edges` writes it is atomic with —
-    /// an `insert_root` on a sibling pool checkout would leave a `workflows` row
-    /// behind when the claim walk rolled back, which is the zombie-row shape the
-    /// executor's own pre-flight content guard exists to avoid.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_root<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         id: Uuid,
@@ -175,10 +180,13 @@ impl WorkflowRepository {
         goal: &str,
         parent_id: Option<Uuid>,
         metadata: serde_json::Value,
+        decl: epigraph_core::TenancyDecl,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO workflows (id, canonical_name, generation, goal, parent_id, metadata) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO workflows \
+                    (id, canonical_name, generation, goal, parent_id, metadata, \
+                     visibility, owner_group_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT (canonical_name, generation) DO NOTHING",
         )
         .bind(id)
@@ -187,6 +195,8 @@ impl WorkflowRepository {
         .bind(goal)
         .bind(parent_id)
         .bind(metadata)
+        .bind(decl.visibility_bind())
+        .bind(decl.owner_group_bind())
         .execute(executor)
         .await?;
         Ok(())
@@ -203,8 +213,10 @@ impl WorkflowRepository {
     ///
     /// `None` for a row written before batch H-b (nothing recorded who created
     /// it) and for a variant of such a row, which inherits "no owner" rather
-    /// than having one invented for it. `workflows` has no row security
-    /// (`relrowsecurity = false`), so this read needs no stamp.
+    /// than having one invented for it. Since migration 183 `workflows` has
+    /// row security keyed on the plan's tenancy, so this reads only a row the
+    /// connection's stamp may read; every caller runs it on the stamped
+    /// transaction its authority check is made on.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -278,8 +290,9 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. `workflows` has no row security, so this needs no
-    /// viewer.
+    /// next `plan_index`. It runs on `add_step`'s system-agent-stamped
+    /// transaction, which `workflows`' row security (migration 183) bounds to
+    /// the rows that stamp reads.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -387,8 +400,9 @@ impl WorkflowRepository {
     ///    question Q2 (U032 scope §6), pinned by
     ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
     ///
-    /// `workflows` has no row security, as [`Self::find_root_by_canonical`]
-    /// records, so this read needs no viewer.
+    /// Since migration 183 `workflows` has row security keyed on the plan's
+    /// tenancy; both callers run this on the plan walk's system-agent-stamped
+    /// transaction, so it reads what that stamp reads.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if a query fails.
@@ -429,8 +443,9 @@ impl WorkflowRepository {
     /// sound — and an empty result (no edge, or none visible to `viewer`) means
     /// the seed is unrecoverable, which the caller reports as undecided.
     ///
-    /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the `workflows`
-    /// table carries no visibility columns.
+    /// Viewer-scoped on the edge like `resolve_steps_to_heads`; the joined
+    /// `workflows` row is bounded by its own row security (migration 183) on
+    /// the pool this runs on.
     ///
     /// RETRACTED edges are included ON PURPOSE — there is deliberately no
     /// `e.valid_to IS NULL` filter here, unlike the house-style edge read. The
@@ -503,10 +518,15 @@ impl WorkflowRepository {
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
     ) -> Result<Vec<Uuid>, sqlx::Error> {
+        // The workflow ids come from the edges alone, not from a join to
+        // `workflows`: since migration 183 that table has row security keyed
+        // on each plan's tenancy, and a join would drop a workflow whose row
+        // the caller cannot read from the set it must hold authority over.
+        // Such a workflow stays in the set, and its authority check (which
+        // reads the row) then refuses.
         sqlx::query_scalar(
-            "SELECT DISTINCT w.id \
+            "SELECT DISTINCT e.source_id \
              FROM edges e \
-             JOIN workflows w ON w.id = e.source_id \
              WHERE e.relationship = 'executes' \
                AND e.source_type = 'workflow' AND e.target_type = 'claim' \
                AND (e.target_id = $1 \
@@ -514,7 +534,7 @@ impl WorkflowRepository {
                         SELECT m.id FROM claims m \
                         JOIN claims p ON p.step_lineage_id = m.step_lineage_id \
                         WHERE p.id = $1)) \
-             ORDER BY w.id",
+             ORDER BY e.source_id",
         )
         .bind(claim_id)
         .fetch_all(&mut *conn)
@@ -543,8 +563,8 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the underlying query fails.
-    pub async fn max_generation_by_canonical(
-        pool: &PgPool,
+    pub async fn max_generation_by_canonical<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         canonical_name: &str,
     ) -> Result<Option<i32>, sqlx::Error> {
         // `SELECT MAX(...)` always returns exactly one row in PostgreSQL —
@@ -553,7 +573,7 @@ impl WorkflowRepository {
         let (max_gen,): (Option<i32>,) =
             sqlx::query_as("SELECT MAX(generation) FROM workflows WHERE canonical_name = $1")
                 .bind(canonical_name)
-                .fetch_one(pool)
+                .fetch_one(executor)
                 .await?;
         Ok(max_gen)
     }
@@ -1047,18 +1067,22 @@ impl WorkflowRepository {
             .collect())
     }
 
-    /// Whether `viewer` reads at least one STEP of `workflow_id`: an
-    /// `executes` edge into a level-2 claim, through the same edge and claim
-    /// predicates as [`Self::plan_step_claim_ids`].
+    /// Whether `viewer` reads the plan `workflow_id`: its `workflows` row, and
+    /// at least one of its STEPS (an `executes` edge into a level-2 claim,
+    /// through the same edge and claim predicates as
+    /// [`Self::plan_step_claim_ids`]).
     ///
-    /// This is the outcome reports' authority predicate. `workflows` has no
-    /// row security, so a report's counter write cannot be scoped by the
-    /// database; the plan's claims and edges can. Backlog c0ab097a (2), as
-    /// ruled: a report is refused, with the same 404 as an unknown id, "when
-    /// the caller can see no step of a workflow that has steps". It
-    /// deliberately does NOT require a resolvable step prefix: a member whose
-    /// first ordinal edge was re-owned still reads the rest of the plan and
-    /// may report.
+    /// This is the outcome reports' authority predicate. Backlog c0ab097a (2),
+    /// as ruled: a report is refused, with the same 404 as an unknown id,
+    /// "when the caller can see no step of a workflow that has steps"; and
+    /// ruling R-74: the decision is made PER PLAN. A step is not plan-specific
+    /// (several workflow rows can execute the same step claim), so the row's
+    /// own tenancy (migration 183, the plan's declared tenancy) is required
+    /// too: a caller outside the group a plan was declared into is refused
+    /// whatever steps it reads. It deliberately does NOT require a resolvable
+    /// step prefix: a
+    /// member whose first ordinal edge was re-owned still reads the rest of
+    /// the plan and may report.
     ///
     /// # Only steps count
     ///
@@ -1070,13 +1094,9 @@ impl WorkflowRepository {
     ///
     /// # A step-less plan is refused to every caller
     ///
-    /// Whether a plan "has steps" is not readable on the caller's transaction:
-    /// row security hides a group's steps from a non-member exactly as if they
-    /// did not exist, and an unstamped session reads only public rows. So a
-    /// plan with no step at all (a generation-0 thesis scaffold before its
+    /// A plan with no step at all (a generation-0 thesis scaffold before its
     /// first `add_step`, or a root with no `executes` edge) is answered 404 to
-    /// every reporter: the refusal the ruling requires cannot be made for
-    /// stepped plans without also being made for these. Reporting a run of a
+    /// every reporter, as before the row carried tenancy: reporting a run of a
     /// plan with no steps attributes nothing either way.
     ///
     /// The level match is the readers' (`(level)::int = 2`, whitespace and a
@@ -1084,7 +1104,8 @@ impl WorkflowRepository {
     /// on some other target cannot fail the check.
     ///
     /// Run it on the caller's STAMPED transaction, as
-    /// [`Self::plan_step_claim_ids`] must be.
+    /// [`Self::plan_step_claim_ids`] must be: the row's own row security and
+    /// the in-query predicate then agree.
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.
@@ -1095,6 +1116,9 @@ impl WorkflowRepository {
     ) -> Result<bool, DbError> {
         let sql = viewer.splice(
             "SELECT EXISTS ( \
+               SELECT 1 FROM workflows w \
+               WHERE w.id = $1 /* {VISIBILITY:w} */ \
+             ) AND EXISTS ( \
                SELECT 1 FROM edges e \
                JOIN claims c ON c.id = e.target_id \
                WHERE e.source_id = $1 AND e.relationship = 'executes' \
@@ -1822,8 +1846,8 @@ impl WorkflowRepository {
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
-    pub async fn set_goal_embedding(
-        pool: &PgPool,
+    pub async fn set_goal_embedding<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         workflow_id: Uuid,
         embedding: &[f32],
     ) -> Result<u64, sqlx::Error> {
@@ -1838,7 +1862,7 @@ impl WorkflowRepository {
         let r = sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2")
             .bind(&vec_str)
             .bind(workflow_id)
-            .execute(pool)
+            .execute(executor)
             .await?;
         Ok(r.rows_affected())
     }
@@ -1857,8 +1881,9 @@ impl WorkflowRepository {
     /// A blank goal has nothing to embed and is excluded, or it would be
     /// reported (and fail) on every run.
     ///
-    /// No viewer: `workflows` has `relrowsecurity = false` and no policy (see
-    /// `set_truth_value`), so the read is the same on any connection.
+    /// No viewer: its caller is the `embed_backfill` CLI on its maintenance
+    /// connection. `workflows` has row security since migration 183, so an
+    /// application-role session would list public rows only.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the database query fails.
@@ -1889,10 +1914,10 @@ impl WorkflowRepository {
     /// Returns `sqlx::Error` if the database query fails.
     /// # The executor is generic for COHESION, not because `workflows` is protected
     ///
-    /// MEASURED on a database migrated 001->101: `workflows` has
-    /// `relrowsecurity = false`, no policy, and no entry in migration 062's
-    /// tier-A array — so unlike the `claims` UPDATE this call cascades from, it
-    /// is NOT refused on an unstamped session. It is generic so that the two
+    /// Since migration 183 `workflows` has row security keyed on the plan's
+    /// tenancy (an UPDATE reaches only a row the session reads), so the
+    /// connection matters here as for the `claims` UPDATE this call cascades
+    /// from. It is generic so that the two
     /// halves of one deprecation can share a transaction: a `claims` row flipped
     /// to `is_current = false` while its hierarchical `workflows` row keeps its
     /// truth value is exactly the split `deprecate_workflow`'s cascade exists to
@@ -1934,9 +1959,11 @@ impl WorkflowRepository {
         Ok(result.rows_affected())
     }
 
-    /// Whether a hierarchical `workflows` row with this id exists. `workflows`
-    /// has no row security and no policy, so the answer is the same on every
-    /// connection.
+    /// Whether a hierarchical `workflows` row with this id is visible on this
+    /// connection. Since migration 183 the row carries its plan's tenancy and
+    /// row security: on a viewer-stamped connection a row declared into a
+    /// group the viewer does not read is absent here, exactly like an unknown
+    /// id; an unstamped application session sees public rows only.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -1950,6 +1977,55 @@ impl WorkflowRepository {
             .await
     }
 
+    /// The `workflows` row `id` as `viewer` reads it (ruling R-74, migration
+    /// 183): public, or declared into a group `viewer` reads; `None` for any
+    /// other row, exactly as for an unknown id. Run it on `viewer`'s STAMPED
+    /// connection, so the in-query predicate and the row security agree.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn row_as_viewer(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<FrozenPlanRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT w.id, w.canonical_name, w.generation, w.goal, w.parent_id, \
+                    w.truth_value, w.metadata \
+               FROM workflows w WHERE w.id = $1 /* {VISIBILITY:w} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FrozenPlanRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// Whether `viewer` reads the `workflows` row `id` (ruling R-74,
+    /// migration 183): public, or declared into a group `viewer` reads. Run
+    /// it on `viewer`'s STAMPED connection, so the in-query predicate and the
+    /// row security agree. An unreadable row answers `false`, exactly like an
+    /// unknown id.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn viewer_reads_row(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS (SELECT 1 FROM workflows w WHERE w.id = $1 /* {VISIBILITY:w} */)",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Every `workflows` row descended from `id` through `workflows.parent_id`
     /// (later generations and variants), transitively, in walk order and
     /// without `id` itself.
@@ -1957,9 +2033,10 @@ impl WorkflowRepository {
     /// `parent_id` and the `workflow -variant_of-> workflow` edge are written
     /// by the ingest executor under the SAME condition (a linked parent), so
     /// this is the lineage the variant edges describe. It is read from
-    /// `workflows` rather than from `edges` because `workflows` has no row
-    /// security, so the walk cannot be silently truncated by an edge the
-    /// session's tenancy context does not reach. Cycle-guarded: a hand-edited
+    /// `workflows` rather than from `edges`. Since migration 183 `workflows`
+    /// has row security keyed on each row's plan tenancy, so the walk is
+    /// bounded by the rows the connection's stamp reads: a descendant
+    /// declared into a group outside it is not in the set. Cycle-guarded: a hand-edited
     /// `parent_id` loop terminates.
     ///
     /// # Errors
@@ -2097,7 +2174,10 @@ impl WorkflowRepository {
     ///   `executes` edge takes its target's tenancy (migration 072's meet).
     /// * RETRACTED edges (`valid_to` set) are returned, flagged, not dropped:
     ///   a retraction changes the plan and the caller must be able to say so.
-    /// * `workflows` has no row security, so the row read needs no predicate.
+    /// * The row read carries no in-query predicate: it runs on the viewer's
+    ///   stamped connection, and `workflows`' row security (migration 183)
+    ///   hides a row declared into a group the viewer does not read, so the
+    ///   whole plan then reads as absent (the route's typed 404).
     /// * `heads_diverged` asks whether the target's step lineage has a head
     ///   other than the target that the viewer may read (`{VISIBILITY:h}`). The
     ///   `supersedes` exclusion inside it carries no viewer predicate, as in
@@ -2554,6 +2634,7 @@ mod tests {
             "Deploy a canary release safely.",
             None,
             serde_json::json!({"tags": ["deploy"]}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2641,6 +2722,7 @@ mod tests {
             "first goal",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2655,6 +2737,7 @@ mod tests {
             "different goal text",
             None,
             serde_json::json!({"foo": "bar"}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2685,6 +2768,7 @@ mod tests {
             "first",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2696,6 +2780,7 @@ mod tests {
             "third",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2723,6 +2808,7 @@ mod tests {
             "Process incoming sensor data and write to warehouse.",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2734,6 +2820,7 @@ mod tests {
             "Deploy a canary release safely.",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2783,6 +2870,7 @@ mod tests {
             "Send daily digest email",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2794,6 +2882,7 @@ mod tests {
             "Send daily digest email with retry",
             Some(gen0_id),
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2866,6 +2955,7 @@ mod tests {
                 "Send daily digest email",
                 None,
                 serde_json::json!({}),
+                epigraph_core::TenancyDecl::inherited(),
             )
             .await
             .unwrap();
@@ -2880,6 +2970,7 @@ mod tests {
             "Unrelated but closer",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -2948,6 +3039,7 @@ mod tests {
                 "Rotate the signing keys",
                 None,
                 serde_json::json!({}),
+                epigraph_core::TenancyDecl::inherited(),
             )
             .await
             .unwrap();
@@ -3000,6 +3092,7 @@ mod tests {
                 "consider all available tools",
                 None,
                 serde_json::json!({}),
+                epigraph_core::TenancyDecl::inherited(),
             )
             .await
             .unwrap();
@@ -3013,6 +3106,7 @@ mod tests {
             "rewrite the plan",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -3081,6 +3175,7 @@ mod tests {
                 goal,
                 None,
                 serde_json::json!({}),
+                epigraph_core::TenancyDecl::inherited(),
             )
             .await
             .unwrap();

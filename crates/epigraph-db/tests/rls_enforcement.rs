@@ -325,6 +325,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          triggers.",
     ),
     (
+        "workflows",
+        "DELETE",
+        "A workflow row (183) is never deleted by the application: deprecation lowers its \
+         truth value, and no route or tool removes a row. Under FORCE the absent permissive \
+         DELETE policy default-denies every non-superuser role, and 183's restrictive \
+         `workflows_delete_owner` would hold a delete to the owner group's writers if one \
+         were ever added.",
+    ),
+    (
         "role_agents",
         "DELETE",
         "A role attachment (166) is ended by its detach stamp, never deleted: the row is the \
@@ -406,6 +415,7 @@ const PROTECTED: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
+    "workflows",
 ];
 
 // ===========================================================================

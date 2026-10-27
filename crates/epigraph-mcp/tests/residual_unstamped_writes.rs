@@ -193,12 +193,12 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
         "tools/workflow_ingest.rs",
         "WorkflowRepository::set_goal_embedding",
-        2,
-        "`ingest_workflow` and `improve_workflow_hierarchy`, one call each. Writes `workflows`, \
-         which is MEASURED `relrowsecurity = false` with no policy at migration head 101 — so \
-         unlike the `claims` embed this one is not refused, and converting it would be cohesion \
-         rather than a fix. Kept unstamped deliberately; see `visibility_lint.rs`'s \
-         `workflow.rs::set_truth_value` entry for the same argument.",
+        1,
+        "`store_workflow_goal_embedding`'s fallback for a server with no `ScopedPool` (a \
+         development superuser), the only case without a stamp. With one, every goal embed \
+         (`ingest_workflow`, `improve_workflow_hierarchy`, `store_workflow`) runs on the ingest \
+         system agent's stamp, since migration 183 gave `workflows` row security keyed on the \
+         plan's tenancy.",
     ),
     (
         "tools/workflows.rs",
@@ -217,13 +217,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          reached the lineage-root early return). Same population and the same H3 question as \
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
-    ),
-    (
-        "tools/workflows.rs",
-        "WorkflowRepository::set_goal_embedding",
-        1,
-        "`store_workflow`'s goal embedding. Same `relrowsecurity = false` argument as the two in \
-         `workflow_ingest.rs`.",
     ),
 ];
 

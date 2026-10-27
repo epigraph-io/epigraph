@@ -402,11 +402,8 @@ pub async fn store_workflow(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&params.goal).await {
             Ok(qvec) => {
-                if let Err(e) =
-                    WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec).await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                crate::tools::workflow_ingest::store_workflow_goal_embedding(server, wf_id, &qvec)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
@@ -1000,20 +997,26 @@ pub async fn report_workflow_outcome(
     // hierarchical outcome path. Falls through to the legacy claims-table
     // flat-workflow path only when the id is not a hierarchical workflow
     // (preserves backward-compat for the ~144 legacy flat-workflow claims).
-    let is_hierarchical: bool =
-        // VISIBILITY-EXEMPT: `workflows` is not in migration 062's `tier_a`
-        // array and carries neither `visibility` nor `owner_group_id` (verified
-        // against `information_schema.columns`), so no predicate can be written
-        // here. Same category as `papers` in `recall.rs::compute_corpus_scope`.
-        // What leaves the function is one boolean routing decision — which of
-        // two outcome paths to take — and both paths perform their own
-        // viewer-scoped reads. Owner of the residual: the PR that gives
-        // `workflows` tenancy columns (plan §2.4's registration pass).
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM workflows WHERE id = $1)")
-            .bind(workflow_id)
-            .fetch_one(&server.pool)
+    //
+    // Read as the CALLER (ruling R-74, migration 183): a `workflows` row
+    // declared into a group the caller does not read routes exactly as an
+    // unknown id does, and a member's row routes to the hierarchical path. A
+    // server with no tenancy-aware pool (a development superuser) probes on
+    // its plain pool, as before.
+    let is_hierarchical: bool = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
+            let readable =
+                epigraph_db::WorkflowRepository::viewer_reads_row(&mut read, viewer, workflow_id)
+                    .await
+                    .map_err(internal_error)?;
+            read.commit().await.map_err(internal_error)?;
+            readable
+        }
+        None => epigraph_db::WorkflowRepository::exists(&server.pool, workflow_id)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?,
+    };
 
     if is_hierarchical {
         // Map flat StepExecution → HierarchicalStepExecution (identical
@@ -1419,8 +1422,10 @@ pub async fn deprecate_workflow(
     // The read accepts ANY readable claim, not only a `workflow`-labelled one,
     // as the flat path always has. The HTTP twin requires the label, and
     // narrowing this path is flat-path authority, which U017 leaves alone.
-    // `workflows` has no row security, so its existence check reads the same
-    // on any connection.
+    // The existence check runs on the same caller-stamped transaction:
+    // `workflows` has row security keyed on the plan's tenancy (migration
+    // 183), so a row declared into a group the caller does not read is
+    // answered like an unknown id.
     let is_claim = ClaimRepository::get_by_id(
         &mut *tx,
         viewer,

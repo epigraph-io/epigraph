@@ -531,6 +531,66 @@ pub async fn store_ingest_embedding(
     }
 }
 
+/// Store a workflow's goal embedding on a transaction stamped from the
+/// workflow-ingest system agent, the identity that wrote the row. Since
+/// migration 183 a `workflows` row carries its plan's tenancy, so the plain
+/// pool cannot see (and so cannot update) a row declared into a group.
+/// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a superuser development
+/// server) the plain pool is used, as before. Best-effort: a failure is logged
+/// and the row stays findable by text.
+pub(crate) async fn store_workflow_goal_embedding(
+    server: &EpiGraphMcpFull,
+    workflow_id: uuid::Uuid,
+    embedding: &[f32],
+) {
+    let stored = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped)
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(workflow_id = %workflow_id, error = %e, "goal embedding not stored: no system-agent write authority");
+                    return;
+                }
+            };
+            let mut tx = match scoped.begin_as(&authority.viewer).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::warn!(workflow_id = %workflow_id, error = %e, "goal embedding not stored: could not begin a stamped transaction");
+                    return;
+                }
+            };
+            let r = epigraph_db::WorkflowRepository::set_goal_embedding(
+                &mut *tx,
+                workflow_id,
+                embedding,
+            )
+            .await;
+            match r {
+                Ok(n) => tx.commit().await.map(|()| n).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        None => epigraph_db::WorkflowRepository::set_goal_embedding(
+            &server.pool,
+            workflow_id,
+            embedding,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+    };
+    match stored {
+        Ok(1) => {}
+        Ok(n) => {
+            tracing::warn!(workflow_id = %workflow_id, rows = n, "goal embedding matched no readable workflow row");
+        }
+        Err(e) => {
+            tracing::warn!(workflow_id = %workflow_id, error = %e, "set_goal_embedding failed")
+        }
+    }
+}
+
 /// MCP tool: ingest a `WorkflowExtraction` JSON.
 ///
 /// `tenancy`: see [`execute_workflow_ingest_with_inserted`]'s declared group.
@@ -578,12 +638,7 @@ pub async fn do_ingest_workflow(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
-                if let Err(e) =
-                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
-                        .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(server, wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
@@ -638,6 +693,45 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub already_ingested: bool,
 }
 
+/// The highest generation of `canonical_name`, read on the ingest system
+/// agent's stamp: the identity whose plan walk the new generation goes
+/// through, and which reads every group it ingests into. Since migration 183 a
+/// `workflows` row carries its plan's tenancy, so the plain pool would see
+/// public generations only and number a new generation at or below a
+/// group-private head; the walk would then find that row and write nothing.
+/// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a development
+/// superuser) the plain pool is read, as before.
+async fn lineage_max_generation(
+    server: &EpiGraphMcpFull,
+    canonical_name: &str,
+) -> Result<Option<i32>, McpError> {
+    match server.scoped.as_ref() {
+        Some(scoped) => {
+            let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
+                .await
+                .map_err(internal_error)?;
+            let mut tx = scoped
+                .begin_as(&authority.viewer)
+                .await
+                .map_err(internal_error)?;
+            let max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
+                &mut *tx,
+                canonical_name,
+            )
+            .await
+            .map_err(internal_error)?;
+            tx.commit().await.map_err(internal_error)?;
+            Ok(max)
+        }
+        None => epigraph_db::WorkflowRepository::max_generation_by_canonical(
+            &server.pool,
+            canonical_name,
+        )
+        .await
+        .map_err(internal_error),
+    }
+}
+
 /// Inner helper: same as [`improve_workflow_hierarchy_via_pool`] but also
 /// returns the executor's `inserted` vec so MCP entry points can embed.
 /// Called by `improve_workflow_hierarchy` (this module) — kept private since
@@ -649,17 +743,13 @@ async fn improve_workflow_hierarchy_with_inserted(
     mut extraction: WorkflowExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
-    let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
-        &server.pool,
-        parent_canonical_name,
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| {
-        invalid_params(format!(
-            "no workflow with canonical_name={parent_canonical_name}"
-        ))
-    })?;
+    let parent_max = lineage_max_generation(server, parent_canonical_name)
+        .await?
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "no workflow with canonical_name={parent_canonical_name}"
+            ))
+        })?;
 
     let new_generation = parent_max + 1;
 
@@ -762,12 +852,7 @@ pub async fn improve_workflow_hierarchy(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&goal).await {
             Ok(qvec) => {
-                if let Err(e) =
-                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
-                        .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(server, wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");

@@ -90,14 +90,13 @@
 //! [`AppState::read_as`] is documented read-only, and a write routed through a
 //! `ScopedRead` is rolled back on drop under `SessionGucMode::Transaction` while
 //! still type-checking. Their owner is `ScopedPool::begin_as` plus
-//! `Viewer::splice_write`. The remaining 2 are `get_workflow`, a routed GET that
-//! holds no `Viewer` at all — adding a `ViewerExtractor` to a routed handler is
-//! a route-table change with its own acceptance, not a read-shard conversion.
-//! Its owner is `F-inline-claim-content-reads`, whose UNCOMPENSATED half carries
-//! this file's 4 and whose `assigned` field calls it LIVE rather than latent;
-//! `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS` still carries
-//! `("workflows.rs", 4)` accordingly. Nothing further about it is recorded
-//! here — see `docs/tenancy/progress.json`.
+//! `Viewer::splice_write`. The remaining 2 were `get_workflow`'s. Since ruling
+//! R-74 (migration 183: a `workflows` row carries its plan's tenancy) that
+//! routed GET takes a `ViewerExtractor` and reads both its statements on the
+//! caller's stamped connection: the row through
+//! `WorkflowRepository::row_as_viewer`, the legacy flat claim inline with the
+//! viewer predicate (`F-inline-claim-content-reads` still owns moving that
+//! one). `no_unscoped_pool.rs` lowers this file's register accordingly.
 //!
 //! `deprecate_workflow`'s existence gate (`F-write-authz-reads-unfiltered`) is
 //! now viewer-filtered on a stamped connection (batch H6): a caller cannot
@@ -391,15 +390,7 @@ pub async fn store_workflow(
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&request.goal).await {
             Ok(qvec) => {
-                if let Err(e) = epigraph_db::WorkflowRepository::set_goal_embedding(
-                    &state.db_pool,
-                    wf_id,
-                    &qvec,
-                )
-                .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(&state, "workflows", wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
@@ -702,8 +693,15 @@ pub async fn list_workflows(
 /// GET /api/v1/workflows/:id - Fetch a single workflow by ID.
 ///
 /// Probes the `workflows` table (hierarchical) first; falls through to the
-/// legacy flat-workflow claims path. Returns 404 only when the id is absent
-/// from both tables.
+/// legacy flat-workflow claims path. Returns 404 when the id is absent from
+/// both tables or the caller may not read it.
+///
+/// Read as the caller, on one viewer-stamped connection. Since migration 183
+/// a `workflows` row carries its plan's tenancy (ruling R-74): a public row is
+/// readable by every authenticated caller, a row declared into a group only
+/// by that group's readers. Any other caller gets exactly the typed 404 an
+/// unknown id gets (`{"error":"NotFound","details":{"entity":"workflow",..}}`),
+/// the answer ruling A4 accepts for a non-member's read of a private plan.
 ///
 /// Response fields common to both paths:
 /// - `workflow_id`: the UUID
@@ -714,20 +712,28 @@ pub async fn list_workflows(
 /// - `canonical_name`: canonical_name (hierarchical) or `null` (flat)
 #[cfg(feature = "db")]
 pub async fn get_workflow(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(workflow_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // ── 1. Try hierarchical workflows table ─────────────────────────────────
-    let hier: Option<WorkflowHierarchicalRow> = sqlx::query_as::<_, WorkflowHierarchicalRow>(
-        "SELECT id, canonical_name, goal, truth_value, metadata \
-         FROM workflows WHERE id = $1",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch hierarchical workflow: {e}"),
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "get_workflow",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
     })?;
+
+    // ── 1. Try hierarchical workflows table ─────────────────────────────────
+    let hier = epigraph_db::WorkflowRepository::row_as_viewer(&mut read, &viewer, workflow_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch hierarchical workflow: {e}"),
+        })?;
 
     if let Some(row) = hier {
         return Ok(Json(serde_json::json!({
@@ -741,20 +747,25 @@ pub async fn get_workflow(
     }
 
     // ── 2. Fall through to legacy flat-workflow claims ───────────────────────
-    let row = sqlx::query_as::<_, WorkflowContentRow>(
-        "SELECT id, content, truth_value, properties \
-         FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to fetch workflow claim: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".to_string(),
-        id: workflow_id.to_string(),
-    })?;
+    let sql = viewer.splice(
+        "SELECT c.id, c.content, c.truth_value, c.properties \
+         FROM claims c WHERE c.id = $1 AND 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */",
+        2,
+    );
+    let mut q = sqlx::query_as::<_, WorkflowContentRow>(&sql).bind(workflow_id);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    let row = q
+        .fetch_optional(&mut *read)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to fetch workflow claim: {e}"),
+        })?
+        .ok_or(ApiError::NotFound {
+            entity: "workflow".to_string(),
+            id: workflow_id.to_string(),
+        })?;
 
     Ok(Json(serde_json::json!({
         "workflow_id": row.id,
@@ -1339,18 +1350,17 @@ pub async fn find_workflow_hierarchical(
 /// # Step attribution runs through the CALLER's viewer
 ///
 /// The whole report runs on one transaction stamped with the caller's viewer
-/// ([`AppState::write_as`]). `workflows` and `behavioral_executions` have no
-/// row security, so that changes nothing about the two writes; it changes the
-/// reads of `claims` and `edges`. On the plain transaction this used to run
-/// on, row security admitted only public rows, so a group's own member got
-/// every row of a group-private workflow written with a NULL `step_claim_id`,
-/// silently. A caller that reads NONE of the plan's STEP `executes` edges (a
-/// visible thesis, phase or shared level-3 atom does not count, so a step-less
-/// plan is refused to every caller:
-/// `WorkflowRepository::viewer_reads_plan_structure`) is refused with the
-/// missing-id 404 before anything is written: `workflows` has no row security,
-/// so without that check any `claims:write` holder could move the counters of
-/// a workflow it cannot read. A reader of the plan resolves its steps, and any
+/// ([`AppState::write_as`]). It decides the reads of `claims` and `edges`,
+/// and, since migration 183, of the `workflows` row itself, which carries the
+/// plan's tenancy (ruling R-74). On the plain transaction this used to run on,
+/// row security admitted only public rows, so a group's own member got every
+/// row of a group-private workflow written with a NULL `step_claim_id`,
+/// silently. A caller that does not read the PLAN (its `workflows` row, and
+/// at least one STEP `executes` edge; a visible thesis, phase or shared
+/// level-3 atom does not count, so a step-less plan is refused to every
+/// caller: `WorkflowRepository::viewer_reads_plan_structure`) is refused with
+/// the missing-id 404 before anything is written. A reader of the plan
+/// resolves its steps, and any
 /// `step_index` that matches no step the caller can read is listed in
 /// `unresolved_step_indices` with a `warning` (out of range and not visible are
 /// deliberately not told apart). Shared with MCP:
@@ -1367,7 +1377,7 @@ pub async fn find_workflow_hierarchical(
         (status = 400, description = "quality outside [0, 1]"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write"),
-        (status = 404, description = "no such workflow, or the caller reads none of its steps"),
+        (status = 404, description = "no such workflow, or the caller does not read its plan"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -1454,10 +1464,12 @@ pub async fn report_hierarchical_outcome(
         Some((m,)) => m,
         None => return Err(not_found()),
     };
-    // A caller that reads none of the plan's STEP `executes` edges (a visible
-    // thesis, phase or shared atom does not count) is answered 404 exactly
-    // like a missing id, before any write (`workflows` has no row security;
-    // its plan does). Shared with MCP.
+    // A caller that does not read the PLAN (its `workflows` row, which
+    // carries the plan's tenancy since migration 183, and at least one STEP
+    // `executes` edge; a visible thesis, phase or shared atom does not count)
+    // is answered 404 exactly like a missing id, before any write. Shared with
+    // MCP. On this stamped transaction the row lookup above already hides a
+    // row the caller does not read; the predicate states the rule itself.
     if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, &viewer, workflow_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -2224,15 +2236,7 @@ pub async fn ingest_workflow(
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
         match embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
-                if let Err(e) = epigraph_db::WorkflowRepository::set_goal_embedding(
-                    &state.db_pool,
-                    wf_id,
-                    &qvec,
-                )
-                .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(&state, "workflows/ingest", wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
@@ -2551,6 +2555,65 @@ async fn embed_inserted_workflow_claims(
     }
 }
 
+/// Store a workflow's goal embedding on a transaction stamped from the
+/// workflow-ingest system agent, as [`embed_inserted_workflow_claims`] stores
+/// the claims'. Since migration 183 a `workflows` row carries its plan's
+/// tenancy, so an unstamped session cannot see (and so cannot update) a row
+/// declared into a group; the system agent wrote the row and reads its group.
+/// Best-effort: a failure is logged and the row stays findable by text.
+#[cfg(feature = "db")]
+async fn store_workflow_goal_embedding(
+    state: &AppState,
+    route: &'static str,
+    workflow_id: Uuid,
+    embedding: &[f32],
+) {
+    let Some(scoped) = state.scoped.as_ref() else {
+        tracing::error!(
+            target: "tenancy.scoped_write",
+            route = route,
+            workflow_id = %workflow_id,
+            "workflow goal embedding not stored: this process was not built from a ScopedPool"
+        );
+        return;
+    };
+    let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                target: "tenancy.scoped_write",
+                route = route,
+                workflow_id = %workflow_id,
+                error = %e,
+                "workflow goal embedding not stored: no system-agent write authority"
+            );
+            return;
+        }
+    };
+    let mut tx = match scoped.begin_as(&authority.viewer).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(route = route, workflow_id = %workflow_id, error = %e, "workflow goal embedding not stored: could not begin a system-agent-stamped transaction");
+            return;
+        }
+    };
+    match epigraph_db::WorkflowRepository::set_goal_embedding(&mut *tx, workflow_id, embedding)
+        .await
+    {
+        Ok(1) => {}
+        Ok(n) => {
+            tracing::warn!(route = route, workflow_id = %workflow_id, rows = n, "workflow goal embedding matched no readable row");
+        }
+        Err(e) => {
+            tracing::warn!(route = route, workflow_id = %workflow_id, error = ?e, "set_goal_embedding failed");
+            return;
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(route = route, workflow_id = %workflow_id, error = %e, "workflow goal embedding could not commit");
+    }
+}
+
 #[cfg(feature = "db")]
 fn format_embedding(embedding: &[f32]) -> String {
     format!(
@@ -2645,16 +2708,6 @@ struct WorkflowContentRow {
     content: String,
     truth_value: Option<f64>,
     properties: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct WorkflowHierarchicalRow {
-    id: Uuid,
-    canonical_name: String,
-    goal: String,
-    truth_value: f64,
-    metadata: serde_json::Value,
 }
 
 // ── add_step / delete_step ──────────────────────────────────────────────────
@@ -3579,15 +3632,14 @@ mod tests {
 
     // ── Test scaffolding (modern style: #[sqlx::test]) ──
 
-    /// Build a minimal AppState backed by the given pool.
-    fn test_state(pool: PgPool) -> AppState {
-        AppState::with_db(pool, ApiConfig::default())
-    }
-
     /// Build a router exposing just the workflow GET-by-id route under test.
+    /// The route reads as its caller since migration 183 (ruling R-74), so it
+    /// carries a caller (`test_auth`, whose viewer reads public rows) and needs
+    /// a state built from a `ScopedPool` ([`scoped_test_state`]).
     fn workflow_router(state: AppState) -> Router {
         Router::new()
             .route("/api/v1/workflows/:id", get(get_workflow))
+            .layer(axum::Extension(test_auth()))
             .with_state(state)
     }
 
@@ -3780,7 +3832,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_workflow_returns_single_workflow(pool: PgPool) {
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let workflow_id = seed_test_workflow(&pool, "deploy-canary", &["step1", "step2"]).await;
 
         let router = workflow_router(state);
@@ -3803,7 +3855,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn get_workflow_returns_404_for_non_workflow_claim(pool: PgPool) {
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let claim_id = seed_plain_claim(&pool, "not a workflow").await;
 
         let router = workflow_router(state);
@@ -3838,7 +3890,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = test_state(pool.clone());
+        let state = scoped_test_state(&pool).await;
         let router = workflow_router(state);
         let response = router
             .oneshot(
@@ -3956,6 +4008,7 @@ mod tests {
             "Test workflow for outcome reporting.",
             None,
             serde_json::json!({"use_count": 0, "success_count": 0, "failure_count": 0, "avg_variance": 0.0}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -4072,6 +4125,7 @@ mod tests {
             "Test workflow for outcome atomicity.",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -4313,6 +4367,7 @@ mod tests {
             "Test workflow for outcome goal embedding.",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();
@@ -4497,6 +4552,7 @@ mod tests {
             "A workflow for end-to-end search testing.",
             None,
             serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
         )
         .await
         .unwrap();

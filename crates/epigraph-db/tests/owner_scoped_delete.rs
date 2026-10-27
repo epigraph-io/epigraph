@@ -2051,9 +2051,11 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .fetch_all(&pool)
     .await
     .expect("catalog");
+    // 24 -> 25 (ruling R-74): migration 183's `workflows`, with
+    // `workflows_delete_owner` and `workflows_owner_immutable`.
     assert_eq!(
         rows.len(),
-        24,
+        25,
         "the tier-A set changed size; decide its DELETE rule: {rows:?}"
     );
     let missing: Vec<&String> = rows
@@ -2089,7 +2091,8 @@ async fn every_public_admitting_table_has_a_restrictive_delete_policy(pool: PgPo
     .fetch_all(&pool)
     .await
     .expect("delete policy quals");
-    assert_eq!(quals.len(), 24, "{quals:?}");
+    // 24 -> 25 (ruling R-74): migration 183's `workflows_delete_owner`.
+    assert_eq!(quals.len(), 25, "{quals:?}");
     for (table, qual) in &quals {
         assert!(
             qual.contains("owner_group_id = ANY") && qual.contains("epigraph_writable_groups()"),

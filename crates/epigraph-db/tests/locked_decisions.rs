@@ -1939,12 +1939,14 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .fetch_all(&pool)
     .await
     .expect("read pg_trigger for the PR-16 set");
+    // 25 -> 26 (ruling R-74): migration 183's `workflows_require_tenancy`,
+    // 074's parentless-root body on the 26th tier-A table.
     assert_eq!(
         pr16.len(),
-        25,
-        "expected 25 after migration 074: 24 *_require_tenancy (claims, the 17 \
-         claim-derived tables, the 6 parentless roots) plus claims_block_widening. \
-         Found {}: {pr16:?}",
+        26,
+        "expected 26: 24 *_require_tenancy after migration 074 (claims, the 17 \
+         claim-derived tables, the 6 parentless roots), migration 183's \
+         workflows_require_tenancy, plus claims_block_widening. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2302,6 +2304,9 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
+    // Workflow rows (183, ruling R-74): tier-A since that migration, which
+    // FORCEs the table itself; reached through `tier_a` in the test below.
+    "workflows",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2443,10 +2448,13 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     .expect("tier_a probe")
     .into_iter()
     .collect();
+    // 25 -> 26 (ruling R-74): migration 183 gives `workflows` both tenancy
+    // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     assert_eq!(
         tier_a.len(),
-        25,
-        "migration 062's tier_a is 25 relations; got {}: {tier_a:?}",
+        26,
+        "migration 062's tier_a (25 relations) plus migration 183's workflows; got {}: \
+         {tier_a:?}",
         tier_a.len()
     );
 
