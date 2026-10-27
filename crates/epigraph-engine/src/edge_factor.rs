@@ -1267,6 +1267,16 @@ async fn preview_of_combined(
 /// persist the result to `claims.{belief, plausibility, pignistic_prob,
 /// conflict_k, missing_mass}` (and `classification` on the binary frame).
 /// No-ops (does not write) when the claim has no BBAs on `frame_id`.
+///
+/// **Every BBA inadmissible (ruling R-80).** When the frame's BBAs are all
+/// left out of the fold by the derivation scope rule (R-22 / R-71) and
+/// [`crate::derivation_scope::must_vacate_cache`] holds (no admissible input on
+/// ANY frame of the claim, and a cache to replace), the cache is set to full
+/// ignorance on this frame instead of being left as it was: Bel 0, Pl 1, BetP
+/// 1/|frame| (0.5 on the binary frame), no conflict or missing mass, and the
+/// classification that ignorance gets (`not_enough_info`). The old value was
+/// folded from sources narrower than the claim, so keeping it would go on
+/// serving their direction and weight to every reader.
 async fn recompute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1275,17 +1285,37 @@ async fn recompute_combined_belief(
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let Some(preview) = compute_combined_belief(
+    let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+        .await
+        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let had_input = !rows.is_empty();
+    let folded = compute_combined_belief_over(
         &mut *conn,
         viewer,
         claim_id,
         frame_id,
         frame,
         frame_overrides,
+        rows,
     )
-    .await?
-    else {
-        return Ok(());
+    .await?;
+    // `None` with input on the frame: the scope rule left none of it.
+    let (preview, vacated) = match folded {
+        Some(preview) => (preview, false),
+        None if had_input
+            && crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id)
+                .await
+                .map_err(|e| format!("derivation scope read: {e}"))? =>
+        {
+            let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+            let ignorance = MassFunction::vacuous(frame.clone());
+            let preview = preview_of_combined(
+                &mut *conn, viewer, claim_id, frame_id, frame, &profile, &ignorance, 0.0, false,
+            )
+            .await?;
+            (preview, true)
+        }
+        None => return Ok(()),
     };
 
     let written = MassFunctionRepository::update_claim_belief(
@@ -1302,6 +1332,16 @@ async fn recompute_combined_belief(
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
+    if vacated {
+        tracing::info!(
+            target: "epigraph::belief_cache::vacate",
+            claim = %claim_id,
+            frame = %frame_id,
+            written,
+            "no BBA of the claim may enter its cache (derivation scope); \
+             cache set to full ignorance"
+        );
+    }
 
     // The verdict belongs to the cache it describes: when the cache was not
     // written (a non-owner on a frame the claim's cache does not carry,
@@ -1385,6 +1425,10 @@ async fn recompute_combined_belief(
 /// query over its leaves rather than a fold of its own BBAs. So this function
 /// never makes a claim's cache emptier than it was. Every caller inherits
 /// both, including the per-write `routes::assess` refresh.
+///
+/// The one exception is ruling R-80: a claim whose every BBA the derivation
+/// scope rule keeps out of its cache gets full ignorance in place of its old
+/// value (see `recompute_combined_belief`); a claim with no cache keeps none.
 ///
 /// Resolving the owner is a read: this function creates no frame. (It used to
 /// get-or-create `binary_truth` here only to compare ids.)
