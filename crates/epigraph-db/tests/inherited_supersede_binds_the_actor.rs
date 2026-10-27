@@ -12,6 +12,10 @@
 //! writes the group. Under R-85 the inherited author of the act's INSERT is no
 //! longer attributed to the writer; the writer is what is checked.
 //!
+//! The three refusals the inherited author caused, one test each: an author
+//! bound to no human (`OPL01`), another human's live agent (`OPL02`), and
+//! another human's RETIRED identity (`OPL02`).
+//!
 //! What stays: the writer's own checks (unbound actor `OPL01`, an actor whose
 //! human does not write the group `OPL02`), the attribution of a FRESH claim
 //! naming another human's agent (`OPL02`), and the attribution of a RE-OPEN of
@@ -277,6 +281,52 @@ async fn an_inherited_supersede_of_another_humans_agent_is_bound_on_the_actor(po
         x_claim,
         x,
         "B's agent Y restates A's agent X's claim in a group both humans write",
+    )
+    .await;
+}
+
+/// THE RULING, third refusal: the inherited author R is a RETIRED identity of
+/// human A (its operator link is retired, so it can never write again, but it
+/// still belongs to A). Human B's live agent Y, a writer of A's group whose
+/// human B writes it too, restates R's claim there. It lands, the successor
+/// keeps R as its author, and the act edge names Y.
+///
+/// Red at the pre-R-85 trigger (153's body): `OperatorScopeRefused` (OPL02),
+/// because 166's attribution reads a retired identity's human for an
+/// inherited author, and R belongs to A, not to Y's human.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_inherited_supersede_of_another_humans_retired_identity_is_bound_on_the_actor(
+    pool: PgPool,
+) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "human-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "human-b").await;
+    let (r, _) = fixture::seed_agent_with_group(&pool, "a-retired-r").await;
+    let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
+    link_live(&pool, y, b).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        AgentRepository::link_retired_agent(&mut conn, r, a)
+            .await
+            .expect("R's retired tie to A");
+    }
+    add_writer(&pool, a_group, b).await;
+    add_writer(&pool, a_group, y).await;
+    let r_claim = insert_claim(&pool, r, a_group).await.expect("R's claim");
+    arm(&pool).await;
+    let retired: bool = sqlx::query_scalar("SELECT public.epigraph_agent_is_retired($1)")
+        .bind(r)
+        .fetch_one(&pool)
+        .await
+        .expect("probe");
+    assert!(retired, "CALIBRATION: R is a retired identity of A");
+
+    assert_actor_supersedes(
+        &pool,
+        y,
+        a_group,
+        r_claim,
+        r,
+        "B's agent Y restates A's retired identity R's claim in a group both humans write",
     )
     .await;
 }
