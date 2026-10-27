@@ -1704,7 +1704,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 `epigraph-operator` (the role verbs and `custodial-supersede`),
 `epigraph-api` (privatization records a custodial act and reads the
 assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
-one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first.
+one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first
+(and, before it, `docs/runbooks/185-undo.sql` if migration 185 is applied).
 Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
@@ -2692,6 +2693,9 @@ reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
 **Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
 transaction: it restores 123's body of the function and re-asserts its owner.
 Run it before `123-undo.sql`.
+If migration 185 is applied (an armed supersede act bound on its writer,
+ruling R-85), run `docs/runbooks/185-undo.sql` first: it restores 153's body
+of the same function. 185 has no ordering constraint against the binaries.
 
 ## `epigraph-operator restrict-claims` — the audited admin privatization act (no migration)
 
