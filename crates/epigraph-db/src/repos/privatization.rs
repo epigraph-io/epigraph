@@ -855,8 +855,8 @@ pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
 /// back.
 ///
 /// A SQL fragment over the alias `e`, like [`SEAL_CONTENT_SENTINEL`]: the seal
-/// UPDATE is set-based, and unseal recognises the sentinel with the same
-/// expression.
+/// UPDATE is set-based. Migration 171's backfill of rows sealed before the
+/// sentinel writes the same expression.
 const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
     "sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'))";
 
@@ -867,7 +867,9 @@ const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
 /// body-less (external) row's digest was supplied by its writer, so the
 /// server could not rebuild it on unseal: like
 /// [`SEALED_EVIDENCE_SOURCE_URL_KEY`], it rides in the properties the client
-/// encrypts, and unseal splits it back out into the column.
+/// encrypts, and unseal splits it back out into the column of a row restored
+/// without a body. A row restored WITH a body gets BLAKE3 of that body
+/// instead, whatever the carrier says.
 pub const SEALED_EVIDENCE_CONTENT_HASH_KEY: &str = "$sealed_content_hash";
 
 /// The key under which a seal manifest carries an evidence row's
@@ -3838,35 +3840,32 @@ impl PrivatizationRepository {
             }
         }
         if !evidence_ids.is_empty() {
-            // The digest, in order: the one the seal folded into the
-            // ciphertext; else, on a row holding the seal's digest sentinel
-            // (sealed without the fold), BLAKE3 of the restored body; else the
-            // column as it is (a row sealed before the sentinel existed still
-            // holds its original digest). A body-less row with neither keeps
-            // the sentinel: its writer-supplied digest is not recoverable.
+            // The digest, in order: for a row whose body is restored, BLAKE3 of
+            // that body, always, so `content_hash` = BLAKE3(`raw_content`)
+            // holds whatever the unsealing client carried; else (a body-less,
+            // external row) the digest the seal folded into the ciphertext,
+            // the only copy of its writer-supplied value; else the column as
+            // it is. A body-less row sealed without the fold therefore keeps
+            // the sentinel: its digest is not recoverable.
             //
             // A restored digest may equal a row the same owner wrote on the
             // claim while it was sealed. Evidence has no unique key (migration
             // 171), so both rows stay, as any stored duplicate does; the unseal
             // is not refused.
-            sqlx::query(&format!(
+            sqlx::query(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = t.raw_content,
                        properties = t.properties,
                        source_url = COALESCE(t.source_url, e.source_url),
-                       content_hash = COALESCE(
-                           t.content_hash,
-                           CASE WHEN e.content_hash = {SEAL_EVIDENCE_DIGEST_SENTINEL}
-                                THEN t.body_hash END,
-                           e.content_hash)
+                       content_hash = COALESCE(t.body_hash, t.content_hash, e.content_hash)
                   FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[],
                               $6::bytea[], $7::bytea[])
                     AS t(evidence_id, claim_id, raw_content, properties, source_url,
                          content_hash, body_hash)
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
-                "
-            ))
+                ",
+            )
             .bind(&evidence_ids)
             .bind(&evidence_parents)
             .bind(&evidence_contents)
