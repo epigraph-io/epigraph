@@ -411,6 +411,82 @@ async fn migration_173_derives_existing_rows_from_their_fragments_or_refuses(poo
     );
 }
 
+/// A migrator that cannot read every fragment is refused before 173 changes
+/// anything. `harvester_fragments` is FORCEd, so its OWNER reads it through
+/// row security too: a table-owning migrator that is not a superuser, has no
+/// BYPASSRLS and is not a maintenance member sees only public fragments, and
+/// the source below (one public and one private fragment of one group) would
+/// look derivable as `('public', group)`, more readable than its fragments.
+/// The attempt runs in a transaction that is rolled back, so the role and the
+/// ownership change it needs leave nothing behind.
+#[sqlx::test(migrations = false)]
+async fn migration_173_refuses_a_migrator_that_cannot_read_every_fragment(pool: PgPool) {
+    use sqlx::Executor;
+    migrate(&pool, &up_to(172)).await.expect("migrate to 172");
+    let (_a, group_a) = fixture::seed_agent_with_group(&pool, "harv-173-reader").await;
+    let split = seed_source(&pool, group_a, "group").await;
+    seed_fragment(&pool, split, group_a, "public").await;
+    seed_fragment(&pool, split, group_a, "group").await;
+
+    let sql_173 = MIGRATOR
+        .migrations
+        .iter()
+        .find(|m| m.version == 173)
+        .expect("migration 173 is embedded")
+        .sql
+        .to_string();
+    // Role names cannot be bound; this one is generated here, never caller data.
+    let role = format!("harv173_reader_{}", Uuid::new_v4().simple());
+
+    let mut tx = pool.begin().await.expect("begin");
+    for stmt in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("ALTER TABLE public.harvester_sources OWNER TO {role}"),
+        format!("ALTER TABLE public.harvester_audit_reports OWNER TO {role}"),
+        format!("ALTER TABLE public.harvester_fragments OWNER TO {role}"),
+        // The application role's grant (077). Without it the owner's read of
+        // the FORCEd table is refused outright (42501), which fails closed.
+        format!("GRANT EXECUTE ON FUNCTION public.epigraph_definer_bypass() TO {role}"),
+        format!("SET LOCAL SESSION AUTHORIZATION {role}"),
+    ] {
+        (&mut *tx)
+            .execute(stmt.as_str())
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    let visible: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM harvester_fragments WHERE source_id = $1")
+            .bind(split)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count fragments as the table owner");
+    assert_eq!(
+        visible, 1,
+        "CONTROL: the owning migrator reads only the public one of the source's two \
+         fragments, so its derivation would see a single pair"
+    );
+    let refused = (&mut *tx)
+        .execute(sql_173.as_str())
+        .await
+        .expect_err("173 must refuse a migrator that cannot read every fragment");
+    let msg = refused.to_string();
+    tx.rollback().await.expect("rollback");
+    assert!(
+        msg.contains("HVT01") && msg.contains("cannot read every fragment"),
+        "the refusal is 173's reader check, before any derivation: {msg}"
+    );
+
+    // Read in full, the same source is underivable: a superuser run refuses it.
+    let full = migrate(&pool, &up_to(173))
+        .await
+        .expect_err("a full read sees the source's two visibilities");
+    let full = full.to_string();
+    assert!(
+        full.contains("HVT01") && full.contains("for 1 harvester_sources"),
+        "a reader that sees every fragment refuses the split source: {full}"
+    );
+}
+
 /// After 173 an audit report takes its fragment's tenancy whatever its writer
 /// declared, and a source is declared or refused like `harvester_fragments`:
 /// an undeclared INSERT outside the seed escape hatch raises 23502.
