@@ -787,18 +787,19 @@ async fn a_seal_encrypts_only_the_claim_owners_evidence(pool: PgPool) {
     assert_eq!(evidence_state(&pool, held).await, held_before);
 }
 
-/// CURRENT BEHAVIOUR, pinned so a change to it is deliberate; it is NOT a
-/// requirement of ruling R-78. A writer's own (writer-owned) public evidence
-/// row on a claim is moved onto the claim's group when the claim narrows
-/// (migration 168's `epigraph_propagate_tenancy`, writer-owned arm), so by seal
-/// time it IS the claim owner's, is sealed with the claim, and is restored by
-/// unseal. Whether such a row should instead stay its writer's (and public)
-/// through a narrowing is an open design question; if that changes, this test
-/// changes with it.
+/// A writer's public evidence row ON the narrowing claim follows that claim
+/// into the seal (operator ruling R-101, "ship A5 as built").
+///
+/// Evidence rows are per claim: this row is the claim's own copy of what the
+/// writer recorded. When the claim narrows, migration 168's
+/// `epigraph_propagate_tenancy` (writer-owned arm) moves the row onto the
+/// claim's group, so by seal time it IS the claim owner's (ruling R-78's
+/// predicate covers it), the seal encrypts it with the claim, and unseal
+/// restores it. The same body on another public claim is that claim's own row
+/// and stays public:
+/// [`the_same_body_on_another_public_claim_stays_public_through_the_seal`].
 #[sqlx::test(migrations = "../../migrations")]
-async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_into_the_seal(
-    pool: PgPool,
-) {
+async fn r101_a_writers_evidence_on_the_narrowing_claim_follows_it_into_the_seal(pool: PgPool) {
     let world = fx::World::seed(&pool).await;
     make_keyed(&pool, world.target_group).await;
     let claim = seed_subject(&pool, &world, "a subject with a writer's evidence").await;
@@ -818,7 +819,7 @@ async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_i
     assert_eq!(
         (written_before.0, written_before.1),
         (world.target_group, false),
-        "current behaviour: the writer's row followed the claim when it narrowed (168)"
+        "R-101: the claim's own row followed the claim when it narrowed (168)"
     );
 
     let manifest = fetch_seal_manifest(&pool, &world, plan)
@@ -827,7 +828,7 @@ async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_i
     let served: Vec<Uuid> = manifest.items[0].evidence.iter().map(|e| e.id).collect();
     assert!(
         served.contains(&written),
-        "current behaviour: the re-owned row is the claim owner's, so it is served"
+        "R-101: the re-owned row is the claim owner's, so the manifest serves it"
     );
     let body = seal_body(&manifest).await;
     let resp = post_seal_commit(&pool, &world, plan, body)
@@ -835,7 +836,10 @@ async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_i
         .expect("seal commit");
     assert_eq!(resp.committed, 1);
     let written_sealed = evidence_state(&pool, written).await;
-    assert!(written_sealed.4, "current behaviour: the row is sealed");
+    assert!(
+        written_sealed.4,
+        "R-101: the claim's own row is sealed with it"
+    );
     assert_ne!(
         written_sealed.2.as_deref(),
         Some(writer_body.as_str()),
@@ -850,6 +854,168 @@ async fn current_behaviour_a_writers_public_evidence_follows_a_narrowing_claim_i
         blake3::hash(writer_body.as_bytes()).as_bytes().to_vec()
     );
     assert!(!written_after.4);
+}
+
+/// Evidence row `id`'s `(owner_group_id, writer_owned, visibility, raw_content,
+/// content_hash, sealed)`, where `sealed` is "has an `evidence_encryption` row".
+async fn evidence_tenancy(
+    pool: &PgPool,
+    id: Uuid,
+) -> (Uuid, bool, String, Option<String>, Vec<u8>, bool) {
+    sqlx::query_as(
+        "SELECT e.owner_group_id, e.writer_owned, e.visibility::text, e.raw_content, \
+                e.content_hash, \
+                EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id) \
+           FROM evidence e WHERE e.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read evidence tenancy")
+}
+
+/// Public evidence supporting a public claim stays public when the SAME body
+/// on another claim is privatized and sealed (operator ruling R-101).
+///
+/// One writer records one body on two public claims, so each claim holds its
+/// own row with the same digest. Claim A is restricted and sealed; claim B is
+/// not in the plan. A's copy follows A (R-101: narrowed by 168, served, sealed,
+/// its digest replaced). B's copy must stay exactly as written through the
+/// restrict, the seal and the unseal: the writer's, writer-owned, `public`,
+/// its body and digest intact, no ciphertext row, and readable by an
+/// unstamped application-role session that cannot read A's copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_same_body_on_another_public_claim_stays_public_through_the_seal(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    make_keyed(&pool, world.target_group).await;
+    let claim_a = seed_subject(&pool, &world, "a subject the plan privatizes").await;
+    let claim_b =
+        viewer_fixture::seed_public_claim(&pool, world.actor, "another public claim").await;
+    let world_group = viewer_fixture::world_group(&pool).await;
+    let (_writer, writer_group) = viewer_fixture::seed_agent_with_group(&pool, "r101-writer").await;
+
+    let body = format!("one public body on two claims {}", Uuid::new_v4());
+    let digest = blake3::hash(body.as_bytes()).as_bytes().to_vec();
+    let on_a = seed_body(&pool, claim_a, &body).await;
+    let on_b = seed_body(&pool, claim_b, &body).await;
+    sqlx::query("UPDATE evidence SET owner_group_id = $2, writer_owned = true WHERE id = ANY($1)")
+        .bind(vec![on_a, on_b])
+        .bind(writer_group)
+        .execute(&pool)
+        .await
+        .expect("make both rows the writer's");
+
+    let b_written = evidence_tenancy(&pool, on_b).await;
+    assert_eq!(
+        b_written,
+        (
+            writer_group,
+            true,
+            "public".to_string(),
+            Some(body.clone()),
+            digest.clone(),
+            false
+        ),
+        "fixture: B's row is the writer's public copy of the body"
+    );
+    assert_eq!(
+        evidence_tenancy(&pool, on_a).await.4,
+        digest,
+        "fixture: both copies carry the body's digest"
+    );
+
+    let plan = applied_seal_plan(&pool, &world, &[claim_a]).await;
+    let a_restricted = evidence_tenancy(&pool, on_a).await;
+    assert_eq!(
+        (a_restricted.0, a_restricted.1),
+        (world.target_group, false),
+        "control: A's own copy followed A when it narrowed (168)"
+    );
+    assert_ne!(
+        a_restricted.2, "public",
+        "control: A's copy is no longer public"
+    );
+    assert_eq!(
+        evidence_tenancy(&pool, on_b).await,
+        b_written,
+        "the restrict of claim A must leave claim B's copy of the body as written"
+    );
+
+    let manifest = fetch_seal_manifest(&pool, &world, plan)
+        .await
+        .expect("seal manifest");
+    let served: Vec<Uuid> = manifest
+        .items
+        .iter()
+        .flat_map(|i| &i.evidence)
+        .map(|e| e.id)
+        .collect();
+    assert!(
+        served.contains(&on_a),
+        "control: A's copy is served: {served:?}"
+    );
+    assert!(
+        !served.contains(&on_b),
+        "the manifest hands claim B's public evidence to the sealing client: {served:?}"
+    );
+    let commit = seal_body(&manifest).await;
+    let resp = post_seal_commit(&pool, &world, plan, commit)
+        .await
+        .expect("seal commit");
+    assert_eq!(resp.committed, 1);
+
+    let a_sealed = evidence_tenancy(&pool, on_a).await;
+    assert!(a_sealed.5, "control: A's copy has a ciphertext row");
+    assert_ne!(
+        a_sealed.4, digest,
+        "control: A's copy no longer carries the body's digest"
+    );
+    assert_ne!(a_sealed.3.as_deref(), Some(body.as_str()));
+    assert_eq!(
+        evidence_tenancy(&pool, on_b).await,
+        b_written,
+        "sealing claim A must leave claim B's public copy as written: owner, writer_owned, \
+         public, body, digest, and no ciphertext row"
+    );
+    let (b_visibility, b_owner): (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
+            .bind(claim_b)
+            .fetch_one(&pool)
+            .await
+            .expect("read claim B");
+    assert_eq!((b_visibility.as_str(), b_owner), ("public", world_group));
+
+    // Through the row-level policies: an unstamped application-role session
+    // reads the public corpus only. It reads B's copy and not A's.
+    let app = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let readable: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT id, raw_content FROM evidence WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![on_a, on_b])
+            .fetch_all(&app)
+            .await
+            .expect("read evidence as the application role");
+    assert_eq!(
+        readable,
+        vec![(on_b, Some(body.clone()))],
+        "an unstamped reader sees claim B's public copy of the body and not A's sealed copy"
+    );
+
+    unseal_through_routes(&pool, &world, plan, 1).await;
+    assert_eq!(
+        evidence_tenancy(&pool, on_b).await,
+        b_written,
+        "unsealing claim A must leave claim B's copy as written"
+    );
+    let a_unsealed = evidence_tenancy(&pool, on_a).await;
+    assert_eq!(
+        (
+            a_unsealed.3.as_deref(),
+            a_unsealed.4.as_slice(),
+            a_unsealed.5
+        ),
+        (Some(body.as_str()), digest.as_slice(), false),
+        "control: unseal restores A's copy"
+    );
 }
 
 /// A commit that omits a TCB member is refused, and NOTHING is sealed.

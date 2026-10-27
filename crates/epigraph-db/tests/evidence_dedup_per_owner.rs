@@ -386,7 +386,7 @@ async fn a_claim_two_owners_hold_one_body_on_can_still_be_privatized(pool: PgPoo
     assert_eq!(moved, vec![claim]);
     // Both rows survive. Which group then owns the writer's row is migration
     // 168's narrowing, not this ruling's, and is deliberately not asserted
-    // here (privatization_seal.rs pins it as current behaviour).
+    // here (privatization_seal.rs pins it as a ruling R-101 requirement).
     assert_eq!(
         rows_with_body(&pool, claim, &body).await.len(),
         2,
