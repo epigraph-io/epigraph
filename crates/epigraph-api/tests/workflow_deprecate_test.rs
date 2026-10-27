@@ -74,7 +74,8 @@ async fn deprecate_workflow_sets_is_current_false_and_lowers_truth() {
 
     // ── Act: DELETE /api/v1/workflows/:id?reason=test ──
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let token = common::test_bearer_token();
+    // The route requires `claims:write` (backlog 05eb8b4a).
+    let token = common::test_bearer_token_with_scopes(&["claims:write"]);
     let resp = reqwest::Client::new()
         .delete(format!(
             "http://{addr}/api/v1/workflows/{workflow_id}?reason=test-deprecate"

@@ -737,6 +737,72 @@ async fn a_declared_ingest_lands_every_claim_and_executes_edge_in_the_group(pool
     assert!(goal_embedded, "the workflow's goal is embedded");
 }
 
+/// The route requires `claims:write`, checked before it reads or writes
+/// anything (backlog 05eb8b4a). Its sibling step routes and the MCP twin
+/// require it (`scope_map.rs`); this route checked no scope, so a `claims:read`
+/// token whose agent writes the declared group ingested into it, and any
+/// read-only token ingested a public workflow.
+///
+/// A read-only token is refused 403 naming `claims:write` with ONE body for:
+/// the human `h` declaring its operator group (a membership the route admits:
+/// the first test in this file is that ingest succeeding), the second human
+/// `h2` declaring the same group (a non-member the membership gate would refuse
+/// with a different 403), and `h` declaring no tenancy at all (a public
+/// ingest). The scope decides first, so the refusal says nothing about
+/// memberships. Nothing is written. The same caller with `claims:write` then
+/// ingests the declared body into the group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_read_only_token_is_refused_before_anything_is_read_or_written(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-tenancy-read-only";
+    let public_body = extraction(name, 0, &[&["acme read-only operation"]]);
+    let declared_body = declared(public_body.clone(), w.og, None);
+    let before = row_counts(&pool).await;
+
+    let mut bodies = Vec::new();
+    for (who, caller, body) in [
+        ("a writer of the declared group", w.h, &declared_body),
+        ("a non-member of the declared group", w.h2, &declared_body),
+        ("a public ingest", w.h, &public_body),
+    ] {
+        let (status, out) = w.api.ingest(&token(caller, READ_SCOPES), body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{who}: a token without claims:write must be refused 403: {out}"
+        );
+        assert!(
+            out.to_string().contains("claims:write"),
+            "{who}: the refusal names the missing scope: {out}"
+        );
+        bodies.push(out);
+    }
+    assert!(
+        bodies.windows(2).all(|p| p[0] == p[1]),
+        "the scope refusal must not depend on the caller's membership or the tenancy: {bodies:?}"
+    );
+    assert_eq!(
+        row_counts(&pool).await,
+        before,
+        "a refused ingest writes no claim, edge, workflow or mass function"
+    );
+    assert_eq!(workflows_named(&pool, name).await, 0);
+
+    let out = w
+        .api
+        .ingest_ok(
+            &token(w.h, &["claims:read", "claims:write"]),
+            &declared_body,
+        )
+        .await;
+    let plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
+    assert!(
+        !plan.is_empty() && plan.iter().all(|(_, v, o)| v == "group" && *o == w.og),
+        "calibration: with claims:write the same caller ingests into the group: {plan:?}"
+    );
+    assert_eq!(workflows_named(&pool, name).await, 1);
+}
+
 /// A curator that itself writes the team group publishes into it over stdio.
 /// The operation atoms' BBAs land in the same group (the DS wiring runs on
 /// the system-agent stamp, which writes it).
