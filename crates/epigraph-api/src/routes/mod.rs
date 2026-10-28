@@ -469,6 +469,10 @@ pub fn create_router_with_extensions(
             post(bba_retract::retract_bba),
         )
         .route(
+            "/api/v1/mass-functions/:id/unretract",
+            post(bba_retract::unretract_bba),
+        )
+        .route(
             "/api/v1/frames/:id/conflict-batch",
             post(belief::conflict_batch),
         )

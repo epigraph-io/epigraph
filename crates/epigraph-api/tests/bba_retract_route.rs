@@ -657,3 +657,105 @@ async fn a_resubmission_to_a_retracted_bba_key_is_refused_409_and_changes_nothin
     .expect("count unretract rows");
     assert_eq!(unretracted, 0, "nothing was un-retracted");
 }
+
+async fn unretract(w: &World, token: &str, id: Uuid, reason: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/mass-functions/{id}/unretract",
+            w.addr
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "reason": reason }))
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    let text = resp.text().await.expect("body");
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    )
+}
+
+async fn unretract_audits(w: &World, id: Uuid) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'mass_functions.unretract' AND details->>'mass_function_id' = $1::text",
+    )
+    .bind(id)
+    .fetch_all(&w.pool)
+    .await
+    .expect("read unretract audit rows")
+}
+
+/// Ruling R-103's way back over HTTP: `POST
+/// /api/v1/mass-functions/:id/unretract`. The refusals first, writing nothing:
+/// a `claims:read` token 403, a stranger 403, a random id 404, a blank reason
+/// 400. Then the owner un-retracts: 200 `unretracted`, the claim's cached
+/// belief is the two-BBA fold it was before the retraction (not the one-BBA
+/// control it was after), one audit row with the reason, and a resubmission
+/// to the key is admitted again (201). A repeat answers `not_retracted`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_owner_unretracts_over_http_and_the_bba_folds_again(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let w = world(pool_opts, conn_opts).await;
+    let target = bba(&w, w.claim, w.p_support).await;
+    let both = cache(&w, w.claim).await;
+    let owner = common::mint_token_with_agent(&["claims:write"], w.owner);
+    let (status, body) = retract(&w, &owner, target, "duplicate re-observation").await;
+    assert_eq!(status, 200, "{body}");
+    let control = cache(&w, w.control).await;
+    assert!(
+        close(cache(&w, w.claim).await, control),
+        "CALIBRATION: retracted, the claim folds only the other BBA"
+    );
+
+    let read_only = common::mint_token_with_agent(&["claims:read"], w.owner);
+    let (status, body) = unretract(&w, &read_only, target, "no write scope").await;
+    assert_eq!(status, 403, "claims:write is required: {body}");
+    let stranger = common::mint_token_with_agent(&["claims:write"], w.stranger);
+    let (status, body) = unretract(&w, &stranger, target, "not mine").await;
+    assert_eq!(status, 403, "not the stranger's to un-retract: {body}");
+    let (status, body) = unretract(&w, &owner, Uuid::new_v4(), "random").await;
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = unretract(&w, &owner, target, "   ").await;
+    assert_eq!(status, 400, "a blank reason: {body}");
+    assert!(retracted(&w, target).await, "no refusal wrote");
+    assert!(unretract_audits(&w, target).await.is_empty());
+
+    let (status, body) = unretract(&w, &owner, target, "retracted in error").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "unretracted", "{body}");
+    assert_eq!(body["arm"], "owner", "{body}");
+    assert_eq!(body["belief_recomputed"], true, "{body}");
+    assert_eq!(body["previous_retract_reason"], "duplicate re-observation");
+    assert!(!retracted(&w, target).await);
+    let after = cache(&w, w.claim).await;
+    assert!(
+        close(after, both),
+        "the BBA folds again: {after:?} must be the two-BBA fold {both:?}"
+    );
+    let audits = unretract_audits(&w, target).await;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    assert_eq!(audits[0]["reason"], "retracted in error");
+
+    let (status, body) = unretract(&w, &owner, target, "again").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "not_retracted", "{body}");
+    assert_eq!(
+        unretract_audits(&w, target).await.len(),
+        1,
+        "a repeat writes nothing"
+    );
+
+    submit(
+        &w,
+        w.owner,
+        w.claim,
+        w.p_support,
+        serde_json::json!({"0": 0.4, "0,1": 0.6}),
+    )
+    .await;
+}

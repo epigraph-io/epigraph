@@ -15,7 +15,9 @@ use common::*;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::bba_retract::{retract_bba, RetractBbaParams};
+use epigraph_mcp::tools::bba_retract::{
+    retract_bba, unretract_bba, RetractBbaParams, UnretractBbaParams,
+};
 use epigraph_mcp::tools::ds::{get_belief, scoped_belief};
 use epigraph_mcp::types::{GetBeliefParams, ScopedBeliefParams};
 use sqlx::PgPool;
@@ -623,4 +625,106 @@ async fn a_stranger_is_refused_an_unreadable_bba_is_not_found_and_an_admin_retra
     assert_eq!(body["arm"], "admin", "{body}");
     assert_eq!(body["retracted_by"], admin.to_string(), "{body}");
     assert_eq!(audit_count(&pool, target).await, 1);
+}
+
+/// Ruling R-103's way back over MCP: `unretract_bba` on a claim's ONLY BBA,
+/// whose retraction left the explicit vacuous cache, restores the cache to
+/// the BBA's fold as it was before the retraction. A stranger is refused
+/// first, writing nothing. The un-retraction is audited once with its
+/// reason; a repeat answers `not_retracted`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unretracting_a_claims_only_bba_over_mcp_restores_its_cache(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (owner, owner_auth, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (_, stranger_auth, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let group = personal_group_of(&pool, owner).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("r103-mcp-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let claim = owned_public_claim(&pool, owner, group, "unretract").await;
+    let only = seed_bba(
+        &pool,
+        owner,
+        claim,
+        frame,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    let before = recomputed(&pool, &owner_viewer, claim).await;
+    retract_bba(
+        &server,
+        &owner_viewer,
+        params(only, "withdrawn"),
+        Some(&owner_auth),
+    )
+    .await
+    .expect("the owner retracts the claim's only BBA");
+    assert!(
+        close(cached(&pool, claim).await, (0.0, 1.0, 0.5)),
+        "CALIBRATION: the retraction vacated the cache"
+    );
+    let unparams = |reason: &str| UnretractBbaParams {
+        mass_function_id: only.to_string(),
+        reason: reason.to_string(),
+    };
+    let unretract_audits = || async {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT details FROM security_events \
+              WHERE event_type = 'mass_functions.unretract' \
+                AND details->>'mass_function_id' = $1::text",
+        )
+        .bind(only)
+        .fetch_all(&pool)
+        .await
+        .expect("read unretract audits")
+    };
+
+    let refused = unretract_bba(
+        &server,
+        &stranger_viewer,
+        unparams("not mine"),
+        Some(&stranger_auth),
+    )
+    .await
+    .expect_err("a stranger is refused");
+    assert_eq!(
+        refused.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "{refused:?}"
+    );
+    assert!(is_retracted(&pool, only).await, "the refusal wrote nothing");
+    assert!(unretract_audits().await.is_empty());
+
+    let res = unretract_bba(
+        &server,
+        &owner_viewer,
+        unparams("withdrawn in error"),
+        Some(&owner_auth),
+    )
+    .await
+    .expect("the owner un-retracts its BBA");
+    let body = first_text(&res);
+    assert_eq!(body["status"], "unretracted", "{body}");
+    assert_eq!(body["arm"], "owner", "{body}");
+    assert_eq!(body["belief_recomputed"], true, "{body}");
+    assert_eq!(body["previous_retract_reason"], "withdrawn", "{body}");
+    assert!(!is_retracted(&pool, only).await);
+    let after = cached(&pool, claim).await;
+    assert!(
+        close(after, before),
+        "the cache is the BBA's fold again {before:?}, not vacuous: {after:?}"
+    );
+    let audits = unretract_audits().await;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    assert_eq!(audits[0]["reason"], "withdrawn in error");
+
+    let again = unretract_bba(&server, &owner_viewer, unparams("again"), Some(&owner_auth))
+        .await
+        .expect("a repeat is answered");
+    assert_eq!(first_text(&again)["status"], "not_retracted");
+    assert_eq!(unretract_audits().await.len(), 1);
 }

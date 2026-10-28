@@ -12,7 +12,8 @@
 //! calibration: the refusal is the scope, not a malformed call).
 //!
 //! Verified to fail with `scope_map`'s `retract_bba` entry lowered to
-//! `claims:read` (the read-only call retracts the row).
+//! `claims:read` (the read-only call retracts the row). `unretract_bba`
+//! (ruling R-103) is pinned the same way after the retraction.
 
 use epigraph_crypto::AgentSigner;
 use epigraph_mcp::embed::McpEmbedder;
@@ -256,4 +257,40 @@ async fn a_read_only_token_cannot_retract_a_bba_through_dispatch(pool: PgPool) {
     let body: serde_json::Value = serde_json::from_str(text).expect("the tool's JSON reply");
     assert_eq!(body["status"], "retracted", "CALIBRATION: {body}");
     assert_eq!(state(&pool, bba).await, (true, 1));
+
+    // `unretract_bba` (ruling R-103) through the same gate: a read-only token
+    // is refused naming claims:write and the row stays retracted; claims:write
+    // un-retracts it.
+    let args = serde_json::json!({"mass_function_id": bba, "reason": "routed un-retraction"});
+    let refused = call(
+        &url,
+        &token(owner, &["claims:read"]),
+        "unretract_bba",
+        args.clone(),
+    )
+    .await;
+    let error = refused
+        .get("error")
+        .unwrap_or_else(|| panic!("a read-only token must be refused: {refused}"));
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires scope 'claims:write'"),
+        "the scope gate's refusal: {refused}"
+    );
+    assert_eq!(state(&pool, bba).await, (true, 1), "still retracted");
+    let admitted = call(
+        &url,
+        &token(owner, &["claims:read", "claims:write"]),
+        "unretract_bba",
+        args,
+    )
+    .await;
+    let text = admitted["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CALIBRATION: a claims:write token is served: {admitted}"));
+    let body: serde_json::Value = serde_json::from_str(text).expect("the tool's JSON reply");
+    assert_eq!(body["status"], "unretracted", "CALIBRATION: {body}");
+    assert!(!state(&pool, bba).await.0, "un-retracted");
 }

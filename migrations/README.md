@@ -2030,23 +2030,25 @@ restart.
   `override` row). EFFECTIVE REACH: that DELETE is why the file grants
   `DELETE ON ds_combined_beliefs TO epigraph_maintenance` (the definer's
   owner); the grant is on the role, so every maintenance-DSN session can
-  delete those derived rows; no application role gains anything. Adds three
-  RT06 guards for application sessions (a privileged session and a
-  maintenance-owned definer frame pass): no direct mark
-  (`mass_functions_retract_guard`), no INSERT that arrives retracted
-  (`mass_functions_retract_insert_guard`) and no bare clear
-  (`mass_functions_unretract_guard`: the columns NULLed with masses and
-  `created_at` unchanged). Ruling R-103: a retracted row HOLDS its upsert key;
-  `mass_functions_retracted_rewrite_guard` refuses any change to a retracted
-  row's assessment (masses, conflict_k, combination_method, source_strength,
-  locality_tag, evidence_id, created_at) with RT07 (42501), in every session
-  and frame, so a write to its key (the repository upsert, which no longer
-  touches the retract columns) is refused and changes nothing. Every clear is
-  audited by `mass_functions_unretract_audit` (AFTER UPDATE, the
-  maintenance-owned definer `epigraph_mass_function_unretract_audit()`, one
-  `mass_functions.unretract` row). Every fold and belief reader excludes a
-  retracted row (`not_retracted_predicate`, pinned by
-  `epigraph-db/tests/bba_retract_read_lint.rs`).
+  delete those derived rows; no application role gains anything. Ruling
+  R-103: a retracted row HOLDS its upsert key, and becomes live again only
+  through `epigraph_unretract_mass_function(uuid, text, uuid, uuid)` (the same
+  authority, codes and readability as the retraction; a reason is required;
+  one `mass_functions.unretract` audit row; it deletes the stored scoped
+  beliefs that will fold the row again; `not_retracted` writes nothing).
+  Guards: no direct mark (`mass_functions_retract_guard`, RT06) and no INSERT
+  that arrives retracted (`mass_functions_retract_insert_guard`, RT06), both
+  passed by a privileged session and a maintenance-owned definer frame; no
+  change to a retracted row's assessment (masses, conflict_k,
+  combination_method, source_strength, locality_tag, evidence_id, created_at)
+  in any session or frame (`mass_functions_retracted_rewrite_guard`, RT07,
+  42501), so a write to its key (the repository upsert, which never touches
+  the retract columns) is refused and changes nothing; and no clear outside
+  the un-retract definer in any session (`mass_functions_unretract_guard`,
+  RT06: the clear needs the maintenance role AND the definer's
+  transaction-local `epigraph.mf_unretract_id` naming the row). Every fold
+  and belief reader excludes a retracted row (`not_retracted_predicate`,
+  pinned by `epigraph-db/tests/bba_retract_read_lint.rs`).
   Pinned by `epigraph-db/tests/bba_retract.rs` and
   `bba_retract_elevated.rs`. Undo: in the file header. **Deploy order:**
   after 114 and 126; apply BEFORE a binary with the matching readers serves

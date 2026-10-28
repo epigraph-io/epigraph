@@ -61,7 +61,8 @@ pub fn retracted_bba_rewrite_message(id: Option<Uuid>) -> String {
     format!(
         "{RETRACTED_BBA_REWRITE_PREFIX}{row} is retracted, and a retracted BBA holds its key \
          (claim, frame, source agent, perspective): a write to that key is refused until the BBA \
-         is un-retracted; nothing was written"
+         is un-retracted (MCP `unretract_bba`, or POST /api/v1/mass-functions/<id>/unretract, \
+         with a reason; audited); nothing was written"
     )
 }
 

@@ -157,6 +157,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     // owning group, or a live claims:admin grant on the token's own client
     // record) is migration 184's definer, behind `tools/bba_retract.rs`.
     ("retract_bba", "claims:write"),
+    // Makes ONE retracted BBA live again (ruling R-103), under the same
+    // per-row rule as retract_bba (migration 184's un-retract definer).
+    ("unretract_bba", "claims:write"),
     ("update_labels", "claims:write"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.
@@ -320,6 +323,8 @@ mod tests {
         assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
         // Retracting one BBA (R-79): the tool tests call it directly too.
         assert_eq!(required_scope("retract_bba"), Some("claims:write"));
+        // Un-retracting one BBA (R-103): called directly by its tests too.
+        assert_eq!(required_scope("unretract_bba"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply

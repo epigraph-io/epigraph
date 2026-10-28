@@ -12,12 +12,15 @@
 //! elevation, not a malformed call).
 //!
 //! Verified to fail with the definer's `epigraph_is_elevated()` refusal
-//! removed (the elevated call lands).
+//! removed (the elevated call lands). The un-retract definer (ruling R-103)
+//! is pinned the same way, after the unelevated retraction.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::repos::mass_function::{BbaRetractStatus, MassFunctionRepository};
+use epigraph_db::repos::mass_function::{
+    BbaRetractStatus, BbaUnretractStatus, MassFunctionRepository,
+};
 use epigraph_db::{ScopedPool, ScopedPoolOptions, SessionGucMode, Viewer};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
@@ -325,4 +328,35 @@ async fn an_elevated_owner_retracts_no_bba(pool: PgPool) {
     let landed = landed.expect("CALIBRATION: P unelevated retracts its own BBA");
     assert_eq!(landed.status, BbaRetractStatus::Retracted);
     assert_eq!(landed.retracted_by, p.person);
+
+    // Ruling R-103's un-retract definer refuses the elevated session too.
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused: Result<serde_json::Value, sqlx::Error> = sqlx::query_scalar(
+        "SELECT public.epigraph_unretract_mass_function($1, 'elevated', NULL, NULL)",
+    )
+    .bind(bba)
+    .fetch_one(&mut *conn)
+    .await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session un-retracts no BBA");
+    let d = e.as_database_error().expect("a database error");
+    assert_eq!(d.code().as_deref(), Some("42501"), "{e}");
+    assert!(d.message().contains("RT05"), "refused as elevated: {e}");
+    let still: (bool, i64) = sqlx::query_as(
+        "SELECT (SELECT retracted_at IS NOT NULL FROM mass_functions WHERE id = $1), \
+                (SELECT count(*) FROM security_events \
+                  WHERE event_type = 'mass_functions.unretract' \
+                    AND details->>'mass_function_id' = $1::text)",
+    )
+    .bind(bba)
+    .fetch_one(&pool)
+    .await
+    .expect("state");
+    assert_eq!(still, (true, 0), "nothing written elevated");
+
+    let mut conn = app_conn(&s, &plain).await;
+    let back = MassFunctionRepository::unretract_conn(&mut conn, bba, "unelevated", None).await;
+    release(conn).await;
+    let back = back.expect("CALIBRATION: P unelevated un-retracts its own BBA");
+    assert_eq!(back.status, BbaUnretractStatus::Unretracted);
 }

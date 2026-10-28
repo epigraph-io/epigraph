@@ -1621,11 +1621,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // guard trigger refuses the column write outside a maintenance frame, so
     // every retraction errors with nothing written (loud).
     ("epigraph_retract_mass_function", 184),
-    // 184's clear audit, an AFTER UPDATE trigger body. Fails CLOSED under a
-    // non-member owner: its `security_events` INSERT is refused by the
-    // tenancy policies, which aborts the clearing UPDATE (or upsert) with it,
-    // so a retracted row cannot become live unaudited (loud).
-    ("epigraph_mass_function_unretract_audit", 184),
+    // 184 (ruling R-103), the audited BBA un-retraction, the twin of the
+    // retraction above. Fails CLOSED under a non-member owner the same way:
+    // its audit INSERT and its UPDATE of another group's row are refused by
+    // the tenancy policies, and the clear guard admits the clear only in a
+    // maintenance-role frame, so every un-retraction errors with nothing
+    // written (loud).
+    ("epigraph_unretract_mass_function", 184),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

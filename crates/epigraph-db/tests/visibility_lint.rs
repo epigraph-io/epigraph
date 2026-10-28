@@ -1827,6 +1827,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          FROM is left for a viewer splice. Pinned by `bba_retract.rs`.",
     ),
     (
+        "mass_function.rs",
+        "unretract_conn",
+        "WRITE through migration 184's SECURITY DEFINER `epigraph_unretract_mass_function` \
+         (ruling R-103), the twin of `retract_conn`: the same principal, the same read control \
+         from the session GUCs (an unreadable row is 'mass function not found', like a random \
+         id), the same authority. It clears the three retract columns of one row and writes one \
+         `security_events` audit row; no FROM is left for a viewer splice. Pinned by \
+         `bba_retract.rs`.",
+    ),
+    (
         "claim.rs",
         "admin_patch_claim_conn",
         "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \

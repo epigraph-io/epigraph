@@ -1,7 +1,7 @@
 //! The claim's cached belief after ONE BBA is retracted (operator rulings
-//! R-79 and R-80, migration 184). Shared by `POST
-//! /api/v1/mass-functions/:id/retract` and MCP `retract_bba`, so both
-//! transports leave the same cache.
+//! R-79 and R-80, migration 184), or un-retracted (ruling R-103). Shared by
+//! `POST /api/v1/mass-functions/:id/retract` and `.../unretract` and MCP
+//! `retract_bba` and `unretract_bba`, so both transports leave the same cache.
 //!
 //! A retracted BBA is excluded from every fold, and the served cache
 //! (`claims.belief`, `plausibility`, `pignistic_prob`, `classification`) is a
@@ -162,4 +162,22 @@ pub async fn refresh_cache_after_retract(
         recomputed: false,
         vacated,
     })
+}
+
+/// Refresh `claim_id`'s cached belief after one of its BBAs was UN-retracted
+/// (operator ruling R-103), on the un-retracting transaction: the BBA folds
+/// again, so the cache is refolded from the live BBAs, the un-retracted one
+/// included ([`edge_factor::recompute_claim_cached_belief`], as after a
+/// retraction). A claim whose cache a retraction had vacated (ruling R-80)
+/// regains a cache-owning input here, so the refold replaces the vacuous
+/// value. Returns whether the cache was written.
+///
+/// # Errors
+/// A database read or write, or a fold that fails.
+pub async fn refresh_cache_after_unretract(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    edge_factor::recompute_claim_cached_belief(&mut *conn, viewer, claim_id).await
 }
