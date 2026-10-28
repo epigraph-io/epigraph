@@ -1816,6 +1816,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          a viewer to filter.",
     ),
     (
+        "mass_function.rs",
+        "retract_conn",
+        "WRITE through migration 184's SECURITY DEFINER `epigraph_retract_mass_function` \
+         (ruling R-79). The function takes the retractor from the session's \
+         `epigraph.principal_id` and applies the read control itself, from the same session \
+         GUCs a Viewer is stamped from: a row that is neither public nor in \
+         `epigraph_session_groups()` is 'mass function not found', the answer a random id gets. \
+         It writes the three retract columns of one row and one `security_events` audit row; no \
+         FROM is left for a viewer splice. Pinned by `bba_retract.rs`.",
+    ),
+    (
+        "mass_function.rs",
+        "unretract_conn",
+        "WRITE through migration 184's SECURITY DEFINER `epigraph_unretract_mass_function` \
+         (ruling R-103), the twin of `retract_conn`: the same principal, the same read control \
+         from the session GUCs (an unreadable row is 'mass function not found', like a random \
+         id), the same authority. It clears the three retract columns of one row and writes one \
+         `security_events` audit row; no FROM is left for a viewer splice. Pinned by \
+         `bba_retract.rs`.",
+    ),
+    (
         "claim.rs",
         "admin_patch_claim_conn",
         "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \

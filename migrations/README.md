@@ -2008,6 +2008,53 @@ restart.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 
+- **184**: public `mass_function_retract` (operator ruling R-79, backlog
+  f8ec73b7). Retracts ONE mass function (BBA) without deleting it. Adds
+  `mass_functions.retracted_at`, `retracted_by` and `retract_reason` (all
+  NULL on a live row, all set on a retracted one:
+  `mass_functions_retract_columns_together`, validated as it is added under
+  the ADD COLUMN's ACCESS EXCLUSIVE lock: the whole migration blocks reads
+  and writes of `mass_functions` for one sequential scan, so measure the row
+  count before the deploy window). Adds
+  `epigraph_retract_mass_function(uuid, text, uuid, uuid)`,
+  a maintenance-owned definer granted to `epigraph_app`: the session
+  principal retracts a row it can read when it writes the row's owning group,
+  or when it presents a token client with a live `claims:admin` grant bound to
+  it (111's re-check); an elevated session is refused (RT05); an unreadable
+  row is "not found" like a random id; a re-retraction writes nothing and
+  answers `already_retracted`; a first retraction appends one
+  `security_events` row (`mass_functions.retract`) carrying the row as it
+  was, and deletes the stored scoped beliefs (`ds_combined_beliefs`) of the
+  row's (claim, frame) that folded it: the global scope, its own perspective
+  scope and the community scopes counting that perspective (not an
+  `override` row). EFFECTIVE REACH: that DELETE is why the file grants
+  `DELETE ON ds_combined_beliefs TO epigraph_maintenance` (the definer's
+  owner); the grant is on the role, so every maintenance-DSN session can
+  delete those derived rows; no application role gains anything. Ruling
+  R-103: a retracted row HOLDS its upsert key, and becomes live again only
+  through `epigraph_unretract_mass_function(uuid, text, uuid, uuid)` (the same
+  authority, codes and readability as the retraction; a reason is required;
+  one `mass_functions.unretract` audit row; it deletes the stored scoped
+  beliefs that will fold the row again; `not_retracted` writes nothing).
+  Guards: no direct mark (`mass_functions_retract_guard`, RT06) and no INSERT
+  that arrives retracted (`mass_functions_retract_insert_guard`, RT06), both
+  passed by a privileged session and a maintenance-owned definer frame; no
+  change to a retracted row's assessment (masses, conflict_k,
+  combination_method, source_strength, locality_tag, evidence_id, created_at)
+  in any session or frame (`mass_functions_retracted_rewrite_guard`, RT07,
+  42501), so a write to its key (the repository upsert, which never touches
+  the retract columns) is refused and changes nothing; and no clear outside
+  the un-retract definer in any session (`mass_functions_unretract_guard`,
+  RT06: the clear needs the maintenance role AND the definer's
+  transaction-local `epigraph.mf_unretract_id` naming the row). Every fold
+  and belief reader excludes a retracted row (`not_retracted_predicate`,
+  pinned by `epigraph-db/tests/bba_retract_read_lint.rs`).
+  Pinned by `epigraph-db/tests/bba_retract.rs` and
+  `bba_retract_elevated.rs`. Undo: in the file header. **Deploy order:**
+  after 114 and 126; apply BEFORE a binary with the matching readers serves
+  (they name `retracted_at`). **Applied to throwaway databases only, NOT to
+  any deployed database.**
+
 ## `-- no-transaction` migrations
 
 Migration `063_idx_claims_group_current.sql` is the **first `-- no-transaction`

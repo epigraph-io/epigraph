@@ -1615,6 +1615,19 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // and its UPDATE by 077's WITH CHECK (the outsider's row is not the
     // owner's), so every resolution is refused "not found" or 42501 (loud).
     ("epigraph_resolve_challenge", 168),
+    // 184 (ruling R-79), the audited BBA retraction. Fails CLOSED under a
+    // non-member owner: its `security_events` audit INSERT and its UPDATE of
+    // another group's row are refused by the tenancy policies, and the retract
+    // guard trigger refuses the column write outside a maintenance frame, so
+    // every retraction errors with nothing written (loud).
+    ("epigraph_retract_mass_function", 184),
+    // 184 (ruling R-103), the audited BBA un-retraction, the twin of the
+    // retraction above. Fails CLOSED under a non-member owner the same way:
+    // its audit INSERT and its UPDATE of another group's row are refused by
+    // the tenancy policies, and the clear guard admits the clear only in a
+    // maintenance-role frame, so every un-retraction errors with nothing
+    // written (loud).
+    ("epigraph_unretract_mass_function", 184),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

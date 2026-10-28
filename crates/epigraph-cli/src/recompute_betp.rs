@@ -84,6 +84,7 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
               FROM mass_functions mf
               JOIN frames f ON f.id = mf.frame_id
              WHERE array_length(f.hypotheses, 1) = 2
+               AND mf.retracted_at IS NULL
              GROUP BY mf.claim_id, mf.frame_id
             HAVING COUNT(*) > 1
 
@@ -105,6 +106,7 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
               FROM mass_functions mf
               JOIN frames f ON f.id = mf.frame_id
              WHERE array_length(f.hypotheses, 1) = 2
+               AND mf.retracted_at IS NULL
                AND (COALESCE(CASE WHEN jsonb_typeof(mf.masses->'1') = 'number'
                                   THEN (mf.masses->>'1')::float8 END, 0) > 0
                     OR COALESCE(CASE WHEN jsonb_typeof(mf.masses->'~') = 'number'
@@ -129,7 +131,7 @@ async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String
         "SELECT DISTINCT mf.frame_id, f.name \
            FROM mass_functions mf \
            JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
+          WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL \
           ORDER BY f.name",
     )
     .bind(claim_id)
