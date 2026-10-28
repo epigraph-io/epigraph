@@ -259,3 +259,134 @@ async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_reti
         "nothing is pinned to the retired claim: {on_old:?}"
     );
 }
+
+// =====================================================================
+// Ruling R-85 (c), backlog 1a54283d: "dedup/consolidate repairs never move a
+// supersession's act edge". REGRESSION PINS of an item that needed no code
+// change: they pass on the base. An act edge always targets a successor, a
+// successor always carries `supersedes`, and both the dedup act and the
+// consolidate act refuse such a claim before their repair runs. These pins
+// hold that refusal for a successor that carries an act edge, through the
+// whole act-plus-repair entry points: if either act ever admitted it, its
+// repair (which re-points the duplicate's / sources' incoming edges) could
+// move the act edge off the claim the actor wrote.
+// =====================================================================
+
+/// The act edge `actor` wrote onto a successor.
+fn act_edge(actor: Uuid) -> (Uuid, String, serde_json::Value) {
+    (
+        actor,
+        "agent".to_string(),
+        serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+    )
+}
+
+/// The act edges (`properties ? 'supersede_act'`) whose target is `claim`.
+async fn act_edges_into(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND properties ? 'supersede_act'",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count act edges")
+}
+
+/// B restates A's v0 as S (S carries B's act edge). Marking S a duplicate of
+/// another claim Q, act and repair together, is refused as a state refusal,
+/// and S keeps B's act edge: S stays current, and Q receives no act edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_carrying_an_act_edge_is_not_marked_a_duplicate(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let v0 = seed_claim(&pool, a).await;
+    let q = seed_claim(&pool, a).await;
+    let s = supersede_through_the_cascade(&pool, v0, b).await;
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "CALIBRATION"
+    );
+
+    let r = ClaimRepository::mark_duplicate_with_repair(
+        &pool,
+        ClaimId::from_uuid(s),
+        ClaimId::from_uuid(q),
+    )
+    .await;
+    match &r {
+        Err(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message,
+        }) => assert!(message.contains("already superseded"), "{message}"),
+        other => panic!("marking a successor a duplicate must be refused: {other:?}"),
+    }
+
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "S keeps B's act edge"
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("S");
+    assert!(current, "the refused dedup retired nothing");
+    assert_eq!(act_edges_into(&pool, q).await, 0, "nothing moved onto Q");
+}
+
+/// B restates A's v0 as S (S carries B's act edge). Consolidating S with
+/// another claim Q, act and edge migration together, is refused, and S keeps
+/// B's act edge: S stays current, and no merged claim receives it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_carrying_an_act_edge_is_not_consolidated(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let c = seed_agent(&pool, "consolidator-c").await;
+    let v0 = seed_claim(&pool, a).await;
+    let q = seed_claim(&pool, a).await;
+    let s = supersede_through_the_cascade(&pool, v0, b).await;
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "CALIBRATION"
+    );
+
+    let r = ClaimRepository::consolidate(
+        &pool,
+        &[s, q],
+        "a merge of a successor and another claim",
+        0.7,
+        epigraph_db::ConsolidateMode::Merge,
+        "R-85 (c) pin",
+        c,
+    )
+    .await;
+    match &r {
+        Err(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message,
+        }) => assert!(message.contains("already superseded"), "{message}"),
+        other => panic!("consolidating a successor must be refused: {other:?}"),
+    }
+
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "S keeps B's act edge"
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("S");
+    assert!(current, "the refused consolidation retired nothing");
+    let act_edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE properties ? 'supersede_act'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(act_edges, 1, "only B's act edge exists, still on S");
+}
