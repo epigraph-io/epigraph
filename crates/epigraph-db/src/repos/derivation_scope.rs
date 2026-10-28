@@ -36,7 +36,9 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::repos::claim_role::is_compound_sql;
-use crate::repos::mass_function::{cached_combination_predicate, ingest_template_predicate};
+use crate::repos::mass_function::{
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+};
 use crate::visibility::Viewer;
 
 /// A source `x` is at least as widely readable as the claim `c` when it is
@@ -215,7 +217,8 @@ impl DerivationScopeRepository {
     /// The ids of `claim_id`'s combine inputs on every frame, as the cache
     /// owner rule counts them (`MassFunctionRepository::cache_owner_frame_for_claim`):
     /// rows `viewer` can see, on a frame it can see, that are neither a cached
-    /// combination nor an ingest template. Pass them to
+    /// combination, nor retracted (migration 184), nor an ingest template.
+    /// Pass them to
     /// [`Self::cache_admissible`] to learn whether ANY of the claim's BBAs may
     /// enter its cache (ruling R-80).
     ///
@@ -232,9 +235,11 @@ impl DerivationScopeRepository {
                    JOIN frames f ON f.id = mf.frame_id \
                  WHERE mf.claim_id = $1 \
                    AND NOT {cached} \
+                   AND {not_retracted} \
                    AND NOT {template} \
                    /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */",
                 cached = cached_combination_predicate("mf."),
+                not_retracted = not_retracted_predicate("mf."),
                 template = ingest_template_predicate("mf.", "f."),
             ),
             2,
