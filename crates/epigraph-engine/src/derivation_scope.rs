@@ -58,3 +58,38 @@ pub async fn retain_for_viewer<'e, E: sqlx::PgExecutor<'e>>(
         .filter(|r| admissible.contains(&r.id))
         .collect())
 }
+
+/// Whether a recompute of `claim_id` must VACATE its cache (ruling R-80): the
+/// claim has a cached belief, it has combine inputs `viewer` can see (on any
+/// frame, as the cache owner rule counts them), and NOT ONE of them may enter
+/// the cache. The cached value was then folded from sources narrower than the
+/// claim (a source narrowed after the fact, or a cache written before R-22),
+/// and keeping it serves their direction and weight to every reader.
+///
+/// A claim with an admissible input on any frame is not vacated, and neither
+/// is a claim with no cache: a vacuous value written where there was none
+/// would tell its readers that an unseen BBA exists. Nor is a compound, whose
+/// cache is not a fold of its own BBAs (the cache owner rule never refolds
+/// one either).
+///
+/// # Errors
+/// `DbError` if a read fails.
+pub async fn must_vacate_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: uuid::Uuid,
+) -> Result<bool, DbError> {
+    let inputs =
+        DerivationScopeRepository::combine_input_ids_for_claim(&mut *conn, viewer, claim_id)
+            .await?;
+    if inputs.is_empty() {
+        return Ok(false);
+    }
+    if !DerivationScopeRepository::cache_admissible(&mut *conn, &inputs)
+        .await?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    DerivationScopeRepository::claim_has_fold_cache(&mut *conn, viewer, claim_id).await
+}
