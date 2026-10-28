@@ -1313,7 +1313,8 @@ async fn persist_packet(
     }
 
     // Short-circuit all dependent writes on a duplicate. On a duplicate the
-    // evidence INSERT would hit `evidence_content_hash_claim_unique` → 500;
+    // raw evidence INSERT below (no `EvidenceRepository` de-duplication) would
+    // add a second copy of the canonical claim's evidence;
     // the `trace_id` UPDATE would mutate another run's canonical noun-claim
     // (forbidden, see claim.rs noun-claim invariant); and post-018 the edges
     // have no triple-unique, so re-inserting would silently duplicate the

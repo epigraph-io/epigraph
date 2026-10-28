@@ -35,6 +35,10 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
+use crate::repos::mass_function::{
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+};
 use crate::visibility::Viewer;
 
 /// A source `x` is at least as widely readable as the claim `c` when it is
@@ -43,7 +47,7 @@ use crate::visibility::Viewer;
 /// edge is readable by the members of BOTH groups, fewer than the claim's).
 const CACHE_ADMISSIBLE_SQL: &str = "SELECT mf.id FROM mass_functions mf \
        JOIN claims c ON c.id = mf.claim_id \
-     WHERE mf.id = ANY($1) \
+     WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL \
        AND (mf.visibility = 'public' \
             OR (c.visibility <> 'public' AND mf.owner_group_id = c.owner_group_id)) \
        AND (mf.evidence_id IS NULL \
@@ -167,7 +171,7 @@ impl DerivationScopeRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT mf.id FROM mass_functions mf \
-                 WHERE mf.id = ANY($1) /* {{VISIBILITY:mf}} */ \
+                 WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
                    AND {VIEWER_DERIVED_PREDICATE}"
             ),
             2,
@@ -198,8 +202,78 @@ impl DerivationScopeRepository {
         let sql = viewer.splice(
             &format!(
                 "SELECT COUNT(*) FROM mass_functions mf \
-                 WHERE mf.claim_id = $1 /* {{VISIBILITY:mf}} */ \
+                 WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
                    AND {VIEWER_DERIVED_PREDICATE}"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// The ids of `claim_id`'s combine inputs on every frame, as the cache
+    /// owner rule counts them (`MassFunctionRepository::cache_owner_frame_for_claim`):
+    /// rows `viewer` can see, on a frame it can see, that are neither a cached
+    /// combination, nor retracted (migration 184), nor an ingest template.
+    /// Pass them to
+    /// [`Self::cache_admissible`] to learn whether ANY of the claim's BBAs may
+    /// enter its cache (ruling R-80).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn combine_input_ids_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT mf.id FROM mass_functions mf \
+                   JOIN frames f ON f.id = mf.frame_id \
+                 WHERE mf.claim_id = $1 \
+                   AND NOT {cached} \
+                   AND {not_retracted} \
+                   AND NOT {template} \
+                   /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */",
+                cached = cached_combination_predicate("mf."),
+                not_retracted = not_retracted_predicate("mf."),
+                template = ingest_template_predicate("mf.", "f."),
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Whether `claim_id`, as `viewer` reads it, is a NON-compound claim with
+    /// a cached belief (any of `belief`, `plausibility`, `pignistic_prob`
+    /// set): a cache that is a fold of the claim's own BBAs. A compound's
+    /// cache is not (its belief is a query over its leaves, and the cache
+    /// owner rule never refolds it), so it is never a fold cache here. A claim
+    /// the viewer cannot read has none.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn claim_has_fold_cache<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM claims c \
+                     WHERE c.id = $1 \
+                       AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
+                            OR c.pignistic_prob IS NOT NULL) \
+                       AND NOT {compound} \
+                       /* {{VISIBILITY:c}} */)",
+                compound = is_compound_sql("c"),
             ),
             2,
         );

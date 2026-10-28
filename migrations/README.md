@@ -1778,6 +1778,55 @@ restart.
   the four triggers and the function. **Deploy order:** after 168; independent
   of the binaries. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **171**: public `evidence_dedup_in_application` (backlog 12b68201,
+  operator ruling R-77). `ALTER TABLE evidence DROP CONSTRAINT IF EXISTS
+  evidence_content_hash_claim_unique`, 001's `UNIQUE (content_hash,
+  claim_id)`, so every database matches the long-lived one, which never
+  carried it (only `evidence_pkey`) and holds same-owner duplicate rows. The
+  key spanned owners: an evidence write whose body equalled a row another
+  group holds on the same claim was refused, and the refusal confirmed that
+  unreadable row and its content. The de-duplication is now the
+  application's, as 150 did for claims: `EvidenceRepository` writes the row,
+  reads back its owner and visibility, takes a transaction-scoped advisory
+  lock on `(content_hash, claim_id, owner)` and refuses (`DuplicateKey`, a
+  savepoint undoes the write) only a row with the same digest, claim, owner
+  and visibility; another owner's body is never consulted. A no-op on the
+  long-lived database; cannot fail on data (it builds no index). A closing DO
+  block refuses (`55000`) if any unique index on `evidence` still covers both
+  columns. Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/evidence_dedup_per_owner.rs` (including the race and
+  `migrated_evidence_carries_no_unique_key_over_body_and_claim`),
+  `epigraph-api/tests/evidence_content_oracle_test.rs` and
+  `epigraph-mcp/tests/evidence_content_oracle_app_role.rs`. Section 3 gives
+  evidence rows sealed before the seal wrote a digest sentinel (an
+  `evidence_encryption` row exists) that per-row sentinel
+  (`privatization::SEAL_EVIDENCE_DIGEST_SENTINEL`, same expression), so a
+  sealed row's plaintext digest stops confirming a guessed body; unseal
+  rebuilds such a row's digest as BLAKE3 of the restored body. IRREVERSIBLE
+  for a sealed row whose body was NULL (external evidence): its
+  writer-supplied digest stays the sentinel after unseal (count first:
+  `SELECT count(*) FROM evidence_encryption`). A second DO block refuses
+  (`55000`) if a sealed row is left without the sentinel. Pinned by
+  `epigraph-db/tests/evidence_seal_digest_backfill.rs`. Slot 171 assigned
+  by the bug-wave plan; free on `main` and in every open PR when committed.
+  **Deploy order:** the matching binaries FIRST (the epigraph-api server,
+  with the hosted jobs it runs, and epigraph-mcp), then 171. Against 171 an
+  older binary's `ON CONFLICT (content_hash, claim_id)` in
+  `record_derivation_conn` fails 42P10 (as it already does on any database
+  without the key), and its other evidence writes are not de-duplicated at
+  all (an identical retry adds a row, as on the long-lived database today);
+  after section 3 its seal would leave the plaintext digest on rows it seals
+  and its unseal would keep the sentinel on rows it restores. No seal or
+  unseal may be in flight while 171 applies. The new binaries work on either
+  side, but while a database still has the key a write that collides with
+  another owner's row is still refused: the cross-owner refusal ends when 171
+  applies, not when the binary ships. **Client-visible from the binary
+  deploy** on a database without the key: a same-owner, byte-identical
+  evidence write on a claim already holding that body (which stores a second
+  row today) is refused as a duplicate (HTTP 400; the MCP evidence-writing
+  tools answer an error and roll the whole submission back, label merges
+  included). Undo is in the file's header.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 - **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
   Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
   pg_catalog, pg_temp` (was `pg_catalog, public`) and its `unnest(` and
@@ -2006,7 +2055,89 @@ restart.
   for every removal instead; `epigraph-tenancy-backfill verify` reports both
   the owner and the grant, so run it after 181.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **185**: public `supersede_binds_the_actor` (ruling R-85, backlog
+  1a54283d). Once the operator binding is armed, the supersede act's INSERT
+  (the inherited-author shape only `ClaimRepository::supersede_act_conn`
+  writes, which also records the writer as the successor's `AUTHORED` act
+  edge) is checked on its WRITER alone: bound (`OPL01`) and a writer of the
+  owner group (`OPL02`), as before. The inherited author is no longer
+  attributed to the writer's human, so a bound writer of the group may
+  restate a claim whose author is bound to no human (was `OPL01`) or belongs
+  to another human (was `OPL02`). 166's `ROL01` on that author is kept (a
+  live role-attached author is checked, a retired identity is not). A
+  re-open of an inherited successor, and every fresh claim, are still
+  attributed. Re-bodies 153's `epigraph_claims_require_operator_binding`
+  (`CREATE OR REPLACE`, same signature, owner re-asserted; still registered
+  at 122 in `tenancy_backfill.rs`) behind an md5 precondition on 153's body
+  (`55000` over any other body, nothing changed). Sets `lock_timeout =
+  '3s'`. Behaviour in `epigraph-db/tests/inherited_supersede_binds_the_actor.rs`
+  (with the precondition and the rollback), HTTP
+  `own_claim_authority_http.rs` and MCP `own_claim_authority_app_role.rs`.
+  The relief is keyed on the row's shape (a `BEFORE INSERT` trigger cannot
+  see the act edge the act writes after the claim), so
+  `epigraph-db/tests/inherited_successor_insert_lint.rs` pins that the only
+  non-test code inserting a claim that names `supersedes` is
+  `supersede_act_conn` and `evolve_step_conn` (which authors the caller).
+  Undo: `docs/runbooks/185-undo.sql` (restores 153's body; run it before
+  `153-undo.sql`). Slot: checked free on `main`, in every open PR, every
+  remote branch and every local worktree (184 is held by an unpushed branch).
+  **Deploy order:** none against the binaries (it only admits writes 153
+  refused); it may apply before or after any lower-numbered migration that
+  does not re-body this function.
+  **Predeploy check:** `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  to_regprocedure('public.epigraph_claims_require_operator_binding()')` must
+  print `292b24b3dfb6b342f6f60d7868666236` (153's body). Any other value
+  means 185 refuses (`55000`, nothing changed) and the migration run stops
+  there, so later migrations in the same run do not apply either.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
+
+- **184**: public `mass_function_retract` (operator ruling R-79, backlog
+  f8ec73b7). Retracts ONE mass function (BBA) without deleting it. Adds
+  `mass_functions.retracted_at`, `retracted_by` and `retract_reason` (all
+  NULL on a live row, all set on a retracted one:
+  `mass_functions_retract_columns_together`, validated as it is added under
+  the ADD COLUMN's ACCESS EXCLUSIVE lock: the whole migration blocks reads
+  and writes of `mass_functions` for one sequential scan, so measure the row
+  count before the deploy window). Adds
+  `epigraph_retract_mass_function(uuid, text, uuid, uuid)`,
+  a maintenance-owned definer granted to `epigraph_app`: the session
+  principal retracts a row it can read when it writes the row's owning group,
+  or when it presents a token client with a live `claims:admin` grant bound to
+  it (111's re-check); an elevated session is refused (RT05); an unreadable
+  row is "not found" like a random id; a re-retraction writes nothing and
+  answers `already_retracted`; a first retraction appends one
+  `security_events` row (`mass_functions.retract`) carrying the row as it
+  was, and deletes the stored scoped beliefs (`ds_combined_beliefs`) of the
+  row's (claim, frame) that folded it: the global scope, its own perspective
+  scope and the community scopes counting that perspective (not an
+  `override` row). EFFECTIVE REACH: that DELETE is why the file grants
+  `DELETE ON ds_combined_beliefs TO epigraph_maintenance` (the definer's
+  owner); the grant is on the role, so every maintenance-DSN session can
+  delete those derived rows; no application role gains anything. Ruling
+  R-103: a retracted row HOLDS its upsert key, and becomes live again only
+  through `epigraph_unretract_mass_function(uuid, text, uuid, uuid)` (the same
+  authority, codes and readability as the retraction; a reason is required;
+  one `mass_functions.unretract` audit row; it deletes the stored scoped
+  beliefs that will fold the row again; `not_retracted` writes nothing).
+  Guards: no direct mark (`mass_functions_retract_guard`, RT06) and no INSERT
+  that arrives retracted (`mass_functions_retract_insert_guard`, RT06), both
+  passed by a privileged session and a maintenance-owned definer frame; no
+  change to a retracted row's assessment (masses, conflict_k,
+  combination_method, source_strength, locality_tag, evidence_id, created_at)
+  in any session or frame (`mass_functions_retracted_rewrite_guard`, RT07,
+  42501), so a write to its key (the repository upsert, which never touches
+  the retract columns) is refused and changes nothing; and no clear outside
+  the un-retract definer in any session (`mass_functions_unretract_guard`,
+  RT06: the clear needs the maintenance role AND the definer's
+  transaction-local `epigraph.mf_unretract_id` naming the row). Every fold
+  and belief reader excludes a retracted row (`not_retracted_predicate`,
+  pinned by `epigraph-db/tests/bba_retract_read_lint.rs`).
+  Pinned by `epigraph-db/tests/bba_retract.rs` and
+  `bba_retract_elevated.rs`. Undo: in the file header. **Deploy order:**
+  after 114 and 126; apply BEFORE a binary with the matching readers serves
+  (they name `retracted_at`). **Applied to throwaway databases only, NOT to
+  any deployed database.**
 
 ## `-- no-transaction` migrations
 

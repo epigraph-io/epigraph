@@ -305,9 +305,13 @@ FROM claims;
 -- Evidence carries its own `embedding` and `embedding_3072`, and an audit
 -- scoped to `claims` alone reports zero while a sealed claim's evidence keeps a
 -- plaintext-derived vector. Must be 0.
+-- Keyed on the ROW's own ciphertext (`evidence_encryption`), not on its
+-- claim's: a seal covers only the evidence its claim's owner holds, so a
+-- sealed claim can keep another group's plaintext row, whose vector is
+-- legitimate. Same predicate as `epigraph-cli reembed`'s sealed filter.
 SELECT COUNT(*) FROM evidence e
  WHERE (e.embedding IS NOT NULL OR e.embedding_3072 IS NOT NULL)
-   AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = e.claim_id);
+   AND EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id);
 ```
 
 `live_missing` and `stale_present` should trend toward zero. `live_missing`

@@ -609,7 +609,9 @@ pub async fn auto_wire_ds_for_claim(
 ///   the author's opinion), stored undiscounted (`source_strength = 1.0`,
 ///   `evidence_type = NULL`: `effective_source_strength`'s exempt arm), with no
 ///   perspective and no evidence row. It is written at most once: afterwards
-///   the claim has BBAs. A caller that seeds must pass an `evidence_id`, or its
+///   the claim has BBAs, and a RETRACTED row at the seed's key (operator
+///   ruling R-103: it holds the key) is not re-seeded either, since that
+///   write would be refused. A caller that seeds must pass an `evidence_id`, or its
 ///   own evidence BBA would upsert over a seed it authored.
 /// - **Clamp prior**: the supports=true monotonicity clamp reads
 ///   `COALESCE(pignistic_prob, truth_value)`, so a caller that does not seed
@@ -741,7 +743,23 @@ pub async fn auto_wire_ds_update_filed_on(
                     .map_err(|e| format!("get_for_claim_binary_frames: {e}"))?;
             let (seed_min, seed_max) = seed_truth_bounds();
             let t = truth.clamp(seed_min, seed_max);
-            let seed = if existing.is_empty() {
+            // A retracted seed (or any retracted row at the seed's key) holds
+            // that key (operator ruling R-103): writing there would be refused
+            // and take this caller's evidence down with it. It was written
+            // once; it is not re-seeded.
+            let seed_key_retracted = existing.is_empty()
+                && MassFunctionRepository::retracted_row_at_key(
+                    &mut *conn,
+                    viewer,
+                    claim_id,
+                    frame_id,
+                    Some(author),
+                    None,
+                )
+                .await
+                .map_err(|e| format!("retracted_row_at_key: {e}"))?
+                .is_some();
+            let seed = if existing.is_empty() && !seed_key_retracted {
                 MassFunction::from_pignistic_prior(frame.clone(), 0, t)
                     .map_err(|e| format!("truth_value seed: {e}"))?
             } else {

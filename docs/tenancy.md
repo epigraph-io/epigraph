@@ -451,12 +451,18 @@ no other current successor; and, on an application session, that predecessor
 has never been restated by that author before, current or retired (migration
 123: before it, "no other CURRENT successor" alone re-admitted a predecessor
 whose successor had been retired, so retire-and-restate doubled the current
-claims under the identity each round). That author may be a retired agent of
-the writer's own human, so a human can supersede its own legacy author's
-claims, once per claim, ever, and in the claim's own group; a fresh claim
-never names a retired identity, however `supersedes` is posed (at a current
-claim, at a claim in another group, as a second successor, at an
-already-restated claim, or at the claim itself). A privileged session keeps
+claims under the identity each round). Since migration 185 (ruling R-85) the
+act's INSERT of such a successor is checked on its WRITER alone (bound, and a
+writer of the owner group): the author it inherits is not attributed to the
+writer's human, so a bound writer of the group may restate a claim whose
+author is bound to no human, a retired identity, or another human's agent,
+once per claim, ever, and in the claim's own group. The act records that
+writer as the successor's `AUTHORED` act edge. A live role-attached inherited
+author is still checked for `ROL01`; a RE-OPEN of such a successor is not the
+act and is still attributed. A fresh claim never names a retired identity,
+however `supersedes` is posed (at a current claim, at a claim in another
+group, as a second successor, at an already-restated claim, or at the claim
+itself). A privileged session keeps
 the "no other current successor" rule, so a custodial revision of a canonical
 claim that retired duplicates point at still works. No claim names ITSELF in
 `supersedes`: a statement that sets it to the row's own id is refused

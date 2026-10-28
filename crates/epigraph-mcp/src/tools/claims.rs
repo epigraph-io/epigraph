@@ -1365,8 +1365,8 @@ pub async fn update_with_evidence(
     // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
     // has no `ON CONFLICT`, so each retry appends another row". #497 measured
     // that premise wrong for an IDENTICAL retry: `content_hash` is
-    // `blake3(evidence_data)` and migration 001's
-    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // `blake3(evidence_data)` and the same-owner evidence de-duplication
+    // (`EvidenceRepository::create`; migration 001's unique key until 171)
     // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
     // adds a row. That makes a committed BBA-less row WORSE, not better: it
     // blocks the identical re-submission that would land the contribution.)
@@ -1528,7 +1528,7 @@ pub async fn update_with_evidence(
     // truth write, no labels — and an error is now the complete and truthful
     // answer. Swallowing it instead would commit exactly the BBA-less evidence
     // row the note above explains is worse than nothing (it blocks the identical
-    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // re-submit via the same-owner evidence de-duplication). The error text keeps
     // the failing step as its prefix (`assign_claim:`, `store BBA:`,
     // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
     // which is the part of #497's disclosure that still has a referent.

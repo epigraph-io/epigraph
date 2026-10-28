@@ -98,6 +98,16 @@ ignore = [
     # resolves rmcp 2.2.0, so the entry matched nothing and is deleted. The
     # MCP HTTP endpoint still relies on bearer-token checks at the proxy; that
     # control does not depend on this entry.
+    #
+    # zstd 0.13.3 (RUSTSEC-2026-0391) and zstd-safe 7.3.0 (RUSTSEC-2026-0398 /
+    # -0403) were cleared by moving the workspace zstd requirement to 0.14.3,
+    # which resolves zstd-safe 8.2.0 (backlog 52cb2c4f, operator ruling R-93).
+    # The fixes exist only in those new series. zstd-sys and the bundled C
+    # library (zstd 1.5.7) are unchanged, and epigraph-db calls only
+    # zstd::bulk::{compress, decompress}, whose signatures did not change. The
+    # floor is a blocking ratchet in
+    # crates/epigraph-db/tests/zstd_advisory_floor.rs. They were never
+    # suppressed; do not add them.
 ]
 
 # ── GitHub advisories with no RustSec ID (Dependabot only) ─────────────────
