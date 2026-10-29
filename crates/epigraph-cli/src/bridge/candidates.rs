@@ -1,6 +1,6 @@
 //! Per-source-atom kNN candidate-pair table builder for bridge sweeps.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 /// Validate that a string is safe to interpolate into SQL as an identifier.
@@ -10,20 +10,48 @@ pub(crate) fn is_safe_table_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Build a temporary candidate-pair table containing per-source-atom top-K
-/// matches in the target atom set, filtered by cosine similarity ≥ min_similarity.
+/// Column list shared by both [`CandidateTableLifetime`]s.
+const CANDIDATE_COLUMNS: &str = "(\
+    source_id uuid NOT NULL, \
+    target_id uuid NOT NULL, \
+    similarity double precision NOT NULL, \
+    PRIMARY KEY (source_id, target_id)\
+ )";
+
+/// How long a candidate table built by [`build_candidate_table`] lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateTableLifetime {
+    /// `CREATE TEMP TABLE … ON COMMIT DROP`: the table exists only inside the
+    /// transaction that built it and is removed when that transaction commits
+    /// or rolls back, on every exit path. Needs only TEMPORARY on the database,
+    /// which the maintenance login has; it holds no CREATE on any schema, by
+    /// design. Every read of the table must run on that same transaction.
+    Transaction,
+    /// A regular table in the first schema of `search_path`, which survives
+    /// the transaction and the process (`--keep-tables`, for inspection or a
+    /// later `rerank_bridges --candidates-table`). Needs CREATE on that schema,
+    /// which neither the application role nor the maintenance login holds;
+    /// only a role granted it can use this. Drop it with
+    /// [`drop_candidate_table`].
+    Persistent,
+}
+
+/// Build a candidate-pair table containing per-source-atom top-K matches in
+/// the target atom set, filtered by cosine similarity ≥ `min_similarity`.
 ///
-/// The table has columns `(source_id uuid, target_id uuid, similarity float8)`
-/// and is created with `CREATE TABLE` (NOT temp — `rerank_candidates_table`
-/// reads it from a separate connection in the pool, and TEMP tables are
-/// session-local).
+/// The table has columns `(source_id uuid, target_id uuid, similarity float8)`.
+/// It is built inside `tx`, and its `lifetime` decides whether it outlives
+/// that transaction (see [`CandidateTableLifetime`]). Taking a transaction,
+/// not a pool, is what makes the TEMP table usable: it is visible only in the
+/// session that created it, so the reads that follow
+/// (`bridge::spine::compute_spine_destination`,
+/// `rerank::find_candidates_from_table`) must be given `&mut *tx` too.
 ///
 /// Returns the row count.
-///
-/// Caller is responsible for dropping the table when done (or pass --keep-tables).
 pub async fn build_candidate_table(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     table_name: &str,
+    lifetime: CandidateTableLifetime,
     source_atom_ids: &[Uuid],
     target_atom_ids: &[Uuid],
     min_similarity: f64,
@@ -35,19 +63,21 @@ pub async fn build_candidate_table(
         )));
     }
 
-    // Build the table.
-    let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
-    sqlx::query(&drop_sql).execute(pool).await?;
-
-    let create_sql = format!(
-        "CREATE TABLE {table_name} (\
-            source_id uuid NOT NULL, \
-            target_id uuid NOT NULL, \
-            similarity double precision NOT NULL, \
-            PRIMARY KEY (source_id, target_id)\
-         )"
-    );
-    sqlx::query(&create_sql).execute(pool).await?;
+    let create_sql = match lifetime {
+        // No leading DROP: an unqualified `DROP TABLE IF EXISTS` falls
+        // through `search_path` to `public` when no temp table of that name
+        // exists. Names are UUID-suffixed, so a clash is an error worth seeing.
+        CandidateTableLifetime::Transaction => {
+            format!("CREATE TEMP TABLE {table_name} {CANDIDATE_COLUMNS} ON COMMIT DROP")
+        }
+        CandidateTableLifetime::Persistent => {
+            sqlx::query(&format!("DROP TABLE IF EXISTS {table_name}"))
+                .execute(&mut **tx)
+                .await?;
+            format!("CREATE TABLE {table_name} {CANDIDATE_COLUMNS}")
+        }
+    };
+    sqlx::query(&create_sql).execute(&mut **tx).await?;
 
     // Per-source-atom top-K insert. The lateral join uses HNSW (migration 030)
     // to bound cost. Cosine similarity = 1 - distance.
@@ -74,14 +104,16 @@ pub async fn build_candidate_table(
         .bind(target_atom_ids)
         .bind(min_similarity)
         .bind(top_k as i64)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?
         .rows_affected();
 
     Ok(rows_inserted as usize)
 }
 
-/// Drop the candidate table.
+/// Drop a [`CandidateTableLifetime::Persistent`] candidate table. A
+/// [`CandidateTableLifetime::Transaction`] one needs no call: it is gone once
+/// its transaction ends.
 pub async fn drop_candidate_table(pool: &PgPool, table_name: &str) -> Result<(), sqlx::Error> {
     if !is_safe_table_name(table_name) {
         return Err(sqlx::Error::Protocol(format!(
