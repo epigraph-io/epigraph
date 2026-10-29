@@ -86,7 +86,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Every database call that does not receive the handler's viewer, per
-/// viewer-holding handler, as measured and reviewed on **2026-10-26**.
+/// viewer-holding handler, as measured and reviewed on **2026-10-26**, and
+/// re-reviewed on **2026-10-29** for the viewer-holding code `origin/main`
+/// gained since (merged at e0c1d482: the group routes' stamped connections,
+/// BBA retraction, challenge resolution, the R-22 cache narrowing, the
+/// workflow goal embedding).
 ///
 /// Asserted as an exact multiset per handler. The comment above each group is
 /// the review. Reason classes, used below:
@@ -106,6 +110,10 @@ use std::path::Path;
 ///   role.
 /// * **no SQL** — handed `AppState` or a pool and runs no tenancy read
 ///   (embedding, config, a lifecycle switch).
+/// * **narrows** — a filter over rows the handler already read through the
+///   viewer (`derivation_scope::retain_for_cache`, ruling R-22: keep only the
+///   rows a cache may fold): it can drop a row, never add one, and returns
+///   nothing it was not given.
 /// * **lifecycle** — the privatization lifecycle: the plan is loaded through
 ///   the viewer (`load_plan_for_actor`), authority is checked against the
 ///   plan's group, and the act then runs on the maintenance connection by
@@ -145,7 +153,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["AgentRepository::get_by_id"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; `human_of` is an agents
-    // read; the SELECT is an advisory lock.
+    // read; the SELECT is an advisory lock. narrows: `retain_for_cache` (and
+    // the `acquire` it runs on) filters the BBAs just read through the viewer
+    // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
+    // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
+    // it took the viewer only while it read lineage, and no longer reads any.
     (
         "assess.rs",
         "assess_claim",
@@ -161,11 +173,28 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "db_pool.acquire",
             "db_pool.acquire",
             "db_pool.acquire",
+            "db_pool.acquire",
             "db_pool.begin",
+            "derivation_scope::retain_for_cache",
+            "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
             "sqlx::query(UPDATE).execute",
         ],
+    ),
+    // stamped: the write transaction is stamped from the caller's viewer, and
+    // the retract / un-retract definer (migration 184) selects the BBA only
+    // when it is public or owned by a group in the session's read set, so an
+    // unreadable BBA is the missing-id 404; the cache refresh is viewed.
+    (
+        "bba_retract.rs",
+        "retract_bba",
+        &["MassFunctionRepository::retract_conn"],
+    ),
+    (
+        "bba_retract.rs",
+        "unretract_bba",
+        &["MassFunctionRepository::unretract_conn"],
     ),
     // open finding: F-aggregate-existence-oracles (the frame's conflict
     // aggregate over mass_functions).
@@ -180,11 +209,21 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "refine_frame",
         &["FrameRepository::create_refinement"],
     ),
+    // narrows: the perspective / community rows its caller read through the
+    // viewer (`get_for_claim_frame_perspective(s)`), filtered to the rows a
+    // scoped belief may fold.
+    (
+        "belief.rs",
+        "scoped_belief_write",
+        &["derivation_scope::retain_for_cache"],
+    ),
     // gated (the claim is read through the viewer on the write transaction
     // first); the reads are the gated claim's own columns, its agent's
     // properties (agents), neighbour truth values for ids that came from
     // viewer-filtered edges, and best-effort derived rows (community scope,
-    // silence alarm) that reach no response field.
+    // silence alarm) that reach no response field. narrows: the source count
+    // keeps only the cache-admissible rows of `get_for_claim_frame`, read
+    // through the viewer just before it.
     (
         "belief.rs",
         "submit_evidence",
@@ -202,6 +241,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "create_edge_under_savepoint",
             "create_edge_under_savepoint",
+            "derivation_scope::retain_for_cache",
             "sqlx::query(INSERT).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_all",
@@ -220,6 +260,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ChallengeRepository::create",
             "EventRepository::publish_or_log_conn",
         ],
+    ),
+    // stamped: the resolution definer (`epigraph_resolve_challenge`, migration
+    // 168 section 7, the only resolution path since 170) runs on the caller's
+    // stamped write transaction; a missing challenge and one whose claim the
+    // session cannot read are one not-found (CR02), and a reader that does not
+    // write the claim's group is 42501 (CR03). The row returned is read
+    // through the viewer.
+    (
+        "challenge.rs",
+        "resolve_challenge",
+        &["ChallengeRepository::resolve_as_claim_owner"],
     ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
@@ -305,6 +356,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
         ],
+    ),
+    // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
+    // read through the viewer (`get_for_claims`); a read-only run filters them
+    // through the viewer instead (`retain_for_viewer`, viewed).
+    (
+        "computation.rs",
+        "bp_seed_rows",
+        &["derivation_scope::retain_for_cache"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
     (
@@ -631,7 +690,48 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "expand",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
-    // stamped: the group-admin check is the database's, for the caller.
+    // stamped: `groups`, `group_memberships` and `group_key_epochs` have row
+    // security (077), and each route runs on ONE connection stamped with the
+    // caller's viewer; the group-admin check is the database's, for the caller.
+    // add_member and remove_member: the admin check first, then the group, its
+    // epoch and the roster write. create_group: the INSERT's `WITH CHECK` binds
+    // the creator to the stamped principal. get_group: the caller's own
+    // membership first (a non-member is refused before existence is told),
+    // then the group, its roster and epoch under row security.
+    (
+        "groups.rs",
+        "add_member",
+        &[
+            "GroupKeyEpochRepository::get_current_epoch_conn",
+            "GroupMembershipRepository::add_member_conn",
+            "GroupRepository::get_by_id_conn",
+            "group_authz::require_group_admin_conn",
+        ],
+    ),
+    (
+        "groups.rs",
+        "create_group",
+        &["GroupRepository::create_with_admin_conn"],
+    ),
+    (
+        "groups.rs",
+        "get_group",
+        &[
+            "GroupKeyEpochRepository::get_current_epoch_conn",
+            "GroupMembershipRepository::get_members_conn",
+            "GroupMembershipRepository::is_member_conn",
+            "GroupRepository::get_by_id_conn",
+        ],
+    ),
+    (
+        "groups.rs",
+        "remove_member",
+        &[
+            "GroupMembershipRepository::revoke_member_unless_last_admin_conn",
+            "GroupRepository::get_by_id_conn",
+            "group_authz::require_group_admin_conn",
+        ],
+    ),
     (
         "groups.rs",
         "rotate_key",
@@ -976,15 +1076,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // write: the ingest transaction is stamped with the system agent and binds
     // the caller's principal for the database's write-authority check
     // (`begin_system_ingest_stamped_tx`); the authorship edges name that
-    // principal; embeddings for the rows this request just ingested.
+    // principal; embeddings for the rows this request just ingested (the
+    // claims', and the workflow row's goal embedding, each on a transaction
+    // stamped from the workflow-ingest system agent).
     (
         "workflows.rs",
         "ingest_workflow",
         &[
-            "WorkflowRepository::set_goal_embedding",
             "begin_system_ingest_stamped_tx",
             "embed_inserted_workflow_claims",
             "record_api_authorship",
+            "store_workflow_goal_embedding",
         ],
     ),
     // untenanted (workflows, behavioral_executions) and write.
@@ -1025,11 +1127,11 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "store_workflow",
         &[
             "EventRepository::insert",
-            "WorkflowRepository::set_goal_embedding",
             "begin_system_ingest_stamped_tx",
             "embed_inserted_workflow_claims",
             "epigraph_ingest_executor::execute_workflow_ingest_plan",
             "record_api_authorship",
+            "store_workflow_goal_embedding",
         ],
     ),
     // ── route helpers a handler hands its viewer to ──────────────────────
@@ -2186,15 +2288,16 @@ fn the_scanner_sees_the_whole_viewer_surface() {
     assert!(
         handlers >= 160,
         "found {handlers} viewer-holding fns (handlers and route helpers); measured 176 \
-         on 2026-10-26"
+         on 2026-10-26, 192 on 2026-10-29"
     );
     assert!(
         calls >= 700,
-        "found {calls} database calls in them; measured 768 on 2026-10-26"
+        "found {calls} database calls in them; measured 768 on 2026-10-26, 827 on 2026-10-29"
     );
     assert!(
         measured.len() >= 80,
-        "found {} viewer-holding fns with an unviewed call; measured 102 on 2026-10-26",
+        "found {} viewer-holding fns with an unviewed call; measured 102 on 2026-10-26, 116 on \
+         2026-10-29",
         measured.len()
     );
 }
