@@ -849,6 +849,22 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          trigger's; nothing for a viewer to filter.",
     ),
     (
+        "ego.rs",
+        "untenanted_entity_types",
+        "Reads `entity_types` -- the schema REGISTRY (type_name, schema_name, table_name, \
+         id_column, tenancy_tier, ...), not a tenant table. Measured at migration head: it \
+         carries neither `visibility` nor `owner_group_id`, `relrowsecurity` and \
+         `relforcerowsecurity` are both false, and it is absent from migration 062's `tier_a` \
+         array, so there is no column to attach a predicate to and no policy for a session GUC \
+         to select. Same relation and same posture as `entity_type.rs::get_by_name_conn` / \
+         `resolve_row` above. WHAT IT IS FOR: `/claims/:id/ego` may emit a bare typed node only \
+         for a neighbour type that has no tenancy of its own, and this fn reads that set from \
+         the registry rather than hard-coding it -- so a type registered after the route was \
+         written is WITHHELD rather than published. Giving it a Viewer would filter the \
+         registry, which is exactly backwards: the set of untenanted types is not viewer-\
+         dependent, and narrowing it per viewer would publish MORE types to a member, not fewer.",
+    ),
+    (
         "elevated_access.rs",
         "record",
         "WRITE through migration 127's app-callable definer `epigraph_record_elevated_access` \
@@ -2742,6 +2758,23 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          epigraph_principal_id()`, so on the unstamped pool every audit row was refused. The \
          engine's agent-less library path still passes its pool. Pinned by \
          `epigraph-mcp/tests/recall_audit_wiring.rs::the_audit_row_is_not_written_on_the_unstamped_pool`.",
+    ),
+    (
+        "cluster_run.rs",
+        "latest",
+        "Reads `graph_cluster_runs` for the newest completed run; the statement's FROM is that \
+         table alone and it joins nothing. The row is `(run_id, completed_at, degraded)` -- an \
+         operational record of when the clusterer last finished, with no claim content and no \
+         claim id. `graph_cluster_runs` is NOT in migration 062's tier_a array, so it has neither \
+         a `visibility` nor an `owner_group_id` column for a predicate to name, and \
+         `routes/graph_neighborhood.rs::expand` records that measured at migration head 92 it \
+         carries no row-level security either. The tenancy decision belongs to the membership \
+         tables this run id is then used against -- `claim_cluster_membership` and \
+         `claim_neighborhood_membership`, both of which ARE in tier_a -- and \
+         `ClusterRunRepository::claim_placement`, the caller that matters, takes a `&Viewer` and \
+         splices it onto both of them plus the `claims` existence probe. SCOPE: the Explorer \
+         branch widened the executor from `&PgPool` so the three `expand` handlers can pass their \
+         viewer-stamped connection and keep one connection per request. The SQL is unchanged.",
     ),
     (
         "method.rs",

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{% block title %}{{ ctx.product_name() }}{% endblock %}</title>
+<link rel="stylesheet" href="{{ ctx.static_url("app.css") }}">
+{%- block og %}
+<meta property="og:site_name" content="{{ ctx.product_name() }}">
+<meta property="og:type" content="website">
+<meta property="og:title" content="{{ ctx.product_name() }}">
+<meta property="og:url" content="{{ ctx.absolute_url() }}">
+{%- endblock %}
+{%- block head %}{% endblock %}
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="site-header__inner">
+    <a class="brand" href="{{ ctx.home_url() }}">{{ ctx.product_name() }}</a>
+    <form class="search-form" method="get" action="{{ ctx.search_url() }}" role="search">
+      <label class="visually-hidden" for="site-search">Search claims</label>
+      <input id="site-search" type="search" name="q" value="{{ ctx.search_query }}" placeholder="Search claims" autocomplete="off">
+      <button type="submit">Search</button>
+    </form>
+    <nav class="auth-nav" aria-label="Account">
+      {%- if ctx.signed_in %}
+      <form method="post" action="{{ ctx.logout_url() }}">
+        <button type="submit" class="button-quiet">Sign out</button>
+      </form>
+      {%- else %}
+      <a class="button" href="{{ ctx.login_url() }}">Sign in</a>
+      {%- endif %}
+    </nav>
+  </div>
+</header>
+<main id="main" class="site-main">
+{% block content %}{% endblock %}
+</main>
+<footer class="site-footer">
+  <p>{{ ctx.product_name() }} · a reader for the EpiGraph knowledge graph</p>
+</footer>
+</body>
+</html>

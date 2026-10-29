@@ -1,0 +1,136 @@
+# EpiGraph Explorer — Caddy configuration.
+#
+# RECOMMENDED: a SITE BLOCK OF ITS OWN, so the Explorer has an origin to
+# itself. Add the block below to the VM Caddyfile, alongside (not inside) the
+# existing epigraph-api site block. A PATH MOUNT on a shared origin is kept at
+# the bottom of this file as an alternative, with the trust-boundary cost it
+# carries spelled out; read that before choosing it.
+#
+# Assumes the explorer listens on 127.0.0.1:8096 on the same host: either the
+# systemd unit (epigraph-explorer.service.example) or a --network host
+# container. The binary binds loopback only, so Caddy is the public edge.
+
+explorer.example.com {
+    reverse_proxy 127.0.0.1:8096
+}
+
+# With:
+#   EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://explorer.example.com
+#   EPIGRAPH_OAUTH_BASE_URL=https://api.example.com
+# and the `oauth_clients` row's redirect_uris containing exactly
+#   https://explorer.example.com/auth/callback
+# (plain string match, byte for byte — no trailing slash).
+#
+# WHY A DEDICATED ORIGIN. The browser's security boundary is the ORIGIN
+# (scheme + host + port), not the path. Everything the Explorer relies on to
+# separate itself from other apps is origin-scoped, so co-hosting dissolves
+# it:
+#
+#   * Cookies. `epx_session` is a bearer-equivalent credential and `epx_login`
+#     binds a sign-in to a browser. A cookie `Path` is NOT a security
+#     boundary: any page on the origin can read `document.cookie` (for a
+#     non-HttpOnly cookie) and any page can SET a cookie at any path, so a
+#     co-hosted app can write both of the Explorer's names.
+#   * On an origin of its own with https, the Explorer names its cookies
+#     `__Host-epx_session` and `__Host-epx_login` (Path=/, Secure, no Domain).
+#     A browser honours a `__Host-` cookie only in exactly that shape, which
+#     is what makes it unwritable from another host. This naming is automatic:
+#     it switches on when the cookies are Secure AND the base path is the
+#     root, and the process logs which pair it is using at startup.
+#   * CSP `default-src 'self'` / `script-src 'self'` / `connect-src 'self'` /
+#     `form-action 'self'`. `'self'` is the origin. On a shared origin the CSP
+#     permits every script, fetch target and form action that any co-hosted
+#     app serves.
+#   * The `Origin` check on POST /auth/logout and POST /auth/redeem compares
+#     the public ORIGIN, so a co-hosted page passes it.
+#   * `Referrer-Policy: same-origin` sends the full URL of an Explorer page —
+#     which can carry a claim id — to every other app on the origin.
+#   * The postMessage `targetOrigin` for the Notion embed handoff code is the
+#     origin, so any page on it can receive a single-use sign-in code.
+#   * localStorage, sessionStorage, IndexedDB and the service-worker scope are
+#     all per-origin.
+#
+# DO NOT deploy the Explorer under a wildcard-DNS parent domain that is not
+# on the Public Suffix List (https://publicsuffix.org/). Cookies are not
+# origin-scoped: under such a parent, any sibling host can `Set-Cookie` with
+# `Domain=<parent>` and the victim's browser will send it here. The `__Host-`
+# prefix above is the defence, so losing it (a base path, or
+# EPIGRAPH_EXPLORER_INSECURE_COOKIES) and a non-PSL wildcard parent is the
+# combination to avoid.
+#
+# /oauth/* MUST STAY BROWSER-REACHABLE ON THE API'S OWN ORIGIN. Sign-in is
+# the API's own OAuth authorization server, and the browser navigates to it
+# directly:
+#   GET  /oauth/authorize            (explorer -> API, with PKCE)
+#   GET  /oauth/callback             (Google -> API)
+#   POST /oauth/authorize/consent    (the consent form's root-relative action)
+# These live at the root of the API's EPIGRAPH_PUBLIC_BASE_URL and are
+# already exposed for the claude.ai connector. Do not move them behind the
+# Explorer, and do not let a matcher here shadow them. Point
+# EPIGRAPH_OAUTH_BASE_URL at that browser-facing API origin. Only /api/v1 can
+# stay hidden behind the Explorer (it reaches the API on loopback via
+# EPIGRAPH_API_URL). The Explorer's own sign-in routes are /auth/*, which are
+# distinct from the API's /oauth/*.
+#
+# RATE LIMITING /auth/login. Every anonymous GET of that path stores a
+# pending login in the explorer's process-local map (10-minute TTL, 10 000
+# entries). The explorer keeps the map bounded by evicting its oldest entries
+# rather than refusing, so a flood can no longer lock anyone out of sign-in —
+# but it can still evict other people's in-flight attempts, which makes them
+# retry. An edge rate limit on that one path removes even that. Caddy has no
+# rate limiter in the standard build; with the `caddy-ratelimit` module built
+# in, add inside the site block:
+#
+#   @login path /auth/login
+#   rate_limit @login {
+#       zone explorer_login {
+#           key    {remote_host}
+#           events 30
+#           window 1m
+#       }
+#   }
+#
+# Do not rate-limit `/auth/callback`: one slow sign-in behind a shared NAT
+# would then fail at the last step.
+#
+# HEADERS. The explorer sets its own Content-Security-Policy, including
+# `frame-ancestors` (the Notion embed depends on it), X-Content-Type-Options,
+# Referrer-Policy and Cache-Control. Do not add X-Frame-Options or a second
+# CSP in Caddy: a site-wide `X-Frame-Options: DENY` breaks the embed. Do not
+# strip the Origin request header (Caddy forwards it by default): POST
+# /auth/logout and POST /auth/redeem compare it with the public origin. Do
+# not add caching for this site: the Explorer marks its own pages
+# `private, no-store` and its static assets as cacheable.
+#
+# ---------------------------------------------------------------------------
+# ALTERNATIVE (NOT RECOMMENDED): a path on a shared origin.
+#
+# Only if a second hostname and certificate are genuinely unavailable. Append
+# this inside the public site block of the VM Caddyfile, next to the existing
+# epigraph-api stanzas (same pattern as services/nli):
+#
+#   handle_path /explorer* {
+#       reverse_proxy 127.0.0.1:8096
+#   }
+#
+# Understand what you are accepting: EVERY APP ON THAT ORIGIN IS INSIDE THE
+# EXPLORER'S TRUST BOUNDARY. For each bullet under "WHY A DEDICATED ORIGIN"
+# above, a co-hosted app — including one someone else deploys there later —
+# can do the thing that bullet describes: read or overwrite the session and
+# binding cookies, be loaded as script by the Explorer's own CSP, post to
+# /auth/logout and /auth/redeem past the Origin check, and receive the
+# postMessage sign-in handoff. A compromise of any app on the origin is a
+# compromise of every Explorer session. The `__Host-` cookie prefix is
+# unavailable on this layout, because it requires Path=/.
+#
+# PREFIX STRIPPING. `handle_path` strips the matched `/explorer` prefix before
+# proxying, so the explorer receives `/claim/<id>`, not
+# `/explorer/claim/<id>`. It cannot recover the prefix from the request, so
+# EPIGRAPH_EXPLORER_PUBLIC_BASE_URL must carry it:
+#   EPIGRAPH_EXPLORER_PUBLIC_BASE_URL=https://api.example.com/explorer
+# Every link, redirect, og:url, the cookie Path and the OAuth redirect_uri
+# (`.../explorer/auth/callback`, which must match the oauth_clients row byte
+# for byte) are generated from it. The explorer also answers on the
+# unstripped paths, so `handle /explorer* { ... }` works too; pick one. The
+# rate-limit matcher above becomes `/auth/login` because `handle_path` has
+# already stripped the prefix.

@@ -104,6 +104,31 @@ impl ProvenanceChainRepository {
         max_depth: u8,
         relationships: Option<&[String]>,
     ) -> Result<ProvenanceChain, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::chain_conn(&mut conn, viewer, claim_id, max_depth, relationships).await
+    }
+
+    /// [`Self::chain`] on a caller-supplied connection.
+    ///
+    /// The `&PgPool` form above cannot serve an HTTP handler: a converted
+    /// handler holds an [`crate::ScopedRead`] whose session carries the
+    /// viewer's tenancy GUCs, and reaching past it to the raw pool is the exact
+    /// failure `AppState::read_as` documents — an unstamped connection makes
+    /// the RLS policy and the in-query predicate disagree, which hides rows
+    /// from their own owners with no error. Both statements run here, so both
+    /// see the same corpus.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the traversal or hydration query
+    /// fails.
+    #[instrument(skip(conn, viewer))]
+    pub async fn chain_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: u8,
+        relationships: Option<&[String]>,
+    ) -> Result<ProvenanceChain, DbError> {
         let depth = i32::from(max_depth.clamp(1, 8));
 
         let (incoming, outgoing) = match relationships {
@@ -141,9 +166,20 @@ impl ProvenanceChainRepository {
         // MACRO SITE — static three-bind spelling. The predicate lives on the
         // RECURSIVE term, which is the only place `edges` is read: an edge the
         // viewer cannot see must not extend the frontier, or the walk leaks the
-        // shape of another tenant's graph one hop at a time. The hydration
-        // query below filters `claims` the same way, so a node id that survived
-        // the walk still yields no content unless the claim itself is visible.
+        // shape of another tenant's graph one hop at a time.
+        //
+        // TWO predicates, because the frontier is extended by an (edge, claim)
+        // PAIR and either half can be invisible on its own. The second one —
+        // the `EXISTS` on the far claim `nxt.id`, spelled exactly as the
+        // hydration query below spells it — is what keeps an unreadable claim
+        // from extending the walk at all. Filtering only `edges` here and
+        // leaving the claim to hydration was not enough: hydration shapes
+        // `nodes`, but `cycles`, `depth` and `truncated` are all computed from
+        // the raw walk, so an invisible claim that stayed in the frontier
+        // leaked its uuid through `cycles`, pulled its own visible ancestors in
+        // behind it as nodes with no edge joining them to the root, and made
+        // `truncated` report a bound the viewer's own corpus never hit.
+        // Stopping the frontier is the single place that fixes all four.
         let rows = sqlx::query!(
             r#"
             WITH RECURSIVE chain AS (
@@ -177,6 +213,12 @@ impl ProvenanceChainRepository {
                        OR (e.owner_group_id = ANY($6::uuid[])
                            AND (e.co_owner_group_id IS NULL
                                 OR e.co_owner_group_id = ANY($6::uuid[]))))
+                  AND EXISTS (
+                      SELECT 1 FROM claims fc
+                      WHERE fc.id = nxt.id
+                        AND ($5::bool OR fc.visibility = 'public'
+                             OR fc.owner_group_id = ANY($6::uuid[]))
+                  )
             )
             SELECT node AS "node!", depth AS "depth!", is_cycle AS "is_cycle!",
                    path AS "path!", e_source, e_target, e_rel
@@ -190,7 +232,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         // Fewest-hops depth per node, the stored edge set, and any cycles.
@@ -242,7 +284,7 @@ impl ProvenanceChainRepository {
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         let depth_of: HashMap<Uuid, i32> = kept.iter().copied().collect();
@@ -257,6 +299,24 @@ impl ProvenanceChainRepository {
                 depth: depth_of.get(&r.id).copied().unwrap_or(0),
             })
             .collect();
+
+        // Retain the edges against the HYDRATED node set, not against the walk.
+        //
+        // `kept_ids` above comes from the walk, which is filtered on `edges`;
+        // `nodes` comes from hydration, which is filtered on `claims`. Migration
+        // 070's trigger usually derives an edge's tenancy from its endpoints, so
+        // the two agree — but an edge stamped independently of its endpoints
+        // survives the first filter while the claim it names does not survive
+        // the second, and the edge then carries that claim's uuid out of here.
+        // `topo_sort` already skips such an edge for ORDERING (see its
+        // `by_id.contains_key` guard); the returned field kept it, so the id
+        // reached every caller, including MCP `get_provenance_chain`.
+        //
+        // A uuid plus a relationship name is a disclosure even with no content
+        // attached: it says a claim exists, that it is an ancestor of this one,
+        // and by what relation.
+        let node_ids: HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
+        edges.retain(|e| node_ids.contains(&e.source) && node_ids.contains(&e.target));
 
         let nodes = topo_sort(nodes, &edges);
 
