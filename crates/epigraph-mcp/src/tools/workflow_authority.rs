@@ -107,7 +107,7 @@
 //! caller is recorded in the provenance row, not by re-authoring the rows,
 //! which would move them out of the system agent's group.
 
-use crate::errors::{internal_error, McpError};
+use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::write_identity::WriteIdentity;
 
@@ -161,9 +161,10 @@ pub(crate) async fn require_workflow_authority(
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: could not read the workflow's submitter: {e}"
-            ))
+            internal_error_logged(
+                format!("{tool_name}: could not read the workflow's submitter"),
+                e,
+            )
         })?;
     let grant = |arm| WorkflowGrant { owner, arm };
     // AUTHENTICATED TRANSPORT ONLY. The batch H-b bar keeps stdio unchanged
@@ -252,9 +253,10 @@ async fn admin_arm(
     )
     .await
     .map_err(|e| {
-        internal_error(format!(
-            "{tool_name}: could not re-check the admin grant: {e}"
-        ))
+        internal_error_logged(
+            format!("{tool_name}: could not re-check the admin grant"),
+            e,
+        )
     })?;
     if live {
         return Ok(Some(()));
@@ -285,7 +287,7 @@ pub(crate) async fn audit_admin_workflow_write(
     details: serde_json::Value,
 ) -> Result<(), McpError> {
     let Some(token) = auth else {
-        return Err(internal_error(format!(
+        return Err(internal_error_text(format!(
             "{tool_name}: an admin workflow write with no token to audit. Nothing was written."
         )));
     };
@@ -308,9 +310,10 @@ pub(crate) async fn audit_admin_workflow_write(
     )
     .await
     .map_err(|e| {
-        internal_error(format!(
-            "{tool_name}: could not write the admin audit row: {e}. Nothing was written."
-        ))
+        internal_error_logged(
+            format!("{tool_name}: could not write the admin audit row. Nothing was written."),
+            e,
+        )
     })
 }
 
@@ -377,7 +380,7 @@ pub(crate) async fn record_caller_workflow_write(
         WorkflowArm::Operator => ("operator", Some(acting)),
     };
     let Some(token) = auth else {
-        return Err(internal_error(format!(
+        return Err(internal_error_text(format!(
             "{tool_name}: a {arm} workflow write with no token to record. Nothing was written."
         )));
     };
@@ -395,9 +398,12 @@ pub(crate) async fn record_caller_workflow_write(
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
         .await
         .map_err(|e| {
-            internal_error(format!(
-                "{tool_name}: could not record the write's provenance: {e}. Nothing was written."
-            ))
+            internal_error_logged(
+                format!(
+                    "{tool_name}: could not record the write's provenance. Nothing was written."
+                ),
+                e,
+            )
         })
 }
 

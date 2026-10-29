@@ -83,6 +83,10 @@ pub struct UndedupResponse {
     pub duplicate_id: Uuid,
     /// The claim it had been marked a duplicate of.
     pub canonical_id: Uuid,
+    /// The claim it was restored against: `canonical_id`, or the claim that
+    /// replaced it since (supersession or consolidation, followed to the
+    /// current one).
+    pub current_canonical_id: Uuid,
     pub mode: &'static str,
     /// Whether the claim got its embedding back (best-effort; a backfill
     /// restores it otherwise).
@@ -204,12 +208,13 @@ pub struct VersionHistoryResponse {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Validation failures or claim already superseded
+/// - 400 Bad Request: Validation failures
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the claim but does not write its
 ///   owning group (authorship alone is not enough) and lacks `claims:admin`
 /// - 404 Not Found: Claim does not exist, or the caller cannot read it (the two
 ///   are indistinguishable)
+/// - 409 Conflict: the claim is already superseded (operator ruling R-55)
 /// - 201 Created: New claim created successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -223,6 +228,7 @@ pub struct VersionHistoryResponse {
         (status = 401),
         (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -372,6 +378,16 @@ pub async fn supersede_claim(
     //    Stamped, the owner's supersede commits, and a caller whose writable set
     //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
+    // The ACTING agent, recorded as the replacement's `AUTHORED` edge (backlog
+    // 73085534, ruling R-23): the replacement keeps the retired claim's author,
+    // so this edge is the only record in the graph of who restated it.
+    // `ViewerExtractor` already refuses an agentless token, so a principal-less
+    // viewer does not reach here; it is refused rather than recorded as nobody.
+    let Some(acting_agent) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "supersede requires an authenticated principal".into(),
+        });
+    };
     let mut tx = state.write_as(&viewer, "supersede_claim").await?;
     //
     //    Migration 117: this is the supersession's ACT only (retire, insert the
@@ -384,6 +400,7 @@ pub async fn supersede_claim(
         &request.content,
         truth_value,
         &request.reason,
+        epigraph_db::SupersedeActor::new(acting_agent, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
     .map_err(|e| {
@@ -410,6 +427,11 @@ pub async fn supersede_claim(
             );
             return ApiError::from(e);
         }
+        // A repo-authored refusal (e.g. the claim is already superseded) is
+        // answered by its kind (operator ruling R-55), not by its text.
+        if matches!(e, epigraph_db::DbError::Refused { .. }) {
+            return ApiError::from(e);
+        }
         // Map DB errors to appropriate API errors
         let msg = e.to_string();
         if msg.contains("not found") {
@@ -417,8 +439,6 @@ pub async fn supersede_claim(
                 entity: "Claim".to_string(),
                 id: claim_id.to_string(),
             }
-        } else if msg.contains("already been superseded") {
-            ApiError::BadRequest { message: msg }
         } else {
             ApiError::InternalError {
                 message: format!("Supersession failed: {msg}"),
@@ -454,13 +474,16 @@ pub async fn supersede_claim(
         .await
         {
             Ok(latest) => {
+                // The version was created by the agent that performed the
+                // act, not by the author the replacement inherits (backlog
+                // 1a54283d, ruling R-85).
                 let version_row = ClaimVersionRow {
                     id: uuid::Uuid::new_v4(),
                     claim_id: new_uuid,
                     version_number: latest + 1,
                     content: request.content.clone(),
                     truth_value: request.truth_value,
-                    created_by: Some(agent_uuid),
+                    created_by: Some(acting_agent),
                     created_at: now,
                 };
                 ClaimVersionRepository::create(&mut *sp, &version_row).await
@@ -658,14 +681,17 @@ pub async fn supersede_claim(
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
+/// - 400 Bad Request: duplicate_id == canonical_id
 /// - 401 Unauthorized: no bearer token
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the duplicate (or the canonical)
 ///   but does not write its owning group (authorship alone is not enough) and
-///   lacks `claims:admin`; `claim_id` names the claim refused
+///   lacks `claims:admin`; `claim_id` names the claim refused; or the act's
+///   own authority refusal (FA04/FA07), with its reason
 /// - 404 Not Found: the claim or the canonical does not exist, or the caller
 ///   cannot read it (the two are indistinguishable)
+/// - 409 Conflict: the duplicate is already superseded, or the canonical is
+///   not current (operator ruling R-55: a state refusal, with its reason)
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -820,6 +846,9 @@ pub async fn mark_duplicate(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        // The act's own refusals by kind (operator ruling R-55): FA04/FA07
+        // are 403, a retired canonical or an already-superseded duplicate 409.
+        e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
         epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
             reason: "claim already superseded or invalid input".into(),
         },
@@ -900,9 +929,12 @@ pub async fn mark_duplicate(
 ///
 /// The claim is current again (re-embedded best-effort), its `same_as`
 /// identity edge is retracted, and the dedup's repair is reversed from the
-/// record it kept; both claims' belief is re-derived. Same authority as the
-/// dedup (`claims:write` plus write authority over the duplicate and the
-/// canonical, or `claims:admin`), proved on a transaction stamped with the
+/// record it kept; both claims' belief is re-derived. A canonical superseded or
+/// consolidated since the mark is followed to its current replacement
+/// (`current_canonical_id`), and the duplicate is restored against it. Same
+/// authority as the dedup (`claims:write` plus write authority over the
+/// duplicate and the canonical, and every claim that replaced the canonical,
+/// or `claims:admin`), proved on a transaction stamped with the
 /// caller and rolled back; the act and the reversal then commit together on
 /// the maintenance connection (`admin_cascade::apply_unmark`), because an
 /// un-mark cannot be deferred. A server without that connection answers 409
@@ -943,8 +975,9 @@ pub async fn unmark_duplicate(
         entity: "Claim".to_string(),
         id: id.to_string(),
     };
-    // The duplicate (and from it the canonical), read through the CALLER.
-    let (canonical_id, content, dup_target, canonical_target) = {
+    // The duplicate (and from it the canonical, and the claims that replaced
+    // the canonical since), read through the CALLER.
+    let (canonical_id, content, dup_target, canonical_target, chain, replacement_targets) = {
         let mut read = state.read_as(&viewer).await.map_err(db)?;
         let claim = ClaimRepository::get_by_id(&mut *read, &viewer, ClaimId::from_uuid(dup_id))
             .await
@@ -964,11 +997,31 @@ pub async fn unmark_duplicate(
             .await
             .map_err(db)?
             .ok_or_else(|| not_found(canonical_id))?;
+        // A canonical superseded or consolidated since is followed to its
+        // current replacement, and the reversal acts on every claim of that
+        // chain (operator ruling R-11), so the caller's authority is checked
+        // over each of them below as over the canonical. A mark with no
+        // identity edge is refused first, with its reason (R-7); either
+        // refusal is answered only after the caller's authority over the
+        // duplicate and the canonical is checked.
+        let chain = ClaimRepository::unmark_chain_conn(&mut read, &viewer, dup_id, canonical_id)
+            .await
+            .map_err(db)?;
+        let mut replacement_targets = Vec::new();
+        for id in chain.iter().flatten().skip(1) {
+            let target = ClaimRepository::write_target_of(&mut *read, &viewer, *id)
+                .await
+                .map_err(db)?
+                .ok_or_else(|| not_found(*id))?;
+            replacement_targets.push((*id, target));
+        }
         (
             canonical_id,
             claim.content.clone(),
             dup_target,
             canonical_target,
+            chain,
+            replacement_targets,
         )
     };
     crate::middleware::scopes::require_claim_act_authority(
@@ -993,6 +1046,22 @@ pub async fn unmark_duplicate(
         canonical_id,
         "un-mark a duplicate of",
     )?;
+    let chain = chain.map_err(|why| ApiError::Conflict {
+        reason: format!("claim {dup_id} {why}; nothing was written"),
+    })?;
+    for (id, (author, owner_group)) in &replacement_targets {
+        crate::middleware::scopes::require_claim_act_authority(
+            &auth,
+            viewer.principal(),
+            viewer.writable_groups(),
+            epigraph_auth::claim_act::ClaimActTarget {
+                author: *author,
+                owner_group: *owner_group,
+            },
+            *id,
+            "un-mark a duplicate onto",
+        )?;
+    }
 
     // No administrative connection: refuse before anything is written.
     let mut session = state
@@ -1011,13 +1080,16 @@ pub async fn unmark_duplicate(
     // (migration 153); the act commits with the reversal on the maintenance
     // connection.
     let mut tx = state.write_as(&viewer, "unmark_duplicate").await?;
-    let may = ClaimRepository::session_may_unmark_conn(
-        &mut tx,
-        ClaimId::from_uuid(dup_id),
-        ClaimId::from_uuid(canonical_id),
-    )
-    .await
-    .map_err(db)?;
+    let mut may = true;
+    for id in &chain {
+        may &= ClaimRepository::session_may_unmark_conn(
+            &mut tx,
+            ClaimId::from_uuid(dup_id),
+            ClaimId::from_uuid(*id),
+        )
+        .await
+        .map_err(db)?;
+    }
     tx.rollback().await.map_err(db)?;
     if !may {
         return Err(crate::errors::write_refused("claim"));
@@ -1031,13 +1103,14 @@ pub async fn unmark_duplicate(
         Some(canonical_id),
     );
     let (conn, admin_viewer) = session.split();
-    let (outcome, belief_cascade) = epigraph_engine::admin_cascade::apply_unmark(
+    let (outcome, belief_cascade) = epigraph_engine::admin_cascade::apply_unmark_authorized(
         conn,
         admin_viewer,
         &viewer,
         &trigger,
         dup_id,
         canonical_id,
+        Some(&chain),
     )
     .await
     .map_err(|e| match e {
@@ -1081,6 +1154,7 @@ pub async fn unmark_duplicate(
     Ok(Json(UndedupResponse {
         duplicate_id: dup_id,
         canonical_id: outcome.canonical_id,
+        current_canonical_id: outcome.current_canonical_id,
         mode: "unmark_duplicate",
         embedded,
         cascade: outcome.cascade,
@@ -1355,8 +1429,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        // Not compiled (this module is `not(feature = "db")`); kept in step
+        // with the db route, which answers a STATE refusal 409 (ruling R-55).
         #[tokio::test]
-        async fn test_supersede_already_superseded_claim_returns_400() {
+        async fn test_supersede_already_superseded_claim_returns_409() {
             let claim_id = Uuid::new_v4();
             let (state, _) = state_with_claim(claim_id).await;
 
@@ -1394,7 +1470,7 @@ mod tests {
                 .unwrap();
 
             let response2 = router.oneshot(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response2.status(), StatusCode::CONFLICT);
         }
 
         #[tokio::test]

@@ -149,6 +149,9 @@ pub struct EpiGraphMcpFull {
     /// has no root and no pin, so stdio `profile_path` is refused until `main`
     /// sets one.
     pub(crate) label_dedup: Arc<crate::tools::label_dedup::LabelDedupConfig>,
+    /// `recall_with_context`'s `frac_3072` auto-detect read, behind a short
+    /// per-scope cache shared by every session (backlog be28f3d2).
+    pub(crate) centroid_population: Arc<crate::tools::recall::CentroidPopulationCache>,
 }
 
 impl EpiGraphMcpFull {
@@ -274,7 +277,7 @@ impl EpiGraphMcpFull {
         )
         .await
         .map_err(|e| {
-            crate::errors::internal_error(format!("could not re-check the admin grant: {e}"))
+            crate::errors::internal_error_logged("could not re-check the admin grant", e)
         })?;
         if !live {
             return Err(McpError::invalid_request(
@@ -1105,6 +1108,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
@@ -1244,6 +1248,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
@@ -1366,7 +1371,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Read the FROZEN plan of one hierarchical workflow generation by its workflows-table id, as the caller. Returns the row (canonical_name, generation, goal, parent_id, truth_value, submitter) and every executes target of THIS generation at every level, in the order its edge's plan_index gives: plan_index, level, claim_id, content, phase, content_hash (hex), content_hash_ok (seed-aware: the stored hash must match the content under this workflow's name, or the plain hash on rows without the scope marker), visibility, owner_group_id, truth_value, is_current and heads_diverged (an evolve_step happened; the frozen step is still what this generation executes). Integrity counts: hidden_count (edges you can see whose target you cannot read: a count, never ids), unindexed_edges (no integer plan_index or level, e.g. a step add_step did not index; not items), plan_index_gaps, duplicate_plan_indices and retracted_edges (not items). digest_echo is the wfd1 digest of the items, present only when every count is zero; it is informational, because plan_index is a mutable edge property and the order is reported as stored, never repaired, and it does not prove the plan is complete (items missing from the END of the plan raise no count; only a comparison with a digest pinned outside the server detects them). Not found when no such workflow exists or when you can see none of its executes edges (for example, a plan whose items are all private to a group you are not in; a plan mixing public and private items reads with gaps instead)."
+        description = "Read the FROZEN plan of one hierarchical workflow generation by its workflows-table id, as the caller. Returns the row (canonical_name, generation, goal, parent_id, truth_value, submitter) and every executes target of THIS generation at every level, in the order its edge's plan_index gives: plan_index, level, claim_id, content, phase, content_hash (hex), content_hash_ok (seed-aware: the stored hash must match the content under this workflow's name, or the plain hash on rows without the scope marker), visibility, owner_group_id, truth_value, is_current and heads_diverged (an evolve_step happened; the frozen step is still what this generation executes). Integrity counts: hidden_count (edges you can see whose target you cannot read: a count, never ids), unindexed_edges (no integer plan_index or level, e.g. a step add_step did not index; not items), plan_index_gaps, duplicate_plan_indices and retracted_edges (not items). digest_echo is the wfd1 digest of the items, present only when every count is zero; it is informational, because plan_index is a mutable edge property and the order is reported as stored, never repaired, and it does not prove the plan is complete (items missing from the END of the plan raise no count; only a comparison with a digest pinned outside the server detects them). chain_order lists the plan's level-2 step ids in step_follows chain order: the order find_workflow and find_workflow_hierarchical list them in and the step_index of report_workflow_outcome / report_hierarchical_outcome counts, so chain_order[i] is step i there. It is outside the digest: not digested, not attested, and items stay in plan_index order whatever it says. It differs from the items' step order when add_step inserted a step (unindexed: listed at its slot, not an item), when a writer rewrote a plan_index or a step_follows edge (every count can still be zero), and when an executes edge is retracted (its step is listed, not an item). When the plan's step_follows pairs fork or cycle there is no single chain and it falls back to stored plan_index order, an unindexed step last; a step you cannot read splits the chain; and it is not cut at a hidden item the way the outcome reports' step_index resolution is. Not found when no such workflow exists or when you can see none of its executes edges (for example, a plan whose items are all private to a group you are not in; a plan mixing public and private items reads with gaps instead)."
     )]
     async fn get_workflow_plan(
         &self,
@@ -1434,7 +1439,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Reverse a mark_duplicate: the claim is current again (supersedes cleared, re-embedded best-effort), its same_as identity edge is retracted, and the dedup's repair is undone from the record the repair kept (edges re-pointed back onto it, its mass functions returned with their old ownership, edges and mass functions the repair retracted or deleted restored, frame bindings it added to the canonical removed); both claims' belief is then re-derived. Rows a later write has changed are left as they are and counted as drifted. WHO MAY: as mark_duplicate (scope claims:write, and write authority over the duplicate's AND the canonical's owning groups, or claims:admin); the caller's authority is proved on a transaction stamped with its own identity, then the act and the reversal commit together on the server's administrative connection, audited as cause \"undedup\" naming the caller. Only a claim a dedup marked (one with an in-force same_as identity edge to the claim it supersedes, and a recorded repair or a still-pending one) can be un-marked; anything else is refused with nothing written. REQUIRES the administrative connection: an un-mark cannot be deferred to the replay, so a server without it refuses the call before writing anything."
+        description = "Reverse a mark_duplicate: the claim is current again (supersedes cleared, re-embedded best-effort), its same_as identity edge is retracted, and the dedup's repair is undone from the record the repair kept (edges re-pointed back onto it, its mass functions returned with their old ownership, edges and mass functions the repair retracted or deleted restored, frame bindings it added to the canonical removed); both claims' belief is then re-derived. Rows a later write has changed are left as they are and counted as drifted. WHO MAY: as mark_duplicate (scope claims:write, and write authority over the duplicate's AND the canonical's owning groups, or claims:admin); the caller's authority is proved on a transaction stamped with its own identity, then the act and the reversal commit together on the server's administrative connection, audited as cause \"undedup\" naming the caller. Only a claim a dedup marked (one with an in-force same_as identity edge to the claim it supersedes, and a recorded repair or a still-pending one, or a legacy fuzzy_dedup_claims mark whose edge backfill_dedup_identity_edges reconstructed: nothing to restore, reported as cascade.touched.legacy_mark) can be un-marked; anything else is refused with nothing written and the reason. A canonical superseded or consolidated since the mark is followed to its current replacement (current_canonical_id) and the duplicate is restored against it; the caller needs the same write authority over every claim of that chain as over the canonical. REQUIRES the administrative connection: an un-mark cannot be deferred to the replay, so a server without it refuses the call before writing anything."
     )]
     async fn unmark_duplicate(
         &self,
@@ -1738,7 +1743,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent. With 'supersedes' the new claim records supersedes = parent and the administrative Supersede cascade (as supersede_claim runs it) carries the retired step's edges onto it; the response's `cascade` reports it (status applied; deferred, for the replay timer to apply, when this server has no maintenance connection; or failed, and replayable), with `belief_cascade`. The workflow's `executes` edge, its step chain (`step_follows` / `phase_follows`), the lineage's `revises` history and other agents' `asserts` / `AUTHORED` stay on the retired step. 'revises' retires nothing and runs no cascade. Authority: when any workflow executes the parent's step lineage (the parent or any claim sharing its step_lineage_id, retracted `executes` edges included), over HTTP the caller needs workflow authority over EVERY such workflow, as add_step and delete_step need over theirs: its recorded submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter admits only the audited admin path. Anyone else is refused with nothing written, and the refusal names the workflow and its submitter. Each admitted write is recorded as one workflows.caller_write (or workflows.admin_write) security event per workflow. A claim no workflow executes is unaffected, and stdio callers are not checked."
+        description = "Evolve a versioned step or operation by atomically creating a new claim that supersedes or revises an existing one. Use 'supersedes' for linear refinement; 'revises' for a concurrent branch from a common ancestor. The new claim shares the same step_lineage_id as the parent. With 'supersedes' the new claim records supersedes = parent and the administrative Supersede cascade (as supersede_claim runs it) carries the retired step's edges onto it; the response's `cascade` reports it (status applied; deferred, for the replay timer to apply, when this server has no maintenance connection; or failed, and replayable), with `belief_cascade`. The workflow's `executes` edge, its step chain (`step_follows` / `phase_follows`), the lineage's `revises` history and other agents' `asserts` / `AUTHORED` stay on the retired step. 'revises' retires nothing and runs no cascade. Authority: when any workflow executes the parent's step lineage (the parent or any claim sharing its step_lineage_id, retracted `executes` edges included), over HTTP the caller needs workflow authority over EVERY such workflow, as add_step and delete_step need over theirs: its recorded submitter, the submitter's operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path, recorded as a workflows.admin_write security event); a workflow with no recorded submitter admits only the audited admin path. Anyone else is refused with nothing written, and the refusal names the workflow and its submitter. Each admitted write is recorded as one workflows.caller_write (or workflows.admin_write) security event per workflow. A claim no workflow executes is unaffected, and stdio callers are not checked. Accepted residual: the workflows checked are read under the caller's own row security, so a workflow the caller cannot see (a group-private workflow outside its groups that executes the same lineage, possible only when a lineage's members were split across tenancies) is not among them and is not authority-checked."
     )]
     async fn evolve_step(
         &self,
@@ -2101,7 +2106,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them; a step add_step left without a plan_index comes after every indexed step). Writes no evidence and changes no belief. All-or-nothing: the counters and every step row commit together, so an error (including a step row the database refuses) writes nothing and step_executions_written always equals the number of step_executions sent; a `quality` outside [0, 1] is refused before anything is written. NOT idempotent: every successful call adds to the counters and rows, so do not retry a call that succeeded (a call that returned an error wrote nothing and can be retried). Each step_index is resolved against the steps YOU can read: a step_index that is out of range, or whose step is not visible to you (for example a group-private step outside your groups), is stored with a null step_claim_id, and the response lists it in unresolved_step_indices with a warning (the two causes are not told apart). A non-blank goal_text is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow. There is no ownership check on the workflow, but a caller that can read none of its plan (none of its executes edges) gets the same not-found error as an unknown id, and nothing is written. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
+        description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them: the step_follows chain, so a step add_step inserted at slot i is step i; when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last). Writes no evidence and changes no belief. All-or-nothing: the counters and every step row commit together, so an error (including a step row the database refuses) writes nothing and step_executions_written always equals the number of step_executions sent; a `quality` outside [0, 1] is refused before anything is written. NOT idempotent: every successful call adds to the counters and rows, so do not retry a call that succeeded (a call that returned an error wrote nothing and can be retried). Each step_index is resolved against the steps YOU can read: a step_index that is out of range, or whose step is not visible to you (for example a group-private step outside your groups), is stored with a null step_claim_id, and the response lists it in unresolved_step_indices with a warning (the two causes are not told apart). A non-blank goal_text is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow. There is no ownership check on the workflow, but a caller that can read none of its steps (no step executes edge; a visible thesis, phase or shared operation atom does not count, so a plan with no steps is refused to every caller) gets the same not-found error as an unknown id, and nothing is written. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(
         &self,
@@ -2115,7 +2120,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. plan_index in the response is where the step sits in plan order (the order find_workflow, find_workflow_hierarchical, get_workflow_plan and the step_index of report_workflow_outcome / report_hierarchical_outcome use). An append to a workflow whose every executes edge the workflow-ingest stamp can read is public gets one past the largest plan_index it can read, and nothing moves. Every other add (an insert; an append to a workflow with a non-public executes edge, or with no integer plan_index) is left unindexed: plan_index is null, no index changes, and plan order lists the step after every indexed step, while for an insert the step_follows chain has it at slot i. Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing. The step row is scoped to this workflow, so a step text another workflow already uses does not conflict. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none."
+        description = "Append or middle-insert a step into an existing hierarchical workflow. `position=None` appends; `position=Some(i)` inserts at the 0-indexed slot i of the `step_follows` chain, and the returned step_index is that chain slot. Plan order for find_workflow, find_workflow_hierarchical and the step_index of report_workflow_outcome / report_hierarchical_outcome is the step_follows chain, not plan_index; plan_index in the response is only the stored ordinal of the step's executes edge, which get_workflow_plan reports in stored order (its chain_order field lists the step_follows chain). An append to a workflow whose every executes edge the workflow-ingest stamp can read is public gets one past the largest plan_index it can read, and nothing moves. Every other add (an insert; an append to a workflow with a non-public executes edge, or with no integer plan_index) is left unindexed: plan_index is null and no index changes; plan order (find_workflow, find_workflow_hierarchical, the outcome reports' step_index) follows the step_follows chain, so an inserted step is at slot i there (except when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last), while get_workflow_plan reports the stored plan_index order and counts it in unindexed_edges. Idempotent on `(canonical_name, step_text)` via deterministic claim ID. All-or-nothing. The step row is scoped to this workflow, so a step text another workflow already uses does not conflict. Authority (batch H-b): a workflow created since then records its submitter (the calling agent: your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio), and over HTTP only that submitter, its operator, or a claims:admin token whose client record still grants it claims:admin (the audited admin path: the write is recorded as a workflows.admin_write security event naming the admin; claims:admin in the token alone is refused) may change it; anyone else is refused with nothing written, and the refusal names the workflow and its submitter (stdio callers are not checked). Every write the submitter or its operator makes over HTTP is recorded as a workflows.caller_write security event naming the arm, the acting agent, the human it acted for, the submitter, the tool, the workflow and the token (the rows themselves stay authored by the workflow-ingest system agent). A workflow with no recorded submitter (created before then) is platform corpus: over HTTP only the audited claims:admin path may change it, and anyone else is refused with nothing written. AUTHORSHIP: every claim this call creates gets one AUTHORED edge (agent -> claim) from the acting agent (your own OAuth agent over HTTP; this server's agent on stdio), written in the same transaction; the claims themselves stay authored by the workflow-ingest system agent, and the acting agent's authority traces to its human through OPERATED_BY / its operator binding. A claim the call only reuses (a step already present, an operation atom shared with another workflow, a re-ingest) keeps its creator's edge and gets none."
     )]
     async fn add_step(
         &self,
@@ -2173,7 +2178,7 @@ impl EpiGraphMcpFull {
         tools::graph::traverse(self, viewer, params).await
     }
 
-    // ── Challenges (2 tools) ──
+    // ── Challenges (3 tools) ──
 
     #[tool(
         description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. The challenge is filed as the calling principal (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's agent on stdio). Refused with an error, writing nothing, when the claim is owned by a group the caller cannot write."
@@ -2199,6 +2204,20 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::challenges::list_challenges(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Set the resolution status of a challenge filed against a claim you own: under_review, accepted or rejected (a pending challenge may be accepted or rejected directly, and a settled one re-resolved; every change is audited). Only a writer of the challenged claim's owning group may do this; the challenger's own text and ownership are untouched. The resolver recorded is always the calling principal (your own OAuth agent over HTTP; this server's agent on stdio). A challenge you cannot see answers exactly as one that does not exist. Returns {challenge_id, claim_id, state, resolved_by, resolved_at, resolution_details}."
+    )]
+    async fn resolve_challenge(
+        &self,
+        Parameters(params): Parameters<ResolveChallengeParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::challenges::resolve_challenge(self, viewer, params, auth).await
     }
 
     // ── Events (2 tools) ──
@@ -2363,6 +2382,34 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Retract ONE mass function (BBA) by its id, with a reason. A retracted BBA is excluded from every belief fold and read (DS combine, scoped and perspective belief, the atom cache, BetP) and is kept, with who retracted it, when and why, for audit; the claim's cached belief is then recomputed from the BBAs that remain, in the same transaction (belief_recomputed says whether a cache was written), or, when none remains, set to the explicit vacuous value Bel 0, Pl 1, BetP 0.5, not_enough_info (belief_vacated), and the stored scoped beliefs that folded the retracted BBA (the global scope, its own perspective's and those of communities counting that perspective) are deleted (scoped_beliefs_cleared; the next evidence write on that claim and frame stores fresh ones). Only a writer of the BBA's owning group may retract it, or a caller whose token carries claims:admin and whose token's own client record still holds that grant (recorded as arm=admin). A BBA you cannot read reports not found, exactly like a random id; one you can read but may not retract is refused; neither writes anything. The first retraction writes one security_events audit row (mass_functions.retract) holding the row as it was; retracting it again changes nothing and answers status=already_retracted. A retracted BBA keeps its key: a later write of the same claim, frame, source agent and perspective_id (for example resubmitting through submit_ds_evidence) is refused with an error coded RT07 and changes nothing; unretract_bba (audited) is the only way back. Written with the calling agent's write authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)."
+    )]
+    async fn retract_bba(
+        &self,
+        Parameters(params): Parameters<crate::tools::bba_retract::RetractBbaParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::bba_retract::retract_bba(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Un-retract ONE retracted mass function (BBA) by its id, with a reason: the only way a retracted BBA becomes live again (a write to its key, the same claim, frame, source agent and perspective_id, is refused with RT07 while it is retracted). It folds again with the masses it was retracted with; the claim's cached belief is recomputed from the live BBAs in the same transaction (belief_recomputed), and the stored scoped beliefs of its claim and frame that will fold it again (the global scope, its own perspective's and those of communities counting that perspective) are deleted (scoped_beliefs_cleared; the next evidence write stores fresh ones). The same authority as retract_bba: a writer of the BBA's owning group, or a caller whose token carries claims:admin and whose token's own client record still holds that grant (arm=admin); either may un-retract a retraction the other made. A BBA you cannot read reports not found, like a random id; one you can read but may not un-retract is refused; neither writes anything. An un-retraction writes one security_events audit row (mass_functions.unretract) with the reason and the row as it was; a BBA that is not retracted answers status=not_retracted and changes nothing. Written with the calling agent's write authority (your own OAuth agent over HTTP; this server's own agent on stdio)."
+    )]
+    async fn unretract_bba(
+        &self,
+        Parameters(params): Parameters<crate::tools::bba_retract::UnretractBbaParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::bba_retract::unretract_bba(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Query the Dempster-Shafer belief interval for a claim. Returns Bel, Pl, ignorance, BetP, and CDST conflict/missing separation. A `shadow` object appears only when the server runs with EPIGRAPH_COMPOUND_BELIEF=shadow: the claim's atom-level view beside the served values, which it does not change. basis=derived: computed from N visible atoms (shadow.derived.leaves_used); not evidence about this claim; never cite or resubmit as evidence."
     )]
     async fn get_belief(
@@ -2501,10 +2548,10 @@ impl EpiGraphMcpFull {
         crate::tools::embeddings::backfill_embeddings(self, &mut session, params).await
     }
 
-    // ── Themes (3 tools) ──
+    // ── Themes (2 read tools, and the retired `theme_cluster` refusal) ──
 
     #[tool(
-        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the k-means family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this instead of theme_cluster to answer \"what topics does this graph cover\"."
+        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
     )]
     async fn list_themes(
         &self,
@@ -2530,16 +2577,13 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Trigger server-side theme clustering via k-means over the claim corpus. Mirrors POST /api/v1/themes/build-from-corpus. Defaults: k_min=4, k_max=16, min_claims_per_theme=5, limit=500 (hard-capped at 500 here for OOM safety), label_prefix=\"auto\", centroid_dim=1536, wipe_first=false (additive: new themes are added alongside the existing set, and repeated runs under one label_prefix accumulate duplicate labels). `wipe_first=true` deletes EVERY existing theme, whatever its prefix, and clears every claim's theme assignment before rebuilding: it requires claims:admin and the canonical label_prefix \"auto\", and is refused otherwise with nothing written. To read the current themes use list_themes / get_theme, never this tool."
+        description = "RETIRED. Was server-side k-means theme clustering; that prototype is removed. Every call is refused with nothing written. Themes are maintained by the UMAP theme pipeline (scripts/maintain_themes.py, theme_pipeline.py grow); read them with list_themes / get_theme."
     )]
     async fn theme_cluster(
         &self,
-        Parameters(params): Parameters<crate::tools::themes::ThemeClusterParams>,
-        extensions: rmcp::model::Extensions,
+        Parameters(_params): Parameters<crate::tools::themes::RetiredThemeClusterParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.reject_if_read_only()?;
-        let auth = extensions.get::<epigraph_auth::AuthContext>();
-        crate::tools::themes::theme_cluster(self, params, auth).await
+        Err(crate::tools::themes::theme_cluster_retired())
     }
 
     // ── RDF Triple Layer (3 tools) ──
@@ -2612,7 +2656,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
+        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — corroborates for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,

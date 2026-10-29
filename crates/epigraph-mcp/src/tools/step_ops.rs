@@ -20,8 +20,14 @@ pub struct AddStepParams {
     /// the workflow-ingest stamp can read is public is indexed one past the
     /// largest `plan_index` it can read. Every other add (an insert, or an
     /// append to a plan with a non-public `executes` edge or with no integer
-    /// `plan_index`) is left unindexed (`plan_index: null` in the response),
-    /// and plan order lists it after every indexed step.
+    /// `plan_index`) is left unindexed (`plan_index: null` in the response).
+    /// The chain readers (find_workflow, find_workflow_hierarchical, the
+    /// outcome reports' `step_index`) list it at slot `position`: they walk
+    /// the `step_follows` chain, not `plan_index` (ruling R-38). Two
+    /// exceptions: when the plan's `step_follows` pairs fork or cycle there is
+    /// no single chain and those readers fall back to stored `plan_index`
+    /// order (an unindexed step last), and `get_workflow_plan` always reports
+    /// stored order.
     #[serde(default)]
     pub position: Option<u32>,
 }
@@ -93,7 +99,12 @@ async fn require_authority_over(
 ) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
     let Some(head) = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
         .await
-        .map_err(|e| internal_error(format!("{tool_name}: could not resolve the workflow: {e}")))?
+        .map_err(|e| {
+            crate::errors::internal_error_logged(
+                format!("{tool_name}: could not resolve the workflow"),
+                e,
+            )
+        })?
     else {
         return Ok(None);
     };
@@ -119,8 +130,8 @@ async fn require_authority_over(
 /// atomic. `add_step` writes the claim, an `executes` edge, a `decomposes_to`
 /// edge and up to three `step_follows` rewires including a `DELETE`; on separate
 /// checkouts a refusal at the last of those left a step spliced into a broken
-/// chain, which `ordered_steps` then reports by appending the orphan in
-/// `created_at` order — a silent reordering rather than an error. Retrying is
+/// chain, which `ordered_steps` then reported by appending the orphan in
+/// plan order — a silent reordering rather than an error. Retrying is
 /// safe because the claim id is `compound_claim_id(step_hash, canonical_name)`
 /// and the INSERT carries `ON CONFLICT (id) DO NOTHING`.
 pub async fn add_step(
@@ -163,7 +174,9 @@ pub async fn add_step(
             "add_step",
         )
         .await
-        .map_err(|e| internal_error(format!("add_step: could not record authorship: {e}")))?;
+        .map_err(|e| {
+            crate::errors::internal_error_logged("add_step: could not record authorship", e)
+        })?;
     }
     // The arm that admitted the caller is recorded with the write: the admin
     // arm's audit row, or the provenance row of any other authenticated arm.
@@ -187,7 +200,7 @@ pub async fn add_step(
     }
     tx.commit()
         .await
-        .map_err(|e| internal_error(format!("add_step: could not commit: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("add_step: could not commit", e))?;
 
     // Post-commit and best-effort, deliberately outside the transaction: the
     // embed holds a network round trip to OpenAI, and CLAUDE.md's embedding
@@ -266,7 +279,7 @@ pub async fn delete_step(
     }
     tx.commit()
         .await
-        .map_err(|e| internal_error(format!("delete_step: could not commit: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("delete_step: could not commit", e))?;
     success_json(&DeleteStepResponse {
         workflow_id: r.workflow_id,
         step_claim_id: r.step_claim_id,

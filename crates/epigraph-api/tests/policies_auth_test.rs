@@ -659,7 +659,7 @@ async fn decide_candidate_promote_same_still_writes_corroborates() {
     );
 
     let rels = edge_relationships(&pool, claim_a, claim_b).await;
-    assert_eq!(rels, vec!["CORROBORATES".to_string()]);
+    assert_eq!(rels, vec!["corroborates".to_string()]);
 }
 
 // ── list_match_candidates ───────────────────────────────────────────────────

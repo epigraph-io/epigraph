@@ -197,7 +197,14 @@
 //!   §2.4 protected set under both of `tenancy_coverage.rs::protected_set`'s
 //!   generators, carries neither `visibility` nor `owner_group_id`, and gets no
 //!   `tenancy_exempt` row (the registry is for relations the generators DO
-//!   find; `migration_068_and_069_apply_twice` pins its cardinality at 12).
+//!   find; `migration_068_and_069_apply_twice` pinned its cardinality at 12).
+//!   AMENDED by migration 173 (ruling R-66, backlog 154efca2): the two FK
+//!   neighbours of the manual tier-A addition `harvester_fragments`
+//!   (`harvester_sources`, `harvester_audit_reports`), which no generator
+//!   finds, are covered (tenancy columns and `harvester_fragments`'s row
+//!   security) and hold no registry row; the cardinality pin stays 12 and
+//!   `tenancy_coverage.rs::the_registry_is_exactly_the_twelve_measured_rows`
+//!   pins the membership. `webhook_subscriptions` is still not in it.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
@@ -654,6 +661,20 @@
 //! * **No `ROW_ONLY_BY_DESIGN` entry goes stale.** None of the four needles
 //!   (`true`, `key_kind`, `privatization_apply`, `agent_id IS NULL`) matches an
 //!   arm 092 rewrites, and that register is exact in both directions.
+//!
+//! ## Status at migration 168
+//!
+//! **168 changes an RLS policy set, so this file is touched deliberately.** It
+//! ADDS one policy, `challenges_claim_readable`: RESTRICTIVE, `FOR SELECT`,
+//! `TO PUBLIC`, so it grants nothing and only narrows reads of `challenges` to
+//! rows whose claim the reader can read (ruling R-CH1b; the reason is that 168
+//! also lets an outsider's challenge stay public when its claim is privatized).
+//! No permissive policy, route split or tenancy column of D1-D4 moves: the new
+//! `challenges.writer_owned` flag is 114's marker on one more table, not a
+//! tenancy column, and `owner_group_id` / `visibility` keep their meaning.
+//! `rls_enforcement.rs` registers the policy's subquery arm in
+//! `ROW_ONLY_BY_DESIGN` with its reason; the per-command coverage table counts
+//! only permissive policies and is unchanged.
 
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -1507,6 +1528,27 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "INSERT INTO public.system_agents",
         "UPDATE system_agents",
         "DELETE FROM system_agents",
+        // Migration 164: a keyless team group is created, and its roster
+        // changed, ONLY by the operator CLI (`create-group` / `group-member`,
+        // its library module allowed below), on the maintenance DSN where the
+        // definers SUCCEED. The bind-call shapes, not the bare names, because
+        // `tenancy_backfill.rs` names the definers in its registers.
+        "epigraph_create_team_group($",
+        "epigraph_team_group_add_member($",
+        "epigraph_team_group_remove_member($",
+        "epigraph_team_group_set_member_role($",
+        // Migration 165: which group follows which role is decided ONLY by the
+        // operator CLI (`define-group-role` / `end-group-role-binding`, its
+        // library module allowed below), on the maintenance DSN where the
+        // definers SUCCEED; a raw statement would be a second, unreviewed way
+        // to make a role confer group membership. Bind-call shapes, not bare
+        // names, because `tenancy_backfill.rs` names the definers.
+        "epigraph_define_group_role($",
+        "epigraph_bind_group_role($",
+        "epigraph_end_group_role_binding($",
+        "INSERT INTO group_role_bindings",
+        "UPDATE group_role_bindings",
+        "DELETE FROM group_role_bindings",
     ];
     // THE READ HALF, AND WHY ITS ROOT SET IS SMALLER THAN THE WRITE HALF'S.
     //
@@ -1558,6 +1600,13 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "AdminActRepository::get",
         "FROM pending_admin_acts",
         "epigraph_has_live_passkey",
+        // Migration 165: who derives a group from a role is answered for ANY
+        // principal by these (a roster oracle; none is app-executable). The
+        // request path reaches the derivation only through the viewer's
+        // `epigraph_live_memberships` and the claims trigger.
+        "epigraph_role_derived_memberships",
+        "epigraph_group_role_roster",
+        "FROM group_role_bindings",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
@@ -1598,6 +1647,10 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         // 148: the operator's system-agent registration, on the maintenance
         // DSN.
         "epigraph-cli/src/operator/system_agent.rs",
+        // 164: the operator's team-group verbs, on the maintenance DSN.
+        "epigraph-cli/src/operator/team_group.rs",
+        // 165: the operator's role-binding verbs, on the maintenance DSN.
+        "epigraph-cli/src/operator/group_role.rs",
     ];
 
     let mut offenders: Vec<String> = Vec::new();
@@ -1863,16 +1916,25 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // the stamp's effect is independent of who writes the provenance row; that is
     // a separate question, recorded as finding F-089-F in
     // docs/tenancy/progress.json with its location and owner.
+    // 23 SINCE MIGRATION 173 (ruling R-66), AND ARM (c)'s TABLE SET DID NOT
+    // MOVE EITHER. 173's `harvester_audit_reports_inherit_tenancy` stamps an
+    // audit report with its FRAGMENT's tenancy at INSERT (a report has no
+    // `claim_id`), and `harvester_fragments_audit_reports_inherit_tenancy`
+    // re-stamps the reports when the fragment's pair changes; both are named
+    // inside the pattern so that a disabled one is visible here like every
+    // other stamping trigger.
     assert_eq!(
         rows.len(),
-        21,
-        "expected 21 tenancy triggers — 3 named (claims_require_tenancy, \
+        23,
+        "expected 23 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
-         089's harvester_claim_provenance_fragment_inherit_tenancy. Found {}: \
+         089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
+         migration 173's harvester_audit_reports_inherit_tenancy and \
+         harvester_fragments_audit_reports_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or 089's trigger is gone, which is a D1 change and needs a \
-         decision, not a silent edit.",
+         moved or an 089 or 173 trigger is gone, which is a D1 change and \
+         needs a decision, not a silent edit.",
         rows.len()
     );
 
@@ -1893,12 +1955,17 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .fetch_all(&pool)
     .await
     .expect("read pg_trigger for the PR-16 set");
+    // 26 SINCE MIGRATION 173: `harvester_sources_require_tenancy`, a seventh
+    // parentless root on 074's root body.
+    // 26 -> 27 (ruling R-74): migration 183's `workflows_require_tenancy`,
+    // 074's parentless-root body on another tier-A table.
     assert_eq!(
         pr16.len(),
-        25,
-        "expected 25 after migration 074: 24 *_require_tenancy (claims, the 17 \
-         claim-derived tables, the 6 parentless roots) plus claims_block_widening. \
-         Found {}: {pr16:?}",
+        27,
+        "expected 27: after migration 074, 24 *_require_tenancy (claims, the 17 \
+         claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
+         migration 173 adds harvester_sources_require_tenancy and migration 183 \
+         workflows_require_tenancy. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2254,6 +2321,13 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "group_role_bindings",
+    "role_agents",
+    "harvester_sources",
+    "harvester_audit_reports",
+    // Workflow rows (183, ruling R-74): tier-A since that migration, which
+    // FORCEs the table itself; reached through `tier_a` in the test below.
+    "workflows",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2347,6 +2421,18 @@ const AGENT_IDENTITY_TABLES: &[&str] = &[
     "agent_succession",
 ];
 
+/// The role-to-group bindings, which migration 165 creates and FORCEs. An
+/// ELEVENTH TERM for the same reason as the ten above: FORCEd by the
+/// migration that creates it, none of the earlier kinds, and carrying no
+/// `visibility` / `owner_group_id` columns, so it does not join `tier_a`.
+const GROUP_ROLE_TABLES: &[&str] = &["group_role_bindings"];
+
+/// The role attachments, which migration 166 creates and FORCEs. A TWELFTH
+/// TERM for the same reason as the eleven above: FORCEd by the migration that
+/// creates it, none of the earlier kinds, and carrying no `visibility` /
+/// `owner_group_id` columns, so it does not join `tier_a`.
+const ROLE_AGENT_TABLES: &[&str] = &["role_agents"];
+
 /// **D4, locked.** The FORCEd set is exactly 062's `tier_a` ∪ the control
 /// tables ∪ the privatization tables, and it is exactly what the catalog
 /// reports.
@@ -2383,10 +2469,16 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     .expect("tier_a probe")
     .into_iter()
     .collect();
+    // 27 SINCE MIGRATION 173 (ruling R-66): 062's 25 plus the two harvester
+    // neighbours `harvester_sources` and `harvester_audit_reports`, which 173
+    // gives both tenancy columns and FORCEs itself, on 078's precedent.
+    // 27 -> 28 (ruling R-74): migration 183 gives `workflows` both tenancy
+    // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     assert_eq!(
         tier_a.len(),
-        25,
-        "migration 062's tier_a is 25 relations; got {}: {tier_a:?}",
+        28,
+        "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours \
+         and 183 adds workflows; got {}: {tier_a:?}",
         tier_a.len()
     );
 
@@ -2402,6 +2494,8 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
         .chain(ELEVATED_ACCESS_TABLES.iter().map(|s| (*s).to_string()))
         .chain(ADMIN_ACT_TABLES.iter().map(|s| (*s).to_string()))
         .chain(AGENT_IDENTITY_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(GROUP_ROLE_TABLES.iter().map(|s| (*s).to_string()))
+        .chain(ROLE_AGENT_TABLES.iter().map(|s| (*s).to_string()))
         .collect();
     let declared: BTreeSet<String> = FORCE_PROTECTED_SET
         .iter()

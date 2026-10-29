@@ -203,7 +203,7 @@ async fn high_band_pair_is_verified_not_blindly_corroborated(pool: PgPool) {
     // The verifier said `contradicts`, so NO CORROBORATES edge may exist...
     let corrob: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -299,7 +299,7 @@ async fn high_band_pair_verified_then_promotes_and_corroborates(pool: PgPool) {
     // order, but assert symmetrically).
     let edge_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -367,7 +367,7 @@ async fn auto_promote_false_stages_pending_for_review_and_skips_edge(pool: PgPoo
 
     let edge_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -517,7 +517,7 @@ async fn mid_band_same_verdict_promotes_and_writes_mapped_column(pool: PgPool) {
 
     let edge_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -562,7 +562,7 @@ async fn mid_band_contradicts_writes_contradicts_edge(pool: PgPool) {
     // No CORROBORATES — only contradicts.
     let corrob: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -637,7 +637,7 @@ async fn mid_band_distinct_verdict_records_rejected_row_and_no_edge(pool: PgPool
         "SELECT COUNT(*)::bigint FROM edges
          WHERE ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))
-           AND relationship IN ('CORROBORATES', 'contradicts')",
+           AND lower(relationship) IN ('corroborates', 'contradicts')",
     )
     .bind(seed)
     .bind(peer)

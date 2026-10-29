@@ -11,7 +11,8 @@
 //! required parameter with no legal argument does not compile.
 //!
 //! What PR-09 still owns: moving the eight inline-SQL tools to the repo layer,
-//! `no_inline_sql_in_tools.rs`, `theme_cluster`'s within-viewer clustering, and
+//! `no_inline_sql_in_tools.rs`, `theme_cluster`'s within-viewer clustering (moot:
+//! the tool is retired with the k-means prototype, backlog a0ed0180), and
 //! the `auth.rs::unauthenticated_context()` change. This file is the acquisition
 //! half only.
 //!
@@ -187,7 +188,7 @@ pub async fn request_viewer(
     if auth.is_none() {
         return Viewer::resolve(&server.pool, principal)
             .await
-            .map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None));
+            .map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e));
     }
     // HTTP: an OPERATED principal gets no viewer. Operated agents are
     // stdio-only (migration 107); token issuance refuses them, but a token
@@ -239,13 +240,13 @@ pub async fn request_viewer(
             ))
         }
         Err(e) => {
-            return Err(McpError::internal_error(
-                format!("could not check whether agent {principal} is operated: {e}"),
-                None,
+            return Err(crate::errors::internal_error_logged(
+                format!("could not check whether agent {principal} is operated"),
+                e,
             ))
         }
     }
-    viewer.map_err(|e| McpError::internal_error(format!("viewer resolution failed: {e}"), None))
+    viewer.map_err(|e| crate::errors::internal_error_logged("viewer resolution failed", e))
 }
 
 /// The refusal of a delegated run token whose delegation is not live: one

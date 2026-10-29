@@ -36,6 +36,10 @@ pub async fn consolidate_claims(
     params: ConsolidateClaimsParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
+    // The merged claim is a claim like any other: the same content cap as
+    // `submit_claim` and its HTTP twins, checked before anything is resolved,
+    // embedded or written (backlog b76e284b).
+    crate::tools::claims::check_claim_content_length(&params.merged_content)?;
     let acting = server.write_identity(auth, viewer).await?;
     let acting_agent_id = acting.agent_id();
 
@@ -141,9 +145,9 @@ pub async fn consolidate_claims(
     };
     // The idempotent-return branch rolled its SAVEPOINT back and wrote nothing;
     // committing the (then empty) outer transaction is harmless and uniform.
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("consolidate_claims: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged("consolidate_claims: could not commit", e)
+    })?;
 
     // THE CASCADE (migration 117), with administrative authority on the
     // maintenance connection: re-point the sources' live edges onto the merged

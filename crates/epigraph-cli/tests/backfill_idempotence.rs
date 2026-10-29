@@ -1745,3 +1745,60 @@ async fn a_seed_fragment_on_a_world_claim_is_neither_moved_nor_counted(pool: PgP
         "the seed fragment on a world claim is never residual: {stderr}"
     );
 }
+
+// ── strict verify lists harvester_claim_provenance offenders (d5e6575c) ──
+
+/// Backlog d5e6575c. `harvester_claim_provenance` has no `id` column (its key
+/// is `(claim_id, fragment_id)`), so strict `verify`'s offender listing, which
+/// selected `id`, aborted on `column "id" does not exist` the moment that table
+/// held a world-owned row: the remaining FAIL lines and the exit status were
+/// lost to the error. Strict verify must instead name the row by its real key
+/// and carry on to the tables after it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn strict_verify_lists_world_owned_provenance_rows_by_their_key(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "provenance author").await;
+    let claim = seed_undeclared_claim(&pool, agent, "world claim with provenance").await;
+    let fragment = seed_unstamped_fragment(&pool, WORLD, claim).await;
+
+    // CALIBRATION: the provenance row inherited its claim's world tenancy, so
+    // verify has a provenance offender to list.
+    let owner: Uuid = sqlx::query_scalar(
+        "SELECT owner_group_id FROM harvester_claim_provenance \
+          WHERE claim_id = $1 AND fragment_id = $2",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .fetch_one(&pool)
+    .await
+    .expect("read provenance tenancy");
+    assert_eq!(
+        owner, WORLD,
+        "CALIBRATION: the provenance row is world-owned"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert!(
+        !stderr.contains("does not exist"),
+        "strict verify must not abort on a missing column; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("FAIL: 1 row(s) in harvester_claim_provenance"),
+        "strict verify must count the provenance row; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "harvester_claim_provenance.(claim_id, fragment_id) = ({claim}, {fragment})"
+        )),
+        "strict verify must list the provenance row by its key; stderr:\n{stderr}"
+    );
+    // The listing runs to completion: the table after it in the tier-A order
+    // is still reported (the fragment inherits the same world tenancy).
+    assert!(
+        stderr.contains(&format!("harvester_fragments.id = {fragment}")),
+        "verify must carry on past the provenance listing; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        code, 1,
+        "verify FAILS on world-owned rows; stderr:\n{stderr}"
+    );
+}

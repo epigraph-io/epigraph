@@ -61,9 +61,10 @@
 //!   a G-private claim and its `executes` edge: the GUCs are session
 //!   settings, not credentials, so a session on the application role reads
 //!   whichever group it names.
-//! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
-//!   `workflows` has no row security. A rewritten submitter is then honoured by
-//!   the workflow authority gate.
+//! * (h) The same role can `UPDATE workflows` (truth and the submitter key) of
+//!   a row it reads: migration 183's row security admits an UPDATE of any
+//!   readable row (a public one here) and guards only the tenancy columns. A
+//!   rewritten submitter is then honoured by the workflow authority gate.
 //! * Outcome report (as changed by #632, then by the visibility gate): `POST
 //!   /api/v1/workflows/hierarchical/:id/outcome` needs `claims:write`; on a
 //!   group-private plan a member's report resolves the steps, and a
@@ -1273,8 +1274,9 @@ async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool
     );
 }
 
-/// (h) CHARACTERIZATION. `workflows` has no row security: the application
-/// role rewrites a workflow's truth and its recorded submitter, and the
+/// (h) CHARACTERIZATION. `workflows`' row security (migration 183) admits an
+/// UPDATE of any row the session reads: the application role rewrites a
+/// public workflow's truth and its recorded submitter, and the
 /// workflow authority gate then honours the rewritten submitter (it reads the
 /// row) and refuses the original one.
 #[sqlx::test(migrations = "../../migrations")]

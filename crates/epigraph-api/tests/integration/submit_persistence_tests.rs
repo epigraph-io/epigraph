@@ -428,6 +428,25 @@ async fn test_submit_creates_evidence_records(pool: PgPool) {
         vec![Some("https://example.com/doc.pdf".to_string()); 2],
         "the packet submit must store each Document evidence URL in the column"
     );
+
+    // Each evidence item is linked to the claim by one evidence -> claim edge
+    // stored in the canonical lower-case spelling (backlog 3ce5e00c). The
+    // packet path writes this edge by raw SQL, outside `EdgeRepository`, so
+    // its literal is pinned here: one row per evidence item, exactly
+    // `supports`, never the legacy `SUPPORTS`.
+    let evidence_edges: Vec<String> = sqlx::query_scalar(
+        "SELECT relationship FROM edges \
+          WHERE source_type = 'evidence' AND target_type = 'claim' AND target_id = $1",
+    )
+    .bind(response.claim_id)
+    .fetch_all(&pool)
+    .await
+    .expect("read evidence -> claim edges");
+    assert_eq!(
+        evidence_edges,
+        vec!["supports".to_string(); 2],
+        "the packet submit must store one canonical `supports` edge per evidence item"
+    );
 }
 
 // =============================================================================

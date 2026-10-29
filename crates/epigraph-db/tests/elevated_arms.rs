@@ -580,6 +580,176 @@ async fn an_elevated_session_writes_nothing_until_it_ends(pool: PgPool) {
     assert_eq!(got, Ok(1), "P writes again once the session has ended");
 }
 
+/// Migration 168 section 7 (ruling R-3): the claim owner's
+/// challenge-resolution definer is owned by the maintenance role, which 126's
+/// `challenges_elevated_no_update` (a policy on `epigraph_app`) does not name,
+/// so it refuses an ELEVATED session itself (CR05, 42501): an elevated
+/// session writes no challenge by this path either. The same principal
+/// unelevated sets the status (the calibration: the refusal is the elevation,
+/// not a malformed call).
+///
+/// Verified to fail with the definer's `epigraph_is_elevated()` refusal
+/// removed (the elevated call lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_claim_owner_sets_no_challenge_status(pool: PgPool) {
+    let p = holder(&pool, "arms-resolve-p", 14).await;
+    let (outsider, outsider_group) =
+        fixture::seed_agent_with_group(&pool, "arms-resolve-outsider").await;
+    let claim = Uuid::new_v4();
+    let hash: Vec<u8> = claim.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, 'P public claim', $2, 0.5, $3, true, 'public', $4)",
+    )
+    .bind(claim)
+    .bind(&hash)
+    .bind(p.person)
+    .bind(p.group)
+    .execute(&pool)
+    .await
+    .expect("P's public claim");
+    // The real attach path: the outsider's own stamped application session
+    // (ScopedPool::acquire_as + epigraph_app), so 168's attach rule makes the
+    // row the outsider's, exactly as a production challenge lands.
+    let s = scoped(&pool).await;
+    let outsider_viewer = Viewer::resolve(&pool, outsider)
+        .await
+        .expect("resolve the outsider");
+    let mut conn = app_conn(&s, &outsider_viewer).await;
+    let theirs = epigraph_db::ChallengeRepository::create(
+        &mut *conn,
+        claim,
+        Some(outsider),
+        "factual_error",
+        "an outsider objects",
+    )
+    .await;
+    release(conn).await;
+    let theirs = theirs.expect("the outsider's challenge lands");
+    let (owner, owned): (Uuid, bool) =
+        sqlx::query_as("SELECT owner_group_id, writer_owned FROM challenges WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("read the challenge's tenancy");
+    assert_eq!(
+        (owner, owned),
+        (outsider_group, true),
+        "CALIBRATION: 168's attach rule made the row the outsider's"
+    );
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+        &mut *conn, theirs, "accepted", None,
+    )
+    .await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session sets no challenge status");
+    assert_eq!(
+        e.as_database_error().and_then(|d| d.code()).as_deref(),
+        Some("42501"),
+        "refused as elevated: {e}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state::text FROM challenges WHERE id = $1")
+        .bind(theirs)
+        .fetch_one(&pool)
+        .await
+        .expect("state");
+    assert_eq!(state, "pending", "nothing was written elevated");
+
+    let mut conn = app_conn(&s, &plain).await;
+    let landed = epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+        &mut *conn, theirs, "accepted", None,
+    )
+    .await;
+    release(conn).await;
+    landed.expect("CALIBRATION: P unelevated sets the status");
+    let (state, by): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state::text, resolved_by FROM challenges WHERE id = $1")
+            .bind(theirs)
+            .fetch_one(&pool)
+            .await
+            .expect("resolution");
+    assert_eq!((state.as_str(), by), ("accepted", Some(p.person)));
+}
+
+/// Migration 181 (ruling R-56): the re-key mark definer
+/// `epigraph_mark_group_reseal_required` is owned by the maintenance role, so
+/// 126's `groups_elevated_no_update` (a policy on `epigraph_app`) is not
+/// applied inside its frame, and before 181 that policy is what refused an
+/// elevated session's direct `UPDATE groups SET reseal_required_at`. The
+/// definer therefore refuses an ELEVATED session itself (`GRA03`, 42501),
+/// as 168's challenge definer does (CR05): an elevated session writes no
+/// re-key obligation by this path either. The same principal unelevated, an
+/// admin of the group, marks it (the calibration: the refusal is the
+/// elevation, not a malformed call).
+///
+/// Verified to fail with the definer's `epigraph_is_elevated()` refusal
+/// removed (the elevated call lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_group_admin_marks_no_rekey_obligation(pool: PgPool) {
+    let p = holder(&pool, "arms-reseal-p", 15).await;
+    let group = Uuid::new_v4();
+    let key: Vec<u8> = group.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'P team', 'did:key:arms-reseal-' || $1::text, $2, 'team', $3)",
+    )
+    .bind(group)
+    .bind(&key)
+    .bind(p.person)
+    .execute(&pool)
+    .await
+    .expect("P's team group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(p.person)
+    .execute(&pool)
+    .await
+    .expect("P administers it");
+    let row = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(g) FROM groups g WHERE g.id = $1",
+        )
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .expect("group row")
+    };
+    let before = row(pool.clone()).await;
+    assert!(before["reseal_required_at"].is_null(), "fixture: unmarked");
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+    const MARK: &str = "SELECT public.epigraph_mark_group_reseal_required($1)";
+
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused = sqlx::query(MARK).bind(group).execute(&mut *conn).await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session marks no re-key obligation");
+    let db = e.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("42501"), "{db}");
+    assert!(db.message().starts_with("GRA03:"), "{}", db.message());
+    assert_eq!(
+        row(pool.clone()).await,
+        before,
+        "nothing was written elevated"
+    );
+
+    let mut conn = app_conn(&s, &plain).await;
+    let landed = sqlx::query(MARK).bind(group).execute(&mut *conn).await;
+    release(conn).await;
+    landed.expect("CALIBRATION: P unelevated, a live admin, marks the group");
+    assert!(row(pool.clone()).await["reseal_required_at"].is_string());
+}
+
 // =====================================================================
 // The standing admin read arms follow the admin-scope switch (migration 129)
 // =====================================================================

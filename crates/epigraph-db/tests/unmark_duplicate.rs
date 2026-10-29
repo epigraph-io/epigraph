@@ -1136,10 +1136,19 @@ async fn unmark_restores_the_duplicates_bp_factors(pool: PgPool) {
     assert_eq!(strength_of(&pool, e_manual, "strength").await, Some(0.85));
 
     let repair = mark(&pool, dup, canonical).await;
-    for e in &dup_edges {
-        assert!(
-            factor_rows(&pool, *e).await.is_empty(),
-            "calibration: retiring the duplicate deleted edge {e}'s factor"
+    // Retiring the duplicate deleted each edge's factor naming it; the mark
+    // re-minted one for every edge it moved, now naming the canonical
+    // (backlog ddb231b7), and none for the copy it retracted.
+    for (e, other_end) in dup_edges.iter().zip(&other) {
+        let expected = if *e == e_twin_dup {
+            Vec::new()
+        } else {
+            vec![sorted_pair(*other_end, canonical)]
+        };
+        assert_eq!(
+            factors_of_edge(&pool, *e).await,
+            expected,
+            "calibration: after the mark, edge {e}'s factor names the canonical, never the duplicate"
         );
     }
     let twin_in_force: bool =
@@ -1281,6 +1290,131 @@ async fn unmark_leaves_the_canonicals_other_factors_as_it_found_them(pool: PgPoo
     );
 }
 
+/// The mark side of the factor graph (backlog ddb231b7). Retiring the
+/// duplicate deletes every factor naming it, and the repair re-points its
+/// edges onto the canonical by UPDATE, which `edges_auto_factor` (INSERT only)
+/// never sees. So each edge the canonical inherits must get the factor the
+/// trigger would mint for it as it now stands: the row it had, with the
+/// duplicate replaced by the canonical in its variables, its `source_var` and
+/// its edge endpoints, and visible to BP's own read of the canonical
+/// (`FactorRepository::get_for_claim`). The re-mint is confined to the edges
+/// the mark moved: a canonical edge whose factor something else removed (a
+/// `decomposes_to` factor, as a sweep of those would) stays without one, and a
+/// moved edge whose `(type, pair)` slot the canonical already holds leaves
+/// that slot's one factor as it was. A redundant copy the mark retracted gets
+/// none. A moved `decomposes_to` edge gets its trigger-shaped factor too, and
+/// BP's read of the canonical still leaves it out (`bp_readable_factor_sql`,
+/// #644): the mark must not put a decomposition back into BP.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_gives_the_canonical_a_factor_for_every_edge_it_inherits(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let supporter = fixture::seed_public_claim(&pool, a, "supporter").await;
+    let supported = fixture::seed_public_claim(&pool, a, "supported").await;
+    let rival = fixture::seed_public_claim(&pool, a, "rival").await;
+    let twin = fixture::seed_public_claim(&pool, a, "twin").await;
+    let holder = fixture::seed_public_claim(&pool, a, "slot holder").await;
+    let atom = fixture::seed_public_claim(&pool, a, "atom").await;
+    let dup_atom = fixture::seed_public_claim(&pool, a, "the duplicate's atom").await;
+
+    let e_in = edge(&pool, supporter, dup, "supports").await;
+    let e_out = edge(&pool, dup, supported, "supports").await;
+    let e_con = edge(&pool, dup, rival, "contradicts").await;
+    let e_twin_dup = edge(&pool, twin, dup, "supports").await;
+    edge(&pool, twin, canonical, "supports").await;
+    let e_held = edge(&pool, holder, canonical, "provides_evidence").await;
+    let e_hold_dup = edge(&pool, holder, dup, "supports").await;
+    let e_dec = edge(&pool, canonical, atom, "decomposes_to").await;
+    let e_dup_dec = edge(&pool, dup, dup_atom, "decomposes_to").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_dec)
+        .execute(&pool)
+        .await
+        .expect("remove the decomposition's factor");
+
+    let moved = [e_in, e_out, e_con];
+    let mut before = Vec::new();
+    for e in moved.iter().chain([&e_dup_dec]) {
+        let rows = factor_rows(&pool, *e).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "calibration: the trigger minted edge {e}'s factor"
+        );
+        before.push(rows[0].clone());
+    }
+    let held_before = factor_rows(&pool, e_held).await;
+    assert_eq!(held_before.len(), 1, "calibration: the canonical's slot");
+
+    mark(&pool, dup, canonical).await;
+
+    // Each inherited edge's factor, as the trigger would mint it now.
+    let swap = |id: Uuid| if id == dup { canonical } else { id };
+    let bp_view = epigraph_db::FactorRepository::get_for_claim(&pool, canonical)
+        .await
+        .expect("BP's read of the canonical");
+    for (e, old) in moved.iter().chain([&e_dup_dec]).zip(&before) {
+        let (source, target): (Uuid, Uuid) =
+            sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+                .bind(e)
+                .fetch_one(&pool)
+                .await
+                .expect("edge");
+        assert!(
+            source == canonical || target == canonical,
+            "calibration: the mark moved edge {e} onto the canonical"
+        );
+        let mut expected = old.clone();
+        expected.1 = sorted_pair(swap(old.1[0]), swap(old.1[1]));
+        if let Some(sv) = expected.2.get_mut("source_var") {
+            *sv = serde_json::json!(source.to_string());
+        }
+        expected.4["edge_source_id"] = serde_json::json!(source);
+        expected.4["edge_target_id"] = serde_json::json!(target);
+        assert_eq!(
+            factor_rows(&pool, *e).await,
+            vec![expected.clone()],
+            "the canonical inherits edge {e}'s factor, keyed to the edge and naming the canonical"
+        );
+        let in_bp_view = bp_view
+            .iter()
+            .any(|f| f.properties["source_edge_id"] == serde_json::json!(e.to_string()));
+        if *e == e_dup_dec {
+            assert_eq!(
+                expected.4["relationship"], "decomposes_to",
+                "calibration: the inherited decomposition's factor is labelled as one"
+            );
+            assert!(
+                !in_bp_view,
+                "BP's read of the canonical leaves out the inherited decomposition's factor (#644)"
+            );
+        } else {
+            assert!(
+                in_bp_view,
+                "BP's read of the canonical sees inherited edge {e}'s factor"
+            );
+        }
+    }
+    assert!(
+        factor_rows(&pool, e_twin_dup).await.is_empty(),
+        "the retracted redundant copy gets no factor"
+    );
+    assert!(
+        factor_rows(&pool, e_dec).await.is_empty(),
+        "the mark mints nothing for a canonical edge it did not move"
+    );
+    assert!(
+        factor_rows(&pool, e_hold_dup).await.is_empty(),
+        "a moved edge whose slot the canonical already holds mints no second factor"
+    );
+    assert_eq!(
+        factor_rows(&pool, e_held).await,
+        held_before,
+        "the canonical's own slot holder is left as it was"
+    );
+}
+
 /// A matcher edge whose score was later changed to something the trigger's
 /// cast would reject (properties can be patched after the INSERT the trigger
 /// saw) does not make the un-mark fail: the re-mint falls back to the
@@ -1341,4 +1475,136 @@ async fn an_overflowing_matcher_score_exponent_does_not_block_the_unmark(pool: P
     let repair = mark(&pool, dup, canonical).await;
     unmark(&pool, dup, &repair.revert).await;
     assert_eq!(strength_of(&pool, e, "strength").await, Some(0.85));
+}
+
+/// Backlog 5272d890 (1), the round-trip over-mint PR #687 left as a known
+/// limitation. The canonical has an edge to X whose factor something removed;
+/// the duplicate has an edge from X of a different relationship that maps to
+/// the same `(factor_type, pair)` slot. The mark mints the moved edge's factor
+/// into that empty slot; the un-mark deletes it again, and at origin/main the
+/// freed slot was then re-filled from the canonical's own edge, so the round
+/// trip left the canonical a factor it did not have before the mark. The
+/// revert record now names the canonical's edges that sat unfactored in a slot
+/// the mark minted into, and the un-mark leaves them as it found them.
+///
+/// The second arm is the refill the un-mark must keep: a canonical edge of the
+/// same slot created AFTER the mark could not mint (the mark's factor held the
+/// slot) and gets its factor once the un-mark frees it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mark_unmark_round_trip_leaves_an_unfactored_canonical_edge_unfactored(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+
+    // Arm 1: the canonical's edge was unfactored before the mark.
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let x = fixture::seed_public_claim(&pool, a, "x").await;
+    let e_c = edge(&pool, x, canonical, "provides_evidence").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_c)
+        .execute(&pool)
+        .await
+        .expect("remove the canonical edge's factor");
+    let e_d = edge(&pool, x, dup, "supports").await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, canonical)],
+        "CALIBRATION: the mark minted the moved edge's factor into the empty slot"
+    );
+    // The revert payload records exactly that slot, read here from the factor
+    // row the mark actually wrote, and the canonical edge it found unfactored.
+    let minted = factor_rows(&pool, e_d).await;
+    let [(factor_type, vars, ..)] = minted.as_slice() else {
+        panic!("CALIBRATION: one factor for the moved edge: {minted:?}");
+    };
+    assert_eq!(
+        repair.revert.minted_factor_slots,
+        vec![format!("{factor_type}:{},{}", vars[0], vars[1])],
+        "the record names the slot the mark minted"
+    );
+    assert_eq!(
+        repair.revert.slot_edges_without_factor,
+        vec![e_c],
+        "the record names the canonical edge the mark found unfactored in that slot"
+    );
+    unmark(&pool, dup, &repair.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, dup)],
+        "CALIBRATION: the un-mark put the duplicate's factor back"
+    );
+    assert!(
+        factors_of_edge(&pool, e_c).await.is_empty(),
+        "the round trip must not mint a factor for the canonical edge the mark found unfactored"
+    );
+
+    // Arm 2: the canonical's edge came after the mark.
+    let canonical2 = fixture::seed_public_claim(&pool, a, "canonical 2").await;
+    let dup2 = fixture::seed_public_claim(&pool, a, "duplicate 2").await;
+    let y = fixture::seed_public_claim(&pool, a, "y").await;
+    let e_d2 = edge(&pool, y, dup2, "supports").await;
+    let repair2 = mark(&pool, dup2, canonical2).await;
+    let e_c2 = edge(&pool, y, canonical2, "provides_evidence").await;
+    assert!(
+        factors_of_edge(&pool, e_c2).await.is_empty(),
+        "CALIBRATION: the mark's factor held the slot, so the later edge minted none"
+    );
+    unmark(&pool, dup2, &repair2.revert).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d2).await,
+        vec![sorted_pair(y, dup2)]
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_c2).await,
+        vec![sorted_pair(y, canonical2)],
+        "a canonical edge created after the mark gets the slot the un-mark frees"
+    );
+}
+
+/// A revert record written before backlog 5272d890 (1) carries neither
+/// `minted_factor_slots` nor `slot_edges_without_factor`. It still parses
+/// (both default to empty), and its un-mark re-fills a freed slot from any
+/// canonical edge, as every un-mark did before the fields existed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_record_from_before_the_minted_slots_unmarks_as_before(pool: PgPool) {
+    let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let canonical = fixture::seed_public_claim(&pool, a, "canonical").await;
+    let dup = fixture::seed_public_claim(&pool, a, "duplicate").await;
+    let x = fixture::seed_public_claim(&pool, a, "x").await;
+    let e_c = edge(&pool, x, canonical, "provides_evidence").await;
+    sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = $1::text")
+        .bind(e_c)
+        .execute(&pool)
+        .await
+        .expect("remove the canonical edge's factor");
+    let e_d = edge(&pool, x, dup, "supports").await;
+    let repair = mark(&pool, dup, canonical).await;
+    assert_eq!(
+        repair.revert.slot_edges_without_factor,
+        vec![e_c],
+        "CALIBRATION: a record written now names the unfactored canonical edge"
+    );
+
+    let mut old = serde_json::to_value(&repair.revert).expect("serialize the record");
+    let fields = old.as_object_mut().expect("the record is an object");
+    assert!(
+        fields.remove("minted_factor_slots").is_some()
+            && fields.remove("slot_edges_without_factor").is_some(),
+        "CALIBRATION: both fields were serialized"
+    );
+    let old: epigraph_db::DedupRevert =
+        serde_json::from_value(old).expect("a record without the fields still parses");
+    assert!(old.minted_factor_slots.is_empty() && old.slot_edges_without_factor.is_empty());
+
+    unmark(&pool, dup, &old).await;
+    assert_eq!(
+        factors_of_edge(&pool, e_d).await,
+        vec![sorted_pair(x, dup)],
+        "CALIBRATION: the un-mark put the duplicate's factor back"
+    );
+    assert_eq!(
+        factors_of_edge(&pool, e_c).await,
+        vec![sorted_pair(x, canonical)],
+        "with no record of the unfactored edge, the freed slot is re-filled from it, as before"
+    );
 }

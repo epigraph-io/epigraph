@@ -25,10 +25,6 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 epigraph-interfaces = { workspace = true }
-# Theme k-means helper (shared by the HTTP route and the scheduled job).
-linfa = { workspace = true }
-linfa-clustering = { workspace = true }
-ndarray = { workspace = true }
 sqlx = { workspace = true }
 # Creation-time (`since`) windows on the diverse-retrieval candidate pool.
 # Was dev-only until temporal recall put a `DateTime<Utc>` in a public
@@ -44,11 +40,13 @@ rerank = []
 
 [dev-dependencies]
 tokio = { workspace = true }
+epigraph-db = { workspace = true, features = ["test-support"] }  # ScopedPool::connect_downgraded_for_tests
 chrono = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 uuid = { workspace = true }  # Test claim/edge ID generation
 epigraph-ds = { workspace = true }  # DS types for frame/mass/measures tests
+tracing-test = { version = "0.2", features = ["no-env-filter"] }  # log assertions on library warns
 
 [[bench]]
 name = "engine_benchmarks"

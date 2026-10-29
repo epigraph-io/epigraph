@@ -82,7 +82,7 @@ use std::path::{Path, PathBuf};
 ///   `workflows.rs` — 5 production).** Each re-reads a scalar of a row the
 ///   caller just wrote, or probes existence by id. Not content reads.
 /// * **Test modules (`workflow_ingest.rs` 10, `novelty_gate.rs` 2,
-///   `workflow_hierarchical.rs` 12).** Fixture assertions inside
+///   `workflow_hierarchical.rs` 14).** Fixture assertions inside
 ///   `#[cfg(test)] mod tests`. Counted so the total means something.
 const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     ("ds.rs", 1, 0),
@@ -110,9 +110,17 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // 9 -> 12 (U033 finalize): the row-lock test's holder transaction (the
     // `FOR UPDATE` read and the `use_count = 5` write) and its
     // `pg_stat_activity` lock-wait poll. Fixture SQL again.
-    ("workflow_hierarchical.rs", 2, 12),
+    // 12 -> 14 (backlog 49863d2c): the all-or-nothing test now ties its
+    // failure to the injected trigger through a sequence the trigger advances
+    // (CREATE SEQUENCE, and one read-back), because the driver text it used to
+    // read from the error message no longer reaches the caller. Fixture SQL.
+    ("workflow_hierarchical.rs", 2, 14),
     ("workflow_ingest.rs", 0, 10),
-    ("workflows.rs", 2, 0),
+    // 2 -> 1 (ruling R-74, migration 183): `report_workflow_outcome`'s
+    // routing probe moved to the repo layer
+    // (`WorkflowRepository::viewer_reads_row`, viewer-spliced, on the caller's
+    // stamped read), now that `workflows` carries tenancy.
+    ("workflows.rs", 1, 0),
 ];
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,

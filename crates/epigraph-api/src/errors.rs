@@ -719,6 +719,19 @@ impl From<DbError> for ApiError {
                         .to_string(),
                 }
             }
+            // Migration 166 (ROL01): a role's agent wrote while no human holds
+            // the role, or while its linked human is not the holder. The agent
+            // and role stay in the log.
+            DbError::RoleHolderRequired { message } => {
+                tracing::warn!(detail = %message, "role-attached agent without its live holder");
+                ApiError::Forbidden {
+                    reason: "ROL01: the writing or named agent is attached to a role that no \
+                             human holds now, or whose holder is not the agent's linked human; a \
+                             role's agents write only while a human holds the role, and only for \
+                             that holder. Nothing was written."
+                        .to_string(),
+                }
+            }
             DbError::InvalidData { reason } => ApiError::ValidationError {
                 field: "data".to_string(),
                 reason,
@@ -769,6 +782,34 @@ impl From<DbError> for ApiError {
                     ),
                 }
             }
+            // Migration 176 (backlog e2c22c7c): a designed refusal whose
+            // message opens with a code 176 introduced
+            // (`epigraph_db::CALLER_REFUSAL_CODES`). Each of those messages was
+            // reviewed for what it discloses, so it is the caller's to read;
+            // the class follows the SQLSTATE, which 176 kept. Keyed on the
+            // listed codes, not on the code SHAPE: an older coded refusal, and
+            // any uncoded database text, still takes the redacted `QueryFailed`
+            // arm below.
+            DbError::QueryFailed {
+                source: sqlx::Error::Database(db),
+            } if epigraph_db::caller_refusal_code(db.message()).is_some() => {
+                let message = db.message().to_string();
+                // DETAIL is what the reply withholds (AGK01 moved the system
+                // agent's role there), so the server log keeps it.
+                let db_detail = db
+                    .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+                    .and_then(sqlx::postgres::PgDatabaseError::detail);
+                tracing::warn!(
+                    detail = %message,
+                    db_detail = ?db_detail,
+                    "the database refused the request"
+                );
+                match db.code().as_deref() {
+                    Some("42501") => ApiError::Forbidden { reason: message },
+                    Some("55000") => ApiError::Conflict { reason: message },
+                    _ => ApiError::BadRequest { message },
+                }
+            }
             DbError::ConnectionFailed { source } => {
                 tracing::error!(error = %source, "Database connection failed");
                 ApiError::DatabaseError {
@@ -779,6 +820,19 @@ impl From<DbError> for ApiError {
                 tracing::error!(error = %source, "Database query failed");
                 ApiError::DatabaseError {
                     message: "A database error occurred".to_string(),
+                }
+            }
+            // A repo-authored refusal (backlog e0f0cb68), answered by its
+            // kind (operator ruling R-55). Its message is text the repo layer
+            // wrote for the caller (MCP sends it as written), so it is the
+            // body's reason. A refusal that must not confirm its target
+            // exists is never a `Refused`: such a site returns `NotFound`.
+            DbError::Refused { kind, message } => {
+                tracing::warn!(?kind, detail = %message, "the repository refused the request");
+                match kind {
+                    epigraph_db::RefusalKind::Input => ApiError::BadRequest { message },
+                    epigraph_db::RefusalKind::Authority => ApiError::Forbidden { reason: message },
+                    epigraph_db::RefusalKind::State => ApiError::Conflict { reason: message },
                 }
             }
             // Fail-closed (elevation plan EL-8): an elevated read that could
@@ -866,6 +920,59 @@ mod tests {
         assert_eq!(api.into_response().status(), StatusCode::BAD_REQUEST);
     }
 
+    /// A repo-authored refusal (`DbError::Refused`, backlog e0f0cb68) is
+    /// answered by its kind (operator ruling R-55): input 400, authority 403,
+    /// state 409, each with the refusal's own words in the body (the repo
+    /// layer authored them for the caller; MCP sends them as written too),
+    /// and each still logged. Before R-55 every kind was the redacted 500.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_repo_refusal_is_answered_by_its_kind_with_its_words() {
+        use epigraph_db::RefusalKind;
+        const ID: &str = "00000000-0000-0000-0000-00000000e0f0";
+        let cases = [
+            (
+                RefusalKind::Input,
+                StatusCode::BAD_REQUEST,
+                "consolidate: duplicate source ids",
+            ),
+            (
+                RefusalKind::Authority,
+                StatusCode::FORBIDDEN,
+                "FA07: canonical 00000000-0000-0000-0000-00000000e0f0 (which this session cannot write) has no binding",
+            ),
+            (
+                RefusalKind::State,
+                StatusCode::CONFLICT,
+                "consolidate: source 00000000-0000-0000-0000-00000000e0f0 is not current",
+            ),
+        ];
+        for (kind, want, message) in cases {
+            let (status, body) = rendered(ApiError::from(DbError::Refused {
+                kind,
+                message: message.to_string(),
+            }))
+            .await;
+            assert_eq!(status, want, "{kind:?}: {body}");
+            assert!(
+                body.contains(message),
+                "{kind:?}: the refusal's words reach the caller: {body}"
+            );
+            assert!(
+                !body.contains("database error occurred"),
+                "{kind:?}: not the redacted database-error body: {body}"
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| l.contains("the repository refused the request") && l.contains(ID))
+                .then_some(())
+                .ok_or_else(|| "no refusal warn line carries the refusal's text".to_string())
+        });
+    }
+
     /// Migration 122's OPL01 is a DENIAL (403), not a server fault, and its
     /// body carries the stable code and the fix; the database's text (which
     /// names the agent) stays in the log.
@@ -898,6 +1005,29 @@ mod tests {
             ApiError::Forbidden { reason } => assert!(reason.starts_with("OPL02"), "{reason}"),
             other => panic!("OPL02 must be Forbidden: {other:?}"),
         }
+    }
+
+    /// Migration 166's ROL01 is a DENIAL (403) carrying its code; the
+    /// database's text (agent and role) stays in the log. Mutation caught: the
+    /// arm removed (it falls to the fault arm).
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_role_agent_without_its_holder_is_forbidden_with_the_code() {
+        let api = ApiError::from(DbError::RoleHolderRequired {
+            message: "ROL01: agent 00000000-0000-0000-0000-00000000abcd is attached to role r"
+                .to_string(),
+        });
+        match &api {
+            ApiError::Forbidden { reason } => {
+                assert!(reason.starts_with("ROL01"), "the code: {reason}");
+                assert!(
+                    !reason.contains("00000000-0000-0000-0000-00000000abcd"),
+                    "the database text must stay server-side: {reason}"
+                );
+            }
+            other => panic!("ROL01 must be Forbidden: {other:?}"),
+        }
+        assert_eq!(api.into_response().status(), StatusCode::FORBIDDEN);
     }
 
     /// An elevated request asking to write is a 403 denial naming the remedy,

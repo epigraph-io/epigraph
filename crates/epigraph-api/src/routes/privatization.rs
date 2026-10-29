@@ -325,6 +325,14 @@ pub struct SideEffects {
     /// destroys nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destroys_derived_rows: Option<&'static [&'static str]>,
+    /// **Seal mode only.** The tables of `destroys_derived_rows` whose
+    /// WRITER-OWNED rows the seal KEEPS instead (operator ruling R-5): an
+    /// outsider's challenge survives the seal, unencrypted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keeps_writer_owned_rows: Option<&'static [&'static str]>,
+    /// **Seal mode only.** What the kept rows are and who can still read them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept_rows: Option<&'static str>,
     /// **Seal mode only.** The one loss that is not re-derivable at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unrecoverable: Option<&'static str>,
@@ -345,6 +353,11 @@ pub struct SideEffects {
 /// `epigraph-api/tests/privatization_seal.rs::the_preview_names_exactly_the_tables_the_seal_deletes`.
 /// Drift here is a preview that under-reports what a seal destroys, which is
 /// consent the operator did not give.
+///
+/// `challenges` names the INSIDER (claim-inherited) challenges: an outsider's
+/// challenge is kept by the seal (ruling R-5, the repo layer's
+/// `SEAL_KEEPS_WRITER_OWNED`), which the preview states separately in
+/// [`SEAL_KEEPS`] and [`SEAL_KEPT_ROWS`].
 pub const SEAL_DESTROYS: &[&str] = &[
     "triples",
     "entity_mentions",
@@ -353,6 +366,22 @@ pub const SEAL_DESTROYS: &[&str] = &[
     "challenges",
     "experiment_triples",
 ];
+
+/// The tables of [`SEAL_DESTROYS`] whose writer-owned rows a seal KEEPS, as the
+/// operator is TOLD (ruling R-5).
+///
+/// A separate constant from the repo layer's `SEAL_KEEPS_WRITER_OWNED` for the
+/// reason [`SEAL_DESTROYS`] is separate from `SEAL_DELETE_TABLES`: this is the
+/// consent surface, that is the mutation. Their agreement is asserted, as an
+/// exact set, by `epigraph-api/tests/privatization_seal.rs::the_preview_names_exactly_the_tables_whose_writer_owned_rows_the_seal_keeps`.
+pub const SEAL_KEEPS: &[&str] = &["challenges"];
+
+/// What the kept writer-owned rows are, and that they stay plaintext.
+pub const SEAL_KEPT_ROWS: &str = "an OUTSIDER's challenge (challenges.writer_owned: written \
+     by a challenger that could not write the claim's group, and owned by that challenger) is \
+     KEPT by the seal and is NOT encrypted: its text, which may quote the claim, stays in \
+     plaintext, readable only by sessions that can read the sealed claim. Insider (inherited) \
+     challenges are deleted as destroys_derived_rows says";
 
 /// What a seal takes that no unseal returns.
 ///
@@ -1291,6 +1320,8 @@ pub async fn create_plan(
         side_effects: SideEffects {
             revocation: crate::tenancy_disclosure::ROTATION_DOES_NOT_REVOKE_PAST_ACCESS,
             destroys_derived_rows: (mode == "seal").then_some(SEAL_DESTROYS),
+            keeps_writer_owned_rows: (mode == "seal").then_some(SEAL_KEEPS),
+            kept_rows: (mode == "seal").then_some(SEAL_KEPT_ROWS),
             unrecoverable: (mode == "seal").then_some(SEAL_UNRECOVERABLE),
             reversibility: (mode == "seal").then_some(SEAL_NOT_SERVER_REVERSIBLE),
         },
@@ -3573,6 +3604,7 @@ async fn resolve_seeds(
             // than absorbed. See this function's doc.
             limit: i64::from(node_cap).saturating_add(1),
             offset: 0,
+            after: None,
         },
     )
     .await?;

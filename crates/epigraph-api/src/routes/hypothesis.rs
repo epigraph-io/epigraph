@@ -338,13 +338,21 @@ pub async fn hypothesis_status(
     // to its own owner, with a 200. Stamping admits the viewer's own groups, so
     // the frame resolves for a caller entitled to it. No leak was closed here;
     // a fail-closed degradation was. Same shape as `F-SHARD4-A5`.
-    let frame_id: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_optional(&mut *read)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("{e}"),
-            })?;
+    //
+    // A PROMOTED hypothesis reads `research_validity` instead: the promotion
+    // moved its evidence there and retired the source (backlog 090221d9).
+    let belief_frame = epigraph_engine::promotion::status_belief_frame(
+        claim_properties
+            .get("hypothesis_status")
+            .and_then(serde_json::Value::as_str),
+    );
+    let frame_id: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(belief_frame)
+        .fetch_optional(&mut *read)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("{e}"),
+        })?;
 
     let (bel_supported, bel_unsupported) = if let Some((fid,)) = frame_id {
         // Propagated for the same reason as the two reads below: this is the
@@ -497,6 +505,15 @@ pub async fn promote_hypothesis(
     .await?;
     let status_json = status_response.0;
 
+    // Promoted once: the status now reads the promoted evidence, so the gate
+    // would pass again and move whatever `hypothesis_assessment` BBA was filed
+    // since onto `research_validity` beside (or over) it.
+    if status_json["status"].as_str() == Some(epigraph_engine::promotion::PROMOTED_STATUS) {
+        return Err(ApiError::Conflict {
+            reason: format!("hypothesis {id} is already promoted; nothing was written"),
+        });
+    }
+
     let ready = status_json["promotion"]["ready"].as_bool().unwrap_or(false);
     if !ready {
         return Err(ApiError::BadRequest {
@@ -532,6 +549,34 @@ pub async fn promote_hypothesis(
         .map_err(|e| ApiError::InternalError {
             message: format!("Failed to begin transaction: {e}"),
         })?;
+
+    // 0. The status write comes FIRST and is conditional, so the gate is
+    //    atomic (backlog 03b1508f): the gate above read the status before this
+    //    transaction, so two concurrent promotions could both pass it. This
+    //    UPDATE takes the claim row's lock; a promotion that waited on another
+    //    one that has since committed re-checks the row, changes nothing and is
+    //    refused before anything else is written.
+    let flipped = sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+          WHERE id = $1 AND properties->>'hypothesis_status' IS DISTINCT FROM 'promoted'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to update status: {e}"),
+    })?
+    .rows_affected();
+    if flipped != 1 {
+        // The gate above read it unpromoted: a promotion that committed
+        // meanwhile flipped it (or the row is no longer writable here).
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "hypothesis {id} is already promoted (a concurrent promotion committed first), \
+                 or its status could not be written; nothing was written"
+            ),
+        });
+    }
 
     // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
     let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
@@ -606,14 +651,7 @@ pub async fn promote_hypothesis(
         message: format!("Failed to update factors: {e}"),
     })?;
 
-    // 4. Update hypothesis status
-    sqlx::query(
-        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1"
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("Failed to update status: {e}") })?;
+    // 4. The status was written first (step 0).
 
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("Promotion transaction failed: {e}"),

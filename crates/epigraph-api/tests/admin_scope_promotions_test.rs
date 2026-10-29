@@ -31,58 +31,9 @@ fn admin_token() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// crud.rs — 8 handlers
+// crud.rs — 7 handlers (build_themes_from_corpus retired with the k-means
+// prototype, backlog a0ed0180: tests/theme_kmeans_retired.rs)
 // ---------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_with_claims_write_returns_403() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .bearer_auth(write_token())
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 403, "expected 403, got {}", resp.status());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_no_token_returns_401() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 401, "expected 401, got {}", resp.status());
-}
-
-/// Backlog 5abe23de: a wipe deletes EVERY theme, so even a `claims:admin`
-/// caller may wipe only to rebuild the canonical `"auto"` family. The refusal
-/// lives in the engine (`theme_kmeans::validate_config`, shared with the MCP
-/// tool and the scheduled job); this pins that the REST route reaches it, so
-/// the check cannot migrate into one caller and leave this one open. It runs
-/// before any read or write, so the shared DB's themes are not touched.
-#[tokio::test(flavor = "multi_thread")]
-async fn build_themes_from_corpus_admin_wipe_under_a_probe_prefix_returns_400() {
-    let (addr, _shutdown) = spawn().await;
-    let resp = reqwest::Client::new()
-        .post(format!("http://{addr}/api/v1/themes/build-from-corpus"))
-        .bearer_auth(admin_token())
-        .json(&serde_json::json!({"wipe_first": true, "label_prefix": "sweep-probe"}))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let body = resp.text().await.unwrap();
-    assert_eq!(status, 400, "expected 400, got {status}: {body}");
-    assert!(
-        body.contains("canonical label_prefix") && body.contains("sweep-probe"),
-        "the refusal must name the canonical-prefix rule and the offered prefix: {body}"
-    );
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reassign_claim_with_claims_write_returns_403() {
@@ -211,6 +162,16 @@ async fn edges_between(pool: &sqlx::PgPool, src: uuid::Uuid, tgt: uuid::Uuid) ->
         .unwrap()
 }
 
+/// The stored relationship of the one edge `src -> tgt`.
+async fn relationship_between(pool: &sqlx::PgPool, src: uuid::Uuid, tgt: uuid::Uuid) -> String {
+    sqlx::query_scalar("SELECT relationship FROM edges WHERE source_id = $1 AND target_id = $2")
+        .bind(src)
+        .bind(tgt)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 async fn staging_status(pool: &sqlx::PgPool, id: uuid::Uuid) -> String {
     sqlx::query_scalar("SELECT review_status::text FROM edges_staging WHERE id = $1")
         .bind(id)
@@ -295,6 +256,12 @@ async fn promote_staged_edges_refuses_a_reserved_dedup_key() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "clean promote: {status}: {body}");
     assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+    // A staged `CORROBORATES` is promoted in the canonical lower-case
+    // spelling every edge writer stores (backlog 3ce5e00c).
+    assert_eq!(
+        relationship_between(&pool, c_src, c_tgt).await,
+        "corroborates"
+    );
     assert_eq!(staging_status(&pool, clean).await, "promoted");
 
     sqlx::query("DELETE FROM edges_staging WHERE id = $1")
@@ -370,7 +337,68 @@ async fn promote_all_staged_edges_refuses_a_reserved_dedup_key() {
     let body = resp.text().await.unwrap();
     assert_eq!(status, 200, "clean promote-all: {status}: {body}");
     assert_eq!(edges_between(&pool, c_src, c_tgt).await, 1);
+    assert_eq!(
+        relationship_between(&pool, c_src, c_tgt).await,
+        "corroborates",
+        "the promote-all branch stores the canonical spelling too"
+    );
     assert_eq!(staging_status(&pool, clean).await, "promoted");
+}
+
+/// `properties.supersede_act` marks a supersession's own `AUTHORED` edge,
+/// which the arming census and the edge migration key on; create and patch
+/// (HTTP and MCP) refuse it, and so does the promote route, on BOTH branches
+/// (named rows and promote-all): nothing is written and the row stays
+/// `approved`. The clean-row positive controls of the dedup tests above run
+/// the same statements.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_staged_edges_refuses_the_supersede_act_marker() {
+    let _serial = PROMOTE_SERIAL.lock().await;
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (forged, f_src, f_tgt) = stage_approved_edge(
+        &pool,
+        "CORROBORATES",
+        serde_json::json!({"supersede_act": "supersede_claim"}),
+    )
+    .await;
+    for body in [
+        serde_json::json!({"edge_ids": [forged]}),
+        serde_json::json!({}),
+    ] {
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+            .bearer_auth(admin_token())
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 400, "{body}: expected 400, got {status}: {text}");
+        assert!(
+            text.contains("supersede_act") && text.contains(&forged.to_string()),
+            "{body}: the refusal names the reserved key and the staged row: {text}"
+        );
+        assert_eq!(
+            edges_between(&pool, f_src, f_tgt).await,
+            0,
+            "{body}: no forged edge"
+        );
+        assert_eq!(staging_status(&pool, forged).await, "approved");
+    }
+
+    sqlx::query("DELETE FROM edges_staging WHERE id = $1")
+        .bind(forged)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------

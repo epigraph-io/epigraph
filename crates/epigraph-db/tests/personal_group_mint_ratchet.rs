@@ -234,6 +234,17 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          the pool's blindness no longer matters.",
     ),
     (
+        "epigraph-mcp/src/tools/workflow_ingest.rs",
+        "system_agent_write_authority",
+        2,
+        "Migration 183: `store_workflow_goal_embedding` (the post-commit goal embed of the \
+         ingest, store_workflow and improve_workflow_hierarchy paths, after the plan walk's own \
+         system-agent-stamped transaction committed) and `lineage_max_generation` \
+         (improve_workflow_hierarchy's numbering read, ahead of the plan walk that resolves the \
+         same agent). Same preflight as the walk; a refusal there refuses the call or stores no \
+         vector.",
+    ),
+    (
         "epigraph-api/src/oauth/token.rs",
         "ensure_for_client",
         1,
@@ -295,12 +306,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-api/src/routes/workflows.rs",
         "system_agent_write_authority",
-        2,
-        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step), and \
+        3,
+        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step), \
          `embed_inserted_workflow_claims` (the same two handlers' post-commit embed, backlog \
-         5ce88457), which runs only after that transaction committed, so the agent already \
-         resolved once in the request. Same preflight; a refusal there logs and stores no \
-         vector.",
+         5ce88457) and `store_workflow_goal_embedding` (their post-commit goal embed, migration \
+         183), which run only after that transaction committed, so the agent already resolved \
+         once in the request. Same preflight; a refusal there logs and stores no vector.",
     ),
     (
         "epigraph-cli/src/bin/hypothesis.rs",

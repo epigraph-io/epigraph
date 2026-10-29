@@ -584,3 +584,98 @@ async fn analyze_refuses_a_request_with_no_auth_context(pool: PgPool) {
         ),
     }
 }
+
+/// An edge the caller can read does not carry an endpoint claim the caller
+/// cannot read into the analysis (backlog 2e44a404).
+///
+/// Migration 070's trigger stamps an edge with the meet of its endpoints, so an
+/// edge touching a group-private claim is ordinarily that group's. Nothing in
+/// the schema keeps it so: an edge whose own tenancy is wider than one of its
+/// endpoints' (a legacy row, a stamp forced past the trigger) passes the EDGE
+/// predicate for every viewer. The edge read has to filter the endpoint CLAIMS
+/// as well, or the hidden claim's id comes back in `transitive_supports`,
+/// `connected_components` and `unsupported_claims`.
+///
+/// Both edges are forced `('public', world)` around a private middle claim
+/// `b`, so `b` is the TARGET of one and the SOURCE of the other: dropping
+/// either endpoint's filter leaves `b`'s id in the stranger's answer. The
+/// owner, who can read `b`, still gets both edges (the over-suppression
+/// control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn analyze_drops_a_readable_edge_whose_endpoint_claim_is_hidden(pool: PgPool) {
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "endpoint-owner").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "endpoint-stranger").await;
+    let world = viewer_fixture::world_group(&pool).await;
+
+    let a = viewer_fixture::seed_public_claim(&pool, owner, "endpoint chain a").await;
+    let b = viewer_fixture::seed_group_claim(&pool, owner, group, "endpoint chain b").await;
+    let c = viewer_fixture::seed_public_claim(&pool, owner, "endpoint chain c").await;
+    viewer_fixture::seed_edge_owned_by(&pool, a, b, "public", world).await;
+    viewer_fixture::seed_edge_owned_by(&pool, b, c, "public", world).await;
+
+    // CALIBRATION: both edges are public, so the EDGE predicate admits them for
+    // the stranger, and `b` is private, so only a CLAIM predicate can withhold it.
+    let shapes: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+        "SELECT source_id, target_id, visibility::text FROM edges \
+         WHERE source_id = ANY($1) AND target_id = ANY($1) ORDER BY source_id, target_id",
+    )
+    .bind(vec![a, b, c])
+    .fetch_all(&pool)
+    .await
+    .expect("read back seeded edges");
+    let mut expected = vec![(a, b, "public".to_string()), (b, c, "public".to_string())];
+    expected.sort();
+    assert_eq!(shapes, expected, "CALIBRATION: both edges must be public");
+    let b_visibility: String =
+        sqlx::query_scalar("SELECT visibility::text FROM claims WHERE id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("read b's visibility");
+    assert_eq!(
+        b_visibility, "group",
+        "CALIBRATION: b must be group-private"
+    );
+
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let owner_token = common::mint_token_with_agent(&["analysis:reasoning"], owner);
+    let stranger_token = common::mint_token_with_agent(&["analysis:reasoning"], stranger);
+
+    let mut leaks = Vec::new();
+    for (arm, body) in [
+        ("claim_ids", json!({ "claim_ids": [a, b, c] })),
+        ("edge endpoints", json!({})),
+    ] {
+        let (status, mine) = analyze(addr, &owner_token, body.clone()).await;
+        assert_eq!(status, 200, "[{arm}] owner analyze must succeed: {mine}");
+        let mine_pairs = support_pairs(&mine);
+        for pair in [(a, b), (b, c), (a, c)] {
+            assert!(
+                mine_pairs.contains(&pair),
+                "[{arm}] the owner can read b and must derive {pair:?}; got {mine_pairs:?}"
+            );
+        }
+
+        let (status, theirs) = analyze(addr, &stranger_token, body).await;
+        assert_eq!(
+            status, 200,
+            "[{arm}] stranger analyze must succeed: {theirs}"
+        );
+        // Collected, not asserted in place, so a leak in either arm is
+        // reported even when the other arm leaks too.
+        if theirs.to_string().contains(&b.to_string()) {
+            leaks.push(format!(
+                "[{arm}] another group's private claim {b} reached a stranger's analysis \
+                 through a public edge: {theirs}"
+            ));
+        }
+        if support_pairs(&theirs).contains(&(a, c)) {
+            leaks.push(format!(
+                "[{arm}] a support derived through the hidden claim reached the stranger: \
+                 {theirs}"
+            ));
+        }
+    }
+    assert!(leaks.is_empty(), "{}", leaks.join("\n"));
+}

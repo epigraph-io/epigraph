@@ -75,7 +75,15 @@ const ARMED_REFUSE_ONLY: &[(&str, &str)] = &[
     ("experiment_entity_mentions", "T-DROP"),
     ("experiment_triples", "T-DROP"),
     ("group_key_epochs", "T-DROP"),
+    // T-PLAN (migration 183, ruling R-74): workflow rows carry their plan's
+    // tenancy; an elevated session reads them as its plain viewer does and
+    // writes none.
+    ("workflows", "T-PLAN"),
 ];
+
+/// Tables armed by a migration AFTER 126, with the same policy shapes; listed
+/// in the census arrays above like every other table.
+const ARMED_AFTER_126: &[&str] = &["workflows"];
 
 /// No elevated policy, each for a reason. None grants the application a write
 /// (`no_excluded_or_read_only_table_lets_the_application_write_unrefused`).
@@ -109,6 +117,16 @@ const EXCLUDED: &[(&str, &str)] = &[
         "agent_succession",
         "agent lineage (161): written only by the attestor's registration definer, read \
          only through the prompt-history definer, which has its own admin arm",
+    ),
+    (
+        "group_role_bindings",
+        "role-to-group bindings (165): maintenance-written governance, read only by the \
+         derivation definers",
+    ),
+    (
+        "role_agents",
+        "role attachments (166): maintenance-written, read only through the role-agent \
+         definers; an attachment confers no read and widens nothing",
     ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
@@ -144,6 +162,16 @@ const EXCLUDED: &[(&str, &str)] = &[
     (
         "rls_canary",
         "bypass-only boot canary: the application reads and writes no row",
+    ),
+    (
+        "harvester_sources",
+        "harvester pipeline (173): the application writes no row (118 section 6), and no \
+         elevated read arm is added, so an elevated session reads only what its tenancy admits",
+    ),
+    (
+        "harvester_audit_reports",
+        "harvester pipeline (173): the application writes no row (118 section 6), and no \
+         elevated read arm is added, so an elevated session reads only what its tenancy admits",
     ),
 ];
 
@@ -749,7 +777,13 @@ async fn a_held_lock_fails_one_table_and_a_rerun_resumes(pool: PgPool) {
         .execute(&mut migrator)
         .await
         .expect("the rerun finishes");
-    assert_eq!(observed(&mut migrator).await, full, "the rerun resumed");
+    // 126 re-arms what 126 arms; a table armed by a LATER migration (which
+    // `disarm` also cleared) is not 126's to restore.
+    let full_126: BTreeMap<String, BTreeSet<Pol>> = full
+        .into_iter()
+        .filter(|(t, _)| !ARMED_AFTER_126.contains(&t.as_str()))
+        .collect();
+    assert_eq!(observed(&mut migrator).await, full_126, "the rerun resumed");
 }
 
 // =====================================================================

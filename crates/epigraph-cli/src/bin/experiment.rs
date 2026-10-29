@@ -494,11 +494,22 @@ async fn analyze(
     .execute(pool)
     .await?;
 
-    // Submit mass function
-    let frame_id: (Uuid,) =
-        sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(pool)
-            .await?;
+    // Submit the mass function to the frame the hypothesis's readers read:
+    // hypothesis_assessment, or research_validity once it is promoted (writers
+    // follow the readers, operator ruling R-8).
+    let evidence_frame = {
+        let mut conn = pool.acquire().await?;
+        epigraph_engine::promotion::hypothesis_evidence_frame(
+            &mut conn,
+            viewer,
+            experiment.hypothesis_id,
+        )
+        .await?
+    };
+    let frame_id: (Uuid,) = sqlx::query_as("SELECT id FROM frames WHERE name = $1")
+        .bind(evidence_frame)
+        .fetch_one(pool)
+        .await?;
 
     let masses_json = mass_result.mass_function.masses_to_json();
     epigraph_db::MassFunctionRepository::store(

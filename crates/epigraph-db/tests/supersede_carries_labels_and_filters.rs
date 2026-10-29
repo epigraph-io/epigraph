@@ -86,12 +86,24 @@ async fn supersede_carries_labels_but_not_properties_to_new_claim(pool: PgPool) 
     let agent = seed_agent(&pool).await;
     let v1 = seed_workflow_claim(&pool, agent, r#"{"goal":"old goal","steps":["a"]}"#).await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(v1)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (v2, _old) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(v1),
         r#"{"goal":"new goal","steps":["b"]}"#,
         TruthValue::clamped(0.85),
         "test supersede",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -122,12 +134,24 @@ async fn search_by_label_and_text_excludes_superseded_returns_replacement(pool: 
     )
     .await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(v1)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (v2, _) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(v1),
         r#"{"goal":"deploy widget","steps":["mcp-only step"]}"#,
         TruthValue::clamped(0.85),
         "MCP migration",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -170,12 +194,24 @@ async fn supersede_carries_labels_but_not_near_duplicate(pool: PgPool) {
     .await
     .unwrap();
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(v1)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (v2, _) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(v1),
         r#"{"goal":"g","steps":["b"]}"#,
         TruthValue::clamped(0.85),
         "plan rev 2",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();

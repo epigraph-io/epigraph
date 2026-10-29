@@ -176,3 +176,46 @@ async fn select_cohort_includes_multi_bba_hub_and_tilde_shape_excludes_simple(po
         "cohort must exclude the simple single-BBA claim: {cohort:?}"
     );
 }
+
+/// Arm (b) narrowed (SPEC §10.7, cohort v2): a lone `"1"` or `"~"` key that
+/// carries ZERO mass is the simple shape written with an explicit zero, not a
+/// non-simple focal element, so it no longer qualifies a single-BBA claim on
+/// its own. The same keys with positive mass still do (the control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_b_ignores_a_lone_one_or_tilde_key_with_zero_mass(pool: PgPool) {
+    let owner = seed_agent(&pool).await;
+    let frame_id = seed_binary_frame(&pool, "recompute_betp_test_binary_arm_b").await;
+
+    let mut zero = Vec::new();
+    for masses in [
+        serde_json::json!({"0": 0.7, "0,1": 0.3, "1": 0.0}),
+        serde_json::json!({"0": 0.6, "0,1": 0.4, "~": 0.0}),
+    ] {
+        let c = seed_claim(&pool, owner, &format!("zero-mass key {masses}")).await;
+        seed_bba(&pool, c, frame_id, seed_agent(&pool).await, masses).await;
+        zero.push(c);
+    }
+    let mut positive = Vec::new();
+    for masses in [
+        serde_json::json!({"0": 0.6, "0,1": 0.3, "1": 0.1}),
+        serde_json::json!({"0": 0.5, "0,1": 0.4, "~": 0.1}),
+    ] {
+        let c = seed_claim(&pool, owner, &format!("positive-mass key {masses}")).await;
+        seed_bba(&pool, c, frame_id, seed_agent(&pool).await, masses).await;
+        positive.push(c);
+    }
+
+    let cohort = select_cohort(&pool).await.expect("select_cohort");
+    for c in &zero {
+        assert!(
+            !cohort.contains(c),
+            "a zero-mass '1' / '~' key must not qualify a claim: {cohort:?}"
+        );
+    }
+    for c in &positive {
+        assert!(
+            cohort.contains(c),
+            "control: a positive-mass '1' / '~' key still qualifies: {cohort:?}"
+        );
+    }
+}

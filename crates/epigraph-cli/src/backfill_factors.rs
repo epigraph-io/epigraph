@@ -129,6 +129,7 @@ JOIN edges e ON e.id = mf.perspective_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
+  AND mf.retracted_at IS NULL
   AND mf.claim_id = e.target_id
   AND e.source_type = 'claim' AND e.target_type = 'claim'
   AND tgt.is_current AND src.is_current
@@ -288,7 +289,8 @@ pub async fn rewire_edges(
 
 /// Delete `edge`'s `edge_factor` rows on its target, except the one at
 /// `keep` = `(frame, source_agent_id)` when given; return each deleted row's
-/// `(id, frame)`.
+/// `(id, frame)`. A retracted row (migration 184) is kept for audit: the
+/// rewire neither selects nor deletes it.
 async fn delete_edge_rows(
     conn: &mut sqlx::PgConnection,
     edge: &RewireEdge,
@@ -298,7 +300,7 @@ async fn delete_edge_rows(
     sqlx::query_as(
         "DELETE FROM mass_functions \
           WHERE perspective_id = $1 AND claim_id = $2 \
-            AND combination_method = 'edge_factor' \
+            AND combination_method = 'edge_factor' AND retracted_at IS NULL \
             AND NOT ($3::uuid IS NOT NULL AND frame_id = $3 \
                      AND source_agent_id IS NOT DISTINCT FROM $4) \
          RETURNING id, frame_id",
@@ -401,6 +403,7 @@ async fn rewire_one(
     let selected: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, owner_group_id, visibility::text, writer_owned FROM mass_functions \
           WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+            AND retracted_at IS NULL \
           ORDER BY created_at, id LIMIT 1 FOR UPDATE",
     )
     .bind(edge.edge_id)

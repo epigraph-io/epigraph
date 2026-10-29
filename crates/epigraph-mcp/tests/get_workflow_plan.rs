@@ -195,3 +195,63 @@ async fn a_caller_who_sees_no_edge_gets_not_found_and_nothing_else(pool: PgPool)
         .iter()
         .all(|i| i["owner_group_id"] == json!(g.to_string())));
 }
+
+/// The body's `chain_order`, insisting on an array of claim ids.
+fn chain_order(p: &Value) -> Vec<Uuid> {
+    p["chain_order"]
+        .as_array()
+        .unwrap_or_else(|| panic!("chain_order is an array in {p}"))
+        .iter()
+        .map(uuid_of)
+        .collect()
+}
+
+/// The body with `chain_order` removed, serialized.
+fn without_chain_order(p: &Value) -> Vec<u8> {
+    let mut p = p.clone();
+    p.as_object_mut()
+        .expect("a plan object")
+        .remove("chain_order");
+    serde_json::to_vec(&p).expect("serialize")
+}
+
+/// The MCP twin of the REST `chain_order` pin (ruling R-81): after the
+/// `step_follows` edge between steps 1.1 and 1.2 is re-pointed (harness
+/// write), the tool's `chain_order` follows the chain, equal to the walk every
+/// plan-order reader uses, while the items keep stored `plan_index` order,
+/// every other byte of the body is unchanged and the echo is still the
+/// independently computed `wfd1`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tool_reports_chain_order_outside_the_items_and_digest(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_owner, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let wf = ingest_vectors(&server, &viewer, &token).await;
+    let plan_items = vectors()["ingest"]["plan"].as_array().unwrap().clone();
+    let [s11, s12, s21] = [2, 5, 7].map(|i| uuid_of(&plan_items[i]["claim_id"]));
+
+    let before = plan(&server, &viewer, wf).await.expect("plan");
+    assert_eq!(chain_order(&before), vec![s11, s12, s21], "{before}");
+
+    let moved = sqlx::query(
+        "UPDATE edges SET source_id = $2, target_id = $1 \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(s11)
+    .bind(s12)
+    .execute(&pool)
+    .await
+    .expect("harness: reverse the step_follows edge")
+    .rows_affected();
+    assert_eq!(moved, 1, "calibration: one 1.1 -> 1.2 step_follows edge");
+
+    let after = plan(&server, &viewer, wf).await.expect("plan");
+    assert_eq!(chain_order(&after), vec![s12, s11, s21], "{after}");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let readers = epigraph_ingest_executor::workflow_steps::ordered_steps(&mut conn, wf)
+        .await
+        .expect("ordered_steps");
+    assert_eq!(chain_order(&after), readers);
+    assert_items_are_the_vectors(&after);
+    assert_eq!(after["digest_echo"], vectors()["ingest"]["wfd1"]);
+    assert_eq!(without_chain_order(&after), without_chain_order(&before));
+}

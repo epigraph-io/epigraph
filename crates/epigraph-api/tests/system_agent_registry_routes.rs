@@ -202,6 +202,7 @@ async fn rest_workflow_ingest_after_rotation_authors_as_the_registered_agent(poo
     let r = epigraph_api::routes::workflows::store_workflow(
         ViewerExtractor(Viewer::resolve(&pool, caller).await.expect("viewer")),
         State(state),
+        Some(Extension(token(caller, ClientType::Service))),
         Json(req),
     )
     .await;

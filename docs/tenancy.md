@@ -451,12 +451,18 @@ no other current successor; and, on an application session, that predecessor
 has never been restated by that author before, current or retired (migration
 123: before it, "no other CURRENT successor" alone re-admitted a predecessor
 whose successor had been retired, so retire-and-restate doubled the current
-claims under the identity each round). That author may be a retired agent of
-the writer's own human, so a human can supersede its own legacy author's
-claims, once per claim, ever, and in the claim's own group; a fresh claim
-never names a retired identity, however `supersedes` is posed (at a current
-claim, at a claim in another group, as a second successor, at an
-already-restated claim, or at the claim itself). A privileged session keeps
+claims under the identity each round). Since migration 185 (ruling R-85) the
+act's INSERT of such a successor is checked on its WRITER alone (bound, and a
+writer of the owner group): the author it inherits is not attributed to the
+writer's human, so a bound writer of the group may restate a claim whose
+author is bound to no human, a retired identity, or another human's agent,
+once per claim, ever, and in the claim's own group. The act records that
+writer as the successor's `AUTHORED` act edge. A live role-attached inherited
+author is still checked for `ROL01`; a RE-OPEN of such a successor is not the
+act and is still attributed. A fresh claim never names a retired identity,
+however `supersedes` is posed (at a current claim, at a claim in another
+group, as a second successor, at an already-restated claim, or at the claim
+itself). A privileged session keeps
 the "no other current successor" rule, so a custodial revision of a canonical
 claim that retired duplicates point at still works. No claim names ITSELF in
 `supersedes`: a statement that sets it to the row's own id is refused
@@ -808,12 +814,12 @@ human (`OPL02`).
   override. The census reads authors, not writing principals: it sees writer
   scope only where the author was also the writer.
 
-### Delegated run tokens (dormant)
+### Delegated run tokens (dormant until armed)
 
 An operated agent is stdio-only, with ONE carve-out: a delegated run token.
 Such a token is an ordinary `agent` access token for the operated agent
 whose `dlg` claim names the agent of the OAuth client that asked for it (the
-DELEGATOR). Nothing mints one yet.
+DELEGATOR). The run-token grant below mints one.
 
 **What is checked, on every request that carries `dlg`.** The REST bearer
 middlewares (`middleware/bearer.rs::admit_delegated`, right after the
@@ -873,6 +879,61 @@ and revoking the token's jti. Disarming the switch needs a restart.
 
 An old binary decodes a `dlg` token as an ordinary token for an operated agent
 and refuses it, so any deploy order fails closed.
+
+**The grant (`grant_type=urn:epigraph:grant:run-token`,
+`oauth/run_token.rs`).** A host that runs operated agents asks
+`POST /oauth/token` for a token for the agent it is about to run:
+
+| Field | Value |
+|---|---|
+| `client_id`, `client_secret` | the delegator: an `active` `service` client (hex secret, checked as client_credentials checks it) |
+| `agent_public_key` | the principal's IDENTITY public key, 64 hex (a host-keyed identity cannot be derived by the server, so the host names it) |
+| `run_label` | optional free text, at most 64 characters, naming the schedule or run; audit only |
+| `scope` | optional; absent means the delegator's granted scopes |
+
+The answer is an `agent` token for the principal (`sub` the delegator client,
+`dlg` the delegator's agent, no `owner_id`), at most 900 seconds, with NO
+refresh token: the host mints again before it lapses. Its scopes are the
+asked-for ones that the delegator is granted AND that lie inside the delegated
+ceiling, through the mint chokepoint. Nothing else in the request matters:
+a field naming a group is ignored, because the token's viewer is resolved by
+the server on every request from the principal's own memberships.
+
+It is refused (`invalid_request`, `invalid_client`, `invalid_grant` or
+`invalid_scope`, RFC 6749 §5.2) unless all of these hold, in this order:
+
+* the process read `EPIGRAPH_RUN_TOKENS=on` (else `unsupported_grant_type`:
+  the grant does not exist, and nothing is recorded);
+* the delegator client authenticates and has an agent (never created here);
+* an agent has the identity key (never created here: the host registers an
+  identity and links it before it runs it);
+* the agent's recorded model (`agents.properties ->> 'llm_model'`) is listed
+  in `EPIGRAPH_RUN_TOKEN_MODELS` (comma or whitespace separated; EMPTY
+  refuses every mint). The property is display state the application role
+  may rewrite on the agent's own row, so this narrows which identities the
+  grant serves; it is not authority;
+* `AgentRepository::delegated_principal_pool` answers `Some`, the same
+  question every request then repeats.
+
+Every mint writes one `security_events` row `oauth_run_token_minted` (the
+principal as `agent_id`; details: delegator, delegator client, operator,
+operator group, jti, exp, scopes, run label) BEFORE the token is returned,
+and a mint whose row cannot be written returns no token. Every refusal
+writes one `oauth_run_token_refused` row with a machine reason. Neither
+carries the secret or the token. A single token can be revoked by the jti
+its row names.
+
+**Arming it (operator, in order).** (1) Create the delegator `service`
+client (legal-entity fields; approve it to `active`) with `granted_scopes`
+inside the ceiling, and keep its secret in a host-only file. (2) Mint one
+`client_credentials` token for it so its agent exists. (3) Give that agent a
+`writer` MEMBERSHIP of the operator's group (never a link). (4)
+`epigraph-operator allow-author-binding-client` naming the operator
+(maintenance). (5) Set `EPIGRAPH_RUN_TOKENS=on` on BOTH `epigraph-api` (the
+grant and the REST check) and the MCP HTTP listener (the MCP check), and
+`EPIGRAPH_RUN_TOKEN_MODELS` on `epigraph-api`. (6) Verify with one mint and
+its `oauth_run_token_minted` row. Disarming is the reverse; suspending the
+delegator client stops every token on its next request.
 
 Deploy 149 with or after the system-agent registry (148): its
 "not a registered system agent" conjunct reads `system_agents` softly and is
@@ -1198,6 +1259,231 @@ scopes; arming is an operator step (`docs/deploy.md`).
   surface is widened.
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
+
+## Keyless team groups (migration 164)
+
+A team group is a visibility boundary, not an encryption one: it carries no
+key, no key epoch and no wrapped shares. The operator creates one, and changes
+its roster, on the maintenance DSN only:
+
+```bash
+epigraph-operator create-group --kind team --name "<name>" --admin <person agent id> \
+    --reason "<why>" [--apply]
+epigraph-operator group-member add --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member set-role --group <id> --agent <agent id> \
+    --role reader|writer|admin --reason "<why>" [--apply]
+epigraph-operator group-member remove --group <id> --agent <agent id> \
+    --reason "<why>" [--apply]
+```
+
+Every command is a dry run without `--apply` (the definer runs and its
+transaction, audit row included, is rolled back). The rules live in the
+database functions these commands call:
+
+* the creator and every `admin` is a registered human operator;
+* a member belongs to a live human: the human itself, or an agent with a LIVE
+  operator link (or a client allowance) to one; unbound and retired-linked
+  agents are refused;
+* an operated agent is a member, at any role, only of a group its operator
+  writes, and an operator cannot be removed or demoted to `reader` while one
+  of its agents is a live member (remove the agents first);
+* the last live admin cannot be removed or demoted;
+* a removal sets `revoked_at` and keeps the row; adding the agent back writes
+  a new row;
+* every applied act writes one `group.*` `security_events` row.
+
+* a group the commands created (its `did_key` is `did:epigraph:group:<id>`)
+  has ONE writer, these commands: no application session, whatever principal
+  it is stamped as (the group's admin, its creator, demoted or not), can
+  insert or change one of its membership rows or change its group row, and no
+  application session can create a keyless team group or one in that
+  namespace (42501, from the triggers migration 164 adds). The REST routes
+  therefore cannot change such a roster either: add needs a key epoch, and
+  remove is refused like any other application write;
+* a member's access LAPSES with the binding that admitted it: a verb-made
+  group's live row counts in a viewer's group set only while the member still
+  belongs to a registered human operator, so revoking a client allowance or a
+  human's registration (or suspending its human client) ends the member's
+  claim reads and writes (everything decided from its resolved viewer) at its
+  next resolve. The row itself stays until `group-member remove` revokes it,
+  and the REST group routes that read the roster table directly (the
+  group-admin check, group info) still see it until then; the roster itself
+  stays closed to them;
+* the last-admin rule counts only admins that are still registered humans;
+* each audit row also carries `actor`: the CLI's tool, command, version and
+  process identity (real and login uid), since `session_user` is a shared
+  login.
+
+Two limits remain. Row security reads the SESSION's group set, so a session
+stamped before a removal (a cached viewer, a long-lived connection) still
+reads the group until it re-resolves; a removal takes effect at the next
+resolve. And the application DSN is not the boundary for anything an
+application session may do, for the reason "Arming, and the valve" gives: a
+holder of it can stamp any principal. That is why a verb-made group's roster
+is closed to every application session rather than to some principals.
+
+
+## Group membership that follows a role (migration 165)
+
+A group's membership can follow a platform role instead of a hand-kept list.
+The operator binds a NON-ELEVATING role to the group, then grants the role to
+humans for a window, on the maintenance DSN:
+
+```bash
+epigraph-operator define-group-role --key role:<key> --description "<what it is>" \
+    --group <group id> --member-role writer --include-agents --reason "<why>" [--apply]
+epigraph-operator grant-role --role role:<key> --holder <person agent id> \
+    (--valid-to <RFC3339> | --open-ended) --reason "<why>" [--apply]
+epigraph-operator group-roster --group <group id> [--at <RFC3339>]
+epigraph-operator end-group-role-binding --binding <binding id> --reason "<why>" [--apply]
+```
+
+While the binding is live, a registered human holding a live assignment of the
+role reads (and, at `writer`, writes) the group; with `--include-agents`, so
+does every agent registered to such a human: an agent with an ACTING live
+operator link, or a service client allowed for that human
+(`allow-author-binding-client`). A retired link, an agent whose acting row was
+revoked, and anyone whose human was revoked or whose human client was
+suspended never derive. A binding never confers `admin`, and a role that
+elevates or reads the audit trail cannot be bound. Once the operator binding
+is armed, the database's claim-write check (OPL02) asks the same question,
+keyed on the WRITING principal itself: an agent that does not derive the group
+is refused a claim write into it even with a forged stamp, and even with its
+session's link valve open.
+
+Nothing is written to the group's roster for these members. Membership is
+computed each time a viewer is resolved, so it LAPSES at the assignment's
+`valid_to` (or its `end-role-assignment`, or the binding's end) with no job:
+reads at the next request, tool call or worker job; claim writes, once the
+operator binding is armed, at the first statement after `valid_to`, even
+inside a transaction opened before it, whatever the session's stamp says
+(OPL02). A request already in flight reads on its old stamp.
+
+Two consequences to know:
+
+* readers of the roster TABLE itself (the REST group routes, the consolidate
+  act's membership test, a profile's detail check) see explicit rows only, so
+  a derived member is refused there; use `group-roster` to see who holds a
+  group through its bindings;
+* an explicit membership is never granted on the strength of a derived one:
+  `group-member add` of a teammate's agent still requires the teammate's own
+  explicit writer row (GRP03), so no explicit row outlives a window.
+
+### Only the role's ATTACHED agents (migration 179)
+
+`--include-agents` admits every agent registered to the holder, which is
+every container or job that human ever linked. To keep a group private to the
+holder and the few agents that work FOR the role, bind it with `--agent-mode
+attached_agents` instead (`holder_only` and `registered_agents` are the other
+two modes; `--include-agents` is `registered_agents`). An agent is then a
+member while:
+
+* it has a live attachment to the BOUND role (migration 166's `role_agents`:
+  not detached, inside its window; an attachment to another role, or one
+  whose window has not opened, admits nothing);
+* its OWN human (its acting live operator link, or its client allowance)
+  holds a live assignment of the role: an agent attached while another human
+  holds it is not a member, the same rule 166's `ROL01` applies to its
+  writes; and
+* the attachment COUNTS: one the operator made for this agent counts as it
+  is; a SUCCESSION COPY (166 attaches every registered successor of an
+  attached identity, at registration and at attach time) counts only when the
+  agent runs in one group folder, and that folder is one the identity the
+  operator attached runs in. A same-folder successor (a prompt or model
+  change of the same job) keeps the group. A successor that also runs in
+  another folder (a shared identity, which 166 flags), a successor registered
+  in a different folder, and later copies of those do not: they stay attached
+  for 166's refusals only.
+
+A detach DOES revoke the lineage's grant: a succession copy counts only while
+every row it was copied through, the operator's own attachment included, is
+un-detached and inside its window. So detaching the identity you attached
+(`epigraph_detach_agent_from_role`) takes the group from every successor
+copied from it at once, and detaching a middle identity takes it from the
+copies below that one. A revert (the job goes back to an earlier prompt or
+model, so the host registers the earlier, detached identity again with its
+successor as the parent) regains nothing. The copies themselves stay
+attached, for 166's write refusal.
+
+To give the group back after a detach, attach the identity that runs NOW.
+Re-attaching the old root alone does not bring back a successor whose old
+copy still covers the window (166's lineage follow copies only into gaps):
+detach the running identity's old copy first, then attach it by name.
+
+#### Recipe: a role-private group for a scheduled job
+
+A role that ELEVATES or reads the audit trail (`role:platform-custodian`,
+`role:auditor`) is refused in every mode (GRB01), so the group is bound to a
+new, non-elevating role that the same human holds, here
+`role:platform-operations`. Everything runs on the maintenance DSN; every
+`epigraph-operator` command is a dry run until `--apply`.
+
+1. Create the group (it carries no key):
+
+   ```bash
+   epigraph-operator create-group --kind team --name "<name>" \
+       --admin <person agent id> --reason "<why>" --apply
+   ```
+
+2. Define the role and bind it in the attached mode. `define-group-role`
+   always writes a NON-elevating catalog row (`elevates = false`,
+   `reads_audit = false`):
+
+   ```bash
+   epigraph-operator define-group-role --key role:platform-operations \
+       --description "<what the role does>" --group <group id> \
+       --member-role writer --agent-mode attached_agents --reason "<why>" --apply
+   ```
+
+   `--agent-mode attached_agents` needs migration 179; the other modes work on
+   165.
+
+3. Grant the role to the human who runs the job:
+
+   ```bash
+   epigraph-operator grant-role --role role:platform-operations \
+       --holder <person agent id> (--valid-to <RFC3339> | --open-ended) \
+       --reason "<why>" --apply
+   ```
+
+   Add `--granted-by` (and `--act`) as "The custodian role" above requires
+   once a live custodian exists.
+
+4. Register the job's identity, through the host's identity attestor, in the
+   group folder the job runs in, and link it to that human. Do this BEFORE
+   step 5: an identity that already has an attachment when the host first
+   registers it is refused (`AID09`).
+
+5. Attach the identity to the role (166; no CLI verb yet):
+
+   ```sql
+   SELECT public.epigraph_attach_agent_to_role(
+       'role:platform-operations', '<identity agent id>', NULL, NULL, '<why>');
+   ```
+
+6. Check: `epigraph-operator group-roster --group <group id>` lists the holder
+   and the identity at `writer`, and no other agent of that human.
+
+What to know before relying on it:
+
+* 166's rule applies as well: an attached identity WRITES nothing anywhere
+  while the role has no holder, and it does not run (host skip, MCP boot
+  refusal). Attach the identity to `role:platform-operations` only. If it is
+  ALSO attached to another role (the custodian role, say), its human must
+  hold every role it is attached to before it may write at all.
+* The job's later identities (a prompt or model change in the same folder)
+  inherit the attachment and keep the group with no operator act. Moving the
+  job to another folder, or running the same identity in a second folder,
+  drops the group for the copies; attach the new identity explicitly if that
+  is intended.
+* Membership is computed at each resolve, like 165's: it lapses at the
+  assignment's end, the attachment's end or detach (of the identity itself
+  or of any identity its attachment was copied from), and the binding's
+  end, with no job.
+* "Private" means non-public to every API and MCP principal outside the
+  group. A process holding the application database DSN is not bound by it
+  (see "Arming, and the valve").
 
 ## The `ownership` table — RETIRED (PR-22, migration 084)
 

@@ -320,6 +320,12 @@ pub struct AppState {
     /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
     #[cfg(feature = "db")]
     pub run_tokens: epigraph_db::RunTokens,
+    /// The LLM models the run-token grant may mint for
+    /// (`crate::oauth::run_token`). EMPTY in every constructor, which refuses
+    /// every mint; `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKEN_MODELS` at
+    /// boot.
+    #[cfg(feature = "db")]
+    pub run_token_models: crate::oauth::run_token::RunTokenModels,
     /// Whether `POST /api/v1/bp/propagate` may WRITE its results
     /// (`apply_updates: true`). OFF in every constructor; `bin/server.rs` sets
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
@@ -697,6 +703,20 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    // The role-to-group bindings (165), FORCEd by the migration that creates
+    // them, on the same precedent.
+    "group_role_bindings",
+    // Role-attached agents (166), FORCEd by the migration that creates it, on
+    // the same precedent.
+    "role_agents",
+    // The two harvester neighbours of `harvester_fragments` (173, ruling
+    // R-66), brought under tenancy and FORCEd by that migration, on the same
+    // precedent. Apply 173 before or with a binary carrying these two names.
+    "harvester_sources",
+    "harvester_audit_reports",
+    // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
+    // that migration, on the same precedent.
+    "workflows",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1104,6 +1124,43 @@ const TENANCY_TRIGGERS_089: &[(&str, &str)] = &[(
 #[cfg(feature = "db")]
 const MIGRATION_089_MARKER: &str = "epigraph_inherit_fragment_tenancy_stmt";
 
+/// The tenancy triggers **migration 173** adds, as `(relation, trigger)`.
+///
+/// Transcribed from `migrations/173_harvester_tables_tenancy_posture.sql`'s
+/// section 4: the root trigger that makes a `harvester_sources` writer declare
+/// its tenancy, the stamp that gives an audit report its fragment's pair at
+/// INSERT, and the trigger on `harvester_fragments` that re-stamps a
+/// fragment's audit reports when the fragment's pair changes. A dropped follow
+/// trigger is the silent case: the audit of a narrowed or re-owned fragment
+/// stays readable to its old readers, and nothing errors.
+///
+/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when one of
+/// [`MIGRATION_173_MARKERS`] exists**, for the reasons
+/// [`TENANCY_TRIGGERS_089`] gives: an unconditional entry would refuse every
+/// database that has not reached 173.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_173: &[(&str, &str)] = &[
+    ("harvester_sources", "harvester_sources_require_tenancy"),
+    (
+        "harvester_audit_reports",
+        "harvester_audit_reports_inherit_tenancy",
+    ),
+    (
+        "harvester_fragments",
+        "harvester_fragments_audit_reports_inherit_tenancy",
+    ),
+];
+
+/// The markers that migration 173 has run: the two functions it installs
+/// beside its triggers. EITHER one present means 173 ran, so dropping one
+/// trigger together with its own function still leaves the tier required by
+/// the other. 173's documented undo drops both, and then nothing is required.
+#[cfg(feature = "db")]
+const MIGRATION_173_MARKERS: &[&str] = &[
+    "epigraph_audit_report_inherit_tenancy",
+    "epigraph_fragment_audit_reports_follow",
+];
+
 impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
@@ -1159,6 +1216,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1240,6 +1299,18 @@ impl AppState {
     #[must_use]
     pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
         self.run_tokens = run_tokens;
+        self
+    }
+
+    /// Set the models the run-token grant may mint for; see
+    /// [`Self::run_token_models`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_run_token_models(
+        mut self,
+        models: crate::oauth::run_token::RunTokenModels,
+    ) -> Self {
+        self.run_token_models = models;
         self
     }
 
@@ -1540,6 +1611,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1611,6 +1684,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1762,6 +1837,9 @@ impl AppState {
     ///     [`MIGRATION_089_MARKER`] — 089's own function — is present. The
     ///     marker is deliberately NOT the trigger: a gate keyed on the thing it
     ///     checks for is vacuous.
+    ///   * [`TENANCY_TRIGGERS_173`] is required only once either of
+    ///     [`MIGRATION_173_MARKERS`] — 173's own functions — is present, on the
+    ///     same reasoning.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -1810,6 +1888,7 @@ impl AppState {
                 .iter()
                 .chain(TENANCY_TRIGGERS_074.iter())
                 .chain(TENANCY_TRIGGERS_089.iter())
+                .chain(TENANCY_TRIGGERS_173.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -1824,14 +1903,25 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        let migration_089_applied: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_proc p \
-                              JOIN pg_namespace n ON n.oid = p.pronamespace \
-                             WHERE n.nspname = 'public' AND p.proname = $1)",
+        // One read for every marker-gated tier (089's and 173's), so the boot
+        // check keeps a single catalog probe.
+        let markers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT p.proname::text FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' AND p.proname = ANY($1)",
         )
-        .bind(MIGRATION_089_MARKER)
-        .fetch_one(&self.db_pool)
+        .bind(
+            std::iter::once(MIGRATION_089_MARKER)
+                .chain(MIGRATION_173_MARKERS.iter().copied())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.db_pool)
         .await?;
+        let migration_089_applied = markers.iter().any(|m| m == MIGRATION_089_MARKER);
+        let migration_173_applied = markers
+            .iter()
+            .any(|m| MIGRATION_173_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -1844,6 +1934,9 @@ impl AppState {
         }
         if migration_089_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_089);
+        }
+        if migration_173_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_173);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -1899,6 +1992,7 @@ impl AppState {
             triggers = rows.len(),
             migration_074_applied,
             migration_089_applied,
+            migration_173_applied,
             "tenancy triggers armed"
         );
         Ok(())

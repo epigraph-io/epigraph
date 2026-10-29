@@ -132,7 +132,10 @@ impl CorpusStatsRepository {
                   (SELECT COUNT(*) FROM claims c
                      WHERE 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */)   AS workflow_claims,
                   (SELECT COUNT(*) FROM challenges ch
-                     WHERE true /* {VISIBILITY:ch} */)                        AS challenges,
+                     WHERE true /* {VISIBILITY:ch} */
+                       AND EXISTS (SELECT 1 FROM claims chc
+                                    WHERE chc.id = ch.claim_id /* {VISIBILITY:chc} */))
+                                                                              AS challenges,
                   (SELECT COUNT(*) FROM claims c2
                      WHERE c2.embedding IS NOT NULL /* {VISIBILITY:c2} */)    AS embedded_claims
             ";

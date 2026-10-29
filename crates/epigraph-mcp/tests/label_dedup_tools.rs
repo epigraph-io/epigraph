@@ -2545,6 +2545,100 @@ async fn a_chain_of_marks_reverts_newest_first(pool: PgPool) {
     assert_eq!(snapshot(&pool, &ids).await, before, "everything restored");
 }
 
+/// A label dedup whose canonical is SUPERSEDED after the apply (by the
+/// supersede act, edges carried on) is still reverted (operator ruling R-11):
+/// the revert's preflight takes the un-mark gate's chain verdict instead of
+/// refusing a retired canonical, and the un-mark restores the duplicate
+/// against the canonical's replacement. (A canonical that is itself a MARKED
+/// duplicate is still refused: `a_chain_of_marks_reverts_newest_first`.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_after_the_canonical_was_superseded_restores_against_its_replacement(
+    pool: PgPool,
+) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server_with_maintenance(&pool, config(Some(&root), None, 5000)).await;
+    let a = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let b = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert!(is_marked_onto(&pool, b, a).await, "{out}");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(a)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
+    let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+        &mut conn,
+        epigraph_core::ClaimId::from_uuid(a),
+        &format!("{PUMP_A} (revised)"),
+        epigraph_core::TruthValue::clamped(0.5),
+        "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
+    )
+    .await
+    .expect("supersede the canonical");
+    epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, a, replacement)
+        .await
+        .expect("edge migration");
+    drop(conn);
+
+    let reverted = first_text(
+        &revert_label_dedup(&server, &viewer, revert_params(&out), None)
+            .await
+            .expect("the revert follows the canonical's supersession"),
+    );
+    assert_eq!(reverted["status"], "reverted", "{reverted}");
+    let unmark = reverted["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|st| st["step"] == "unmark")
+        .cloned()
+        .expect("an unmark step");
+    assert_eq!(unmark["claim_id"], json!(b.to_string()), "{reverted}");
+    assert_eq!(
+        unmark["result"]["current_canonical_id"],
+        json!(replacement),
+        "restored against the replacement: {reverted}"
+    );
+    let (is_current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("b");
+    assert_eq!((is_current, supersedes), (true, None), "b is current again");
+}
+
 /// A mark made on a server without the administrative connection is
 /// deferred; the un-mark on a server that has it still reverts it (the open
 /// deferral is retired with it).

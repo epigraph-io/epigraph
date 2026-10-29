@@ -109,6 +109,23 @@ pub struct AuthorOperator {
     pub retired: bool,
 }
 
+/// Whether an agent attached to a role may run now (migration 166's
+/// `epigraph_role_agent_may_run`): the answer epigraph-mcp checks at boot and
+/// the host checks before it starts a role's container or schedule.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct RoleAgentRunGate {
+    /// `false` only for an agent with a live attachment whose role has no live
+    /// holder, or whose linked human is not that holder.
+    pub may_run: bool,
+    /// The role of the first failing attachment, else of the first live one;
+    /// `None` for an unattached agent.
+    pub role: Option<String>,
+    /// The holder, only when it is the agent's own linked human (`held`).
+    pub holder: Option<Uuid>,
+    /// `unattached`, `held`, `no_holder` or `not_holder`.
+    pub reason: String,
+}
+
 /// What one [`AgentRepository::link_operator`] call did, for the startup log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct OperatorLinkOutcome {
@@ -1562,6 +1579,58 @@ impl AgentRepository {
         )
     }
 
+    /// [`Self::human_of`] for many agents in one read: each agent of `agents`
+    /// that is bound to a human, mapped to that human. An agent bound to no
+    /// human (or, with `live_only`, only through a retired link) is absent.
+    /// Duplicates in `agents` are harmless; an empty slice issues no query.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent or the read fails.
+    pub async fn humans_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        agents: &[Uuid],
+        live_only: bool,
+    ) -> Result<std::collections::HashMap<Uuid, Uuid>, DbError> {
+        if agents.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT a.id, public.epigraph_human_of(a.id, $2) \
+               FROM (SELECT DISTINCT unnest($1::uuid[]) AS id) a",
+        )
+        .bind(agents)
+        .bind(live_only)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(agent, human)| human.map(|h| (agent, h)))
+            .collect())
+    }
+
+    /// May `agent_id` run now? Migration 166's `epigraph_role_agent_may_run`,
+    /// EXECUTE-able on the request DSN (and by the identity attestor). An
+    /// unattached agent always may; an attached one only while its linked
+    /// human holds every role it is attached to.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the function is absent (a database that has
+    /// not applied migration 166) or the read fails. Deliberately NOT mapped to
+    /// "may run": a binary that cannot ask must not start as if the answer
+    /// were yes.
+    pub async fn role_agent_may_run(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<RoleAgentRunGate, DbError> {
+        Ok(sqlx::query_as::<_, RoleAgentRunGate>(
+            "SELECT may_run, role, holder, reason \
+               FROM public.epigraph_role_agent_may_run($1)",
+        )
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
     /// [`Self::operator_actor`] for a caller holding a pool.
     ///
     /// # Errors
@@ -1638,6 +1707,30 @@ impl AgentRepository {
             operator_id,
             operator_group_id,
         }))
+    }
+
+    /// The agent whose identity public key is `public_key`, with its recorded
+    /// LLM model (`properties ->> 'llm_model'`), for the run-token grant: the
+    /// principal a delegator names. `None` when no agent has the key; this
+    /// never creates one.
+    ///
+    /// The model is DISPLAY state (the application role may rewrite the
+    /// agent's own `properties`); the grant uses it only to narrow which
+    /// identities it serves, never as authority, which is
+    /// [`Self::delegated_principal_pool`]'s.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn run_token_principal_pool(
+        pool: &PgPool,
+        public_key: &[u8; 32],
+    ) -> Result<Option<(Uuid, Option<String>)>, DbError> {
+        Ok(sqlx::query_as(
+            "SELECT id, properties ->> 'llm_model' FROM public.agents WHERE public_key = $1",
+        )
+        .bind(public_key.as_slice())
+        .fetch_optional(pool)
+        .await?)
     }
 
     /// Refuse, with [`DbError::OperatorLinkRequired`] (`OPL01`), an author that

@@ -137,20 +137,43 @@ def report(val, q):
     }
 
 
-def write_conformal_section(q, n_by, n_total):
-    text = CALIBRATION_TOML.read_text()
-    marker = "# ── Split-Conformal Prediction Sets"
-    if "[conformal]" in text:
-        raise SystemExit("[conformal] already present; remove it before re-fitting.")
-    block = (
-        f"\n{marker} ────────────────\n"
+CONFORMAL_MARKER = "# ── Split-Conformal Prediction Sets"
+
+
+def conformal_comment(n_by, n_total):
+    """The comment block written above [conformal].
+
+    It must state the population the SHIPPED quantiles were fit on. main()
+    refits on all fixtures (no held-out split) before writing, so the
+    calibration n is the full corpus, and the split-conformal held-out
+    validation is a separate measurement (--check). An earlier wording,
+    "over N fixtures (split-conformal, alpha, seed)", read as a held-out
+    split that never happened (backlog 733df577).
+    tests/scifact_calibration/test_conformal_coverage.py --check asserts the
+    shipped comment is exactly this text for a refit of the fixtures.
+    """
+    return (
+        f"{CONFORMAL_MARKER} ────────────────\n"
         f"# Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py\n"
-        f"# over {n_total} labelled SciFact fixtures (split-conformal, alpha={ALPHA},\n"
-        f"# seed={SEED}). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);\n"
+        f"# on ALL {n_total} labelled SciFact fixtures (alpha={ALPHA}). No held-out split:\n"
+        f"# the calibration n is the full corpus. Held-out coverage is measured\n"
+        f"# separately by `calibrate_conformal.py --check`, which fits on a stratified\n"
+        f"# {CAL_FRACTION:.0%} split (seed={SEED}) and scores the rest.\n"
+        f"# score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);\n"
         f"# class c is in the prediction set iff score_c <= q_c. Calibration n per class:\n"
         f"# supported={n_by['supported']} contradicted={n_by['contradicted']} "
         f"not_enough_info={n_by['not_enough_info']}.\n"
-        f"[conformal]\n"
+    )
+
+
+def write_conformal_section(q, n_by, n_total):
+    text = CALIBRATION_TOML.read_text()
+    if "[conformal]" in text:
+        raise SystemExit("[conformal] already present; remove it before re-fitting.")
+    block = (
+        "\n"
+        + conformal_comment(n_by, n_total)
+        + f"[conformal]\n"
         f"alpha = {ALPHA}\n\n"
         f"[conformal.quantiles]\n"
         f"supported        = {q['supported']:.6f}\n"

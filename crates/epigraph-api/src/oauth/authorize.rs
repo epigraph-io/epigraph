@@ -212,15 +212,20 @@ pub async fn callback_endpoint(
     let id_token = flow
         .exchange_code(&q.code, &google_redirect, &session.google_code_verifier)
         .await
-        .map_err(|e| ApiError::BadGateway {
-            reason: format!("{e:?}"),
+        .map_err(|e| {
+            // The IdP's error body, or the transport error naming the token
+            // endpoint, is the server's to read (backlog 49863d2c).
+            tracing::warn!(target: "oauth.callback", error = %e, "code exchange failed");
+            ApiError::BadGateway {
+                reason: "the identity provider's code exchange failed".into(),
+            }
         })?;
-    let identity = provider
-        .validate(&id_token)
-        .await
-        .map_err(|e| ApiError::Unauthorized {
-            reason: format!("{e:?}"),
-        })?;
+    let identity = provider.validate(&id_token).await.map_err(|e| {
+        tracing::warn!(target: "oauth.callback", error = %e, "id_token validation failed");
+        ApiError::Unauthorized {
+            reason: "the identity provider's token could not be validated".into(),
+        }
+    })?;
 
     // 3. Provision/find the per-user `human` oauth_client for this identity (no tokens yet).
     let user = provision_external_user_client(&state, provider.as_ref(), &identity).await?;

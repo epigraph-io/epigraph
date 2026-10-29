@@ -1178,6 +1178,243 @@ async fn the_consent_page_cannot_be_framed_or_cached(pool: PgPool) {
     assert_oauth_headers(&headers, "consent page");
 }
 
+/// The router with one Google provider whose token endpoint is
+/// `token_endpoint`. The returned fixture serves the provider's JWKS, so it
+/// must outlive the router's requests.
+async fn app_with_google_token_endpoint(
+    pool: &PgPool,
+    token_endpoint: String,
+) -> (axum::Router, ProviderFixture) {
+    let fx = ProviderFixture::new().await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(token_endpoint);
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app =
+        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+    (app, fx)
+}
+
+/// Drive `POST /oauth/google/exchange` (the device-style code exchange) against
+/// a Google provider whose token endpoint is `token_endpoint`; return
+/// `(status, body)`.
+async fn exchange_against(pool: &PgPool, token_endpoint: String) -> (StatusCode, String) {
+    let (app, _fx) = app_with_google_token_endpoint(pool, token_endpoint).await;
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/google/exchange")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "code": "google-code",
+                "code_verifier": VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Drive `GET /oauth/callback` for a fresh pending session against a Google
+/// provider whose token endpoint is `token_endpoint`; return `(status, body)`.
+async fn callback_against(pool: &PgPool, token_endpoint: String) -> (StatusCode, String) {
+    let (app, _fx) = app_with_google_token_endpoint(pool, token_endpoint).await;
+
+    let google_state = format!("gstate_{}", Uuid::new_v4().simple());
+    AuthorizeSessionRepository::create(
+        pool,
+        &google_state,
+        "upstream-redaction-app",
+        REDIRECT_URI,
+        &pkce_challenge(VERIFIER),
+        Some("claims:read"),
+        Some("claude-state"),
+        "google-verifier",
+        Utc::now() + Duration::minutes(10),
+    )
+    .await
+    .expect("seed pending authorize session");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// A `logs_assert` predicate: ONE captured line holds both `message` (the
+/// warn's own text) and `detail` (the withheld error's text). A bare
+/// `logs_contain(detail)` would also accept any other line naming the same
+/// text, such as an HTTP client's debug line for a request URI, so it would not
+/// prove the warn carries the error.
+fn on_one_line(
+    message: &'static str,
+    detail: &'static str,
+) -> impl Fn(&[&str]) -> Result<(), String> {
+    move |lines: &[&str]| {
+        lines
+            .iter()
+            .any(|l| l.contains(message) && l.contains(detail))
+            .then_some(())
+            .ok_or_else(|| format!("no `{message}` line in the server log carries `{detail}`"))
+    }
+}
+
+/// A wiremock identity provider with two token endpoints: `/token-error`
+/// answers with an OAuth error body naming an internal host, and
+/// `/token-garbage` answers 200 with an `id_token` that is not a JWT.
+async fn misbehaving_idp() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let idp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token-error"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant from idp-internal-4b7e.corp"
+        })))
+        .mount(&idp)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token-garbage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "id_token": "not-a-jwt-4b7e-payload" })),
+        )
+        .mount(&idp)
+        .await;
+    idp
+}
+
+/// A token endpoint nothing listens on; the transport error names its URL.
+const UNREACHABLE_TOKEN_ENDPOINT: &str = "http://127.0.0.1:9/token-path-4b7e";
+
+// The identity provider's error text stays on the server (backlog 49863d2c):
+// a failed code exchange answers 502 with a fixed reason, whether the IdP
+// answered with an error body or could not be reached at all, and a token that
+// fails validation answers 401 with a fixed reason. One test per arm, so each
+// arm's red and each probe's red is observed on its own.
+
+/// The IdP answers the code exchange with an error body.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_callback_withholds_the_identity_providers_error_body(pool: PgPool) {
+    let idp = misbehaving_idp().await;
+    let (status, body) = callback_against(&pool, format!("{}/token-error", idp.uri())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("idp-internal-4b7e") && !body.contains("invalid_grant"),
+        "the IdP's error text reached the browser: {body}"
+    );
+    assert!(
+        body.contains("the identity provider's code exchange failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line("code exchange failed", "idp-internal-4b7e"));
+}
+
+/// The token endpoint cannot be reached; the transport error names its URL.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_callback_withholds_the_token_endpoints_transport_error(pool: PgPool) {
+    let (status, body) = callback_against(&pool, UNREACHABLE_TOKEN_ENDPOINT.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("token-path-4b7e") && !body.contains("127.0.0.1"),
+        "the token endpoint's URL reached the browser: {body}"
+    );
+    assert!(
+        body.contains("the identity provider's code exchange failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line("code exchange failed", "token-path-4b7e"));
+}
+
+/// The exchange succeeds but the token does not validate.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_callback_withholds_the_validators_error_text(pool: PgPool) {
+    let idp = misbehaving_idp().await;
+    let (status, body) = callback_against(&pool, format!("{}/token-garbage", idp.uri())).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(
+        !body.contains("InvalidAssertion") && !body.contains("4b7e"),
+        "the validator's error text reached the browser: {body}"
+    );
+    assert!(
+        body.contains("the identity provider's token could not be validated"),
+        "the 401 carries the fixed reason: {body}"
+    );
+    // `ProviderError`'s Display of the validator's refusal: text that only the
+    // withheld error carries, not the warn's own message.
+    logs_assert(on_one_line(
+        "id_token validation failed",
+        "invalid assertion: bad header",
+    ));
+}
+
+// The same redaction on the device-style exchange, `POST
+// /oauth/:provider/exchange` (oauth/device.rs::exchange_endpoint), which maps
+// the provider's `Upstream` error itself rather than through the callback.
+
+/// The IdP answers the device exchange with an error body.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_device_exchange_withholds_the_identity_providers_error_body(pool: PgPool) {
+    let idp = misbehaving_idp().await;
+    let (status, body) = exchange_against(&pool, format!("{}/token-error", idp.uri())).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("idp-internal-4b7e") && !body.contains("invalid_grant"),
+        "the IdP's error text reached the client: {body}"
+    );
+    assert!(
+        body.contains("the identity provider request failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line(
+        "identity provider request failed",
+        "idp-internal-4b7e",
+    ));
+}
+
+/// The token endpoint cannot be reached; the transport error names its URL.
+#[tracing_test::traced_test]
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_device_exchange_withholds_the_token_endpoints_transport_error(pool: PgPool) {
+    let (status, body) = exchange_against(&pool, UNREACHABLE_TOKEN_ENDPOINT.to_string()).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert!(
+        !body.contains("token-path-4b7e") && !body.contains("127.0.0.1"),
+        "the token endpoint's URL reached the client: {body}"
+    );
+    assert!(
+        body.contains("the identity provider request failed"),
+        "the 502 carries the fixed reason: {body}"
+    );
+    logs_assert(on_one_line(
+        "identity provider request failed",
+        "token-path-4b7e",
+    ));
+}
+
 // ── Loopback (RFC 8252) redirect URIs: native MCP clients such as OpenAI Codex ──
 //
 // Codex's MCP OAuth (codex-rs/rmcp-client, perform_oauth_login.rs::resolve_redirect_uri

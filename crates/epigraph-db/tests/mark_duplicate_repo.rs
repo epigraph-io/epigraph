@@ -1,5 +1,5 @@
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, DbError};
+use epigraph_db::{ClaimRepository, DbError, RefusalKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -83,6 +83,18 @@ async fn mark_duplicate_rejects_already_superseded(pool: PgPool) {
     .err()
     .unwrap();
     assert!(format!("{err:?}").contains("already superseded"), "{err:?}");
+    // A STATE refusal (operator ruling R-55): the duplicate was retired
+    // before this request, so HTTP answers it 409.
+    assert!(
+        matches!(
+            err,
+            DbError::Refused {
+                kind: RefusalKind::State,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -98,6 +110,19 @@ async fn mark_duplicate_rejects_self(pool: PgPool) {
     .err()
     .unwrap();
     assert!(format!("{err:?}").contains("dup == canonical"), "{err:?}");
+    // A repo-authored refusal, so the MCP layer may send it as written
+    // (backlog e0f0cb68); never a `QueryFailed`, which it must redact. An
+    // INPUT refusal (operator ruling R-55): wrong whatever the graph holds.
+    assert!(
+        matches!(
+            err,
+            DbError::Refused {
+                kind: RefusalKind::Input,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 async fn seed_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
@@ -405,12 +430,24 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
     ClaimRepository::mark_duplicate(&pool, ClaimId::from_uuid(c1), ClaimId::from_uuid(c2))
         .await
         .expect("calibration: c1 marked onto the current c2");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(s)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(s),
         "superseded canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede s");
@@ -429,8 +466,14 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
         .await
         .expect_err("a mark onto a retired canonical is refused");
         assert!(
-            matches!(err, DbError::QueryFailed { .. })
-                && format!("{err:?}").contains("not current"),
+            // A STATE refusal (operator ruling R-55): HTTP answers it 409.
+            matches!(
+                err,
+                DbError::Refused {
+                    kind: RefusalKind::State,
+                    ..
+                }
+            ) && format!("{err:?}").contains("not current"),
             "{err:?}"
         );
         let (sup, current): (Option<Uuid>, bool) =

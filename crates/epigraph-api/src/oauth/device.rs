@@ -188,12 +188,14 @@ pub async fn exchange_endpoint(
         .exchange_code(&code, &redirect_uri, &req.code_verifier)
         .await
         .map_err(|e| match e {
-            ProviderError::Upstream(msg) => ApiError::BadGateway { reason: msg },
+            ProviderError::Upstream(msg) => {
+                crate::oauth::providers::upstream_bad_gateway("device_exchange", &msg)
+            }
             ProviderError::InvalidAssertion(msg) => ApiError::BadRequest { message: msg },
             ProviderError::Config(msg) => ApiError::InternalError { message: msg },
-            ProviderError::JwksFetch(msg) => ApiError::ServiceUnavailable {
-                service: format!("JWKS unavailable: {msg}"),
-            },
+            ProviderError::JwksFetch(msg) => {
+                crate::oauth::providers::jwks_unavailable("device_exchange", &msg)
+            }
         })?;
 
     let identity = match provider.validate(&id_token).await {
@@ -211,10 +213,12 @@ pub async fn exchange_endpoint(
             );
             return Err(match e {
                 ProviderError::InvalidAssertion(msg) => ApiError::Unauthorized { reason: msg },
-                ProviderError::JwksFetch(msg) => ApiError::ServiceUnavailable {
-                    service: format!("JWKS unavailable: {msg}"),
-                },
-                ProviderError::Upstream(msg) => ApiError::BadGateway { reason: msg },
+                ProviderError::JwksFetch(msg) => {
+                    crate::oauth::providers::jwks_unavailable("device_validate", &msg)
+                }
+                ProviderError::Upstream(msg) => {
+                    crate::oauth::providers::upstream_bad_gateway("device_validate", &msg)
+                }
                 ProviderError::Config(msg) => ApiError::InternalError { message: msg },
             });
         }

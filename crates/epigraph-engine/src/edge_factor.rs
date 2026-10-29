@@ -23,6 +23,7 @@ use epigraph_db::{
 };
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
+use crate::belief_profile::{BeliefProfile, FrameTier, PerspectiveTier};
 use crate::calibration::CalibrationConfig;
 use crate::epistemic_interval::{
     restrict_epistemic_frame_evidence, restrict_epistemic_negative, restrict_epistemic_positive,
@@ -31,6 +32,7 @@ use crate::epistemic_interval::{
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 
 const BINARY_FRAME_NAME: &str = "binary_truth";
+// belief-profile: allow-literal (array length of a fixed hypothesis list)
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
 /// The canonical claim-assessment frame's name. It replaced the per-source
@@ -42,8 +44,10 @@ pub const CLAIM_VALIDITY_FRAME_NAME: &str = "claim_validity";
 /// can create a frame of any name, so a by-name lookup lets the first one to
 /// name a frame `claim_validity` decide what every assess writes into.
 pub const CLAIM_VALIDITY_FRAME_ID: Uuid =
+    // belief-profile: allow-literal (a frame's fixed id, not a parameter)
     Uuid::from_u128(0x8a59_4393_c343_4f1a_b942_5c5b_7862_f792);
 /// `claim_validity`'s ordered axis: 0 = supported, 1 = refuted, 2 = uncertain.
+// belief-profile: allow-literal (array length of a fixed hypothesis list)
 pub const CLAIM_VALIDITY_HYPOTHESES: [&str; 3] = ["supported", "refuted", "uncertain"];
 
 /// Outcome of an edge-factor auto-wire pass.
@@ -90,8 +94,13 @@ pub async fn auto_wire_ds_for_edge(
     let Some((Some(bel), Some(pl), ow_opt)) = source_row else {
         return Ok(EdgeFactorOutcome::SourceFactorless);
     };
-    let source_interval =
-        EpistemicInterval::new(bel, pl, ow_opt.unwrap_or((pl - bel).max(0.0) * 0.5));
+    // Write-time constants come from the served (default) profile.
+    let profile = BeliefProfile::served();
+    let source_interval = EpistemicInterval::new(
+        bel,
+        pl,
+        ow_opt.unwrap_or((pl - bel).max(0.0) * profile.edge_factor.open_world_fraction_default),
+    );
 
     // Extract the restriction transmission factor `f`. This is the baseline
     // per-BBA reliability before locality composition. (`f` is ALSO folded
@@ -117,7 +126,9 @@ pub async fn auto_wire_ds_for_edge(
         RestrictionKind::Neutral => unreachable!(),
     };
 
-    if restricted.width() >= 0.999 && restricted.bel < 0.01 {
+    if restricted.width() >= profile.edge_factor.vacuous_width
+        && restricted.bel < profile.edge_factor.vacuous_belief
+    {
         return Ok(EdgeFactorOutcome::Vacuous);
     }
 
@@ -169,29 +180,25 @@ pub async fn auto_wire_ds_for_edge(
     //      Lets operators tune locality discounting per epistemic context
     //      (binary_truth vs textbook_veracity_* vs research_validity etc.)
     //      without code releases. Set via FrameRepository::set_property.
-    //   2. Global default from calibration.toml.
-    //   3. Hardcoded fallback 0.3 if calibration.toml is unreadable.
+    //   2. The served belief profile (calibration.toml, then the built-in
+    //      default when calibration.toml is unreadable).
     //
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
     // per-frame override naturally follows because we look up by frame_id.
-    let frame_id = ensure_binary_frame(&mut *conn, viewer).await?;
+    let frame_row = ensure_binary_frame_row(&mut *conn, viewer).await?;
+    let frame_id = frame_row.id;
     let per_frame_factor =
         FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
             .await
             .map_err(|e| format!("per-frame locality factor lookup: {e}"))?;
-    // Single calibration load for both the locality fallback AND the
-    // Phase 2 canonical-key alias resolution below. Cheap on the local
-    // filesystem; failure is recoverable (the helper's
-    // `default_for_phase2_fallback` mirrors the pre-Phase-2 hardcodes).
-    let calibration = crate::calibration::CalibrationConfig::from_workspace_root().ok();
-    let intra_factor = per_frame_factor.unwrap_or_else(|| {
-        calibration
-            .as_ref()
-            .map(|c| c.evidence_locality.intra_evidence_locality_factor)
-            .unwrap_or(0.3)
-    });
-    let locality_factor = if is_intra { intra_factor } else { 1.0 };
+    let intra_factor =
+        per_frame_factor.unwrap_or(profile.reliability.intra_evidence_locality_factor);
+    let locality_factor = if is_intra {
+        intra_factor
+    } else {
+        profile.reliability.cross_locality_factor
+    };
     let source_strength = transmission_factor * locality_factor;
 
     let frame = binary_frame()?;
@@ -220,23 +227,13 @@ pub async fn auto_wire_ds_for_edge(
     let locality_tag = if is_intra { "intra_self_cite" } else { "cross" };
 
     // Phase 2 (issue #197) canonical-key write: resolve the raw
-    // relationship string (e.g. "supports") through
-    // `evidence_type_aliases` to the canonical SciFact-calibrated key
-    // (`"derived_support"`). This lets the Phase 2 helper's tier 2
-    // path resolve a real calibrated weight instead of falling
-    // through to the 0.5 unknown-key sentinel. Source-of-truth is
-    // `calibration.toml`'s `[evidence_type_aliases]` — adding a new
-    // relationship is a TOML edit, not a Rust edit. Calibration load
-    // failure (calibration.toml missing) is rare on production; the
-    // fallback below stores the raw relationship verbatim and the
-    // helper's path-3 source_strength bridge keeps the math correct.
-    let stored_evidence_type: String = calibration
-        .as_ref()
-        .and_then(|c| {
-            let lower = relationship.to_lowercase();
-            c.evidence_type_aliases.get(&lower).cloned()
-        })
-        .unwrap_or_else(|| relationship.to_string());
+    // relationship string (e.g. "supports") through the served profile's
+    // `evidence_type_aliases` (filled from `calibration.toml`) to the
+    // canonical SciFact-calibrated key (`"derived_support"`), so the fold
+    // resolves a real calibrated weight instead of the unknown-type weight,
+    // and a profile override of the alias reaches edge-written rows exactly
+    // as it reaches raw-typed ones. See [`edge_evidence_type`].
+    let stored_evidence_type = edge_evidence_type(relationship, profile);
 
     MassFunctionRepository::store_with_perspective(
         &mut *conn,
@@ -255,8 +252,33 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(&mut *conn, viewer, target_id, frame_id, &frame).await?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        target_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&frame_row.properties),
+    )
+    .await?;
     Ok(EdgeFactorOutcome::Wired)
+}
+
+/// The evidence type an edge-factor BBA for `relationship` is stored under:
+/// the relationship's alias in `profile`'s alias table (matched
+/// case-insensitively), else the relationship verbatim.
+///
+/// Storing the alias the fold would resolve anyway keeps a relationship's
+/// weight the same whether its row carries the canonical key or the raw
+/// relationship, under any profile whose alias table this is.
+#[must_use]
+pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String {
+    profile
+        .reliability
+        .evidence_type_aliases
+        .get(&relationship.to_lowercase())
+        .cloned()
+        .unwrap_or_else(|| relationship.to_string())
 }
 
 /// Fire `auto_wire_ds_for_edge` from an edge-creation call site, gated on
@@ -448,14 +470,23 @@ pub async fn recompute_claim_belief_on_frame(
     if all_rows.is_empty() {
         return Ok(false);
     }
-    recompute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+    )
+    .await?;
     Ok(true)
 }
 
 /// Write-free variant of [`recompute_claim_belief_on_frame`]: loads the frame
-/// and every BBA on (claim, frame), runs the identical discount+combine
-/// pipeline as [`recompute_combined_belief`], and returns the resulting
-/// scalars instead of writing them to `claims`.
+/// and every BBA on (claim, frame), runs the identical pipeline as
+/// [`recompute_combined_belief`] (the same [`compute_combined_belief`],
+/// ruling R-80's vacate included), and returns the resulting scalars instead
+/// of writing them to `claims`.
 ///
 /// Added for `epigraph-cli/src/bin/recompute_betp.rs`'s `--dry-run` mode: it
 /// needs to show "recomputed value if we wrote it" without mutating state.
@@ -467,7 +498,10 @@ pub async fn recompute_claim_belief_on_frame(
 /// the only reliable way to preview without a DB side effect.
 ///
 /// Returns `Ok(None)` if the claim has no BBAs on `frame_id` (mirrors
-/// `recompute_claim_belief_on_frame`'s `Ok(false)`).
+/// `recompute_claim_belief_on_frame`'s `Ok(false)`), or when a real run would
+/// leave the cache as it was because the derivation scope rule admits none
+/// of the frame's BBAs and there is nothing to vacate. When a real run would
+/// VACATE the cache (ruling R-80), this returns that full-ignorance value.
 ///
 /// # Errors
 /// Same failure modes as [`recompute_claim_belief_on_frame`].
@@ -483,12 +517,68 @@ pub async fn preview_claim_belief_on_frame(
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, &frame).await
+    Ok(compute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+    )
+    .await?
+    .map(|(preview, _vacated)| preview))
+}
+
+/// [`preview_claim_belief_on_frame`] over the frame's stored rows as `adjust`
+/// leaves them: the same discount + combine pipeline, on rows the caller
+/// filtered or edited in memory. Writes nothing and changes no stored row.
+///
+/// Added for `recompute_betp`'s drift decomposition (SPEC §10.4), whose
+/// stages are counterfactual folds of the owner frame: without the ingest
+/// template's rows (2), or with the `evidence_type` a manifest names reset to
+/// its pre-backfill value (1'). `None` when no row is left, including when
+/// the derivation scope rule admits none of them: a counterfactual fold has
+/// no cache to vacate, so ruling R-80's vacate (which
+/// [`preview_claim_belief_on_frame`] models) does not apply here.
+///
+/// # Errors
+/// Same failure modes as [`preview_claim_belief_on_frame`].
+pub async fn preview_claim_belief_on_frame_adjusted<F>(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    adjust: F,
+) -> Result<Option<CombinedBeliefPreview>, String>
+where
+    F: FnOnce(Vec<MassFunctionRow>) -> Vec<MassFunctionRow>,
+{
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {frame_id} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
+    let stored =
+        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+            .await
+            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    compute_combined_belief_over(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+        adjust(stored),
+    )
+    .await
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
 /// scalars [`recompute_combined_belief`] writes to `claims`, plus the CDST
-/// classification label when the frame is the canonical binary frame.
+/// classification label when the frame is the canonical binary frame (or
+/// `not_enough_info` on any frame when the cache is vacated, ruling R-80).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CombinedBeliefPreview {
     pub belief: f64,
@@ -498,7 +588,8 @@ pub struct CombinedBeliefPreview {
     pub missing_mass: f64,
     /// CDST classification label, only computed on the canonical binary
     /// frame (mirrors the `frame.id == BINARY_FRAME_NAME` gate in
-    /// `recompute_combined_belief`).
+    /// `recompute_combined_belief`), except that a vacated cache (ruling
+    /// R-80) carries `not_enough_info` on every frame.
     pub classification: Option<String>,
 }
 
@@ -579,6 +670,27 @@ pub fn effective_source_strength(
     per_frame_evidence_weights: Option<&HashMap<String, f64>>,
     calibration: &CalibrationConfig,
 ) -> f64 {
+    // Kept for callers that hold a calibration rather than a profile. It
+    // resolves a profile per call, so fold loops use
+    // [`effective_source_strength_profiled`] with a profile resolved once.
+    let profile = BeliefProfile::from_calibration(calibration).resolve(
+        FrameTier {
+            overrides: None,
+            intra_evidence_locality_factor: per_frame_intra_factor,
+            evidence_type_weights: per_frame_evidence_weights,
+        },
+        PerspectiveTier::default(),
+    );
+    global_source_strength(row, &profile)
+}
+
+/// The global (no perspective opinion on this BBA) branch of
+/// [`effective_source_strength_profiled`]: the chain documented on
+/// [`effective_source_strength`], with every constant read from `profile`
+/// (the per-frame tier lives in `profile.lens.frame_evidence_type_weights` and
+/// in the resolved `intra_evidence_locality_factor`).
+fn global_source_strength(row: &MassFunctionRow, profile: &BeliefProfile) -> f64 {
+    let r = &profile.reliability;
     // Step (1): legacy null-evidence_type cohort. The 5202ded backfill
     // populated `source_strength` on these rows without setting
     // `evidence_type`; we honor the stored value verbatim until Phase
@@ -588,8 +700,8 @@ pub fn effective_source_strength(
         if let Some(ss) = row.source_strength {
             return ss.clamp(0.0, 1.0);
         }
-        // Step (5): everything NULL → unknown-key 0.5 fallback.
-        return 0.5;
+        // Step (5): everything NULL → the unknown-key fallback weight.
+        return r.unknown_evidence_type_weight;
     }
 
     // SAFETY: just matched `Some` above.
@@ -600,14 +712,13 @@ pub fn effective_source_strength(
     // 2 global calibration). Keeps the locality semantics identical
     // across both tiers — an operator who writes `{"empirical": 0.5}`
     // expects the same `intra` discount to apply on top of 0.5 as it
-    // would have applied to the global 1.0.
+    // would have applied to the global 1.0. The intra factor arrives
+    // resolved (per-frame override ∨ profile).
     let compose_with_locality = |base: f64| -> f64 {
-        let intra_factor = per_frame_intra_factor
-            .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor);
         let locality_factor = if row.locality_tag.starts_with("intra") {
-            intra_factor
+            r.intra_evidence_locality_factor
         } else {
-            1.0
+            r.cross_locality_factor
         };
         (base * locality_factor).clamp(0.0, 1.0)
     };
@@ -616,11 +727,12 @@ pub fn effective_source_strength(
     // Map keys are already lowercased by the repo accessor; lowercase
     // the BBA's evidence_type to match. NO alias resolution at this
     // tier — see Q9 locked decision in Phase 4 spec § 5.
-    if let Some(map) = per_frame_evidence_weights {
-        let key = evidence_type.to_lowercase();
-        if let Some(&w) = map.get(&key) {
-            return compose_with_locality(w);
-        }
+    if let Some(&w) = profile
+        .lens
+        .frame_evidence_type_weights
+        .get(&evidence_type.to_lowercase())
+    {
+        return compose_with_locality(w);
     }
 
     // Step (3): evidence_type resolves to a calibrated weight (direct
@@ -630,20 +742,20 @@ pub fn effective_source_strength(
     // historical 'intra' rows are migrated to 'intra_self_cite' in
     // the same PR — applies the intra discount. Everything else
     // ('cross', 'unknown', or any future tag we haven't taught the
-    // helper) gets the un-discounted base weight.
-    if calibration.evidence_type_weight_present(evidence_type) {
-        let base = calibration.get_evidence_type_weight(evidence_type);
+    // helper) gets the cross factor.
+    if profile.evidence_type_weight_present(evidence_type) {
+        let base = profile.evidence_type_weight(evidence_type);
         return compose_with_locality(base);
     }
 
     // Step (4): evidence_type was set but isn't a calibrated key (path
     // 1 sentinel from Phase 2 spec § 4). The legacy `source_strength`
     // cache preserves write-time semantics; without it we drop to the
-    // 0.5 unknown-key fallback.
+    // unknown-key fallback weight.
     if let Some(ss) = row.source_strength {
         return ss.clamp(0.0, 1.0);
     }
-    0.5
+    r.unknown_evidence_type_weight
 }
 
 /// A querying perspective's reliability overrides — the "frame function"
@@ -695,50 +807,83 @@ pub fn effective_source_strength_with_perspective(
     calibration: &CalibrationConfig,
     perspective: &PerspectiveReliability,
 ) -> f64 {
+    // Calibration-holding entry point; resolves a profile per call (see
+    // [`effective_source_strength`]).
+    let profile = BeliefProfile::from_calibration(calibration).resolve(
+        FrameTier {
+            overrides: None,
+            intra_evidence_locality_factor: per_frame_intra_factor,
+            evidence_type_weights: per_frame_evidence_weights,
+        },
+        PerspectiveTier {
+            overrides: None,
+            reliability: Some(perspective),
+        },
+    );
+    effective_source_strength_profiled(row, &profile)
+}
+
+/// Per-BBA reliability under a resolved [`BeliefProfile`]: the tier chain of
+/// [`effective_source_strength_with_perspective`] with every constant, every
+/// table and every lens map read from the profile.
+///
+/// - **base weight** = `lens.perspective_source_reliability[evidence_type]`
+///   → `lens.frame_evidence_type_weights` → the profile's evidence-type
+///   weights (aliases resolved) → stored `source_strength` → the unknown-type
+///   weight.
+/// - **locality factor** = `lens.perspective_locality_reliability[locality_tag]`
+///   → the resolved intra factor when the tag is `intra*` → the cross factor.
+/// - result = `base × locality`, clamped.
+///
+/// When the perspective maps have no entry touching this BBA, the result is
+/// the global chain documented on [`effective_source_strength`], so a profile
+/// without a perspective opinion reproduces the global belief.
+#[must_use]
+pub fn effective_source_strength_profiled(row: &MassFunctionRow, profile: &BeliefProfile) -> f64 {
+    let lens = &profile.lens;
+    let r = &profile.reliability;
     let etype = row.evidence_type.as_deref().map(str::to_lowercase);
     let locality_key = row.locality_tag.to_lowercase();
 
     let persp_base = etype
         .as_ref()
-        .and_then(|t| perspective.source_reliability.get(t))
+        .and_then(|t| lens.perspective_source_reliability.get(t))
         .copied();
-    let persp_locality = perspective.locality_reliability.get(&locality_key).copied();
+    let persp_locality = lens
+        .perspective_locality_reliability
+        .get(&locality_key)
+        .copied();
 
     // No override touches this BBA → identical to the global computation.
     if persp_base.is_none() && persp_locality.is_none() {
-        return effective_source_strength(
-            row,
-            per_frame_intra_factor,
-            per_frame_evidence_weights,
-            calibration,
-        );
+        return global_source_strength(row, profile);
     }
 
-    // Base evidence-type weight: perspective → per-frame → calibration →
-    // stored source_strength → 0.5.
+    // Base evidence-type weight: perspective → per-frame → profile table →
+    // stored source_strength → unknown-type weight.
     let base = persp_base
         .or_else(|| {
             etype
                 .as_ref()
-                .and_then(|t| per_frame_evidence_weights.and_then(|m| m.get(t)).copied())
+                .and_then(|t| lens.frame_evidence_type_weights.get(t))
+                .copied()
         })
         .or_else(|| {
             etype
                 .as_ref()
-                .filter(|t| calibration.evidence_type_weight_present(t))
-                .map(|t| calibration.get_evidence_type_weight(t))
+                .filter(|t| profile.evidence_type_weight_present(t))
+                .map(|t| profile.evidence_type_weight(t))
         })
         .or(row.source_strength)
-        .unwrap_or(0.5);
+        .unwrap_or(r.unknown_evidence_type_weight);
 
-    // Locality factor: perspective → legacy intra logic (per-frame ∨ global
-    // intra factor when the tag is intra*, else 1.0).
+    // Locality factor: perspective → resolved intra factor when the tag is
+    // intra*, else the cross factor.
     let locality = persp_locality.unwrap_or_else(|| {
         if locality_key.starts_with("intra") {
-            per_frame_intra_factor
-                .unwrap_or(calibration.evidence_locality.intra_evidence_locality_factor)
+            r.intra_evidence_locality_factor
         } else {
-            1.0
+            r.cross_locality_factor
         }
     });
 
@@ -779,27 +924,40 @@ pub fn is_known_evidence_type_key(key: &str, calibration: &CalibrationConfig) ->
         || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
 }
 
+/// [`is_known_evidence_type_key`] against a belief profile's weight and alias
+/// tables: the vocabulary the fold under `profile` actually resolves. Write
+/// surfaces and the recompute's warn-log use this with the profile the combine
+/// folds under, so a `[belief_profiles]` override that adds or removes a
+/// weight moves the verdict with the combine.
+#[must_use]
+pub fn is_known_evidence_type_key_in(key: &str, profile: &BeliefProfile) -> bool {
+    profile.evidence_type_weight_present(key)
+        || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
-/// keys that aren't in calibration's known vocabulary.
+/// keys that aren't in the known vocabulary of the profile the combine folds
+/// under.
 ///
-/// "Known vocabulary" = canonical key in `calibration.evidence_type_weights`
-/// ∪ alias in `calibration.evidence_type_aliases` ∪ a small allow-list of
+/// "Known vocabulary" = canonical key in the profile's `evidence_type_weights`
+/// ∪ alias in its `evidence_type_aliases` (both filled from
+/// `calibration.toml`, then the profile tiers) ∪ a small allow-list of
 /// relationship-vocab strings the `auto_wire_ds_for_edge` write path may
 /// emit before they're added to `evidence_type_aliases`. Operators may
 /// legitimately register weights for future evidence types not yet in
 /// calibration.toml; this is a log signal for typos, not a hard reject.
 ///
-/// The vocabulary test itself is [`is_known_evidence_type_key`], public so the
+/// The vocabulary test itself is [`is_known_evidence_type_key_in`], public so the
 /// MCP write surfaces that accept these keys can return the same verdict to
 /// the caller as a warning instead of only logging it (backlog 86ee2d30).
 fn warn_on_unknown_evidence_type_keys(
     frame_id: Uuid,
     map: &HashMap<String, f64>,
-    calibration: &CalibrationConfig,
+    profile: &BeliefProfile,
 ) {
     for key in map.keys() {
         // Map keys are already lowercased by the repo accessor.
-        if is_known_evidence_type_key(key, calibration) {
+        if is_known_evidence_type_key_in(key, profile) {
             continue;
         }
         tracing::warn!(
@@ -843,33 +1001,99 @@ pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) ->
         .unwrap_or(0)
 }
 
-/// Pure compute half of the combine pipeline: load every BBA on (claim,
-/// frame), discount + combine, and derive the resulting Bel/Pl/BetP/
-/// conflict/missing scalars (plus the CDST classification label on the
-/// binary frame). Does not touch the database beyond the read-only loads
-/// (`mass_functions`, calibration, per-frame overrides).
-///
-/// Factored out of [`recompute_combined_belief`] so
-/// [`preview_claim_belief_on_frame`] can share the exact same combine
-/// pipeline (same calibration lookups, same reliability derivation, same
-/// classifier) without also performing the `UPDATE claims ...` write —
-/// see that function's doc comment for why a caller-side rolled-back
-/// transaction can't substitute for this split.
-async fn compute_combined_belief(
+/// [`compute_combined_belief`] over the given rows of (claim, frame) instead
+/// of the stored ones, under the same frame tier (`frame_overrides`). `None`
+/// when `all_rows` is empty.
+async fn compute_combined_belief_over(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
+    all_rows: Vec<MassFunctionRow>,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
-    let all_rows =
-        MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
-            .await
-            .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    // Ruling R-22: what this fold computes is the claim's CACHED belief (or a
+    // preview of it), which everyone who can read the claim is served, so it
+    // folds only the BBAs whose every source is at least as widely readable
+    // as the claim (`crate::derivation_scope`). Filtered before anything
+    // reads the rows: the classification's `has_opposing` below iterates them
+    // too.
+    let all_rows = crate::derivation_scope::retain_for_cache(&mut *conn, all_rows)
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
     if all_rows.is_empty() {
         return Ok(None);
     }
 
+    let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+
+    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
+    // one `source_url`) are folded cautiously into one before the Dempster
+    // fold (backlog 4c42c0bf, `crate::source_dependence`), and so are the
+    // agreeing BBAs of sibling agents of one human (ruling R-36); the write
+    // path `ds_auto::auto_wire_ds_update` uses the same function, so a
+    // recompute cannot re-inflate what the write left honest.
+    //
+    // `fold_conflict` is the conflict the fold SAW. Since U025 every
+    // `combine_multiple` step is Dempster, which normalises conflict out of
+    // the combined mass (`combined.mass_of_conflict()` is 0), so the
+    // multi-BBA arm takes it from the per-step reports via
+    // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
+    // A single (or single-source) BBA is not folded: its own empty-set mass
+    // is the conflict.
+    let sources = crate::source_dependence::bba_sources_for_rows(&mut *conn, viewer, &all_rows)
+        .await
+        .map_err(|e| format!("BBA source read: {e}"))?;
+    let mut items = Vec::with_capacity(all_rows.len());
+    for (row, key) in all_rows.iter().zip(sources) {
+        let mf = parse_stored_bba(frame, &row.masses)?;
+        let reliability = effective_source_strength_profiled(row, &profile);
+        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
+        items.push((key, d));
+    }
+    let (combined, fold_conflict) = crate::source_dependence::combine_with_owner_dependence(
+        items,
+        profile.combination.conflict_threshold,
+    )
+    .map_err(|e| format!("combine_multiple: {e}"))?;
+
+    // has_opposing: does any single source BBA lean toward contradiction?
+    // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
+    // BBA on the target, so edge-borne AND directly-submitted opposition both
+    // surface here as a per-BBA betp_unsup — this replaces (and subsumes) the
+    // legacy CONTRADICTS-edge query, which only saw edge-borne opposition.
+    // Only the binary frame's classification reads it.
+    let opposing_threshold = profile.classifier.thresholds().has_opposing_threshold;
+    let has_opposing = all_rows.iter().any(|row| {
+        parse_stored_bba(frame, &row.masses)
+            .map(|bba| measures::pignistic_probability(&bba, 1) > opposing_threshold)
+            .unwrap_or(false)
+    });
+
+    preview_of_combined(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        &profile,
+        &combined,
+        fold_conflict,
+        has_opposing,
+    )
+    .await
+    .map(Some)
+}
+
+/// The belief profile the combine of (claim, `frame_id`) folds under: the
+/// served (default) profile, then this frame's tier (its `belief_profile`
+/// object, `frame_overrides`, and the per-frame keys read here).
+async fn fold_profile(
+    conn: &mut sqlx::PgConnection,
+    frame_id: Uuid,
+    frame_overrides: Option<&serde_json::Value>,
+) -> BeliefProfile {
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. Instead we compute
     // each BBA's effective reliability discount dynamically from
@@ -878,12 +1102,9 @@ async fn compute_combined_belief(
     // in `calibration.toml` or via a per-frame override — flows through
     // to combined BetP without any DB rewrite.
     //
-    // The load is hoisted above the loop to avoid a per-row I/O cost
-    // for the multi-BBA branch. Calibration I/O failure is recoverable
-    // (per CalibrationConfig::from_workspace_root docs); we fall back
-    // to the synthetic config that mirrors the pre-Phase-2 hardcodes.
-    let calibration = CalibrationConfig::from_workspace_root()
-        .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback());
+    // Every reliability input is resolved ONCE, above the loop, into a
+    // belief profile: the served (default) profile, then this frame's tier
+    // (its `belief_profile` object and the per-frame keys below).
     let per_frame_intra = FrameRepository::get_intra_evidence_locality_factor(&mut *conn, frame_id)
         .await
         .ok()
@@ -902,49 +1123,45 @@ async fn compute_combined_belief(
             .ok()
             .flatten();
 
+    let profile = BeliefProfile::served().resolve(
+        FrameTier {
+            overrides: frame_overrides,
+            intra_evidence_locality_factor: per_frame_intra,
+            evidence_type_weights: per_frame_evidence_weights.as_ref(),
+        },
+        PerspectiveTier::default(),
+    );
+
     // Vocabulary warn-log (Q8 locked: loose validation at set_property,
     // warn-log at read-site). Iterate the override map's keys and warn
     // on any that don't resolve to a known evidence-type vocabulary
-    // entry: canonical calibration key, calibration alias, or one of
+    // entry of the profile this combine folds under: canonical key, alias, or one of
     // the relationship-vocab strings the auto-wire write path emits.
     // Surfaces operator typos in operational logs without blocking the
     // write.
     if let Some(ref map) = per_frame_evidence_weights {
-        warn_on_unknown_evidence_type_keys(frame_id, map, &calibration);
+        warn_on_unknown_evidence_type_keys(frame_id, map, &profile);
     }
 
-    // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
-    // one `source_url`) are folded cautiously into one before the Dempster
-    // fold (backlog 4c42c0bf, `crate::source_dependence`); the write path
-    // `ds_auto::auto_wire_ds_update` uses the same function, so a recompute
-    // cannot re-inflate what the write left honest.
-    //
-    // `fold_conflict` is the conflict the fold SAW. Since U025 every
-    // `combine_multiple` step is Dempster, which normalises conflict out of
-    // the combined mass (`combined.mass_of_conflict()` is 0), so the
-    // multi-BBA arm takes it from the per-step reports via
-    // `aggregate_conflict` (= the TBM empty-set mass, order-independent).
-    // A single (or single-source) BBA is not folded: its own empty-set mass
-    // is the conflict.
-    let source_keys = crate::source_dependence::source_keys_for_rows(&mut *conn, viewer, &all_rows)
-        .await
-        .map_err(|e| format!("evidence source_url read: {e}"))?;
-    let mut items = Vec::with_capacity(all_rows.len());
-    for (row, key) in all_rows.iter().zip(source_keys) {
-        let mf = parse_stored_bba(frame, &row.masses)?;
-        let reliability = effective_source_strength(
-            row,
-            per_frame_intra,
-            per_frame_evidence_weights.as_ref(),
-            &calibration,
-        );
-        let d = combination::discount(&mf, reliability).map_err(|e| format!("discount: {e}"))?;
-        items.push((key, d));
-    }
-    let (combined, fold_conflict) =
-        crate::source_dependence::combine_with_source_dependence(items, 0.9)
-            .map_err(|e| format!("combine_multiple: {e}"))?;
+    profile
+}
 
+/// The cached scalars (and the binary frame's classification) of `combined`,
+/// the fold of the claim's BBAs on `frame` with conflict `conflict`, about the
+/// hypothesis the claim is assigned on that frame. `has_opposing`: some
+/// single folded BBA leans toward contradiction.
+#[allow(clippy::too_many_arguments)]
+async fn preview_of_combined(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    profile: &BeliefProfile,
+    combined: &MassFunction,
+    conflict: f64,
+    has_opposing: bool,
+) -> Result<CombinedBeliefPreview, String> {
     // Which hypothesis these cached scalars are ABOUT. On the canonical binary
     // frame this is 0 (TRUE) for every claim, so the binary path is unchanged.
     // On a multi-hypothesis frame — a declared labeled axis (issue #222), or any
@@ -967,19 +1184,18 @@ async fn compute_combined_belief(
     );
 
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
-    let bel = measures::belief(&combined, &target);
-    let pl = measures::plausibility(&combined, &target);
-    let betp = measures::pignistic_probability(&combined, hypothesis_index);
-    let conflict = fold_conflict;
+    let bel = measures::belief(combined, &target);
+    let pl = measures::plausibility(combined, &target);
+    let betp = measures::pignistic_probability(combined, hypothesis_index);
     let missing = combined.mass_of_missing();
 
     // CDST classification — a verdict on the COMBINED belief via the
     // deterministic BetP 7-rule cascade. Defined only on the canonical binary
     // {TRUE, FALSE} frame (supported = idx 0, contradicted = idx 1); other
-    // frames leave classification unset. Thresholds come from `calibration`
-    // (operator-tunable, same load as the discount path).
+    // frames leave classification unset. Thresholds come from the resolved
+    // profile (operator-tunable, same resolution as the discount path).
     let classification = if frame.id == BINARY_FRAME_NAME {
-        let thresholds = &calibration.classifier_thresholds;
+        let thresholds = &profile.classifier.thresholds();
         // theta = closed-world full-frame ignorance m({0,1}); the open-world
         // missing mass is excluded (Smets TBM), matching the legacy
         // `compute_betp` the cascade was calibrated against.
@@ -990,20 +1206,8 @@ async fn compute_combined_belief(
         // normal binary claim (assigned index 0); they differ only for a claim
         // deliberately assigned index 1 on the binary frame, where feeding
         // pignistic(1) in as "supported" would invert the verdict.
-        let betp_supported = measures::pignistic_probability(&combined, 0);
-        let betp_unsup = measures::pignistic_probability(&combined, 1);
-        // has_opposing: does any single source BBA lean toward contradiction?
-        // Post-#197 a `refutes`/`contradicts` edge auto-wires a Negative-leaning
-        // BBA on the target, so edge-borne AND directly-submitted opposition both
-        // surface here as a per-BBA betp_unsup — this replaces (and subsumes) the
-        // legacy CONTRADICTS-edge query, which only saw edge-borne opposition.
-        let has_opposing = all_rows.iter().any(|row| {
-            parse_stored_bba(frame, &row.masses)
-                .map(|bba| {
-                    measures::pignistic_probability(&bba, 1) > thresholds.has_opposing_threshold
-                })
-                .unwrap_or(false)
-        });
+        let betp_supported = measures::pignistic_probability(combined, 0);
+        let betp_unsup = measures::pignistic_probability(combined, 1);
         let label = crate::classifier::classify(
             conflict,
             theta,
@@ -1017,29 +1221,124 @@ async fn compute_combined_belief(
         None
     };
 
-    Ok(Some(CombinedBeliefPreview {
+    Ok(CombinedBeliefPreview {
         belief: bel,
         plausibility: pl,
         pignistic_prob: betp,
         conflict_k: conflict,
         missing_mass: missing,
         classification,
-    }))
+    })
 }
 
-/// Write half of the combine pipeline: run [`compute_combined_belief`] and
-/// persist the result to `claims.{belief, plausibility, pignistic_prob,
-/// conflict_k, missing_mass}` (and `classification` on the binary frame).
-/// No-ops (does not write) when the claim has no BBAs on `frame_id`.
+/// Pure compute half of the combine pipeline: the value a recompute of
+/// (claim, `frame_id`) leaves in the claim's cache, computed without writing
+/// anything. `Some((preview, vacated))`, or `None` when the recompute leaves
+/// the cache as it was. Does not touch the database beyond read-only loads
+/// (`mass_functions`, calibration, per-frame overrides, the derivation scope
+/// reads).
+///
+/// Factored out of [`recompute_combined_belief`], which writes exactly this,
+/// so [`preview_claim_belief_on_frame`] can return it without also performing
+/// the `UPDATE claims ...` write (see that function's doc comment for why a
+/// caller-side rolled-back transaction can't substitute for this split). A
+/// dry run and a real run therefore cannot disagree.
+///
+/// * The frame has BBAs the derivation scope rule admits: their fold
+///   (discount + combine + classifier; `vacated` false).
+/// * **Every BBA inadmissible (ruling R-80).** The frame has BBAs, the
+///   derivation scope rule (R-22 / R-71) leaves none of them in the fold, and
+///   [`crate::derivation_scope::must_vacate_cache`] holds (no admissible input
+///   on ANY frame of the claim, a non-compound claim, and a cache to
+///   replace): full ignorance on this frame (`vacated` true). Bel 0, Pl 1,
+///   BetP 1/|frame| (0.5 on the binary frame), no conflict or missing mass,
+///   and the classification `not_enough_info` on every frame (the classifier
+///   gives ignorance that label on the binary frame; on any other frame an
+///   older label would still carry the direction of the evidence that was
+///   left out). The old value was folded from sources narrower than the
+///   claim, so keeping it would go on serving their direction and weight to
+///   every reader.
+/// * Otherwise (no BBA on the frame, or every BBA inadmissible but the claim
+///   has no cache, is a compound, or has admissible input on another frame):
+///   `None`.
+///
+/// `frame_overrides` is the frame's `belief_profile` object, taken from the
+/// frame row the caller already loaded under `viewer` (every caller loads it
+/// before combining and stops when the frame is invisible), so the frame tier
+/// costs no query here and always comes from the same visible row as the
+/// per-frame keys.
+async fn compute_combined_belief(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
+) -> Result<Option<(CombinedBeliefPreview, bool)>, String> {
+    let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
+        .await
+        .map_err(|e| format!("get_for_claim_frame: {e}"))?;
+    let had_input = !rows.is_empty();
+    let folded = compute_combined_belief_over(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        frame_overrides,
+        rows,
+    )
+    .await?;
+    // `None` with input on the frame: the scope rule left none of it.
+    match folded {
+        Some(preview) => Ok(Some((preview, false))),
+        None if had_input
+            && crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id)
+                .await
+                .map_err(|e| format!("derivation scope read: {e}"))? =>
+        {
+            let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+            let ignorance = MassFunction::vacuous(frame.clone());
+            let mut preview = preview_of_combined(
+                &mut *conn, viewer, claim_id, frame_id, frame, &profile, &ignorance, 0.0, false,
+            )
+            .await?;
+            preview
+                .classification
+                .get_or_insert_with(|| VACATED_CLASSIFICATION.to_string());
+            Ok(Some((preview, true)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The classification a vacated cache carries on every frame (ruling R-80):
+/// the label the classifier gives full ignorance on the binary frame.
+const VACATED_CLASSIFICATION: &str = "not_enough_info";
+
+/// Write half of the combine pipeline: persist what [`compute_combined_belief`]
+/// computes to `claims.{belief, plausibility, pignistic_prob, conflict_k,
+/// missing_mass}` (and `classification`: on the binary frame, or on any
+/// frame when the cache is vacated under ruling R-80). No-ops (does not
+/// write) when the claim has no BBAs on `frame_id`, or none the scope rule
+/// admits and nothing to vacate.
 async fn recompute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_id: Uuid,
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
+    frame_overrides: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let Some(preview) =
-        compute_combined_belief(&mut *conn, viewer, claim_id, frame_id, frame).await?
+    let Some((preview, vacated)) = compute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        frame_id,
+        frame,
+        frame_overrides,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -1058,6 +1357,16 @@ async fn recompute_combined_belief(
     )
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
+    if vacated {
+        tracing::info!(
+            target: "epigraph::belief_cache::vacate",
+            claim = %claim_id,
+            frame = %frame_id,
+            written,
+            "no BBA of the claim may enter its cache (derivation scope); \
+             cache set to full ignorance"
+        );
+    }
 
     // The verdict belongs to the cache it describes: when the cache was not
     // written (a non-owner on a frame the claim's cache does not carry,
@@ -1141,6 +1450,10 @@ async fn recompute_combined_belief(
 /// query over its leaves rather than a fold of its own BBAs. So this function
 /// never makes a claim's cache emptier than it was. Every caller inherits
 /// both, including the per-write `routes::assess` refresh.
+///
+/// The one exception is ruling R-80: a claim whose every BBA the derivation
+/// scope rule keeps out of its cache gets full ignorance in place of its old
+/// value (see `recompute_combined_belief`); a claim with no cache keeps none.
 ///
 /// Resolving the owner is a read: this function creates no frame. (It used to
 /// get-or-create `binary_truth` here only to compare ids.)
@@ -1384,7 +1697,7 @@ pub async fn recompute_atom_cache_with(
     legacy: LegacyFold,
     settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    use crate::atom_items::{atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode};
+    use crate::atom_items::{atom_axiom_rows_under, atom_fold_under, AtomFoldMode, AxiomMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     if let CacheWriteCause::EvidenceRemoved(before) = cause {
@@ -1432,6 +1745,8 @@ pub async fn recompute_atom_cache_with(
     }
 
     let ctx = crate::belief_query::FramedBeliefContext::global();
+    // The classifier reads the same profile the fold runs under.
+    let thresholds = ctx.profile().classifier.thresholds();
     let rows = atom_axiom_rows_under(
         &mut *conn,
         viewer,
@@ -1453,7 +1768,7 @@ pub async fn recompute_atom_cache_with(
                 claim_id,
                 &crate::atom_items::EvidencedInterval::unproven(),
                 false,
-                &ctx.calibration,
+                &thresholds,
             )
             .await?;
             if written {
@@ -1475,21 +1790,130 @@ pub async fn recompute_atom_cache_with(
         return Ok(AtomCacheOutcome::KeptEmpty);
     }
 
-    let interval = atom_fold(&rows)?;
-    let thresholds = &ctx.calibration.classifier_thresholds;
+    let interval = atom_fold_under(&rows, ctx.profile())?;
     let has_opposing = rows.iter().any(|r| {
         measures::pignistic_probability(r.coarse(), 1) > thresholds.has_opposing_threshold
     });
+    let written =
+        write_atom_cache(conn, viewer, claim_id, &interval, has_opposing, &thresholds).await?;
+    Ok(AtomCacheOutcome::Folded { interval, written })
+}
+
+/// What [`vacate_atom_cache`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VacateOutcome {
+    /// The explicit vacuous cache was offered; `written` is whether the
+    /// cache took it (as for [`AtomCacheOutcome::Folded`]).
+    Vacated { written: bool },
+    /// The claim is not visible to the viewer: nothing was written.
+    NotVisible,
+    /// The claim is a compound: nothing was written, and
+    /// [`compound_cache_write_skipped`] counts it.
+    Compound,
+    /// A procedural or rule claim, whose cache is not an atom's: nothing
+    /// was written.
+    NotAnAtom,
+    /// The claim is not current (superseded or marked a duplicate): it is
+    /// no atom of the corpus, so nothing was written.
+    NotCurrent,
+    /// The atom has AEF input, so it is not residue: vacating it would
+    /// erase an evidence-backed value. Nothing was written.
+    HasAefInput,
+}
+
+/// The accepted-vacate write (SPEC §10.5): give a RESIDUE atom (a standalone
+/// or leaf with no AEF input) the explicit vacuous cache (Bel 0, Pl 1, BetP
+/// .5, stamped `binary_truth`), which reads back as `unproven`. Never NULL.
+///
+/// The caller decides WHICH atoms (only ids on an operator-accepted list);
+/// this function refuses every claim the vacate is not for, whatever the
+/// list says ([`vacate_refusal`]). The PR-0 guard keeps every bulk recompute
+/// from writing this value, so this is the one bulk path to it.
+///
+/// # Errors
+/// A database read or write.
+pub async fn vacate_atom_cache(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    compound_source_edges: crate::atom_items::CompoundSourceEdges,
+) -> Result<VacateOutcome, String> {
+    if let Some(refused) =
+        vacate_refusal(&mut *conn, viewer, claim_id, compound_source_edges).await?
+    {
+        if refused == VacateOutcome::Compound {
+            COMPOUND_CACHE_WRITE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(refused);
+    }
+    let ctx = crate::belief_query::FramedBeliefContext::global();
+    // The classifier reads the same profile the fold runs under.
+    let thresholds = ctx.profile().classifier.thresholds();
     let written = write_atom_cache(
         conn,
         viewer,
         claim_id,
-        &interval,
-        has_opposing,
-        &ctx.calibration,
+        &crate::atom_items::EvidencedInterval::unproven(),
+        false,
+        &thresholds,
     )
     .await?;
-    Ok(AtomCacheOutcome::Folded { interval, written })
+    Ok(VacateOutcome::Vacated { written })
+}
+
+/// Why [`vacate_atom_cache`] refuses `claim_id` (the outcome it returns
+/// without writing), or `None` when it would write the vacuous cache. The
+/// ONE refusal ladder: the vacate and its dry run both read it. Writes
+/// nothing.
+///
+/// Refused: a claim the viewer cannot see, a claim that is not current, a
+/// compound, a procedural or rule claim, and an atom with AEF input (read as
+/// the single atom-cache writer reads it, under `compound_source_edges`).
+///
+/// # Errors
+/// A database read.
+pub async fn vacate_refusal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    compound_source_edges: crate::atom_items::CompoundSourceEdges,
+) -> Result<Option<VacateOutcome>, String> {
+    use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
+
+    let roles = roles_batch(&mut *conn, viewer, &[claim_id])
+        .await
+        .map_err(|e| format!("roles_batch: {e}"))?;
+    let Some(role) = roles.get(&claim_id).copied() else {
+        return Ok(Some(VacateOutcome::NotVisible));
+    };
+    let current: Option<bool> = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| format!("is_current: {e}"))?;
+    match current {
+        None => return Ok(Some(VacateOutcome::NotVisible)),
+        Some(false) => return Ok(Some(VacateOutcome::NotCurrent)),
+        Some(true) => {}
+    }
+    match role {
+        ClaimRole::Compound { .. } => return Ok(Some(VacateOutcome::Compound)),
+        ClaimRole::Procedural | ClaimRole::Rule => return Ok(Some(VacateOutcome::NotAnAtom)),
+        ClaimRole::Standalone | ClaimRole::Atom => {}
+    }
+    let ctx = crate::belief_query::FramedBeliefContext::global();
+    let has_input = crate::atom_items::atom_axiom_rows_under(
+        &mut *conn,
+        viewer,
+        &[claim_id],
+        crate::atom_items::AxiomMode::Display,
+        &ctx,
+        compound_source_edges,
+    )
+    .await?
+    .get(&claim_id)
+    .is_some_and(|rows| !rows.is_empty());
+    Ok(has_input.then_some(VacateOutcome::HasAefInput))
 }
 
 /// Write an AEF value to the claim's cache, stamped `binary_truth`, and its
@@ -1500,7 +1924,7 @@ async fn write_atom_cache(
     claim_id: Uuid,
     interval: &crate::atom_items::EvidencedInterval,
     has_opposing: bool,
-    calibration: &CalibrationConfig,
+    thresholds: &crate::calibration::ClassifierThresholds,
 ) -> Result<bool, String> {
     let binary = ensure_binary_frame(&mut *conn, viewer).await?;
     let written = MassFunctionRepository::update_claim_belief(
@@ -1524,7 +1948,7 @@ async fn write_atom_cache(
             interval.pignistic_prob(),
             interval.pignistic_false(),
             has_opposing,
-            &calibration.classifier_thresholds,
+            thresholds,
         );
         MassFunctionRepository::update_claim_classification(
             &mut *conn,
@@ -1543,11 +1967,20 @@ pub async fn ensure_binary_frame(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
+    ensure_binary_frame_row(conn, viewer).await.map(|r| r.id)
+}
+
+/// [`ensure_binary_frame`], returning the frame row (its `properties` carry
+/// the frame tier of the belief profile).
+async fn ensure_binary_frame_row(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<epigraph_db::FrameRow, String> {
     if let Some(row) = FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
         .await
         .map_err(|e| format!("get_by_name: {e}"))?
     {
-        return Ok(row.id);
+        return Ok(row);
     }
     let hyps: Vec<String> = BINARY_HYPOTHESES.iter().map(|s| (*s).to_string()).collect();
     // Under its own SAVEPOINT because the failure below is swallowed into a
@@ -1572,7 +2005,7 @@ pub async fn ensure_binary_frame(
             sp.commit().await.map_err(|e| {
                 format!("binary_truth: could not release the create savepoint: {e}")
             })?;
-            Ok(row.id)
+            Ok(row)
         }
         Err(_) => {
             sp.rollback()
@@ -1581,7 +2014,6 @@ pub async fn ensure_binary_frame(
             FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
                 .await
                 .map_err(|e| format!("fallback get_by_name: {e}"))?
-                .map(|r| r.id)
                 .ok_or_else(|| "binary_truth frame missing after create attempt".to_string())
         }
     }

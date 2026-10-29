@@ -166,15 +166,25 @@ fn evidence_from_row(
 impl EvidenceRepository {
     /// Create new evidence in the database.
     ///
-    /// # Why the executor is generic
+    /// # Why the connection is generic
     ///
     /// Same reason as
     /// [`ReasoningTraceRepository::create`](crate::ReasoningTraceRepository::create),
     /// and see that doc for the full argument: an `evidence` INSERT belongs in
     /// the SAME transaction as the claim it derives from, and a `&PgPool`
     /// parameter made that impossible to express. `&PgPool` and
-    /// `&mut PgConnection` both satisfy [`sqlx::PgExecutor`], so existing
-    /// pool-taking callers are unaffected.
+    /// `&mut PgConnection` both satisfy [`sqlx::Acquire`], so existing
+    /// pool-taking callers are unaffected. `Acquire` rather than an executor,
+    /// because the write and its de-duplication are one unit: a transaction
+    /// on a pool, a savepoint inside the caller's transaction.
+    ///
+    /// # De-duplicated per owner, in the application
+    ///
+    /// Evidence has no unique key over its body (migration 171). An identical
+    /// body on the same claim, under the owner and visibility this row gets, is
+    /// refused as [`DbError::DuplicateKey`] and writes nothing; see
+    /// [`Self::same_tenancy_duplicate`]. A body another owner holds is never
+    /// consulted, so a write cannot learn whether one exists.
     ///
     /// `evidence` differs from `reasoning_traces` in one respect worth naming so
     /// nobody concludes this change was unnecessary: a deployment may carry an
@@ -185,18 +195,15 @@ impl EvidenceRepository {
     /// what made the 42501 look like a `reasoning_traces`-only defect.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, evidence))]
-    pub async fn create<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `DbError::DuplicateKey` for a same-owner duplicate (nothing is
+    /// written), `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, evidence))]
+    pub async fn create<'c, A: sqlx::Acquire<'c, Database = sqlx::Postgres>>(
+        conn: A,
         evidence: &Evidence,
     ) -> Result<Evidence, DbError> {
-        Self::create_with_source_url(
-            executor,
-            evidence,
-            Self::source_url_of(&evidence.evidence_type),
-        )
-        .await
+        Self::create_with_source_url(conn, evidence, Self::source_url_of(&evidence.evidence_type))
+            .await
     }
 
     /// The URL an evidence type carries that belongs in `evidence.source_url`:
@@ -224,10 +231,10 @@ impl EvidenceRepository {
     /// (`epigraph_engine::source_dependence`, backlog 4c42c0bf).
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, evidence))]
-    pub async fn create_with_source_url<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// As [`Self::create`].
+    #[instrument(skip(conn, evidence))]
+    pub async fn create_with_source_url<'c, A: sqlx::Acquire<'c, Database = sqlx::Postgres>>(
+        conn: A,
         evidence: &Evidence,
         source_url: Option<&str>,
     ) -> Result<Evidence, DbError> {
@@ -246,6 +253,7 @@ impl EvidenceRepository {
         let signature = evidence.signature.as_ref().map(|s| s.as_slice());
         let signer_id: Option<Uuid> = evidence.signature.as_ref().map(|_| agent_id);
 
+        let mut tx = conn.begin().await?;
         let row = sqlx::query!(
             r#"
             INSERT INTO evidence (
@@ -267,8 +275,14 @@ impl EvidenceRepository {
             evidence_type_json,
             created_at
         )
-        .fetch_one(executor)
+        .fetch_one(&mut *tx)
         .await?;
+
+        if Self::same_tenancy_duplicate(&mut tx, row.id, &row.content_hash, row.claim_id).await? {
+            tx.rollback().await?;
+            return Err(Self::duplicate());
+        }
+        tx.commit().await?;
 
         // Parse content_hash
         let content_hash: [u8; 32] =
@@ -321,19 +335,24 @@ impl EvidenceRepository {
     /// [`DerivationEvidence::ParentUnavailable`] — one answer, so the caller
     /// cannot use it as an existence oracle.
     ///
-    /// # Idempotent on `(content_hash, claim_id)`
+    /// # Idempotent on `(content_hash, claim_id)` within the row's owner
     ///
-    /// `content_hash` is BLAKE3 of the parent text, and migration 001's
-    /// `evidence_content_hash_claim_unique` makes the INSERT a no-op when the
-    /// same text is already evidence on the claim — a re-applied plan line or
-    /// a concurrent duplicate request. A second parent with DIFFERENT text
-    /// gets its own row, so an atom stated by two parents names both.
+    /// `content_hash` is BLAKE3 of the parent text, and the same-tenancy
+    /// de-duplication every evidence write takes ([`Self::same_tenancy_duplicate`])
+    /// undoes the INSERT when the same text is already evidence on the claim
+    /// under the owner and visibility this row gets — a re-applied plan line or
+    /// a concurrent duplicate request. There is no unique key to name in an
+    /// `ON CONFLICT` (migration 171; the long-lived database never had one, so
+    /// the `ON CONFLICT (content_hash, claim_id)` this used to carry failed
+    /// 42P10 there). A second parent with DIFFERENT text gets its own row, so an
+    /// atom stated by two parents names both.
     ///
     /// The key is the parent's TEXT, not its id, and that has two known
     /// consequences: two parents with byte-identical text (legacy imports
     /// labelled `deduped` can be) share ONE row, naming whichever parent came
-    /// first; and an existing evidence row on the claim whose raw text equals
-    /// the parent's suppresses the derivation row ([`DerivationEvidence::AlreadyPresent`]).
+    /// first; and an existing evidence row on the claim, in the same tenancy,
+    /// whose raw text equals the parent's suppresses the derivation row
+    /// ([`DerivationEvidence::AlreadyPresent`]).
     /// Keying on `properties->>'derived_from_claim'` instead would break the
     /// `content_hash` = BLAKE3(`raw_content`) convention every evidence row
     /// follows. `properties` is the serialized
@@ -389,11 +408,11 @@ impl EvidenceRepository {
             );
         }
 
-        let inserted: Option<Uuid> = sqlx::query_scalar(
+        let mut tx = sqlx::Acquire::begin(&mut *conn).await?;
+        let inserted = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO evidence (content_hash, evidence_type, raw_content, claim_id, properties)
             VALUES ($1, 'document', $2, $3, $4)
-            ON CONFLICT (content_hash, claim_id) DO NOTHING
             RETURNING id
             "#,
         )
@@ -401,13 +420,112 @@ impl EvidenceRepository {
         .bind(&parent_content)
         .bind(claim_id)
         .bind(&properties)
-        .fetch_optional(&mut *conn)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await;
+        let id = match inserted.map_err(DbError::from) {
+            Ok(id) => id,
+            // A database below migration 171 still carries 001's
+            // `(content_hash, claim_id)` key, and this binary deploys first: the
+            // same text already on the claim is the duplicate it always was.
+            // The savepoint keeps the caller's transaction usable.
+            Err(DbError::DuplicateKey { .. }) => {
+                tx.rollback().await?;
+                return Ok(DerivationEvidence::AlreadyPresent);
+            }
+            Err(e) => return Err(e),
+        };
 
-        Ok(match inserted {
-            Some(id) => DerivationEvidence::Recorded(id),
-            None => DerivationEvidence::AlreadyPresent,
-        })
+        if Self::same_tenancy_duplicate(&mut tx, id, content_hash.as_slice(), claim_id).await? {
+            tx.rollback().await?;
+            return Ok(DerivationEvidence::AlreadyPresent);
+        }
+        tx.commit().await?;
+        Ok(DerivationEvidence::Recorded(id))
+    }
+
+    /// Whether the evidence row `id`, just written in `conn`'s transaction,
+    /// duplicates another row: the same `content_hash` on the same claim, with
+    /// the same owner AND visibility.
+    ///
+    /// The de-duplication contract of every evidence write (backlog 12b68201,
+    /// operator ruling R-77). Migration 001's `evidence_content_hash_claim_unique
+    /// UNIQUE (content_hash, claim_id)` spanned owners, so a write that
+    /// collided with a row another group holds, unreadable to the writer, was
+    /// refused, and the refusal confirmed that row and its body. The long-lived
+    /// database never had the key and holds same-owner duplicates, so
+    /// migration 171 drops it everywhere and the contract lives here, as 150
+    /// moved the claim dedup into `ClaimRepository::lock_content_hash_agent`.
+    ///
+    /// # Order: write, read the tenancy, lock, look
+    ///
+    /// The row's owner and visibility are whatever the tenancy triggers gave
+    /// it (inherited from the claim, or the writer's, migration 114), so they
+    /// are read back AFTER the write statement (070's AFTER INSERT statement
+    /// trigger may re-stamp what `RETURNING` reported). Then a
+    /// transaction-scoped advisory lock on `(content_hash, claim_id, owner)`,
+    /// then the lookup, as separate statements: under READ COMMITTED the
+    /// lookup's snapshot is taken after the lock is held, so a concurrent first
+    /// write of the same body either committed before (and is found) or waits
+    /// for this transaction to end. The caller undoes its write (a savepoint)
+    /// when this answers `true`.
+    ///
+    /// # Why a duplicate never discloses anything
+    ///
+    /// Only a row in the SAME tenancy as the one just written counts. The
+    /// caller was allowed to write a row with that owner and visibility, so a
+    /// public match is readable by anyone and a group match is in a group the
+    /// caller can write. A body another owner holds, or the same owner holds
+    /// under a narrower visibility (a pinned row), is never consulted: such a
+    /// write lands exactly as a fresh body does. Existing same-tenancy
+    /// duplicates (the long-lived database holds them) stay valid; a third copy
+    /// is simply refused.
+    ///
+    /// A row the session cannot read back (no such row, or RLS) is not
+    /// de-duplicated: there is no tenancy to key the lock on.
+    async fn same_tenancy_duplicate(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        content_hash: &[u8],
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let tenancy: Option<(Uuid, String)> =
+            sqlx::query_as("SELECT owner_group_id, visibility::text FROM evidence WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        let Some((owner, visibility)) = tenancy else {
+            return Ok(false);
+        };
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtext('epigraph.evidence_dedup'), \
+                    hashtext(encode($1, 'hex') || $2::text || $3::text))",
+        )
+        .bind(content_hash)
+        .bind(claim_id)
+        .bind(owner)
+        .execute(&mut *conn)
+        .await?;
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM evidence \
+                             WHERE content_hash = $1 AND claim_id = $2 \
+                               AND owner_group_id = $3 AND visibility::text = $4 \
+                               AND id <> $5)",
+        )
+        .bind(content_hash)
+        .bind(claim_id)
+        .bind(owner)
+        .bind(&visibility)
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
+    /// The answer a same-tenancy duplicate gets: the `DbError` a unique
+    /// violation maps to, so callers see what they saw under 001's key.
+    fn duplicate() -> DbError {
+        DbError::DuplicateKey {
+            entity: "entity".to_string(),
+        }
     }
 
     /// Get evidence by ID
@@ -884,9 +1002,31 @@ impl EvidenceRepository {
     ///
     /// A `WHERE` predicate decides which ROW a statement may touch. It says
     /// nothing about the VALUES the `SET` clause assigns. This function only
-    /// ever assigns `raw_content`, so the gap is not reachable here — but a
-    /// future write fn that lets a caller assign `owner_group_id` is not made
-    /// safe by carrying this marker.
+    /// ever assigns `raw_content` and the `content_hash` derived from it, so
+    /// the gap is not reachable here — but a future write fn that lets a
+    /// caller assign `owner_group_id` is not made safe by carrying this marker.
+    ///
+    /// # `content_hash` moves with the body
+    ///
+    /// `content_hash` is set to BLAKE3(`raw_content`) in the same statement
+    /// (backlog 9e7a9a96). `POST /api/v1/evidence` refuses a stored digest
+    /// that disagrees with its body; rewriting the body alone left exactly
+    /// that row behind, where no create-time check could see it. Computed
+    /// here, not in the handler, so no caller can update one column without
+    /// the other. A new body equal to a sibling row's on the same claim, in
+    /// the same tenancy, is refused as `DbError::DuplicateKey`, writing nothing
+    /// (the de-duplication every evidence write takes,
+    /// [`Self::same_tenancy_duplicate`]); a body only another owner holds is
+    /// not consulted, so the rewrite lands. A rewrite to the body the row
+    /// already holds creates no new duplicate and is never refused, so a
+    /// member of a same-owner duplicate pair stored before migration 171 stays
+    /// writable. Backfilling a body onto
+    /// external evidence (stored with `raw_content` NULL and a caller-supplied
+    /// digest) replaces that digest with BLAKE3(body), deliberately: the row
+    /// then describes, and can be checked against, the body it holds.
+    ///
+    /// A row holding the seal sentinel (its claim is sealed) is not
+    /// rewritten and reports `false`, like an unwritable row.
     ///
     /// # Returns
     ///
@@ -896,29 +1036,60 @@ impl EvidenceRepository {
     /// the existence of evidence in a group the caller cannot write to.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer, raw_content))]
-    pub async fn update_raw_content<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `DbError::DuplicateKey` for a same-tenancy duplicate (nothing is
+    /// written), `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, raw_content))]
+    pub async fn update_raw_content<'c, A: sqlx::Acquire<'c, Database = sqlx::Postgres>>(
+        conn: A,
         viewer: &crate::visibility::Viewer,
         id: EvidenceId,
         raw_content: &str,
     ) -> Result<bool, DbError> {
+        // `$4` is the seal sentinel: a sealed claim's evidence is refused like
+        // an unwritable row. Unseal writes the original body back and keeps
+        // the original digest, so a PUT here would leave plaintext over a seal
+        // and, after unseal, a digest that is not BLAKE3(raw_content).
         let sql = viewer.splice_write(
-            "UPDATE evidence AS e SET raw_content = $2 \
+            "UPDATE evidence AS e SET raw_content = $2, content_hash = $3 \
              WHERE e.id = $1 \
-               /* {WRITABLE:e} */",
-            3,
+               AND e.raw_content IS DISTINCT FROM $4 \
+               /* {WRITABLE:e} */ \
+             RETURNING e.claim_id",
+            5,
         );
         let uuid: Uuid = id.into();
-        let mut q = sqlx::query(&sql).bind(uuid).bind(raw_content);
+        let content_hash = blake3::hash(raw_content.as_bytes());
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(uuid)
+            .bind(raw_content)
+            .bind(content_hash.as_bytes().as_slice())
+            .bind(crate::repos::privatization::SEAL_EVIDENCE_SENTINEL);
         // Conditional, not `unwrap_or(&[])`: a `Bypass` viewer renders `" "` and
-        // the statement therefore has no `$3` to fill. Binding unconditionally
+        // the statement therefore has no `$5` to fill. Binding unconditionally
         // would over-supply the maintenance path by one parameter.
         if let Some(w) = viewer.writable_bind() {
             q = q.bind(w);
         }
-        Ok(q.execute(executor).await?.rows_affected() > 0)
+
+        let mut tx = conn.begin().await?;
+        let previous: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT content_hash FROM evidence WHERE id = $1")
+                .bind(uuid)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(claim_id) = q.fetch_optional(&mut *tx).await? else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let digest = content_hash.as_bytes().as_slice();
+        if previous.as_deref() != Some(digest)
+            && Self::same_tenancy_duplicate(&mut tx, uuid, digest, claim_id).await?
+        {
+            tx.rollback().await?;
+            return Err(Self::duplicate());
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Delete evidence by ID
@@ -1197,7 +1368,9 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if any database operation fails.
-    /// Returns `DbError::DuplicateKey` if any evidence ID already exists.
+    /// Returns `DbError::DuplicateKey` if any evidence ID already exists, or any
+    /// row duplicates another in its tenancy ([`Self::same_tenancy_duplicate`]);
+    /// nothing is written then.
     ///
     /// # Performance
     /// - Batch size is limited internally to prevent memory issues
@@ -1285,6 +1458,20 @@ impl EvidenceRepository {
 
         let rows = query.fetch_all(&mut *tx).await?;
 
+        // The same de-duplication as `create`, row by row, in key order so two
+        // batches lock in the same order. Any duplicate refuses the whole
+        // batch, as a unique violation did: `tx` rolls back on return.
+        let mut in_key_order: Vec<&EvidenceRow> = rows.iter().collect();
+        in_key_order.sort_by(|a, b| {
+            (&a.content_hash, a.claim_id, a.id).cmp(&(&b.content_hash, b.claim_id, b.id))
+        });
+        for row in in_key_order {
+            if Self::same_tenancy_duplicate(&mut tx, row.id, &row.content_hash, row.claim_id)
+                .await?
+            {
+                return Err(Self::duplicate());
+            }
+        }
         tx.commit().await?;
 
         // Convert rows to Evidence

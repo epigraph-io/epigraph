@@ -217,6 +217,15 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          only the one revoke.",
     ),
     (
+        "group_role_bindings",
+        "DELETE",
+        "A role-to-group binding (165) is ended by its `revoked_at` stamp, never deleted: \
+         the row is the record that a role conferred a group's membership, from when to \
+         when. The bypass-only INSERT and UPDATE pair stops short of FOR ALL on purpose \
+         (123's role_assignments pair is the template), 165 grants DELETE to nobody, its \
+         update guard admits only the one end, and its delete guard refuses every role.",
+    ),
+    (
         "passkey_enrollments",
         "DELETE",
         "An enrollment ticket (124) is never deleted: it ends by expiring or by its one \
@@ -315,6 +324,24 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    (
+        "workflows",
+        "DELETE",
+        "A workflow row (183) is never deleted by the application: deprecation lowers its \
+         truth value, and no route or tool removes a row. Under FORCE the absent permissive \
+         DELETE policy default-denies every non-superuser role, and 183's restrictive \
+         `workflows_delete_owner` would hold a delete to the owner group's writers if one \
+         were ever added.",
+    ),
+    (
+        "role_agents",
+        "DELETE",
+        "A role attachment (166) is ended by its detach stamp, never deleted: the row is the \
+         record that the agent belonged to the role, from when to when. Under FORCE the \
+         absent DELETE policy default-denies every non-superuser role, 166 grants DELETE to \
+         nobody, and its guards refuse DELETE and TRUNCATE for every role, a superuser \
+         included, short of disabling triggers.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -386,6 +413,11 @@ const PROTECTED: &[&str] = &[
     "agent_prompt_blobs",
     "agent_prompt_snapshots",
     "agent_succession",
+    "group_role_bindings",
+    "role_agents",
+    "harvester_sources",
+    "harvester_audit_reports",
+    "workflows",
 ];
 
 // ===========================================================================
@@ -1538,6 +1570,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_definer_bypass()`), i.e. the maintenance session or 148's audit trigger.",
         ),
         (
+            "challenges_claim_readable",
+            "challenges.claim_id",
+            "168's RESTRICTIVE read policy (ruling R-CH1b): its arm `EXISTS (SELECT 1 FROM \
+             claims c WHERE c.id = challenges.claim_id)` names no session helper itself, but the \
+             subquery reads `claims` with the reader's own rights, so it is `claims`' policies \
+             (077's session arms, 126's elevated read) that answer it: session-derived through \
+             the subquery. A restrictive policy is AND-ed with the permissive \
+             `challenges_tenancy` and grants nothing; the two session arms beside it keep the \
+             maintenance session and the definers unfiltered.",
+        ),
+        (
             "security_events_cascade_privileged",
             "cascade.",
             "117's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 8) <> \
@@ -1556,6 +1599,16 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              other row still needs 077's attribution arms; an `agent.identity_*` row needs one of \
              the two session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), \
              i.e. the maintenance session or 161's registration definer.",
+        ),
+        (
+            "security_events_group_roster_privileged",
+            "group.",
+            "164's RESTRICTIVE insert policy: its row-only arm (`left(event_type, 6) <> \
+             'group.'`) says WHICH rows the restriction applies to, and grants nothing. A \
+             restrictive policy is AND-ed with the permissive `security_events_append`, so every \
+             other row still needs 077's attribution arms; a `group.*` row needs one of the two \
+             session arms beside it (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the \
+             maintenance session or one of 164's team-group definers.",
         ),
     ];
 
@@ -2213,7 +2266,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
 
     let (edge_vis, edge_owner): (String, Uuid) = sqlx::query_as(
         "SELECT visibility, owner_group_id FROM edges \
-         WHERE source_id = $1 AND target_id = $2 AND relationship = 'CORROBORATES'",
+         WHERE source_id = $1 AND target_id = $2 AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)
@@ -2260,7 +2313,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
     let edges_seen: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges \
          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
-           AND relationship = 'CORROBORATES'",
+           AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)
@@ -2292,7 +2345,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
     let total: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges \
          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
-           AND relationship = 'CORROBORATES'",
+           AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)

@@ -113,18 +113,21 @@ impl MatchVerdict {
 pub const REJECTED_RELATIONSHIP: &str = "llm_rejected";
 
 /// Edge relationship for a corroborating promotion.
-pub const CORROBORATES_RELATIONSHIP: &str = "CORROBORATES";
+///
+/// Lower case, the canonical spelling every edge writer stores
+/// (`epigraph_core::edge::relationships::canonical_relationship`, backlog
+/// 3ce5e00c). It was `CORROBORATES`; rows the matcher wrote under that spelling
+/// stay until the operator case-fold, and every reader and the matcher's
+/// unique index (migration 175) match both spellings meanwhile.
+pub const CORROBORATES_RELATIONSHIP: &str = "corroborates";
 
 /// Edge relationship for a contradicting promotion.
 ///
-/// **Lowercase on purpose.** [`EdgeRepository::create_symmetric_if_absent`] and
-/// every consumer query dedup/filter on an exact `relationship = <string>`
-/// comparison, so casing is identity, not style. Both the automatic path
+/// **Lowercase on purpose**, like [`CORROBORATES_RELATIONSHIP`]: the canonical
+/// spelling. Both the automatic path
 /// (`matching::policy`'s `WriteContradicts` arm) and the human-decide path must
 /// emit the same byte string or the same pair acquires two edges and every
 /// `WHERE relationship = 'contradicts'` query sees half the population.
-///
-/// [`EdgeRepository::create_symmetric_if_absent`]: epigraph_db::EdgeRepository::create_symmetric_if_absent
 pub const CONTRADICTS_RELATIONSHIP: &str = "contradicts";
 
 /// What promoting a `match_candidates` row should write to the graph.

@@ -1470,8 +1470,16 @@ async fn test_concurrent_searches_dont_block_each_other() {
     // If requests were blocking each other sequentially, max_time would be
     // roughly num_concurrent * avg_time. Check that they ran concurrently.
     // Use min_time + 1 to handle the case where min_time is 0ms (fast mocks).
+    //
+    // The ratio alone is noise-bound when the mocks answer in ~0 ms: then it
+    // demands max < 5 ms, and scheduler jitter on a loaded gate host (6-29 ms
+    // observed) failed it with no blocking at all. Serialized requests show up
+    // as a multiple of a real request time, so a run whose slowest request
+    // finished within NOISE_FLOOR_MS cannot have been blocked in a way this
+    // test exists to catch.
+    const NOISE_FLOOR_MS: u128 = 250;
     assert!(
-        max_time < (min_time + 1) * 5,
+        max_time < (min_time + 1) * 5 || max_time < NOISE_FLOOR_MS,
         "Concurrent searches appear to be blocking. min={}ms, max={}ms",
         min_time,
         max_time

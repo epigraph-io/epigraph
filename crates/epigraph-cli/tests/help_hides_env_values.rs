@@ -41,6 +41,11 @@ const CROSS_SOURCE_SWEEP: Option<&str> = None;
 /// relative to the crate root)`.
 const BINS: &[(&str, Option<&str>, &str)] = &[
     (
+        "backfill_dedup_identity_edges",
+        Some(env!("CARGO_BIN_EXE_backfill_dedup_identity_edges")),
+        "src/bin/backfill_dedup_identity_edges.rs",
+    ),
+    (
         "backfill_evidence_type",
         Some(env!("CARGO_BIN_EXE_backfill_evidence_type")),
         "src/bin/backfill_evidence_type.rs",

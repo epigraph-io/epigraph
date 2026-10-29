@@ -218,8 +218,11 @@ intra_evidence_locality_factor = 0.3
 
 # ── Split-Conformal Prediction Sets ────────────────
 # Per-class nonconformity quantiles q_c, fit by scripts/calibrate_conformal.py
-# over 1189 labelled SciFact fixtures (split-conformal, alpha=0.1,
-# seed=42). score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
+# on ALL 1189 labelled SciFact fixtures (alpha=0.1). No held-out split:
+# the calibration n is the full corpus. Held-out coverage is measured
+# separately by `calibrate_conformal.py --check`, which fits on a stratified
+# 50% split (seed=42) and scores the rest.
+# score_c = 1 - BetP_c (supported/contradicted) or 1 - theta (NEI);
 # class c is in the prediction set iff score_c <= q_c. Calibration n per class:
 # supported=508 contradicted=265 not_enough_info=416.
 [conformal]
@@ -229,3 +232,18 @@ alpha = 0.1
 supported        = 0.414726
 contradicted     = 0.367560
 not_enough_info  = 0.117009
+
+# ── Belief Profiles ─────────────────────────────────────────────────────────
+# Named overrides of the belief profile (crates/epigraph-engine/src/belief_profile.rs).
+# The served profile is built from the sections above, then the table named
+# "opinionated-v1" below (if present) overrides any parameter by name, e.g.
+#
+#   [belief_profiles."opinionated-v1".reliability]
+#   intra_evidence_locality_factor = 0.3
+#
+#   [belief_profiles."opinionated-v1"]
+#   testimonial_ceiling = 0.1
+#
+# A table that names an unknown parameter or carries an out-of-range value is
+# ignored as a whole (with a warning). Changing the default profile changes
+# served values: it is a cache event (recompute the cohort).

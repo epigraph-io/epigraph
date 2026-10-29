@@ -169,6 +169,12 @@ name = "belief_cache_bins"
 path = "tests/belief_cache_bins.rs"
 required-features = ["db"]
 
+# Cohort-v2 waves of `recompute_betp` as real processes (`db`-gated bins).
+[[test]]
+name = "recompute_betp_wave"
+path = "tests/recompute_betp_wave.rs"
+required-features = ["db"]
+
 # Spawns the wave bins (`db`-gated) against a fixture `/health`.
 [[test]]
 name = "belief_mode_check_bins"
@@ -234,6 +240,20 @@ name = "backfill_evidence_type"
 path = "src/bin/backfill_evidence_type.rs"
 required-features = ["db"]
 
+# The identity-edge backfill for duplicates the legacy raw-SQL
+# fuzzy_dedup_claims marked (backlog d5781a48). Dry run unless --apply.
+[[bin]]
+name = "backfill_dedup_identity_edges"
+path = "src/bin/backfill_dedup_identity_edges.rs"
+required-features = ["db"]
+
+# Spawns the `db`-gated binary above; without `db` its CARGO_BIN_EXE_* does
+# not exist and the test would not compile.
+[[test]]
+name = "backfill_dedup_identity_edges_bin"
+path = "tests/backfill_dedup_identity_edges_bin.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every
@@ -256,7 +276,7 @@ required-features = ["db"]
 #
 # `required-features = ["db"]` matches its sibling. `db` IS in this crate's
 # default feature set, so `--workspace --all-targets` builds this target; the
-# `genai`-gated targets are the ones the four gates miss, and this is not one.
+# `genai`-gated targets are built only by the lint job's genai check.
 [[bin]]
 name = "epigraph-instance-admin"
 path = "src/bin/instance_admin.rs"
