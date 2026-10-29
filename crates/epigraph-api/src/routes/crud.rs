@@ -866,6 +866,33 @@ pub struct UpsertClusterRequest {
     pub properties: Option<serde_json::Value>,
 }
 
+/// 404 unless `viewer` can read claim `id`, exactly as for a missing claim.
+///
+/// `upsert_cluster` and `assign_claim_to_frame` bind a CLAIM to a frame and
+/// read only the frame through the caller's viewer, so a `claims:admin` caller
+/// could bind a claim it cannot read (backlog 4815dcf7). Their siblings
+/// (`reassign_claim` here, `forget_convention` in `conventions.rs`) already read
+/// their claim through the viewer first; this is that read, on a stamped
+/// connection with the spliced predicate.
+#[cfg(feature = "db")]
+async fn require_readable_claim(
+    state: &AppState,
+    viewer: &epigraph_db::Viewer,
+    id: Uuid,
+) -> Result<(), ApiError> {
+    let mut read = state.read_as(viewer).await?;
+    let visible =
+        epigraph_db::ClaimRepository::visible_claim_ids(&mut *read, viewer, &[id]).await?;
+    if visible.contains(&id) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: id.to_string(),
+        })
+    }
+}
+
 /// Upsert a claim's cluster assignment
 ///
 /// POST /api/v1/clusters
@@ -887,6 +914,8 @@ pub async fn upsert_cluster(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
+
+    require_readable_claim(&state, &viewer, request.claim_id).await?;
 
     let frame_name = format!("cluster:{}", request.cluster_label);
 
@@ -995,6 +1024,7 @@ pub async fn assign_claim_to_frame(
             entity: "Frame".to_string(),
             id: frame_id.to_string(),
         })?;
+    require_readable_claim(&state, &viewer, request.claim_id).await?;
 
     FrameRepository::assign_claim(
         &state.db_pool,
