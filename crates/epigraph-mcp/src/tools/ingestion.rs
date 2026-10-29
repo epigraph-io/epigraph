@@ -1232,7 +1232,11 @@ pub async fn do_ingest_document(
         // Bind the PLANNER's hash, not `hash(content)`: for document-scoped
         // nodes it folds in the artifact seed (see `ids::compound_content_hash`).
         claim.content_hash = planned.content_hash;
-        claim.signature = Some(server.signer.sign(&claim.content_hash));
+        claim.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Claim, &claim.content_hash),
+        );
 
         let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
@@ -1316,7 +1320,11 @@ pub async fn do_ingest_document(
             Some(formatted_evidence),
             claim.id,
         );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
+        evidence.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
 
         let trace = ReasoningTrace::new(
             agent_id_typed,
@@ -2188,7 +2196,11 @@ pub async fn do_ingest_document_spine(
         );
         claim.id = ClaimId::from_uuid(planned.id);
         claim.content_hash = planned.content_hash;
-        claim.signature = Some(server.signer.sign(&claim.content_hash));
+        claim.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Claim, &claim.content_hash),
+        );
 
         let (persisted_id, resolved_to_existing, known_author) = persist_planned_claim(
             &mut tx,
@@ -2272,7 +2284,11 @@ pub async fn do_ingest_document_spine(
             Some(formatted_evidence),
             claim.id,
         );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
+        evidence.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
 
         let trace = ReasoningTrace::new(
             agent_id_typed,

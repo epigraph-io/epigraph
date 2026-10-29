@@ -90,7 +90,7 @@ The graph's semantic-search entry point, exposed via the `recall_with_context` M
 
 ## signature
 
-An Ed25519 signature attached to a claim or edge by its signer agent, with `signer_id` identifying the key. Signatures give every assertion in the graph an audit guarantee independent of the database; edge signing is schema-supported (migration 073) and writer-realised per S3 plans. [see 02-concepts.md §2 (Agents and signing)](02-concepts.md#2--agents-and-signing)
+An Ed25519 signature attached to a claim, evidence row or edge by its signer agent, with `signer_id` identifying the key. In-tree writers sign the entity-tagged message `epigraph-sig-v1:<claim|evidence|edge>:` followed by the digest, so a v1 signature cannot be replayed as another entity type's signature. Rows signed before v1 carry a legacy signature over the bare digest, which still verifies for claims and is reported as `legacy`; a legacy signature binds no type, so it CAN be replayed onto a same-digest row of another type, which is why it is reported. Edge signatures are defined and verifiable, v1 only; no edge writer emits them yet. (The canonical-JSON `Signable` struct signatures and packet envelope signatures are a separate, untagged scheme.) [see 02-concepts.md §2 (Agents and signing)](02-concepts.md#2--agents-and-signing)
 
 ## supports
 

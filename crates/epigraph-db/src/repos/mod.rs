@@ -34,6 +34,7 @@ pub mod derivation_scope;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
+pub mod edge_signature;
 pub mod elevated_access;
 pub mod elevation_ceremony;
 pub mod entity;
@@ -199,6 +200,10 @@ pub use workflow::{
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
+pub use edge_signature::{
+    edge_attestation_canonical_json, edge_attestation_digest, EdgeAttestation, EdgeSignOutcome,
+    EdgeSignatureCheck, EdgeSignatureRepository, EdgeSigningCoverage,
+};
 pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRow};
 pub use group::{GroupRepository, GroupRow};
 pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};
