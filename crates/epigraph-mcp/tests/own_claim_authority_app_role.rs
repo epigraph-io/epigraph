@@ -570,6 +570,346 @@ async fn a_writer_of_the_owning_group_may_retire_its_claim_and_a_reader_may_not(
     assert!(!is_current(&pool, c).await);
 }
 
+/// Every `AUTHORED` edge into `claim`: `(source_id, source_type, properties)`.
+async fn authored_into(pool: &PgPool, claim: Uuid) -> Vec<(Uuid, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT source_id, source_type, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND target_type = 'claim' \
+          ORDER BY source_id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read AUTHORED edges")
+}
+
+/// `(successor id, its author)` of the supersession `r` reported.
+async fn successor_of(pool: &PgPool, r: &rmcp::model::CallToolResult) -> (Uuid, Uuid) {
+    let body = first_text(r);
+    let new: Uuid = body["new_claim_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .expect("new_claim_id");
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(pool)
+        .await
+        .expect("the successor");
+    (new, author)
+}
+
+/// Backlog 73085534 (ruling R-23) over MCP on the application role: a group
+/// writer W supersedes the human H's claim. The successor keeps H as its
+/// author; W, the agent that performed the act, is recorded by exactly one
+/// `AUTHORED` edge to the successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writers_supersede_records_the_writer_as_the_successors_author_edge(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "r23-human").await;
+    let (w, _) = fixture::seed_agent_with_group(&pool, "r23-group-writer").await;
+    add_member(&pool, hg, w, "writer").await;
+    let c = claim_of(&pool, h, hg, "group", "the group's claim").await;
+
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, w).await,
+        supersede_params(c),
+        Some(&human(w, &["claims:write"])),
+    )
+    .await
+    .expect("a writer of the owning group retires its claim");
+    let (new, author) = successor_of(&pool, &r).await;
+    assert_eq!(author, h, "the successor inherits the predecessor's author");
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            w,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "the acting writer is recorded as the successor's AUTHORED edge"
+    );
+}
+
+/// Backlog 1a54283d (ruling R-85 (a)) over MCP on the application role, with
+/// the operator binding ARMED. Human A's live agent X, human B's live agent Y
+/// (a writer of A's group, which B writes too), an unlinked legacy identity L,
+/// and an unbound agent U holding a `writer` membership of A's group; one
+/// claim in A's group by X and one by L. Armed after seeding.
+struct ArmedMcp {
+    server: EpiGraphMcpFull,
+    a: Uuid,
+    x: Uuid,
+    y: Uuid,
+    u: Uuid,
+    legacy: Uuid,
+    x_claim: Uuid,
+    legacy_claim: Uuid,
+}
+
+async fn armed_two_humans_over_mcp(pool: &PgPool) -> ArmedMcp {
+    let (server, _) = app_role_server(pool).await;
+    let (a, ag) = fixture::seed_human_operator(pool, "r85-human-a").await;
+    let (b, _) = fixture::seed_human_operator(pool, "r85-human-b").await;
+    let (x, _) = fixture::seed_agent_with_group(pool, "r85-a-agent-x").await;
+    let (y, _) = fixture::seed_agent_with_group(pool, "r85-b-agent-y").await;
+    let (u, _) = fixture::seed_agent_with_group(pool, "r85-unbound-u").await;
+    let (legacy, _) = fixture::seed_agent_with_group(pool, "r85-unlinked-legacy").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, x, a)
+            .await
+            .expect("X's live link");
+        epigraph_db::AgentRepository::link_operator(&mut conn, y, b)
+            .await
+            .expect("Y's live link");
+    }
+    add_member(pool, ag, b, "writer").await;
+    add_member(pool, ag, y, "writer").await;
+    add_member(pool, ag, u, "writer").await;
+    let x_claim = claim_of(pool, x, ag, "public", "X's claim").await;
+    let legacy_claim = claim_of(pool, legacy, ag, "public", "the legacy claim").await;
+    arm_for_test(pool).await;
+    ArmedMcp {
+        server,
+        a,
+        x,
+        y,
+        u,
+        legacy,
+        x_claim,
+        legacy_claim,
+    }
+}
+
+async fn arm_for_test(pool: &PgPool) {
+    sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
+        .execute(pool)
+        .await
+        .expect("arm (the harness stands in for the maintenance role)");
+}
+
+/// `caller` supersedes `old` over MCP with `claims:write`.
+async fn mcp_supersede(
+    pool: &PgPool,
+    server: &EpiGraphMcpFull,
+    caller: Uuid,
+    old: Uuid,
+) -> Result<rmcp::model::CallToolResult, epigraph_mcp::errors::McpError> {
+    supersede_claim(
+        server,
+        &viewer(pool, caller).await,
+        supersede_params(old),
+        Some(&human(caller, &["claims:write"])),
+    )
+    .await
+}
+
+/// The supersede `r` landed: its successor keeps `author`, its one act edge
+/// names `caller`, and `old` is retired.
+async fn assert_landed_for(
+    pool: &PgPool,
+    r: &rmcp::model::CallToolResult,
+    old: Uuid,
+    author: Uuid,
+    caller: Uuid,
+) {
+    let (new, inherited) = successor_of(pool, r).await;
+    assert_eq!(inherited, author, "the successor inherits the author");
+    let actors: Vec<Uuid> = authored_into(pool, new)
+        .await
+        .into_iter()
+        .map(|(source, _, _)| source)
+        .collect();
+    assert_eq!(actors, vec![caller], "the act edge names the caller");
+    assert!(!is_current(pool, old).await, "the predecessor is retired");
+}
+
+/// R-85 (a) over MCP, armed: B's agent Y restates A's agent X's claim. It
+/// lands; the successor keeps X and its act edge names Y.
+///
+/// Red before migration 185: the database refuses the act (OPL02: X belongs
+/// to A, not to Y's human).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_of_another_humans_agent_is_bound_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_mcp(&pool).await;
+    let r = mcp_supersede(&pool, &s.server, s.y, s.x_claim)
+        .await
+        .unwrap_or_else(|e| panic!("Y is bound and writes the group: {e:?}"));
+    assert_landed_for(&pool, &r, s.x_claim, s.x, s.y).await;
+}
+
+/// R-85 (a) over MCP, armed: A's agent X restates the unlinked legacy
+/// identity L's claim. It lands; the successor keeps L and its act edge names
+/// X.
+///
+/// Red before migration 185: the database refuses the act (OPL01: L is bound
+/// to no human).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_of_an_unbound_legacy_author_is_bound_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_mcp(&pool).await;
+    let r = mcp_supersede(&pool, &s.server, s.x, s.legacy_claim)
+        .await
+        .unwrap_or_else(|e| panic!("X is bound and writes the group: {e:?}"));
+    assert_landed_for(&pool, &r, s.legacy_claim, s.legacy, s.x).await;
+}
+
+/// R-85 (a) over MCP, armed: the binding is still checked on the CALLER. U
+/// holds a `writer` membership of A's group, so the tool's act authority
+/// admits it (the refusal is not the named `not_claim_writer` one), but U is
+/// bound to no human: the database refuses its supersede of X's claim, and
+/// nothing is written. A transport that stamped the act as the inherited
+/// author, or ran it on a privileged session, would land it.
+///
+/// CONTROL: once U is linked to A (X's own human), the same supersede lands
+/// with the act edge naming U, so the refusal was U's binding and nothing
+/// else. The error code the refusal maps to is not pinned here (a separate
+/// follow-up).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_supersede_by_an_unbound_caller_is_refused_on_the_caller(pool: PgPool) {
+    let s = armed_two_humans_over_mcp(&pool).await;
+    let err = mcp_supersede(&pool, &s.server, s.u, s.x_claim)
+        .await
+        .expect_err("an unbound caller may not supersede once armed");
+    let rule = err.data.as_ref().map(|d| d["rule"].clone());
+    assert_ne!(
+        rule,
+        Some(serde_json::json!("not_claim_writer")),
+        "the act authority admits U; the database refuses: {err:?}"
+    );
+    assert!(is_current(&pool, s.x_claim).await, "nothing retired");
+    assert_eq!(successors(&pool, s.x_claim).await, 0, "no successor");
+
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, s.u, s.a)
+            .await
+            .expect("U's live link to A");
+    }
+    let r = mcp_supersede(&pool, &s.server, s.u, s.x_claim)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: U, now bound to A, supersedes: {e:?}"));
+    assert_landed_for(&pool, &r, s.x_claim, s.x, s.u).await;
+}
+
+/// The `claims:admin` borrow: the act runs on the SERVER agent's stamp (the
+/// caller cannot write the group), but the agent that performed it is the
+/// CALLER, so the `AUTHORED` edge names the caller, never the borrowed stamp
+/// (crediting the server agent would misattribute the act exactly as the
+/// inherited author did).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_borrowed_supersede_records_the_caller_not_the_server_agent(pool: PgPool) {
+    let (server, server_agent) = app_role_server(&pool).await;
+    let server_group = personal_group_of(&pool, server_agent).await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "r23-author-x").await;
+    let (a, _) = fixture::seed_agent_with_group(&pool, "r23-admin").await;
+    let c = claim_of(&pool, x, server_group, "public", "X's claim, server group").await;
+    let token = human(a, &["claims:write", "claims:admin"]);
+    seed_admin_grant(&pool, &token).await;
+
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, a).await,
+        supersede_params(c),
+        Some(&token),
+    )
+    .await
+    .expect("claims:admin admits it");
+    let (who, _) = deferral(&pool, &first_text(&r)).await;
+    assert_eq!(
+        who,
+        Some(server_agent),
+        "calibration: the stamp was borrowed"
+    );
+    let (new, author) = successor_of(&pool, &r).await;
+    assert_eq!(author, x, "the successor inherits the predecessor's author");
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            a,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "the caller, not the borrowed server stamp, is recorded"
+    );
+}
+
+/// Backlog 1a54283d (ruling R-85 (a)): the `claims:admin` borrow with the
+/// operator binding ARMED. The borrowed transaction is stamped with the
+/// SERVER agent's identity, so that identity is the writer the database binds;
+/// the caller is recorded by the act edge. The predecessor is a claim in the
+/// server agent's group by X, a live agent of another human A.
+///
+/// * While the server identity is bound to no human, the borrow is refused by
+///   the writer binding and nothing is written (the stated limit: the
+///   database cannot bind a borrow on the caller, whose stamp it never sees).
+/// * Once the server identity is linked to a human S who writes its group,
+///   the borrow lands: the successor keeps X as its author and its act edge
+///   names the caller.
+///
+/// Red before migration 185 at the second step: the database attributes the
+/// inherited author X to the server identity's human and refuses (OPL02: X
+/// belongs to A, not to S).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_armed_admin_borrow_is_bound_on_the_server_identity(pool: PgPool) {
+    let (server, server_agent) = app_role_server(&pool).await;
+    let server_group = personal_group_of(&pool, server_agent).await;
+    let (a, _) = fixture::seed_human_operator(&pool, "r85-borrow-human-a").await;
+    let (s_human, _) = fixture::seed_human_operator(&pool, "r85-borrow-server-human").await;
+    let (x, _) = fixture::seed_agent_with_group(&pool, "r85-borrow-a-agent-x").await;
+    let (admin, _) = fixture::seed_agent_with_group(&pool, "r85-borrow-admin").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, x, a)
+            .await
+            .expect("X's live link");
+    }
+    add_member(&pool, server_group, s_human, "writer").await;
+    let c = claim_of(&pool, x, server_group, "public", "X's claim, server group").await;
+    let token = human(admin, &["claims:write", "claims:admin"]);
+    seed_admin_grant(&pool, &token).await;
+    arm_for_test(&pool).await;
+
+    let err = supersede_claim(
+        &server,
+        &viewer(&pool, admin).await,
+        supersede_params(c),
+        Some(&token),
+    )
+    .await
+    .expect_err("STATED LIMIT: an unbound server identity cannot borrow once armed");
+    let rule = err.data.as_ref().map(|d| d["rule"].clone());
+    assert_ne!(
+        rule,
+        Some(serde_json::json!("not_claim_writer")),
+        "claims:admin admits the caller; the database refuses: {err:?}"
+    );
+    assert!(is_current(&pool, c).await, "nothing retired");
+    assert_eq!(successors(&pool, c).await, 0, "no successor");
+
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, server_agent, s_human)
+            .await
+            .expect("the server identity's live link to S");
+    }
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, admin).await,
+        supersede_params(c),
+        Some(&token),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the bound server identity writes its group: {e:?}"));
+    let (who, _) = deferral(&pool, &first_text(&r)).await;
+    assert_eq!(
+        who,
+        Some(server_agent),
+        "calibration: the stamp was borrowed"
+    );
+    assert_landed_for(&pool, &r, c, x, admin).await;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // A bystander
 // ─────────────────────────────────────────────────────────────────────────────

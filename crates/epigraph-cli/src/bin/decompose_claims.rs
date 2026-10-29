@@ -1381,9 +1381,8 @@ fn print_retarget_plan(plan: &[epigraph_cli::retarget::RetargetPlanEntry]) {
         .count();
     if held > 0 {
         eprintln!(
-            "note: {held} of the atom mappings above are `contradicts` retargets, which --apply \
-             HOLDS (reports, writes nothing) until POST /api/v1/edges accepts lower-case \
-             `contradicts`; see epigraph_cli::retarget::HELD_RELATIONSHIPS"
+            "note: {held} of the atom mappings above are held retargets, which --apply \
+             reports and does not write; see epigraph_cli::retarget::HELD_RELATIONSHIPS"
         );
     }
     let count = |v: &str| plan.iter().filter(|e| e.verdict == v).count();

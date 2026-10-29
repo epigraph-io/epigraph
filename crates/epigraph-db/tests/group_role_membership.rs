@@ -2061,3 +2061,1246 @@ async fn armed_the_head_writer_scope_keeps_the_derived_arm_beside_the_role_holde
         .await
         .expect("POSITIVE CONTROL: the agent still writes where its human writes directly");
 }
+
+// =====================================================================
+// Migration 179: a binding that admits the holder and the role's ATTACHED
+// agents only.
+// =====================================================================
+
+/// 179's agent modes, as the mode-taking verbs spell them.
+const HOLDER_ONLY: &str = "holder_only";
+const REGISTERED_AGENTS: &str = "registered_agents";
+const ATTACHED_AGENTS: &str = "attached_agents";
+
+/// `epigraph_bind_group_role` with 179's agent MODE (the text overload) on a
+/// maintenance session.
+async fn bind_mode(
+    pool: &PgPool,
+    role: &str,
+    group: Uuid,
+    member_role: &str,
+    mode: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let mut c = maint(pool).await;
+    // `::text` on the mode: the SQL text differs from 165's call, so sqlx's
+    // per-connection statement cache (keyed by the SQL text) never hands the
+    // boolean call a statement prepared for the text overload, or back.
+    let r = sqlx::query_scalar("SELECT public.epigraph_bind_group_role($1, $2, $3, $4::text, $5)")
+        .bind(role)
+        .bind(group)
+        .bind(member_role)
+        .bind(mode)
+        .bind("role membership test (mode)")
+        .fetch_one(&mut *c)
+        .await;
+    reset(c).await;
+    r
+}
+
+/// `epigraph_define_group_role` with 179's agent MODE on a maintenance
+/// session.
+async fn define_mode(
+    pool: &PgPool,
+    key: &str,
+    group: Uuid,
+    member_role: &str,
+    mode: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let mut c = maint(pool).await;
+    let r = sqlx::query_scalar(
+        "SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5::text, $6)",
+    )
+    .bind(key)
+    .bind("synthetic team role (mode)")
+    .bind(group)
+    .bind(member_role)
+    .bind(mode)
+    .bind("role membership test (mode)")
+    .fetch_one(&mut *c)
+    .await;
+    reset(c).await;
+    r
+}
+
+/// One team group with `ROLE` DEFINED and bound to it at `member_role` in
+/// 179's `attached_agents` mode. Returns `(group, binding)`.
+async fn attached_group(pool: &PgPool, name: &str, member_role: &str) -> (Uuid, Uuid) {
+    let (owner, _) = human(pool, &format!("{name}-owner")).await;
+    let group = team_group(pool, name, owner).await;
+    let binding = define_mode(pool, ROLE, group, member_role, ATTACHED_AGENTS)
+        .await
+        .expect("define the role and bind it, attached agents only");
+    (group, binding)
+}
+
+/// Attach `agent` to `role` with a window that closes `to_s` seconds from now.
+async fn attach_until(pool: &PgPool, role: &str, agent: Uuid, to_s: i32) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                    now() + make_interval(secs => $3), 'role membership test windowed attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .bind(to_s)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches with a window");
+        (conn, ())
+    })
+    .await;
+}
+
+/// Detach `agent` from `role` (166's verb) on a maintenance session.
+async fn detach_from_role(pool: &PgPool, role: &str, agent: Uuid) -> i32 {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role($1, $2, 'role membership test detach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role detaches");
+        (conn, n)
+    })
+    .await
+}
+
+/// `(include_agents, attached_agents)` of one binding row.
+async fn binding_flags(pool: &PgPool, binding: Uuid) -> (bool, bool) {
+    sqlx::query_as("SELECT include_agents, attached_agents FROM group_role_bindings WHERE id = $1")
+        .bind(binding)
+        .fetch_one(pool)
+        .await
+        .expect("binding flags")
+}
+
+/// The roster of `group` now, on a maintenance session: `(agent, role)`.
+async fn roster_now(pool: &PgPool, group: Uuid) -> Vec<(Uuid, String)> {
+    let mut c = maint(pool).await;
+    let mut rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT out_agent_id, out_role FROM public.epigraph_group_role_roster($1, now())",
+    )
+    .bind(group)
+    .fetch_all(&mut *c)
+    .await
+    .expect("roster");
+    reset(c).await;
+    rows.sort();
+    rows
+}
+
+/// THE MODE. A binding in `attached_agents` mode admits the role HOLDER and
+/// an agent ATTACHED to the role (166's `role_agents`) whose own live-linked
+/// human is that holder, and NOT:
+///
+/// * an agent registered to (live-linked to) the holder that is not attached,
+///   although the very same agent reads a group bound to the same role in
+///   165's `include_agents` mode (positive control: it IS registered to the
+///   holder, so the mode is what leaves it out);
+/// * an agent attached to the role whose human is someone else while the role
+///   IS held (by the holder): the attachment alone, with "some live holder",
+///   admits nothing.
+///
+/// Armed, the writer scope asks the same derivation: the attached agent's
+/// honest write lands, the unattached one's write stamped (forged) with the
+/// group is refused OPL02. The roster names the holder and the attached agent
+/// only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_agents_binding_admits_the_holder_and_its_attached_agents_only(pool: PgPool) {
+    let (h, _) = human(&pool, "att-h").await;
+    let attached = operated(&pool, h, "att-attached").await;
+    let unattached = operated(&pool, h, "att-unattached").await;
+    let (other, _) = human(&pool, "att-other").await;
+    let others_attached = operated(&pool, other, "att-others-attached").await;
+    let (group, binding) = attached_group(&pool, "Synthetic Attached Team", "writer").await;
+    assert_eq!(
+        binding_flags(&pool, binding).await,
+        (false, true),
+        "PREMISE: the binding is recorded in the attached mode"
+    );
+    // A second group bound to the SAME role in 165's include_agents mode,
+    // through the OLD boolean signature.
+    let (owner2, _) = human(&pool, "att-owner2").await;
+    let registered_group = team_group(&pool, "Synthetic Registered Team", owner2).await;
+    let old = bind(&pool, ROLE, registered_group, "reader", true)
+        .await
+        .expect("the old boolean signature still binds");
+    assert_eq!(binding_flags(&pool, old).await, (true, false));
+    attach_to_role(&pool, ROLE, attached).await;
+    attach_to_role(&pool, ROLE, others_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    arm(&pool).await;
+
+    assert_eq!(resolves(&pool, h, group).await, (true, true), "the holder");
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (true, true),
+        "an agent attached to the role, linked to the holder"
+    );
+    assert_eq!(
+        resolves(&pool, unattached, group).await,
+        (false, false),
+        "an agent registered to the holder but NOT attached"
+    );
+    assert!(live_roles(&pool, unattached, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, others_attached, group).await,
+        (false, false),
+        "an agent attached to the held role whose own human is not the holder"
+    );
+    assert_eq!(
+        resolves(&pool, unattached, registered_group).await,
+        (true, false),
+        "POSITIVE CONTROL: the unattached agent IS registered to the holder (165's mode admits it)"
+    );
+    assert_eq!(
+        resolves(&pool, attached, registered_group).await,
+        (true, false),
+        "POSITIVE CONTROL: 165's mode is unchanged for an attached agent too"
+    );
+
+    write_honest(&pool, h, group)
+        .await
+        .expect("POSITIVE CONTROL: the holder writes");
+    write_honest(&pool, attached, group)
+        .await
+        .expect("the attached agent writes through the derived writer arm");
+    assert_refused(
+        &write_forged(&pool, unattached, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the unattached agent, forged stamp",
+    );
+
+    let w = |id: Uuid| (id, "writer".to_string());
+    let mut expected = vec![w(h), w(attached)];
+    expected.sort();
+    assert_eq!(roster_now(&pool, group).await, expected, "the roster");
+}
+
+/// An attached member lapses with its HOLDER: ending the holder's assignment
+/// takes the group from the holder and the attached agent at once, and a NEW
+/// holder of the role (another human) does not bring the previous holder's
+/// attached agent back (its own human must hold the role), while the new
+/// holder itself is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_member_lapses_when_the_holders_assignment_ends(pool: PgPool) {
+    let (h, _) = human(&pool, "attend-h").await;
+    let attached = operated(&pool, h, "attend-attached").await;
+    let (next, _) = human(&pool, "attend-next").await;
+    let (group, _) = attached_group(&pool, "Synthetic Attached End Team", "reader").await;
+    attach_to_role(&pool, ROLE, attached).await;
+    let assignment = grant(&pool, ROLE, h, 0, Some(3600)).await;
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (true, false),
+        "PREMISE: the attached agent reads while its human holds the role"
+    );
+
+    assert!(end_role(&pool, assignment).await, "the assignment ends");
+    assert_eq!(resolves(&pool, h, group).await, (false, false), "holder");
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (false, false),
+        "the attached agent, no holder"
+    );
+
+    grant(&pool, ROLE, next, 0, None).await;
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (true, false),
+        "POSITIVE CONTROL: the new holder reads"
+    );
+    assert_eq!(
+        resolves(&pool, attached, group).await,
+        (false, false),
+        "the previous holder's attached agent, while another human holds the role"
+    );
+}
+
+/// An attached member lapses with its ATTACHMENT: a detach takes the group
+/// from the agent at once and leaves the holder; an attachment whose window
+/// closes lapses at its `valid_to` with no job.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attached_member_lapses_when_its_attachment_ends(pool: PgPool) {
+    let (h, _) = human(&pool, "attdet-h").await;
+    let detached = operated(&pool, h, "attdet-detached").await;
+    let windowed = operated(&pool, h, "attdet-windowed").await;
+    let (group, _) = attached_group(&pool, "Synthetic Attached Detach Team", "writer").await;
+    attach_to_role(&pool, ROLE, detached).await;
+    attach_until(&pool, ROLE, windowed, 5).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, detached, group).await,
+        (true, true),
+        "PREMISE"
+    );
+    assert_eq!(
+        resolves(&pool, windowed, group).await,
+        (true, true),
+        "PREMISE"
+    );
+
+    assert_eq!(detach_from_role(&pool, ROLE, detached).await, 1, "detached");
+    assert_eq!(
+        resolves(&pool, detached, group).await,
+        (false, false),
+        "the detached agent"
+    );
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder stays"
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, windowed, group).await,
+        (false, false),
+        "the attachment's window closed"
+    );
+    assert_eq!(resolves(&pool, h, group).await, (true, true), "holder");
+}
+
+/// The verbs keep 165's boolean signatures (`true` = registered agents,
+/// `false` = the holder only) and add a MODE overload: `holder_only`,
+/// `registered_agents`, `attached_agents`, recorded as the two flags and
+/// named in the bind audit row; any other mode is refused 22023 and writes
+/// nothing. The `holder_only` mode admits no agent, an attached one included
+/// (165's `include_agents = false`, unchanged). A row with both flags is
+/// refused by the table (23514), and a binding's mode never changes: an end
+/// that also flips `attached_agents` is refused (55000) on any session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_mode_verbs_keep_the_old_signatures_and_a_mode_never_changes(pool: PgPool) {
+    let (h, _) = human(&pool, "mode-h").await;
+    let attached = operated(&pool, h, "mode-attached").await;
+    let (owner, _) = human(&pool, "mode-owner").await;
+    let mut groups = Vec::new();
+    for i in 0..5 {
+        groups.push(team_group(&pool, &format!("Synthetic Mode Team {i}"), owner).await);
+    }
+    let holder_only = define_mode(&pool, ROLE, groups[0], "reader", HOLDER_ONLY)
+        .await
+        .expect("define, holder only");
+    let registered = bind_mode(&pool, ROLE, groups[1], "reader", REGISTERED_AGENTS)
+        .await
+        .expect("bind, registered agents");
+    let attached_b = bind_mode(&pool, ROLE, groups[2], "reader", ATTACHED_AGENTS)
+        .await
+        .expect("bind, attached agents");
+    let old_true = bind(&pool, ROLE, groups[3], "reader", true)
+        .await
+        .expect("the old signature, true");
+    let old_false = bind(&pool, ROLE, groups[4], "reader", false)
+        .await
+        .expect("the old signature, false");
+    assert_eq!(binding_flags(&pool, holder_only).await, (false, false));
+    assert_eq!(binding_flags(&pool, registered).await, (true, false));
+    assert_eq!(binding_flags(&pool, attached_b).await, (false, true));
+    assert_eq!(binding_flags(&pool, old_true).await, (true, false));
+    assert_eq!(binding_flags(&pool, old_false).await, (false, false));
+    for (binding, mode) in [
+        (holder_only, HOLDER_ONLY),
+        (registered, REGISTERED_AGENTS),
+        (attached_b, ATTACHED_AGENTS),
+        (old_true, REGISTERED_AGENTS),
+        (old_false, HOLDER_ONLY),
+    ] {
+        let named: Option<String> = sqlx::query_scalar(
+            "SELECT details->>'agent_mode' FROM security_events \
+              WHERE event_type = 'platform.group_role_bound' AND details->>'binding_id' = $1",
+        )
+        .bind(binding.to_string())
+        .fetch_optional(&pool)
+        .await
+        .expect("bind audit row");
+        assert_eq!(named.as_deref(), Some(mode), "audit of {binding}");
+    }
+
+    attach_to_role(&pool, ROLE, attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    for (i, expected) in [false, true, true, true, false].into_iter().enumerate() {
+        assert_eq!(
+            resolves(&pool, attached, groups[i]).await,
+            (expected, false),
+            "the attached agent in group {i}"
+        );
+        assert_eq!(
+            resolves(&pool, h, groups[i]).await,
+            (true, false),
+            "the holder in group {i}"
+        );
+    }
+
+    let (owner6, _) = human(&pool, "mode-owner6").await;
+    let spare = team_group(&pool, "Synthetic Mode Spare Team", owner6).await;
+    let unknown = bind_mode(&pool, ROLE, spare, "reader", "everyone").await;
+    assert_eq!(code_of(&unknown).as_deref(), Some("22023"), "{unknown:?}");
+    let both = sqlx::query(
+        "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, \
+                                          attached_agents, reason) \
+         VALUES ($1, $2, 'reader', true, true, 'both modes')",
+    )
+    .bind(spare)
+    .bind(ROLE)
+    .execute(&pool)
+    .await;
+    assert_eq!(code_of(&both).as_deref(), Some("23514"), "{both:?}");
+    let spare_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM group_role_bindings WHERE group_id = $1")
+            .bind(spare)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(spare_rows, 0, "nothing was bound to the spare group");
+
+    // The harness superuser passes the guard's session gate, so what refuses
+    // is the guard's immutable tuple, not a privilege; and the holder-only
+    // binding flipped to attached would satisfy the CHECK, so the CHECK is
+    // not what refuses either.
+    let flip = sqlx::query(
+        "UPDATE group_role_bindings SET revoked_at = now(), revoked_by = 'x', \
+                revoked_reason = 'end and flip', attached_agents = true WHERE id = $1",
+    )
+    .bind(holder_only)
+    .execute(&pool)
+    .await;
+    assert_eq!(code_of(&flip).as_deref(), Some("55000"), "{flip:?}");
+    assert_eq!(
+        binding_flags(&pool, holder_only).await,
+        (false, false),
+        "the binding is unchanged"
+    );
+    assert!(
+        end_binding(&pool, holder_only).await.expect("end"),
+        "POSITIVE CONTROL: a plain end still lands"
+    );
+}
+
+// =====================================================================
+// Migration 179: which attachments count. The bound role, the window's
+// start, and SUCCESSION COPIES (166 copies an attachment to every
+// registered successor, a SHARED one included; in this mode a copy is a
+// read and write grant, so only some copies count).
+// =====================================================================
+
+fn identity_key() -> Vec<u8> {
+    [
+        Uuid::new_v4().as_bytes().to_vec(),
+        Uuid::new_v4().as_bytes().to_vec(),
+    ]
+    .concat()
+}
+
+/// Register an identity through 161's attestor verb (re-stated by 166) in
+/// `folder`, naming `parent`; returns the agent id. Every identity in a
+/// lineage test is registered this way: a succession copy exists only along
+/// `agent_succession`, and the folder rule reads `agent_prompt_snapshots`,
+/// both of which only the registration writes.
+async fn register_in(pool: &PgPool, key: &[u8], parent: Option<Uuid>, folder: &str) -> Uuid {
+    let key = key.to_vec();
+    let hash = blake3::hash(&key).to_hex().to_string();
+    let folder = folder.to_string();
+    fixture::as_role(pool, "epigraph_identity_attestor", |mut conn| async move {
+        let id: Uuid = sqlx::query_scalar(
+            "SELECT agent_id FROM public.epigraph_register_agent_identity( \
+                 $1, $2, 'test-model-179', $3, $4, NULL, $5)",
+        )
+        .bind(&key)
+        .bind(parent)
+        .bind(&hash)
+        .bind(&folder)
+        .bind(serde_json::json!({"in_prompt": {}}))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the attestor registers the identity");
+        (conn, id)
+    })
+    .await
+}
+
+async fn link_to(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let mut c = pool.acquire().await.expect("acquire");
+    let out = AgentRepository::link_operator(&mut c, agent, human)
+        .await
+        .expect("link the identity");
+    assert!(out.link_live, "PREMISE: a live link: {out:?}");
+}
+
+/// `(un-detached attachment rows to ROLE, of which copies)` for `agent`.
+async fn attachment_rows(pool: &PgPool, agent: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT count(*), count(inherited_from) FROM role_agents \
+          WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .fetch_one(pool)
+    .await
+    .expect("attachment rows")
+}
+
+/// `platform.role_agent_copied_shared` events plus registration audit rows
+/// flagged `shared_identity`, for `agent`.
+async fn shared_flags(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE agent_id = $1 \
+            AND (event_type = 'platform.role_agent_copied_shared' \
+                 OR details ->> 'role_attachments_shared' = 'shared_identity')",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("shared flags")
+}
+
+/// THE BOUND ROLE. An agent of the holder attached to ANOTHER role (one its
+/// human also holds, bound to another group) is not a member of a group bound
+/// to ROLE in the attached mode. Positive controls: the holder reads ROLE's
+/// group, and the same agent reads the OTHER role's group, so the attachment
+/// is live and held, and only the role match leaves it out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_attached_to_another_role_is_not_admitted(pool: PgPool) {
+    const OTHER: &str = "role:another-team";
+    let (h, _) = human(&pool, "other-role-h").await;
+    let other_attached = operated(&pool, h, "other-role-attached").await;
+    let (group, _) = attached_group(&pool, "Synthetic Role Match Team", "writer").await;
+    let (owner2, _) = human(&pool, "other-role-owner2").await;
+    let other_group = team_group(&pool, "Synthetic Other Role Team", owner2).await;
+    define_mode(&pool, OTHER, other_group, "reader", ATTACHED_AGENTS)
+        .await
+        .expect("define the other role, attached agents only");
+    attach_to_role(&pool, OTHER, other_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    grant(&pool, OTHER, h, 0, None).await;
+
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder"
+    );
+    assert_eq!(
+        resolves(&pool, other_attached, other_group).await,
+        (true, false),
+        "POSITIVE CONTROL: the agent's attachment to the other role is live and held"
+    );
+    assert_eq!(
+        resolves(&pool, other_attached, group).await,
+        (false, false),
+        "an agent attached to ANOTHER role its human holds"
+    );
+    assert!(live_roles(&pool, other_attached, group).await.is_empty());
+}
+
+/// THE WINDOW'S START. An attachment whose window opens in an hour admits
+/// nothing now, while the role IS held by the agent's own human (positive
+/// control: the holder reads, and an agent of the same human attached now
+/// does).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attachment_that_has_not_started_admits_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "future-h").await;
+    let future = operated(&pool, h, "future-attached").await;
+    let now_attached = operated(&pool, h, "future-control").await;
+    let (group, _) = attached_group(&pool, "Synthetic Future Attach Team", "writer").await;
+    let role = ROLE.to_string();
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() + interval '1 hour', \
+                    NULL, 'role membership test future attach')",
+        )
+        .bind(&role)
+        .bind(future)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a future attachment");
+        (conn, ())
+    })
+    .await;
+    attach_to_role(&pool, ROLE, now_attached).await;
+    grant(&pool, ROLE, h, 0, None).await;
+
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the holder"
+    );
+    assert_eq!(
+        resolves(&pool, now_attached, group).await,
+        (true, true),
+        "POSITIVE CONTROL: an agent of the same human attached now"
+    );
+    assert_eq!(
+        resolves(&pool, future, group).await,
+        (false, false),
+        "an attachment whose window opens in an hour"
+    );
+}
+
+/// A SHARED SUCCESSOR, BY REGISTRATION. An identity that already runs in
+/// another group folder (a fleet container's, linked to the same human) is
+/// registered as the successor of the attached identity in that identity's
+/// folder. 166's registration copies the attachment to it (flagged
+/// `shared_identity`); that copy must not make it a member: it is
+/// `(false, false)` and absent from the roster. Control: a same-human fleet
+/// identity that was never a successor. Positive control: the attached
+/// identity itself reads and writes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_successor_does_not_inherit_the_group_through_registration(pool: PgPool) {
+    let (h, _) = human(&pool, "shreg-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Shared Reg Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    let control = register_in(&pool, &identity_key(), None, "g-fleet-2").await;
+    link_to(&pool, fleet, h).await;
+    link_to(&pool, control, h).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the attached identity"
+    );
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "PREMISE"
+    );
+
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (1, 1),
+        "PREMISE: 166 copied the attachment"
+    );
+    assert!(
+        shared_flags(&pool, fleet).await >= 1,
+        "PREMISE: the copy was flagged shared"
+    );
+
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "a SHARED successor does not read or write the group through its copy"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, fleet, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the shared successor, forged stamp (armed)",
+    );
+    assert!(live_roles(&pool, fleet, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, control, group).await,
+        (false, false),
+        "control"
+    );
+    let w = |id: Uuid| (id, "writer".to_string());
+    let mut expected = vec![w(h), w(root)];
+    expected.sort();
+    assert_eq!(roster_now(&pool, group).await, expected, "the roster");
+}
+
+/// A SHARED SUCCESSOR, BY ATTACH. The same shape through 166's other copy
+/// path: the shared successor is registered FIRST, then the root is attached,
+/// and the attach-time lineage follow copies the attachment down to it
+/// (flagged). The copy must not make it a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_successor_does_not_inherit_the_group_through_an_attach(pool: PgPool) {
+    let (h, _) = human(&pool, "shatt-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Shared Attach Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    link_to(&pool, fleet, h).await;
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (0, 0),
+        "PREMISE: nothing to copy yet"
+    );
+
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, fleet).await,
+        (1, 1),
+        "PREMISE: the follow copied it"
+    );
+    assert!(
+        shared_flags(&pool, fleet).await >= 1,
+        "PREMISE: the copy was flagged shared"
+    );
+
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL: the root"
+    );
+    assert_eq!(
+        resolves(&pool, fleet, group).await,
+        (false, false),
+        "a SHARED successor attached by the lineage follow"
+    );
+}
+
+/// A SUCCESSOR IN ANOTHER FOLDER. A fresh identity (it runs nowhere else, so
+/// it is NOT shared) registered with the attached identity as its parent but
+/// in a DIFFERENT group folder inherits the link and the attachment, and is
+/// still not a member: a copy counts only for a successor running in the
+/// folder of the identity the operator attached. (A count-only "not shared"
+/// test would admit it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_in_another_folder_does_not_inherit_the_group(pool: PgPool) {
+    let (h, _) = human(&pool, "fold-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Folder Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+
+    let elsewhere = register_in(&pool, &identity_key(), Some(root), "g-elsewhere").await;
+    assert_eq!(
+        attachment_rows(&pool, elsewhere).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        shared_flags(&pool, elsewhere).await,
+        0,
+        "PREMISE: not a shared identity"
+    );
+    let viewer = Viewer::resolve(&pool, elsewhere).await.expect("resolve");
+    assert!(
+        !viewer.writable_groups().is_empty(),
+        "PREMISE: the successor inherited a live link (it writes somewhere)"
+    );
+    assert_eq!(
+        resolves(&pool, elsewhere, group).await,
+        (false, false),
+        "a successor running in another folder than the attached identity"
+    );
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "POSITIVE CONTROL"
+    );
+}
+
+/// A COPY OF A COPY. A shared successor (excluded above) runs on in its other
+/// folder and gets its own successor THERE, which runs nowhere else: 166
+/// copies the shared successor's (inherited) row to it. It is not a member:
+/// the folder a copy must run in is the folder of the identity the operator
+/// ATTACHED (the root of the copy chain), not of the row it was copied from.
+/// Positive control: a successor of the shared identity back in the root's
+/// folder (the job's own next identity) IS a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_of_a_shared_successors_copy_counts_only_in_the_attached_folder(pool: PgPool) {
+    let (h, _) = human(&pool, "chain-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Copy Chain Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let fleet_key = identity_key();
+    let fleet = register_in(&pool, &fleet_key, None, "g-fleet").await;
+    link_to(&pool, fleet, h).await;
+    assert_eq!(
+        register_in(&pool, &fleet_key, Some(root), "g-job").await,
+        fleet
+    );
+
+    let fleet_next = register_in(&pool, &identity_key(), Some(fleet), "g-fleet").await;
+    assert_eq!(
+        attachment_rows(&pool, fleet_next).await,
+        (1, 1),
+        "PREMISE: copied from the copy"
+    );
+    assert_eq!(
+        shared_flags(&pool, fleet_next).await,
+        0,
+        "PREMISE: not itself shared"
+    );
+    assert_eq!(
+        resolves(&pool, fleet_next, group).await,
+        (false, false),
+        "a successor of the shared identity in the shared identity's other folder"
+    );
+
+    let job_next = register_in(&pool, &identity_key(), Some(fleet), "g-job").await;
+    assert_eq!(
+        attachment_rows(&pool, job_next).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        resolves(&pool, job_next, group).await,
+        (true, true),
+        "POSITIVE CONTROL: a successor running in the attached identity's folder"
+    );
+}
+
+/// A SAME-FOLDER SUCCESSOR KEEPS THE GROUP. The attached identity's next
+/// identity (a prompt or model change, same folder) is a member through
+/// 166's registration copy, and so is one registered before the attach and
+/// reached by the lineage follow, transitively. So a prompt edit does not cut
+/// the job off. Once such a successor ALSO runs in another folder (it became
+/// shared), its copy no longer counts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_same_folder_successor_keeps_the_group_until_it_runs_elsewhere(pool: PgPool) {
+    let (h, _) = human(&pool, "same-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Same Folder Team", "writer").await;
+
+    // The attach-time follow: root -> mid -> newest registered first.
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    let mid = register_in(&pool, &identity_key(), Some(root), "g-job").await;
+    let newest = register_in(&pool, &identity_key(), Some(mid), "g-job").await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, newest).await,
+        (1, 1),
+        "PREMISE: followed"
+    );
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (true, true),
+        "a same-folder successor reached by the attach-time follow"
+    );
+    // `resolves` runs on the test's privileged session, where 161's snapshot
+    // policy admits every row (`epigraph_bypass()`). This write runs, armed,
+    // on an `epigraph_app` session: the claims-path writer scope asks the
+    // derivation, whose maintenance-owned frame must read the FORCEd
+    // `agent_prompt_snapshots` through `epigraph_definer_bypass()`.
+    arm(&pool).await;
+    write_honest(&pool, newest, group)
+        .await
+        .expect("a same-folder successor writes on an application session");
+
+    // The registration copy: the newest identity's own next identity.
+    let next_key = identity_key();
+    let next = register_in(&pool, &next_key, Some(newest), "g-job").await;
+    assert_eq!(
+        attachment_rows(&pool, next).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (true, true),
+        "a same-folder successor through the registration copy"
+    );
+    write_honest(&pool, next, group)
+        .await
+        .expect("the registration-copy successor writes on an application session");
+
+    // The same identity then also runs in another folder: it is shared now.
+    register_in(&pool, &next_key, None, "g-fleet").await;
+    assert_eq!(
+        resolves(&pool, next, group).await,
+        (false, false),
+        "a successor that now runs in a second folder"
+    );
+    assert_refused(
+        &write_forged(&pool, next, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the now-shared successor, forged stamp (armed)",
+    );
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (true, true),
+        "CONTROL: its parent stays"
+    );
+}
+
+/// AN EXPLICIT ATTACHMENT COUNTS WHEREVER THE IDENTITY RUNS. The folder rule
+/// applies to succession COPIES only: an identity the operator attached by
+/// name is a member even when it runs in two folders (the operator's act
+/// names it). Pins that documented choice.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicitly_attached_identity_is_admitted_in_any_folder(pool: PgPool) {
+    let (h, _) = human(&pool, "explicit-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Explicit Team", "writer").await;
+    let key = identity_key();
+    let shared = register_in(&pool, &key, None, "g-one").await;
+    assert_eq!(register_in(&pool, &key, None, "g-two").await, shared);
+    link_to(&pool, shared, h).await;
+    attach_to_role(&pool, ROLE, shared).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        attachment_rows(&pool, shared).await,
+        (1, 0),
+        "PREMISE: an explicit row"
+    );
+    assert_eq!(
+        resolves(&pool, shared, group).await,
+        (true, true),
+        "an explicitly attached identity running in two folders"
+    );
+}
+
+// =====================================================================
+// A DETACH REVOKES THE LINEAGE. A succession copy counts only while EVERY
+// row of its `inherited_from` chain, the operator's own attachment (the
+// root) included, is un-detached and inside its window at the instant
+// asked. A copy is a grant in this mode, so it must not outlive any row it
+// was copied through.
+// =====================================================================
+
+/// Rows `epigraph_role_derived_memberships(agent, now())` answers, on the
+/// test's privileged session (the derivation is not app-executable).
+async fn derived_rows(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM public.epigraph_role_derived_memberships($1, now())")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("the derivation")
+}
+
+/// The id of `agent`'s un-detached attachment to ROLE (exactly one).
+async fn live_attachment(pool: &PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM role_agents WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .fetch_one(pool)
+    .await
+    .expect("one live attachment")
+}
+
+/// A three-identity lineage root -> mid -> newest in `folder`, the root
+/// attached by the operator and linked to `h`, each later identity a member
+/// through 166's registration copy (asserted).
+async fn lineage_of_three(pool: &PgPool, h: Uuid, group: Uuid, folder: &str) -> [Uuid; 3] {
+    let root = register_in(pool, &identity_key(), None, folder).await;
+    link_to(pool, root, h).await;
+    attach_to_role(pool, ROLE, root).await;
+    let mid = register_in(pool, &identity_key(), Some(root), folder).await;
+    let newest = register_in(pool, &identity_key(), Some(mid), folder).await;
+    for (who, what) in [(root, "root"), (mid, "mid"), (newest, "newest")] {
+        assert_eq!(
+            resolves(pool, who, group).await,
+            (true, true),
+            "PREMISE: the {what} in {folder} is a member"
+        );
+    }
+    assert_eq!(attachment_rows(pool, newest).await, (1, 1), "PREMISE");
+    [root, mid, newest]
+}
+
+/// DETACHING ANY ROW OF THE CHAIN REVOKES WHAT WAS COPIED THROUGH IT. Two
+/// lineages root -> mid -> newest (prompt or model changes of one job each).
+/// In the first, detaching the MIDDLE identity takes the group from it and
+/// from the newest (the newest's own copy stays un-detached: the chain
+/// refuses it, not a missing row), and leaves the root. In the second,
+/// detaching the ROOT takes the group from the root, the mid AND the newest,
+/// two hops down; the newest's armed forged write is refused. Recovery
+/// (documented): re-attaching the root does NOT bring the newest back while
+/// its stale copy still covers the window; detaching that copy and attaching
+/// the running identity itself does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_detach_anywhere_in_the_chain_revokes_the_successors_copies(pool: PgPool) {
+    let (h, _) = human(&pool, "chain-detach-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Chain Detach Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+
+    let [root1, mid1, newest1] = lineage_of_three(&pool, h, group, "g-job-1").await;
+    assert_eq!(detach_from_role(&pool, ROLE, mid1).await, 1, "mid detached");
+    assert_eq!(
+        resolves(&pool, mid1, group).await,
+        (false, false),
+        "the mid"
+    );
+    assert_eq!(
+        attachment_rows(&pool, newest1).await,
+        (1, 1),
+        "PREMISE: the newest's own copy is still un-detached"
+    );
+    assert_eq!(
+        resolves(&pool, newest1, group).await,
+        (false, false),
+        "a copy made through a detached middle row admits nothing"
+    );
+    assert_eq!(
+        derived_rows(&pool, newest1).await,
+        0,
+        "the newest's derivation"
+    );
+    assert_eq!(
+        resolves(&pool, root1, group).await,
+        (true, true),
+        "CONTROL: the root's own attachment stays"
+    );
+
+    let [root2, mid2, newest2] = lineage_of_three(&pool, h, group, "g-job-2").await;
+    assert_eq!(
+        detach_from_role(&pool, ROLE, root2).await,
+        1,
+        "root detached"
+    );
+    assert_eq!(
+        resolves(&pool, root2, group).await,
+        (false, false),
+        "the root"
+    );
+    assert_eq!(
+        resolves(&pool, mid2, group).await,
+        (false, false),
+        "the mid, one hop down"
+    );
+    assert_eq!(
+        attachment_rows(&pool, newest2).await,
+        (1, 1),
+        "PREMISE: the newest's own copy and the mid's are un-detached"
+    );
+    assert_eq!(
+        resolves(&pool, newest2, group).await,
+        (false, false),
+        "the newest, two hops below the detached root"
+    );
+    assert_eq!(
+        derived_rows(&pool, newest2).await,
+        0,
+        "the newest's derivation"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, newest2, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the newest below a detached root, forged stamp (armed)",
+    );
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "CONTROL: the holder stays"
+    );
+
+    // Recovery. Re-attaching the root: its lineage follow finds the newest's
+    // stale copy covering the window and copies nothing that is live now.
+    attach_to_role(&pool, ROLE, root2).await;
+    assert_eq!(
+        resolves(&pool, root2, group).await,
+        (true, true),
+        "re-attached root"
+    );
+    assert_eq!(
+        resolves(&pool, newest2, group).await,
+        (false, false),
+        "DOCUMENTED: a re-attached root does not bring back a successor whose stale copy \
+         still covers the window"
+    );
+    // The verb detaches every un-detached row of the agent for the role (the
+    // re-attach may also have copied a gap before the stale copy's start).
+    assert!(
+        detach_from_role(&pool, ROLE, newest2).await >= 1,
+        "stale copy detached"
+    );
+    assert_eq!(
+        attachment_rows(&pool, newest2).await,
+        (0, 0),
+        "PREMISE: nothing left"
+    );
+    attach_to_role(&pool, ROLE, newest2).await;
+    assert_eq!(
+        resolves(&pool, newest2, group).await,
+        (true, true),
+        "the running identity, attached by name, is a member again"
+    );
+    write_honest(&pool, newest2, group)
+        .await
+        .expect("and writes on an application session");
+}
+
+/// THE ROOT DETACH (the realistic revoke path: the operator attached an older
+/// identity, and the running one is its same-folder successor). Detaching the
+/// root revokes the successor's copy: `(false, false)`, nothing derived, and
+/// its armed forged write is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn detaching_the_attached_identity_revokes_its_same_folder_successor(pool: PgPool) {
+    let (h, _) = human(&pool, "root-detach-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Root Detach Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, ROLE, root).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let succ = register_in(&pool, &identity_key(), Some(root), "g-job").await;
+    assert_eq!(
+        attachment_rows(&pool, succ).await,
+        (1, 1),
+        "PREMISE: copied"
+    );
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (true, true),
+        "PREMISE: root"
+    );
+    assert_eq!(
+        resolves(&pool, succ, group).await,
+        (true, true),
+        "PREMISE: successor"
+    );
+
+    assert_eq!(detach_from_role(&pool, ROLE, root).await, 1, "detached");
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (false, false),
+        "the root"
+    );
+    assert_eq!(
+        resolves(&pool, succ, group).await,
+        (false, false),
+        "the successor of a detached root"
+    );
+    assert_eq!(
+        derived_rows(&pool, succ).await,
+        0,
+        "nothing derived for the successor"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, succ, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the successor of a detached root, forged stamp (armed)",
+    );
+    assert!(live_roles(&pool, succ, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "CONTROL: the holder"
+    );
+}
+
+/// A REVERT TO A DETACHED IDENTITY REGAINS NOTHING. Attach A; a prompt change
+/// makes B (same folder), which 166 copies A's attachment to; the operator
+/// detaches A; the job reverts, so the host registers A AGAIN with B as its
+/// parent. A must be admitted nowhere (its own attachment is detached, and
+/// whatever a revert copies back onto it runs through that detached row), its
+/// armed forged write is refused, and B, whose copy came from the detached A,
+/// is out as well.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_to_a_detached_identity_regains_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "revert-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Revert Team", "writer").await;
+    let a_key = identity_key();
+    let a = register_in(&pool, &a_key, None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let b = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    assert_eq!(resolves(&pool, a, group).await, (true, true), "PREMISE: A");
+    assert_eq!(resolves(&pool, b, group).await, (true, true), "PREMISE: B");
+
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    assert_eq!(
+        register_in(&pool, &a_key, Some(b), "g-job").await,
+        a,
+        "PREMISE: the revert re-derives A's key"
+    );
+    let reverse: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_succession WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(&pool)
+    .await
+    .expect("succession");
+    assert_eq!(reverse, 1, "PREMISE: 'A succeeded B' is on record");
+
+    assert_eq!(derived_rows(&pool, a).await, 0, "A is admitted nowhere");
+    assert_eq!(derived_rows(&pool, b).await, 0, "nor is B");
+    assert_eq!(resolves(&pool, a, group).await, (false, false), "A");
+    assert_eq!(resolves(&pool, b, group).await, (false, false), "B");
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the reverted, detached identity, forged stamp (armed)",
+    );
+    assert!(live_roles(&pool, a, group).await.is_empty());
+    assert_eq!(
+        resolves(&pool, h, group).await,
+        (true, true),
+        "CONTROL: the holder"
+    );
+}
+
+/// EVERY HOP'S WINDOW. A copy whose own window is open still admits nothing
+/// once a row it was copied through has closed its window. 166's own copy
+/// paths never write a copy that outlasts its source, so the copy here is a
+/// direct maintenance INSERT that meets every 166 guard (the shape a hand
+/// repair could leave). Before the source's window closes the copy is a
+/// member (positive control); after, it is not, while its own row is live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_counts_only_inside_every_hops_window(pool: PgPool) {
+    let (h, _) = human(&pool, "hop-window-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Hop Window Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    let copy = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    link_to(&pool, copy, h).await;
+    attach_until(&pool, ROLE, root, 5).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let source = live_attachment(&pool, root).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query(
+            "INSERT INTO role_agents (role, agent_id, valid_from, valid_to, reason, \
+                                      inherited_from) \
+             VALUES ($1, $2, now(), NULL, 'hand repair: an open copy of a closing row', $3)",
+        )
+        .bind(ROLE)
+        .bind(copy)
+        .bind(source)
+        .execute(&mut *conn)
+        .await
+        .expect("a maintenance INSERT that meets 166's guards");
+        (conn, ())
+    })
+    .await;
+    assert_eq!(
+        attachment_rows(&pool, copy).await,
+        (1, 1),
+        "PREMISE: an open copy"
+    );
+    assert_eq!(
+        resolves(&pool, copy, group).await,
+        (true, true),
+        "POSITIVE CONTROL: inside the source's window"
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (false, false),
+        "the root's window closed"
+    );
+    assert_eq!(
+        attachment_rows(&pool, copy).await,
+        (1, 1),
+        "PREMISE: the copy is still open"
+    );
+    assert_eq!(
+        resolves(&pool, copy, group).await,
+        (false, false),
+        "a copy outside a hop's window admits nothing"
+    );
+    assert_eq!(derived_rows(&pool, copy).await, 0, "nothing derived");
+}

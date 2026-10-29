@@ -40,7 +40,8 @@ use uuid::Uuid;
 
 use super::claim_role::is_compound_sql;
 use super::mass_function::{
-    cached_combination_predicate, ingest_template_predicate, MassFunctionRow,
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+    MassFunctionRow,
 };
 use crate::errors::DbError;
 use crate::visibility::Viewer;
@@ -133,6 +134,7 @@ pub async fn atom_input_rows<'e, E: sqlx::PgExecutor<'e>>(
               AND (array_length(f.hypotheses, 1) = 2 OR f.id = $2)
               AND NOT {cached}
               AND NOT {template}
+              AND {not_retracted}
               AND NOT {claim_compound}
               AND (mf.combination_method IS DISTINCT FROM 'edge_factor'
                    OR ae.relationship IS NOT NULL)
@@ -142,6 +144,7 @@ pub async fn atom_input_rows<'e, E: sqlx::PgExecutor<'e>>(
             src_compound = is_compound_sql("aa_src"),
             cached = cached_combination_predicate("mf."),
             template = ingest_template_predicate("mf.", "f."),
+            not_retracted = not_retracted_predicate("mf."),
             claim_compound = is_compound_sql("c"),
         ),
         3,

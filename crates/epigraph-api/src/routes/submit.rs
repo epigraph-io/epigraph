@@ -1313,7 +1313,8 @@ async fn persist_packet(
     }
 
     // Short-circuit all dependent writes on a duplicate. On a duplicate the
-    // evidence INSERT would hit `evidence_content_hash_claim_unique` → 500;
+    // raw evidence INSERT below (no `EvidenceRepository` de-duplication) would
+    // add a second copy of the canonical claim's evidence;
     // the `trace_id` UPDATE would mutate another run's canonical noun-claim
     // (forbidden, see claim.rs noun-claim invariant); and post-018 the edges
     // have no triple-unique, so re-inserting would silently duplicate the
@@ -1506,10 +1507,11 @@ async fn persist_packet(
             )
         })?;
 
-            // Materialize graph edges: evidence --SUPPORTS--> claim
+            // Materialize graph edges: evidence --supports--> claim (the canonical
+            // spelling, `epigraph_core::edge::relationships::canonical_relationship`)
             sqlx::query_scalar::<_, i32>(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
+             VALUES ($1, 'evidence', $2, 'claim', 'supports', '{}'::jsonb) \
              RETURNING 1"
         )
         .bind(evidence_uuid)

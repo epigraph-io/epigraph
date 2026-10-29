@@ -162,7 +162,7 @@ pub async fn ingest_document(
     let canonical = std::fs::canonicalize(&params.file_path)
         .map_err(|e| invalid_params(format!("invalid file path: {e}")))?;
     let cwd = std::env::current_dir()
-        .map_err(|e| internal_error(format!("cannot determine CWD: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("cannot determine CWD", e))?;
     if !canonical.starts_with(&cwd) {
         return Err(invalid_params(
             "file path must be within the working directory",
@@ -882,7 +882,12 @@ impl IngestTx<'_> {
         let writable =
             epigraph_db::GroupMembershipRepository::session_can_write_group_conn(tx, group)
                 .await
-                .map_err(|e| internal_error(format!("{tool_name}: writable-group check: {e}")))?;
+                .map_err(|e| {
+                    crate::errors::internal_error_logged(
+                        format!("{tool_name}: writable-group check"),
+                        e,
+                    )
+                })?;
         if !writable {
             return Err(refuse(format!(
                 "the ingesting agent ({agent_id}) holds a live but READ-ONLY membership of the \
@@ -908,7 +913,10 @@ async fn begin_ingest_tx<'p>(
                 "document ingest on a DECLARED privileged pool: a plain transaction, no stamp"
             );
             let tx = server.pool.begin().await.map_err(|e| {
-                internal_error(format!("{tool_name}: could not begin a transaction: {e}"))
+                crate::errors::internal_error_logged(
+                    format!("{tool_name}: could not begin a transaction"),
+                    e,
+                )
             })?;
             return Ok(IngestTx::Privileged(tx));
         }
@@ -1461,9 +1469,9 @@ pub async fn do_ingest_document(
     .await
     .map_err(internal_error)?;
 
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("ingest_document: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged("ingest_document: could not commit", e)
+    })?;
 
     // ── 6. DS wiring: edge factors + per-atom BBAs, POST-COMMIT, best-effort ──
     //
@@ -2387,9 +2395,9 @@ pub async fn do_ingest_document_spine(
     .await
     .map_err(internal_error)?;
 
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("ingest_document_spine: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged("ingest_document_spine: could not commit", e)
+    })?;
 
     // ── 6. Detach embeddings ──
     let queued = embed_queue.len();

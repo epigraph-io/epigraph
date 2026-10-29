@@ -23,8 +23,10 @@
 //! * A caller that reads NONE of the plan's `executes` edges is refused on
 //!   both tools with the hierarchical not-found error, which is exactly what
 //!   the direct tool answers for an unknown id, and nothing is written:
-//!   `workflows` has no row security, so this is the only gate on its
-//!   counters. It learns no step id. (`report_workflow_outcome` answers an
+//!   the fixture's `workflows` row is PUBLIC (seeded without a declaration,
+//!   so the seed role's `('public', seed)`), so the plan's steps are what
+//!   refuses it here; a row declared into a group is refused on the row too
+//!   (migration 183, `workflow_ingest_group_tenancy.rs`). It learns no step id. (`report_workflow_outcome` answers an
 //!   unknown id through the flat path's own error; a known, pre-existing
 //!   difference, pinned in `a_non_member_cannot_report_on_a_plan_it_cannot_read`.)
 //! * A reader of the plan whose `step_index` matches no step it can read gets
@@ -96,6 +98,7 @@ async fn seed_private_workflow(pool: &PgPool, name: &str) -> PrivateWorkflow {
         "A workflow whose steps only one group can read.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -337,6 +340,7 @@ async fn seed_mixed_plan(pool: &PgPool, name: &str) -> MixedPlan {
         "A private plan with one public step appended.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -500,6 +504,7 @@ async fn a_plan_without_ordinals_still_resolves_by_position(pool: PgPool) {
         "A public plan with no ordinals.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -954,8 +959,9 @@ async fn refusals(
 
 /// A caller that can read none of a workflow's `executes` edges is refused on
 /// both MCP entry points with exactly the error an unknown id gets, and
-/// nothing is written: `workflows` has no row security, so without this
-/// refusal any writer could move a group-private workflow's counters. A
+/// nothing is written: the fixture's `workflows` row is public, so without
+/// this refusal any writer could move the counters of a plan whose steps are
+/// group-private. A
 /// member's report on the same plan is recorded (positive control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
@@ -973,9 +979,11 @@ async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
     // id to the legacy flat-claim path and that path's own error, while an
     // existing `workflows` row takes the hierarchical branch and gets the
     // hierarchical not-found error. That difference predates this gate and is
-    // a known limitation: the row's existence is not secret (`workflows` has
-    // no row security), but the delegated tool does tell "exists" from
-    // "absent". Pinned below so that changing it is a deliberate decision.
+    // a known limitation for a PUBLIC row like this fixture's (its existence
+    // is not secret), but the delegated tool does tell "exists" from
+    // "absent". A row declared into a group the caller does not read routes
+    // like an unknown id (migration 183). Pinned below so that changing it is
+    // a deliberate decision.
     let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
     assert_eq!(
         refused[0], unknown[0],
@@ -1028,9 +1036,160 @@ async fn a_root_with_no_executes_edge_is_refused_like_an_unknown_id(pool: PgPool
         "A workflow root with no plan claims.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
+
+    let refused = refusals(&server, &viewer, workflow_id).await;
+    let unknown = refusals(&server, &viewer, Uuid::new_v4()).await;
+    assert_eq!(refused[0], unknown[0], "refused as for an unknown id");
+    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        written(&pool, workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
+}
+
+/// Backlog c0ab097a (2), MCP twin of the REST route's
+/// `a_shared_public_atom_does_not_admit_a_non_member`: a public level-3 atom
+/// reused by a group-private plan gives a non-member one visible `executes`
+/// edge. Both MCP entry points must still refuse it as for an unknown id, and
+/// nothing is written; a member's report is recorded (positive control).
+///
+/// RED before the fix: `refusals` panicked, the stranger's report was accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_private_workflow(&pool, "stamped-outcome-public-atom").await;
+
+    let atom = fixture::seed_public_claim(
+        &pool,
+        w.stranger_id,
+        &format!("a shared operation atom {}", w.workflow_id),
+    )
+    .await;
+    set_level(&pool, atom, 3).await;
+    executes(&pool, w.workflow_id, atom, Some(2)).await;
+    let atom_edge: String = sqlx::query_scalar(
+        "SELECT visibility::text FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+    )
+    .bind(w.workflow_id)
+    .bind(atom)
+    .fetch_one(&pool)
+    .await
+    .expect("atom edge read-back");
+    assert_eq!(
+        atom_edge, "public",
+        "fixture shape: the atom's executes edge is public"
+    );
+
+    let refused = refusals(&server, &w.stranger, w.workflow_id).await;
+    let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
+    assert_eq!(refused[0], unknown[0], "refused as for an unknown id");
+    assert_eq!(refused[1], refused[0], "both tools refuse alike");
+    assert_eq!(
+        written(&pool, w.workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
+
+    let json = report(&server, &w.member, w.workflow_id, &[0, 1]).await;
+    assert!(unresolved(&json).is_empty(), "{json}");
+    assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
+}
+
+/// Backlog c0ab097a (2), MCP twin of the REST route's
+/// `a_visible_public_thesis_or_phase_does_not_admit_a_non_member`: a
+/// group-private plan that executes a PUBLIC thesis (level 0) or phase
+/// (level 1) through a public edge. A non-member reads that edge and none of
+/// the plan's steps. Both MCP entry points must refuse it as for an unknown id,
+/// and nothing is written; a member's report is recorded (positive control).
+///
+/// RED before the fix: `refusals` panicked, the stranger's report was accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_visible_public_thesis_or_phase_does_not_admit_a_non_member(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    for (level, what) in [(0, "thesis"), (1, "phase")] {
+        let w = seed_private_workflow(&pool, &format!("stamped-outcome-public-{what}")).await;
+        let shared = fixture::seed_public_claim(
+            &pool,
+            w.member_id,
+            &format!(
+                "a {what} an earlier public generation wrote {}",
+                w.workflow_id
+            ),
+        )
+        .await;
+        set_level(&pool, shared, level).await;
+        executes(&pool, w.workflow_id, shared, Some(2)).await;
+        let edge: String = sqlx::query_scalar(
+            "SELECT visibility::text FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .fetch_one(&pool)
+        .await
+        .expect("edge read-back");
+        assert_eq!(
+            edge, "public",
+            "fixture shape: the {what}'s executes edge is public"
+        );
+
+        let refused = refusals(&server, &w.stranger, w.workflow_id).await;
+        let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
+        assert_eq!(
+            refused[0], unknown[0],
+            "{what}: refused as for an unknown id"
+        );
+        assert_eq!(refused[1], refused[0], "{what}: both tools refuse alike");
+        assert_eq!(
+            written(&pool, w.workflow_id).await,
+            (None, 0),
+            "{what}: a refused report moves no counter and writes no row"
+        );
+
+        let json = report(&server, &w.member, w.workflow_id, &[0, 1]).await;
+        assert!(unresolved(&json).is_empty(), "{what}: {json}");
+        assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2), "{what}");
+    }
+}
+
+/// The ruled gate cannot tell a plan with no steps from one whose steps the
+/// caller cannot read (row security hides both alike), so a step-less plan,
+/// here a generation-0 thesis scaffold before its first `add_step`, is refused
+/// to EVERY reporter, a reader of its public thesis included, and nothing is
+/// written. Pinned so the consequence is visible; reporting on a step-less
+/// plan is an operator question (see `viewer_reads_plan_structure`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_step_less_plan_is_refused_to_every_reporter(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-stepless").await;
+    let viewer = Viewer::resolve(&pool, agent).await.expect("viewer");
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-stepless",
+        0,
+        "A thesis scaffold with no steps yet.",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+    let thesis = fixture::seed_public_claim(
+        &pool,
+        agent,
+        &format!("a public thesis scaffold {workflow_id}"),
+    )
+    .await;
+    set_level(&pool, thesis, 0).await;
+    executes(&pool, workflow_id, thesis, Some(0)).await;
 
     let refused = refusals(&server, &viewer, workflow_id).await;
     let unknown = refusals(&server, &viewer, Uuid::new_v4()).await;

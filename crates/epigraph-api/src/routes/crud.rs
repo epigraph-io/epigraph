@@ -309,10 +309,10 @@ pub async fn create_evidence(
     //
     // A provided hash is verified whenever there is raw_content to verify it
     // against: the stored digest must be the digest of the stored body, or the
-    // row's integrity claim is false (and, through the
-    // (content_hash, claim_id) uniqueness, a chosen digest could block a later
-    // legitimate row). With no raw_content the evidence is external and the
-    // caller's hash is the only one there is, as on `/api/v1/submit`.
+    // row's integrity claim is false (and, through the same-owner evidence
+    // de-duplication, a chosen digest could block a later legitimate row).
+    // With no raw_content the evidence is external and the caller's hash is
+    // the only one there is, as on `/api/v1/submit`.
     let content_hash: [u8; 32] = if let Some(ref hex_hash) = request.content_hash {
         let bytes = hex::decode(hex_hash).map_err(|e| ApiError::ValidationError {
             field: "content_hash".to_string(),
@@ -1061,7 +1061,8 @@ pub struct PromoteStagedEdgesRequest {
 ///
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
 /// Refuses (400, nothing written) when a selected row's `properties` carry
-/// the reserved `dedup` key.
+/// a reserved key (`epigraph_db::RESERVED_EDGE_PROPERTIES`: `dedup`,
+/// `supersede_act`).
 #[cfg(feature = "db")]
 pub async fn promote_staged_edges(
     State(state): State<AppState>,
@@ -1076,13 +1077,19 @@ pub async fn promote_staged_edges(
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
     // Build the query based on whether specific IDs were provided. Each arm is
-    // ONE statement ($1 = the reserved dedup key), so the reserved-key check and
+    // ONE statement ($1 = the reserved keys), so the reserved-key check and
     // the copy read the same snapshot. `reserved` lists the selected rows whose
-    // `properties` carry `dedup`; when any does, `to_promote` is empty and
-    // nothing is written. That key marks a dedup act's identity edge, which only
-    // the act writes (create and patch refuse it too); a staged row is copied
-    // verbatim, so promoting it would publish a forged dedup record. The whole
+    // `properties` carry `dedup` or `supersede_act`; when any does,
+    // `to_promote` is empty and nothing is written. Those keys mark a dedup
+    // act's identity edge and a supersession's act edge, which only the acts
+    // write (create and patch refuse them too); a staged row is copied
+    // verbatim, so promoting it would publish a forged act record. The whole
     // request is refused rather than silently promoting the rest.
+    //
+    // The one column NOT copied verbatim is a case-folded relationship
+    // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
+    // lower-case canonical spelling, as every edge writer stores it (backlog
+    // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
     let (promoted_count, reserved): (i64, Vec<Uuid>) = if let Some(ref ids) = request.edge_ids {
         if ids.is_empty() {
             return Err(ApiError::ValidationError {
@@ -1100,14 +1107,17 @@ pub async fn promote_staged_edges(
                 WHERE id = ANY($2) AND review_status = 'approved'
             ),
             reserved AS (
-                SELECT id FROM selected WHERE properties ? $1
+                SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
             to_promote AS (
                 SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type, relationship, properties
+                SELECT source_id, source_type, target_id, target_type,
+                       CASE WHEN lower(relationship) = ANY($3::text[])
+                            THEN lower(relationship) ELSE relationship END,
+                       properties
                 FROM to_promote
                 ON CONFLICT DO NOTHING
                 RETURNING id
@@ -1120,8 +1130,9 @@ pub async fn promote_staged_edges(
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
-        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
+        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(ids)
+        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
@@ -1137,14 +1148,17 @@ pub async fn promote_staged_edges(
                 WHERE review_status = 'approved'
             ),
             reserved AS (
-                SELECT id FROM selected WHERE properties ? $1
+                SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
             to_promote AS (
                 SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type, relationship, properties
+                SELECT source_id, source_type, target_id, target_type,
+                       CASE WHEN lower(relationship) = ANY($2::text[])
+                            THEN lower(relationship) ELSE relationship END,
+                       properties
                 FROM to_promote
                 ON CONFLICT DO NOTHING
                 RETURNING id
@@ -1157,7 +1171,8 @@ pub async fn promote_staged_edges(
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
         )
-        .bind(epigraph_db::DUPLICATE_IDENTITY_PROPERTY)
+        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
+        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
         .fetch_one(&state.db_pool)
         .await
         .map_err(|e| ApiError::DatabaseError {
@@ -1170,8 +1185,9 @@ pub async fn promote_staged_edges(
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
             reason: format!(
-                "{} (staged edges carrying it: {})",
+                "{} {} (staged edges carrying a reserved key: {})",
                 epigraph_db::DEDUP_IDENTITY_KEY_RESERVED,
+                epigraph_db::SUPERSEDE_ACT_KEY_RESERVED,
                 ids.join(", ")
             ),
         });
@@ -1471,151 +1487,6 @@ pub async fn reassign_claim(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Err(ApiError::ServiceUnavailable {
         service: "Theme reassignment requires database".to_string(),
-    })
-}
-
-// =============================================================================
-// THEME MAINTENANCE: BUILD FROM CORPUS
-// =============================================================================
-
-/// Request to bootstrap themes from the existing corpus by k-means.
-#[derive(Deserialize)]
-pub struct BuildThemesFromCorpusRequest {
-    /// If `Some`, fit k-means with exactly this many clusters. If `None`,
-    /// search `k_min..=k_max` and pick the best inertia (elbow-penalized).
-    pub k: Option<usize>,
-    /// Lower bound when searching k. Default 4.
-    pub k_min: Option<usize>,
-    /// Upper bound when searching k. Default 16.
-    pub k_max: Option<usize>,
-    /// Skip clusters with fewer than this many claims (no theme created;
-    /// claims left unthemed). Default 5.
-    pub min_claims_per_theme: Option<usize>,
-    /// Cap on claims pulled into k-means. Default 500. Higher values risk
-    /// OOM on small VMs (the calibration done on the wrhq deployment OOMs
-    /// the kernel host above ~2000 embeddings).
-    pub limit: Option<i64>,
-    /// Theme labels are auto-named `"{prefix}-{idx}"`. Default `"auto"`.
-    pub label_prefix: Option<String>,
-    /// If true, `DELETE FROM claim_themes` before building. Default false —
-    /// callers that want a clean slate must opt in explicitly. A wipe replaces
-    /// the whole live set, so it is refused (400) unless `label_prefix` is the
-    /// canonical `"auto"` (`epigraph_engine::theme_kmeans::validate_config`).
-    pub wipe_first: Option<bool>,
-    /// Embedding dimension to source. `None` or `Some(1536)` uses the legacy
-    /// `claims.embedding` column and writes to `claim_themes.centroid`.
-    /// `Some(3072)` uses `claims.embedding_3072` and writes to
-    /// `claim_themes.centroid_3072` (operator must run `epigraph-cli reembed`
-    /// first, otherwise this returns 412 Precondition Failed).
-    pub centroid_dim: Option<u32>,
-}
-
-/// k-means bootstrap of `claim_themes` from the existing corpus. Required
-/// before `/api/v1/search/semantic?diverse=true` can return diverse-by-
-/// theme results on a fresh deployment.
-///
-/// Synchronous: blocks the HTTP request until k-means + theme creation
-/// finishes. Sub-second on the wrhq-scale corpus (1607 claims, 1536d).
-/// Larger corpora should expect tens of seconds and may OOM small VMs;
-/// see the `limit` field on the request.
-///
-/// **Quality caveat**: themes built from `claims.embedding` (currently
-/// `vector(1536)`) sit at the `text-embedding-3-small` noise floor on
-/// short hierarchical claims (#48 part 2 — widening to 3072d is a
-/// separate migration). Bootstrap works, but the resulting themes will
-/// be lower-quality than 3072d would produce.
-///
-/// POST /api/v1/themes/build-from-corpus
-#[cfg(feature = "db")]
-pub async fn build_themes_from_corpus(
-    State(state): State<AppState>,
-    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Json(request): Json<BuildThemesFromCorpusRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    use epigraph_engine::theme_kmeans::{
-        run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError, CANONICAL_LABEL_PREFIX,
-    };
-
-    let auth = auth_ctx
-        .ok_or(ApiError::Unauthorized {
-            reason: "build_themes_from_corpus requires authentication".into(),
-        })?
-        .0;
-    crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
-
-    let config = RunThemeKmeansConfig {
-        k: request.k.map(|k| u32::try_from(k).unwrap_or(u32::MAX)),
-        k_min: request
-            .k_min
-            .map_or(4, |v| u32::try_from(v).unwrap_or(u32::MAX)),
-        k_max: request
-            .k_max
-            .map_or(16, |v| u32::try_from(v).unwrap_or(u32::MAX)),
-        min_claims_per_theme: request
-            .min_claims_per_theme
-            .map_or(5, |v| u32::try_from(v).unwrap_or(u32::MAX)),
-        limit: request
-            .limit
-            .map_or(500, |v| u32::try_from(v.max(1)).unwrap_or(u32::MAX))
-            .max(1),
-        label_prefix: request
-            .label_prefix
-            .unwrap_or_else(|| CANONICAL_LABEL_PREFIX.to_string()),
-        wipe_first: request.wipe_first.unwrap_or(false),
-        centroid_dim: request.centroid_dim.unwrap_or(1536),
-    };
-
-    let summary = run_theme_kmeans(&state.db_pool, &config)
-        .await
-        .map_err(|e| match e {
-            ThemeKmeansError::BadRequest(msg) => ApiError::BadRequest { message: msg },
-            ThemeKmeansError::Centroid3072Empty => ApiError::BadRequest {
-                message: e.to_string(),
-            },
-            ThemeKmeansError::Repo(repo_err) => ApiError::from(repo_err),
-            other => ApiError::InternalError {
-                message: other.to_string(),
-            },
-        })?;
-
-    // Preserve byte-identical legacy JSON shape.
-    //
-    // - Skip path: `k_used` is JSON null and a `skipped_reason` field is
-    //   emitted; `centroid_dim` is the *requested* config dim
-    //   (`summary.centroid_dim` already reflects this on skip).
-    // - Success path: `k_used` is the chosen integer; `centroid_dim` is
-    //   the *measured* dim from the first row.  The original handler also
-    //   omitted `skipped_reason` on this path — we do the same.
-    let body = if let Some(k_used) = summary.k_used {
-        serde_json::json!({
-            "themes_created": summary.themes_created,
-            "claims_assigned": summary.claims_assigned,
-            "k_used": k_used,
-            "claims_with_embeddings": summary.claims_with_embeddings,
-            "centroid_dim": summary.centroid_dim,
-        })
-    } else {
-        serde_json::json!({
-            "themes_created": summary.themes_created,
-            "claims_assigned": summary.claims_assigned,
-            "k_used": serde_json::Value::Null,
-            "claims_with_embeddings": summary.claims_with_embeddings,
-            "centroid_dim": summary.centroid_dim,
-            "skipped_reason": summary.skipped_reason.unwrap_or_default(),
-        })
-    };
-
-    Ok(Json(body))
-}
-
-#[cfg(not(feature = "db"))]
-pub async fn build_themes_from_corpus(
-    State(_state): State<AppState>,
-    _auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
-    Json(_request): Json<BuildThemesFromCorpusRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    Err(ApiError::ServiceUnavailable {
-        service: "Build themes requires database".to_string(),
     })
 }
 

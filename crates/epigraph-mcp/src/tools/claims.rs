@@ -453,6 +453,7 @@ async fn prepare_submission(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            &params.labels,
         )
         .await
         {
@@ -1050,8 +1051,9 @@ pub async fn get_claim(
     // page-degrade semantics).
     let lensed_belief = match lens {
         Some((frame_id, perspective_id)) => {
-            let interval = epigraph_engine::belief_query::get_perspective_belief(
+            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 id,
                 frame_id,
@@ -1187,13 +1189,14 @@ pub async fn verify_claim(
         if epigraph_ingest::document::stored_content_hash_is_canonical_name_scoped(&properties) {
             // Workflow structural row: the seed is the canonical_name of the
             // workflow that executes it — recovered from the edge, not guessed.
-            let names = epigraph_db::WorkflowRepository::executing_canonical_names(
-                &server.pool,
-                viewer,
-                id,
-            )
-            .await
-            .map_err(internal_error)?;
+            // On the caller's read: the executing `workflows` rows carry
+            // their plan's tenancy (migration 183, ruling R-74).
+            let mut read = super::workflows::CallerRead::open(server, viewer).await?;
+            let names =
+                epigraph_db::WorkflowRepository::executing_canonical_names(read.conn(), viewer, id)
+                    .await
+                    .map_err(internal_error)?;
+            read.close().await?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
                 &claim.content,
                 &claim.content_hash,
@@ -1376,8 +1379,8 @@ pub async fn update_with_evidence(
     // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
     // has no `ON CONFLICT`, so each retry appends another row". #497 measured
     // that premise wrong for an IDENTICAL retry: `content_hash` is
-    // `blake3(evidence_data)` and migration 001's
-    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // `blake3(evidence_data)` and the same-owner evidence de-duplication
+    // (`EvidenceRepository::create`; migration 001's unique key until 171)
     // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
     // adds a row. That makes a committed BBA-less row WORSE, not better: it
     // blocks the identical re-submission that would land the contribution.)
@@ -1539,7 +1542,7 @@ pub async fn update_with_evidence(
     // truth write, no labels — and an error is now the complete and truthful
     // answer. Swallowing it instead would commit exactly the BBA-less evidence
     // row the note above explains is worse than nothing (it blocks the identical
-    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // re-submit via the same-owner evidence de-duplication). The error text keeps
     // the failing step as its prefix (`assign_claim:`, `store BBA:`,
     // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
     // which is the part of #497's disclosure that still has a referent.
@@ -1551,7 +1554,21 @@ pub async fn update_with_evidence(
     // the same unit as its BBA.
     //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    let ds = ds_auto::auto_wire_ds_update(
+    // A promoted hypothesis's readers read `research_validity`, never
+    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
+    // R-17), instead of on `binary_truth`, never on both: the fold reads every
+    // two-hypothesis frame and would count it twice. A missing or non-binary
+    // `research_validity` is the caller's refusal, with nothing written.
+    let file_on =
+        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, claim_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { .. }
+                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+                other => internal_error(other),
+            })?
+            .map(|frame| frame.id);
+    let ds = ds_auto::auto_wire_ds_update_filed_on(
         &mut tx,
         viewer,
         claim_id,
@@ -1562,6 +1579,7 @@ pub async fn update_with_evidence(
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
         !foreign_claim, // seed the authored truth_value only on a claim this caller writes
+        file_on,
     )
     .await
     .map_err(|e| {

@@ -129,6 +129,13 @@ exposed as a configurable flag `matcher.filter.include_agent_id` for
 operators who want the stricter rule. Defer the calibration of which
 default to use to the SciFact tuning run.
 
+> **Superseded for non-paper pairs (operator ruling R-12, 2026-10-25).** When
+> neither claim has an asserting paper (on itself or a `decomposes_to`
+> ancestor), the same agent alone makes the pair same-source, always on. The
+> provenance-only default and the `include_agent_id` flag above still apply to
+> any pair with a paper claim on it. See
+> `crates/epigraph-engine/src/matching/source_key.rs::is_same_source`.
+
 #### 2. Blocker
 
 Pluggable strategies, results unioned and source-filtered:

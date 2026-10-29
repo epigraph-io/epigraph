@@ -110,23 +110,34 @@ const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
 /// `None` → default (`GRAPH_VIEW_RELATIONSHIPS`).
 /// `Some("*")` or `Some("all")` → returns `None` (caller treats as "no filter").
 /// Otherwise → comma-split, trimmed, non-empty entries.
+///
+/// Every entry is expanded to all its stored spellings
+/// (`epigraph_core::edge::relationships::relationship_spellings`), so a
+/// case-folded relationship (`supports`, `contradicts`, `corroborates`,
+/// `refutes`) matches its legacy upper-case rows and its canonical lower-case
+/// ones whichever spelling the caller named (backlog 3ce5e00c). Any other
+/// entry stays the single exact spelling it was (`REFINES` != `refines`).
+/// Order is kept and repeats are dropped.
 fn resolve_relationship_filter(override_param: Option<&str>) -> Option<Vec<String>> {
-    match override_param.map(str::trim).filter(|s| !s.is_empty()) {
-        None => Some(
-            GRAPH_VIEW_RELATIONSHIPS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-        ),
-        Some(s) if s == "*" || s.eq_ignore_ascii_case("all") => None,
-        Some(s) => Some(
-            s.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
+    let entries: Vec<&str> = match override_param.map(str::trim).filter(|s| !s.is_empty()) {
+        None => GRAPH_VIEW_RELATIONSHIPS.to_vec(),
+        Some(s) if s == "*" || s.eq_ignore_ascii_case("all") => return None,
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect(),
+    };
+    let mut out: Vec<String> = Vec::with_capacity(entries.len());
+    for spelling in entries
+        .into_iter()
+        .flat_map(epigraph_core::edge::relationships::relationship_spellings)
+    {
+        if !out.contains(&spelling) {
+            out.push(spelling);
+        }
     }
+    Some(out)
 }
 
 #[derive(Debug, Serialize)]
@@ -910,6 +921,35 @@ mod tests {
         assert!(resolve_relationship_filter(Some("ALL")).is_none());
         assert!(resolve_relationship_filter(Some("All")).is_none());
         assert!(resolve_relationship_filter(Some("all")).is_none());
+    }
+
+    #[test]
+    fn resolve_filter_expands_a_folded_relationship_to_both_spellings() {
+        // Backlog 3ce5e00c: `?relationships=SUPPORTS` used to bind the one
+        // spelling, so every canonical lower-case `supports` edge was counted
+        // as filtered out, and `?relationships=supports` hid the legacy rows.
+        for asked in ["SUPPORTS", "supports", "Supports"] {
+            assert_eq!(
+                resolve_relationship_filter(Some(asked)).unwrap(),
+                vec!["supports".to_string(), "SUPPORTS".to_string()],
+                "{asked}"
+            );
+        }
+        // Mixed with an unfolded entry; repeats collapse.
+        assert_eq!(
+            resolve_relationship_filter(Some("contradicts,REFINES,CONTRADICTS")).unwrap(),
+            vec![
+                "contradicts".to_string(),
+                "CONTRADICTS".to_string(),
+                "REFINES".to_string()
+            ]
+        );
+        // The default allow-list covers both spellings of every folded one.
+        let default = resolve_relationship_filter(None).unwrap();
+        for rel in ["supports", "contradicts", "corroborates", "refutes"] {
+            assert!(default.contains(&rel.to_string()), "{rel}");
+            assert!(default.contains(&rel.to_ascii_uppercase()), "{rel}");
+        }
     }
 
     #[test]

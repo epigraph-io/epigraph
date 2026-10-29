@@ -342,3 +342,283 @@ async fn find_workflow_hierarchical_resolve_to_latest_flags_a_deprecated_head() 
         );
     }
 }
+
+// ── A deprecated lineage head sorts AFTER the live rows of its group ────
+//
+// HTTP twins of the MCP `workflow_deprecated_head_order.rs`. #676 made the
+// true lineage head always present and ordered it first in its group; for a
+// head deprecated below `min_truth` that put the one row a caller should not
+// pick ahead of every live generation. It is still returned and still flagged
+// `lineage_head_deprecated`, but it trails its group's live rows. A LIVE head
+// (here `beta`'s, injected because its goal misses the query) still leads.
+
+/// Seed one `workflows` row; `embedding` is stored as its `goal_embedding`.
+async fn seed_order_row(
+    pool: &sqlx::PgPool,
+    canonical: &str,
+    generation: i32,
+    goal: &str,
+    truth: f64,
+    embedding: Option<&[f32]>,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, goal, generation, metadata, truth_value) \
+         VALUES ($1, $2, $3, $4, '{}'::jsonb, $5)",
+    )
+    .bind(id)
+    .bind(canonical)
+    .bind(goal)
+    .bind(generation)
+    .bind(truth)
+    .execute(pool)
+    .await
+    .expect("seed generation");
+    if let Some(v) = embedding {
+        epigraph_db::WorkflowRepository::set_goal_embedding(pool, id, v)
+            .await
+            .expect("set goal embedding");
+    }
+    id
+}
+
+/// `[alpha gen1, alpha gen0, alpha DEPRECATED head, beta live head, beta gen0]`.
+/// The live alpha truths run opposite to generation (gen 0 at 1.0, gen 1 at
+/// 0.6), so a truth-descending sort would swap them.
+struct OrderIds {
+    expected: Vec<Uuid>,
+    a_dead: Uuid,
+    a_rows: Vec<Uuid>,
+    b_head: Uuid,
+}
+
+fn assert_deprecated_head_trails(body: &serde_json::Value, ids: &OrderIds) {
+    let workflows = body["workflows"].as_array().expect("workflows array");
+    // The file shares one database: compare the order of THIS fixture's rows.
+    let order: Vec<Uuid> = workflows
+        .iter()
+        .filter_map(|w| w["workflow_id"].as_str().and_then(|s| s.parse().ok()))
+        .filter(|id| ids.expected.contains(id))
+        .collect();
+    assert_eq!(
+        order, ids.expected,
+        "a deprecated head trails the live rows of its group and a live head leads its group; \
+         got {body}"
+    );
+    let entry = |id: Uuid| {
+        workflows
+            .iter()
+            .find(|w| w["workflow_id"].as_str() == Some(&id.to_string()))
+            .unwrap_or_else(|| panic!("{id} must be returned; got {body}"))
+    };
+    assert_eq!(
+        entry(ids.a_dead)["is_lineage_head"],
+        serde_json::json!(true)
+    );
+    for id in &ids.a_rows {
+        let w = entry(*id);
+        assert_eq!(w["lineage_head_generation"], serde_json::json!(2), "{w}");
+        assert_eq!(
+            w["lineage_head_deprecated"],
+            serde_json::json!(true),
+            "still flagged deprecated: {w}"
+        );
+    }
+    let b_head = entry(ids.b_head);
+    assert_eq!(
+        b_head["is_lineage_head"],
+        serde_json::json!(true),
+        "{b_head}"
+    );
+    assert_eq!(
+        b_head["lineage_head_deprecated"],
+        serde_json::json!(false),
+        "{b_head}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_ilike_sorts_a_deprecated_head_after_live_rows() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let alpha = format!("{}-a-dep-order", &tag[..12]);
+    let beta = format!("{}-b-dep-order", &tag[..12]);
+    let phrase = format!("qqord{tag}");
+    let a0 = seed_order_row(&pool, &alpha, 0, &format!("{phrase} digest"), 1.0, None).await;
+    let a1 = seed_order_row(&pool, &alpha, 1, &format!("{phrase} digest v1"), 0.6, None).await;
+    let a_dead = seed_order_row(&pool, &alpha, 2, &format!("{phrase} digest v2"), 0.05, None).await;
+    let b0 = seed_order_row(&pool, &beta, 0, &format!("{phrase} inbox"), 1.0, None).await;
+    let b_head = seed_order_row(&pool, &beta, 1, "rewritten plan", 1.0, None).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/workflows/hierarchical/search?q={phrase}&resolve_to_latest=true"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["workflows"].as_array().map(Vec::len),
+        Some(5),
+        "{body}"
+    );
+    assert_deprecated_head_trails(
+        &body,
+        &OrderIds {
+            expected: vec![a1, a0, a_dead, b_head, b0],
+            a_dead,
+            a_rows: vec![a0, a1, a_dead],
+            b_head,
+        },
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_embedding_sorts_a_deprecated_head_after_live_rows() {
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let alpha = format!("{}-a-dep-order-ann", &tag[..12]);
+    let beta = format!("{}-b-dep-order-ann", &tag[..12]);
+    // No seeded goal or canonical_name contains the query text, so anything
+    // returned arrived through the embedding path, not the ILIKE fallback.
+    let query = format!("zzann{tag}");
+
+    // The route embeds `q` with the same provider `spawn_app_with_mock_embedding`
+    // installs; place each row at a chosen cosine similarity to that vector.
+    let q = MockProvider::new(EmbeddingConfig::openai(1536))
+        .generate(&query)
+        .await
+        .expect("mock embedding");
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let qn: Vec<f32> = q.iter().map(|x| x / norm(&q)).collect();
+    let mut u: Vec<f32> = vec![0.0; qn.len()];
+    u[0] = 1.0;
+    let dot: f32 = u.iter().zip(&qn).map(|(a, b)| a * b).sum();
+    for (ui, qi) in u.iter_mut().zip(&qn) {
+        *ui -= dot * qi;
+    }
+    let un = norm(&u);
+    u.iter_mut().for_each(|x| *x /= un);
+    let at = |cos: f32| -> Vec<f32> {
+        let sin = (1.0 - cos * cos).sqrt();
+        qn.iter().zip(&u).map(|(a, b)| cos * a + sin * b).collect()
+    };
+
+    let a0 = seed_order_row(&pool, &alpha, 0, "send the digest", 1.0, Some(&at(0.9))).await;
+    let a1 = seed_order_row(&pool, &alpha, 1, "send the digest v1", 0.6, Some(&at(1.0))).await;
+    let a_dead = seed_order_row(&pool, &alpha, 2, "send the digest v2", 0.05, None).await;
+    let b0 = seed_order_row(&pool, &beta, 0, "triage the inbox", 1.0, Some(&at(0.8))).await;
+    let b_head = seed_order_row(&pool, &beta, 1, "rewritten plan", 1.0, None).await;
+
+    let (addr, _shutdown) = common::spawn_app_with_mock_embedding(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/v1/workflows/hierarchical/search?q={query}&resolve_to_latest=true&limit=50"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_deprecated_head_trails(
+        &body,
+        &OrderIds {
+            expected: vec![a1, a0, a_dead, b_head, b0],
+            a_dead,
+            a_rows: vec![a0, a1, a_dead],
+            b_head,
+        },
+    );
+}
+
+/// HTTP twin of the min_truth cases in `workflow_deprecated_head_order.rs`.
+/// The route computes `lineage_head_deprecated` itself (`truth < min_truth`),
+/// after either search path, so it must use the same caller-supplied bound
+/// the repo statement sorted by: a 0.4 head leads at the default 0.3 and
+/// trails at `min_truth=0.5`, and the flag agrees with the position each time.
+/// A hardcoded `< 0.3` or `<= 0.05` in the sort or the flag fails one of the
+/// two requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn find_workflow_hierarchical_deprecation_follows_the_callers_min_truth() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let tag = Uuid::new_v4().simple().to_string();
+    let alpha = format!("{}-a-dep-threshold", &tag[..12]);
+    let phrase = format!("qqthr{tag}");
+    let a0 = seed_order_row(&pool, &alpha, 0, &format!("{phrase} digest"), 1.0, None).await;
+    let a1 = seed_order_row(&pool, &alpha, 1, &format!("{phrase} digest v1"), 0.6, None).await;
+    let head = seed_order_row(&pool, &alpha, 2, "rewritten plan", 0.4, None).await;
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::mint_token_with_agent(&["claims:read"], Uuid::new_v4());
+    let fetch = |min_truth: &'static str| {
+        let (token, phrase) = (token.clone(), phrase.clone());
+        async move {
+            let body: serde_json::Value = reqwest::Client::new()
+                .get(format!(
+                    "http://{addr}/api/v1/workflows/hierarchical/search?q={phrase}&resolve_to_latest=true{min_truth}"
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body
+        }
+    };
+    let check = |body: &serde_json::Value, expected: Vec<Uuid>, deprecated: bool, case: &str| {
+        let workflows = body["workflows"].as_array().expect("workflows array");
+        let order: Vec<Uuid> = workflows
+            .iter()
+            .filter_map(|w| w["workflow_id"].as_str().and_then(|s| s.parse().ok()))
+            .collect();
+        assert_eq!(order, expected, "{case}: order; got {body}");
+        for w in workflows {
+            assert_eq!(
+                w["lineage_head_deprecated"],
+                serde_json::json!(deprecated),
+                "{case}: the flag and the position must agree; {w}"
+            );
+        }
+    };
+
+    let body = fetch("").await;
+    check(
+        &body,
+        vec![head, a1, a0],
+        false,
+        "0.4 head, default min_truth 0.3",
+    );
+    let body = fetch("&min_truth=0.5").await;
+    check(&body, vec![a1, a0, head], true, "0.4 head, min_truth 0.5");
+}
