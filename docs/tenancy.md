@@ -1697,7 +1697,12 @@ every collapse has a `cascade.admin_applied` row naming `--acting-agent`
 (cause `dedup`). Migration 119 lets no application session enqueue a job and
 grants the maintenance role the job handlers' DELETEs; `maintenance_timer_only.rs`
 pins both, and `maintenance_surface_register.rs` pins that the request crates
-acquire no maintenance authority outside the drain.
+acquire no maintenance authority outside the drain. The retention timer
+`prune_recall_events` likewise runs on the maintenance login (an application
+DELETE on the FORCE-RLS `recall_events` matches nothing); migration 186 grants
+it DELETE on `recall_events` and `events`, and
+`epigraph-cli/tests/prune_recall_events_maintenance.rs` pins the pass on a
+maintenance login and the application role's refusal.
 
 The replay acts on `security_events` rows, so 117 makes those rows the
 server's: a non-privileged session cannot write any `cascade.*` row itself (a
