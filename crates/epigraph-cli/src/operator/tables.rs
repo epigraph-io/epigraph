@@ -59,15 +59,20 @@ pub const WRITER_COLUMNS: &[(&str, Option<&str>)] = &[
     ("claim_signature_revocations", Some("revoked_by")),
 ];
 
-/// `edges.signer_id` is the writer of an edge, as far as this tool's
-/// `--derived keep-writer` mode reads one.
+/// The writer of an edge (alias `e`), as this tool's `--derived keep-writer`
+/// mode, its spill report and `restrict-claims` read one: the author of the
+/// edge's SOURCE claim; NULL when the source is not a claim (the row is then
+/// unattributed and follows the claim).
 ///
-/// On legacy rows `signer_id` is, where set, a BULK ATTESTATION key rather than
-/// an author, so it attributes nothing. Since migration 120 the author record
-/// is `edges.writer_group_id` (a group, set from the writing session), and a
-/// re-own never rewrites a public edge, so this column no longer decides where
-/// any edge lands.
-pub const EDGE_WRITER: &str = "signer_id";
+/// Not `edges.signer_id` (ruling R-49): that is the agent whose key ATTESTED
+/// the edge. Every edge an MCP server or the API writes is attested by that
+/// server's own signer agent, whoever asserted it, and on legacy rows
+/// `signer_id` is, where set, a BULK ATTESTATION key, so it attributes
+/// nothing. Since migration 120 the author record is `edges.writer_group_id`
+/// (a group, set from the writing session), and a re-own never rewrites a
+/// public edge, so this reading no longer decides where any edge lands.
+pub const EDGE_WRITER_SQL: &str = "(SELECT wc.agent_id FROM claims wc \
+      WHERE e.source_type = 'claim' AND wc.id = e.source_id)";
 
 /// How a table hangs off a claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,14 +344,17 @@ pub async fn propagated_tables(conn: &mut PgConnection) -> anyhow::Result<Vec<Ta
             "owner_group_id",
             "visibility",
             "co_owner_group_id",
-            EDGE_WRITER,
+            "source_type",
+            "source_id",
         ],
     )
     .await?;
     specs.push(TableSpec {
         name: "edges".into(),
         pk: pk_columns(conn, "edges").await?,
-        writer: Some(EDGE_WRITER.into()),
+        // No writer COLUMN: `fetch_attached` reads an edge's writer through
+        // `EDGE_WRITER_SQL` (its source claim's author, ruling R-49).
+        writer: None,
         kind: Kind::Edges,
         writer_owned: false,
     });
@@ -561,7 +569,7 @@ pub async fn fetch_attached(
                 let sql = format!(
                     "SELECT {pk}, c.cid, \
                             e.owner_group_id, e.visibility::text, e.co_owner_group_id, \
-                            e.\"{EDGE_WRITER}\", (s.v = 'public' AND tt.v = 'public'), \
+                            {EDGE_WRITER_SQL}, (s.v = 'public' AND tt.v = 'public'), \
                             array_remove(ARRAY[ \
                               CASE WHEN e.source_type = 'claim' AND e.source_id <> ALL($1) \
                                    THEN e.source_id END, \

@@ -348,10 +348,8 @@ const CLAIMS_SIGNED_EVIDENCE: &str =
     "SELECT content_hash, signature FROM evidence WHERE claim_id = $1 AND signature IS NOT NULL";
 
 /// `ingest_document`'s evidence sign site (`do_ingest_document`). Its claim
-/// sign site is guarded by `epigraph-crypto`'s `entity_signing_sites` ratchet
-/// instead: the document walk's claim INSERTs
-/// (`create_with_id_if_absent_conn`, `create_conn`) store no signature, so no
-/// row shows it.
+/// sign site is checked on the stored rows by `ingest_claim_signatures.rs`
+/// (backlog 4ff87716: the walk's claim INSERTs now store the signature).
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingest_document_signs_its_evidence_under_v1(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;

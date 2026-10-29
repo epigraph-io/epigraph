@@ -280,10 +280,15 @@ pub async fn do_link_epistemic(
     // caller: the BBA is keyed on `edge_id`, so materializing the caller's
     // direction onto a row recording the opposite one would attach a factor
     // the row does not describe.
+    //
+    // Either arm attests the edge it INSERTS with this server's key
+    // (R-49/R-50); a dedup hit returns the existing edge unchanged.
+    let edge_key = Some(server.edge_signing_key().await?);
     let (edge_id, was_created, wire_source, wire_target) =
         if is_symmetric_relationship(&params.relationship) {
-            let upsert = EdgeRepository::create_symmetric_if_absent_oriented_conn(
+            let upsert = EdgeRepository::create_symmetric_if_absent_oriented_signed_conn(
                 &mut tx,
+                edge_key,
                 source_id,
                 target_id,
                 &params.relationship,
@@ -298,8 +303,9 @@ pub async fn do_link_epistemic(
                 upsert.target_id,
             )
         } else {
-            let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+            let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
                 &mut tx,
+                edge_key,
                 source_id,
                 "claim",
                 target_id,

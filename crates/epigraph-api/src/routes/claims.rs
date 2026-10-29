@@ -1004,8 +1004,9 @@ pub(crate) async fn create_claim_core(
     // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
     // and for the same reason, as the labels and properties writes above.
     if was_created {
-        let _ = epigraph_db::EdgeRepository::create(
+        let _ = epigraph_db::EdgeRepository::create_signed(
             &state.db_pool,
+            state.edge_signing_key(),
             request.agent_id,
             "agent",
             claim_uuid,
@@ -1018,8 +1019,9 @@ pub(crate) async fn create_claim_core(
         .await;
 
         if let Some(trace_uuid) = request.trace_id {
-            let _ = epigraph_db::EdgeRepository::create(
+            let _ = epigraph_db::EdgeRepository::create_signed(
                 &state.db_pool,
+                state.edge_signing_key(),
                 claim_uuid,
                 "claim",
                 trace_uuid,
@@ -1033,8 +1035,9 @@ pub(crate) async fn create_claim_core(
         }
 
         if let Some(evidence_id) = request.evidence_id {
-            let _ = epigraph_db::EdgeRepository::create(
+            let _ = epigraph_db::EdgeRepository::create_signed(
                 &state.db_pool,
+                state.edge_signing_key(),
                 claim_uuid,
                 "claim",
                 evidence_id,

@@ -163,6 +163,7 @@ pub async fn memorize(
         &claim,
         Some(signer_typed.as_uuid()),
         "memorize",
+        Some(server.edge_signing_key().await?),
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();

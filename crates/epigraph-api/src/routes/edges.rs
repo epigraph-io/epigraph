@@ -810,8 +810,9 @@ pub async fn create_edge(
             && request.source_type == "claim"
             && request.target_type == "claim";
     let (edge_row, was_created) = if symmetric_claim_pair {
-        EdgeRepository::create_symmetric_if_absent_row_conn(
+        EdgeRepository::create_symmetric_if_absent_row_signed_conn(
             &mut tx,
+            state.edge_signing_key(),
             request.source_id,
             request.target_id,
             &request.relationship,
@@ -822,8 +823,9 @@ pub async fn create_edge(
         .await
         .map_err(refused)?
     } else if request.if_not_exists {
-        EdgeRepository::create_if_not_exists_conn(
+        EdgeRepository::create_if_not_exists_signed_conn(
             &mut tx,
+            state.edge_signing_key(),
             request.source_id,
             &request.source_type,
             request.target_id,
@@ -836,8 +838,9 @@ pub async fn create_edge(
         .await
         .map_err(refused)?
     } else {
-        let id = EdgeRepository::create(
-            &mut *tx,
+        let id = EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
             request.source_id,
             &request.source_type,
             request.target_id,
@@ -1269,8 +1272,9 @@ pub async fn create_hierarchical_edge(
 
     // Idempotent on (source, target, relationship) so per-chapter wire-ups
     // can re-run safely. source_type / target_type are always "claim" here.
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
         &mut tx,
+        state.edge_signing_key(),
         request.source_claim_id,
         "claim",
         request.target_claim_id,
@@ -1588,8 +1592,9 @@ pub async fn relate_claims(
         }
     };
     // Create bidirectional edges
-    let edge1 = EdgeRepository::create(
-        &mut *tx,
+    let edge1 = EdgeRepository::create_signed_conn(
+        &mut tx,
+        state.edge_signing_key(),
         source_id,
         "claim",
         request.target_claim_id,
@@ -1602,8 +1607,9 @@ pub async fn relate_claims(
     .await
     .map_err(refused)?;
 
-    let edge2 = EdgeRepository::create(
-        &mut *tx,
+    let edge2 = EdgeRepository::create_signed_conn(
+        &mut tx,
+        state.edge_signing_key(),
         request.target_claim_id,
         "claim",
         source_id,

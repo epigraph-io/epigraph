@@ -2371,6 +2371,71 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          tenancy (migrations 070/074) and `triples_tenancy`'s WITH CHECK applies on the stamped \
          connection. An INSERT has no read for a viewer marker to filter.",
     ),
+    (
+        "claim.rs",
+        "create_signed_conn",
+        "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "claim.rs",
+        "create_with_id_if_absent_signed_conn",
+        "WRITE. The signed twin of the unsigned form above it (backlog 4ff87716): the same INSERT plus the claim's v1 signature and signer_id, gated by v1_claim_signature_to_store; nothing to filter, and the INSERT is authorised by claims_tenancy's WITH CHECK on the caller's stamped connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_absent_including_retracted_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_if_not_exists_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_processed_by_stamp_if_absent_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_oriented_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_returning_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "create_symmetric_if_absent_row_signed_conn",
+        "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
+    ),
+    (
+        "edge.rs",
+        "symmetric_in_force_id",
+        "WRITE PATH. The dedup-hit half of a symmetric edge primitive, split out so the signed and unsigned arms share it: the same VISIBILITY-EXEMPT symmetric-dedup probe the primitive always ran inside its write (it must see an existing edge whoever asks, or the get half becomes a duplicate create).",
+    ),
+    (
+        "edge.rs",
+        "symmetric_in_force_oriented",
+        "WRITE PATH. The dedup-hit half of a symmetric edge primitive, split out so the signed and unsigned arms share it: the same VISIBILITY-EXEMPT symmetric-dedup probe the primitive always ran inside its write (it must see an existing edge whoever asks, or the get half becomes a duplicate create).",
+    ),
+    (
+        "edge.rs",
+        "symmetric_in_force_row",
+        "WRITE PATH. The dedup-hit half of a symmetric edge primitive, split out so the signed and unsigned arms share it: the same VISIBILITY-EXEMPT symmetric-dedup probe the primitive always ran inside its write (it must see an existing edge whoever asks, or the get half becomes a duplicate create).",
+    ),
+    (
+        "edge_signature.rs",
+        "insert_attested_conn",
+        "WRITE. The attested edge INSERT (ruling R-50) every signed edge twin runs: one INSERT carrying content_hash, the v1 edge signature and signer_id, re-made once over the stored row if the database rewrote a column; nothing to filter, and the INSERT is authorised by edges_tenancy's WITH CHECK.",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it

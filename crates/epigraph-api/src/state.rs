@@ -469,6 +469,11 @@ pub struct AppState {
     /// (fail closed; dev and CI run this way).
     #[cfg(feature = "db")]
     pub passkeys: Option<Arc<epigraph_passkey::Passkeys>>,
+    /// The API's OWN entity signing key for the edges HTTP writers insert
+    /// (ruling R-50; [`crate::edge_signer`]). `None` = edges are written
+    /// unsigned (no key configured).
+    #[cfg(feature = "db")]
+    pub edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
 }
 
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
@@ -1240,6 +1245,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -1635,6 +1641,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -1708,6 +1715,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -2312,6 +2320,27 @@ impl AppState {
     pub fn with_passkeys(mut self, passkeys: Option<Arc<epigraph_passkey::Passkeys>>) -> Self {
         self.passkeys = passkeys;
         self
+    }
+
+    /// Attach the API's edge signing key; see [`Self::edge_signer`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_edge_signer(
+        mut self,
+        edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
+    ) -> Self {
+        self.edge_signer = edge_signer;
+        self
+    }
+
+    /// The key an HTTP edge writer passes to the `EdgeRepository::*_signed_conn`
+    /// primitives: the API's own (ruling R-50), or `None` (unsigned).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn edge_signing_key(&self) -> Option<epigraph_db::repos::EdgeSigningKey<'_>> {
+        self.edge_signer
+            .as_deref()
+            .map(crate::edge_signer::ApiEdgeSigner::key)
     }
 }
 

@@ -376,8 +376,9 @@ pub async fn assess_claim(
     .bind(frame_id)
     .execute(pool)
     .await;
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         pool,
+        state.edge_signing_key(),
         claim_id,
         "claim",
         frame_id,
@@ -569,8 +570,9 @@ pub async fn assess_claim(
 
     // Create edges reflecting DS relationships
     if final_bel > 0.5 {
-        let _ = epigraph_db::EdgeRepository::create(
+        let _ = epigraph_db::EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             mf_id,
             "evidence",
             claim_id,
@@ -582,8 +584,9 @@ pub async fn assess_claim(
         )
         .await;
     } else if final_bel < 0.3 {
-        let _ = epigraph_db::EdgeRepository::create(
+        let _ = epigraph_db::EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             mf_id,
             "evidence",
             claim_id,

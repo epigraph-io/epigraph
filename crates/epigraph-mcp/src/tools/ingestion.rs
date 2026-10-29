@@ -975,6 +975,10 @@ pub async fn do_ingest_document(
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
+    // Every edge the walk INSERTS (authored, asserts, the plan's relationships,
+    // processed_by) is attested at INSERT by this server's key (R-49/R-50); a
+    // dedup hit returns the existing edge unchanged.
+    let edge_key = Some(server.edge_signing_key().await?);
 
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
@@ -1161,26 +1165,28 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
             created.id.into()
         };
-        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-            &mut tx,
-            agent_uuid,
-            "agent",
-            paper_id,
-            "paper",
-            "authored",
-            Some(serde_json::json!({
-                // The ORIGINAL extraction index: it can have gaps where a
-                // placeholder author was dropped ([Unknown, Alice] gives Alice
-                // position 1 and no edge position 0).
-                "position": idx,
-                "role": author.roles.first().map_or("author", String::as_str),
-                "affiliations": author.affiliations,
-            })),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
+        let (_row, _was_created) =
+            EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                &mut tx,
+                edge_key,
+                agent_uuid,
+                "agent",
+                paper_id,
+                "paper",
+                "authored",
+                Some(serde_json::json!({
+                    // The ORIGINAL extraction index: it can have gaps where a
+                    // placeholder author was dropped ([Unknown, Alice] gives Alice
+                    // position 1 and no edge position 0).
+                    "position": idx,
+                    "role": author.roles.first().map_or("author", String::as_str),
+                    "affiliations": author.affiliations,
+                })),
+                None,
+                None,
+            )
+            .await
+            .map_err(internal_error)?;
         author_agent_map.insert(idx, agent_uuid);
         author_responses.push(AuthorResponse {
             agent_id: agent_uuid.to_string(),
@@ -1243,6 +1249,7 @@ pub async fn do_ingest_document(
             &claim,
             planned,
             agent_id,
+            signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
         )
@@ -1271,19 +1278,21 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
         }
         if resolved_to_existing {
-            let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-                &mut tx,
-                paper_id,
-                "paper",
-                persisted_id,
-                "claim",
-                "asserts",
-                Some(planned.properties.clone()),
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
+            let (_row, _was_created) =
+                EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                    &mut tx,
+                    edge_key,
+                    paper_id,
+                    "paper",
+                    persisted_id,
+                    "claim",
+                    "asserts",
+                    Some(planned.properties.clone()),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             claim_ids.push(persisted_id.to_string());
             dedup_count += 1;
@@ -1349,19 +1358,21 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-            &mut tx,
-            paper_id,
-            "paper",
-            persisted_id,
-            "claim",
-            "asserts",
-            Some(planned.properties.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
+        let (_row, _was_created) =
+            EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                &mut tx,
+                edge_key,
+                paper_id,
+                "paper",
+                persisted_id,
+                "claim",
+                "asserts",
+                Some(planned.properties.clone()),
+                None,
+                None,
+            )
+            .await
+            .map_err(internal_error)?;
 
         embed_queue.push((persisted_id, planned.content.clone()));
 
@@ -1418,8 +1429,9 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
+        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut tx,
+            edge_key,
             src,
             &src_type,
             tgt,
@@ -1459,8 +1471,9 @@ pub async fn do_ingest_document(
     // `check_already_ingested` reports, and this path runs DETACHED, so that
     // edge is the caller's only way to learn whether the queued ingest landed.
     // Written with the walk, it exists if and only if the walk committed.
-    EdgeRepository::create_processed_by_stamp_if_absent_conn(
+    EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(
         &mut tx,
+        edge_key,
         paper_id,
         agent_id,
         &pipeline_version,
@@ -1843,11 +1856,16 @@ fn find_arxiv_id(s: &str) -> Option<String> {
 ///   hash(text))`. Convergence across papers IS the feature (it is how
 ///   cross-source corroboration finds agreement), so these stay on the
 ///   content-hash path unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn persist_planned_claim(
     conn: &mut sqlx::PgConnection,
     claim: &Claim,
     planned: &PlannedClaim,
     agent_id: Uuid,
+    // The server's signer agent: `claims.signer_id` of a row this call
+    // INSERTS, next to the claim's signature (backlog 4ff87716). A row the
+    // walk resolves to is never written.
+    signer_id: Uuid,
     truth: TruthValue,
     // Tenancy declaration (PR-16): the owner group `IngestTx::owner_decl`
     // resolves (the ingesting agent's own personal group, or its operator's
@@ -1861,7 +1879,7 @@ async fn persist_planned_claim(
     decl: epigraph_core::TenancyDecl,
 ) -> Result<(Uuid, bool, Option<Uuid>), McpError> {
     if planned.id_is_document_scoped() {
-        let was_new = ClaimRepository::create_with_id_if_absent_conn(
+        let was_new = ClaimRepository::create_with_id_if_absent_signed_conn(
             &mut *conn,
             planned.id,
             &planned.content,
@@ -1870,6 +1888,9 @@ async fn persist_planned_claim(
             truth,
             &[],
             decl,
+            claim
+                .signature
+                .map(|signature| (claim.public_key, signature, signer_id)),
         )
         .await
         .map_err(internal_error)?;
@@ -1899,7 +1920,7 @@ async fn persist_planned_claim(
     // a cleanly-migrated schema: a document whose atom converged onto a workflow
     // operation atom wrote nothing (`processed_by=0 doc_claims=0`). Another
     // author's claim is resolved to, never rewritten.
-    let persisted = ClaimRepository::create_conn(&mut *conn, claim, decl)
+    let persisted = ClaimRepository::create_signed_conn(&mut *conn, claim, decl, Some(signer_id))
         .await
         .map_err(internal_error)?;
     let persisted_id: Uuid = persisted.id.into();
@@ -1963,6 +1984,10 @@ pub async fn do_ingest_document_spine(
     let agent_id_typed = AgentId::from_uuid(agent_id);
     let signer_typed = AgentId::from_uuid(server.signer_agent_id().await?);
     let pub_key = server.signer.public_key();
+    // Every edge the walk INSERTS (authored, asserts, the plan's relationships,
+    // processed_by) is attested at INSERT by this server's key (R-49/R-50); a
+    // dedup hit returns the existing edge unchanged.
+    let edge_key = Some(server.edge_signing_key().await?);
 
     let paper_title = extraction.source.title.clone();
     let doi = resolve_doi(extraction);
@@ -2134,8 +2159,9 @@ pub async fn do_ingest_document_spine(
                 .id
                 .into()
         };
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut tx,
+            edge_key,
             agent_uuid,
             "agent",
             paper_id,
@@ -2207,6 +2233,7 @@ pub async fn do_ingest_document_spine(
             &claim,
             planned,
             agent_id,
+            signer_typed.as_uuid(),
             TruthValue::clamped(raw_truth),
             decl,
         )
@@ -2237,8 +2264,9 @@ pub async fn do_ingest_document_spine(
         }
 
         if resolved_to_existing {
-            let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
+            let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
                 &mut tx,
+                edge_key,
                 paper_id,
                 "paper",
                 persisted_id,
@@ -2313,8 +2341,9 @@ pub async fn do_ingest_document_spine(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut tx,
+            edge_key,
             paper_id,
             "paper",
             persisted_id,
@@ -2369,8 +2398,9 @@ pub async fn do_ingest_document_spine(
             continue;
         }
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_conn(
+        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut tx,
+            edge_key,
             src,
             &src_type,
             tgt,
@@ -2385,8 +2415,9 @@ pub async fn do_ingest_document_spine(
     }
 
     // ── 5. processed_by edge (idempotent per pipeline stamp; each :ch{n} chunk gets its own) ──
-    EdgeRepository::create_processed_by_stamp_if_absent_conn(
+    EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(
         &mut tx,
+        edge_key,
         paper_id,
         agent_id,
         &pipeline_version,

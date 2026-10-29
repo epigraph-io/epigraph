@@ -202,7 +202,7 @@ pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
 pub use edge_signature::{
     edge_attestation_canonical_json, edge_attestation_digest, EdgeAttestation, EdgeSignOutcome,
-    EdgeSignatureCheck, EdgeSignatureRepository, EdgeSigningCoverage,
+    EdgeSignatureCheck, EdgeSignatureRepository, EdgeSigningCoverage, EdgeSigningKey,
 };
 pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRow};
 pub use group::{GroupRepository, GroupRow};

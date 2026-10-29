@@ -236,8 +236,10 @@ fn deprecated_parameter_warnings(request: &SubmitEvidenceRequest) -> Vec<String>
 /// `ApiError::DatabaseError` only when the savepoint itself cannot be opened
 /// or closed.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn create_edge_under_savepoint(
     conn: &mut sqlx::PgConnection,
+    key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
     source_id: Uuid,
     source_type: &str,
     target_id: Uuid,
@@ -249,8 +251,9 @@ async fn create_edge_under_savepoint(
     let mut sp = conn.begin().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to open a savepoint: {e}"),
     })?;
-    let created = epigraph_db::EdgeRepository::create(
-        &mut *sp,
+    let created = epigraph_db::EdgeRepository::create_signed_conn(
+        &mut sp,
+        key,
         source_id,
         source_type,
         target_id,
@@ -1933,6 +1936,7 @@ pub async fn submit_evidence(
     //     security.
     create_edge_under_savepoint(
         &mut tx,
+        state.edge_signing_key(),
         request.claim_id,
         "claim",
         frame_id,
@@ -1945,6 +1949,7 @@ pub async fn submit_evidence(
     for (context_id, modifier_type) in &scoped_by {
         create_edge_under_savepoint(
             &mut tx,
+            state.edge_signing_key(),
             request.claim_id,
             "claim",
             *context_id,
@@ -1959,6 +1964,7 @@ pub async fn submit_evidence(
     if final_bel > 0.5 {
         create_edge_under_savepoint(
             &mut tx,
+            state.edge_signing_key(),
             mf_id,
             "evidence",
             request.claim_id,
@@ -1970,6 +1976,7 @@ pub async fn submit_evidence(
     } else if final_bel < 0.3 {
         create_edge_under_savepoint(
             &mut tx,
+            state.edge_signing_key(),
             mf_id,
             "evidence",
             request.claim_id,
@@ -1982,6 +1989,7 @@ pub async fn submit_evidence(
     if let Some(agent_id) = request.agent_id {
         create_edge_under_savepoint(
             &mut tx,
+            state.edge_signing_key(),
             mf_id,
             "evidence",
             agent_id,
@@ -1994,6 +2002,7 @@ pub async fn submit_evidence(
     if let Some(perspective_id) = request.perspective_id {
         create_edge_under_savepoint(
             &mut tx,
+            state.edge_signing_key(),
             perspective_id,
             "perspective",
             request.claim_id,

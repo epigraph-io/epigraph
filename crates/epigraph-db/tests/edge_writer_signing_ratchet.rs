@@ -35,12 +35,19 @@
 //! # The rules
 //!
 //! * A new site (a new function, or one more site in a registered function) is
-//!   a failure until it is registered here. Sign it
-//!   (`sign_created_edge_conn` on the writer's connection, for an edge THIS act
-//!   created), register it [`Signed`], or register it [`Unsigned`] with the
-//!   reason it cannot sign.
-//! * A [`Signed`] entry's function must call `sign_created_edge_conn`, so a
-//!   signed writer cannot silently stop signing.
+//!   a failure until it is registered here. Sign it and register it
+//!   [`Signed`], or register it [`Unsigned`] with the reason it cannot sign.
+//!   A writer signs AT INSERT (ruling R-50: an `EdgeRepository::*_signed_conn`
+//!   twin called with the writer's `EdgeSigningKey`, which also signs a
+//!   world-owned structural edge no application session may UPDATE), or
+//!   after it (`sign_created_edge_conn` on the writer's connection, for an
+//!   edge THIS act created and the session may update).
+//! * A [`Signed`] entry's function must call `sign_created_edge_conn`, or a
+//!   signed twin and name its key ([`signs`]), so a signed writer cannot
+//!   silently stop signing. And PER SITE ([`site_problems`]): in a function
+//!   that signs at INSERT, every primitive call must be a signed twin whose
+//!   key argument is not a literal `None`, so one site of a multi-site writer
+//!   cannot revert unseen.
 //! * A site that disappears must have its entry REMOVED (exact match both ways).
 //! * [`UNSIGNED_SITES_HIGH_WATER`] is the exact number of unsigned sites
 //!   (Rust and database). It should only go down: signing a writer lowers it
@@ -83,15 +90,130 @@ const CALLS: &[&str] = &[
     "EdgeRepository::create_if_absent_including_retracted_conn(",
     "EdgeRepository::create_symmetric_if_absent",
     "EdgeRepository::create_processed_by_stamp_if_absent_conn(",
+    // The INSERT-time signed twins (ruling R-50); the symmetric family's
+    // `_signed_conn` forms match the prefix above.
+    "EdgeRepository::create_signed(",
+    "EdgeRepository::create_signed_conn(",
+    "EdgeRepository::create_if_not_exists_signed_conn(",
+    "EdgeRepository::create_if_absent_including_retracted_signed_conn(",
+    "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn(",
 ];
 
-/// The call a [`Signed`] writer's function must contain.
+/// The after-the-fact signing call: one way a [`Signed`] writer attests.
 const SIGN_CALL: &str = "sign_created_edge_conn";
+
+/// The INSERT-time way (ruling R-50): a signed twin called with a key the
+/// writer holds. A [`Signed`] function must name both a signed twin
+/// (`*_signed_conn`, or `create_signed` on a pool) and the key (`edge_signing_key()` / an `EdgeSigningKey`).
+const SIGNED_TWINS: &[&str] = &["_signed_conn(", "EdgeRepository::create_signed("];
+const KEY_MARKERS: &[&str] = &["edge_signing_key", "EdgeSigningKey"];
+
+/// The attested INSERT itself (`edge_signature::insert_attested_conn`): it
+/// signs the edge message in the statement that writes the row.
+const SIGN_AT_INSERT: &str = "sign_entity(SignedEntity::Edge";
+
+/// Whether a function body attests the edges it creates, by any of the three
+/// ways above.
+fn signs(body: &str) -> bool {
+    body.contains(SIGN_CALL)
+        || body.contains(SIGN_AT_INSERT)
+        || (SIGNED_TWINS.iter().any(|t| body.contains(t))
+            && KEY_MARKERS.iter().any(|k| body.contains(k)))
+}
+
+/// The text of the call starting at `at` in `body`: from the primitive's name
+/// through its balanced argument list (the key argument sits on a later line
+/// than the name in most writers).
+fn call_span(body: &str, at: usize) -> &str {
+    let Some(open) = body[at..].find('(').map(|i| at + i) else {
+        return &body[at..];
+    };
+    let mut depth = 0i64;
+    for (i, c) in body[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &body[at..=open + i];
+                }
+            }
+            _ => {}
+        }
+    }
+    &body[at..]
+}
+
+/// The top-level arguments of a call span (`Name(a, b(c, d), e)` -> `a`,
+/// `b(c, d)`, `e`), trimmed.
+fn call_args(span: &str) -> Vec<String> {
+    let Some(open) = span.find('(') else {
+        return Vec::new();
+    };
+    let inner = &span[open + 1..span.len().saturating_sub(1)];
+    let mut out = Vec::new();
+    let mut depth = 0i64;
+    let mut cur = String::new();
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// PER-SITE checks of a [`Signed`] function's body (backlog `dae795f8`): the
+/// body-level [`signs`] cannot see ONE site of a multi-site writer reverting
+/// to the unsigned primitive, or passing a literal `None` key. Every
+/// primitive call in a function that signs at INSERT must be a signed twin
+/// whose key argument (the second) is not `None`. A function that signs
+/// after the INSERT (`sign_created_edge_conn`) or is the attested INSERT
+/// itself is exempt: its sites are unsigned calls by design.
+fn site_problems(body: &str) -> Vec<String> {
+    if body.contains(SIGN_CALL) || body.contains(SIGN_AT_INSERT) {
+        return Vec::new();
+    }
+    let mut starts: Vec<usize> = CALLS
+        .iter()
+        .flat_map(|c| body.match_indices(c).map(|(i, _)| i))
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let mut problems = Vec::new();
+    for (n, at) in starts.into_iter().enumerate() {
+        let span = call_span(body, at);
+        let name = &span[..span.find('(').unwrap_or(span.len())];
+        let twin = name.ends_with("_signed_conn") || name == "EdgeRepository::create_signed";
+        if !twin {
+            problems.push(format!(
+                "site {} calls the UNSIGNED primitive {name}",
+                n + 1
+            ));
+            continue;
+        }
+        if call_args(span).get(1).map(String::as_str) == Some("None") {
+            problems.push(format!("site {} passes a None key to {name}", n + 1));
+        }
+    }
+    problems
+}
 
 /// Why an unsigned site does not sign. Each is a measured property of the
 /// tree, not a preference.
-const NO_KEY_API: &str = "epigraph-api holds no entity signing key: HTTP claims are signed by \
-     their client in the packet, and giving the API server a key is a deployment decision";
+const BULK_STAGING_COPY: &str = "one INSERT .. SELECT statement copies every approved \
+     edges_staging row (claims:admin); attesting each copy needs a per-row INSERT through the \
+     signed primitive with the API key, not yet threaded";
 const NO_KEY_CLI: &str = "an operator CLI on a database DSN with no entity signer";
 const NO_KEY_ENGINE: &str = "epigraph-engine (matching) holds no signing key";
 const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no key; its MCP \
@@ -99,11 +221,8 @@ const NO_KEY_EXECUTOR: &str = "epigraph-ingest-executor is pure-DB and holds no 
 const REPO_INTERNAL: &str = "emitted inside a repository act (supersede, dedup, consolidate, \
      analysis, lineage, semantic link, match promotion); the repository holds no key, so the \
      signing caller must receive the edge id";
-const PRIMITIVE: &str = "the EdgeRepository insert primitive itself; writers sign after it";
-const PENDING_SIGNER_ID_RULING: &str = "the MCP server holds a key, but stamping \
-     edges.signer_id with the server's agent changes what backfill_factors::EDGE_QUERY reads \
-     as an edge factor's agent (COALESCE(e.signer_id, src.agent_id)); awaiting an operator \
-     ruling (backlog dae795f8)";
+const PRIMITIVE: &str = "the unsigned arm (no key) of an EdgeRepository insert primitive; a \
+     writer signs by passing its key to the primitive's _signed_conn twin";
 
 const NO_KEY_DB_FUNCTION: &str = "a database function (SECURITY DEFINER entry point or \
      trigger) holds no entity key; its edges could only be signed at INSERT time by a key the \
@@ -112,9 +231,6 @@ const NO_KEY_DB_FUNCTION: &str = "a database function (SECURITY DEFINER entry po
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     /// The function attests the edges it creates.
-    // No writer is registered Signed yet: wiring the MCP writers waits on the
-    // signer_id ruling named in PENDING_SIGNER_ID_RULING.
-    #[allow(dead_code)]
     Signed,
     /// The function does not sign, for the stated reason.
     Unsigned(&'static str),
@@ -139,9 +255,10 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 
 /// The exact number of unsigned edge-emitting sites, Rust ([`REGISTER`]) plus
 /// database ([`DB_REGISTER`]). Should only go down; see the module docs.
-// 104: main's supersede act gained the acting agent's AUTHORED edge (R-23),
-// one more unsigned REPO_INTERNAL site.
-const UNSIGNED_SITES_HIGH_WATER: usize = 104;
+// 47: this branch's 46 plus main's supersede-act AUTHORED edge (R-23), one
+// more unsigned REPO_INTERNAL site (#704's merge of main raised its own
+// count 103 -> 104 for the same site).
+const UNSIGNED_SITES_HIGH_WATER: usize = 47;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -195,127 +312,127 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-api/src/routes/assess.rs",
         "assess_claim",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/belief.rs",
         "create_edge_under_savepoint",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/claims.rs",
         "create_claim_core",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/community.rs",
         "add_member",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
         4,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "forget_convention",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "share_skill",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "create_evidence",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "create_reasoning_trace",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
         "promote_staged_edges",
         2,
-        Unsigned(NO_KEY_API),
+        Unsigned(BULK_STAGING_COPY),
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "create_edge",
         3,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "create_hierarchical_edge",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/edges.rs",
         "relate_claims",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "create_experiment",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "submit_results",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/experiment_loop.rs",
         "analyze_result",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/perspective.rs",
         "create_perspective",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/provenance.rs",
         "set_provenance",
         4,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/spans.rs",
         "create_span",
         1,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/spans.rs",
         "close_span",
         2,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-api/src/routes/submit.rs",
         "persist_packet",
         5,
-        Unsigned(NO_KEY_API),
+        Signed,
     ),
     site(
         "crates/epigraph-cli/src/decompose.rs",
@@ -435,21 +552,28 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_returning_conn",
+        "create_symmetric_if_absent_returning_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "create_symmetric_if_absent_oriented_conn",
+        "create_symmetric_if_absent_oriented_signed_conn",
         1,
         Unsigned(PRIMITIVE),
     ),
     site(
         "crates/epigraph-db/src/repos/edge.rs",
-        "edge_row",
+        "create_symmetric_if_absent_row_signed_conn",
         1,
         Unsigned(PRIMITIVE),
+    ),
+    // The attested INSERT (ruling R-50): every signed twin's key path.
+    site(
+        "crates/epigraph-db/src/repos/edge_signature.rs",
+        "insert_attested_conn",
+        1,
+        Signed,
     ),
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
@@ -491,55 +615,55 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-mcp/src/claim_helper.rs",
         "emit_verb_edge_best_effort",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/server.rs",
         "record_auth_lineage",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/claims.rs",
         "resolve_backlog_item",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document",
         5,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document_spine",
         5,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_alternative.rs",
         "do_link_alternative",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_epistemic.rs",
         "do_link_epistemic",
         2,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/link_hierarchical.rs",
         "do_link_hierarchical",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/perspectives.rs",
         "create_perspective",
         1,
-        Unsigned(PENDING_SIGNER_ID_RULING),
+        Signed,
     ),
 ];
 
@@ -941,10 +1065,15 @@ fn check(
                         s.count
                     ));
                 }
-                if s.status == Signed && !body.contains(SIGN_CALL) {
+                if s.status == Signed && !signs(body) {
                     problems.push(format!(
-                        "{file}::{func} is registered Signed but no longer calls {SIGN_CALL}"
+                        "{file}::{func} is registered Signed but no longer calls {SIGN_CALL} \
+                         or a signed twin with its key"
                     ));
+                } else if s.status == Signed {
+                    for p in site_problems(body) {
+                        problems.push(format!("{file}::{func} is registered Signed but {p}"));
+                    }
                 }
             }
         }
@@ -1050,8 +1179,55 @@ fn the_register_rules_hold_on_a_synthetic_register() {
     assert_eq!(
         check(&measured, &register, &no_db, &[], 0),
         vec![format!(
-            "a.rs::stopped is registered Signed but no longer calls {SIGN_CALL}"
+            "a.rs::stopped is registered Signed but no longer calls {SIGN_CALL} or a signed \
+             twin with its key"
         )]
+    );
+
+    // The INSERT-time way: a signed twin WITH the writer's key signs; the twin
+    // alone (a `None` key) does not.
+    let twin_keyed = "EdgeRepository::create_signed_conn(conn, server.edge_signing_key(), ..);\n";
+    let twin_bare = "EdgeRepository::create_signed_conn(conn, None, ..);\n";
+    assert!(signs(twin_keyed));
+    assert!(!signs(twin_bare));
+    assert!(signs(
+        "let s = key.signer.sign_entity(SignedEntity::Edge, &digest);\n"
+    ));
+
+    // Per site: one of two sites reverting to the unsigned primitive, or one
+    // passing a literal `None` key, fails although the body still names a
+    // signed twin and a key; a key bound to a local passes.
+    let keyed =
+        "EdgeRepository::create_signed(\n    pool,\n    state.edge_signing_key(),\n    a,\n);\n";
+    let reverted = format!("{keyed}let _ = EdgeRepository::create(\n    pool, a, \"claim\",\n);\n");
+    let none_key = format!(
+        "{keyed}EdgeRepository::create_if_not_exists_signed_conn(\n    &mut tx,\n    None,\n    a,\n);\n"
+    );
+    let local = "let k = Some(key);\nEdgeRepository::create_symmetric_if_absent_row_signed_conn(conn, k, a, json!({\"x\": 1}), b)\n";
+    assert_eq!(site_problems(keyed), Vec::<String>::new());
+    assert_eq!(site_problems(local), Vec::<String>::new());
+    assert_eq!(
+        site_problems(&reverted),
+        vec!["site 2 calls the UNSIGNED primitive EdgeRepository::create".to_string()]
+    );
+    assert_eq!(
+        site_problems(&none_key),
+        vec![
+            "site 2 passes a None key to EdgeRepository::create_if_not_exists_signed_conn"
+                .to_string()
+        ]
+    );
+    let multi: BTreeMap<(String, String), (usize, String)> =
+        [(("m.rs".to_string(), "multi".to_string()), (2, reverted))]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        check(&multi, &[site("m.rs", "multi", 2, Signed)], &no_db, &[], 0),
+        vec![
+            "m.rs::multi is registered Signed but site 2 calls the UNSIGNED primitive \
+             EdgeRepository::create"
+                .to_string()
+        ]
     );
 
     let register = [

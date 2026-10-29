@@ -67,7 +67,7 @@ async fn helper_creates_when_absent(pool: PgPool) {
     // below is the arm that drives the transactional one.
     let mut conn = pool.acquire().await.expect("checkout");
     let (returned, was_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
             .await
             .expect("helper call");
     drop(conn);
@@ -118,11 +118,11 @@ async fn helper_returns_existing_when_present(pool: PgPool) {
     // below is the arm that drives the transactional one.
     let mut conn = pool.acquire().await.expect("checkout");
     let (first, first_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim_a, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim_a, None, "test_tool", None)
             .await
             .expect("first call");
     let (second, second_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim_b, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim_b, None, "test_tool", None)
             .await
             .expect("second call");
     drop(conn);
@@ -194,10 +194,10 @@ async fn helper_emits_authored_on_both_branches(pool: PgPool) {
     // is the minimum shape that satisfies that here; `tx_is_not_poisoned_...`
     // below is the arm that drives the transactional one.
     let mut conn = pool.acquire().await.expect("checkout");
-    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
         .await
         .expect("first");
-    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+    let _ = create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
         .await
         .expect("second");
     drop(conn);
@@ -264,11 +264,11 @@ async fn helper_post_107_idempotent(pool: PgPool) {
     // below is the arm that drives the transactional one.
     let mut conn = pool.acquire().await.expect("checkout");
     let (first, first_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
             .await
             .expect("first call");
     let (second, second_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
             .await
             .expect("second call");
     drop(conn);
@@ -302,11 +302,11 @@ async fn helper_pre_107_no_constraint(pool: PgPool) {
     // below is the arm that drives the transactional one.
     let mut conn = pool.acquire().await.expect("checkout");
     let (_first, first_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
             .await
             .expect("first call");
     let (_second, second_created) =
-        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool")
+        create_claim_idempotent(&mut conn, &viewer, &claim, None, "test_tool", None)
             .await
             .expect("second call");
     drop(conn);
@@ -379,7 +379,7 @@ async fn helper_authored_failure_does_not_propagate(pool: PgPool) {
     // implementations: a plain swallow makes the `SELECT` after the failure and
     // then the `commit()` both fail.
     let mut tx = pool.begin().await.expect("begin");
-    let result = create_claim_idempotent(&mut tx, &viewer, &claim, None, "test_tool").await;
+    let result = create_claim_idempotent(&mut tx, &viewer, &claim, None, "test_tool", None).await;
 
     let (returned, was_created) = result.expect("helper must not propagate AUTHORED failure");
     assert!(

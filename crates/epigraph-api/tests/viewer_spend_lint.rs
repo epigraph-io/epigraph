@@ -92,6 +92,11 @@ use std::path::Path;
 /// BBA retraction, challenge resolution, the R-22 cache narrowing, the
 /// workflow goal embedding).
 ///
+/// The edge writes that moved to their signed variants (`EdgeRepository::
+/// create*` and raw `INSERT INTO edges` -> `create*_signed*`) keep the reason
+/// class of the call they replaced: the same write, with an attestation added,
+/// on the same pool or connection.
+///
 /// Asserted as an exact multiset per handler. The comment above each group is
 /// the review. Reason classes, used below:
 ///
@@ -167,9 +172,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AgentRepository::human_of",
             "AgentRepository::human_of",
-            "EdgeRepository::create",
-            "EdgeRepository::create",
-            "EdgeRepository::create",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
@@ -343,7 +348,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "community.rs",
         "add_member",
-        &["CommunityRepository::add_member", "EdgeRepository::create"],
+        &[
+            "CommunityRepository::add_member",
+            "EdgeRepository::create_signed",
+        ],
     ),
     (
         "community.rs",
@@ -369,6 +377,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["derivation_scope::retain_for_cache"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
+    // The REFUTES edge write runs on a transaction bound by
+    // `if let Ok(mut tx) = state.write_as(..)` and passed as `&mut tx`, a
+    // binding this scanner does not recognise as a connection, so it is not
+    // measured here.
     (
         "conventions.rs",
         "forget_convention",
@@ -376,7 +388,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
             "ClaimRepository::update_truth_value",
-            "EdgeRepository::create",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
@@ -389,7 +400,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_public_key",
             "ClaimRepository::create",
             "ClaimRepository::default_decl_for_author_pool",
-            "EdgeRepository::create",
+            "EdgeRepository::create_signed_conn",
             "sqlx::query(UPDATE).execute",
         ],
     ),
@@ -486,9 +497,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "edges.rs",
         "create_edge",
         &[
-            "EdgeRepository::create",
-            "EdgeRepository::create_if_not_exists_conn",
-            "EdgeRepository::create_symmetric_if_absent_row_conn",
+            "EdgeRepository::create_if_not_exists_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_symmetric_if_absent_row_signed_conn",
             "EdgeRepository::owned_by_session",
             "entity_exists",
             "entity_exists",
@@ -504,7 +515,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "edges.rs",
         "create_hierarchical_edge",
         &[
-            "EdgeRepository::create_if_not_exists_conn",
+            "EdgeRepository::create_if_not_exists_signed_conn",
             "EdgeRepository::owned_by_session",
         ],
     ),
@@ -542,8 +553,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "edges.rs",
         "relate_claims",
         &[
-            "EdgeRepository::create",
-            "EdgeRepository::create",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
             "provenance::record_provenance",
         ],
     ),
@@ -599,14 +610,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "experiment_loop.rs",
         "analyze_result",
         &[
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
             "ExperimentRepository::get",
             "ExperimentRepository::update_status",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::get",
             "ExperimentResultRepository::update_status",
             "MassFunctionRepository::store",
-            "sqlx::query(INSERT).execute",
-            "sqlx::query(INSERT).execute",
             "sqlx::query_as(INSERT).fetch_one",
             "sqlx::query_as(SELECT).fetch_one",
         ],
@@ -618,8 +629,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "experiment_loop.rs",
         "create_experiment",
         &[
+            "EdgeRepository::create_signed",
             "ExperimentRepository::create",
-            "sqlx::query(INSERT).execute",
         ],
     ),
     // gated (R-51: `require_hypothesis`, read access) then untenanted:
@@ -644,9 +655,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "experiment_loop.rs",
         "submit_results",
         &[
+            "EdgeRepository::create_signed",
             "ExperimentRepository::update_status",
             "ExperimentResultRepository::create",
-            "sqlx::query(INSERT).execute",
         ],
     ),
     // untenanted: methods.
@@ -1167,9 +1178,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::create_strict",
             "ClaimRepository::default_decl_for_author",
             "ClaimRepository::lock_content_hash_agent",
-            "EdgeRepository::create",
-            "EdgeRepository::create",
-            "EdgeRepository::create",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
             "provenance::record_provenance",
@@ -1268,16 +1279,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AgentRepository::get_by_id",
             "ClaimRepository::default_decl_for_author",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(INSERT).fetch_one",
-            "sqlx::query_scalar(INSERT).fetch_one",
         ],
     ),
     // write: workflows.rs's ingest helpers run on the system-ingest transaction

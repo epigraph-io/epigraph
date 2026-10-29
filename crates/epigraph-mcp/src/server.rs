@@ -311,6 +311,24 @@ impl EpiGraphMcpFull {
     pub async fn signer_agent_id(&self) -> Result<uuid::Uuid, McpError> {
         self.agent_id().await
     }
+
+    /// The key this server attests the edges it INSERTS with (rulings R-49,
+    /// R-50): its signer, recorded as `edges.signer_id` =
+    /// [`Self::signer_agent_id`]. The signer is never the edge's author: an
+    /// edge's author is its source claim's (`backfill_factors::EDGE_QUERY`,
+    /// the operator's `EDGE_WRITER_SQL`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`Self::signer_agent_id`] returns.
+    pub async fn edge_signing_key(
+        &self,
+    ) -> Result<epigraph_db::repos::EdgeSigningKey<'_>, McpError> {
+        Ok(epigraph_db::repos::EdgeSigningKey {
+            signer: &self.signer,
+            signer_id: self.signer_agent_id().await?,
+        })
+    }
 }
 
 /// Builds the per-session servers of ONE HTTP listener, all sharing ONE
@@ -616,8 +634,32 @@ impl EpiGraphMcpFull {
             }
         };
 
-        match epigraph_db::EdgeRepository::create_if_not_exists(
-            &self.pool,
+        // A world-owned structural edge (both endpoints agents): attested at
+        // INSERT by the server's key (R-50), the only point it can be signed.
+        // Best-effort, like `create_perspective`'s PERSPECTIVE_OF: without a
+        // key the edge is written UNSIGNED, as before R-50, and said so.
+        let edge_key = match self.edge_signing_key().await {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(
+                    principal = %principal,
+                    error = ?e,
+                    "auth-lineage edge: the server's signing key is unavailable; \
+                     writing the edge UNSIGNED"
+                );
+                None
+            }
+        };
+        let mut conn = match self.pool.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = ?e, "auth-lineage edge: no connection; skipping");
+                return;
+            }
+        };
+        match epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
+            &mut conn,
+            edge_key,
             mcp_agent,
             "agent",
             principal,
@@ -1384,7 +1426,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false. The signature is also checked against the attested agent_keys rows (signing, identity-legacy) of the claim's signer and author, because a server running with a separate signing key records its IDENTITY key as agents.public_key and signs with a registered signing key. key_bound says whether the verifying key is an attested key of the claim's AUTHOR that was valid when the claim was created; key_kind names it (signing, identity-legacy, or unattested when only the signer's agents.public_key verifies; null when nothing verifies). signature_scheme names the signed message: v1 (the digest tagged as a claim, so an evidence or edge signature over the same digest never verifies here) or legacy (the bare digest, written before v1; it binds no entity type); null when nothing verifies. A claim authored by an HTTP caller and signed by the server reports key_bound=false: the key is the server's, not the author's. An identity-legacy key is derived from public inputs, so a signature under it is forgeable even when bound. key_bound covers only blake3(content): the signature names no author or date, and created_at is writer-set, so a direct database write can copy a bound signature onto another row with the same content."
+        description = "Verify a claim's Ed25519 signature and BLAKE3 content hash. Reports whether the claim has been tampered with. The signature is checked against the key of the claim's SIGNER (the agent recorded as claims.signer_id), not its author: a claim written through MCP is authored by the calling agent and signed by the MCP server, so it verifies (signed=true, signature_valid=true) whoever authored it. A claim with no stored signature reports signed=false. The signature is also checked against the attested agent_keys rows (signing, identity-legacy) of the claim's signer and author, because a server running with a separate signing key records its IDENTITY key as agents.public_key and signs with a registered signing key. Only a key ADMITTED when the claim was created verifies: an attested key whose status and validity window admit created_at, or the signer's agents.public_key only when no agent_keys row carries those bytes, so a revoked, pending or out-of-window key verifies nothing (signature_valid=false). key_bound says whether the verifying key is an attested key of the claim's AUTHOR that was valid when the claim was created; key_kind names it (signing, identity-legacy, or unattested when only the signer's agents.public_key verifies; null when nothing verifies). signature_scheme names the signed message: v1 (the digest tagged as a claim, so an evidence or edge signature over the same digest never verifies here) or legacy (the bare digest, written before v1; it binds no entity type); null when nothing verifies. A claim authored by an HTTP caller and signed by the server reports key_bound=false: the key is the server's, not the author's. An identity-legacy key is derived from public inputs, so a signature under it is forgeable even when bound. key_bound covers only blake3(content): the signature names no author or date, and created_at is writer-set, so a direct database write can copy a bound signature onto another row with the same content."
     )]
     async fn verify_claim(
         &self,

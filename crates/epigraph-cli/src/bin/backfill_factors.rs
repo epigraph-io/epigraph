@@ -309,13 +309,15 @@ async fn run_edge_phase(
             "DRY RUN: would attempt {} edge factors (showing first 5):",
             summary.eligible
         );
-        for (eid, sgn, src, tgt, rel) in rows.iter().take(5) {
-            println!("  edge={eid} signer={sgn} {src} —[{rel}]→ {tgt}");
+        for (eid, author, src, tgt, rel) in rows.iter().take(5) {
+            println!("  edge={eid} author={author} {src} —[{rel}]→ {tgt}");
         }
         return Ok(summary);
     }
 
-    for (edge_id, signer_id, source_id, target_id, relationship) in rows {
+    // `author`: the source claim's author (`EDGE_QUERY`, ruling R-49), never
+    // the edge's signer.
+    for (edge_id, author, source_id, target_id, relationship) in rows {
         let mut conn = match pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
@@ -327,7 +329,7 @@ async fn run_edge_phase(
             &mut conn,
             viewer,
             edge_id,
-            signer_id,
+            author,
             source_id,
             target_id,
             &relationship,
