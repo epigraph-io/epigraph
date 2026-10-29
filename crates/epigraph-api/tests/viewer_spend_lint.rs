@@ -102,9 +102,12 @@ use std::path::Path;
 ///   target is established by the viewed call(s) before it, and write
 ///   authority is the database's (`WITH CHECK`) and the write-side registers'.
 /// * **untenanted** — the table has no tenancy columns (`agents`, `methods`,
-///   `workflows`, `experiments`, `experiment_results`, `behavioral_executions`,
+///   `experiments`, `experiment_results`, `behavioral_executions`,
 ///   `match_candidates`, `entities`, `claim_themes`, `graph_cluster_runs`,
 ///   `claim_encryption`), or the read is the caller's own membership.
+///   `workflows` left this list with migration 183 (ruling R-74): a row
+///   carries its plan's tenancy under forced row security, so a `workflows`
+///   read is **stamped**, never untenanted.
 /// * **stamped** — runs on a connection stamped with this viewer, for an id
 ///   the viewer already read; row security filters it under an application
 ///   role.
@@ -1064,7 +1067,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "versioning::admin_session_or_deferral",
         ],
     ),
-    // untenanted: workflows.
+    // stamped: both searches run on the caller's viewer-stamped connection,
+    // and since migration 183 (ruling R-74) row security on `workflows` admits
+    // only public rows and rows of the caller's read set.
     (
         "workflows.rs",
         "find_workflow_hierarchical",
@@ -1089,7 +1094,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "store_workflow_goal_embedding",
         ],
     ),
-    // untenanted (workflows, behavioral_executions) and write.
+    // stamped: the `workflows` row is locked (SELECT .. FOR UPDATE) and its
+    // counters updated on the caller's stamped write transaction, where row
+    // security (migration 183, ruling R-74) hides a row the caller does not
+    // read, so it takes the missing-id 404; `viewer_reads_plan_structure`
+    // (viewed) then requires a readable step before any write. untenanted:
+    // behavioral_executions. write.
     (
         "workflows.rs",
         "report_hierarchical_outcome",
@@ -1272,7 +1282,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write: workflows.rs's ingest helpers run on the system-ingest transaction
     // that binds the caller's principal for the database's write-authority
-    // check; the lineage anchors are workflows rows (untenanted), the
+    // check; the lineage anchors are workflows rows, read under row security
+    // on that stamped transaction (migration 183, ruling R-74), the
     // authority check is for the caller's principal over each anchor, and the
     // rest record the submitter, the per-anchor provenance and the admin audit.
     (
