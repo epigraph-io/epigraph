@@ -305,11 +305,23 @@ pub async fn hypothesize(
 }
 
 /// POST /api/v1/methods - Add a characterization/synthesis method.
+///
+/// Writes the shared method catalog (a method row and its capability links),
+/// so it takes `claims:write` like the experiment writes (operator ruling
+/// R-52a), checked before the embedder is called or anything is written.
 #[cfg(feature = "db")]
 pub async fn add_method(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AddMethodRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "POST /api/v1/methods requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     let canonical_name = request.name.to_lowercase().replace(' ', "_");
 
     // Generate embedding for the method

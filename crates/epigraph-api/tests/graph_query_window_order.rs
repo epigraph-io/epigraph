@@ -309,3 +309,48 @@ async fn graph_query_window_order_plans_for_every_node_table(pool: PgPool) {
         );
     }
 }
+
+/// The WALK form for every node table (backlog 4815dcf7). With an edge in the
+/// MATCH, `GraphViewRepository::graph_query_node_ids` splices the anchor's
+/// `{VISIBILITY:n}` (absent for `agents`, which has no tenancy columns) and the
+/// recursive step's `{EDGE_VISIBILITY:e}`, after the relationship bind. That is
+/// three marker layouts, and a bind-index or splice mistake in any of them is a
+/// 500 on that label only. Each runs as the public viewer AND as a scoped
+/// group member, because only a viewer with a group bind appends a bind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn graph_query_walk_plans_for_every_node_table(pool: PgPool) {
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let (member, _group) = seed_agent_with_group(&pool, "a12-gq-walk-member").await;
+    for label in ["claim", "evidence", "agent", "trace"] {
+        for query in [
+            format!("MATCH (n:{label})-[r:cites*1..1]->(m:claim) RETURN * LIMIT 1"),
+            format!("MATCH (n:{label})-[*1..2]-(m:claim) WHERE n.probe = 'x' RETURN * LIMIT 1"),
+        ] {
+            let viewers = [
+                ("public", public_viewer(&pool).await),
+                (
+                    "scoped member",
+                    epigraph_db::visibility::Viewer::resolve(&pool, member)
+                        .await
+                        .expect("resolve the member's viewer"),
+                ),
+            ];
+            for (who, viewer) in viewers {
+                let res = execute_graph_query(
+                    ViewerExtractor(viewer),
+                    State(state.clone()),
+                    Json(GraphQueryRequest {
+                        query: query.clone(),
+                        agent_id: None,
+                    }),
+                )
+                .await;
+                assert!(
+                    res.is_ok(),
+                    "`{query}` as the {who} viewer must execute; got {:?}",
+                    res.err()
+                );
+            }
+        }
+    }
+}
