@@ -193,6 +193,13 @@ name = "help_hides_env_values"
 path = "tests/help_hides_env_values.rs"
 required-features = ["db"]
 
+# Drives the `db`-gated `prune_recall_events` bin on maintenance and
+# application logins (migration 186).
+[[test]]
+name = "prune_recall_events_maintenance"
+path = "tests/prune_recall_events_maintenance.rs"
+required-features = ["db"]
+
 [[test]]
 name = "embed_backfill_workflows"
 path = "tests/embed_backfill_workflows.rs"
