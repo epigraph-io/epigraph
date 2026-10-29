@@ -1314,6 +1314,23 @@ impl EvidenceRepository {
     /// row's own ciphertext: a sealed row must never carry a vector derived
     /// from its plaintext.
     ///
+    /// # Why the row is locked first, in its own statement
+    ///
+    /// The seal writes `evidence_encryption` and then blanks the evidence row
+    /// (`UPDATE evidence SET … embedding = NULL`) in one transaction, so it
+    /// holds the row's lock until it commits. A single guarded `UPDATE` that
+    /// blocks on that lock re-checks its qual on the new row version after the
+    /// seal commits, but against its ORIGINAL snapshot for every other table,
+    /// `evidence_encryption` included: it would miss the seal and write a
+    /// plaintext-derived vector onto the blanked row. So, as
+    /// `ClaimRepository::store_embedding_if_unsealed` does on `claims`, this
+    /// takes `SELECT … FOR UPDATE` (which conflicts with the seal UPDATE's row
+    /// lock) as a SEPARATE statement first; the guarded `UPDATE` then takes a
+    /// fresh snapshot that includes any seal committed during the wait. If this
+    /// store locks first instead, the seal's blanking `UPDATE` waits for it and
+    /// nulls the vector when it proceeds. Pinned by
+    /// `epigraph-db/tests/evidence_embedding_seal_race.rs`.
+    ///
     /// # Returns
     /// `true` when a row was updated; `false` when none matched (no such row, a
     /// sealed row, or a row `viewer` may not write).
@@ -1328,6 +1345,17 @@ impl EvidenceRepository {
         embedding_pgvector: &str,
     ) -> Result<bool, DbError> {
         let uuid: Uuid = id.into();
+        // A savepoint when `conn` is already in a transaction (the stamped
+        // request path), a transaction otherwise: the lock must be held across
+        // both statements.
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+
+        // The lock, as its own statement (see the section above).
+        sqlx::query("SELECT 1 FROM evidence WHERE id = $1 FOR UPDATE")
+            .bind(uuid)
+            .fetch_optional(&mut *tx)
+            .await?;
+
         let sql = viewer.splice_write(
             "UPDATE evidence AS e SET embedding = $2::vector \
               WHERE e.id = $1 \
@@ -1342,7 +1370,8 @@ impl EvidenceRepository {
         if let Some(w) = viewer.writable_bind() {
             q = q.bind(w);
         }
-        let result = q.execute(&mut *conn).await?;
+        let result = q.execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
