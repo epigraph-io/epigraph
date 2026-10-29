@@ -35,36 +35,14 @@ const NEEDLE: &str = ".sign(";
 
 const PACKET_ENVELOPE: &str = "the submit_packet ENVELOPE signature over the canonical packet \
      bytes, a request signature with its own verifier, not an entity digest";
-const SIGNABLE_STRUCT: &str = "the core Signable trait's canonical-JSON struct signature \
-     (`value.sign(&signer)`), a separate untagged scheme, not a bare-digest entity signature";
 
 /// `(file, fn, count, what it signs)`.
-const REGISTER: &[(&str, &str, usize, &str)] = &[
-    (
-        "crates/epigraph-cli/src/bin/ingest_git.rs",
-        "build_packet",
-        1,
-        PACKET_ENVELOPE,
-    ),
-    (
-        "crates/epigraph-harvester/src/commit.rs",
-        "create_claim_with_evidence_and_trace",
-        1,
-        SIGNABLE_STRUCT,
-    ),
-    (
-        "crates/epigraph-harvester/src/commit.rs",
-        "create_evidence_from_citation",
-        1,
-        SIGNABLE_STRUCT,
-    ),
-    (
-        "crates/epigraph-harvester/src/commit.rs",
-        "create_reasoning_trace",
-        1,
-        SIGNABLE_STRUCT,
-    ),
-];
+const REGISTER: &[(&str, &str, usize, &str)] = &[(
+    "crates/epigraph-cli/src/bin/ingest_git.rs",
+    "build_packet",
+    1,
+    PACKET_ENVELOPE,
+)];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -251,8 +229,8 @@ mod tests {
     // And the live tree is not vacuous.
     assert!(
         measure().contains_key(&(
-            "crates/epigraph-harvester/src/commit.rs".to_string(),
-            "create_reasoning_trace".to_string()
+            "crates/epigraph-cli/src/bin/ingest_git.rs".to_string(),
+            "build_packet".to_string()
         )),
         "the scanner no longer sees a registered site: it has gone vacuous"
     );
