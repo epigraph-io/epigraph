@@ -164,23 +164,47 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
     );
     assert!(revert.get("moved_bbas").is_some(), "{revert}");
 
-    // The record names other writers' rows, so the TRIGGERING principal, which
-    // `security_events_read` lets read the applied row it is named on, must
-    // not be able to read the record. Calibrated on the applied row itself.
+    // The record names other writers' rows, so the TRIGGERING principal must
+    // not be able to read it; since migration 169 it does not read the applied
+    // row it is named on either. Calibrated on a plain event naming it, and on
+    // the applied row being what the zero below is about: the author's
+    // `cascade.admin_applied` row (read on the superuser pool).
+    let (named, kind): (Option<Uuid>, String) =
+        sqlx::query_as("SELECT agent_id, event_type::text FROM security_events WHERE id = $1")
+            .bind(dedup_row)
+            .fetch_one(&pool)
+            .await
+            .expect("the applied dedup row");
+    assert_eq!(
+        (named, kind.as_str()),
+        (Some(author), "cascade.admin_applied"),
+        "calibration: the applied row names the author"
+    );
+    let probe: Uuid = sqlx::query_scalar(
+        "INSERT INTO security_events (event_type, agent_id, success) \
+         VALUES ('test.unmark_probe', $1, true) RETURNING id",
+    )
+    .bind(author)
+    .fetch_one(&pool)
+    .await
+    .expect("a probe event naming the author");
     fixture::grant_app_privileges(&pool, "epigraph_app").await;
-    let (applied_visible, record_rows) =
+    let ((applied_visible, probe_visible), record_rows) =
         fixture::as_role(&pool, "epigraph_app", |mut c| async move {
             sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
                 .bind(author.to_string())
                 .execute(&mut *c)
                 .await
                 .expect("stamp principal");
-            let applied: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM security_events WHERE id = $1")
-                    .bind(dedup_row)
-                    .fetch_one(&mut *c)
-                    .await
-                    .expect("read applied row");
+            let applied: (i64, i64) = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE id = $1), count(*) FILTER (WHERE id = $2) \
+                   FROM security_events",
+            )
+            .bind(dedup_row)
+            .bind(probe)
+            .fetch_one(&mut *c)
+            .await
+            .expect("read applied row");
             // No row it can read carries a revert record or names the other
             // writer's BBA (which only the record does).
             let records: i64 = sqlx::query_scalar(
@@ -195,8 +219,12 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
         })
         .await;
     assert_eq!(
-        applied_visible, 1,
-        "calibration: the triggering agent reads its applied row"
+        probe_visible, 1,
+        "calibration: the triggering agent reads a row naming it"
+    );
+    assert_eq!(
+        applied_visible, 0,
+        "the triggering agent does not read its applied row (migration 169)"
     );
     assert_eq!(
         record_rows, 0,

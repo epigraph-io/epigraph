@@ -44,10 +44,11 @@ pub const EVENT_APPLIED: &str = "cascade.admin_applied";
 /// `security_events.event_type` of the row that keeps the ids an
 /// [`EVENT_APPLIED`] row's `touched` counts (the edges the repair moved,
 /// most of them other writers'). The applied row names the triggering
-/// principal, and `security_events_read` lets a principal read the rows
-/// naming it, so that row carries counts only; this one has `agent_id` NULL,
-/// readable by privileged and admin sessions only, and names its applied row
-/// in `details.applied_event_id`. Written in the applied row's transaction,
+/// principal, so that row carries counts only (and since migration 169
+/// `security_events_read` no longer shows a principal its applied or belief
+/// rows: rows written before this split still carry the ids); this one has
+/// `agent_id` NULL, readable by privileged and admin sessions only, and names
+/// its applied row in `details.applied_event_id`. Written in the applied row's transaction,
 /// on the maintenance connection only (117 refuses a `cascade.*` row
 /// elsewhere).
 pub const EVENT_APPLIED_IDS: &str = "cascade.admin_applied_ids";
@@ -428,8 +429,9 @@ pub const EVENT_DEDUP_REVERT: &str = "cascade.dedup_revert_record";
 ///
 /// It names OTHER writers' rows (their BBAs whole, with masses and owner
 /// groups), so it is its own row with `agent_id` NULL: `security_events_read`
-/// lets a principal read the rows naming it, which includes the applied row,
-/// and this one must be readable by privileged and admin sessions only.
+/// lets a principal read the rows naming it (the applied row excepted since
+/// migration 169), and this one must be readable by privileged and admin
+/// sessions only.
 ///
 /// Maintenance connection only (117 refuses a `cascade.*` row elsewhere).
 ///

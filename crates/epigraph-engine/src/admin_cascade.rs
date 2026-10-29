@@ -609,8 +609,8 @@ macro_rules! repair_with_audit {
             let touched: serde_json::Value = $touched;
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
-            // The applied row names the triggering principal, who can read it
-            // (`security_events_read`): it carries COUNTS. The ids the repair
+            // The applied row names the triggering principal (who could read
+            // it before migration 169): it carries COUNTS. The ids the repair
             // moved -- other writers' edges among them -- go to an agent-less
             // companion row in the same transaction, when there are any.
             let counts = counts_only(&touched);
@@ -652,8 +652,8 @@ type BeliefAudit = (Option<Uuid>, Option<String>);
 
 /// Write the belief re-derivation's row after the applied repair (best-effort).
 ///
-/// The row names the triggering principal, who can read it
-/// (`security_events_read`), so it carries [`belief_counts`]; the claim ids
+/// The row names the triggering principal (who could read it before migration
+/// 169's `security_events_read`), so it carries [`belief_counts`]; the claim ids
 /// and error texts go to an agent-less [`EVENT_BELIEF_IDS`] row, committed
 /// with it in one transaction.
 async fn record_belief(
@@ -1227,8 +1227,9 @@ pub async fn apply_match_retire(
 /// The applied row names `trigger.agent_id`: the edge's owner whose act
 /// deferred it (or, for the one-shot legacy sweep, the acting operator).
 /// `touched` carries COUNTS only, never another writer's BBA ids or source
-/// agents, because the row's `agent_id` can read it. `sweep_reason` is the
-/// operator's text for the one-shot sweep, recorded in `touched`.
+/// agents, because the row names its `agent_id` (who could read it before
+/// migration 169). `sweep_reason` is the operator's text for the one-shot
+/// sweep, recorded in `touched`.
 pub async fn apply_after_edge_retract(
     admin: &mut sqlx::PgConnection,
     admin_viewer: &Viewer,
