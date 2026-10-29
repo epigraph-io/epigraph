@@ -139,7 +139,9 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 
 /// The exact number of unsigned edge-emitting sites, Rust ([`REGISTER`]) plus
 /// database ([`DB_REGISTER`]). Should only go down; see the module docs.
-const UNSIGNED_SITES_HIGH_WATER: usize = 103;
+// 104: main's supersede act gained the acting agent's AUTHORED edge (R-23),
+// one more unsigned REPO_INTERNAL site.
+const UNSIGNED_SITES_HIGH_WATER: usize = 104;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -375,10 +377,12 @@ const REGISTER: &[Site] = &[
         2,
         Unsigned(REPO_INTERNAL),
     ),
+    // Two sites: the `supersedes` edge and the acting agent's `AUTHORED` edge
+    // (ruling R-23, merged from main), both emitted inside the supersede act.
     site(
         "crates/epigraph-db/src/repos/claim.rs",
         "supersede_act_conn",
-        1,
+        2,
         Unsigned(REPO_INTERNAL),
     ),
     site(
