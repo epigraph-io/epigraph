@@ -1058,6 +1058,12 @@ pub async fn apply_unmark_authorized(
     if legacy_mark {
         details["legacy_mark"] = serde_json::json!(true);
     }
+    if let Some(stripped) = &unmarked.legacy_stripped {
+        // What the act stripped from the restored legacy claim (operator
+        // ruling R-18): the duplicate's own label and properties, which the
+        // caller's authority over the duplicate already covers.
+        details["legacy_stripped"] = stripped.clone();
+    }
     if current_canonical_id != canonical_id {
         // Restored against the canonical's current replacement (R-11).
         details["canonical_chain"] = serde_json::json!(unmarked.chain);

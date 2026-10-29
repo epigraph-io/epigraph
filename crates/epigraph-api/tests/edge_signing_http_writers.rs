@@ -602,7 +602,9 @@ async fn submit_packet_attests_its_structural_edges() {
     )
     .await;
     let claim = id_of(&out, "claim_id");
-    for rel in ["AUTHORED", "HAS_TRACE", "TRACES", "SUPPORTS"] {
+    // `supports` in its canonical stored spelling (migration 175,
+    // `epigraph_core::edge::relationships::canonical_relationship`).
+    for rel in ["AUTHORED", "HAS_TRACE", "TRACES", "supports"] {
         let edges = edges_of(&pool, claim, rel).await;
         assert_eq!(edges.len(), 1, "{rel}: {edges:?} ({out})");
         assert_attested(&pool, edges[0], signer_id, &format!("packet {rel}")).await;

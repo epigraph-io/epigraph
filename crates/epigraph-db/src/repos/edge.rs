@@ -4,6 +4,7 @@ use crate::errors::DbError;
 use crate::repos::edge_signature::{
     insert_attested_conn, new_attestation, EdgeSigningKey, SymmetricGuard,
 };
+use epigraph_core::edge::relationships::{canonical_relationship, relationship_spellings};
 use sqlx::types::Json;
 use sqlx::PgPool;
 use tracing::instrument;
@@ -282,6 +283,7 @@ impl EdgeRepository {
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Uuid, DbError> {
         let properties = properties.unwrap_or(serde_json::json!({}));
+        let relationship = canonical_relationship(relationship);
 
         let row = sqlx::query!(
             r#"
@@ -736,7 +738,7 @@ impl EdgeRepository {
                  SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
                         e.relationship, e.properties, e.valid_from, e.valid_to \
                    FROM edges e \
-                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
                     AND {EDGE_IN_FORCE} \
                   LIMIT 1"
             ),
@@ -745,7 +747,7 @@ impl EdgeRepository {
                  SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
                         e.relationship, e.properties, e.valid_from, e.valid_to \
                    FROM edges e \
-                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
                   LIMIT 1"
                 .to_string(),
         };
@@ -763,7 +765,7 @@ impl EdgeRepository {
         )> = sqlx::query_as(&sql)
             .bind(source_id)
             .bind(target_id)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -786,6 +788,7 @@ impl EdgeRepository {
         }
 
         let properties = properties.unwrap_or(serde_json::json!({}));
+        let relationship = canonical_relationship(relationship);
         if let Some(key) = key {
             let a = new_attestation(
                 source_id,
@@ -966,11 +969,23 @@ impl EdgeRepository {
     /// `(LEAST(source,target), GREATEST(source,target), relationship)`, keyed on
     /// the same `(pair + properties->>'source' = 'cross_source_matcher')`
     /// identity `MatchCandidateRepo::retire` already uses and restricted to
-    /// in-force claim-claim rows. Its predicate is a strict SUBSET of what this
-    /// guard blocks, so it can only ever reject a row the guard would have
-    /// rejected too if it had seen it — and an operator-authored edge over the
-    /// same pair is untouched, which is what keeps this a dedup repair rather
-    /// than a change to what `POST /edges` may write.
+    /// in-force claim-claim rows. Migration 175 re-keys it on
+    /// `lower(relationship)`, so a legacy `CORROBORATES` and a canonical
+    /// `corroborates` matcher row over one pair are one key.
+    ///
+    /// For rows stored in the lower-case or UPPER-case spelling (the two
+    /// [`relationship_spellings`] returns, which this guard matches) the index
+    /// predicate is a strict SUBSET of what this guard blocks, so it can only
+    /// ever reject a row the guard would have rejected too if it had seen it —
+    /// and an operator-authored edge over the same pair is untouched, which is
+    /// what keeps this a dedup repair rather than a change to what
+    /// `POST /edges` may write. A MIXED-case in-force matcher row (e.g.
+    /// `Corroborates`; no matcher writer ever produced one) is the exception:
+    /// the guard misses it and the index swallows the insert, so this form
+    /// reports a dedup hit and the `_returning` / `_oriented` / `_full` forms'
+    /// post-conflict probe finds no row and errors. The operator case-fold
+    /// (`docs/runbooks/edge-relationship-casefold.sql`) rewrites mixed-case rows
+    /// to lower case, which closes that window.
     ///
     /// The second case it covers is why this is a FORCE precondition
     /// (`D-PR17-read-guards-widen-under-rls`): 072 arm (d)'s no-widening rule
@@ -1033,14 +1048,15 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
              )
              ON CONFLICT DO NOTHING",
         )
         .bind(a)
         .bind(b)
-        .bind(relationship)
+        .bind(canonical_relationship(relationship))
         .bind(Json(properties))
+        .bind(relationship_spellings(relationship))
         .execute(&mut *conn)
         .await?;
 
@@ -1162,7 +1178,7 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              ON CONFLICT DO NOTHING
@@ -1171,8 +1187,9 @@ impl EdgeRepository {
         let inserted: Option<Uuid> = sqlx::query_scalar(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties))
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1197,14 +1214,14 @@ impl EdgeRepository {
              SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
-               AND relationship = $3
+               AND relationship = ANY($3)
                AND {EDGE_IN_FORCE_UNALIASED}
              LIMIT 1"
         );
         let existing: Uuid = sqlx::query_scalar(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
@@ -1317,7 +1334,7 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              RETURNING id, source_id, target_id"
@@ -1325,8 +1342,9 @@ impl EdgeRepository {
         let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties))
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1355,14 +1373,14 @@ impl EdgeRepository {
             "SELECT id, source_id, target_id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
-               AND relationship = $3
+               AND relationship = ANY($3)
                AND {EDGE_IN_FORCE_UNALIASED}
              LIMIT 1"
         );
         let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
@@ -1478,7 +1496,7 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($7)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              RETURNING id, source_id, source_type, target_id, target_type,
@@ -1487,10 +1505,11 @@ impl EdgeRepository {
         let inserted: Option<SymmetricRow> = sqlx::query_as(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties.unwrap_or(serde_json::json!({}))))
             .bind(valid_from)
             .bind(valid_to)
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1517,14 +1536,14 @@ impl EdgeRepository {
                FROM edges
               WHERE ((source_id = $1 AND target_id = $2)
                   OR (source_id = $2 AND target_id = $1))
-                AND relationship = $3
+                AND relationship = ANY($3)
                 AND {EDGE_IN_FORCE_UNALIASED}
               LIMIT 1"
         );
         let existing: SymmetricRow = sqlx::query_as(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
@@ -2165,7 +2184,8 @@ impl EdgeRepository {
             .collect())
     }
 
-    /// Get edges by relationship type
+    /// Get edges by relationship type, in every stored spelling of a
+    /// case-folded relationship (`relationship_spellings`).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -2187,14 +2207,14 @@ impl EdgeRepository {
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
-            WHERE relationship = $1
+            WHERE relationship = ANY($1::text[])
               AND ($2::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($3::uuid[])
                        AND (co_owner_group_id IS NULL
                             OR co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY created_at DESC
             "#,
-            relationship,
+            &relationship_spellings(relationship)[..],
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
@@ -2308,13 +2328,19 @@ impl EdgeRepository {
         // implementer converting the marked sites by grep would have converted
         // six of the eleven `edges` reads in this file and left five reading on
         // `owner_group_id` alone.
+        //
+        // A relationship filter matches every stored spelling of a case-folded
+        // relationship (`relationship_spellings`), so `?relationship=SUPPORTS`
+        // and `?relationship=supports` return the same rows, legacy upper-case
+        // ones included.
+        let spellings = relationship.map(relationship_spellings);
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE ($1::uuid IS NULL OR source_id = $1)
               AND ($2::uuid IS NULL OR target_id = $2)
-              AND ($3::text IS NULL OR relationship = $3)
+              AND ($3::text[] IS NULL OR relationship = ANY($3::text[]))
               AND ($4::text IS NULL OR source_type = $4)
               AND ($5::text IS NULL OR target_type = $5)
               AND ($7::bool OR visibility = 'public'
@@ -2326,7 +2352,7 @@ impl EdgeRepository {
             "#,
             source_id,
             target_id,
-            relationship,
+            spellings.as_deref(),
             source_type,
             target_type,
             limit,

@@ -390,10 +390,20 @@ pub async fn assess_claim(
     )
     .await;
 
-    // Retrieve all user-submitted BBAs for this (claim, frame)
+    // Retrieve all user-submitted BBAs for this (claim, frame). This fold is
+    // stored as the claim's global scoped belief and returned as its updated
+    // belief, so it takes only the BBAs whose every source is at least as
+    // widely readable as the claim (ruling R-22), as the cache refresh below
+    // does.
     let all_rows =
         epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
             .await?;
+    let all_rows = {
+        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
+            message: format!("acquire connection: {e}"),
+        })?;
+        epigraph_engine::derivation_scope::retain_for_cache(&mut conn, all_rows).await?
+    };
 
     let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
         .iter()
@@ -412,39 +422,48 @@ pub async fn assess_claim(
             indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
         )
     } else {
-        super::independence::analyze_independence(pool, &viewer, &indexed_rows, 5).await?
+        super::independence::analyze_independence(pool, &indexed_rows).await?
     };
 
-    // Cautious-combine within each dependent group
-    let mut group_results = Vec::new();
-    for group in &analysis.dependent_groups {
-        if group.is_empty() {
-            continue;
-        }
-        let combined_group = group
-            .iter()
-            .skip(1)
-            .try_fold(group[0].clone(), |acc, m| {
-                combination::cautious_combine(&acc, m)
-            })
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Cautious combine failed: {e}"),
-            })?;
-        group_results.push(combined_group);
-    }
-
-    // Merge independent BBAs + group results
+    // Reduce each dependent group (sibling agents of one owner, ruling R-36)
+    // by Denoeux's cautious rule, the reduction the engine fold applies
+    // (`source_dependence::cautious_reduce`). This response and the cache
+    // agree when each sibling has one row on the frame (the assessment slot,
+    // or one restating it). They can differ otherwise: this fold puts all of
+    // a group's rows into one cautious reduction, while the engine first
+    // Dempster-folds each agent's own rows (and applies the same-source rule
+    // and its reliability discounts). The cache is the engine's. The min-commonality
+    // `combination::cautious_combine` used here before drops open-world mass,
+    // which every default-shaped assessment carries. A group the rule is not
+    // defined on folds as independent, as before.
     let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
-    for_combination.extend(group_results);
+    let mut used_cautious = false;
+    for group in &analysis.dependent_groups {
+        match epigraph_engine::source_dependence::cautious_reduce(group).map_err(|e| {
+            ApiError::InternalError {
+                message: format!("Cautious combine failed: {e}"),
+            }
+        })? {
+            Some((reduced, _)) => {
+                used_cautious = true;
+                for_combination.push(reduced);
+            }
+            None => for_combination.extend(group.iter().cloned()),
+        }
+    }
 
     // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
     let default_conflict_threshold = 0.3;
     let (combined, reports) = if for_combination.len() <= 1 {
+        // Nothing admissible left to fold (the rows read above can be emptied
+        // by the derivation scope, e.g. a claim whose visibility changed
+        // between the write and this read): report this call's own
+        // assessment rather than index an empty list.
         (
             for_combination
                 .into_iter()
                 .next()
-                .unwrap_or_else(|| indexed_rows[0].2.clone()),
+                .unwrap_or_else(|| mass_function.clone()),
             vec![],
         )
     } else {
@@ -512,7 +531,7 @@ pub async fn assess_claim(
     // Conflict/method summary of this frame's fold, for the scoped-belief
     // cache below (no combined mass_functions row is stored).
     let final_k = reports.last().map(|r| r.conflict_k);
-    let used_cautious = !analysis.dependent_groups.is_empty();
+
     let final_method_str = if used_cautious {
         let adaptive = reports
             .last()

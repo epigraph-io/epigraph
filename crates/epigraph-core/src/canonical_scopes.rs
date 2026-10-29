@@ -15,6 +15,11 @@
 //!   and dedup at `claims:write` since batch OA1).
 //! - **read-only** (`ro`): every read scope, no writes, no admin.
 
+/// The `claims:admin` scope, named once so a caller asking the check chokepoint
+/// (`epigraph_auth::AuthContext::has_scope`) about it does not spell it again
+/// (`epigraph-api/tests/admin_scope_literals.rs`).
+pub const CLAIMS_ADMIN: &str = "claims:admin";
+
 /// Scopes that gate admin-only operations. These are EXCLUDED from `wo` and
 /// `ro`; included in `admin`.
 ///

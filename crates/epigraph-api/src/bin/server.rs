@@ -429,6 +429,7 @@ async fn main() {
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
+            .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);

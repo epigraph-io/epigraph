@@ -219,9 +219,8 @@ pub struct SemanticSearchResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub graph_neighbors: Option<Vec<GraphNeighbor>>,
 
-    /// Theme this claim belongs to (k-means partition over `claim_themes`).
-    /// `Some` when populated by `POST /api/v1/themes/build-from-corpus`;
-    /// always emitted in diverse mode so callers can render or filter by
+    /// Theme this claim belongs to (its `claims.theme_id` in `claim_themes`,
+    /// maintained by the UMAP theme pipeline); always emitted in diverse mode so callers can render or filter by
     /// theme. `None` if the claim hasn't been assigned. Flat-search results
     /// omit this field via `skip_serializing_if`.
     #[serde(skip_serializing_if = "Option::is_none")]

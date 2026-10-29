@@ -13,6 +13,16 @@
 // the same response shapes as real data. Treat the no-db configuration as a
 // compile-time target, not a runnable mode, until that is resolved.
 // Re-audited 2026-09-01.
+//
+// OPERATOR RULING R-39 (2026-10, backlog ca927c3b): the no-db configuration IS
+// check-only, by decision rather than by caveat. The `server` binary declares
+// `required-features = ["db"]` (Cargo.toml; pinned by
+// tests/server_bin_requires_db.rs), so a `--no-default-features` build compiles
+// this library and skips the server: no `not(db)` arm here is ever reachable
+// from a request. Consequently the two `#[cfg]` arms of a split handler are NOT
+// held to extractor parity (finding F-PR28-route-arm-extractor-parity is closed
+// by this ruling, not by an audit of ~120 handlers). A `not(db)` arm only has to
+// compile.
 
 pub mod activities;
 pub mod admin;
@@ -30,6 +40,8 @@ pub mod assess;
 #[cfg(feature = "db")]
 pub mod audit;
 pub mod batch;
+#[cfg(feature = "db")]
+pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
 pub mod claims;
@@ -366,10 +378,6 @@ pub fn create_router_with_extensions(
             post(crud::create_theme_with_centroid),
         )
         .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
-        )
-        .route(
             "/api/v1/clusters/build-from-bridges",
             post(clusters::build_from_bridges),
         )
@@ -385,6 +393,10 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/claims/:id/challenge",
             post(challenge::submit_challenge),
+        )
+        .route(
+            "/api/v1/challenges/:id/resolve",
+            post(challenge::resolve_challenge),
         )
         .route(
             "/api/v1/claims/:id/supersede",
@@ -452,6 +464,14 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/frames", post(belief::create_frame))
         .route("/api/v1/frames/:id/evidence", post(belief::submit_evidence))
+        .route(
+            "/api/v1/mass-functions/:id/retract",
+            post(bba_retract::retract_bba),
+        )
+        .route(
+            "/api/v1/mass-functions/:id/unretract",
+            post(bba_retract::unretract_bba),
+        )
         .route(
             "/api/v1/frames/:id/conflict-batch",
             post(belief::conflict_batch),
@@ -1274,10 +1294,6 @@ pub fn create_router_with_extensions(
         .route(
             "/api/v1/themes/create-with-centroid",
             post(crud::create_theme_with_centroid),
-        )
-        .route(
-            "/api/v1/themes/build-from-corpus",
-            post(crud::build_themes_from_corpus),
         )
         .route(
             "/api/v1/clusters/build-from-bridges",

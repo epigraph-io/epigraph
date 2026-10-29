@@ -215,12 +215,23 @@ async fn an_operated_agent_cannot_mint_a_token_by_assertion(pool: PgPool) {
     );
 }
 
-async fn refresh_grant(pool: &PgPool, refresh_token: &str) -> (StatusCode, Value) {
+/// The refresh grant for a confidential chain, carrying the client's own
+/// credential (`credential`: an [`agent_credential`] or a
+/// [`service_credential`]), which the refresh grant verifies like
+/// `client_credentials` does (RFC 6749 section 6).
+async fn refresh_grant(
+    pool: &PgPool,
+    refresh_token: &str,
+    credential: Value,
+) -> (StatusCode, Value) {
     let app = create_router(AppState::with_db(pool.clone(), config()));
-    let body = json!({
+    let mut body = json!({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
     });
+    for (k, v) in credential.as_object().expect("a credential object") {
+        body[k] = v.clone();
+    }
     let req = Request::builder()
         .method(Method::POST)
         .uri("/oauth/token")
@@ -234,6 +245,20 @@ async fn refresh_grant(pool: &PgPool, refresh_token: &str) -> (StatusCode, Value
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+/// An agent's credential for the refresh grant: a fresh assertion under `key`.
+fn agent_credential(client_id: &str, key: &SigningKey) -> Value {
+    json!({
+        "client_id": client_id,
+        "client_assertion_type": "urn:epigraph:ed25519",
+        "client_assertion": assertion(key),
+    })
+}
+
+/// A service's credential for the refresh grant: its id and secret.
+fn service_credential(client_id: &str, secret: &str) -> Value {
+    json!({ "client_id": client_id, "client_secret": secret })
 }
 
 /// Mint by assertion and return the refresh token.
@@ -265,7 +290,7 @@ async fn an_agent_linked_after_minting_cannot_refresh(pool: PgPool) {
         .expect("link the agent after it minted");
     drop(conn);
 
-    let (status, body) = refresh_grant(&pool, &refresh).await;
+    let (status, body) = refresh_grant(&pool, &refresh, agent_credential(&client_id, &key)).await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
@@ -301,7 +326,7 @@ async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("make the link-record read uncallable");
-    let (status, body) = refresh_grant(&pool, &refresh).await;
+    let (status, body) = refresh_grant(&pool, &refresh, agent_credential(&client_id, &key)).await;
     sqlx::query(
         "ALTER FUNCTION public.epigraph_operator_of_author_gone(uuid) \
          RENAME TO epigraph_operator_of_author",
@@ -315,7 +340,7 @@ async fn a_failed_operator_check_does_not_burn_the_refresh_token(pool: PgPool) {
         "PREMISE: with the link-record read gone the refresh cannot be answered: {body}"
     );
 
-    let (status, body) = refresh_grant(&pool, &refresh).await;
+    let (status, body) = refresh_grant(&pool, &refresh, agent_credential(&client_id, &key)).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -833,7 +858,8 @@ async fn an_allowlisted_client_still_mints_and_keeps_its_viewer(pool: PgPool) {
         .as_str()
         .unwrap_or_else(|| panic!("PREMISE: the service mint issues a refresh token: {body}"))
         .to_string();
-    let (status, body) = refresh_grant(&pool, &refresh).await;
+    let (status, body) =
+        refresh_grant(&pool, &refresh, service_credential(&service_id, &secret)).await;
     let access = access_of("(c) refresh", status, &body);
     assert_viewer("(c) refresh", evidence_read(&pool, &access).await);
 }
@@ -922,7 +948,8 @@ async fn an_operated_agent_on_the_allowlist_still_cannot_mint(pool: PgPool) {
             body.to_string().contains(&link_to.to_string()),
             "(b) {what}: {body}"
         );
-        let (status, body) = refresh_grant(&pool, &refresh).await;
+        let (status, body) =
+            refresh_grant(&pool, &refresh, service_credential(&service_id, &secret)).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "(c) {what}: {body}");
         assert!(
             body.to_string().contains(&link_to.to_string()),

@@ -20,14 +20,10 @@ fn cluster_job() -> Job {
     .expect("serialize ClusterGraph job")
 }
 
-fn theme_job() -> Job {
-    EpiGraphJob::ThemeClusterRebuild {
-        max_themes: 50,
-        min_claims_per_theme: 5,
-        skip_if_unchanged: true,
-    }
-    .into_job()
-    .expect("serialize ThemeClusterRebuild job")
+fn cleanup_job() -> Job {
+    EpiGraphJob::DataCleanup { retention_days: 30 }
+        .into_job()
+        .expect("serialize DataCleanup job")
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -89,11 +85,11 @@ async fn dedup_is_scoped_per_job_type(pool: PgPool) {
         .unwrap()
         .is_some());
     assert!(
-        q.enqueue_unique_pending(theme_job())
+        q.enqueue_unique_pending(cleanup_job())
             .await
             .unwrap()
             .is_some(),
-        "a pending cluster_graph must not block a theme_cluster_rebuild enqueue"
+        "a pending cluster_graph must not block a data_cleanup enqueue"
     );
 
     assert_eq!(q.count_by_state(JobState::Pending).await.unwrap(), 2);

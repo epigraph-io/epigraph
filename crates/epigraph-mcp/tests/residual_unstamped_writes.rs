@@ -192,26 +192,14 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          the static `instance_wide()` arm admits it unstamped.",
     ),
     (
-        "tools/themes.rs",
-        "run_theme_kmeans",
-        1,
-        "`theme_cluster`. Surfaced when `run_theme` joined WRITE_TOKENS (batch H-a review). A \
-         corpus-wide clustering: its `bulk_assign` (`UPDATE claims SET theme_id`) spans every \
-         claim's owner group, so no single author stamp covers it. Since 5cafc60a the whole \
-         run is ONE transaction (wipe, themes, assignment), so on a clean migrate it fails \
-         loudly with nothing written (MEASURED: ERR 42501, the previous themes intact) instead \
-         of leaving an orphan theme. Not moved behind the maintenance gate: production runs it \
-         today with no maintenance DSN, and gating it would refuse it there.",
-    ),
-    (
         "tools/workflow_ingest.rs",
         "WorkflowRepository::set_goal_embedding",
-        2,
-        "`ingest_workflow` and `improve_workflow_hierarchy`, one call each. Writes `workflows`, \
-         which is MEASURED `relrowsecurity = false` with no policy at migration head 101 — so \
-         unlike the `claims` embed this one is not refused, and converting it would be cohesion \
-         rather than a fix. Kept unstamped deliberately; see `visibility_lint.rs`'s \
-         `workflow.rs::set_truth_value` entry for the same argument.",
+        1,
+        "`store_workflow_goal_embedding`'s fallback for a server with no `ScopedPool` (a \
+         development superuser), the only case without a stamp. With one, every goal embed \
+         (`ingest_workflow`, `improve_workflow_hierarchy`, `store_workflow`) runs on the ingest \
+         system agent's stamp, since migration 183 gave `workflows` row security keyed on the \
+         plan's tenancy.",
     ),
     (
         "tools/workflows.rs",
@@ -230,13 +218,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          reached the lineage-root early return). Same population and the same H3 question as \
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
-    ),
-    (
-        "tools/workflows.rs",
-        "WorkflowRepository::set_goal_embedding",
-        1,
-        "`store_workflow`'s goal embedding. Same `relrowsecurity = false` argument as the two in \
-         `workflow_ingest.rs`.",
     ),
 ];
 
@@ -262,6 +243,15 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
         "`memorize`'s novelty-gate preamble. The same read-only content-hash probe as \
          `tools/claims.rs` above, matched for the same WRITE_TOKENS reason. The write half of \
          `memorize` runs on `begin_author_stamped_tx`.",
+    ),
+    (
+        "tools/workflows.rs",
+        "server.pool.acquire",
+        "`CallerRead::open`'s fallback for a server with no tenancy-aware pool (a development \
+         superuser): the connection carries the READS of `workflows` rows that find_workflow, \
+         recall's include_workflows leg and verify_claim's digest seed make as the caller \
+         (migration 183). With a `ScopedPool` the same reads run on `read_as(viewer)`; nothing \
+         is written on either connection.",
     ),
     (
     "claim_helper.rs",
@@ -332,8 +322,10 @@ const WRITE_TOKENS: &[&str] = &[
     // Added by the batch H-a review, which found three unstamped write sites
     // this register did not list because no token matched their callee:
     // `ClaimRepository::evolve_step`, `ClaimRepository::merge_properties` and
-    // `run_theme_kmeans`. The register GREW when these landed because the
-    // earlier count was wrong, not because a write was added.
+    // `run_theme_kmeans` (since retired with the k-means prototype, backlog
+    // a0ed0180, which took its register row with it). The register GREW when
+    // these landed because the earlier count was wrong, not because a write
+    // was added.
     "evolve",
     "merge",
     "run_theme",

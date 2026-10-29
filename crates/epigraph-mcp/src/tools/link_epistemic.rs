@@ -62,9 +62,10 @@ use epigraph_engine::edge_factor::{auto_wire_edge_if_epistemic, EdgeFactorOutcom
 /// `epigraph-core::relationships` constants and the engine's internal
 /// `to_ascii_lowercase`).
 ///
-/// Deliberately NOT validated against `routes/edges.rs::VALID_RELATIONSHIPS`:
-/// that HTTP whitelist stores only UPPER-CASE `CONTRADICTS`/`CORROBORATES` and
-/// is case-sensitive, while the engine lowercases internally. The real invariant
+/// Deliberately NOT validated against `routes/edges.rs::VALID_RELATIONSHIPS`
+/// (a broader, mostly structural list). Both accept the case-folded
+/// relationships in any ASCII case and store them in this lower-case spelling
+/// (`canonical_relationship`, applied before this check). The real invariant
 /// (asserted by the coverage-guard test) is that every entry maps to a
 /// **non-Neutral** `RestrictionKind`, which is what actually moves belief.
 ///
@@ -135,13 +136,11 @@ fn is_structural_relationship(s: &str) -> bool {
 /// `target` (A generalizes B is not B generalizes A), and collapsing their
 /// orderings would erase real information rather than a duplicate.
 ///
-/// **Casing caveat.** Dedup is a byte-exact `relationship = $3` comparison.
-/// The cross-source matcher writes `CORROBORATES` (upper) and `contradicts`
-/// (lower) — see `epigraph_engine::matching::verifier`'s two relationship
-/// constants. So listing lowercase `corroborates` here collapses the two call
-/// ORDERS of `link_epistemic`'s own `corroborates`; it does NOT unify a
-/// `link_epistemic` `corroborates` with a matcher-written `CORROBORATES`.
-/// That casing split is pre-existing and out of scope here.
+/// **Casing.** Every writer stores the lower-case spelling
+/// (`canonical_relationship`), and the dedup probe matches every stored
+/// spelling (`relationship_spellings`), so a `link_epistemic` `corroborates`
+/// over a pair holding a legacy matcher-written `CORROBORATES` row is the same
+/// edge (backlog 3ce5e00c).
 ///
 /// Re-exported from the shared definition in `epigraph_core` so this tool and
 /// the HTTP twin (`POST /api/v1/edges`) cannot drift apart.
@@ -176,10 +175,18 @@ pub async fn link_epistemic(
 pub async fn do_link_epistemic(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
-    params: LinkEpistemicParams,
+    mut params: LinkEpistemicParams,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let source_id = parse_uuid(&params.source_claim_id)?;
+    // One stored spelling (backlog 3ce5e00c): a case-folded relationship
+    // (`supports`, `contradicts`, `corroborates`, `refutes`) is accepted in any
+    // ASCII case, as its HTTP twin accepts it, and handled from here on in the
+    // lower-case canonical spelling the allow-list below names. Every other
+    // relationship is left as sent and still matched exactly.
+    params.relationship =
+        epigraph_core::edge::relationships::canonical_relationship(&params.relationship)
+            .to_string();
     let target_id = parse_uuid(&params.target_claim_id)?;
 
     // Tight allow-list — lowercase canonical epistemic relations, plus the

@@ -51,6 +51,38 @@ impl GroupMembershipRepository {
         epoch: i32,
         role: &str,
     ) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::add_member_conn(
+            &mut conn,
+            group_id,
+            agent_id,
+            wrapped_key_share,
+            epoch,
+            role,
+        )
+        .await
+    }
+
+    /// [`Self::add_member`] over a borrowed connection.
+    ///
+    /// `POST /api/v1/groups/:id/members` calls this on the caller's
+    /// `ScopedPool::begin_as` transaction (backlog 323773fe), the same one its
+    /// admin check ran on. On the application role
+    /// `group_memberships_tenancy`'s `WITH CHECK` admits the row only through
+    /// `epigraph_is_group_admin(group_id)`, which reads the CONNECTION's
+    /// stamped principal; an unstamped connection is refused.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, wrapped_key_share))]
+    pub async fn add_member_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+        wrapped_key_share: &[u8],
+        epoch: i32,
+        role: &str,
+    ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
@@ -63,7 +95,7 @@ impl GroupMembershipRepository {
         .bind(wrapped_key_share)
         .bind(epoch)
         .bind(role)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok(row.0)
@@ -172,14 +204,32 @@ impl GroupMembershipRepository {
     /// rotation, so revocation on its own discharges nothing, and an obligation
     /// nobody can see is one nobody services.
     ///
+    /// The `groups` mark goes through migration 181's definer,
+    /// `epigraph_mark_group_reseal_required` (ruling R-56, backlog 323773fe),
+    /// not a direct `UPDATE groups`: on the application role `groups_tenancy`'s
+    /// `WITH CHECK` admits only the group's CREATOR, so a direct write refused
+    /// the whole removal for every other admin. The definer writes that one
+    /// column for a live admin of the group (or a privileged session) and
+    /// refuses anyone else with 42501 (`GRA01`), and an elevated session
+    /// with 42501 (`GRA03`).
+    ///
+    /// It is called BEFORE the guarded revoke, inside a savepoint, because the
+    /// definer decides on the CALLER's admin row: an admin removing itself
+    /// would otherwise no longer be an admin by the time the mark is asked
+    /// for. When nothing is revoked (`LastAdmin`, `NotAMember`) the
+    /// transaction rolls back to the savepoint, so the mark is undone and the
+    /// outcome is as if it had never been taken. The roster lock is taken
+    /// before the savepoint and survives that rollback.
+    ///
     /// It MARKS and does not enqueue. §6.7 is explicit that an automatic
     /// re-seal is deliberately not built: re-sealing needs the group key, which
     /// by §6.5.6 the server does not have, so a job scheduled here could only
     /// ever fail.
     ///
-    /// Both writes are on the `Revoked` arm alone. The loser of the concurrent
-    /// last-admin race sees `rows_affected() == 0` and returns `LastAdmin`; it
-    /// revoked nobody and must mark nothing.
+    /// Both marks are KEPT on the `Revoked` arm alone. The loser of the
+    /// concurrent last-admin race sees `rows_affected() == 0` and returns
+    /// `LastAdmin`; it revoked nobody, and its `groups` mark is rolled back to
+    /// the savepoint, so it marks nothing.
     ///
     /// `COALESCE(reseal_required_at, now())` rather than the plan's bare
     /// `now()`, and this is a deliberate documented deviation: the obligation
@@ -202,7 +252,11 @@ impl GroupMembershipRepository {
     /// community projection is id-preserving). Since batch F that function's
     /// definer (`epigraph_community_remove_member`, migration 106) and its
     /// `add_member` twin DO take a `groups` row lock, but only AFTER the same
-    /// roster lock, so the order is unchanged. `GroupKeyEpochRepository::rotate_conn` takes the same
+    /// roster lock, so the order is unchanged. Taking the `groups` mark before
+    /// the guard `UPDATE` does not change it either: that `UPDATE` acquires no
+    /// new `group_memberships` lock (its target is in the roster already
+    /// held), so the acquisitions are still roster, then `groups`, then
+    /// `group_key_epochs`. `GroupKeyEpochRepository::rotate_conn` takes the same
     /// two it needs in the same relative order — roster first, epoch row
     /// second — for exactly this reason: the reverse would let a rotation
     /// holding the epoch row wait on a removal holding the roster while the
@@ -239,6 +293,32 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<RevokeOutcome, DbError> {
         let mut tx = pool.begin().await?;
+        let outcome =
+            Self::revoke_member_unless_last_admin_conn(&mut tx, group_id, agent_id).await?;
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
+    /// [`Self::revoke_member_unless_last_admin`] on a transaction the CALLER
+    /// owns: every statement above, in the same order, and no `BEGIN` /
+    /// `COMMIT` of its own. The roster lock is held until the caller commits,
+    /// so the guard's argument is unchanged as long as `conn` is a transaction
+    /// (the caller must not pass a bare autocommit connection: each statement
+    /// would then release the roster lock as it finished).
+    ///
+    /// `DELETE /api/v1/groups/:id/members/:agent_id` calls this on the
+    /// caller's `ScopedPool::begin_as` transaction (backlog 323773fe), the
+    /// same one its admin check ran on.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any statement fails.
+    #[instrument(skip(conn))]
+    pub async fn revoke_member_unless_last_admin_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<RevokeOutcome, DbError> {
+        let tx = conn;
 
         // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
         // The `UPDATE` below locks only the row it writes; this locks the whole
@@ -272,6 +352,21 @@ impl GroupMembershipRepository {
             "last-admin guard: locked the group's live roster"
         );
 
+        // FINAL-PLAN §6.7 point 2, taken BEFORE the guard and kept only if the
+        // guard revokes (see the doc comment). The savepoint is opened after
+        // the roster lock, so rolling back to it keeps the lock. A raw
+        // statement, not a nested sqlx transaction: the caller's transaction
+        // may have been opened with a raw `BEGIN` that sqlx does not track, and
+        // `SAVEPOINT` outside a transaction block is an error rather than a
+        // silent autocommit.
+        sqlx::query("SAVEPOINT revoke_member_reseal_mark")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT public.epigraph_mark_group_reseal_required($1)")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+
         let result = sqlx::query(
             r#"
             UPDATE group_memberships
@@ -297,20 +392,10 @@ impl GroupMembershipRepository {
         .await?;
 
         let outcome = if result.rows_affected() > 0 {
-            // FINAL-PLAN §6.7 point 2, in the transaction that did the
-            // revoking. See this function's doc comment for why the timestamp
-            // is COALESCEd and why nothing is enqueued.
-            sqlx::query(
-                r#"
-                UPDATE groups
-                SET reseal_required_at = COALESCE(reseal_required_at, now())
-                WHERE id = $1
-                "#,
-            )
-            .bind(group_id)
-            .execute(&mut *tx)
-            .await?;
-
+            // The `groups` mark taken above stands. See this function's doc
+            // comment for why the timestamp is COALESCEd (migration 181's body)
+            // and why nothing is enqueued.
+            //
             // The mark goes on the epoch row because `groups.status` cannot
             // hold it: `groups_status_check` admits only
             // active|suspended|deprovisioned, while
@@ -329,8 +414,16 @@ impl GroupMembershipRepository {
             .execute(&mut *tx)
             .await?;
 
+            sqlx::query("RELEASE SAVEPOINT revoke_member_reseal_mark")
+                .execute(&mut *tx)
+                .await?;
             RevokeOutcome::Revoked
         } else {
+            // Nothing was revoked, so nothing may be marked: undo the
+            // `groups` mark. The roster lock predates the savepoint and stays.
+            sqlx::query("ROLLBACK TO SAVEPOINT revoke_member_reseal_mark")
+                .execute(&mut *tx)
+                .await?;
             // Zero rows: either no live membership at all, or the guard bit.
             let still_live: (bool,) = sqlx::query_as(
                 r#"
@@ -352,7 +445,6 @@ impl GroupMembershipRepository {
             }
         };
 
-        tx.commit().await?;
         Ok(outcome)
     }
 
@@ -403,6 +495,21 @@ impl GroupMembershipRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn get_members(pool: &PgPool, group_id: Uuid) -> Result<Vec<MembershipRow>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_members_conn(&mut conn, group_id).await
+    }
+
+    /// [`Self::get_members`] over a borrowed connection, for
+    /// `GET /api/v1/groups/:id` on the caller's stamped read (backlog
+    /// 323773fe).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_members_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<Vec<MembershipRow>, DbError> {
         let rows: Vec<MembershipRow> = sqlx::query_as(
             r#"
             SELECT id, group_id, agent_id, wrapped_key_share, epoch, role, joined_at, revoked_at
@@ -412,7 +519,7 @@ impl GroupMembershipRepository {
             "#,
         )
         .bind(group_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
         Ok(rows)
@@ -424,6 +531,24 @@ impl GroupMembershipRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn is_member(pool: &PgPool, group_id: Uuid, agent_id: Uuid) -> Result<bool, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::is_member_conn(&mut conn, group_id, agent_id).await
+    }
+
+    /// [`Self::is_member`] over a borrowed connection, for
+    /// `GET /api/v1/groups/:id`'s membership gate on the caller's stamped read
+    /// (backlog 323773fe). On the unstamped application pool
+    /// `group_memberships_tenancy` shows no row and every member reads as a
+    /// non-member.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn is_member_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<bool, DbError> {
         let row: (bool,) = sqlx::query_as(
             r#"
             SELECT EXISTS (
@@ -434,7 +559,7 @@ impl GroupMembershipRepository {
         )
         .bind(group_id)
         .bind(agent_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
         Ok(row.0)
@@ -467,7 +592,8 @@ impl GroupMembershipRepository {
 
     /// [`Self::get_member_role`] over a borrowed connection.
     ///
-    /// Exists for `POST /api/v1/groups/:id/rotate`, whose whole body runs on
+    /// Exists for `POST /api/v1/groups/:id/rotate` (and, since backlog
+    /// 323773fe, the member routes), whose whole body runs on
     /// one `ScopedPool::begin_as` transaction: the handler must decide
     /// authorization on the SAME stamped connection that performs the rotation,
     /// and it must reach the raw application pool nowhere, because

@@ -309,7 +309,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
 
     let edge_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -339,7 +339,7 @@ async fn decide_match_candidate_promote_writes_edge_and_updates_status(pool: PgP
     .expect_err("a second promote must be refused as already decided");
     let edge_count2: (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = 'CORROBORATES'
+         WHERE lower(relationship) = 'corroborates'
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
@@ -382,7 +382,7 @@ async fn decide_match_candidate_reject_marks_status_and_skips_edge(pool: PgPool)
         .unwrap();
     assert_eq!(status, "rejected");
     let edge_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint FROM edges WHERE relationship = 'CORROBORATES'
+        "SELECT COUNT(*)::bigint FROM edges WHERE lower(relationship) = 'corroborates'
          AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
     )
     .bind(a)
@@ -452,7 +452,7 @@ async fn decide_match_candidate_promote_blocked_when_endpoint_not_current(pool: 
 
     // The guard must short-circuit BEFORE any edge write.
     let edge_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*)::bigint FROM edges WHERE relationship = 'CORROBORATES'
+        "SELECT COUNT(*)::bigint FROM edges WHERE lower(relationship) = 'corroborates'
          AND ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1))",
     )
     .bind(live)
@@ -589,7 +589,7 @@ async fn decide_match_candidate_promote_paraphrase_still_writes_corroborates(poo
     .expect("promote");
 
     let rels = edge_relationships(&pool, a, b).await;
-    assert_eq!(rels, vec!["CORROBORATES".to_string()]);
+    assert_eq!(rels, vec!["corroborates".to_string()]);
 }
 
 /// The reported gap: no MCP surface could retract a promotion, so an agent
@@ -647,7 +647,7 @@ async fn decide_match_candidate_retire_retracts_edge_and_deletes_derived_factor(
     assert_eq!(body["candidate"]["status"], "promoted", "{body}");
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "nothing is retracted before the replay"
     );
     // ...and the replay, on the maintenance connection, carries it out.
@@ -796,7 +796,7 @@ async fn decide_match_candidate_retire_rejected_in_read_only_mode(pool: PgPool) 
 
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "a refused retire must leave the edge in place"
     );
 }
@@ -839,7 +839,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
     .expect("promote");
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "precondition: the promotion wrote the matcher edge"
     );
 
@@ -873,7 +873,7 @@ async fn decide_match_candidate_reject_refuses_an_already_promoted_row(pool: PgP
     );
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "the matcher edge must still be in force"
     );
 }
@@ -1178,7 +1178,7 @@ async fn retire_without_an_admin_connection_defers_the_whole_retirement(pool: Pg
         .to_string();
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "the deferred cascade retracted nothing"
     );
     let server_agent = server.server_agent_id().await.expect("server agent");
@@ -1421,7 +1421,7 @@ async fn a_promote_does_not_publish_promoted_before_its_edge_commits(pool: PgPoo
     assert_eq!(status, "promoted");
     assert_eq!(
         edge_relationships(&pool, a, b).await,
-        vec!["CORROBORATES".to_string()],
+        vec!["corroborates".to_string()],
         "exactly one matcher edge, written by the promote itself"
     );
 }

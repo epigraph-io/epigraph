@@ -76,9 +76,11 @@
 //!         --reason TEXT [--apply --confirm-delete N]
 //!     epigraph-operator create-group --kind team --name NAME --admin <uuid> --reason TEXT [--apply]
 //!     epigraph-operator define-group-role --key role:K --description TEXT --group <uuid> \
-//!         --member-role reader|writer [--include-agents] --reason TEXT [--apply]
+//!         --member-role reader|writer [--include-agents | --agent-mode MODE] --reason TEXT \
+//!         [--apply]
 //!     epigraph-operator bind-group-role --role role:K --group <uuid> --member-role reader|writer \
-//!         [--include-agents] --reason TEXT [--apply]
+//!         [--include-agents | --agent-mode MODE] --reason TEXT [--apply]
+//!         (MODE: holder_only | registered_agents | attached_agents)
 //!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
 //!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
@@ -342,9 +344,16 @@ enum Command {
         #[arg(long)]
         member_role: String,
         /// Also make every agent registered to a holder (an acting live link
-        /// or a live client allowance) a member.
+        /// or a live client allowance) a member (= `--agent-mode
+        /// registered_agents`).
         #[arg(long)]
         include_agents: bool,
+        /// Which agents the binding admits besides the holder (migration
+        /// 179): `holder_only`, `registered_agents`, or `attached_agents`
+        /// (only agents attached to the role, `role_agents`, whose own human
+        /// holds it). One choice with --include-agents.
+        #[arg(long, conflicts_with = "include_agents")]
+        agent_mode: Option<String>,
         /// Recorded on the binding and in its audit row.
         #[arg(long)]
         reason: String,
@@ -364,9 +373,14 @@ enum Command {
         /// `reader` or `writer`.
         #[arg(long)]
         member_role: String,
-        /// Also make every agent registered to a holder a member.
+        /// Also make every agent registered to a holder a member (= `--agent-mode
+        /// registered_agents`).
         #[arg(long)]
         include_agents: bool,
+        /// `holder_only`, `registered_agents` or `attached_agents` (migration
+        /// 179; see define-group-role). One choice with --include-agents.
+        #[arg(long, conflicts_with = "include_agents")]
+        agent_mode: Option<String>,
         /// Recorded on the binding and in its audit row.
         #[arg(long)]
         reason: String,
@@ -1021,22 +1035,28 @@ async fn main_inner() -> anyhow::Result<i32> {
             key,
             description,
             member_role,
+            include_agents,
+            agent_mode,
             reason,
             ..
         } => {
             group_role::validate_key("--key", key)?;
             group_role::validate_member_role(member_role)?;
+            group_role::agent_mode(*include_agents, agent_mode.as_deref())?;
             team_group::validate_text("--description", description)?;
             team_group::validate_text("--reason", reason)?;
         }
         Command::BindGroupRole {
             role,
             member_role,
+            include_agents,
+            agent_mode,
             reason,
             ..
         } => {
             group_role::validate_key("--role", role)?;
             group_role::validate_member_role(member_role)?;
+            group_role::agent_mode(*include_agents, agent_mode.as_deref())?;
             team_group::validate_text("--reason", reason)?;
         }
         Command::EndGroupRoleBinding { reason, .. } => {
@@ -1394,16 +1414,18 @@ async fn main_inner() -> anyhow::Result<i32> {
             group,
             member_role,
             include_agents,
+            agent_mode,
             reason,
             apply,
         } => {
+            let mode = group_role::agent_mode(include_agents, agent_mode.as_deref())?;
             let binding = group_role::define(
                 &mut conn,
                 &key,
                 &description,
                 group,
                 &member_role,
-                include_agents,
+                mode,
                 &reason,
                 apply,
             )
@@ -1414,8 +1436,9 @@ async fn main_inner() -> anyhow::Result<i32> {
             );
             println!(
                 "{}BOUND\tbinding={binding}\trole={key}\tgroup={group}\tmember_role={member_role}\t\
-                 include_agents={include_agents}",
-                if apply { "" } else { "WOULD BE " }
+                 include_agents={}\tagent_mode={mode}",
+                if apply { "" } else { "WOULD BE " },
+                mode == "registered_agents"
             );
             if !apply {
                 println!(
@@ -1430,23 +1453,19 @@ async fn main_inner() -> anyhow::Result<i32> {
             group,
             member_role,
             include_agents,
+            agent_mode,
             reason,
             apply,
         } => {
-            let binding = group_role::bind(
-                &mut conn,
-                &role,
-                group,
-                &member_role,
-                include_agents,
-                &reason,
-                apply,
-            )
-            .await?;
+            let mode = group_role::agent_mode(include_agents, agent_mode.as_deref())?;
+            let binding =
+                group_role::bind(&mut conn, &role, group, &member_role, mode, &reason, apply)
+                    .await?;
             println!(
                 "{}BOUND\tbinding={binding}\trole={role}\tgroup={group}\tmember_role={member_role}\t\
-                 include_agents={include_agents}",
-                if apply { "" } else { "WOULD BE " }
+                 include_agents={}\tagent_mode={mode}",
+                if apply { "" } else { "WOULD BE " },
+                mode == "registered_agents"
             );
             if !apply {
                 println!("DRY RUN: the binding and its audit row were rolled back.");

@@ -48,8 +48,9 @@ async fn dedup_nonexistent_dup_returns_404() {
 }
 
 /// Calling dedup against a claim that already has supersedes set → 409.
-/// ClaimRepository::mark_duplicate returns DbError::QueryFailed when
-/// the dup row already has supersedes != NULL → handler maps to ApiError::Conflict → 409.
+/// ClaimRepository::mark_duplicate returns DbError::Refused when
+/// the dup row already has supersedes != NULL, a STATE refusal → ApiError::Conflict → 409
+/// (operator ruling R-55: `From<DbError>` answers a refusal by its kind).
 #[tokio::test(flavor = "multi_thread")]
 async fn dedup_already_superseded_dup_returns_409() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
@@ -88,12 +89,20 @@ async fn dedup_already_superseded_dup_returns_409() {
         .await
         .unwrap();
 
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
     assert_eq!(
-        resp.status(),
-        409,
-        "expected 409 for already-superseded dup; got {} — body={}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
+        status, 409,
+        "expected 409 for already-superseded dup; got {status} — body={text}"
+    );
+    // The refusal's own words and the claim it names (operator ruling R-55),
+    // not the route's fixed "already superseded or invalid input" text.
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let reason = body["details"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("already superseded; refusing to overwrite")
+            && reason.contains(&dup.to_string()),
+        "the state refusal's reason names the duplicate: {text}"
     );
 }
 
@@ -137,7 +146,7 @@ async fn dedup_self_dedup_returns_400() {
 
 /// Calling dedup onto a canonical that is no longer current → 409, and the
 /// duplicate is untouched: the act refuses to build a dedup chain onto a
-/// retired claim (it returns DbError::QueryFailed, which the handler maps to
+/// retired claim (it returns a STATE DbError::Refused, which is answered
 /// ApiError::Conflict).
 #[tokio::test(flavor = "multi_thread")]
 async fn dedup_onto_retired_canonical_returns_409() {
@@ -181,6 +190,14 @@ async fn dedup_onto_retired_canonical_returns_409() {
     assert_eq!(
         status, 409,
         "expected 409 for a dedup onto a retired canonical; got {status} — body={text}"
+    );
+    // The refusal's own words and the canonical it names (operator ruling
+    // R-55), not the route's fixed "already superseded or invalid input" text.
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let reason = body["details"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("is not current") && reason.contains(&canonical.to_string()),
+        "the state refusal's reason names the canonical: {text}"
     );
     let (sup, current): (Option<uuid::Uuid>, bool) =
         sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")

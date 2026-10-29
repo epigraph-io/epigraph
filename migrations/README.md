@@ -1637,6 +1637,61 @@ restart.
   before a binary with the matching repo/route changes serves. **Applied to
   throwaway databases only, NOT to any deployed database.**
 
+- **180**: public `aid03_legacy_fleet_parent`. 161's AID03 refused every
+  `agent_type 'human'` parent, and the pre-161 create path
+  (`AgentRepository::create`, which names no `agent_type`) left every fleet
+  identity at that column default, so the host's first keyed registration of
+  a group's successor was refused and fell back to registering it with NO
+  parent (no succession, no inherited link). Adds
+  `epigraph_is_legacy_fleet_parent(uuid)` (maintenance-owned definer, no
+  `epigraph_app` EXECUTE): `agent_type` exactly `'human'`, a LIVE (not
+  retired) `operator_links` row naming it as the agent (attested; a retired
+  link does not count, because `epigraph_link_legacy_authors` writes retired
+  ownership ties in bulk for any author, and the self-writable `llm_model`
+  is not read, because the host finds the parent by a legacy key anyone can
+  compute and plant a row under), an
+  `identity-legacy` key for its own public key (161's backfill),
+  not a keyless OAuth human (`key_kind 'derived'` or the `oauth-principal`
+  label), never a `human_operators` row (revoked included), and no
+  `client_type 'human'` OAuth client naming it as `agent_id` (any status).
+  Re-states `epigraph_register_agent_identity` from 166's body with two
+  marked deltas: AID03 also accepts a parent for which that holds (161's live
+  human-operator refusal still applies to every parent); and step 5b never
+  copies a parent's role attachment back onto its source, i.e. when the
+  row's `inherited_from` chain (detached rows included) reaches a row of the
+  child, or "the parent succeeded the child" is on record (a revert to an
+  earlier, possibly detached identity), counting withheld rows in the audit
+  row (`role_attachments_withheld`). The cost: the reverted identity then
+  holds no attachment, so 166's restriction (ROL01, may-run) no longer
+  applies to it; attach the running identity by name after a revert if it
+  must hold. Adds
+  `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
+  maintenance-session only and audited (`agent.identity_succession_recorded`):
+  for a child the host registered parentless in that folder, with no
+  succession row or display parent, a legacy parent created no later than it
+  and holding no live role attachment, both live-linked to the same
+  operator, it writes the `agent_succession` row and the display parent,
+  and moves no link. The folder is checked first: a (child, parent) pair
+  already on record in any folder, named for a folder the child also
+  registered parentless in, is a repeat (`recorded = false`, nothing written;
+  a shared identity runs in several folders), while a folder the child never
+  ran in is refused `AID10`; a second, different parent is refused `AID10`.
+  The (child, parent, folder) triple is the caller's assertion (no SQL can
+  derive a folder's legacy parent): take it from the host's refusal alert. Pinned by
+  `epigraph-db/tests/legacy_fleet_parent.rs`. Undo:
+  `docs/runbooks/180-undo.sql` (tested: it returns the `public` catalog to
+  below 180 and refuses `55000` over any registration body but 180's or
+  166's). A precondition checks the md5 of 166's registration body and
+  RAISEs `55000` (changing nothing) over any other body; any later edit to
+  that body must update 180's expected md5, and a later migration that
+  re-states the registration starts from 180's. Once the legacy operator
+  links are retired, a cut-over naming a legacy parent falls back to a
+  parentless registration plus an alert, and the record refuses it: record
+  any skipped succession first. **Deploy order:** after 166; independent of
+  179 (179 does not touch the registration, so 180's precondition holds
+  either way). Run `180-undo.sql` before `166-undo.sql`. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+
 - **166**: public `role_attached_agents` (agent identity lineage design D6:
   role-attached agents run only while a human holds the role). Adds the
   append-only, FORCE-RLS `role_agents` (role, agent, window), written only
@@ -1698,6 +1753,391 @@ restart.
   FUNCTION public.epigraph_role_agent_may_run(uuid) TO
   epigraph_identity_attestor;` to 161's out-of-band recipe. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **170**: public `challenge_resolution_definer_only` (operator ruling R-13,
+  backlog c6e20f43). A challenge's resolution columns (`state`, `resolved_by`,
+  `resolved_at`, `resolution_details`) change only through 168's
+  `epigraph_resolve_challenge`, which stamps the real caller. Adds the invoker
+  guard `epigraph_challenge_resolution_guard()` (re-owned to
+  `epigraph_maintenance`, registered in `tenancy_backfill.rs`'s invoker
+  exemptions) on four ROW triggers: for an application session (not
+  114's `epigraph_session_is_privileged_writer()`), an UPDATE may only be the
+  CHALLENGER withdrawing its own UNRESOLVED challenge (`pending` /
+  `under_review` -> `withdrawn`, `challenger_id` = the session principal, the
+  other three columns unchanged), and an INSERT is born
+  `pending` with no resolver, time or details; anything else is refused
+  `CR07` (42501); `challenger_id` is the filer and fixed at filing (an
+  INSERT's must be the session principal, an UPDATE may not change it), else
+  `CR08` (42501); a DELETE is refused `CR09` (42501): the challenger retracts
+  by withdrawing, and no binary deletes a challenge on an application session
+  (the seal ceremony's delete runs on a maintenance connection). Closes the
+  forged-`resolved_by` gap 168 left: the outsider
+  owns its row, so 077 let it plain-UPDATE its own resolution columns. 168's
+  definer passes (its maintenance-owned frame reads as privileged), so R-14
+  (re-resolve, direct `pending` -> `accepted` / `rejected`, audited) is
+  unchanged. Pinned by `epigraph-db/tests/challenge_ownership.rs`. Undo: drop
+  the four triggers and the function. **Deploy order:** after 168; independent
+  of the binaries. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+- **171**: public `evidence_dedup_in_application` (backlog 12b68201,
+  operator ruling R-77). `ALTER TABLE evidence DROP CONSTRAINT IF EXISTS
+  evidence_content_hash_claim_unique`, 001's `UNIQUE (content_hash,
+  claim_id)`, so every database matches the long-lived one, which never
+  carried it (only `evidence_pkey`) and holds same-owner duplicate rows. The
+  key spanned owners: an evidence write whose body equalled a row another
+  group holds on the same claim was refused, and the refusal confirmed that
+  unreadable row and its content. The de-duplication is now the
+  application's, as 150 did for claims: `EvidenceRepository` writes the row,
+  reads back its owner and visibility, takes a transaction-scoped advisory
+  lock on `(content_hash, claim_id, owner)` and refuses (`DuplicateKey`, a
+  savepoint undoes the write) only a row with the same digest, claim, owner
+  and visibility; another owner's body is never consulted. A no-op on the
+  long-lived database; cannot fail on data (it builds no index). A closing DO
+  block refuses (`55000`) if any unique index on `evidence` still covers both
+  columns. Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/evidence_dedup_per_owner.rs` (including the race and
+  `migrated_evidence_carries_no_unique_key_over_body_and_claim`),
+  `epigraph-api/tests/evidence_content_oracle_test.rs` and
+  `epigraph-mcp/tests/evidence_content_oracle_app_role.rs`. Section 3 gives
+  evidence rows sealed before the seal wrote a digest sentinel (an
+  `evidence_encryption` row exists) that per-row sentinel
+  (`privatization::SEAL_EVIDENCE_DIGEST_SENTINEL`, same expression), so a
+  sealed row's plaintext digest stops confirming a guessed body; unseal
+  rebuilds such a row's digest as BLAKE3 of the restored body. IRREVERSIBLE
+  for a sealed row whose body was NULL (external evidence): its
+  writer-supplied digest stays the sentinel after unseal (count first:
+  `SELECT count(*) FROM evidence_encryption`). A second DO block refuses
+  (`55000`) if a sealed row is left without the sentinel. Pinned by
+  `epigraph-db/tests/evidence_seal_digest_backfill.rs`. Slot 171 assigned
+  by the bug-wave plan; free on `main` and in every open PR when committed.
+  **Deploy order:** the matching binaries FIRST (the epigraph-api server,
+  with the hosted jobs it runs, and epigraph-mcp), then 171. Against 171 an
+  older binary's `ON CONFLICT (content_hash, claim_id)` in
+  `record_derivation_conn` fails 42P10 (as it already does on any database
+  without the key), and its other evidence writes are not de-duplicated at
+  all (an identical retry adds a row, as on the long-lived database today);
+  after section 3 its seal would leave the plaintext digest on rows it seals
+  and its unseal would keep the sentinel on rows it restores. No seal or
+  unseal may be in flight while 171 applies. The new binaries work on either
+  side, but while a database still has the key a write that collides with
+  another owner's row is still refused: the cross-owner refusal ends when 171
+  applies, not when the binary ships. **Client-visible from the binary
+  deploy** on a database without the key: a same-owner, byte-identical
+  evidence write on a claim already holding that body (which stores a second
+  row today) is refused as a duplicate (HTTP 400; the MCP evidence-writing
+  tools answer an error and roll the whole submission back, label merges
+  included). Undo is in the file's header.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **172**: public `refresh_rotate_pins_builtins` (backlog 1228c284).
+  Re-states 140's `epigraph_refresh_token_rotate` with `SET search_path =
+  pg_catalog, pg_temp` (was `pg_catalog, public`) and its `unnest(` and
+  `now()` calls written `pg_catalog.`-qualified; nothing else changes. A
+  `public.unnest(text[])` is an exact argument-type match and wins over
+  `pg_catalog.unnest(anyarray)` whatever the path order, so 140's pin did not
+  keep the call in `pg_catalog`. Owner and grant re-asserted as 140 does.
+  Pinned by `schema_contract.rs::migration_140_rotate_definer_keeps_owner_grant_and_search_path`
+  (reads the body at head) and
+  `app_role_table_lockdown.rs::rotation_ignores_a_public_overload_of_the_builtins_it_calls`.
+  A later re-statement of this function must start from 172's body. The other
+  definers that call unqualified built-ins under a path including `public`
+  are the same class and are not changed here. Undo: re-run 140's `CREATE OR
+  REPLACE FUNCTION` block. Slot: 172 and 173 are assigned to this batch and
+  are free on `main` and in every open PR. **Deploy order:** after 140; no
+  binary change. **Applied to throwaway databases only, NOT to any deployed
+  database.**
+- **173**: public `harvester_tables_tenancy_posture` (ruling R-66, backlog
+  90d7baf0; closes 154efca2, ledger F-089-B). Brings `harvester_sources` and
+  `harvester_audit_reports`, the two FK neighbours of the hand-registered
+  tier-A `harvester_fragments` that neither generator finds, under tenancy
+  with `harvester_fragments`'s posture: `owner_group_id` and `visibility` NOT
+  NULL with no default; 062's three constraints, validated; ENABLE + FORCE
+  row security; 077's `<t>_tenancy`, 115's restrictive `<t>_delete_owner`
+  and `<t>_owner_immutable`. Existing rows are DERIVED, never defaulted: a
+  report from its fragment, a source from its fragments when they agree on
+  one pair; anything else refuses with `HVT01` and changes nothing. Before
+  deriving, it also refuses (`HVT01`, nothing changed) when either table holds
+  a row and the migrator cannot read every fragment (not a superuser, no
+  BYPASSRLS, not a maintenance member): `harvester_fragments` is FORCEd, and
+  a filtered read would derive a source from its public fragments only,
+  more readable than the rest. A source
+  takes 074's root `harvester_sources_require_tenancy` (declare both columns,
+  or the seed escape hatch, or 23502). A report always carries its
+  fragment's pair: `harvester_audit_reports_inherit_tenancy` stamps it at
+  INSERT over any declaration, and
+  `harvester_fragments_audit_reports_inherit_tenancy` re-stamps a fragment's
+  reports whenever the fragment's own pair changes (arm (d), 089, operator
+  re-own or restrict). Two new maintenance-owned definers
+  (`epigraph_audit_report_inherit_tenancy`,
+  `epigraph_fragment_audit_reports_follow`), registered in
+  `tenancy_backfill.rs`. The two `tenancy_exempt` rows an earlier revision
+  of this file added are gone (the registry is back to 069's twelve). Grants
+  are unchanged: the application role reads both tables and writes neither
+  (118 section 6). No elevated read arm (126) is added, so a custodian's
+  elevated session reads these rows only where tenancy admits; both are on
+  `elevation_arms_census.rs`'s excluded list with that reason. Pinned by
+  `harvester_tenancy.rs` (as `epigraph_app`, with `harvester_fragments` as
+  the control: a non-member cannot read another group's row in either
+  table, a member can, public rows stay readable; the 172 -> 173 derivation
+  and refusal on seeded rows, and the refusal of a migrator that reads only
+  some fragments; the write side; a report follows its fragment when a claim
+  is narrowed and when the fragment is re-owned) and by
+  `tenancy_coverage.rs::the_harvester_neighbours_carry_the_fragment_row_security`
+  (policy expressions compared with `harvester_fragments`'s own). Registered
+  in every FORCE list (`epigraph_api::state::FORCE_PROTECTED_SET`,
+  `locked_decisions.rs`, `rls_enforcement.rs`, `docs/runbooks/079-undo.sql`).
+  Its three triggers are a boot-check tier
+  (`epigraph_api::state::TENANCY_TRIGGERS_173`), required once either of its
+  two functions exists, so a dropped one refuses to serve
+  (`tenancy_trigger_boot_refusal.rs`).
+  REWRITTEN IN PLACE: the earlier revision only declared the two tables
+  exempt and was never applied to a deployed database; a throwaway database
+  that applied it fails the checksum and must be recreated, not repaired.
+  Undo: the steps in the file's header (drop the triggers, policies, guards,
+  constraints, columns and the two functions; remove the two names from
+  `079-undo.sql`). Slot: see 172. **Deploy order:** apply 173 before, or
+  with, the API binary carrying the two names in `FORCE_PROTECTED_SET`; that
+  binary refuses to serve on a database where the two tables exist but are
+  not FORCEd (partial FORCE). An older binary on a migrated database is
+  unaffected. Any external writer of either table must declare a source's
+  tenancy from 173 on. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **174**: public `refresh_chain_issuing_app` (backlog 7a2111e6, U002
+  follow-up). Adds `refresh_tokens.issued_to_client_id` (the connector app an
+  authorization-code chain was issued to; no foreign key, read as "not
+  active" when the app cannot be found), granted to `epigraph_app` as a
+  column SELECT. A `BEFORE INSERT` trigger,
+  `refresh_tokens_inherit_issuing_app` (SECURITY INVOKER), gives a rotated
+  successor its family's app, with a partial index over the bound rows for
+  the lookup. `epigraph_refresh_token_rotate` is NOT restated, so 174
+  commutes with any migration that restates it (172 included). Adds
+  `epigraph_refresh_token_revoke_client_app(uuid, uuid)`, a SECURITY INVOKER
+  operator revoke keyed by (per-user client, app), EXECUTE for
+  `epigraph_maintenance` only. Both functions pin `search_path = pg_catalog,
+  pg_temp`. Pinned by `epigraph-api/tests/oauth_refresh_hardening.rs` (app
+  role end to end, including a bound chain rotated twice before its app is
+  suspended; the revoke run as the maintenance role). Existing chains stay
+  unbound (NULL). Undo is in the file's header. **Deploy order:** before the
+  API binary built against it (without the column, every refresh-token mint
+  and every refresh fails). **Applied to throwaway databases only, NOT to any
+  deployed database.**
+
+- **175**: public `edge_relationship_canonical_spelling` (backlog 3ce5e00c,
+  U014 PR-2). The schema half of one lower-case spelling for the case-folded
+  relationships `supports` / `contradicts` / `corroborates` / `refutes`
+  (writers store `canonical_relationship`; readers match
+  `relationship_spellings`). Re-states 011's `edge_to_factor_type` verbatim
+  plus `corroborates` (evidential_support 0.85/0.85) and `refutes`
+  (mutual_exclusion), so a lower-case claim/claim edge of either gets the
+  factor its upper-case spelling always got (new MCP `link_epistemic`
+  `corroborates` / `refutes` edges now get one too). Rebuilds 090's
+  `edges_symmetric_relationship_uniq` keyed and filtered on
+  `lower(relationship)`, so a legacy matcher `CORROBORATES` and a new matcher
+  `corroborates` over one pair are one key. Pinned by
+  `epigraph-db/tests/edge_relationship_canonical_write.rs`. Existing rows are
+  NOT rewritten here: the fold is the operator runbook
+  `docs/runbooks/edge-relationship-casefold.sql` (backup table, undo in
+  `edge-relationship-casefold-undo.sql`), run after this migration. **Deploy
+  order (binding):** epigraph-api first (only it applies migrations), THEN
+  epigraph-mcp / epigraph-jobs / `decompose_claims`, THEN the operator fold. A
+  matcher binary running against a database without 175 writes `corroborates`
+  edges that get no factor (AFTER INSERT trigger, no backfill) and fall outside
+  090's index; see the file header. **Deploy precondition:** the census in the
+  file header (expected zero rows). Undo:
+  re-run 011's function body and 090's index statement. **Applied to
+  throwaway databases only, NOT to any deployed database.**
+- **176**: public `caller_refusal_codes` (backlog e2c22c7c, operator ruling
+  R-25). Re-states twelve functions from their latest definitions so that the
+  designed refusals in functions an application session runs on a caller's
+  write (EXECUTE-able by `epigraph_app`, or triggers on tables it may write)
+  open with a refusal code, which PR #686's fail-closed MCP `internal_error`
+  passes and the shared HTTP mapper maps (`epigraph_db::CALLER_REFUSAL_CODES`)
+  to a 4xx carrying the message:
+  `AAR01`-`AAR11` (`epigraph_admin_act_args`), `AAR12`
+  (`epigraph_propose_admin_act`), `TEN01` (`epigraph_owner_immutable_guard`),
+  `TEN02` (`epigraph_writer_owner_guard`), `GRM01`-`GRM06` (108, 109 and 164's
+  guards on `groups` and `group_memberships`), `PRV01`
+  (`epigraph_no_public_sealed`) and `AGK01`
+  (`epigraph_agents_refuse_registered_system_key`, whose system role moves to
+  DETAIL). Reach when written: AGK01 through `POST /api/v1/agents` and the MCP
+  document ingest (it answered the generic error before 176); AAR01-AAR12
+  through propose-admin-act (already relayed as text); the TEN, GRM and PRV
+  arms are reached by no shipped route or tool and are coded for a later
+  path that does. Only RAISE statements change, each keeping its SQLSTATE; owner,
+  ACL, SECURITY mode, search_path and volatility are kept by CREATE OR
+  REPLACE. Pinned by `epigraph-db/tests/caller_refusal_codes_restatement.rs`
+  (a database before 176 against the same database at 176) and the refusal
+  tests `epigraph-api/tests/caller_refusal_codes_http.rs` and
+  `epigraph-mcp/tests/caller_refusal_codes_mcp.rs` (AGK01 through the real
+  route and tool; the others through the mappers). The header lists what is
+  deliberately NOT coded and why. Undo: re-run each function's latest prior
+  definition (named in the file). **Deploy order:** after 168 (every body it
+  starts from is at or below 168). A LATER migration that re-states one of
+  these functions must start from 176's body or it drops the code. **Applied
+  to throwaway databases only, NOT to any deployed database.**
+- **179**: public `role_binding_attached_agents`. A third mode for 165's
+  role bindings: the role HOLDER plus the agents ATTACHED to the role (166's
+  `role_agents`) only. Adds `group_role_bindings.attached_agents boolean NOT
+  NULL DEFAULT false` and the CHECK `group_role_bindings_one_agent_mode`
+  (never together with `include_agents`); existing bindings keep 165's
+  meaning, no backfill. Modes: `holder_only` (both false),
+  `registered_agents` (165's `include_agents`), `attached_agents`. In the
+  attached mode an agent is a member while it has a live, undetached
+  attachment to the BOUND role AND its own human (165's agent arm: acting
+  live link or live client allowance) holds a live assignment of the role;
+  an agent registered to the holder but not attached, and an agent attached
+  while another human holds the role, are not members (the same rule as
+  166's `ROL01`). Which attachments count: an operator's own attachment
+  (`inherited_from` NULL) as it is; a SUCCESSION COPY (166's registration
+  step 5b or its attach-time lineage follow) only for an agent that runs in
+  ONE group folder (`agent_prompt_snapshots`) which the identity the operator
+  attached (the root of the `inherited_from` chain) also runs in. So a
+  same-folder successor (a prompt or model change) keeps the group, while a
+  SHARED successor (166 copies to those too, flagged `shared_identity`), a
+  successor registered in another folder, and copies of their copies admit
+  nothing. This overturns 166's "a copy never grants" premise for this mode
+  only; 166 itself is unchanged (every copy still refuses under `ROL01`). A
+  copy also counts only while EVERY row of its `inherited_from` chain, the
+  root included, is un-detached and inside its window: detaching the
+  attached identity revokes every successor copied from it, and a revert to
+  a detached identity (registered again with its successor as parent)
+  regains nothing. Re-attaching the root does not bring back a successor
+  whose old copy still covers the window (166 copies into gaps only): detach
+  that copy and attach the running identity itself. Re-states `epigraph_role_derived_memberships` (165's body
+  plus the attached arm; the viewer set, the writer scope and the roster all
+  ask it, none is re-stated), `epigraph_group_role_bindings_guard_update`
+  (the mode joins the immutable tuple) and `epigraph_group_role_bindings_audit`
+  (the row names `attached_agents` and `agent_mode`). Adds mode-taking
+  overloads `epigraph_bind_group_role(text, uuid, text, text, text)` and
+  `epigraph_define_group_role(text, text, uuid, text, text, text)`
+  (maintenance only, not app-executable; unknown mode `22023`); 165's
+  boolean signatures are unchanged. Callers cast the mode argument
+  (`$4::text` / `$4::boolean`): a client caching statements by SQL text
+  otherwise reuses one overload's statement for the other. GRB01 is NOT
+  relaxed (an elevating or audit-reading role is bound in no mode). CLI:
+  `define-group-role` / `bind-group-role --agent-mode MODE`. Pinned by
+  `epigraph-db/tests/group_role_membership.rs` (the 179 section),
+  `schema_contract.rs::migration_179_attached_mode_definers_are_owned_and_granted`
+  and `::migration_179_attached_arm_survives_at_head`, and
+  `epigraph-cli/tests/operator_group_role.rs`. Undo in the file's header. A
+  precondition checks the md5 of the three 165 bodies it re-states and
+  RAISEs `55000` (changing nothing) over any other body; a LATER re-statement
+  of the derivation must start from 179's body (the head pin fails
+  otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
+  **Deploy order:** after 165 and 166; before any operator CLI call with
+  `--agent-mode attached_agents` (the other modes work without it).
+- **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
+  R-56). One SECURITY DEFINER, `epigraph_mark_group_reseal_required(p_group
+  uuid) RETURNS void`, that writes only `groups.reseal_required_at =
+  COALESCE(reseal_required_at, now())` on that one row. It admits a caller
+  whose session principal is a live admin of the group
+  (`epigraph_is_group_admin`), or a privileged session (which can already
+  write the column directly); an ELEVATED session gets `GRA03` / 42501 first
+  (126's `groups_elevated_no_update` is an `epigraph_app` policy and does not
+  apply inside the maintenance-owned frame, so the definer refuses it itself,
+  as 168's CR05 does), anyone else gets `GRA01` / 42501, and an UPDATE that
+  matched no row gets `GRA02` / 42501. Path pinned as 172
+  (`pg_catalog, pg_temp`, built-ins qualified); owner
+  `epigraph_maintenance`; EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app`. `GroupMembershipRepository::revoke_member_unless_last_admin_conn`
+  calls it under the roster lock and before the guarded revoke, so a group
+  admin who did not create the group can remove a member (before this,
+  `groups_tenancy`'s creator-only WITH CHECK refused the mark and the whole
+  removal). Pinned by `group_reseal_mark.rs` (direct calls on the application
+  role, catalog shape), `elevated_arms.rs` (`GRA03`) and
+  `group_routes_app_role.rs`; registered in
+  `tenancy_backfill.rs` (`DEFERRED_DEFINER_FUNCTIONS`, grant list). Undo:
+  `DROP FUNCTION public.epigraph_mark_group_reseal_required(uuid)` with the
+  repository change reverted. Slot: 181 is assigned to this batch (moved from
+  179, which an open PR holds) and is free on `main` and in every open PR.
+  **Deploy order:** with or after 172, and before (or with) the API binary
+  that calls it. Without 181 that binary's call raises 42883 (function does
+  not exist), so EVERY member removal is a 500, the creator's included. A
+  grant that no-opped (role absent when 181 ran) shows on that route as a 403
+  for every removal instead; `epigraph-tenancy-backfill verify` reports both
+  the owner and the grant, so run it after 181.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **185**: public `supersede_binds_the_actor` (ruling R-85, backlog
+  1a54283d). Once the operator binding is armed, the supersede act's INSERT
+  (the inherited-author shape only `ClaimRepository::supersede_act_conn`
+  writes, which also records the writer as the successor's `AUTHORED` act
+  edge) is checked on its WRITER alone: bound (`OPL01`) and a writer of the
+  owner group (`OPL02`), as before. The inherited author is no longer
+  attributed to the writer's human, so a bound writer of the group may
+  restate a claim whose author is bound to no human (was `OPL01`) or belongs
+  to another human (was `OPL02`). 166's `ROL01` on that author is kept (a
+  live role-attached author is checked, a retired identity is not). A
+  re-open of an inherited successor, and every fresh claim, are still
+  attributed. Re-bodies 153's `epigraph_claims_require_operator_binding`
+  (`CREATE OR REPLACE`, same signature, owner re-asserted; still registered
+  at 122 in `tenancy_backfill.rs`) behind an md5 precondition on 153's body
+  (`55000` over any other body, nothing changed). Sets `lock_timeout =
+  '3s'`. Behaviour in `epigraph-db/tests/inherited_supersede_binds_the_actor.rs`
+  (with the precondition and the rollback), HTTP
+  `own_claim_authority_http.rs` and MCP `own_claim_authority_app_role.rs`.
+  The relief is keyed on the row's shape (a `BEFORE INSERT` trigger cannot
+  see the act edge the act writes after the claim), so
+  `epigraph-db/tests/inherited_successor_insert_lint.rs` pins that the only
+  non-test code inserting a claim that names `supersedes` is
+  `supersede_act_conn` and `evolve_step_conn` (which authors the caller).
+  Undo: `docs/runbooks/185-undo.sql` (restores 153's body; run it before
+  `153-undo.sql`). Slot: checked free on `main`, in every open PR, every
+  remote branch and every local worktree (184 is held by an unpushed branch).
+  **Deploy order:** none against the binaries (it only admits writes 153
+  refused); it may apply before or after any lower-numbered migration that
+  does not re-body this function.
+  **Predeploy check:** `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  to_regprocedure('public.epigraph_claims_require_operator_binding()')` must
+  print `292b24b3dfb6b342f6f60d7868666236` (153's body). Any other value
+  means 185 refuses (`55000`, nothing changed) and the migration run stops
+  there, so later migrations in the same run do not apply either.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+
+
+- **184**: public `mass_function_retract` (operator ruling R-79, backlog
+  f8ec73b7). Retracts ONE mass function (BBA) without deleting it. Adds
+  `mass_functions.retracted_at`, `retracted_by` and `retract_reason` (all
+  NULL on a live row, all set on a retracted one:
+  `mass_functions_retract_columns_together`, validated as it is added under
+  the ADD COLUMN's ACCESS EXCLUSIVE lock: the whole migration blocks reads
+  and writes of `mass_functions` for one sequential scan, so measure the row
+  count before the deploy window). Adds
+  `epigraph_retract_mass_function(uuid, text, uuid, uuid)`,
+  a maintenance-owned definer granted to `epigraph_app`: the session
+  principal retracts a row it can read when it writes the row's owning group,
+  or when it presents a token client with a live `claims:admin` grant bound to
+  it (111's re-check); an elevated session is refused (RT05); an unreadable
+  row is "not found" like a random id; a re-retraction writes nothing and
+  answers `already_retracted`; a first retraction appends one
+  `security_events` row (`mass_functions.retract`) carrying the row as it
+  was, and deletes the stored scoped beliefs (`ds_combined_beliefs`) of the
+  row's (claim, frame) that folded it: the global scope, its own perspective
+  scope and the community scopes counting that perspective (not an
+  `override` row). EFFECTIVE REACH: that DELETE is why the file grants
+  `DELETE ON ds_combined_beliefs TO epigraph_maintenance` (the definer's
+  owner); the grant is on the role, so every maintenance-DSN session can
+  delete those derived rows; no application role gains anything. Ruling
+  R-103: a retracted row HOLDS its upsert key, and becomes live again only
+  through `epigraph_unretract_mass_function(uuid, text, uuid, uuid)` (the same
+  authority, codes and readability as the retraction; a reason is required;
+  one `mass_functions.unretract` audit row; it deletes the stored scoped
+  beliefs that will fold the row again; `not_retracted` writes nothing).
+  Guards: no direct mark (`mass_functions_retract_guard`, RT06) and no INSERT
+  that arrives retracted (`mass_functions_retract_insert_guard`, RT06), both
+  passed by a privileged session and a maintenance-owned definer frame; no
+  change to a retracted row's assessment (masses, conflict_k,
+  combination_method, source_strength, locality_tag, evidence_id, created_at)
+  in any session or frame (`mass_functions_retracted_rewrite_guard`, RT07,
+  42501), so a write to its key (the repository upsert, which never touches
+  the retract columns) is refused and changes nothing; and no clear outside
+  the un-retract definer in any session (`mass_functions_unretract_guard`,
+  RT06: the clear needs the maintenance role AND the definer's
+  transaction-local `epigraph.mf_unretract_id` naming the row). Every fold
+  and belief reader excludes a retracted row (`not_retracted_predicate`,
+  pinned by `epigraph-db/tests/bba_retract_read_lint.rs`).
+  Pinned by `epigraph-db/tests/bba_retract.rs` and
+  `bba_retract_elevated.rs`. Undo: in the file header. **Deploy order:**
+  after 114 and 126; apply BEFORE a binary with the matching readers serves
+  (they name `retracted_at`). **Applied to throwaway databases only, NOT to
+  any deployed database.**
 
 ## `-- no-transaction` migrations
 
