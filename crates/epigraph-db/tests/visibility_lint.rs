@@ -1114,6 +1114,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          no rows to filter.",
     ),
     (
+        "evidence.rs",
+        "same_tenancy_duplicate",
+        "READ inside an evidence write's own transaction (migration 171, backlog 12b68201): the \
+         owner and visibility of the row the caller just wrote, an advisory lock, then whether \
+         another row with the same digest, claim, owner AND visibility exists. Private, and the \
+         match is restricted to the tenancy of the row the caller was allowed to write, so it \
+         can only find a row the caller could read; a viewer predicate would add nothing and \
+         must not widen the match. Returns one boolean.",
+    ),
+    (
         "group_key_epoch.rs",
         "create_epoch_conn",
         "WRITE. Creates a key epoch for a group inside the membership/rotation transaction that \
@@ -1126,9 +1136,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `group_memberships`, which carries neither `visibility` nor `owner_group_id` — it \
          is not in migration 062's tier_a array and schema_contract.rs pins its eight columns — so \
          there is no predicate a Viewer could be spent on. It answers the authorization question \
-         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate, on the \
-         same ScopedPool::begin_as transaction that performs the rotation, so the decision and \
-         the write cannot be taken on different connections. Its tenancy backstop is migration \
+         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate and the \
+         two member routes, on the same ScopedPool::begin_as transaction that performs the \
+         write, so the decision and the write cannot be taken on different connections. Its tenancy backstop is migration \
          077 section 7's group_memberships_tenancy policy, which selects on the CONNECTION.",
     ),
     (
@@ -1820,6 +1830,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          a viewer to filter.",
     ),
     (
+        "mass_function.rs",
+        "retract_conn",
+        "WRITE through migration 184's SECURITY DEFINER `epigraph_retract_mass_function` \
+         (ruling R-79). The function takes the retractor from the session's \
+         `epigraph.principal_id` and applies the read control itself, from the same session \
+         GUCs a Viewer is stamped from: a row that is neither public nor in \
+         `epigraph_session_groups()` is 'mass function not found', the answer a random id gets. \
+         It writes the three retract columns of one row and one `security_events` audit row; no \
+         FROM is left for a viewer splice. Pinned by `bba_retract.rs`.",
+    ),
+    (
+        "mass_function.rs",
+        "unretract_conn",
+        "WRITE through migration 184's SECURITY DEFINER `epigraph_unretract_mass_function` \
+         (ruling R-103), the twin of `retract_conn`: the same principal, the same read control \
+         from the session GUCs (an unreadable row is 'mass function not found', like a random \
+         id), the same authority. It clears the three retract columns of one row and writes one \
+         `security_events` audit row; no FROM is left for a viewer splice. Pinned by \
+         `bba_retract.rs`.",
+    ),
+    (
         "claim.rs",
         "admin_patch_claim_conn",
         "WRITE through migration 111's SECURITY DEFINER `epigraph_admin_patch_claim` (batch H-b, \
@@ -2251,6 +2282,73 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Unstamped, the function is `{}` and the answer is false: it fails closed. Its caller is \
          `IngestTx::owner_decl`, which refuses the ingest when it is false.",
     ),
+    // ── Backlog 323773fe: the group management routes moved off the raw pool
+    // onto the caller's stamped connection. None of the three group tables
+    // carries `visibility` / `owner_group_id` (they are not in migration 062's
+    // tier_a array), so no Viewer predicate exists to splice; each one's control
+    // is its own migration-077 policy, evaluated on the CONNECTION. The pool
+    // forms now delegate here.
+    (
+        "group.rs",
+        "create_with_admin_conn",
+        "WRITE. The group row, its epoch 0 and the creator's admin membership for POST \
+         /api/v1/groups, on the caller's stamped transaction. groups_tenancy's WITH CHECK admits \
+         `created_by_agent_id = epigraph_principal_id()` and the two child rows are admitted by \
+         `epigraph_is_group_creator`'s empty-roster arm (migrations 077/092), all against the \
+         CONNECTION's stamp; an INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "group.rs",
+        "get_by_id_conn",
+        "READ of one `groups` row by id. `groups` has neither `visibility` nor `owner_group_id` \
+         (schema_contract.rs pins its columns), so there is no predicate a Viewer could be spent \
+         on; groups_tenancy on the CONNECTION shows a stamped session the groups it is a live \
+         member of, and the group routes have already checked that membership on the same \
+         connection.",
+    ),
+    (
+        "group_key_epoch.rs",
+        "get_current_epoch_conn",
+        "READ of `group_key_epochs`, which carries neither `visibility` nor `owner_group_id`. Its \
+         control is migration 077 section 8's group_key_epochs_tenancy policy (live members of \
+         the group), which selects on the CONNECTION; the member and read routes call it on the \
+         stamped connection their membership check ran on.",
+    ),
+    (
+        "group_membership.rs",
+        "add_member_conn",
+        "WRITE. One `group_memberships` INSERT for POST /api/v1/groups/:id/members, on the \
+         caller's stamped transaction after `require_group_admin_conn` on the same connection. \
+         group_memberships_tenancy's WITH CHECK (`epigraph_is_group_admin`, keyed on the \
+         stamped principal) is the control; an INSERT has no read for a viewer marker to filter.",
+    ),
+    (
+        "group_membership.rs",
+        "get_members_conn",
+        "READ of a group's live roster for GET /api/v1/groups/:id. `group_memberships` carries \
+         neither `visibility` nor `owner_group_id`, and narrowing the roster to the viewer's own \
+         row would make `member_count` wrong; the route has checked live membership on the same \
+         stamped connection, and group_memberships_tenancy selects on that CONNECTION.",
+    ),
+    (
+        "group_membership.rs",
+        "is_member_conn",
+        "READ answering the authorization question itself (is this agent a live member of THIS \
+         group) for GET /api/v1/groups/:id, on the caller's stamped connection. \
+         `group_memberships` has no tenancy column for a Viewer to filter on; on an unstamped \
+         connection group_memberships_tenancy shows no row and the answer fails closed.",
+    ),
+    (
+        "group_membership.rs",
+        "revoke_member_unless_last_admin_conn",
+        "WRITE. The last-admin-guarded revoke and its re-key mark (`group_memberships`, \
+         `groups`, `group_key_epochs`) on the caller's stamped transaction, with the roster \
+         lock held until that caller commits. None of the three tables carries a tenancy column \
+         for a Viewer to filter on; the membership and epoch writes are controlled by their \
+         migration-077 policies, evaluated on the CONNECTION, and the `groups` mark by migration \
+         181's definer, which admits only a live admin of that group (keyed on the stamped \
+         principal). The route has checked the caller's admin role on the same connection.",
+    ),
     // ── Backlog 850dcc61: the entity-mention and triple batch WRITES moved off
     // the raw pool onto the route's stamped transaction.
     (
@@ -2426,6 +2524,25 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
+    (
+        "agent.rs",
+        "humans_of",
+        "READ through migration 149's definer `epigraph_human_of(agent, live)` over a list of \
+         agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
+         itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
+         `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "derivation_scope.rs",
+        "cache_admissible",
+        "READ that answers, for BBA rows the caller already read, which may enter THEIR \
+         claim's cached belief (ruling R-22, generalised): each row, its cited evidence, its \
+         edge and the edge's source claim are compared with the row's own claim (public, or \
+         the claim's owner group). It returns only a subset of the ids it was given, and the \
+         audience is the CLAIM's readers, not a viewer's, so there is no viewer predicate to \
+         splice; the viewer-scoped twin `viewer_derived` takes a `&Viewer` and splices.",
+    ),
     (
         "admin_scope_enforcement.rs",
         "read",
@@ -2577,7 +2694,7 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "evidence.rs",
         "create",
-        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged.",
+        "INSERT INTO `evidence`. Same argument as `trace.rs::create` above -- a write, whose          authorization is the connection's stamped GUCs evaluated by the table's `WITH CHECK`,          not an in-query predicate -- and it moved for the same reason: the `evidence` INSERT          belongs in the SAME transaction as the claim it derives from, which a `&PgPool`          parameter cannot express. ONE DIFFERENCE WORTH RECORDING so nobody concludes this          widening was unnecessary: a deployment may carry an orphan PERMISSIVE          `evidence_privacy` policy, present in no migration of the 077 series, whose          unconditional USING is reused as its WITH CHECK -- which is the only reason an          UNSTAMPED evidence INSERT succeeds there, and is what made the 42501 look like a          `reasoning_traces`-only defect. That is an accident of a deployment, not a property of          the schema. SCOPE: executor only; the SQL is unchanged. LATER (migration 171, backlog          12b68201): the parameter is `sqlx::Acquire` rather than an executor, because the INSERT          and the same-tenancy de-duplication after it (`same_tenancy_duplicate`) are one unit, a          transaction on a pool or a savepoint in the caller's transaction; still no viewer, for          the same reason.",
     ),
     (
         "evidence.rs",
@@ -3306,7 +3423,16 @@ fn every_executor_taking_repo_fn_takes_a_viewer_or_is_exempt() {
         // Both spellings of the bound: the explicit generic PR-27 used, and
         // `impl PgExecutor<'_>` in argument position, which is equivalent for a
         // single use and would otherwise slip past a generics-only check.
-        if !(f.generics.contains("PgExecutor") || f.params.contains("PgExecutor")) {
+        //
+        // And `sqlx::Acquire`, which accepts a `&mut PgConnection` (and a
+        // `&PgPool`) the same way: `EvidenceRepository::create` takes it so its
+        // write and the de-duplication after it run in one transaction or
+        // savepoint (migration 171). Same capability, same rule.
+        if !(f.generics.contains("PgExecutor")
+            || f.params.contains("PgExecutor")
+            || f.generics.contains("Acquire<")
+            || f.params.contains("Acquire<"))
+        {
             continue;
         }
         if f.params.contains("Viewer") {

@@ -174,6 +174,50 @@ pub async fn promoted_hypothesis_evidence_frame(
     Ok(Some(row))
 }
 
+/// For a writer that files a claim's evidence on a frame of its OWN choosing
+/// (MCP `update_with_evidence`, which files on `binary_truth`): the frame row it
+/// files the evidence on instead once the claim is a promoted hypothesis,
+/// `research_validity` (operator rulings R-8 and R-17), or `None` to file it
+/// where it always has. No reader of a promoted hypothesis reads
+/// `binary_truth`, so evidence filed there never reaches its displayed belief.
+/// Reads the claim's status and the frame through `viewer`.
+///
+/// # Errors
+/// `DbError::NotFound` when the frame does not exist (no promotion can have
+/// happened without it); `DbError::InvalidData` when it is not a
+/// two-hypothesis frame (the writer's binary masses would not address it);
+/// `DbError` when a read fails.
+pub async fn promoted_hypothesis_filing_frame(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim: uuid::Uuid,
+) -> Result<Option<epigraph_db::FrameRow>, epigraph_db::DbError> {
+    use epigraph_db::FrameRepository;
+    let status = hypothesis_status_of(&mut *conn, viewer, claim).await?;
+    if status.as_deref() != Some(PROMOTED_STATUS) {
+        return Ok(None);
+    }
+    let Some(row) =
+        FrameRepository::get_by_name(&mut *conn, viewer, RESEARCH_VALIDITY_FRAME).await?
+    else {
+        return Err(epigraph_db::DbError::NotFound {
+            entity: format!("frame {RESEARCH_VALIDITY_FRAME}"),
+            id: claim,
+        });
+    };
+    if row.hypotheses.len() != 2 {
+        return Err(epigraph_db::DbError::InvalidData {
+            reason: format!(
+                "hypothesis {claim} is promoted, so its evidence is filed on \
+                 {RESEARCH_VALIDITY_FRAME}, but {RESEARCH_VALIDITY_FRAME} has {} hypotheses and \
+                 this evidence is binary; nothing was written",
+                row.hypotheses.len()
+            ),
+        });
+    }
+    Ok(Some(row))
+}
+
 /// The warning a redirected write returns ([`promoted_hypothesis_evidence_frame`]).
 #[must_use]
 pub fn redirected_evidence_warning(

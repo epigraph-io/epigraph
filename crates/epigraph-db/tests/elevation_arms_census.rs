@@ -163,6 +163,16 @@ const EXCLUDED: &[(&str, &str)] = &[
         "rls_canary",
         "bypass-only boot canary: the application reads and writes no row",
     ),
+    (
+        "harvester_sources",
+        "harvester pipeline (173): the application writes no row (118 section 6), and no \
+         elevated read arm is added, so an elevated session reads only what its tenancy admits",
+    ),
+    (
+        "harvester_audit_reports",
+        "harvester pipeline (173): the application writes no row (118 section 6), and no \
+         elevated read arm is added, so an elevated session reads only what its tenancy admits",
+    ),
 ];
 
 /// THE READ-PATH WRITE CENSUS (plan §1.5), checked in. An elevated READ breaks

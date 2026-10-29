@@ -349,3 +349,107 @@ async fn refusals_write_nothing(pool: PgPool) {
     assert!(binding_audit(&pool).await.is_empty());
     drop_login(&pool, &login).await;
 }
+
+/// Migration 179's mode through the CLI: `--agent-mode attached_agents` is
+/// recorded as the attached mode (and printed); `--agent-mode registered_agents`
+/// is 165's `include_agents`; an unknown mode is refused before any connection
+/// (no DSN is configured), and so is `--agent-mode` together with
+/// `--include-agents` (one choice), each with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_agent_mode_flag_binds_each_mode_and_refuses_the_rest(pool: PgPool) {
+    let (owner, _) = fixture::seed_human_operator(&pool, "cli-mode-owner").await;
+    let attached_group = team_group(&pool, "Synthetic CLI Attached Team", owner).await;
+    let registered_group = team_group(&pool, "Synthetic CLI Registered Team", owner).await;
+    let (ag, rg) = (attached_group.to_string(), registered_group.to_string());
+
+    let refused = |extra: &'static [&'static str]| {
+        let mut args = vec![
+            "bind-group-role",
+            "--role",
+            "role:auditor",
+            "--group",
+            &ag,
+            "--member-role",
+            "reader",
+            "--reason",
+            "r",
+            "--apply",
+        ];
+        args.extend_from_slice(extra);
+        run_with(&args, None)
+    };
+    let unknown = refused(&["--agent-mode", "everyone"]);
+    assert_ne!(unknown.code, 0, "{}", unknown.show());
+    assert!(
+        unknown.stderr.contains("--agent-mode"),
+        "{}",
+        unknown.show()
+    );
+    let both = refused(&["--agent-mode", "attached_agents", "--include-agents"]);
+    assert_ne!(both.code, 0, "{}", both.show());
+
+    let (login, dsn) = maintenance_login(&pool).await;
+    let define = run_with(
+        &[
+            "define-group-role",
+            "--key",
+            ROLE,
+            "--description",
+            "synthetic team role",
+            "--group",
+            &ag,
+            "--member-role",
+            "writer",
+            "--agent-mode",
+            "attached_agents",
+            "--reason",
+            "cli mode test",
+            "--apply",
+        ],
+        Some(&dsn),
+    );
+    assert_eq!(define.code, 0, "{}", define.show());
+    assert!(
+        define.stdout.contains("agent_mode=attached_agents"),
+        "{}",
+        define.show()
+    );
+    let bind = run_with(
+        &[
+            "bind-group-role",
+            "--role",
+            ROLE,
+            "--group",
+            &rg,
+            "--member-role",
+            "reader",
+            "--agent-mode",
+            "registered_agents",
+            "--reason",
+            "cli mode test",
+            "--apply",
+        ],
+        Some(&dsn),
+    );
+    assert_eq!(bind.code, 0, "{}", bind.show());
+    let flags = |binding: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, bool)>(
+                "SELECT include_agents, attached_agents FROM group_role_bindings WHERE id = $1",
+            )
+            .bind(binding)
+            .fetch_one(&pool)
+            .await
+            .expect("binding flags")
+        }
+    };
+    assert_eq!(flags(binding_of(&define)).await, (false, true), "attached");
+    assert_eq!(flags(binding_of(&bind)).await, (true, false), "registered");
+    assert_eq!(
+        binding_audit(&pool).await,
+        ["platform.group_role_bound", "platform.group_role_bound"],
+        "the two refusals wrote nothing"
+    );
+    drop_login(&pool, &login).await;
+}

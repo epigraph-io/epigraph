@@ -303,11 +303,22 @@ fn slugify_goal(s: &str) -> String {
 pub async fn store_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<StoreWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use epigraph_ingest::common::schema::ThesisDerivation;
     use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
     use epigraph_ingest::workflow::WorkflowExtraction;
+
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "store_workflow requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let canonical_name = slugify_goal(&request.goal);
     let prereqs = request.prerequisites.unwrap_or_default();
@@ -874,9 +885,20 @@ pub async fn get_workflow_plan(
 pub async fn report_outcome(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(workflow_id): Path<Uuid>,
     Json(request): Json<ReportOutcomeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "report_outcome requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // ── The target, read through the CALLER's viewer ──
     //
     // An unreadable workflow is 404, exactly like a missing one. The read also
@@ -1683,7 +1705,8 @@ pub struct EvolveStepResponse {
 /// `content` or an `edge_type` other than `supersedes` / `revises`; 404 for a
 /// parent that does not exist or that the caller cannot see; 409 for
 /// `supersedes` on a parent that is no longer current (`revises` may still
-/// branch from it).
+/// branch from it); 403 for a `supersedes` whose retire of the parent changed
+/// no row.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -1771,8 +1794,7 @@ pub async fn evolve_step(
         // The repo's refusals are the caller's to act on (backlog 769989ae):
         // `InvalidData` (an edge_type outside the vocabulary) is a 400 and
         // `Conflict` (superseding a non-current step) a 409, as
-        // `From<DbError>` maps them everywhere else. These are the only two
-        // refusals `evolve_step_conn` raises besides `NotFound`. Its other
+        // `From<DbError>` maps them everywhere else. Its other
         // `InvalidData`, a parent whose stored visibility is outside the
         // vocabulary, is a data fault but also reads as a 400: the column is
         // NOT NULL with a CHECK, so it is unreachable unless that constraint
@@ -1780,6 +1802,11 @@ pub async fn evolve_step(
         e @ (epigraph_db::DbError::InvalidData { .. } | epigraph_db::DbError::Conflict { .. }) => {
             ApiError::from(e)
         }
+        // A `supersedes` parent whose retire changed no row (backlog
+        // d34f5096): a denial, 403 as `From<DbError>` maps it, not a server
+        // fault. Defensive: the claims tenancy policy refuses an unwritable
+        // parent by raising at WITH CHECK, not with a zero-row retire.
+        e @ epigraph_db::DbError::WriteRefused { .. } => ApiError::from(e),
         e if e.is_write_authority_refusal() => ApiError::from(e),
         other => ApiError::InternalError {
             message: other.to_string(),
@@ -1869,6 +1896,8 @@ pub async fn evolve_step(
     ),
     responses(
         (status = 200, body = serde_json::Value),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write"),
         (status = 404),
         (status = 500),
     ),
@@ -1878,9 +1907,20 @@ pub async fn evolve_step(
 pub async fn deprecate_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(workflow_id): Path<Uuid>,
     Query(params): Query<DeprecateQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "deprecate_workflow requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     let cascade = params.cascade.unwrap_or(false);
 
     // The existence gate, read through the CALLER's viewer on a viewer-stamped
@@ -2045,8 +2085,19 @@ pub async fn deprecate_workflow(
 pub async fn record_behavioral_execution(
     Path(workflow_id): Path<Uuid>,
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(body): Json<RecordBehavioralExecutionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the MCP twin
+    // (`scope_map.rs`) and the sibling write routes require (backlog 05eb8b4a).
+    // A request with no `AuthContext` is 401, never a skipped check.
+    let auth = auth_ctx
+        .map(|axum::Extension(a)| a)
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "record_behavioral_execution requires authentication".into(),
+        })?;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     // Verify the referenced workflow exists
     let _exists = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
@@ -2158,6 +2209,8 @@ pub struct IngestWorkflowRequest {
     responses(
         (status = 200, body = serde_json::Value),
         (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
+        (status = 401, description = "no authenticated caller"),
+        (status = 403, description = "the token lacks claims:write, or a declared group the caller or the ingest system agent does not write"),
         (status = 500),
     ),
     security(("ed25519_signature" = [])),
@@ -2169,6 +2222,15 @@ pub async fn ingest_workflow(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<IngestWorkflowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // `claims:write` first, before any read or write, as the sibling step
+    // routes and the MCP twin (`scope_map.rs`) require (backlog 05eb8b4a). A
+    // request with no `AuthContext` is 401, never a skipped check.
+    let Some(axum::Extension(auth)) = auth_ctx.as_ref() else {
+        return Err(ApiError::Unauthorized {
+            reason: "ingest_workflow requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
     let IngestWorkflowRequest {
         mut extraction,
         tenancy,
@@ -2194,7 +2256,7 @@ pub async fn ingest_workflow(
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx =
         begin_system_ingest_stamped_tx(&state, "workflows/ingest", viewer.principal()).await?;
-    let auth = auth_ctx.as_ref().map(|a| &a.0);
+    let auth = Some(auth);
     let decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
         &mut tx,

@@ -539,3 +539,127 @@ async fn an_unclipped_depth_two_walk_keeps_edges_between_already_visited_nodes(p
     // present and zero rather than absent.
     assert_eq!(t["edges_omitted"], serde_json::json!(0), "{t}");
 }
+
+// ── relationship filters match every spelling of a case-folded relationship ──
+//
+// Backlog 3ce5e00c: `supports` / `contradicts` / `corroborates` / `refutes` are
+// stored in two spellings until the operator case-fold runs (legacy upper-case
+// rows, canonical lower-case ones). Both tools filtered on the caller's string
+// byte for byte, so `relationship: "supports"` hid every legacy `SUPPORTS` row
+// and `relationship: "SUPPORTS"` hid every newly written one.
+
+async fn neighborhood_filtered(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    node: Uuid,
+    relationship: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "node_id": node.to_string(),
+        "direction": "outgoing",
+        "limit": 200,
+    });
+    if let Some(rel) = relationship {
+        params["relationship"] = serde_json::json!(rel);
+    }
+    first_text(
+        &tools::graph::get_neighborhood(server, viewer, serde_json::from_value(params).unwrap())
+            .await
+            .expect("get_neighborhood"),
+    )
+}
+
+/// The `target_id`s of a response's edges, sorted.
+fn edge_targets(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .map(|e| e["target_id"].as_str().expect("target_id").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+fn sorted(ids: &[Uuid]) -> Vec<String> {
+    let mut out: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    out.sort();
+    out
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_relationship_filter_matches_every_spelling_of_a_folded_relationship(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let hub = seed_claim(&pool, "fold filter hub", 0.5).await;
+    let legacy = seed_claim(&pool, "fold filter legacy target", 0.5).await;
+    let canonical = seed_claim(&pool, "fold filter canonical target", 0.5).await;
+    let other = seed_claim(&pool, "fold filter other target", 0.5).await;
+    let upper_refines = seed_claim(&pool, "fold filter REFINES target", 0.5).await;
+    let lower_refines = seed_claim(&pool, "fold filter refines target", 0.5).await;
+    // Raw SQL, as rows written before the canonical spelling are.
+    insert_claim_edge(&pool, hub, legacy, "SUPPORTS").await;
+    insert_claim_edge(&pool, hub, canonical, "supports").await;
+    insert_claim_edge(&pool, hub, other, "elaborates").await;
+    insert_claim_edge(&pool, hub, upper_refines, "REFINES").await;
+    insert_claim_edge(&pool, hub, lower_refines, "refines").await;
+
+    // Calibration: unfiltered, the viewer sees every seeded edge, so an empty
+    // filtered answer below is the filter's doing and not visibility's.
+    let all = neighborhood_filtered(&server, &viewer, hub, None).await;
+    assert_eq!(
+        edge_targets(&all),
+        sorted(&[legacy, canonical, other, upper_refines, lower_refines]),
+        "calibration: {all}"
+    );
+
+    for asked in ["supports", "SUPPORTS", "Supports"] {
+        let n = neighborhood_filtered(&server, &viewer, hub, Some(asked)).await;
+        assert_eq!(
+            edge_targets(&n),
+            sorted(&[legacy, canonical]),
+            "get_neighborhood relationship={asked} must return both spellings: {n}"
+        );
+
+        let t = traverse_with(
+            &server,
+            &viewer,
+            serde_json::json!({
+                "start_id": hub.to_string(),
+                "relationship": asked,
+                "max_depth": 1,
+                "limit": 100,
+            }),
+        )
+        .await;
+        assert_eq!(
+            edge_targets(&t),
+            sorted(&[legacy, canonical]),
+            "traverse relationship={asked} must follow both spellings: {t}"
+        );
+        let nodes = node_ids(&t);
+        assert!(
+            nodes.contains(&legacy.to_string()) && nodes.contains(&canonical.to_string()),
+            "traverse relationship={asked} must reach both targets: {t}"
+        );
+    }
+
+    // A relationship outside the folded list is still matched exactly:
+    // `REFINES` (synthesis -> synthesis) and `refines` are different relations.
+    for (asked, want) in [("refines", lower_refines), ("REFINES", upper_refines)] {
+        let n = neighborhood_filtered(&server, &viewer, hub, Some(asked)).await;
+        assert_eq!(edge_targets(&n), sorted(&[want]), "{asked}: {n}");
+        let t = traverse_with(
+            &server,
+            &viewer,
+            serde_json::json!({
+                "start_id": hub.to_string(),
+                "relationship": asked,
+                "max_depth": 1,
+                "limit": 100,
+            }),
+        )
+        .await;
+        assert_eq!(edge_targets(&t), sorted(&[want]), "{asked}: {t}");
+    }
+}

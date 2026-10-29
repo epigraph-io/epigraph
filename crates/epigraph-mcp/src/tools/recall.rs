@@ -58,11 +58,130 @@ pub async fn embedded_3072_population(
 }
 
 async fn detect_centroid_dim(
+    cache: &CentroidPopulationCache,
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<u32, sqlx::Error> {
-    let frac = embedded_3072_population(pool, viewer).await?;
+    let frac = cache.fraction(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
+}
+
+/// [`embedded_3072_population`] behind a short per-scope cache (backlog
+/// be28f3d2).
+///
+/// The fraction is two full-table aggregates over `claims`, and
+/// `recall_with_context` used to run it on EVERY call that omitted
+/// `centroid_dim` (or asked for 3072): about 1.25 s per recall, logged as a slow
+/// statement. It moves only when a re-embed run moves it, so a read stands for
+/// [`Self::ttl`] and a recall pays for it once per interval per scope.
+///
+/// # The key is the query's binds, not the principal
+///
+/// The answer is a function of `(pool, bypass_bind, group_bind)` and nothing
+/// else, so that pair is the key: two viewers that bind the same values read
+/// the same corpus by construction, and a membership change produces a
+/// different key rather than a stale hit. One cache per server process (shared
+/// by every session the factory clones), never a `static`: two servers on two
+/// databases must not answer for each other.
+///
+/// Errors are not cached; the next call reads again.
+#[derive(Debug)]
+pub struct CentroidPopulationCache {
+    ttl: std::time::Duration,
+    slots: std::sync::Mutex<std::collections::HashMap<PopulationKey, (std::time::Instant, f64)>>,
+}
+
+/// `(bypass_bind, sorted group_bind)` — the two values
+/// [`embedded_3072_population`] binds.
+type PopulationKey = (bool, Vec<Uuid>);
+
+impl Default for CentroidPopulationCache {
+    fn default() -> Self {
+        Self::with_ttl(Self::DEFAULT_TTL)
+    }
+}
+
+impl CentroidPopulationCache {
+    /// How long a read stands. Auto-detect therefore follows a re-embed run
+    /// across the 0.5 threshold within five minutes.
+    pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Distinct scopes held at once; past this, expired entries are evicted
+    /// and, if none were, the map is cleared. Bounds memory against an
+    /// unbounded variety of group sets.
+    const MAX_SCOPES: usize = 1024;
+
+    /// A cache whose reads stand for `ttl` (`Duration::ZERO`: every call reads).
+    #[must_use]
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// How long a read stands.
+    #[must_use]
+    pub const fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    fn key(viewer: &epigraph_db::visibility::Viewer) -> PopulationKey {
+        // `group_bind` is already sorted and deduplicated (`Viewer::resolve`).
+        (
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]).to_vec(),
+        )
+    }
+
+    /// The standing read for `viewer`'s scope, if one is younger than the TTL.
+    #[must_use]
+    pub fn cached(&self, viewer: &epigraph_db::visibility::Viewer) -> Option<f64> {
+        let key = Self::key(viewer);
+        let slots = self.slots.lock().ok()?;
+        slots
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < self.ttl)
+            .map(|(_, frac)| *frac)
+    }
+
+    /// The fraction for `viewer`'s scope: the standing read, else a fresh one.
+    ///
+    /// # Errors
+    /// The population query failed (not cached).
+    pub async fn fraction(
+        &self,
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<f64, sqlx::Error> {
+        if let Some(frac) = self.cached(viewer) {
+            return Ok(frac);
+        }
+        self.refresh(pool, viewer).await
+    }
+
+    /// A fresh read for `viewer`'s scope, which then stands for the TTL.
+    ///
+    /// # Errors
+    /// The population query failed (not cached).
+    pub async fn refresh(
+        &self,
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<f64, sqlx::Error> {
+        let frac = embedded_3072_population(pool, viewer).await?;
+        if let Ok(mut slots) = self.slots.lock() {
+            if slots.len() >= Self::MAX_SCOPES {
+                let ttl = self.ttl;
+                slots.retain(|_, (at, _)| at.elapsed() < ttl);
+                if slots.len() >= Self::MAX_SCOPES {
+                    slots.clear();
+                }
+            }
+            slots.insert(Self::key(viewer), (std::time::Instant::now(), frac));
+        }
+        Ok(frac)
+    }
 }
 
 /// Corpus cardinality reported alongside every `recall_with_context` response.
@@ -775,17 +894,24 @@ pub async fn recall_with_context(
                 "centroid_dim must be 1536 or 3072 (got {d})"
             )));
         }
-        None => detect_centroid_dim(&server.pool, viewer)
+        None => detect_centroid_dim(&server.centroid_population, &server.pool, viewer)
             .await
             .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
     };
 
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
+    //
+    // A standing positive read is trusted; a zero is re-measured before it
+    // refuses, so a caller who has just re-embedded is never turned away on a
+    // stale cache (backlog be28f3d2).
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = embedded_3072_population(&server.pool, viewer)
-            .await
-            .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
+        let cache = &server.centroid_population;
+        let frac = match cache.cached(viewer) {
+            Some(frac) if frac > 0.0 => Ok(frac),
+            _ => cache.refresh(&server.pool, viewer).await,
+        }
+        .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
         if frac == 0.0 {
             return Err(invalid_params(
                 "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
@@ -2568,7 +2694,20 @@ pub mod __test_only {
         pool: &sqlx::PgPool,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<u32, sqlx::Error> {
-        super::detect_centroid_dim(pool, viewer).await
+        // A fresh cache: this pins the DECISION, not the caching.
+        let cache = super::CentroidPopulationCache::with_ttl(std::time::Duration::ZERO);
+        super::detect_centroid_dim(&cache, pool, viewer).await
+    }
+
+    /// The fraction `server`'s population cache currently holds for
+    /// `viewer`'s scope — `None` when no read stands. Lets a test observe that
+    /// `recall_with_context`'s auto-detect went through the SERVER's cache.
+    #[must_use]
+    pub fn cached_centroid_population(
+        server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Option<f64> {
+        server.centroid_population.cached(viewer)
     }
 
     /// Integration-test entry point that skips the OpenAI embedder.

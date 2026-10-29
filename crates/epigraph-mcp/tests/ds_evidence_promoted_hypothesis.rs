@@ -234,3 +234,301 @@ async fn a_redirected_write_checks_its_evidence_type_against_the_frame_it_is_fil
     });
     assert!(!vocab_warning, "no unknown-type warning: {out}");
 }
+
+async fn update_with_evidence(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim: Uuid,
+) -> serde_json::Value {
+    first_text(
+        &tools::claims::update_with_evidence(
+            server,
+            viewer,
+            epigraph_mcp::types::UpdateWithEvidenceParams {
+                canonical_name: None,
+                step_index: None,
+                claim_id: claim.to_string(),
+                evidence_type: "empirical".into(),
+                evidence_data: format!("r17 bench result {}", Uuid::new_v4()),
+                source_url: None,
+                supports: true,
+                strength: 0.8,
+                labels: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("update_with_evidence accepted"),
+    )
+}
+
+/// The frames holding the BBA of an evidence row (`mass_functions.evidence_id`).
+async fn frames_of_evidence_bbas(pool: &PgPool, claim: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT f.name FROM mass_functions mf JOIN frames f ON f.id = mf.frame_id \
+          WHERE mf.claim_id = $1 AND mf.evidence_id IS NOT NULL ORDER BY mf.created_at, mf.id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read evidence BBAs")
+}
+
+/// Operator ruling R-17 (backlog 0e013aa8): R-8 covers MCP
+/// `update_with_evidence`. Its BBA used to go on `binary_truth` whatever the
+/// claim, and no reader of a PROMOTED hypothesis reads that frame: the status
+/// reads the latest `research_validity` BBA. So the evidence never reached the
+/// displayed belief. It is now filed on `research_validity` for a promoted
+/// hypothesis, INSTEAD of `binary_truth`. The cache fold reads every
+/// two-hypothesis frame, so filing it on both would count it twice there, the
+/// double read the promotion's move (846b808e) removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_on_a_promoted_hypothesis_lands_on_research_validity(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    ensure_frame(&pool, "hypothesis_assessment").await;
+    let rv_frame = ensure_frame(&pool, "research_validity").await;
+    let promoted = hypothesis(&pool, "promoted").await;
+    let active = hypothesis(&pool, "active").await;
+
+    // CALIBRATION: an unpromoted claim's evidence goes on binary_truth.
+    update_with_evidence(&server, &viewer, active).await;
+    assert_eq!(
+        frames_of_evidence_bbas(&pool, active).await,
+        vec!["binary_truth".to_string()]
+    );
+
+    let out = update_with_evidence(&server, &viewer, promoted).await;
+    assert_eq!(
+        frames_of_evidence_bbas(&pool, promoted).await,
+        vec!["research_validity".to_string()],
+        "a promoted hypothesis's evidence is filed on research_validity, once: {out}"
+    );
+    // The promoted status reader reads the latest research_validity row.
+    let latest = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        &pool, &viewer, promoted, rv_frame,
+    )
+    .await
+    .expect("research_validity rows")
+    .pop()
+    .expect("a research_validity row");
+    assert!(
+        latest.evidence_id.is_some()
+            && latest.masses.get("0").and_then(serde_json::Value::as_f64) > Some(0.0),
+        "the status reader's row is this supporting evidence: {latest:?}"
+    );
+    assert!(
+        out["pignistic_prob"].as_f64() > Some(0.5),
+        "the claim's cached belief still folds the evidence: {out}"
+    );
+}
+
+/// R-17 on the path most production calls take: a NON-OWNER (migration 114)
+/// attaching evidence to a promoted hypothesis that the memberless world group
+/// owns, with every connection of the server on the application role (a
+/// superuser pool bypasses RLS and would make this arm vacuous). The evidence
+/// BBA is the writer's and lands on `research_validity` only; the claim-owned
+/// frame binding the promotion made is kept, and the claim row is not written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_owners_update_on_a_promoted_world_hypothesis_lands_on_research_validity(
+    pool: PgPool,
+) {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(&pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(!bypassrls, "CALIBRATION: epigraph_app does not bypass RLS");
+    let url = fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let server = build_scoped_test_server(plain, scoped);
+    let agent = server.server_agent_id().await.expect("server agent");
+    let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+        .await
+        .expect("viewer");
+
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('binary_truth', ARRAY['TRUE','FALSE']::text[]) \
+         ON CONFLICT (name) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("binary_truth");
+    ensure_frame(&pool, "hypothesis_assessment").await;
+    let rv_frame = ensure_frame(&pool, "research_validity").await;
+    let claim = seed_claim(&pool, "r17 world hypothesis someone else wrote", 0.5).await;
+    sqlx::query(
+        "UPDATE claims SET labels = ARRAY['hypothesis'], \
+                properties = COALESCE(properties, '{}'::jsonb) \
+                             || '{\"hypothesis_status\": \"promoted\"}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(&pool)
+    .await
+    .expect("a promoted hypothesis");
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(claim)
+    .bind(rv_frame)
+    .execute(&pool)
+    .await
+    .expect("the promotion's research_validity binding");
+    let owner: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("owner");
+    assert!(
+        !viewer.writable_groups().contains(&owner),
+        "CALIBRATION: the caller cannot write the claim's group"
+    );
+    let truth_before: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("truth");
+
+    let out = update_with_evidence(&server, &viewer, claim).await;
+    assert_eq!(out["evidence_owner"], "writer", "CALIBRATION: {out}");
+    assert_eq!(out["truth_written"], false, "{out}");
+    assert_eq!(
+        frames_of_evidence_bbas(&pool, claim).await,
+        vec!["research_validity".to_string()],
+        "a non-owner's evidence on a promoted hypothesis is filed on research_validity: {out}"
+    );
+    let bound: Vec<(Uuid, Option<i32>)> = sqlx::query_as(
+        "SELECT frame_id, hypothesis_index FROM claim_frames \
+          WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(claim)
+    .bind(rv_frame)
+    .fetch_all(&pool)
+    .await
+    .expect("binding");
+    assert_eq!(bound, vec![(rv_frame, Some(0))], "the binding is kept");
+    let truth_after: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("truth");
+    assert_eq!(truth_after, truth_before, "the claim row is not written");
+}
+
+/// The two refusals `promoted_hypothesis_filing_frame` makes, through
+/// `update_with_evidence`: a promoted hypothesis's evidence is filed on
+/// `research_validity`, so when that frame does not exist, or is not a
+/// two-hypothesis frame the binary evidence can address, the call is a CALLER
+/// error (invalid params) and nothing is written: no evidence row (it was
+/// inserted in the same transaction, which rolls back), no BBA, no frame
+/// binding and no truth write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_refuses_a_promoted_hypothesis_without_a_binary_research_validity(
+    pool: PgPool,
+) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    ensure_frame(&pool, "hypothesis_assessment").await;
+
+    async fn refused(
+        pool: &PgPool,
+        server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim: Uuid,
+        arm: &str,
+    ) {
+        let truth_before: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("truth");
+        let err = tools::claims::update_with_evidence(
+            server,
+            viewer,
+            epigraph_mcp::types::UpdateWithEvidenceParams {
+                canonical_name: None,
+                step_index: None,
+                claim_id: claim.to_string(),
+                evidence_type: "empirical".into(),
+                evidence_data: format!("r17 refused bench result {}", Uuid::new_v4()),
+                source_url: None,
+                supports: true,
+                strength: 0.8,
+                labels: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect_err("the evidence cannot be filed where the claim's readers look");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_PARAMS,
+            "{arm}: a caller error, not an internal one: {err:?}"
+        );
+        assert!(
+            err.message.contains("research_validity"),
+            "{arm}: the reason names the frame: {}",
+            err.message
+        );
+        let evidence: i64 = sqlx::query_scalar("SELECT count(*) FROM evidence WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("evidence rows");
+        assert_eq!(evidence, 0, "{arm}: no evidence row");
+        assert!(
+            frames_with_bbas(pool, claim).await.is_empty(),
+            "{arm}: no BBA"
+        );
+        let bound: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(pool)
+                .await
+                .expect("claim_frames");
+        assert_eq!(bound, 0, "{arm}: no frame binding");
+        let truth_after: f64 = sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(pool)
+            .await
+            .expect("truth");
+        assert_eq!(truth_after, truth_before, "{arm}: no truth write");
+    }
+
+    // Arm 1: research_validity does not exist.
+    let absent: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM frames WHERE name = 'research_validity'")
+            .fetch_one(&pool)
+            .await
+            .expect("frames");
+    assert_eq!(absent, 0, "CALIBRATION: no research_validity frame yet");
+    let promoted = hypothesis(&pool, "promoted").await;
+    refused(&pool, &server, &viewer, promoted, "missing frame").await;
+
+    // Arm 2: research_validity has three hypotheses.
+    sqlx::query(
+        "INSERT INTO frames (name, hypotheses) VALUES ('research_validity', \
+                ARRAY['valid','invalid','undetermined']::text[])",
+    )
+    .execute(&pool)
+    .await
+    .expect("a three-hypothesis research_validity frame");
+    let promoted = hypothesis(&pool, "promoted").await;
+    refused(&pool, &server, &viewer, promoted, "three-hypothesis frame").await;
+
+    // CALIBRATION: the same call on an unpromoted claim is accepted.
+    let active = hypothesis(&pool, "active").await;
+    update_with_evidence(&server, &viewer, active).await;
+    assert_eq!(
+        frames_of_evidence_bbas(&pool, active).await,
+        vec!["binary_truth".to_string()]
+    );
+}

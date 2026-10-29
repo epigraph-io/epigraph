@@ -109,6 +109,32 @@ Full spec: `docs/conventions/backlog-retirement.md`.
   and post-fix the returned `Claim` (see `list_by_labels` and `get_by_id`
   for the pattern).
 
+## Status claims bypass the novelty gate
+
+MCP `submit_claim` / `memorize` / `batch_submit_claims` run a write-side
+semantic novelty gate (`epigraph-mcp/src/tools/novelty_gate.rs`): a new claim
+within `novelty_threshold` (default 0.05) cosine distance of an existing
+`is_current` claim is SUPPRESSED and the existing claim's id is returned
+instead. Recurring reports are templated (only numbers and dates move), so
+each run used to collapse into the prior run's claim and the time series was
+lost (backlog `a3e63a12`, `0a97ba24`).
+
+A claim carrying any label in `novelty_gate::STATUS_CLAIM_LABELS` (`telemetry`,
+the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels, and
+the older bare `gen-status`, `generator-summary`, `review-status`,
+`revise-status`, `research-scan`) is exempt: `novelty_gate::decide` pins its
+effective threshold to 0.0. Suppression only; the fixed 0.15 `near-duplicate`
+soft-flag still applies.
+
+- Writing a recurring reporter? **Label its per-run summary claim** with a
+  status label, and add a new label to `STATUS_CLAIM_LABELS` (exact match).
+  Do not rely on passing `novelty_threshold=0` on every call.
+- Keep the list to *shape* labels. Topic labels (`graph-integrity`,
+  `maintenance`, `rfp`) stay out: exempting a topic disables dedup for genuine
+  content on that topic.
+- Adding a gated write path? `decide` takes `labels` as a required argument.
+  Pass the caller's real labels, never `&[]` as a placeholder.
+
 ## Test database
 
 Integration tests against the live `epigraph` DB fan out for 30+ minutes
@@ -279,9 +305,13 @@ FROM claims;
 -- Evidence carries its own `embedding` and `embedding_3072`, and an audit
 -- scoped to `claims` alone reports zero while a sealed claim's evidence keeps a
 -- plaintext-derived vector. Must be 0.
+-- Keyed on the ROW's own ciphertext (`evidence_encryption`), not on its
+-- claim's: a seal covers only the evidence its claim's owner holds, so a
+-- sealed claim can keep another group's plaintext row, whose vector is
+-- legitimate. Same predicate as `epigraph-cli reembed`'s sealed filter.
 SELECT COUNT(*) FROM evidence e
  WHERE (e.embedding IS NOT NULL OR e.embedding_3072 IS NOT NULL)
-   AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = e.claim_id);
+   AND EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id);
 ```
 
 `live_missing` and `stale_present` should trend toward zero. `live_missing`

@@ -219,3 +219,62 @@ async fn evolve_step_supersede_of_a_non_current_step_is_invalid_params_on_the_ap
     assert_eq!(claims_with_content(&pool, &content).await, 0);
     assert_eq!(edges_into(&pool, retired).await, 0, "nothing is written");
 }
+
+/// `supersedes` on the caller's own current step, whose retirement the
+/// database refuses, is INVALID_REQUEST (a write refusal, the twin of the HTTP
+/// route's 403) with nothing written (backlog d34f5096). Before the fix the
+/// step was inserted next to a parent that stayed current, leaving the lineage
+/// with two current heads.
+///
+/// A `BEFORE UPDATE` trigger that skips only the parent's `is_current` change
+/// produces a retire that changes no row without raising (the claims tenancy
+/// policy refuses an unwritable parent by raising at WITH CHECK instead).
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_supersede_whose_retire_is_refused_is_invalid_request_on_the_app_role(
+    pool: PgPool,
+) {
+    let (server, caller) = app_role_server(&pool, 0xD3).await;
+    let group = bind_and_arm(&pool, caller).await;
+    let parent = fixture::seed_group_claim(&pool, caller, group, "an unretirable step").await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_step_retire() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_step_retire BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{parent}'::uuid AND NEW.is_current IS DISTINCT FROM OLD.is_current) \
+         EXECUTE FUNCTION aaa_test_skip_step_retire();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the retirement stand-in");
+
+    let content = format!("successor of an unretirable step {}", Uuid::new_v4());
+    let err = evolve(&server, params(parent, "supersedes", &content))
+        .await
+        .expect_err("a step whose parent cannot be retired must not evolve");
+    assert_eq!(
+        err.code,
+        ErrorCode::INVALID_REQUEST,
+        "a refused retirement is a write refusal: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("was refused"),
+        "the refusal says what happened: {}",
+        err.message
+    );
+    assert_eq!(
+        claims_with_content(&pool, &content).await,
+        0,
+        "no successor"
+    );
+    assert_eq!(edges_into(&pool, parent).await, 0, "nothing is written");
+    let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("parent");
+    assert!(
+        still_current,
+        "the parent stays the lineage's one current head"
+    );
+}

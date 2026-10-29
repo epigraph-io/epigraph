@@ -332,7 +332,6 @@
 //!   connection primitive that `visibility_lint.rs`'s two connection rules
 //!   cannot see, because their scan root is `crates/epigraph-db/src/repos`.
 //!   Enumerated so no shard author mistakes this table for complete —
-//!   `middleware/group_authz.rs::require_group_admin`,
 //!   `middleware/provenance.rs::record_provenance`,
 //!   `oauth/providers/provision.rs::emit_oauth_audit`,
 //!   `routes/clusters.rs::{persist_bridge_run, gc_bridge_runs}`,
@@ -544,8 +543,18 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          `oauth.` event about the client.",
     ),
     (
+        "oauth/run_token.rs",
+        1,
+        "Pre-authentication, as `oauth/token.rs`: the run-token grant MINTS a token for a \
+         principal, so no Viewer can precede it. Its one pool binding serves the delegator \
+         client's row (`oauth_clients`, which carries no RLS), the principal's identity-key \
+         lookup (`agents`, universally readable by policy), the delegation's liveness (one \
+         statement over app-executable SECURITY DEFINER reads that answer without a stamp) and \
+         the mint's audit row in `security_events`. None reads a tenancy-partitioned row.",
+    ),
+    (
         "oauth/token.rs",
-        17,
+        19,
         "Pre-authentication by definition, and the largest such site. Token issuance is the step \
          that MINTS the principal every later request is scoped to; a Viewer cannot precede it. \
          The fourteenth site is `refuse_operated_agent` (migration 107): it asks, before minting, \
@@ -560,7 +569,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          EL-5): the client lookup by its `client_id`, as every other grant does, and the one \
          connection for migration 125's `epigraph_redeem_elevation_ticket`, an app-callable \
          definer keyed by the ticket and its redeem secret's hash (the credential), which needs \
-         no stamp. Both run before the elevated principal's token is minted.",
+         no stamp. Both run before the elevated principal's token is minted. The eighteenth \
+         and nineteenth are migration 174's connector-app binding: the code exchange's lookup of \
+         the app that obtained the code (by its `client_id`, any status, as `register` does), \
+         and the refresh grant's lookup of the app a chain was issued to (by id), each reading \
+         one `oauth_clients` row's status before anything is minted, the same \
+         pre-authentication reason.",
     ),
     (
         "routes/elevate.rs",
@@ -599,8 +613,8 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          every server is built through with_scoped_pool and takes the stamped write_as branch, \
          and a claim written by an unstamped application session is refused by migration 122 \
          once armed (OPL01), so the fallback cannot fail open in production. The third site in \
-         assert_tenancy_triggers_armed is migration 089's marker probe, added with \
-         TENANCY_TRIGGERS_089: it reads pg_proc, which carries no tenancy columns and no rows a \
+         assert_tenancy_triggers_armed is the marker probe of the migration-gated tiers, \
+         added with TENANCY_TRIGGERS_089 and since shared by TENANCY_TRIGGERS_173: it reads pg_proc, which carries no tenancy columns and no rows a \
          Viewer could filter. VERIFIED BY CALL GRAPH, not \
          by grep: every caller outside state.rs is bin/server.rs at boot, tenancy_gauge.rs (itself \
          exempt), or a #[cfg(all(test, feature = \"db\"))] module in routes/admin.rs and \
@@ -688,16 +702,27 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `routes/challenge.rs` 2 -> 0 and its key is deleted, read off
 /// `the_scanner_is_not_vacuous`'s own failure (`left: 244, right: 246`).
 ///
+/// 244 -> 232 (backlog 323773fe): the five group management routes run on the
+/// caller's stamped connection (`write_as` for create / add / remove,
+/// `read_as` for `get_group`; `rotate_key` already did), so `routes/groups.rs`
+/// 12 -> 0 and its key is deleted, read off this test's own failure.
 /// 244 -> 243 (backlog a0ed0180, ruling R-29): `build_themes_from_corpus` was
 /// deleted with the k-means prototype, not converted (`routes/crud.rs`
 /// 31 -> 30, keeping sites), read off `the_scanner_is_not_vacuous`'s own
 /// failure (`left: 243, right: 244`).
+/// 244 -> 243 (rulings R-22 / R-36, backlogs fef24216 / fe3ec493):
+/// `propagate_beliefs` loads its CDST seed rows once (`bp_seed_rows`), not once
+/// for the auto-mode coverage check and again for the seed, and admits them on
+/// a viewer-stamped read (`routes/computation.rs` 7 -> 6), read off
+/// `the_unconverted_register_is_exactly_what_was_measured`'s own failure
+/// (`recorded 7, measured 6`).
+/// Staging union (integration/20261027): the three deltas above from 244 -> 230.
 ///
-/// 243 -> 239 (ruling R-74, migration 183): `get_workflow`'s two reads moved
+/// 230 -> 226 (ruling R-74, migration 183): `get_workflow`'s two reads moved
 /// to the caller's stamped read and both post-ingest goal embeds to the
 /// system-agent stamp (`routes/workflows.rs` 8 -> 4), read off
-/// `the_scanner_is_not_vacuous`'s own failure (`left: 239, right: 243`).
-const HIGH_WATER: usize = 239;
+/// `the_scanner_is_not_vacuous`'s own failure.
+const HIGH_WATER: usize = 226;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -761,7 +786,8 @@ const HIGH_WATER: usize = 239;
 /// 44 -> 43 when `routes/reasoning.rs` reached zero (see [`HIGH_WATER`]).
 /// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
 /// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
-const HIGH_WATER_FILES: usize = 41;
+/// 41 -> 40 when `routes/groups.rs` reached zero (backlog 323773fe).
+const HIGH_WATER_FILES: usize = 40;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -829,7 +855,8 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 8 -> 7 (atom-level belief): `propagate_beliefs`' factor load moved onto
     // `AppState::read_as`, because the `decomposes_to` exclusion's legacy arm
     // reads `edges` and must see the caller's own private edges.
-    ("routes/computation.rs", 7),
+    // 7 -> 6 (R-22 / R-36): the CDST seed rows are loaded once (`bp_seed_rows`).
+    ("routes/computation.rs", 6),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 10),
@@ -932,7 +959,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `&mut PgConnection`, so they also leave the `&PgPool`-parameter blind-spot
     // enumeration in this file's module doc.
     ("routes/graph_query.rs", 1),
-    ("routes/groups.rs", 12),
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
     // 6 since its VOI cache moved onto that same stamped transaction (round 4

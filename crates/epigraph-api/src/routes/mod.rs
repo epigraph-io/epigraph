@@ -40,6 +40,8 @@ pub mod assess;
 #[cfg(feature = "db")]
 pub mod audit;
 pub mod batch;
+#[cfg(feature = "db")]
+pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
 pub mod claims;
@@ -393,6 +395,10 @@ pub fn create_router_with_extensions(
             post(challenge::submit_challenge),
         )
         .route(
+            "/api/v1/challenges/:id/resolve",
+            post(challenge::resolve_challenge),
+        )
+        .route(
             "/api/v1/claims/:id/supersede",
             post(versioning::supersede_claim),
         )
@@ -458,6 +464,14 @@ pub fn create_router_with_extensions(
         )
         .route("/api/v1/frames", post(belief::create_frame))
         .route("/api/v1/frames/:id/evidence", post(belief::submit_evidence))
+        .route(
+            "/api/v1/mass-functions/:id/retract",
+            post(bba_retract::retract_bba),
+        )
+        .route(
+            "/api/v1/mass-functions/:id/unretract",
+            post(bba_retract::unretract_bba),
+        )
         .route(
             "/api/v1/frames/:id/conflict-batch",
             post(belief::conflict_batch),

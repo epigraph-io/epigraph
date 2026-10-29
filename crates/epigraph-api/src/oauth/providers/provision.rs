@@ -185,6 +185,9 @@ pub async fn provision_external_user(
             .collect::<Vec<_>>(),
         None => client.granted_scopes.clone(),
     };
+    // The refresh chain stores the consent, not the chokepoint's output; see
+    // `crate::oauth::scopes::chain_scopes`.
+    let chain_scopes = crate::oauth::scopes::chain_scopes(requested_scopes.clone());
     let effective_scopes =
         crate::oauth::scopes::grantable(state, client.id, requested_scopes, grant).await;
 
@@ -211,7 +214,7 @@ pub async fn provision_external_user(
             &state.db_pool,
             hash.as_bytes(),
             client.id,
-            &effective_scopes,
+            &chain_scopes,
             Utc::now() + refresh_ttl,
         )
         .await

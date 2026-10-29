@@ -415,6 +415,8 @@ const PROTECTED: &[&str] = &[
     "agent_succession",
     "group_role_bindings",
     "role_agents",
+    "harvester_sources",
+    "harvester_audit_reports",
     "workflows",
 ];
 
@@ -2264,7 +2266,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
 
     let (edge_vis, edge_owner): (String, Uuid) = sqlx::query_as(
         "SELECT visibility, owner_group_id FROM edges \
-         WHERE source_id = $1 AND target_id = $2 AND relationship = 'CORROBORATES'",
+         WHERE source_id = $1 AND target_id = $2 AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)
@@ -2311,7 +2313,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
     let edges_seen: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges \
          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
-           AND relationship = 'CORROBORATES'",
+           AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)
@@ -2343,7 +2345,7 @@ async fn symmetric_dedup_holds_when_the_existing_edge_is_invisible_to_the_writer
     let total: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges \
          WHERE ((source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)) \
-           AND relationship = 'CORROBORATES'",
+           AND lower(relationship) = 'corroborates'",
     )
     .bind(c1)
     .bind(c2)

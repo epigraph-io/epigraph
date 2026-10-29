@@ -1704,7 +1704,8 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
 `epigraph-operator` (the role verbs and `custodial-supersede`),
 `epigraph-api` (privatization records a custodial act and reads the
 assignment), and `epigraph-tenancy-backfill` (an older `verify` is the safe
-one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first.
+one). If migration 153 is applied, run `docs/runbooks/153-undo.sql` first
+(and, before it, `docs/runbooks/185-undo.sql` if migration 185 is applied).
 Then run `docs/runbooks/123-undo.sql` on the migration DSN, in one
 transaction: it stamps every live `instance_admins` row whose agent holds no
 live custodian assignment (so 083's restored body resurrects no authority
@@ -2085,6 +2086,14 @@ own audit (reason `128-undo`), then drops the table and every 128 function.
 The events stay. Run it AFTER `129-undo.sql` (129's policies call
 `epigraph_admin_scopes_armed()`, so 128-undo refuses while they exist) and
 before 127-undo.
+
+A disarm is reversible for the refresh chains minted while armed: a new chain
+stores its CONSENTED scopes (`oauth::scopes::chain_scopes`), not the
+chokepoint's output, so an admin-only scope stripped from the access token at
+the first mint comes back at the chain's first refresh after the disarm.
+Chains minted before this release by a binary that stored the stripped set
+stay without it; their holder re-consents (a new authorization-code grant, or
+a fresh `client_credentials` grant for a service or agent).
 
 ## The standing admin read arms follow the switch (migration 129)
 
@@ -2490,8 +2499,11 @@ narrowing `scope`) widened the chain to everything the client is granted.
    refresh.
 3. **BREAKING — a refresh `scope` that names nothing issuable is refused.**
    A refresh request whose `scope` names none of the chain's issuable scopes
-   gets `400` with `invalid_scope`, and the presented refresh token is NOT
-   spent. Before this release `scope` was ignored on refresh. A `scope` that
+   gets `400` with the RFC 6749 section 5.2 body `{"error":"invalid_scope"}`,
+   and the presented refresh token is NOT spent. That includes a `scope` whose
+   every name the mint chokepoint strips (an admin-only scope while migration
+   128's switch is armed, or when the switch cannot be read). Before this
+   release `scope` was ignored on refresh. A `scope` that
    names some issuable scopes narrows the access token to them (unknown names
    are dropped, as for `client_credentials`); the chain keeps its scopes.
 4. **DECISION — chains widened under 118 are not healed.** Migration 140
@@ -2569,6 +2581,59 @@ narrowing `scope`) widened the chain to everything the client is granted.
    public.epigraph_refresh_token_rotate` block verbatim (owner and ACL survive
    it), and roll the API binary back with it (step 1).
 
+## Refresh-grant hardening (migration 174) — confidential clients authenticate on refresh; a chain is bound to its connector app
+
+1. **BREAKING — an agent or service refresh carries the client's credential.**
+   RFC 6749 section 6: a confidential client authenticates on the
+   `refresh_token` grant. An agent sends a fresh `client_assertion` (with
+   `client_assertion_type=urn:epigraph:ed25519`), a service sends its
+   `client_secret`, each checked exactly as the `client_credentials` grant
+   checks it (one shared check). A `client_id` on the request must be the
+   chain's own. A refresh that does not authenticate is refused (`400` for a
+   missing credential, `401` for a wrong one or a foreign `client_id`) and
+   changes nothing: the presented token is neither burned nor rotated, so the
+   client retries with its credential. Before this release possession of the
+   refresh token was enough, so a later secret rotation or key change would
+   not have cut a live chain. No in-tree consumer refreshes an agent or
+   service chain (the agents re-run `client_credentials`); an out-of-tree
+   consumer that does must add its credential before this binary ships, or
+   switch to re-running `client_credentials`. Human (connector) chains are
+   unchanged. Rollback: the previous API binary.
+2. **Migration 174 BEFORE the API binary.** 174 adds
+   `refresh_tokens.issued_to_client_id` (the connector app that obtained an
+   authorization-code chain; no foreign key), a `BEFORE INSERT` trigger that
+   gives every rotated successor its family's app, and the operator revoke
+   below. It does not restate `epigraph_refresh_token_rotate`, so it commutes
+   with any migration that does (172 and 174 may apply in either order). The
+   new binary reads the column on every refresh and writes it on every
+   refresh-token mint, so on a database without 174 every grant that mints or
+   refreshes a refresh token fails with `500`: the code exchange,
+   `client_credentials` (every agent and service token), the external-provider
+   grants (every login) and the refresh grant. The same holds after 174's UNDO
+   if the binary was not rolled back first. The previous binary runs unchanged
+   on a migrated database.
+3. **BEHAVIOUR — suspending a connector app cuts that app's sessions only.**
+   A code exchange binds the new chain to the app that obtained the code, and
+   refuses (`403`) when that app is no longer active. A refresh of a bound
+   chain whose app is suspended, revoked or gone is refused (`403`) and burns
+   the presented token; the same person's chains through other apps keep
+   refreshing. Chains minted before 174 store no app and are not bound until
+   their person re-connects (nothing is backfilled).
+4. **Operator revoke keyed by (person, app)**, on the maintenance DSN:
+   `SELECT public.epigraph_refresh_token_revoke_client_app('<per-user oauth_clients.id>', '<app oauth_clients.id>');`
+   revokes that person's live chains issued to that app and returns how many
+   (reason `client`). Migration 125's trigger ends the elevation sessions of
+   those families, as for any revoke. It is `SECURITY INVOKER` and EXECUTE is
+   the maintenance role's alone. The coarse per-person lever,
+   `epigraph_refresh_token_revoke_client`, still logs the person out of every
+   connector. Chains minted before 174 carry no app, so only the coarse lever
+   reaches them.
+5. **Rollback:** roll the API binary back first, then 174's UNDO (its header):
+   drop the trigger and its function, drop
+   `epigraph_refresh_token_revoke_client_app`, drop the partial index, and
+   drop the column. The rotate definer is untouched by 174, so nothing is
+   re-run for it.
+
 ## A lineage stays in its owner group (migration 153) — deploy order and rollback
 
 Once the operator binding is armed, an application session may not leave a
@@ -2628,6 +2693,13 @@ reason are in `docs/tenancy.md` ("A lineage stays in its owner group").
 **Rollback.** `docs/runbooks/153-undo.sql` on the migration DSN, in one
 transaction: it restores 123's body of the function and re-asserts its owner.
 Run it before `123-undo.sql`.
+If migration 185 is applied (an armed supersede act bound on its writer,
+ruling R-85), run `docs/runbooks/185-undo.sql` first: it restores 153's body
+of the same function. 185 has no ordering constraint against the binaries.
+Before applying 185, check that `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+to_regprocedure('public.epigraph_claims_require_operator_binding()')` prints
+`292b24b3dfb6b342f6f60d7868666236` (153's body); over any other body 185
+refuses with `55000`, changes nothing, and stops the migration run.
 
 ## `epigraph-operator restrict-claims` — the audited admin privatization act (no migration)
 

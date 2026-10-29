@@ -49,7 +49,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // --- epigraph-mcp -------------------------------------------------------
     ("crates/epigraph-mcp/src/tools/ds.rs", "submit_ds_evidence", 1, "SPEC §4.1 W3: MCP submit_ds_evidence; warn-then-refuse on compounds is PR-W1a"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_for_claim", 1, "SPEC §4.1 W2: the first BBA of a newly created claim"),
-    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
+    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "wire_single_batch_entry", 1, "SPEC §4.1 W5: ingest atom BBA; PR-W3 keys it to the atom's evidence row"),
     // --- scripts ------------------------------------------------------------
     ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; frozen, not edited"),

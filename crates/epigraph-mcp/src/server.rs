@@ -149,6 +149,9 @@ pub struct EpiGraphMcpFull {
     /// has no root and no pin, so stdio `profile_path` is refused until `main`
     /// sets one.
     pub(crate) label_dedup: Arc<crate::tools::label_dedup::LabelDedupConfig>,
+    /// `recall_with_context`'s `frac_3072` auto-detect read, behind a short
+    /// per-scope cache shared by every session (backlog be28f3d2).
+    pub(crate) centroid_population: Arc<crate::tools::recall::CentroidPopulationCache>,
 }
 
 impl EpiGraphMcpFull {
@@ -274,7 +277,7 @@ impl EpiGraphMcpFull {
         )
         .await
         .map_err(|e| {
-            crate::errors::internal_error(format!("could not re-check the admin grant: {e}"))
+            crate::errors::internal_error_logged("could not re-check the admin grant", e)
         })?;
         if !live {
             return Err(McpError::invalid_request(
@@ -1105,6 +1108,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
@@ -1244,6 +1248,7 @@ impl EpiGraphMcpFull {
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
+            centroid_population: Arc::default(),
         }
     }
 
@@ -2173,7 +2178,7 @@ impl EpiGraphMcpFull {
         tools::graph::traverse(self, viewer, params).await
     }
 
-    // ── Challenges (2 tools) ──
+    // ── Challenges (3 tools) ──
 
     #[tool(
         description = "Submit a typed challenge against a claim. Types: insufficient_evidence, outdated_evidence, flawed_methodology, contradicting_evidence, factual_error. Returns {challenge_id, claim_id, challenge_type, state: 'pending'}. The challenge is filed as the calling principal (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's agent on stdio). Refused with an error, writing nothing, when the claim is owned by a group the caller cannot write."
@@ -2199,6 +2204,20 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::challenges::list_challenges(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Set the resolution status of a challenge filed against a claim you own: under_review, accepted or rejected (a pending challenge may be accepted or rejected directly, and a settled one re-resolved; every change is audited). Only a writer of the challenged claim's owning group may do this; the challenger's own text and ownership are untouched. The resolver recorded is always the calling principal (your own OAuth agent over HTTP; this server's agent on stdio). A challenge you cannot see answers exactly as one that does not exist. Returns {challenge_id, claim_id, state, resolved_by, resolved_at, resolution_details}."
+    )]
+    async fn resolve_challenge(
+        &self,
+        Parameters(params): Parameters<ResolveChallengeParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        self.reject_if_read_only()?;
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::challenges::resolve_challenge(self, viewer, params, auth).await
     }
 
     // ── Events (2 tools) ──
@@ -2360,6 +2379,34 @@ impl EpiGraphMcpFull {
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         self.reject_if_read_only()?;
         tools::ds::submit_ds_evidence(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Retract ONE mass function (BBA) by its id, with a reason. A retracted BBA is excluded from every belief fold and read (DS combine, scoped and perspective belief, the atom cache, BetP) and is kept, with who retracted it, when and why, for audit; the claim's cached belief is then recomputed from the BBAs that remain, in the same transaction (belief_recomputed says whether a cache was written), or, when none remains, set to the explicit vacuous value Bel 0, Pl 1, BetP 0.5, not_enough_info (belief_vacated), and the stored scoped beliefs that folded the retracted BBA (the global scope, its own perspective's and those of communities counting that perspective) are deleted (scoped_beliefs_cleared; the next evidence write on that claim and frame stores fresh ones). Only a writer of the BBA's owning group may retract it, or a caller whose token carries claims:admin and whose token's own client record still holds that grant (recorded as arm=admin). A BBA you cannot read reports not found, exactly like a random id; one you can read but may not retract is refused; neither writes anything. The first retraction writes one security_events audit row (mass_functions.retract) holding the row as it was; retracting it again changes nothing and answers status=already_retracted. A retracted BBA keeps its key: a later write of the same claim, frame, source agent and perspective_id (for example resubmitting through submit_ds_evidence) is refused with an error coded RT07 and changes nothing; unretract_bba (audited) is the only way back. Written with the calling agent's write authority (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)."
+    )]
+    async fn retract_bba(
+        &self,
+        Parameters(params): Parameters<crate::tools::bba_retract::RetractBbaParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::bba_retract::retract_bba(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Un-retract ONE retracted mass function (BBA) by its id, with a reason: the only way a retracted BBA becomes live again (a write to its key, the same claim, frame, source agent and perspective_id, is refused with RT07 while it is retracted). It folds again with the masses it was retracted with; the claim's cached belief is recomputed from the live BBAs in the same transaction (belief_recomputed), and the stored scoped beliefs of its claim and frame that will fold it again (the global scope, its own perspective's and those of communities counting that perspective) are deleted (scoped_beliefs_cleared; the next evidence write stores fresh ones). The same authority as retract_bba: a writer of the BBA's owning group, or a caller whose token carries claims:admin and whose token's own client record still holds that grant (arm=admin); either may un-retract a retraction the other made. A BBA you cannot read reports not found, like a random id; one you can read but may not un-retract is refused; neither writes anything. An un-retraction writes one security_events audit row (mass_functions.unretract) with the reason and the row as it was; a BBA that is not retracted answers status=not_retracted and changes nothing. Written with the calling agent's write authority (your own OAuth agent over HTTP; this server's own agent on stdio)."
+    )]
+    async fn unretract_bba(
+        &self,
+        Parameters(params): Parameters<crate::tools::bba_retract::UnretractBbaParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::bba_retract::unretract_bba(self, viewer, params, auth).await
     }
 
     #[tool(
@@ -2609,7 +2656,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
+        description = "Decide a match candidate: 'promote' marks the row promoted and writes the edge its verifier_verdict calls for — corroborates for same/paraphrase/overlapping, contradicts for contradicts, and refused for distinct (no truthful edge exists; reject it instead); 'reject' marks it rejected. To undo a promotion use retire_match_candidate (claims:admin). Honours read-only mode."
     )]
     async fn decide_match_candidate(
         &self,

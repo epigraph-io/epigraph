@@ -1198,8 +1198,8 @@ pub async fn report_workflow_outcome(
     // on the premise that a fresh `EvidenceId` plus no `ON CONFLICT` appends a
     // row per retry. That is wrong for an IDENTICAL retry: `content_hash` is
     // `blake3(evidence_text)`, a deterministic serialization of the call's
-    // arguments, and migration 001's `evidence_content_hash_claim_unique UNIQUE
-    // (content_hash, claim_id)` refuses it. Only a retry with different
+    // arguments, and the same-owner evidence de-duplication
+    // (`EvidenceRepository::create`) refuses it. Only a retry with different
     // arguments adds a row. See `tools::claims::update_with_evidence`, where the
     // same correction is measured.) Re-adding the stamp belongs in D2, which has
     // to put evidence → BBA → truth_value into one unit anyway.
@@ -1214,7 +1214,7 @@ pub async fn report_workflow_outcome(
     // row in the same transaction satisfies it. The stamped INSERT is therefore no
     // longer forced to commit alone, which removes the objection: nothing commits
     // unless everything does, so a failed call leaves no BBA-less evidence row
-    // behind to make `evidence_content_hash_claim_unique` refuse the identical
+    // behind to make the evidence de-duplication refuse the identical
     // retry that would land it.
     let mut tx =
         crate::claim_helper::begin_author_stamped_tx(server, author, "report_workflow_outcome")
@@ -1827,9 +1827,9 @@ async fn deprecate_hierarchical_workflow(
         }
     }
 
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("{TOOL}: could not commit: {e}")))?;
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged(format!("{TOOL}: could not commit"), e)
+    })?;
 
     success_json(&DeprecateWorkflowResponse {
         deprecated_ids,

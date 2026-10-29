@@ -65,6 +65,7 @@ WITH target AS ( \
 fc AS ( \
     SELECT DISTINCT mf.frame_id, mf.claim_id \
     FROM mass_functions mf JOIN target t ON t.id = mf.frame_id \
+    WHERE mf.retracted_at IS NULL \
 ), \
 conflict AS ( \
     SELECT e.source_id, e.target_id FROM edges e \
@@ -92,7 +93,8 @@ SELECT t.id AS frame_id, t.name AS frame_name, \
        COALESCE(fcc.n, 0) AS total_claims, \
        COALESCE(pc.n, 0) AS contradicts_edges, \
        (SELECT COUNT(DISTINCT mf.source_agent_id) FROM mass_functions mf \
-        WHERE mf.frame_id = t.id AND mf.source_agent_id IS NOT NULL) AS distinct_sources \
+        WHERE mf.frame_id = t.id AND mf.source_agent_id IS NOT NULL \
+          AND mf.retracted_at IS NULL) AS distinct_sources \
 FROM target t \
 LEFT JOIN fc_counts fcc ON fcc.frame_id = t.id \
 LEFT JOIN pair_counts pc ON pc.frame_id = t.id \

@@ -358,3 +358,262 @@ async fn cli_analyze_after_promotion_files_on_research_validity(pool: PgPool) {
         "beside the promoted evidence: {rv:?}"
     );
 }
+
+/// Every BBA on (claim, frame), oldest first, as `(id, masses)`.
+async fn frame_rows(pool: &PgPool, claim: Uuid, frame: Uuid) -> Vec<(Uuid, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT id, masses FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
+         ORDER BY created_at ASC, id ASC",
+    )
+    .bind(claim)
+    .bind(frame)
+    .fetch_all(pool)
+    .await
+    .expect("read BBA rows")
+}
+
+/// A promotable hypothesis: a completed analysis with an explicit scope and a
+/// `hypothesis_assessment` BBA whose Bel(supported) 0.8 clears the gate.
+async fn promotable(pool: &PgPool, tag: &str) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (agent, _group) = fixture::seed_agent_with_group(pool, tag).await;
+    let claim = fixture::seed_public_claim(pool, agent, &format!("{tag} hypothesis")).await;
+    let hyp_frame = binary_frame(pool, "hypothesis_assessment").await;
+    let rv_frame = binary_frame(pool, "research_validity").await;
+    seed_completed_analysis(pool, agent, claim).await;
+    store_assessment(
+        pool,
+        claim,
+        hyp_frame,
+        agent,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    (agent, claim, hyp_frame, rv_frame)
+}
+
+async fn store_assessment(
+    pool: &PgPool,
+    claim: Uuid,
+    hyp_frame: Uuid,
+    agent: Uuid,
+    masses: serde_json::Value,
+) -> Uuid {
+    epigraph_db::MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        hyp_frame,
+        Some(agent),
+        None,
+        &masses,
+        None,
+        Some("error_derived"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed a hypothesis_assessment BBA")
+}
+
+fn promote_cmd(url: &str, claim: Uuid) -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.args(["promote", &claim.to_string()])
+        .env("DATABASE_URL", url)
+        .env("MAINTENANCE_DATABASE_URL", url)
+        .env("RUST_LOG", "warn");
+    cmd
+}
+
+/// Backlog 03b1508f (1): `hypothesis promote` refuses an already-promoted
+/// hypothesis, as `POST /hypothesis/:id/promote` does (409) since #687. At
+/// origin/main the CLI re-ran the gate on `hypothesis_assessment` only, so a
+/// BBA filed there after the promotion (here a ready-making one) passed it,
+/// and the CLI promoted again and moved that BBA onto `research_validity`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_refuses_to_promote_an_already_promoted_hypothesis(pool: PgPool) {
+    let (agent, claim, hyp_frame, rv_frame) = promotable(&pool, "03b1508f-cli-twice").await;
+    let url = fixture::database_url_for(&pool).await;
+    let first = promote_cmd(&url, claim).output().expect("spawn hypothesis");
+    assert!(
+        first.status.success(),
+        "CALIBRATION: the first promotion runs: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let promoted = frame_rows(&pool, claim, rv_frame).await;
+    assert_eq!(promoted.len(), 1, "CALIBRATION: one promoted row");
+
+    let later = store_assessment(
+        &pool,
+        claim,
+        hyp_frame,
+        agent,
+        serde_json::json!({"0": 0.95, "0,1": 0.05}),
+    )
+    .await;
+    let again = promote_cmd(&url, claim).output().expect("spawn hypothesis");
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !again.status.success(),
+        "a second promotion must be refused, got exit {:?}: {}",
+        again.status.code(),
+        String::from_utf8_lossy(&again.stdout)
+    );
+    assert!(
+        stderr.contains("already promoted; nothing was written"),
+        "the pre-check refuses it, before the gate and the transaction: {stderr}"
+    );
+    assert!(
+        !stderr.contains("concurrent"),
+        "a sequential re-promotion is the pre-check's refusal, not the race's: {stderr}"
+    );
+    assert_eq!(
+        frame_rows(&pool, claim, rv_frame).await,
+        promoted,
+        "the refused promotion leaves research_validity as the first one left it"
+    );
+    assert!(
+        frame_rows(&pool, claim, hyp_frame)
+            .await
+            .iter()
+            .any(|(id, _)| *id == later),
+        "the refused promotion leaves the later hypothesis_assessment BBA in place"
+    );
+}
+
+/// Backlog 03b1508f (2): the promote gate is atomic. A promotion whose gate
+/// read the hypothesis as not yet promoted, while another promotion was
+/// committing, must not promote it again once that one has committed. Here
+/// the other promotion holds the claim row with its status write
+/// uncommitted; the CLI is started, waits on that row, and the other commits.
+/// At origin/main the CLI's status write simply ran after the other's commit
+/// and the second promotion moved the evidence again (exit 0).
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_promotion_racing_a_committed_promotion_is_refused(pool: PgPool) {
+    let (_agent, claim, hyp_frame, rv_frame) = promotable(&pool, "03b1508f-cli-race").await;
+    let source = frame_rows(&pool, claim, hyp_frame).await;
+    assert_eq!(source.len(), 1, "CALIBRATION: one source BBA");
+    let url = fixture::database_url_for(&pool).await;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("database name");
+
+    let mut other = pool
+        .begin()
+        .await
+        .expect("the other promotion's transaction");
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+         WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(&mut *other)
+    .await
+    .expect("the other promotion's status write");
+
+    let child = promote_cmd(&url, claim)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hypothesis");
+    let mut blocked = false;
+    for _ in 0..1200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind(&db)
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        blocked,
+        "CALIBRATION: the CLI promotion reached the claim row the other promotion holds"
+    );
+    other.commit().await.expect("the other promotion commits");
+
+    let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .expect("join")
+        .expect("wait for hypothesis");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the racing promotion must be refused once the other committed, got exit {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("concurrent promotion"),
+        "the conditional status write refuses it (its 0-row path): {stderr}"
+    );
+    assert!(
+        frame_rows(&pool, claim, rv_frame).await.is_empty(),
+        "the refused promotion writes no research_validity copy"
+    );
+    assert_eq!(
+        frame_rows(&pool, claim, hyp_frame).await,
+        source,
+        "the refused promotion leaves the source BBA in place"
+    );
+}
+
+/// Backlog 03b1508f (1), the other refusal the HTTP route makes (400): a
+/// hypothesis that is not ready (no completed analysis here, though its
+/// `hypothesis_assessment` BBA clears the belief threshold) is refused by the
+/// CLI too, with nothing written and its status unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cli_refuses_to_promote_a_hypothesis_that_is_not_ready(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "03b1508f-cli-not-ready").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "03b1508f not ready hypothesis").await;
+    let hyp_frame = binary_frame(&pool, "hypothesis_assessment").await;
+    let rv_frame = binary_frame(&pool, "research_validity").await;
+    let source = store_assessment(
+        &pool,
+        claim,
+        hyp_frame,
+        agent,
+        serde_json::json!({"0": 0.8, "0,1": 0.2}),
+    )
+    .await;
+    let url = fixture::database_url_for(&pool).await;
+
+    let out = promote_cmd(&url, claim).output().expect("spawn hypothesis");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a hypothesis that is not ready must be refused, got exit {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr.contains("not ready"), "{stderr}");
+    assert!(
+        frame_rows(&pool, claim, rv_frame).await.is_empty(),
+        "the refused promotion writes no research_validity row"
+    );
+    assert!(
+        frame_rows(&pool, claim, hyp_frame)
+            .await
+            .iter()
+            .any(|(id, _)| *id == source),
+        "the refused promotion leaves the hypothesis_assessment BBA in place"
+    );
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("the hypothesis");
+    assert_ne!(
+        status.as_deref(),
+        Some("promoted"),
+        "the refused promotion does not flip the status"
+    );
+}

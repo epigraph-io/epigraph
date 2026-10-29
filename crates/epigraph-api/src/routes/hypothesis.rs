@@ -550,6 +550,34 @@ pub async fn promote_hypothesis(
             message: format!("Failed to begin transaction: {e}"),
         })?;
 
+    // 0. The status write comes FIRST and is conditional, so the gate is
+    //    atomic (backlog 03b1508f): the gate above read the status before this
+    //    transaction, so two concurrent promotions could both pass it. This
+    //    UPDATE takes the claim row's lock; a promotion that waited on another
+    //    one that has since committed re-checks the row, changes nothing and is
+    //    refused before anything else is written.
+    let flipped = sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+          WHERE id = $1 AND properties->>'hypothesis_status' IS DISTINCT FROM 'promoted'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("Failed to update status: {e}"),
+    })?
+    .rows_affected();
+    if flipped != 1 {
+        // The gate above read it unpromoted: a promotion that committed
+        // meanwhile flipped it (or the row is no longer writable here).
+        return Err(ApiError::Conflict {
+            reason: format!(
+                "hypothesis {id} is already promoted (a concurrent promotion committed first), \
+                 or its status could not be written; nothing was written"
+            ),
+        });
+    }
+
     // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
     let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
         &state.db_pool,
@@ -623,14 +651,7 @@ pub async fn promote_hypothesis(
         message: format!("Failed to update factors: {e}"),
     })?;
 
-    // 4. Update hypothesis status
-    sqlx::query(
-        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1"
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| ApiError::InternalError { message: format!("Failed to update status: {e}") })?;
+    // 4. The status was written first (step 0).
 
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("Promotion transaction failed: {e}"),

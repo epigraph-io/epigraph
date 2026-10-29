@@ -78,6 +78,9 @@ BEGIN
                        t || '_require_tenancy', t);
     END LOOP;
 END $$;
+-- Migration 173 later gave `harvester_sources` the same root body. Its trigger
+-- depends on the function, so it goes first or the DROP FUNCTION below fails.
+DROP TRIGGER IF EXISTS harvester_sources_require_tenancy ON public.harvester_sources;
 DROP FUNCTION IF EXISTS public.epigraph_derived_require_tenancy();
 DROP FUNCTION IF EXISTS public.epigraph_root_require_tenancy();
 

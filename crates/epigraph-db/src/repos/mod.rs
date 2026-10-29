@@ -30,6 +30,7 @@ pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
 pub mod decomposition_priority;
+pub mod derivation_scope;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
@@ -107,17 +108,19 @@ pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    carries_dedup_identity_key, AdminClaimAction, AdminClaimWrite, AdminToken,
-    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
-    ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
-    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
+    AdminToken, BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute,
+    ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
+    ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
+    DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
     EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
     LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
     MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
-    SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
+    SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

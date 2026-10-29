@@ -1784,7 +1784,8 @@ async fn stored_conflict(
     }
     let sql = viewer.splice(
         "SELECT mf.claim_id, MAX(mf.conflict_k)::float8 FROM mass_functions mf \
-          WHERE mf.claim_id = ANY($1) AND mf.conflict_k IS NOT NULL /* {VISIBILITY:mf} */ \
+          WHERE mf.claim_id = ANY($1) AND mf.conflict_k IS NOT NULL \
+            AND mf.retracted_at IS NULL /* {VISIBILITY:mf} */ \
           GROUP BY mf.claim_id",
         2,
     );

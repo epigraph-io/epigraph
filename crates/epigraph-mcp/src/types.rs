@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -502,7 +502,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -2833,6 +2833,25 @@ pub struct ListChallengesParams {
     pub claim_id: String,
 }
 
+/// `resolve_challenge`'s parameters. There is no resolver field, and an
+/// unknown field is refused: the resolver is always the calling principal
+/// (operator ruling R-13).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveChallengeParams {
+    #[schemars(description = "UUID of the challenge to resolve")]
+    pub challenge_id: String,
+
+    #[schemars(
+        description = "Resolution status to set: under_review, accepted or rejected. A pending challenge may be accepted or rejected directly, and a settled one re-resolved."
+    )]
+    pub state: String,
+
+    #[schemars(description = "Optional JSON object recording the resolution (e.g. the reason)")]
+    #[serde(default)]
+    pub resolution_details: Option<serde_json::Value>,
+}
+
 // ── Events ──
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3429,7 +3448,7 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
     #[schemars(
-        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — corroborates for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
     )]
     pub verdict: String,
 }

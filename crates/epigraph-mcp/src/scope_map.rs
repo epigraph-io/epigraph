@@ -104,6 +104,10 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("add_step", "claims:write"),
     ("batch_submit_claims", "claims:write"),
     ("challenge_claim", "claims:write"),
+    // The claim owner's twin of `POST /api/v1/challenges/:id/resolve`
+    // (ruling R-3): it writes the four resolution columns of a challenge
+    // through migration 168's definer, as the calling principal.
+    ("resolve_challenge", "claims:write"),
     ("create_frame", "claims:write"),
     ("create_perspective", "claims:write"),
     ("decide_match_candidate", "claims:write"),
@@ -149,6 +153,13 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("unmark_duplicate", "claims:write"),
     ("supersede_claim", "claims:write"),
     ("submit_ds_evidence", "claims:write"),
+    // Retracts ONE BBA (ruling R-79). The per-row rule (a writer of the BBA's
+    // owning group, or a live claims:admin grant on the token's own client
+    // record) is migration 184's definer, behind `tools/bba_retract.rs`.
+    ("retract_bba", "claims:write"),
+    // Makes ONE retracted BBA live again (ruling R-103), under the same
+    // per-row rule as retract_bba (migration 184's un-retract definer).
+    ("unretract_bba", "claims:write"),
     ("update_labels", "claims:write"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.
@@ -307,6 +318,13 @@ mod tests {
         assert_eq!(required_scope("apply_label_dedup"), Some("claims:write"));
         assert_eq!(required_scope("unmark_duplicate"), Some("claims:write"));
         assert_eq!(required_scope("revert_label_dedup"), Some("claims:write"));
+        // The claim owner's resolution of a challenge (R-3/R-13): the tool
+        // tests call it directly, past the router's scope check.
+        assert_eq!(required_scope("resolve_challenge"), Some("claims:write"));
+        // Retracting one BBA (R-79): the tool tests call it directly too.
+        assert_eq!(required_scope("retract_bba"), Some("claims:write"));
+        // Un-retracting one BBA (R-103): called directly by its tests too.
+        assert_eq!(required_scope("unretract_bba"), Some("claims:write"));
     }
 
     /// Plan and probe only read, so a `claims:read` bearer reaches them; apply
