@@ -849,6 +849,26 @@ async fn the_experiment_loop_attests_its_edges() {
         &format!("R-50 experiment hypothesis {}", Uuid::new_v4()),
     )
     .await;
+    // Every experiment write requires the hypothesis writable by the caller
+    // (operator ruling R-51): its owning group in the caller's writable set.
+    // The hypothesis is authored by another agent, so the caller gets there
+    // through a `writer` membership in that group alone, as the `writer` arm
+    // of `experiment_hypothesis_gate.rs` does.
+    let hypothesis_group: Uuid =
+        sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+            .bind(hypothesis)
+            .fetch_one(&pool)
+            .await
+            .expect("hypothesis owning group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(hypothesis_group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("caller writes the hypothesis's group");
     sqlx::query(
         "INSERT INTO frames (name, hypotheses) VALUES ('hypothesis_assessment', \
          ARRAY['true','false']::text[]) ON CONFLICT (name) DO NOTHING",
