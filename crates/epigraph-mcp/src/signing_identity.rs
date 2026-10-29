@@ -145,9 +145,14 @@ pub struct KeyBinding {
     /// when only the signer's `agents.public_key` verifies; `None` when nothing
     /// verifies.
     pub key_kind: Option<&'static str>,
+    /// The message the verifying key's signature was made over (ruling R-34):
+    /// `v1` (claim-tagged) or `legacy` (the bare digest), for the same key
+    /// `key_kind` names; `None` when nothing verifies.
+    pub signature_scheme: Option<epigraph_crypto::SignatureScheme>,
 }
 
-/// How far before a key's `valid_from` a claim may be dated and still bind.
+/// How far before a key's `valid_from` a claim may be dated and still bind:
+/// the shared window rule's skew ([`epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS`]).
 ///
 /// `claims.created_at` is stamped by the writer's clock (`Claim::new`) and
 /// `valid_from` by the database's (`now()` at registration), so a writer a
@@ -156,7 +161,7 @@ pub struct KeyBinding {
 /// the writer and is not covered by the signature, so the lower bound never
 /// stopped a determined backdater. Only the LOWER bound is relaxed; a window's
 /// END (rotation, the legacy cut-over) stays exact.
-pub const VALID_FROM_SKEW_SECS: i64 = 60;
+pub const VALID_FROM_SKEW_SECS: i64 = epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS;
 
 /// Whether an attested key row was valid at `at`: inside `[valid_from -
 /// VALID_FROM_SKEW_SECS, valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a
@@ -168,23 +173,16 @@ fn valid_at(row: &AttestedKeyRow, at: DateTime<Utc>) -> bool {
 }
 
 /// [`valid_at`] over the fields alone, shared with the boot verdict so the
-/// boot check and `verify_claim` cannot disagree about a window. `status` is
-/// in the SQL spelling (`lower(btrim(..))`).
+/// boot check and `verify_claim` cannot disagree about a window. It IS the
+/// repository's [`epigraph_db::repos::agent_key::key_window_admits`], which
+/// the edge verifier calls too.
 fn window_admits(
     status: &str,
     valid_from: DateTime<Utc>,
     valid_until: Option<DateTime<Utc>>,
     at: DateTime<Utc>,
 ) -> bool {
-    let opens = valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
-    if at < opens || valid_until.is_some_and(|until| at >= until) {
-        return false;
-    }
-    match status {
-        "active" => true,
-        "rotated" | "expired" => valid_until.is_some(),
-        _ => false,
-    }
+    epigraph_db::repos::agent_key::key_window_admits(status, valid_from, valid_until, at)
 }
 
 fn kind_of(row: &AttestedKeyRow) -> Option<&'static str> {
@@ -234,18 +232,28 @@ pub fn bind_signature(
             signature_valid: false,
             key_bound: false,
             key_kind: None,
+            signature_scheme: None,
         };
     };
-    let verifies = |key: &[u8]| {
-        <[u8; 32]>::try_from(key).is_ok_and(|key| {
-            epigraph_crypto::SignatureVerifier::verify(&key, digest, signature).unwrap_or(false)
+    // Versioned (ruling R-34): the claim-tagged v1 message first, then the
+    // legacy bare digest. A signature tagged for another kind verifies neither.
+    let scheme_under = |key: &[u8]| {
+        <[u8; 32]>::try_from(key).ok().and_then(|key| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &key,
+                epigraph_crypto::SignedEntity::Claim,
+                digest,
+                signature,
+            )
+            .ok()
+            .flatten()
         })
     };
     let verifying: Vec<&AttestedKeyRow> = keys
         .iter()
-        .filter(|k| kind_of(k).is_some() && verifies(&k.public_key))
+        .filter(|k| kind_of(k).is_some() && scheme_under(&k.public_key).is_some())
         .collect();
-    let signer_key_verifies = verifies(signer_key);
+    let signer_key_scheme = scheme_under(signer_key);
 
     let bound = prefer_signing(
         verifying
@@ -253,14 +261,18 @@ pub fn bind_signature(
             .copied()
             .filter(|k| k.agent_id == author && valid_at(k, created_at)),
     );
-    let key_kind = bound
+    let named = bound.or_else(|| prefer_signing(verifying.iter().copied()));
+    let key_kind = named
         .and_then(kind_of)
-        .or_else(|| prefer_signing(verifying.iter().copied()).and_then(kind_of))
-        .or(signer_key_verifies.then_some(KEY_KIND_UNATTESTED));
+        .or(signer_key_scheme.map(|_| KEY_KIND_UNATTESTED));
+    let signature_scheme = named
+        .and_then(|k| scheme_under(&k.public_key))
+        .or(signer_key_scheme);
     KeyBinding {
-        signature_valid: signer_key_verifies || !verifying.is_empty(),
+        signature_valid: signer_key_scheme.is_some() || !verifying.is_empty(),
         key_bound: bound.is_some(),
         key_kind,
+        signature_scheme,
     }
 }
 
@@ -481,7 +493,8 @@ mod tests {
             KeyBinding {
                 signature_valid: true,
                 key_bound: false,
-                key_kind: Some(KEY_KIND_UNATTESTED)
+                key_kind: Some(KEY_KIND_UNATTESTED),
+                signature_scheme: Some(epigraph_crypto::SignatureScheme::Legacy),
             }
         );
         let b = bind_signature(&digest, None, &key.public_key(), author, Utc::now(), &[]);
@@ -490,8 +503,62 @@ mod tests {
             KeyBinding {
                 signature_valid: false,
                 key_bound: false,
-                key_kind: None
+                key_kind: None,
+                signature_scheme: None,
             }
         );
+    }
+    /// Ruling R-34 at the claim verifier: a claim-tagged v1 signature verifies
+    /// and says `v1`; the SAME key's evidence-tagged signature over the same
+    /// digest is not a claim signature, under the bare agent key or an
+    /// attested one.
+    #[test]
+    fn only_a_claim_tagged_or_legacy_signature_verifies_a_claim() {
+        use epigraph_crypto::{SignatureScheme, SignedEntity};
+        let author = Uuid::new_v4();
+        let key = AgentSigner::from_bytes(&[8; 32]).expect("key");
+        let digest = [4u8; 32];
+        let row = attested(
+            author,
+            &key,
+            "signing",
+            "active",
+            Utc::now() - Duration::hours(1),
+            None,
+        );
+
+        let v1 = key.sign_entity(SignedEntity::Claim, &digest);
+        let b = bind_signature(
+            &digest,
+            Some(&v1),
+            &key.public_key(),
+            author,
+            Utc::now(),
+            std::slice::from_ref(&row),
+        );
+        assert!(b.signature_valid && b.key_bound, "{b:?}");
+        assert_eq!(b.signature_scheme, Some(SignatureScheme::V1), "{b:?}");
+
+        let as_evidence = key.sign_entity(SignedEntity::Evidence, &digest);
+        for keys in [&[][..], std::slice::from_ref(&row)] {
+            let b = bind_signature(
+                &digest,
+                Some(&as_evidence),
+                &key.public_key(),
+                author,
+                Utc::now(),
+                keys,
+            );
+            assert_eq!(
+                b,
+                KeyBinding {
+                    signature_valid: false,
+                    key_bound: false,
+                    key_kind: None,
+                    signature_scheme: None,
+                },
+                "an evidence-tagged signature verified a claim"
+            );
+        }
     }
 }

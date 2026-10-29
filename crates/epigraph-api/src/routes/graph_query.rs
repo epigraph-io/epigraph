@@ -5,6 +5,11 @@ use crate::errors::ApiError;
 use crate::query_parser::{parse_gql, EdgeDirection, GqlQuery, Operator, ReturnClause, Value};
 use crate::routes::edges::FullGraphResponse;
 use crate::state::AppState;
+#[cfg(feature = "db")]
+use epigraph_db::{
+    GqlColumn, GqlCondition, GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk,
+    GraphViewRepository,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -54,10 +59,12 @@ pub async fn execute_graph_query(
 
     // Determine Table (allowlist — no user strings enter table names)
     let node_table = match node_type.to_lowercase().as_str() {
-        "claim" | "claims" => "claims",
-        "evidence" => "evidence",
-        "agent" | "agents" => "agents",
-        "trace" | "traces" | "reasoning_traces" | "reasoning_trace" => "reasoning_traces",
+        "claim" | "claims" => GqlNodeTable::Claims,
+        "evidence" => GqlNodeTable::Evidence,
+        "agent" | "agents" => GqlNodeTable::Agents,
+        "trace" | "traces" | "reasoning_traces" | "reasoning_trace" => {
+            GqlNodeTable::ReasoningTraces
+        }
         _ => {
             return Err(ApiError::ValidationError {
                 field: "label".to_string(),
@@ -66,34 +73,27 @@ pub async fn execute_graph_query(
         }
     };
 
-    // Build WHERE clause with bind parameters ($1, $2, ...)
-    // All user-supplied values go through bind() — no string interpolation.
-    let mut where_fragments: Vec<String> = Vec::new();
-    let mut bind_strings: Vec<String> = Vec::new();
-    let mut bind_numbers: Vec<(usize, f64)> = Vec::new(); // (param_index, value)
-    let mut param_idx = 0usize;
-
+    // WHERE conditions on the anchor node. Column names come from a fixed
+    // mapping or a validated property name; every number and string is bound
+    // by the repo layer.
+    let mut conditions: Vec<GqlCondition> = Vec::new();
     if let Some(where_c) = &ast.where_clause {
-        let conditions: Vec<_> = where_c
+        for c in where_c
             .conditions
             .iter()
             .filter(|c| c.variable == *node_var)
-            .collect();
-
-        for c in conditions {
+        {
             let op = match c.operator {
-                Operator::Eq => "=",
-                Operator::Gt => ">",
-                Operator::Lt => "<",
-                Operator::Gte => ">=",
-                Operator::Lte => "<=",
+                Operator::Eq => GqlOp::Eq,
+                Operator::Gt => GqlOp::Gt,
+                Operator::Lt => GqlOp::Lt,
+                Operator::Gte => GqlOp::Gte,
+                Operator::Lte => GqlOp::Lte,
             };
-
-            // Column mapping: only known columns allowed (no user strings in column names)
             let column = if c.property == "truth_value" {
-                "truth_value".to_string()
+                GqlColumn::TruthValue
             } else if c.property == "confidence" {
-                "(properties->>'confidence')::float8".to_string()
+                GqlColumn::Confidence
             } else {
                 // property names come from parser (alphanumeric + underscore only)
                 // but validate defensively
@@ -107,188 +107,95 @@ pub async fn execute_graph_query(
                         reason: format!("Invalid property name: {}", c.property),
                     });
                 }
-                format!("properties->>'{}'", c.property)
+                GqlColumn::Property(c.property.clone())
             };
-
-            param_idx += 1;
-            match &c.value {
-                Value::Number(n) => {
-                    where_fragments.push(format!("{} {} ${}", column, op, param_idx));
-                    bind_numbers.push((param_idx, *n));
-                }
-                Value::String(s) => {
-                    where_fragments.push(format!("{} {} ${}", column, op, param_idx));
-                    bind_strings.push(s.clone());
-                }
-                Value::Boolean(b) => {
-                    // Booleans are safe to inline (only true/false from parser)
-                    where_fragments.push(format!("{} {} {}", column, op, b));
-                    param_idx -= 1; // no bind needed
-                }
-            }
+            let value = match &c.value {
+                Value::Number(n) => GqlValue::Number(*n),
+                Value::String(s) => GqlValue::Text(s.clone()),
+                Value::Boolean(b) => GqlValue::Bool(*b),
+            };
+            conditions.push(GqlCondition { column, op, value });
         }
     }
 
-    // Both id SELECTs below (the recursive CTE's anchor and the plain
-    // node SELECT) take their LIMIT window `ORDER BY created_at DESC, id`:
-    // newest matches first, `id` as the tie-breaker so the order is total.
-    // Without it the window was heap order — roughly oldest-first, and it moved
-    // after VACUUM or an UPDATE (backlog 2aacb390). Every allowlisted
-    // `node_table` has `created_at timestamptz NOT NULL` and a
-    // `created_at DESC` btree index (001_initial_schema.sql).
-    let where_sql = if where_fragments.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", where_fragments.join(" AND "))
-    };
-
-    // Helper: bind all accumulated parameters to a query
-    // Since sqlx doesn't support heterogeneous dynamic binding easily,
-    // we use float parameters for all bound values (numbers stay as-is,
-    // strings use a separate text query path).
+    // The anchor rows are taken newest first, `id` as the tie-breaker, so the
+    // LIMIT window is a total order (backlog 2aacb390).
     let pool = &state.db_pool;
 
-    if let Some(edge) = &ast.match_clause.edge {
-        // Validate relationship type against allowlist
-        let rel_filter = if let Some(rt) = &edge.rel_type {
-            const VALID_RELS: &[&str] = &[
-                "supports",
-                "contradicts",
-                "derives_from",
-                "refines",
-                "analogous",
-                "authored",
-                "asserts",
-                "variant_of",
-                "produced",
-                "cites",
-            ];
-            if !VALID_RELS.contains(&rt.as_str()) {
-                return Err(ApiError::ValidationError {
-                    field: "relationship".to_string(),
-                    reason: format!("Unknown relationship type: {}. Valid: {:?}", rt, VALID_RELS),
-                });
+    let walk = match &ast.match_clause.edge {
+        Some(edge) => {
+            // Validate relationship type against allowlist
+            if let Some(rt) = &edge.rel_type {
+                const VALID_RELS: &[&str] = &[
+                    "supports",
+                    "contradicts",
+                    "derives_from",
+                    "refines",
+                    "analogous",
+                    "authored",
+                    "asserts",
+                    "variant_of",
+                    "produced",
+                    "cites",
+                ];
+                if !VALID_RELS.contains(&rt.as_str()) {
+                    return Err(ApiError::ValidationError {
+                        field: "relationship".to_string(),
+                        reason: format!(
+                            "Unknown relationship type: {}. Valid: {:?}",
+                            rt, VALID_RELS
+                        ),
+                    });
+                }
             }
-            format!("AND e.relationship = '{}'", rt)
+            Some(GqlWalk {
+                relationship: edge.rel_type.as_deref(),
+                direction: match edge.direction {
+                    EdgeDirection::Outgoing => GqlDirection::Outgoing,
+                    EdgeDirection::Incoming => GqlDirection::Incoming,
+                    EdgeDirection::Any => GqlDirection::Any,
+                },
+                min_hops: edge.min_hops,
+                max_hops: edge.max_hops.min(4), // Safety cap
+            })
+        }
+        None => None,
+    };
+
+    // The selection AND the walk are read through the viewer (backlog
+    // 4815dcf7): the anchor table and every `edges` hop carry the predicate,
+    // so neither a property predicate nor a traversal reaches past what the
+    // caller can read, and the LIMIT window counts only readable rows.
+    let node_ids = GraphViewRepository::graph_query_node_ids(
+        pool,
+        &viewer,
+        node_table,
+        &conditions,
+        limit,
+        walk,
+    )
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: if walk.is_some() {
+            format!("Graph Query Error: {}", e)
         } else {
-            String::new()
-        };
+            format!("Query Error: {}", e)
+        },
+    })?;
 
-        let direction_filter = match edge.direction {
-            EdgeDirection::Outgoing => "e.source_id = p.id",
-            EdgeDirection::Incoming => "e.target_id = p.id",
-            EdgeDirection::Any => "(e.source_id = p.id OR e.target_id = p.id)",
-        };
-
-        let max_hops = edge.max_hops.min(4); // Safety cap
-        let min_hops = edge.min_hops;
-
-        let sql = format!(
-            r#"
-            WITH RECURSIVE paths(id, depth) AS (
-                (SELECT id, 0
-                FROM {node_table}
-                {where_sql}
-                ORDER BY created_at DESC, id
-                LIMIT {limit})
-                UNION
-                SELECT
-                    CASE WHEN e.source_id = p.id THEN e.target_id ELSE e.source_id END,
-                    p.depth + 1
-                FROM edges e
-                JOIN paths p ON {direction_filter}
-                WHERE p.depth < {max_hops}
-                {rel_filter}
-            )
-            SELECT DISTINCT id FROM paths WHERE depth >= {min_hops};
-            "#,
-        );
-
-        #[derive(sqlx::FromRow)]
-        struct IdRow {
-            id: Uuid,
-        }
-
-        // Build dynamic query with bound parameters
-        let mut query = sqlx::query_as::<_, IdRow>(&sql);
-        let mut str_idx = 0;
-        for i in 1..=param_idx {
-            if let Some((_, n)) = bind_numbers.iter().find(|(idx, _)| *idx == i) {
-                query = query.bind(*n);
-            } else {
-                query = query.bind(&bind_strings[str_idx]);
-                str_idx += 1;
-            }
-        }
-
-        let path_nodes: Vec<IdRow> =
-            query
-                .fetch_all(pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Graph Query Error: {}", e),
-                })?;
-
-        let node_ids: Vec<Uuid> = path_nodes.into_iter().map(|r| r.id).collect();
-
-        if node_ids.is_empty() {
-            return Ok(Json(FullGraphResponse {
-                nodes: vec![],
-                edges: vec![],
-                total_nodes: 0,
-                total_edges: 0,
-            }));
-        }
-
-        // No `apply_partition_filter`: `load_subgraph` is spliced with
-        // `&viewer`, so a claim node the caller may not read is not in `resp`.
-        let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
-        Ok(resp)
-    } else {
-        let sql = format!(
-            "SELECT id FROM {} {} ORDER BY created_at DESC, id LIMIT {}",
-            node_table, where_sql, limit
-        );
-
-        #[derive(sqlx::FromRow)]
-        struct IdRow {
-            id: Uuid,
-        }
-
-        let mut query = sqlx::query_as::<_, IdRow>(&sql);
-        let mut str_idx = 0;
-        for i in 1..=param_idx {
-            if let Some((_, n)) = bind_numbers.iter().find(|(idx, _)| *idx == i) {
-                query = query.bind(*n);
-            } else {
-                query = query.bind(&bind_strings[str_idx]);
-                str_idx += 1;
-            }
-        }
-
-        let matches: Vec<IdRow> =
-            query
-                .fetch_all(pool)
-                .await
-                .map_err(|e| ApiError::InternalError {
-                    message: format!("Query Error: {}", e),
-                })?;
-
-        let node_ids: Vec<Uuid> = matches.into_iter().map(|r| r.id).collect();
-        if node_ids.is_empty() {
-            return Ok(Json(FullGraphResponse {
-                nodes: vec![],
-                edges: vec![],
-                total_nodes: 0,
-                total_edges: 0,
-            }));
-        }
-
-        // No `apply_partition_filter`: `load_subgraph` is spliced with
-        // `&viewer`, so a claim node the caller may not read is not in `resp`.
-        let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
-        Ok(resp)
+    if node_ids.is_empty() {
+        return Ok(Json(FullGraphResponse {
+            nodes: vec![],
+            edges: vec![],
+            total_nodes: 0,
+            total_edges: 0,
+        }));
     }
+
+    // No `apply_partition_filter`: `load_subgraph` is spliced with
+    // `&viewer`, so a claim node the caller may not read is not in `resp`.
+    let resp = super::graph_query_utils::load_subgraph(pool, &viewer, node_ids).await?;
+    Ok(resp)
 }
 
 #[cfg(not(feature = "db"))]

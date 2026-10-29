@@ -1469,11 +1469,11 @@ pub struct VerifyResponse {
     ///
     /// What `true` does NOT prove:
     /// * that the author asserted THIS claim. The signature covers
-    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
-    ///   evidence distinction (evidence rows are signed the same way). Someone
-    ///   who can write the database directly can copy the author's signature
-    ///   from any claim or evidence row with the same bytes onto a row naming
-    ///   that author, and it reports bound.
+    ///   `blake3(content)` only: no author and no `created_at`, and under
+    ///   [`Self::signature_scheme`] `legacy` no claim / evidence distinction
+    ///   either. Someone who can write the database directly can copy the
+    ///   author's signature from any claim (or, legacy, evidence) row with the
+    ///   same bytes onto a row naming that author, and it reports bound.
     /// * the date. `created_at` is set by the writer and is not signed, so the
     ///   window test trusts it: a backdated row passes it.
     /// * anything, under an `identity-legacy` key: its private half is
@@ -1487,6 +1487,13 @@ pub struct VerifyResponse {
     /// `"unattested"` (only the signer's `agents.public_key` verifies it, and
     /// no attested row carries that key). `null` when no key verifies.
     pub key_kind: Option<&'static str>,
+    /// Which message the verifying signature was made over (ruling R-34):
+    /// `"v1"` (`epigraph-sig-v1:claim:` || digest, bound to the claim type) or
+    /// `"legacy"` (the bare digest, written before v1: it binds no entity
+    /// type, so an evidence row with the same bytes carries an equally valid
+    /// one). `null` when nothing verifies. A v1 signature tagged for evidence
+    /// or an edge never verifies a claim.
+    pub signature_scheme: Option<epigraph_crypto::SignatureScheme>,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
     pub hash_check: HashCheck,
