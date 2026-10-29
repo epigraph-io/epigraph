@@ -1781,32 +1781,36 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "ingest_anchors",
         "READ of `workflows` only: `find_root_by_canonical` / `head_by_canonical` / \
          `resolve_ingest_parent` lookups by `canonical_name` (batch H-b review, H3's \
-         lineage-takeover fix). `workflows` has no row security and no policy, as \
-         `find_root_by_canonical` records, so there is nothing for a viewer to filter; the \
-         ingest entry points call it on the plan walk's own transaction to decide which \
-         existing rows need the caller's authority.",
+         lineage-takeover fix), to decide which existing rows need the caller's authority. \
+         Since migration 183 (ruling R-74) `workflows` carries its plan's tenancy and row \
+         security, so the stamp of the connection it runs on bounds what it sees: the ingest \
+         entry points call it on the plan walk's own transaction, stamped from the ingest \
+         system agent, which reads every group it ingests into; a caller viewer predicate could \
+         only hide an anchor and so skip an authority check.",
     ),
     (
         "workflow.rs",
         "resolve_ingest_parent",
         "READ of `workflows` only (U032): the row an ingest links as `parent_id`, the named \
-         parent at `generation - 1` or the lineage's predecessor. `workflows` has no row \
-         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
-         viewer to filter; the executor and `ingest_anchors` both call it on the plan walk's \
-         own transaction so the row authority-checked is the row linked.",
+         parent at `generation - 1` or the lineage's predecessor. Since migration 183 (ruling \
+         R-74) `workflows` carries its plan's tenancy and row security, so the stamp of the \
+         connection it runs on bounds what it sees: the executor and `ingest_anchors` both call \
+         it on the plan walk's system-agent-stamped transaction, so the row authority-checked \
+         is the row linked.",
     ),
     (
         "workflow.rs",
         "workflows_executing_step_lineage",
-        "AUTHORITY READ of `edges` (`executes`), `claims` (the parent's `step_lineage_id` \
-         siblings) and `workflows` (no row security), for the `evolve_step` gate: it returns the \
-         workflows the caller must hold workflow authority over, so a spliced viewer predicate \
-         could only DROP workflows from that set, which makes the gate fail open, never safer. \
-         Both callers run it on the caller's own stamped write transaction (MCP \
-         `begin_author_stamped_tx`, REST `begin_claim_write`), before the act it gates, so row \
-         security on that connection still applies; the residual it leaves (lineage members \
-         split across tenancies out of band) is stated on the function. Returns workflow ids \
-         only, never content.",
+        "AUTHORITY READ of `edges` (`executes`) and `claims` (the parent's `step_lineage_id` \
+         siblings), for the `evolve_step` gate; the workflow ids come from the edges, with no \
+         join to `workflows`, whose row security (migration 183) would drop a row the caller \
+         cannot read. It returns the workflows the caller must hold workflow authority over, so a \
+         spliced viewer predicate could only DROP workflows from that set, which makes the gate \
+         fail open, never safer. Both callers run it on the caller's own stamped write \
+         transaction (MCP `begin_author_stamped_tx`, REST `begin_claim_write`), before the act \
+         it gates, so row security on that connection still applies; the residual it leaves \
+         (lineage members split across tenancies out of band) is stated on the function. \
+         Returns workflow ids only, never content.",
     ),
     (
         "system_agent.rs",
@@ -2836,55 +2840,42 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "search_hierarchical_by_text",
-        "Reads the `workflows` table by ILIKE over `canonical_name`/`goal`, and the statement's \
-         FROM is `workflows` alone -- it joins nothing. `workflows` is the HIERARCHICAL root \
-         table, which is a different relation from the `claims` rows labelled `workflow` that \
-         `WorkflowRepository::list`/`find_by_embedding` read and DO splice a viewer into; the \
-         distinction is why this entry exists beside functions in the same file that need none. \
-         Measured at migration head 92 it carries neither a `visibility` nor an `owner_group_id` \
-         column, and row-level security is off on it (`pg_class.relrowsecurity` and \
-         `relforcerowsecurity` both false, against `claims` which is true/true). So this site has \
-         no column to attach a predicate to and no policy for a session GUC to select, and a \
-         `&Viewer` here would be a parameter the statement could not spend. THE VISIBLE ROW SET \
-         IS UNCHANGED BY THE CONVERSION: its caller \
-         `routes/workflows.rs::find_workflow_hierarchical` reads this beside \
-         `resolve_steps_to_heads_batched`, which is viewer-spliced over `edges` and `claims`, and \
-         the reason it now shares that connection is that the handler's answer should be \
-         assembled under ONE tenancy stamp, not that this read was leaking. SCOPE: conversion \
-         shard 7 widened the executor only. The SQL, its three binds and the projected row shape \
-         are unchanged and were not re-derived here. REACH IS WIDER THAN MOTIVATION: one other \
-         production call site -- `epigraph-mcp/src/tools/workflow_hierarchical.rs` -- still \
-         passes `&PgPool`, which satisfies `E: PgExecutor<'e>`, and was not edited.",
+        "Reads the `workflows` table by ILIKE over `canonical_name`/`goal`; the statement's \
+         FROM is `workflows` alone. `workflows` is the HIERARCHICAL root table, a different \
+         relation from the `claims` rows labelled `workflow` that `list`/`find_by_embedding` \
+         read and splice a viewer into. Since migration 183 (ruling R-74) the row carries its \
+         plan's tenancy under FORCEd row security, and every production caller runs this on the \
+         CALLER's viewer-stamped read (REST `find_workflow_hierarchical`, MCP \
+         `find_workflow_hierarchical` and `find_workflow` when the server has a tenancy-aware \
+         pool), so the policy \
+         returns exactly the rows the caller may read; an in-query predicate would restate it. \
+         A development server without a tenancy-aware pool reads its plain pool, where the \
+         policy admits public rows only.",
     ),
     (
         "workflow.rs",
         "find_hierarchical_by_embedding",
         "Cosine-similarity search over `workflows.goal_embedding`; the statement's FROM is \
-         `workflows` alone (cross-joined to a one-row `q` CTE holding the query vector) and it \
-         joins no other relation. Same relation and same measured posture as \
-         `search_hierarchical_by_text` above -- at migration head 92 `workflows` carries neither \
-         a `visibility` nor an `owner_group_id` column and has row-level security off \
-         (`relrowsecurity` and `relforcerowsecurity` both false) -- but the argument is RESTATED \
-         rather than inherited from the file name, because these are two different statements and \
-         a shared file proves nothing about either. This is the embedding-ranked sibling of the \
-         ILIKE path and falls back to it, so the two must agree about what they may return. \
-         SCOPE: conversion shard 7 widened the executor only; the SQL, its four binds and the \
-         projected row shape are unchanged. REACH IS WIDER THAN MOTIVATION: one other production \
-         call site -- `epigraph-mcp/src/tools/workflow_hierarchical.rs` -- still passes \
-         `&PgPool` and was not edited.",
+         `workflows` alone (cross-joined to a one-row `q` CTE holding the query vector). Same \
+         relation and posture as `search_hierarchical_by_text`, restated because these are two \
+         statements: since migration 183 the row carries its plan's tenancy under FORCEd row \
+         security, and both production callers run this on the caller's viewer-stamped read, so \
+         the policy returns exactly the rows the caller may read. It is the embedding-ranked \
+         sibling of the ILIKE path and falls back to it, so the two agree about what they may \
+         return.",
     ),
     (
         "behavioral_execution.rs",
         "behavioral_affinity_hierarchical",
         "U033: scores hierarchical outcome reports. FROM `behavioral_executions` JOIN `workflows` \
-         and nothing else -- no `claims`, no `edges`. Neither relation carries a `visibility` or \
-         `owner_group_id` column, and row security is off on both (`residual_unstamped_writes.rs` \
-         records `workflows` as MEASURED `relrowsecurity = false`; `behavioral_executions` as \
-         not claim-derived with no `owner_group_id`). It projects only `(workflows.id, float8, \
-         bigint)` -- no content column. The `workflows` ids it can return are the same ones the \
-         viewer-less `search_hierarchical_by_embedding_scored` already returns to every caller of \
-         `find_workflow`. The flat (claim-rooted) twin, `behavioral_affinity_lineage`, keeps its \
-         Viewer and its markers; this is a separate fn precisely so the claim arm is unchanged.",
+         and nothing else -- no `claims`, no `edges`. `behavioral_executions` is not \
+         claim-derived and has no `owner_group_id`; since migration 183 (ruling R-74) the joined \
+         `workflows` row carries its plan's tenancy under FORCEd row security, and the \
+         production caller (MCP `find_workflow`) runs this on the CALLER's viewer-stamped read, \
+         so the join keeps exactly the rows the caller may read. It projects only \
+         `(workflows.id, float8, bigint)` -- no content column. The flat (claim-rooted) twin, \
+         `behavioral_affinity_lineage`, keeps its Viewer and its markers; this is a separate fn \
+         precisely so the claim arm is unchanged.",
     ),
     (
         "behavioral_execution.rs",
@@ -3073,16 +3064,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "set_truth_value",
-        "UPDATE `workflows` SET `truth_value`. THE ONE ENTRY HERE THAT IS NOT ABOUT A REFUSAL, \
-         and the distinction is measured rather than assumed: at migration head 101 `workflows` \
-         has `relrowsecurity` and `relforcerowsecurity` both FALSE, no policy, and no entry in \
-         migration 062's `tier_a` array — so unlike the `claims` UPDATE it cascades from, this \
-         statement is NOT refused on an unstamped session and a `&Viewer` would have nothing to \
-         filter on either. The executor moved for COHESION: `deprecate_workflow` flips the flat \
-         claim and this hierarchical row as two halves of ONE deprecation, and a `claims` row \
-         marked `is_current = false` whose `workflows` row keeps its truth value is exactly the \
-         split the cascade exists to prevent — `find_workflow_hierarchical` reads the half that \
-         was missed. SCOPE: executor only; the SQL is unchanged.",
+        "UPDATE `workflows` SET `truth_value` by primary key, for `deprecate_workflow`'s \
+         cascade from the flat claim onto the hierarchical row (one deprecation, one \
+         transaction). Since migration 183 (ruling R-74) `workflows` carries its plan's tenancy \
+         and row security, so the stamp of the connection it runs on bounds what it sees: the \
+         REST handler runs it on the caller's stamped transaction after its authority check, so \
+         it updates only a row the caller reads; there is no read for a viewer to filter.",
     ),
     // ── Unit E (R3 release gate). Every entry below was a viewer-less `&PgPool`
     // function before this branch; ONLY its executor widened, so the ingest
@@ -3239,9 +3226,11 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "head_by_canonical",
-        "READ of `workflows` by `canonical_name` (latest generation). `workflows` has no row \
-         security and no policy, as `find_root_by_canonical` records, so there is nothing for a \
-         viewer to filter; batch H-b's H3 check resolves the workflow a step op names with it.",
+        "READ of `workflows` by `canonical_name` (latest generation), for batch H-b's H3 check \
+         of the workflow a step op names. Since migration 183 (ruling R-74) `workflows` carries \
+         its plan's tenancy and row security, so the stamp of the connection it runs on bounds \
+         what it sees: it runs on the step op's system-agent-stamped transaction; a caller \
+         predicate could only hide the head an authority check is made against.",
     ),
     (
         "perspective.rs",
@@ -3263,30 +3252,35 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "workflow.rs",
         "record_submitter",
-        "WRITE of one `workflows` row's `metadata.epigraph_submitted_by`, once (batch H-b, H3). \
-         `workflows` has no row security and no policy, so there is no stamp to satisfy; the \
-         ingest entry point calls it on the plan walk's own transaction.",
+        "WRITE of one `workflows` row's `metadata.epigraph_submitted_by`, once (batch H-b, H3), \
+         on the plan walk's own system-agent-stamped transaction. Row security (migration 183) \
+         admits the UPDATE of a row that stamp reads; there is no read to filter.",
     ),
     (
         "workflow.rs",
         "submitter_of",
-        "READ of one `workflows` row's recorded submitter (batch H-b, H3). No row security and no \
-         policy on `workflows`; it is an authority check's input, not a disclosure.",
+        "READ of one `workflows` row's recorded submitter (batch H-b, H3): an authority check's \
+         input on the caller's or the system agent's stamped transaction, bounded by \
+         `workflows`' row security (migration 183); not a disclosure.",
     ),
     (
         "workflow.rs",
         "find_root_by_canonical",
-        "READ of `workflows` by `(canonical_name, generation)`. `workflows` has \
-         `relrowsecurity` and `relforcerowsecurity` both FALSE and no policy (measured at head \
-         101), so there is nothing for a viewer to filter; it is the ingest executor's \
-         idempotency gate and must see every row. Widened to ride the plan walk's transaction.",
+        "READ of `workflows` by `(canonical_name, generation)`: the ingest executor's \
+         idempotency gate, on the plan walk's system-agent-stamped transaction. Since migration \
+         183 (ruling R-74) `workflows` carries its plan's tenancy and row security, so the \
+         stamp of the connection it runs on bounds what it sees: a row that stamp cannot read \
+         is absent here, and the executor then refuses rather than write under it (it re-reads \
+         the row after `insert_root`).",
     ),
     (
         "workflow.rs",
         "insert_root",
-        "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO NOTHING`. \
-         `workflows` has no RLS (see `find_root_by_canonical`); widened for COHESION, so a \
-         workflow row cannot survive the rollback of the plan walk that wrote it.",
+        "WRITE: `INSERT INTO workflows ... ON CONFLICT (canonical_name, generation) DO \
+         NOTHING`, with the row's tenancy declared by the caller (migration 183: never \
+         defaulted; the row-security WITH CHECK asks that the stamp writes the owner group). On \
+         the plan walk's own transaction for COHESION, so a workflow row cannot survive the \
+         rollback of the walk that wrote it.",
     ),
     // ── U017 (backlog fe874d2a): `deprecate_workflow` retires a hierarchical
     //    workflow as a unit, on the ingest system agent's stamped transaction.
@@ -3303,31 +3297,39 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "workflow.rs",
         "set_truth_value_if_changed",
         "UPDATE `workflows` SET `truth_value` WHERE it differs, so `rows_affected` means the \
-         state changed. `workflows` has no row security and no policy (see `set_truth_value`), \
-         so there is nothing for a viewer to filter; the caller's authority is \
-         `require_workflow_authority` over the same row.",
+         state changed. Since migration 183 (ruling R-74) `workflows` carries its plan's \
+         tenancy and row security, so the stamp of the connection it runs on bounds what it \
+         sees: the caller's authority is `require_workflow_authority` over the same row, and \
+         there is no read for a viewer to filter.",
     ),
     (
         "workflow.rs",
         "exists",
-        "READ of `workflows` only: whether a row with this id exists, for `deprecate_workflow`'s \
-         dispatch between a flat claim and a hierarchical row. `workflows` has no row security \
-         and no policy, so the answer is the same on every connection.",
+        "READ of `workflows` only: whether a row with this id is visible, for \
+         `deprecate_workflow`'s dispatch between a flat claim and a hierarchical row. Since \
+         migration 183 (ruling R-74) `workflows` carries its plan's tenancy and row security, \
+         so the stamp of the connection it runs on bounds what it sees: on the caller's stamped \
+         transaction a row declared into a group it does not read answers false, like an \
+         unknown id.",
     ),
     (
         "workflow.rs",
         "lineage_descendants",
         "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
-         set of `deprecate_workflow`). `workflows` has no row security and no policy; it reads \
-         `parent_id` rather than `edges` precisely so no tenancy filter can truncate the walk.",
+         set of `deprecate_workflow`). Since migration 183 (ruling R-74) `workflows` carries \
+         its plan's tenancy and row security, so the stamp of the connection it runs on bounds \
+         what it sees: on the system-agent stamp (MCP) every group it ingests into, on the \
+         caller's stamp (REST) the rows the caller reads; a descendant outside that set is not \
+         deprecated by this call.",
     ),
     (
         "workflow.rs",
         "lock_lineages_for_deprecation",
         "READ of `workflows` only, `FOR UPDATE`: locks the rows sharing a `canonical_name` with \
          a deprecation's targets, so two concurrent deprecations cannot each keep a claim the \
-         other retires. `workflows` has no row security and no policy, so there is nothing for \
-         a viewer to filter; the caller's authority is `require_workflow_authority`.",
+         other retires. Since migration 183 (ruling R-74) `workflows` carries its plan's \
+         tenancy and row security, so the stamp of the connection it runs on bounds what it \
+         sees: the caller's authority is `require_workflow_authority`.",
     ),
     (
         "workflow.rs",
@@ -3342,9 +3344,33 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "workflow.rs",
         "lock_for_plan_edit",
         "READ of `workflows` only, `FOR UPDATE`: locks the one row `add_step` is about to \
-         extend, so two concurrent calls cannot take the same next `plan_index`. `workflows` \
-         has no row security and no policy, so there is nothing for a viewer to filter; the \
-         caller's authority is `require_workflow_authority` over the same row.",
+         extend, so two concurrent calls cannot take the same next `plan_index`. Since \
+         migration 183 (ruling R-74) `workflows` carries its plan's tenancy and row security, \
+         so the stamp of the connection it runs on bounds what it sees: it runs on the \
+         system-agent-stamped transaction; the caller's authority is \
+         `require_workflow_authority` over the same row.",
+    ),
+    (
+        "workflow.rs",
+        "max_generation_by_canonical",
+        "READ of `workflows` only: the highest generation of one `canonical_name`, which \
+         numbers the generation `improve_workflow_hierarchy` creates (executor-generic since \
+         migration 183). Its numbering caller runs it on the ingest system agent's stamp, the \
+         identity whose plan walk writes that generation, so `workflows`' row security bounds it \
+         to the groups that agent ingests into; a caller viewer predicate could hide a \
+         group-private head and number a generation below it. MCP `find_workflow`'s \
+         `latest_generation` disclosure runs it on the CALLER's stamped read, where the same \
+         row security bounds it to the rows the caller reads. Returns one integer.",
+    ),
+    (
+        "workflow.rs",
+        "set_goal_embedding",
+        "WRITE of one `workflows` row's `goal_embedding` by primary key, best-effort after an \
+         ingest committed (migration 183 made it executor-generic). Since migration 183 the row \
+         carries its plan's tenancy under row security, so every production caller runs it on \
+         the ingest system agent's stamped transaction (the identity that wrote the row and \
+         reads its group); the CLI backfill runs it on its maintenance connection. There is no \
+         read for a viewer to filter.",
     ),
     (
         "workflow.rs",

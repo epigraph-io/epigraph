@@ -23,8 +23,10 @@
 //! * A caller that reads NONE of the plan's `executes` edges is refused on
 //!   both tools with the hierarchical not-found error, which is exactly what
 //!   the direct tool answers for an unknown id, and nothing is written:
-//!   `workflows` has no row security, so this is the only gate on its
-//!   counters. It learns no step id. (`report_workflow_outcome` answers an
+//!   the fixture's `workflows` row is PUBLIC (seeded without a declaration,
+//!   so the seed role's `('public', seed)`), so the plan's steps are what
+//!   refuses it here; a row declared into a group is refused on the row too
+//!   (migration 183, `workflow_ingest_group_tenancy.rs`). It learns no step id. (`report_workflow_outcome` answers an
 //!   unknown id through the flat path's own error; a known, pre-existing
 //!   difference, pinned in `a_non_member_cannot_report_on_a_plan_it_cannot_read`.)
 //! * A reader of the plan whose `step_index` matches no step it can read gets
@@ -96,6 +98,7 @@ async fn seed_private_workflow(pool: &PgPool, name: &str) -> PrivateWorkflow {
         "A workflow whose steps only one group can read.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -337,6 +340,7 @@ async fn seed_mixed_plan(pool: &PgPool, name: &str) -> MixedPlan {
         "A private plan with one public step appended.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -500,6 +504,7 @@ async fn a_plan_without_ordinals_still_resolves_by_position(pool: PgPool) {
         "A public plan with no ordinals.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -954,8 +959,9 @@ async fn refusals(
 
 /// A caller that can read none of a workflow's `executes` edges is refused on
 /// both MCP entry points with exactly the error an unknown id gets, and
-/// nothing is written: `workflows` has no row security, so without this
-/// refusal any writer could move a group-private workflow's counters. A
+/// nothing is written: the fixture's `workflows` row is public, so without
+/// this refusal any writer could move the counters of a plan whose steps are
+/// group-private. A
 /// member's report on the same plan is recorded (positive control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
@@ -973,9 +979,11 @@ async fn a_non_member_cannot_report_on_a_plan_it_cannot_read(pool: PgPool) {
     // id to the legacy flat-claim path and that path's own error, while an
     // existing `workflows` row takes the hierarchical branch and gets the
     // hierarchical not-found error. That difference predates this gate and is
-    // a known limitation: the row's existence is not secret (`workflows` has
-    // no row security), but the delegated tool does tell "exists" from
-    // "absent". Pinned below so that changing it is a deliberate decision.
+    // a known limitation for a PUBLIC row like this fixture's (its existence
+    // is not secret), but the delegated tool does tell "exists" from
+    // "absent". A row declared into a group the caller does not read routes
+    // like an unknown id (migration 183). Pinned below so that changing it is
+    // a deliberate decision.
     let unknown = refusals(&server, &w.stranger, Uuid::new_v4()).await;
     assert_eq!(
         refused[0], unknown[0],
@@ -1028,6 +1036,7 @@ async fn a_root_with_no_executes_edge_is_refused_like_an_unknown_id(pool: PgPool
         "A workflow root with no plan claims.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -1169,6 +1178,7 @@ async fn a_step_less_plan_is_refused_to_every_reporter(pool: PgPool) {
         "A thesis scaffold with no steps yet.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");

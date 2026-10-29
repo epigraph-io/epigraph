@@ -1140,3 +1140,223 @@ async fn a_group_writer_reordering_or_retracting_edges_changes_what_the_read_rep
     assert!(!item_ids(&p).contains(&edges[8].1));
     assert_eq!(p["digest_echo"], Value::Null);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// chain_order (ruling R-81, backlog ca30e645)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The body's `chain_order`, insisting on an array of claim ids.
+fn chain_order(p: &Value) -> Vec<Uuid> {
+    p["chain_order"]
+        .as_array()
+        .unwrap_or_else(|| panic!("chain_order is an array in {p}"))
+        .iter()
+        .map(uuid_of)
+        .collect()
+}
+
+/// The level-2 items, in the order the body lists them (`plan_index` order).
+fn item_steps(p: &Value) -> Vec<Uuid> {
+    p["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|i| i["level"] == json!(2))
+        .map(|i| uuid_of(&i["claim_id"]))
+        .collect()
+}
+
+/// The body with `chain_order` removed, serialized: what the digest and every
+/// pre-existing field are read from.
+fn without_chain_order(p: &Value) -> Vec<u8> {
+    let mut p = p.clone();
+    p.as_object_mut()
+        .expect("a plan object")
+        .remove("chain_order");
+    serde_json::to_vec(&p).expect("serialize")
+}
+
+/// The step order every plan-order reader walks (harness read).
+async fn reader_chain(pool: &PgPool, workflow_id: Uuid) -> Vec<Uuid> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_ingest_executor::workflow_steps::ordered_steps(&mut conn, workflow_id)
+        .await
+        .expect("ordered_steps")
+}
+
+/// Re-point the `step_follows` edge `from -> to` as `to -> from` (harness
+/// write: the edges are world-owned, and no API route rewires a chain except
+/// `add_step`). Insists that exactly one edge moved.
+async fn reverse_step_follows(pool: &PgPool, from: Uuid, to: Uuid) {
+    let moved = sqlx::query(
+        "UPDATE edges SET source_id = $2, target_id = $1 \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(pool)
+    .await
+    .expect("harness: reverse the step_follows edge")
+    .rows_affected();
+    assert_eq!(
+        moved, 1,
+        "calibration: one {from} -> {to} step_follows edge"
+    );
+}
+
+/// `chain_order` lists the plan's steps in `step_follows` order, the order
+/// `find_workflow`, `find_workflow_hierarchical` and the outcome reports'
+/// `step_index` use, while `items` stay in stored `plan_index` order and the
+/// digest stays the digest of THAT order.
+///
+/// The chain is re-pointed so that step 1.2 precedes 1.1: `chain_order`
+/// follows it, equal to the readers' walk, and differs from the items' step
+/// order. Every other byte of the body is what it was before the re-point,
+/// and the echo is still the independently computed `wfd1`. Then a second
+/// successor makes the chain fork: there is no single chain, and
+/// `chain_order` falls back to stored order, as the readers do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn chain_order_follows_step_follows_and_leaves_the_items_and_digest_alone(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let [s11, s12, s21] = vector_steps();
+    let v = vectors();
+
+    let before = api.plan(&t, wf).await;
+    assert_eq!(item_steps(&before), vec![s11, s12, s21]);
+    assert_eq!(chain_order(&before), vec![s11, s12, s21], "{before}");
+
+    reverse_step_follows(&pool, s11, s12).await;
+    let after = api.plan(&t, wf).await;
+    assert_eq!(chain_order(&after), vec![s12, s11, s21], "{after}");
+    assert_eq!(
+        chain_order(&after),
+        reader_chain(&pool, wf).await,
+        "the order every plan-order reader walks"
+    );
+    assert_eq!(
+        item_steps(&after),
+        vec![s11, s12, s21],
+        "items keep stored order"
+    );
+    assert_eq!(flags(&after), clean(), "{after}");
+    assert_eq!(after["digest_echo"], v["ingest"]["wfd1"]);
+    assert_eq!(
+        without_chain_order(&after),
+        without_chain_order(&before),
+        "nothing but chain_order moved"
+    );
+
+    // A fork: 1.2 gets a second successor. No single chain; stored order.
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'step_follows')",
+    )
+    .bind(s12)
+    .bind(s21)
+    .execute(&pool)
+    .await
+    .expect("harness: a second successor of step 1.2");
+    let forked = api.plan(&t, wf).await;
+    assert_eq!(chain_order(&forked), vec![s11, s12, s21], "{forked}");
+    assert_eq!(chain_order(&forked), reader_chain(&pool, wf).await);
+    assert_eq!(forked["digest_echo"], v["ingest"]["wfd1"]);
+}
+
+/// A middle insert is unindexed, so it is no item and the plan has no digest
+/// echo; `chain_order` still lists it at the slot it was inserted at, which
+/// is the slot every plan-order reader gives it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn chain_order_lists_an_unindexed_insert_at_its_slot(pool: PgPool) {
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let body = add_step(&api, &t, "ACME-123456 inserted step", Some(1)).await;
+    let mid = uuid_of(&body["step_claim_id"]);
+    let [s11, s12, s21] = vector_steps();
+
+    let p = api.plan(&t, wf).await;
+    assert_eq!(p["unindexed_edges"], json!(1), "{p}");
+    assert!(!item_ids(&p).contains(&mid), "{p}");
+    assert_eq!(p["digest_echo"], Value::Null);
+    assert_eq!(chain_order(&p), vec![s11, mid, s12, s21], "{p}");
+    assert_eq!(chain_order(&p), reader_chain(&pool, wf).await);
+}
+
+/// What a pinned-workflow resolver parses: it recomputes `wfd1` from the
+/// body's items alone (sorted by `plan_index`; level, claim id and content)
+/// and tolerates top-level fields it does not know. So `chain_order` is a
+/// TOP-LEVEL key only, every item carries exactly the keys it carried
+/// before, and the recomputation from the body equals the echo and the
+/// vectors even when `chain_order` differs from the items' step order. A
+/// digest taken in chain order would not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_resolver_recomputes_the_digest_from_items_whatever_chain_order_says(pool: PgPool) {
+    use epigraph_ingest::workflow::frozen_plan::{wfd1, DigestItem};
+
+    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let api = Api::prod_shaped(&pool).await;
+    let t = token(curator, WRITE_SCOPES);
+    let wf = api.ingest(&t, &extraction()).await;
+    let [s11, s12, _] = vector_steps();
+    reverse_step_follows(&pool, s11, s12).await;
+    let p = api.plan(&t, wf).await;
+    let v = vectors();
+
+    assert!(p["chain_order"].is_array(), "chain_order is top-level: {p}");
+    let item_keys = [
+        "claim_id",
+        "content",
+        "content_hash",
+        "content_hash_ok",
+        "heads_diverged",
+        "is_current",
+        "level",
+        "owner_group_id",
+        "phase",
+        "plan_index",
+        "truth_value",
+        "visibility",
+    ];
+    for item in p["items"].as_array().expect("items") {
+        let mut keys: Vec<&str> = item
+            .as_object()
+            .expect("an item object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, item_keys, "{item}");
+    }
+
+    let mut items: Vec<&Value> = p["items"].as_array().unwrap().iter().collect();
+    items.sort_by_key(|i| i["plan_index"].as_u64().expect("plan_index"));
+    let digest_of = |items: &[&Value]| {
+        wfd1(
+            p["canonical_name"].as_str().expect("canonical_name"),
+            u32::try_from(p["generation"].as_u64().expect("generation")).unwrap(),
+            items.iter().map(|i| DigestItem {
+                level: u32::try_from(i["level"].as_u64().unwrap()).unwrap(),
+                claim_id: uuid_of(&i["claim_id"]),
+                content: i["content"].as_str().unwrap(),
+            }),
+        )
+    };
+    let recomputed = digest_of(&items);
+    assert_eq!(json!(recomputed), v["ingest"]["wfd1"]);
+    assert_eq!(json!(recomputed), p["digest_echo"]);
+
+    // Mutation check: the items with their steps put in chain order.
+    let pos = |id: Uuid| {
+        items
+            .iter()
+            .position(|i| uuid_of(&i["claim_id"]) == id)
+            .unwrap()
+    };
+    let mut chained = items.clone();
+    chained.swap(pos(s11), pos(s12));
+    assert_ne!(json!(digest_of(&chained)), p["digest_echo"]);
+}

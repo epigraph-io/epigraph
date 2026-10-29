@@ -714,6 +714,9 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // precedent. Apply 173 before or with a binary carrying these two names.
     "harvester_sources",
     "harvester_audit_reports",
+    // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
+    // that migration, on the same precedent.
+    "workflows",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

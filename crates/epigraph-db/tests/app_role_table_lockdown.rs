@@ -104,7 +104,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("tasks", OPERATIONAL),
     ("webhook_subscriptions", OPERATIONAL),
     ("workflow_executions", OPERATIONAL),
-    ("workflows", OPERATIONAL),
 ];
 
 /// Credential, authority and ledger tables: never allowlisted, and the

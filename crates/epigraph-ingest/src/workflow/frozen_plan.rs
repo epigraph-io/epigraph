@@ -28,6 +28,13 @@
 //! The echo is informational: equal to that digest when the plan is what was
 //! published, different when it is not, and a resolver decides on its own
 //! recomputation, never on the echo.
+//!
+//! # `chain_order` is not digested
+//!
+//! [`FrozenPlan::chain_order`] carries the plan's steps in the `step_follows`
+//! order the other plan-order readers use (ruling R-81). It is passed through
+//! as read, never an input of [`wfd1`], never used to order `items`, and never
+//! attested: a resolver that pins a plan reads `items` alone.
 
 use std::collections::BTreeSet;
 
@@ -158,6 +165,9 @@ pub struct FrozenPlanInput {
     pub truth_value: f64,
     pub submitter: Option<Uuid>,
     pub edges: Vec<ExecutesEdge>,
+    /// The level-2 steps in `step_follows` chain order, as read. Copied to
+    /// [`FrozenPlan::chain_order`]; nothing here reads it.
+    pub chain_order: Vec<Uuid>,
 }
 
 /// One item of a [`FrozenPlan`] (SPEC §2.13).
@@ -218,6 +228,32 @@ pub struct FrozenPlan {
     /// the digest of the shortened plan. Only a comparison with the digest the
     /// publisher pinned detects a missing tail.
     pub digest_echo: Option<String>,
+    /// The ids of the plan's level-2 steps in `step_follows` chain order: the
+    /// order `find_workflow` and `find_workflow_hierarchical` list them in and
+    /// the outcome reports' `step_index` counts, so `chain_order[i]` is the
+    /// step those readers call step `i` (ruling R-81). Informational, like the
+    /// echo, and OUTSIDE it: not digested, not attested, and `items` stay in
+    /// `plan_index` order whatever it says.
+    ///
+    /// Where it is not the order of `items`' steps:
+    ///
+    /// * a step `add_step` inserted is unindexed, so it is listed here at its
+    ///   chain slot and is no item;
+    /// * a writer can rewrite a `plan_index` or a `step_follows` edge, and the
+    ///   two orders then differ with every count still zero;
+    /// * a retracted `executes` edge's step is listed here (the plan-order
+    ///   readers do not drop it) and is no item.
+    ///
+    /// Where it is not a single chain: when the `step_follows` pairs fork or
+    /// cycle (two generations of one `canonical_name` sharing reordered
+    /// steps), it falls back to stored `plan_index` order, an unindexed step
+    /// last; a step the caller cannot read splits the chain, and the pieces
+    /// follow each other in plan order. It is not cut where a hidden item
+    /// leaves a position unproven, as the outcome reports' `step_index`
+    /// resolution is, so with a nonzero `hidden_count` or `plan_index_gaps`
+    /// a slot here can name a step those reports leave unresolved.
+    #[serde(default)]
+    pub chain_order: Vec<Uuid>,
 }
 
 /// A JSON integer `>= 0` that fits `u32`. A string, a float (`1.0`), a
@@ -326,6 +362,7 @@ pub fn assemble(input: FrozenPlanInput) -> FrozenPlan {
         duplicate_plan_indices,
         retracted_edges,
         digest_echo,
+        chain_order: input.chain_order,
     }
 }
 

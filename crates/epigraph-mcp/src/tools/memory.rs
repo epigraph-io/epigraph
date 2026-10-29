@@ -615,16 +615,26 @@ async fn recall_post_embed(
     // its dense+lexical fusion (`crate::embed::HYBRID_RRF_K`), just applied in
     // Rust across two disjoint (claim vs workflow) ranked lists instead of two
     // legs of one list.
+    //
+    // Read as the CALLER: a `workflows` row carries its plan's tenancy since
+    // migration 183 (ruling R-74), so a member finds its group's workflows and
+    // nobody else does.
     let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
         match pgvec_opt.as_deref() {
-            Some(pgvec) => WorkflowRepository::search_by_goal_embedding_since(
-                &server.pool,
-                pgvec,
-                HYBRID_CANDIDATE_POOL,
-                params.since,
-            )
-            .await
-            .map_err(internal_error)?,
+            Some(pgvec) => {
+                let mut read = super::workflows::CallerRead::open(server, viewer).await?;
+                let hits = WorkflowRepository::search_by_goal_embedding_since(
+                    read.conn(),
+                    viewer,
+                    pgvec,
+                    HYBRID_CANDIDATE_POOL,
+                    params.since,
+                )
+                .await
+                .map_err(internal_error)?;
+                read.close().await?;
+                hits
+            }
             None => Vec::new(),
         }
     } else {

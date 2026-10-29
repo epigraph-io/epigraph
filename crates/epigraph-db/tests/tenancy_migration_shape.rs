@@ -907,7 +907,15 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
     .expect("owner_group_id census");
 
     let observed: BTreeSet<&str> = widened.iter().map(String::as_str).collect();
-    let expected: BTreeSet<&str> = TIER_A.iter().chain(HARVESTER_173).copied().collect();
+    // Plus migration 183's `workflows` (ruling R-74): it carries the columns
+    // in 062's shape (`workflows_tenancy.rs::workflow_rows_carry_the_tier_a_shape`) and is
+    // backfilled by that migration itself, so it has no ledger row.
+    let expected: BTreeSet<&str> = TIER_A
+        .iter()
+        .chain(HARVESTER_173)
+        .copied()
+        .chain(std::iter::once("workflows"))
+        .collect();
     assert_eq!(
         observed, expected,
         "the set of tables carrying owner_group_id has drifted from the tier-A \

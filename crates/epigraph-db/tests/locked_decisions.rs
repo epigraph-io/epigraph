@@ -1957,12 +1957,15 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     .expect("read pg_trigger for the PR-16 set");
     // 26 SINCE MIGRATION 173: `harvester_sources_require_tenancy`, a seventh
     // parentless root on 074's root body.
+    // 26 -> 27 (ruling R-74): migration 183's `workflows_require_tenancy`,
+    // 074's parentless-root body on another tier-A table.
     assert_eq!(
         pr16.len(),
-        26,
-        "expected 26: after migration 074, 24 *_require_tenancy (claims, the 17 \
+        27,
+        "expected 27: after migration 074, 24 *_require_tenancy (claims, the 17 \
          claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
-         migration 173 adds harvester_sources_require_tenancy. Found {}: {pr16:?}",
+         migration 173 adds harvester_sources_require_tenancy and migration 183 \
+         workflows_require_tenancy. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2322,6 +2325,9 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     "role_agents",
     "harvester_sources",
     "harvester_audit_reports",
+    // Workflow rows (183, ruling R-74): tier-A since that migration, which
+    // FORCEs the table itself; reached through `tier_a` in the test below.
+    "workflows",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2466,11 +2472,13 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // 27 SINCE MIGRATION 173 (ruling R-66): 062's 25 plus the two harvester
     // neighbours `harvester_sources` and `harvester_audit_reports`, which 173
     // gives both tenancy columns and FORCEs itself, on 078's precedent.
+    // 27 -> 28 (ruling R-74): migration 183 gives `workflows` both tenancy
+    // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     assert_eq!(
         tier_a.len(),
-        27,
-        "migration 062's tier_a is 25 relations and 173 adds the two harvester neighbours; \
-         got {}: {tier_a:?}",
+        28,
+        "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours \
+         and 183 adds workflows; got {}: {tier_a:?}",
         tier_a.len()
     );
 

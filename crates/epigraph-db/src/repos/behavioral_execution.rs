@@ -469,9 +469,12 @@ impl BehavioralExecutionRepository {
     /// row per step, all sharing `created_at` and the goal embedding, so a
     /// per-row count would let one long report clear `min_executions` alone.
     ///
-    /// Deprecated workflows (`truth_value <= 0.1`) are excluded. `workflows`
-    /// and `behavioral_executions` carry no visibility columns and no row
-    /// security, so there is no viewer predicate to apply.
+    /// Deprecated workflows (`truth_value <= 0.1`) are excluded.
+    /// `behavioral_executions` carries no visibility columns and no row
+    /// security; the joined `workflows` row carries its plan's tenancy under
+    /// row security since migration 183 (ruling R-74), so run this on the
+    /// caller's STAMPED connection: the join then keeps exactly the workflows
+    /// the caller reads.
     ///
     /// Returns `(workflows.id, avg_similarity, report_count)`.
     #[instrument(skip(executor, goal_embedding_pgvec))]
