@@ -58,6 +58,7 @@
 use crate::errors::DbError;
 use crate::visibility::Viewer;
 use chrono::{DateTime, SecondsFormat, Utc};
+use epigraph_core::edge::relationships::{canonical_relationship, relationship_spellings};
 use epigraph_crypto::{
     signing_message, AgentSigner, ContentHasher, SignatureScheme, SignatureVerifier, SignedEntity,
     HASH_SIZE,
@@ -161,13 +162,22 @@ pub fn to_stored_micros(t: DateTime<Utc>) -> DateTime<Utc> {
 pub(crate) enum SymmetricGuard {
     /// Unconditional INSERT.
     None,
-    /// Skip when such an edge IN FORCE exists (the link tools, migration 120).
+    /// Skip when such an edge IN FORCE exists (the link tools, migration 120),
+    /// in any stored spelling of the relationship
+    /// (`epigraph_core::edge::relationships::relationship_spellings`), as the
+    /// unsigned `create_symmetric_if_absent*` guards match.
     InForce,
 }
 
 /// A new edge's attestation, before its INSERT: a fresh `id` and the writer's
 /// `created_at` (at the microsecond), so the digest is computable before the
 /// row exists (ruling R-50).
+///
+/// `relationship` is stored in its canonical spelling
+/// (`epigraph_core::edge::relationships::canonical_relationship`), the one
+/// every unsigned edge writer stores, so a signed and an unsigned writer of
+/// one relationship produce the same row and the signature is over the
+/// spelling the database holds.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn new_attestation(
@@ -185,7 +195,7 @@ pub(crate) fn new_attestation(
         source_type: source_type.to_string(),
         target_id,
         target_type: target_type.to_string(),
-        relationship: relationship.to_string(),
+        relationship: canonical_relationship(relationship).to_string(),
         properties,
         valid_from: valid_from.map(to_stored_micros),
         created_at: to_stored_micros(Utc::now()),
@@ -232,7 +242,7 @@ pub(crate) async fn insert_attested_conn(
             " WHERE NOT EXISTS (SELECT 1 FROM edges \
                  WHERE ((source_id = $2 AND target_id = $4) \
                      OR (source_id = $4 AND target_id = $2)) \
-                   AND relationship = $6 AND {})",
+                   AND relationship = ANY($14) AND {})",
             crate::repos::edge::EDGE_IN_FORCE_UNALIASED
         ),
     };
@@ -254,7 +264,7 @@ pub(crate) async fn insert_attested_conn(
         let digest = edge_attestation_digest(&a)?;
         let signature = key.signer.sign_entity(SignedEntity::Edge, &digest);
         let mut sp = conn.begin().await?;
-        let row = sqlx::query(&sql)
+        let mut q = sqlx::query(&sql)
             .bind(a.id)
             .bind(a.source_id)
             .bind(&a.source_type)
@@ -267,9 +277,11 @@ pub(crate) async fn insert_attested_conn(
             .bind(a.created_at)
             .bind(digest.as_slice())
             .bind(signature.as_slice())
-            .bind(key.signer_id)
-            .fetch_optional(&mut *sp)
-            .await?;
+            .bind(key.signer_id);
+        if guard == SymmetricGuard::InForce {
+            q = q.bind(relationship_spellings(&a.relationship));
+        }
+        let row = q.fetch_optional(&mut *sp).await?;
         let Some(row) = row else {
             sp.commit().await?;
             return Ok(None);

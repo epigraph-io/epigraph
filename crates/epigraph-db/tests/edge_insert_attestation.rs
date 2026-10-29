@@ -494,6 +494,10 @@ async fn a_dedup_hit_onto_another_writers_unsigned_edge_stays_unsigned(pool: PgP
 /// canonical-spelling rule would) still gets an edge whose signature verifies
 /// AND whose row recomputes to its digest; the INSERT is re-made over the
 /// stored values rather than leaving a signature over what was sent.
+///
+/// The relationship is `Refines`, outside the case-folded set
+/// (`canonical_relationship` leaves it as sent), so it is the trigger and not
+/// the writer that changes it and the re-made INSERT is what is exercised.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_the_database_rewrites_is_signed_over_what_it_stores(pool: PgPool) {
     sqlx::query(
@@ -526,7 +530,7 @@ async fn an_edge_the_database_rewrites_is_signed_over_what_it_stores(pool: PgPoo
         "claim",
         b,
         "claim",
-        "Supports",
+        "Refines",
         Some(serde_json::json!({"x": -0.0, "big": 1e300})),
         None,
         None,
@@ -538,7 +542,7 @@ async fn an_edge_the_database_rewrites_is_signed_over_what_it_stores(pool: PgPoo
         .fetch_one(&pool)
         .await
         .expect("relationship");
-    assert_eq!(rel, "supports", "calibration: the trigger rewrote the row");
+    assert_eq!(rel, "refines", "calibration: the trigger rewrote the row");
     assert_attested(&verify(&pool, id).await, s, "rewritten on INSERT");
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE source_id = $1")
         .bind(a)
@@ -546,4 +550,118 @@ async fn an_edge_the_database_rewrites_is_signed_over_what_it_stores(pool: PgPoo
         .await
         .expect("count");
     assert_eq!(n, 1, "the first attempt was rolled back, not left behind");
+}
+
+/// The canonical relationship spelling (migration 175,
+/// `epigraph_core::edge::relationships`) holds on the signed primitives as on
+/// the unsigned ones: a case-folded relationship sent in another case is
+/// STORED and ATTESTED in its lower-case spelling, and each signed symmetric
+/// twin's dedup guard finds an in-force edge stored in the legacy upper-case
+/// spelling (a row written before the canonical spelling), so it returns that
+/// edge instead of writing a second one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_signed_insert_stores_and_dedups_the_canonical_relationship_spelling(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x56; 32]).expect("signer");
+    let s = seed_signer_agent(&pool, "r50-spelling", &signer).await;
+    let key = Some(EdgeSigningKey {
+        signer: &signer,
+        signer_id: s,
+    });
+    let mut c = Vec::new();
+    for i in 0..4 {
+        c.push(fixture::seed_public_claim(&pool, s, &format!("R-50 spelling {i}")).await);
+    }
+    let mut conn = pool.acquire().await.expect("conn");
+
+    // Stored and attested in the canonical spelling.
+    let id = EdgeRepository::create_signed_conn(
+        &mut conn, key, c[0], "claim", c[1], "claim", "SUPPORTS", None, None, None,
+    )
+    .await
+    .expect("insert");
+    let rel: String = sqlx::query_scalar("SELECT relationship::text FROM edges WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("relationship");
+    assert_eq!(
+        rel, "supports",
+        "the signed insert stores the canonical spelling"
+    );
+    assert_attested(
+        &verify(&pool, id).await,
+        s,
+        "SUPPORTS sent, supports stored",
+    );
+
+    // A legacy upper-case in-force edge over (c2, c3), not matcher-written, so
+    // migration 175's unique index does not cover it and only the guard can
+    // find it.
+    let legacy: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'CONTRADICTS') RETURNING id",
+    )
+    .bind(c[2])
+    .bind(c[3])
+    .fetch_one(&pool)
+    .await
+    .expect("seed the legacy spelling");
+
+    let (got, created) = EdgeRepository::create_symmetric_if_absent_returning_signed_conn(
+        &mut conn,
+        key,
+        c[3],
+        c[2],
+        "contradicts",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("returning twin");
+    assert_eq!((got, created), (legacy, false), "returning twin: dedup hit");
+
+    let upsert = EdgeRepository::create_symmetric_if_absent_oriented_signed_conn(
+        &mut conn,
+        key,
+        c[3],
+        c[2],
+        "contradicts",
+        serde_json::json!({}),
+    )
+    .await
+    .expect("oriented twin");
+    assert_eq!(
+        (upsert.edge_id, upsert.was_created, upsert.source_id),
+        (legacy, false, c[2]),
+        "oriented twin: dedup hit, reported as stored"
+    );
+
+    let (row, created) = EdgeRepository::create_symmetric_if_absent_row_signed_conn(
+        &mut conn,
+        key,
+        c[3],
+        c[2],
+        "contradicts",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("row twin");
+    assert_eq!((row.id, created), (legacy, false), "row twin: dedup hit");
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE (source_id = $1 AND target_id = $2) OR (source_id = $2 AND target_id = $1)",
+    )
+    .bind(c[2])
+    .bind(c[3])
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(n, 1, "no second edge in another spelling");
+    assert_eq!(
+        stored_attestation(&pool, legacy).await,
+        (None, None),
+        "a dedup hit leaves the legacy edge as it was"
+    );
 }
