@@ -1302,6 +1302,50 @@ impl EvidenceRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Store an embedding vector on an evidence row `viewer` may write, and
+    /// only while the row carries no ciphertext.
+    ///
+    /// The request-path twin of [`Self::store_embedding`], for a caller that
+    /// holds a connection stamped with `viewer`
+    /// (`AppState::store_evidence_embedding_as`). `evidence` is under the
+    /// generic tenancy policy, whose `WITH CHECK` refuses this UPDATE on an
+    /// unstamped connection; the `{WRITABLE:e}` splice keeps the statement's
+    /// own qual in agreement with the stamp. Keyed on `evidence_encryption`, the
+    /// row's own ciphertext: a sealed row must never carry a vector derived
+    /// from its plaintext.
+    ///
+    /// # Returns
+    /// `true` when a row was updated; `false` when none matched (no such row, a
+    /// sealed row, or a row `viewer` may not write).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, embedding_pgvector))]
+    pub async fn store_embedding_as(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: EvidenceId,
+        embedding_pgvector: &str,
+    ) -> Result<bool, DbError> {
+        let uuid: Uuid = id.into();
+        let sql = viewer.splice_write(
+            "UPDATE evidence AS e SET embedding = $2::vector \
+              WHERE e.id = $1 \
+                AND NOT EXISTS ( \
+                    SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id \
+                ) \
+                /* {WRITABLE:e} */",
+            3,
+        );
+        let mut q = sqlx::query(&sql).bind(uuid).bind(embedding_pgvector);
+        // Conditional: a `Bypass` viewer renders no `$3` to fill.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let result = q.execute(&mut *conn).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Search evidence by vector similarity using cosine distance
     ///
     /// Returns evidence IDs and similarity scores for the closest matches.

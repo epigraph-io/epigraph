@@ -722,7 +722,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// to the caller's stamped read and both post-ingest goal embeds to the
 /// system-agent stamp (`routes/workflows.rs` 8 -> 4), read off
 /// `the_scanner_is_not_vacuous`'s own failure.
-const HIGH_WATER: usize = 226;
+///
+/// 226 -> 223 (backlog 1e2315a9): the post-commit embedding stores of
+/// `submit_packet` (claim + figure evidence) and `create_claim_core` moved onto
+/// the caller's stamp (`routes/submit.rs` 4 -> 2, `routes/claims.rs` 18 -> 17),
+/// read off `the_unconverted_register_is_exactly_what_was_measured`'s own
+/// failure. No file reached zero.
+const HIGH_WATER: usize = 223;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -833,7 +839,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `ViewerExtractor` makes on the same pool. 20, the row below.
     // 19 before the operator-binding delta review, which moved `create_claim`'s
     // claim transaction onto `AppState::begin_claim_write` (stamped).
-    ("routes/claims.rs", 18),
+    // 18 -> 17 (backlog 1e2315a9): `create_claim_core`'s post-commit embedding
+    // UPDATE moved off `state.db_pool` onto `AppState::store_claim_embedding_as`
+    // (the caller's stamp). Read off this test's own failure (`recorded 18,
+    // measured 17`).
+    ("routes/claims.rs", 17),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
@@ -1025,7 +1035,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // It is one of TWO rows that shard deleted; see `routes/graph_neighborhood.rs`
     // above, whose two sites also reached zero, and which additionally left the
     // `&PgPool`-parameter blind-spot list in this file's module doc.
-    ("routes/submit.rs", 4),
+    // 4 -> 2 (backlog 1e2315a9): `submit_packet`'s post-commit claim and
+    // figure-evidence embedding UPDATEs moved off `state.db_pool` onto the
+    // caller's stamp (`AppState::store_claim_embedding_as` /
+    // `store_evidence_embedding_as`). The two that remain are
+    // `validate_packet`'s signer-key read and `persist_packet`'s `pool` alias
+    // (its agent-existence and dedup reads). Read off this test's own failure
+    // (`recorded 4, measured 2`).
+    ("routes/submit.rs", 2),
     ("routes/tasks.rs", 15),
     ("routes/timeline.rs", 2),
     // 9 before conversion shard 7, which moved `claim_history` onto

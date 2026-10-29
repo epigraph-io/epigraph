@@ -276,6 +276,15 @@ async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embe
         .await
         .unwrap();
     let agent = common::seed_system_agent(&pool).await;
+    // Provision the agent's personal group before any request, as the token
+    // mint does in production (PR-02). The public item is owned by that group
+    // and its embedding is stored on the caller's viewer, resolved when the
+    // request arrives; a group first minted inside the claim's transaction is
+    // not in that viewer's writable set (and on the application role the
+    // INSERT itself would be refused by row security).
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, agent)
+        .await
+        .expect("provision the agent's personal group");
     let (addr, _shutdown) = common::spawn_app_with_mock_embedding(&db).await;
     let (token, _) = common::test_bearer_token_with_seeded_client_for_agent(
         &pool,

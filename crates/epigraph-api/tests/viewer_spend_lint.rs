@@ -1015,18 +1015,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // write: embeddings and propagation for the claim this request just
-    // persisted through the viewer (`persist_packet`); `validate_packet` runs
-    // no tenancy read.
+    // write: propagation for the claim this request just persisted through
+    // the viewer (`persist_packet`); `validate_packet` runs no tenancy read.
+    // The two post-commit embedding UPDATEs (claim, figure evidence) now
+    // receive the viewer (`AppState::store_claim_embedding_as` /
+    // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
     (
         "submit.rs",
         "submit_packet",
-        &[
-            "propagate_from",
-            "sqlx::query(UPDATE).execute",
-            "sqlx::query(UPDATE).execute",
-            "validate_packet",
-        ],
+        &["propagate_from", "validate_packet"],
     ),
     // gated (`write_target_of`) then write.
     (
@@ -1165,10 +1162,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // authenticated id, never the body), then that group's current key epoch,
     // read only after the membership check passed; the author's agent row.
     // write: everything else runs on the claim-write transaction stamped with
-    // this viewer, except the best-effort post-commit embedding, AUTHORED /
-    // HAS_TRACE / DERIVED_FROM edges and provenance row, which are raw-pool
-    // writes for a row this call created (`was_created`; ROUTE_LAYER_WRITES in
-    // viewer_route_table_lint.rs).
+    // this viewer, except the AUTHORED / HAS_TRACE / DERIVED_FROM edges and
+    // provenance row, which are raw-pool writes for a row this call created
+    // (`was_created`; ROUTE_LAYER_WRITES in viewer_route_table_lint.rs). The
+    // best-effort post-commit embedding now receives the viewer
+    // (`AppState::store_claim_embedding_as`, backlog 1e2315a9), so one
+    // `sqlx::query(UPDATE).execute` left this list.
     (
         "claims.rs",
         "create_claim_core",
@@ -1184,7 +1183,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
             "provenance::record_provenance",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
         ],
