@@ -617,6 +617,24 @@ async fn execute_plan(
     // ── 2. Ensure system agent ───────────────────────────────────────────
     let system_agent_id = get_or_create_system_agent(&mut *conn).await?;
 
+    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
+    // in a workflow ingest is authored by the same system agent, and resolving
+    // it per claim would be N identical round trips. The executor is pure-DB
+    // and its callers do not choose a group -- `store_workflow`,
+    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
+    // instance-wide workflow content -- so the system agent's own group is the
+    // declaration, publicly visible.
+    //
+    // A DECLARED group (`execute_workflow_ingest_plan_in_group`) replaces that
+    // default for the claims this walk creates; step 0c proved the stamp writes
+    // it. The `workflows` row takes the same declaration (ruling R-74,
+    // migration 183): the row is the plan's, and its tenancy is what every
+    // reader of the plan and the outcome report decide on.
+    let decl = match declared_group {
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        None => ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?,
+    };
+
     // ── 3. Insert workflow row (idempotent) ──────────────────────────────
     // The parent is resolved in ONE place, shared with the authority check
     // (`WorkflowRepository::ingest_anchors`): the named parent at
@@ -638,9 +656,22 @@ async fn execute_plan(
         goal,
         parent_id,
         workflow_row_metadata(&extraction.source.metadata, &extraction.source.tags),
+        decl,
     )
     .await
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;
+    // `ON CONFLICT DO NOTHING` also skips a row this stamp cannot read (step 1
+    // did not find it): writing this plan's claims and edges under it would
+    // extend a plan the stamp has no view of. Refuse, so nothing is written.
+    if WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation)
+        .await?
+        .is_none()
+    {
+        return Err(IngestExecutorError::WorkflowOutsideView {
+            canonical_name: canonical_name.to_string(),
+            generation,
+        });
+    }
 
     // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────
     // When a parent was resolved above (the named parent, or this lineage's
@@ -730,21 +761,8 @@ async fn execute_plan(
     let mut inserted: Vec<(Uuid, String)> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
 
-    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
-    // in a workflow ingest is authored by the same system agent, and resolving
-    // it per claim would be N identical round trips. The executor is pure-DB
-    // and its callers do not choose a group -- `store_workflow`,
-    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
-    // instance-wide workflow content -- so the system agent's own group is the
-    // declaration, publicly visible.
-    //
-    // A DECLARED group (`execute_workflow_ingest_plan_in_group`) replaces that
-    // default for the claims this walk creates; step 0c proved the stamp writes
-    // it.
-    let decl = match declared_group {
-        Some(group) => epigraph_core::TenancyDecl::group(group),
-        None => ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?,
-    };
+    // The tenancy declaration `decl` (step 2) covers every claim this walk
+    // creates, as it covered the `workflows` row.
     let mut reused_ids: Vec<Uuid> = Vec::new();
 
     for planned in &plan.claims {

@@ -763,29 +763,35 @@ pub async fn get_belief_in_mode(
         .await?;
     }
 
-    let interval =
-        epigraph_engine::belief_query::get_belief(&server.pool, viewer, claim_id, frame_id)
-            .await
-            .map_err(|e| match e {
-                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
-                    invalid_params(format!("frame {id} not found"))
-                }
-                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
-                    invalid_params(format!("claim {id} not found"))
-                }
-                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
-                    invalid_params(format!("invalid mass function: {msg}"))
-                }
-                other => internal_error(other),
-            })?;
+    let interval = epigraph_engine::belief_query::get_belief_scoped(
+        &server.pool,
+        server.scoped.as_ref(),
+        viewer,
+        claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(|e| match e {
+        epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+            invalid_params(format!("frame {id} not found"))
+        }
+        epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+            invalid_params(format!("claim {id} not found"))
+        }
+        epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+            invalid_params(format!("invalid mass function: {msg}"))
+        }
+        other => internal_error(other),
+    })?;
 
     // Additive lensed interval, computed under the chosen (frame, perspective).
     // The top-level belief/plausibility/etc above stay the global (unlensed)
     // values. Existence already validated → a compute failure is internal.
     let lensed_belief = match lens {
         Some((lens_frame, lens_perspective)) => {
-            let lensed = epigraph_engine::belief_query::get_perspective_belief(
+            let lensed = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 claim_id,
                 lens_frame,
@@ -877,6 +883,23 @@ pub async fn compare_methods(
         MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
             .await
             .map_err(internal_error)?;
+    // Ruling R-22: only the BBAs whose sources this viewer can read; a
+    // reader outside a group never sees a fold of BBAs derived from it.
+    // On the viewer-stamped read when the server has one, so a group member's
+    // own group's sources are visible to the session as well as the viewer.
+    let all_bbas = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
+            epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, all_bbas)
+                .await
+                .map_err(internal_error)?
+        }
+        None => {
+            epigraph_engine::derivation_scope::retain_for_viewer(&server.pool, viewer, all_bbas)
+                .await
+                .map_err(internal_error)?
+        }
+    };
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));
@@ -980,8 +1003,9 @@ pub async fn scoped_belief(
     if scope_type == "perspective" {
         if let Some(frame_id_str) = params.frame_id.as_deref() {
             let frame_id = parse_uuid(frame_id_str)?;
-            let interval = epigraph_engine::belief_query::get_perspective_belief(
+            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 claim_id,
                 frame_id,

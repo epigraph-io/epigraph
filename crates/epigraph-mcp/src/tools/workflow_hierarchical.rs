@@ -71,55 +71,101 @@ pub async fn find_workflow_hierarchical(
     // unavailable, the API call fails, or zero workflows have an embedding
     // similar enough to clear the threshold.
     let mut search_path = "ilike";
-    let mut rows = if server.embedder.is_mock() {
-        Vec::new()
+    let qvec = if server.embedder.is_mock() {
+        None
     } else {
         match server.embedder.generate(&params.query).await {
-            Ok(qvec) => {
-                match epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
-                    &server.pool,
-                    &qvec,
-                    similarity_threshold,
-                    min_truth,
-                    limit,
-                    resolve_to_latest,
-                )
-                .await
-                {
-                    Ok(rs) if !rs.is_empty() => {
-                        search_path = "embedding";
-                        rs
-                    }
-                    Ok(_) => Vec::new(), // embedding ran but no rows cleared threshold
-                    Err(e) => {
-                        tracing::warn!(
-                            error = ?e,
-                            "find_hierarchical_by_embedding failed; falling back to ILIKE"
-                        );
-                        Vec::new()
-                    }
-                }
-            }
+            Ok(qvec) => Some(qvec),
             Err(e) => {
                 tracing::warn!(
                     error = ?e,
                     "embedder.generate failed; falling back to ILIKE"
                 );
-                Vec::new()
+                None
             }
         }
     };
 
+    // Both searches read `workflows` rows, which carry their plan's tenancy
+    // (ruling R-74, migration 183): run them as the CALLER, on one
+    // viewer-stamped read taken after the embedding round trip, so a member
+    // finds its group's workflows and nobody else does. A server with no
+    // tenancy-aware pool (a development superuser) reads its plain pool.
+    let mut read = match server.scoped.as_ref() {
+        Some(scoped) => Some(scoped.read_as(viewer).await.map_err(internal_error)?),
+        None => None,
+    };
+    let mut rows = match qvec {
+        Some(qvec) => {
+            let found = match read.as_mut() {
+                Some(read) => {
+                    epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+                        &mut **read,
+                        &qvec,
+                        similarity_threshold,
+                        min_truth,
+                        limit,
+                        resolve_to_latest,
+                    )
+                    .await
+                }
+                None => {
+                    epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+                        &server.pool,
+                        &qvec,
+                        similarity_threshold,
+                        min_truth,
+                        limit,
+                        resolve_to_latest,
+                    )
+                    .await
+                }
+            };
+            match found {
+                Ok(rs) if !rs.is_empty() => {
+                    search_path = "embedding";
+                    rs
+                }
+                Ok(_) => Vec::new(), // embedding ran but no rows cleared threshold
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "find_hierarchical_by_embedding failed; falling back to ILIKE"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+
     if rows.is_empty() {
-        rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-            &server.pool,
-            &params.query,
-            limit,
-            min_truth,
-            resolve_to_latest,
-        )
-        .await
+        rows = match read.as_mut() {
+            Some(read) => {
+                epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+                    &mut **read,
+                    &params.query,
+                    limit,
+                    min_truth,
+                    resolve_to_latest,
+                )
+                .await
+            }
+            None => {
+                epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+                    &server.pool,
+                    &params.query,
+                    limit,
+                    min_truth,
+                    resolve_to_latest,
+                )
+                .await
+            }
+        }
         .map_err(internal_error)?;
+    }
+    if let Some(read) = read {
+        read.commit().await.map_err(internal_error)?;
     }
 
     // With `resolve_to_latest` both searches add the head of every matched
@@ -307,8 +353,9 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
 ///
 /// # Why the transaction is stamped
 ///
-/// `workflows` and `behavioral_executions` have no row security, so the two
-/// writes need no stamp. The step LOOKUP does: it reads `claims` and `edges`,
+/// `behavioral_executions` has no row security; the counter write on
+/// `workflows` (row security since migration 183) reaches only a row the
+/// stamp reads. The step LOOKUP reads `claims` and `edges`,
 /// and on an UNSTAMPED application session row security admits only public
 /// rows. This used to run on a plain `pool.begin()`, so for a workflow whose
 /// steps are group-private EVERY reporter, the group's own members included,
@@ -319,11 +366,13 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
 ///
 /// # A reporter that reads none of the plan is refused
 ///
-/// `workflows` has no row security, so the counter write cannot be scoped by
-/// the database. A reporter that reads none of the workflow's `executes`
-/// edges (`WorkflowRepository::viewer_reads_any_executes_edge`, on the
-/// stamped transaction) gets the same [`not_found`] error as an unknown id,
-/// and nothing is written. It used to record the run with every step NULL,
+/// A reporter that does not read the PLAN gets the same [`not_found`] error as
+/// an unknown id, and nothing is written: its `workflows` row (which carries
+/// the plan's tenancy and row security since migration 183, ruling R-74) and
+/// at least one STEP `executes` edge (a visible thesis, phase or shared
+/// level-3 atom does not count, so a step-less plan is refused to every
+/// reporter: `WorkflowRepository::viewer_reads_plan_structure`, on the stamped
+/// transaction). It used to record the run with every step NULL,
 /// so any `claims:write` holder could move the counters of a workflow it
 /// cannot read.
 ///
@@ -369,13 +418,13 @@ pub async fn do_report_hierarchical_outcome_as(
     //    read-modify-write of the counters below.
     //
     // VISIBILITY-EXEMPT: this statement and the counter `UPDATE` touch only
-    // `workflows`, which is not in migration 062's `tier_a` array and carries
-    // neither `visibility` nor `owner_group_id`, so no predicate can be written
-    // for them (same category as `workflows.rs::report_workflow_outcome`'s
-    // routing probe). The viewer IS spent where there is something to filter:
-    // the plan reads below (`viewer_reads_any_executes_edge`, which refuses a
-    // reporter that reads none of the plan, and `plan_step_claim_ids`) splice
-    // the edge and claim predicates, on this transaction stamped with the viewer.
+    // `workflows` by primary key, on this transaction stamped with the viewer:
+    // since migration 183 that row carries its plan's tenancy under FORCEd
+    // row security, so a row the viewer does not read is absent here and
+    // reported as an unknown id. The viewer is ALSO spent in the plan reads
+    // below (`viewer_reads_plan_structure`, which requires the row through
+    // `{VISIBILITY:w}` and a readable step, and `plan_step_claim_ids`), which
+    // splice the row, edge and claim predicates.
     let row: Option<(serde_json::Value,)> =
         sqlx::query_as("SELECT metadata FROM workflows WHERE id = $1 FOR UPDATE")
             .bind(workflow_id)
@@ -386,15 +435,11 @@ pub async fn do_report_hierarchical_outcome_as(
         Some((m,)) => m,
         None => return Err(not_found(workflow_id)),
     };
-    // A reporter that reads none of the plan's `executes` edges cannot read
-    // this workflow: refused exactly like a missing id, before any write.
-    if !epigraph_db::WorkflowRepository::viewer_reads_any_executes_edge(
-        &mut tx,
-        viewer,
-        workflow_id,
-    )
-    .await
-    .map_err(internal_error)?
+    // A reporter that reads none of the plan's STEP `executes` edges is
+    // refused exactly like a missing id, before any write.
+    if !epigraph_db::WorkflowRepository::viewer_reads_plan_structure(&mut tx, viewer, workflow_id)
+        .await
+        .map_err(internal_error)?
     {
         return Err(not_found(workflow_id));
     }

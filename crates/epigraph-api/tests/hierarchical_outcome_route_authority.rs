@@ -84,6 +84,7 @@ async fn seed_private_workflow(pool: &PgPool, name: &str) -> PrivateWorkflow {
         "A workflow whose steps only one group can read.",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflow root");
@@ -403,4 +404,259 @@ async fn non_member_cannot_move_a_group_private_workflows_counters(pool: PgPool)
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
     assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
+}
+
+/// Backlog c0ab097a (2): a reused, content-addressed level-3 atom is shared
+/// across workflows, and the ingest executor links a PUBLIC one into a
+/// group-private plan. Its `executes` edge is then public, so a non-member
+/// reads one `executes` edge of a plan whose own claims (thesis, phases,
+/// steps) it reads none of. Reading that edge must not admit it: the report is
+/// refused with the not-found 404 and nothing is written. Positive control: a
+/// member of the owning group still records the same report.
+///
+/// RED before the fix: the gate admitted any visible `executes` edge, so the
+/// stranger got a 200 and moved `use_count` to 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_shared_public_atom_does_not_admit_a_non_member(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let w = seed_private_workflow(&pool, "outcome-route-public-atom").await;
+
+    let atom = viewer_fixture::seed_public_claim(
+        &pool,
+        w.stranger,
+        &format!("a shared operation atom {}", w.workflow_id),
+    )
+    .await;
+    sqlx::query("UPDATE claims SET properties = jsonb_build_object('level', 3) WHERE id = $1")
+        .bind(atom)
+        .execute(&pool)
+        .await
+        .expect("level 3");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, 'workflow', $2, 'claim', 'executes', \
+                 jsonb_build_object('level', 3, 'plan_index', 2))",
+    )
+    .bind(w.workflow_id)
+    .bind(atom)
+    .execute(&pool)
+    .await
+    .expect("executes edge to the atom");
+    let atom_edge: String = sqlx::query_scalar(
+        "SELECT visibility::text FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+    )
+    .bind(w.workflow_id)
+    .bind(atom)
+    .fetch_one(&pool)
+    .await
+    .expect("atom edge read-back");
+    assert_eq!(
+        atom_edge, "public",
+        "fixture shape: the atom's executes edge is public"
+    );
+
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.stranger, &["claims:read", "claims:write"])),
+        body(&[0, 1]),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a caller that reads only a shared atom of the plan must be refused: {text}"
+    );
+    assert_eq!(
+        written(&pool, w.workflow_id).await,
+        (None, 0),
+        "a refused report moves no counter and writes no row"
+    );
+
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.member, &["claims:write"])),
+        body(&[0, 1]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2));
+}
+
+/// Backlog c0ab097a (2), as ruled: a report is refused "when the caller can
+/// see no step of a workflow that has steps". Fixture: a group-private plan
+/// that executes a PUBLIC thesis (level 0) or phase (level 1) through a
+/// public edge. A non-member reads that thesis or phase and none of the
+/// plan's steps. That must not admit it: 404 as for an
+/// unknown id, and nothing written. Positive control per level: a member of
+/// the owning group still records the report.
+///
+/// RED before the fix: the gate counted level 0, 1 and 2 edges, so the
+/// stranger got a 200 and moved `use_count` to 1.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_visible_public_thesis_or_phase_does_not_admit_a_non_member(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    for (level, what) in [(0, "thesis"), (1, "phase")] {
+        let w = seed_private_workflow(&pool, &format!("outcome-route-public-{what}")).await;
+        let shared = viewer_fixture::seed_public_claim(
+            &pool,
+            w.member,
+            &format!(
+                "a {what} an earlier public generation wrote {}",
+                w.workflow_id
+            ),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE claims SET properties = jsonb_build_object('level', $2::int) WHERE id = $1",
+        )
+        .bind(shared)
+        .bind(level)
+        .execute(&pool)
+        .await
+        .expect("set level");
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, 'workflow', $2, 'claim', 'executes', \
+                     jsonb_build_object('level', $3::int, 'plan_index', 2))",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .bind(level)
+        .execute(&pool)
+        .await
+        .expect("executes edge to the shared claim");
+        let edge: String = sqlx::query_scalar(
+            "SELECT visibility::text FROM edges \
+             WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+        )
+        .bind(w.workflow_id)
+        .bind(shared)
+        .fetch_one(&pool)
+        .await
+        .expect("edge read-back");
+        assert_eq!(
+            edge, "public",
+            "fixture shape: the {what}'s executes edge is public"
+        );
+
+        let (status, text) = post(
+            &state,
+            w.workflow_id,
+            Some(token(w.stranger, &["claims:read", "claims:write"])),
+            body(&[0, 1]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a caller that reads the {what} but no step must be refused: {text}"
+        );
+        assert_eq!(
+            written(&pool, w.workflow_id).await,
+            (None, 0),
+            "a refused report moves no counter and writes no row ({what})"
+        );
+
+        let (status, text) = post(
+            &state,
+            w.workflow_id,
+            Some(token(w.member, &["claims:write"])),
+            body(&[0, 1]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{what}: {text}");
+        assert_eq!(written(&pool, w.workflow_id).await, (Some(1), 2), "{what}");
+    }
+}
+
+/// Backlog ca30e645 / ruling R-38, REST twin of
+/// `epigraph-mcp/tests/add_step_plan_position.rs`: after `add_step(position =
+/// 1)` the inserted step's `executes` edge carries no `plan_index`, and the
+/// `step_follows` chain is `s0 -> inserted -> s1`. A report against
+/// `step_index` 1 must attach to the inserted step, and the old slot-1 step to
+/// index 2: plan order is the chain, not the ordinal.
+///
+/// RED before the fix: `plan_step_claim_ids` sorted the unindexed step last, so
+/// index 1 was attributed to `s1` and index 2 to the inserted step.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_report_resolves_step_index_through_the_step_follows_chain(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let w = seed_private_workflow(&pool, "outcome-route-chain-order").await;
+    let group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.steps[0])
+        .fetch_one(&pool)
+        .await
+        .expect("group");
+
+    // What `add_step(position = 1)` writes: an unindexed level-2 `executes`
+    // edge, and the chain rewired around the new step.
+    let inserted = viewer_fixture::seed_group_claim(
+        &pool,
+        w.member,
+        group,
+        &format!("inserted between the two steps {}", w.workflow_id),
+    )
+    .await;
+    sqlx::query("UPDATE claims SET properties = jsonb_build_object('level', 2) WHERE id = $1")
+        .bind(inserted)
+        .execute(&pool)
+        .await
+        .expect("level 2");
+    for (source, source_type, target, relationship, props) in [
+        (
+            w.workflow_id,
+            "workflow",
+            inserted,
+            "executes",
+            serde_json::json!({"level": 2}),
+        ),
+        (
+            w.steps[0],
+            "claim",
+            inserted,
+            "step_follows",
+            serde_json::json!({}),
+        ),
+        (
+            inserted,
+            "claim",
+            w.steps[1],
+            "step_follows",
+            serde_json::json!({}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+             VALUES ($1, $2, $3, 'claim', $4, $5)",
+        )
+        .bind(source)
+        .bind(source_type)
+        .bind(target)
+        .bind(relationship)
+        .bind(props)
+        .execute(&pool)
+        .await
+        .expect("edge");
+    }
+
+    let (status, text) = post(
+        &state,
+        w.workflow_id,
+        Some(token(w.member, &["claims:write"])),
+        body(&[0, 1, 2]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(
+        step_rows(&pool, w.workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(w.steps[0])),
+            ("planned 1".to_string(), Some(inserted)),
+            ("planned 2".to_string(), Some(w.steps[1])),
+        ],
+        "step_index follows the step_follows chain: {text}"
+    );
 }

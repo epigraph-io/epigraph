@@ -430,8 +430,22 @@ jobs:
         # Scope is deliberately lib+bins, NOT --all-targets: the crate's
         # [dev-dependencies] on epigraph-db and sqlx are non-optional, so the
         # test targets link Postgres regardless of the feature flag and cannot
-        # pass under --no-default-features today.
+        # pass under --no-default-features today. Every bin, `server`
+        # included, declares required-features = ["db"] (ruling R-39: not(db)
+        # is check-only), so in practice this checks the library.
         run: cargo check -p epigraph-api --no-default-features --locked
+      - name: Genai feature build check
+        # `genai` is off by default and no other step compiles it, so its code
+        # had no compile-time signal: epigraph-api's POST
+        # /api/v1/analyze/unconstrained handler (whose provider errors must go
+        # through llm_unavailable) was pinned only by a source-scan test, and
+        # epigraph-cli's genai-gated bins and tests were never built (backlog
+        # e0f0cb68). One invocation per package, NOT `-p a -p b`: api's `genai`
+        # does not enable epigraph-cli's, so a combined run would unify
+        # features and could hide a break that only api-alone shows.
+        run: |
+          cargo clippy -p epigraph-api --features genai --all-targets --locked -- -D warnings
+          cargo clippy -p epigraph-cli --features genai --all-targets --locked -- -D warnings
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
@@ -453,6 +467,129 @@ jobs:
         run: python3 --version
       - name: Run kanban tests
         run: python3 -m unittest discover -s tests -v
+
+  # The Python suites: scripts/tests (the operator scripts' unit tests, incl.
+  # test_fuzzy_dedup_claims.py), tests/dedup (fuzzy_dedup_claims.py driven end
+  # to end against a migrated database), tests/theme, and the SciFact
+  # calibration fixtures in tests/scifact_calibration. Before this job they ran
+  # only at author time (backlogs d5781a48, 733df577). They need a database migrated like the deployed
+  # schema, so the job builds `epigraph-migrate` and migrates a separate
+  # `epigraph_py_test` database: tests/dedup refuses any database whose name does
+  # not end in `_test`. It also builds `ingest_git`, which
+  # test_git_ingest_reconciler.py's integration arm drives. Both URLs below are
+  # derived from DATABASE_URL, and epigraph-migrate reads MIGRATION_DATABASE_URL
+  # first, so the migrate step sets both.
+  #
+  # EPIGRAPH_PYTEST_REQUIRE_DB=1 turns "test DB unavailable" from a skip into a
+  # failure, so an unprovisioned database cannot leave the job green with its
+  # database arms skipped. Every pytest step also enforces a skip budget:
+  # tests/ci/pytest_skip_budget.py reads the run's JUnit XML and fails the step
+  # on any skip not named in its --allow list, which also covers skips the flag
+  # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
+  # cannot find the ingest_git binary built above). The one allowed skip is
+  # test_executed_dedup_removes_the_duplicate_from_recall: it needs a running
+  # API and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), which this
+  # job does not provide yet, so that arm does not run in CI.
+  #
+  # The database arms connect as the service container's superuser, so RLS is
+  # bypassed: they verify the scripts' logic against the migrated schema, not
+  # role or tenancy scoping (a script run as a non-superuser role seeing only
+  # part of the rows is outside what they can catch).
+  #
+  # Advisory at first (continue-on-error, the `audit` precedent): promote it to
+  # a hard gate once it has been stable on main.
+  python:
+    name: Python tests (advisory)
+    # Pinned, not ubuntu-latest: tests/requirements-ci.txt pins wheels built
+    # for the image's system python3 (3.12; numpy 1.26.4 has none past cp312),
+    # so a newer default image would turn the install into a source build.
+    runs-on: ubuntu-24.04
+    # A cold debug build of the two binaries plus the suites; 60 cuts off a hang.
+    timeout-minutes: 60
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: epigraph
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      SQLX_OFFLINE: "true"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          # Save only from main: PR runs restore main's entry but do not add
+          # their own, so this job's cache cannot churn the shared Actions cache
+          # budget the `test` job's (much larger) entry depends on.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build epigraph-migrate and ingest_git
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate -p epigraph-cli --bin ingest_git
+      - name: Install Python test dependencies
+        # A venv, not the system interpreter (PEP 668), from a pinned file, and
+        # no extra setup action (the trust surface stays the pinned actions).
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyenv"
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet -r tests/requirements-ci.txt
+          echo "$RUNNER_TEMP/pyenv/bin" >> "$GITHUB_PATH"
+      - name: Create and migrate the Python test database
+        run: |
+          python3 - <<'PY'
+          import os, psycopg2
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          conn.autocommit = True
+          with conn.cursor() as cur:
+              cur.execute("DROP DATABASE IF EXISTS epigraph_py_test")
+              cur.execute("CREATE DATABASE epigraph_py_test")
+          PY
+          export DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export MIGRATION_DATABASE_URL="$DATABASE_URL"
+          ./target/debug/epigraph-migrate
+      - name: Python tests (scripts/tests, tests/dedup)
+        run: |
+          export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export EPIGRAPH_PYTEST_REQUIRE_DB=1
+          python3 -m pytest -rs scripts/tests tests/dedup --junitxml "$RUNNER_TEMP/pytest-scripts-dedup.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-scripts-dedup.xml" \
+            --allow tests.dedup.test_fuzzy_dedup_retraction::test_executed_dedup_removes_the_duplicate_from_recall
+      - name: Python tests (tests/theme)
+        # The theme pipeline's pytest files. Their DB fixture wipes the
+        # clustering tables of the database it is given, which here is the
+        # job's own epigraph_py_test.
+        run: |
+          export THEME_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
+          export EPIGRAPH_PYTEST_REQUIRE_DB=1
+          python3 -m pytest -rs tests/theme --junitxml "$RUNNER_TEMP/pytest-theme.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-theme.xml"
+      - name: SciFact conformal calibration check
+        # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
+        # coverage and efficiency, plus --check, which fails when the shipped
+        # calibration.toml [conformal] quantiles (or the comment stating their
+        # calibration n) disagree with a refit of the fixtures (backlog 733df577).
+        # The job's database-free pytest files run here too (a new step name
+        # would need a matching local-gate classification): tests/ci, the
+        # skip-budget checker's own tests, and tests/scifact_calibration, which
+        # feeds altered copies of calibration.toml to --check. Both exist so a
+        # change that made either checker vacuous fails this step instead of
+        # leaving the job green (in CI --check otherwise only sees the faithful
+        # file).
+        run: |
+          python3 -m pytest -rs tests/ci tests/scifact_calibration --junitxml "$RUNNER_TEMP/pytest-ci.xml"
+          python3 tests/ci/pytest_skip_budget.py "$RUNNER_TEMP/pytest-ci.xml"
+          python3 tests/scifact_calibration/test_conformal_coverage.py --check
 
   # Advisory, NOT a merge gate. cargo audit checks Cargo.lock against the
   # RustSec DB fetched at run time, so a blocking gate would red-light every

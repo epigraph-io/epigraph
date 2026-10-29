@@ -2063,33 +2063,67 @@ async fn migration_149_author_binding_allowlist_definers_are_owned_and_granted(p
 }
 
 /// Migration 140 redefines `epigraph_refresh_token_rotate` (the successor keeps
-/// the presented token's scopes, narrowed to the client's grant). `CREATE OR
-/// REPLACE` keeps the owner and ACL, and 140 re-asserts both; this pins them,
-/// because the harness migrates as a superuser and a definer silently left
-/// superuser-owned, or granted back to PUBLIC, would pass every behavioural
-/// test. The pinned `search_path` keeps the body's unqualified `unnest` and
-/// `ANY` resolving in `pg_catalog`.
+/// the presented token's scopes, narrowed to the client's grant), and 172
+/// re-states it with its built-ins pinned. `CREATE OR REPLACE` keeps the owner
+/// and ACL, and both files re-assert them; this pins them, because the harness
+/// migrates as a superuser and a definer silently left superuser-owned, or
+/// granted back to PUBLIC, would pass every behavioural test.
+///
+/// The search_path half, corrected (backlog 1228c284). 140's
+/// `pg_catalog, public` did NOT keep the body's unqualified `unnest` in
+/// `pg_catalog`, which this comment used to claim: a `public.unnest(text[])`
+/// is an exact argument-type match and beats `pg_catalog.unnest(anyarray)`
+/// wherever `public` sits in the path. So this reads the body AT HEAD and
+/// requires both that `public` is off the path and that every `unnest(` and
+/// `now(` call is written `pg_catalog.`-qualified. A later migration that
+/// re-states the function from 140's body fails here.
+/// `app_role_table_lockdown.rs::rotation_ignores_a_public_overload_of_the_builtins_it_calls`
+/// is the behavioural half.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_140_rotate_definer_keeps_owner_grant_and_search_path(pool: PgPool) {
     let signature = "public.epigraph_refresh_token_rotate(bytea, bytea, timestamp with time zone)";
-    let (secdef, owner, acl, config): (bool, String, Option<String>, Option<Vec<String>>) =
-        sqlx::query_as(
-            "SELECT p.prosecdef, r.rolname::text, p.proacl::text, p.proconfig \
-               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
-              WHERE p.oid = $1::regprocedure",
-        )
-        .bind(signature)
-        .fetch_one(&pool)
-        .await
-        .expect("the rotate definer exists");
+    let (secdef, owner, acl, config, src): (
+        bool,
+        String,
+        Option<String>,
+        Option<Vec<String>>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.proacl::text, p.proconfig, p.prosrc \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = $1::regprocedure",
+    )
+    .bind(signature)
+    .fetch_one(&pool)
+    .await
+    .expect("the rotate definer exists");
     assert!(secdef, "the rotation must stay SECURITY DEFINER");
     assert_eq!(owner, "epigraph_maintenance", "rotate definer owner");
     assert!(acl.is_some(), "an EXPLICIT ACL; NULL is the PUBLIC default");
     assert_eq!(
         config,
-        Some(vec!["search_path=pg_catalog, public".to_string()]),
-        "the definer pins its search_path"
+        Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+        "the definer pins its search_path to pg_catalog, with public off the path"
     );
+    // Whitespace is stripped before counting, so a re-statement that writes
+    // `unnest (` or `pg_catalog . now (` is counted like the compact spelling.
+    let lowered: String = src
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for builtin in ["unnest(", "now("] {
+        let qualified = format!("pg_catalog.{builtin}");
+        assert!(
+            lowered.contains(&qualified),
+            "the body calls {qualified}; a vacuous pass would hide a renamed call"
+        );
+        assert_eq!(
+            lowered.matches(builtin).count(),
+            lowered.matches(qualified.as_str()).count(),
+            "every {builtin} call in the rotate definer is pg_catalog-qualified"
+        );
+    }
     for (role, expected) in [
         ("public", false),
         ("epigraph_app", true),
@@ -3351,5 +3385,190 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                  (re-state it from the head body, keeping every delta)"
             );
         }
+    }
+}
+
+/// `(prosecdef, owner, provolatile, proacl, proconfig)` of one function.
+type DefinerCatalogRow = (bool, String, String, Option<String>, Option<Vec<String>>);
+
+/// Migration 179 (a role binding that admits the holder and the role's
+/// ATTACHED agents only): the two mode-taking verb overloads are maintenance
+/// SECURITY DEFINERs with an explicit ACL that neither PUBLIC nor the
+/// application role can execute, beside 165's boolean signatures (kept); the
+/// three functions it re-states (the derivation, the binding's update guard
+/// and its audit) keep their owner, volatility and grants; the new
+/// `attached_agents` column is NOT NULL, defaults to false (an existing
+/// binding keeps 165's meaning), is not updatable by maintenance, and cannot
+/// be set together with `include_agents`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_179_attached_mode_definers_are_owned_and_granted(pool: PgPool) {
+    for (signature, volatility, app_may_execute) in [
+        (
+            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+            "v",
+            false,
+        ),
+        (
+            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+            "s",
+            false,
+        ),
+        (
+            "public.epigraph_group_role_bindings_guard_update()",
+            "v",
+            false,
+        ),
+        ("public.epigraph_group_role_bindings_audit()", "v", false),
+        ("public.epigraph_live_memberships(uuid)", "s", true),
+        (
+            "public.epigraph_require_writer_scope(uuid, uuid)",
+            "s",
+            true,
+        ),
+    ] {
+        let meta: Option<DefinerCatalogRow> = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text, \
+                        p.proconfig \
+                   FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(signature)
+        .fetch_optional(&pool)
+        .await
+        .expect("pg_proc lookup");
+        let (secdef, owner, vol, acl, config) =
+            meta.unwrap_or_else(|| panic!("{signature} must exist (migration 179)"));
+        assert!(secdef, "{signature} must stay SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        assert_eq!(vol, volatility, "{signature} volatility");
+        assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+        assert!(
+            config
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.starts_with("search_path=")),
+            "{signature} must pin its search_path"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_may_execute),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+        }
+    }
+
+    let column: Option<(bool, Option<String>)> = sqlx::query_as(
+        "SELECT a.attnotnull, pg_get_expr(d.adbin, d.adrelid) \
+           FROM pg_attribute a \
+           LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+          WHERE a.attrelid = 'public.group_role_bindings'::regclass \
+            AND a.attname = 'attached_agents' AND NOT a.attisdropped",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("column lookup");
+    assert_eq!(
+        column,
+        Some((true, Some("false".to_string()))),
+        "attached_agents must be NOT NULL DEFAULT false"
+    );
+    let updatable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege('epigraph_maintenance', 'public.group_role_bindings', \
+                                     'attached_agents', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column privilege");
+    assert!(!updatable, "maintenance must not UPDATE attached_agents");
+    let check: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c \
+          WHERE c.conrelid = 'public.group_role_bindings'::regclass \
+            AND c.conname = 'group_role_bindings_one_agent_mode'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("constraint lookup");
+    let check = check.expect("the one-agent-mode CHECK must exist");
+    assert!(
+        check.contains("include_agents") && check.contains("attached_agents"),
+        "{check}"
+    );
+}
+
+/// Migration 179's attached arm survives AT HEAD. The derivation is the one
+/// rule the viewer's group set, the claims-path writer scope and the roster
+/// all ask; a later re-statement from 165's body would silently turn every
+/// `attached_agents` binding into a holder-only one (fail-closed, but quiet:
+/// the role's attached agents lose the group). Keep these fragments when
+/// re-stating it. They are a text tripwire only; each conjunct is pinned by
+/// BEHAVIOUR in `group_role_membership.rs` (the bound role, the window's
+/// start, the copy rule, every hop live), so a reformatted but equivalent
+/// re-statement fails here and passes there, and a semantically different
+/// one fails there.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p \
+          WHERE p.oid = to_regprocedure('public.epigraph_role_derived_memberships(uuid, \
+                                         timestamp with time zone)')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let body = body.expect("the derivation must exist");
+    for fragment in [
+        // 165's arms.
+        "b.include_agents",
+        "public.epigraph_live_role_assignment(c.human, b.role, p_at) IS NOT NULL",
+        // 179's attached arm: a live attachment of THIS agent to THE BOUND role.
+        "b.attached_agents",
+        "FROM public.role_agents ra",
+        "ra.agent_id = p_agent AND ra.role = b.role",
+        "ra.detached_at IS NULL",
+        "ra.valid_from <= p_at",
+        // 179's copy rule: an operator's own attachment counts; a succession
+        // copy only for an agent in ONE folder that the copy chain's root
+        // (the attached identity) runs in. Losing it lets a SHARED successor
+        // (166 copies attachments to those too) read the role's group.
+        "ra.inherited_from IS NULL",
+        "WITH RECURSIVE chain",
+        "WHERE root.inherited_from IS NULL",
+        "FROM public.agent_prompt_snapshots s",
+        "(SELECT count(*) FROM folders) = 1",
+        // A detach (or a closed window) anywhere in the copy chain, the root
+        // included, revokes what was copied through it: every hop is live
+        // at `p_at`. Losing it lets a successor keep the group after the
+        // operator detached the identity it was copied from.
+        "hop.detached_at IS NULL",
+        "hop.valid_from <= p_at",
+        "(hop.valid_to IS NULL OR p_at < hop.valid_to)",
+    ] {
+        assert!(
+            body.contains(fragment),
+            "epigraph_role_derived_memberships at head lost {fragment:?} (re-state it from the \
+             head body, keeping every delta)"
+        );
     }
 }

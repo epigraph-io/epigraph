@@ -1615,6 +1615,19 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // and its UPDATE by 077's WITH CHECK (the outsider's row is not the
     // owner's), so every resolution is refused "not found" or 42501 (loud).
     ("epigraph_resolve_challenge", 168),
+    // 184 (ruling R-79), the audited BBA retraction. Fails CLOSED under a
+    // non-member owner: its `security_events` audit INSERT and its UPDATE of
+    // another group's row are refused by the tenancy policies, and the retract
+    // guard trigger refuses the column write outside a maintenance frame, so
+    // every retraction errors with nothing written (loud).
+    ("epigraph_retract_mass_function", 184),
+    // 184 (ruling R-103), the audited BBA un-retraction, the twin of the
+    // retraction above. Fails CLOSED under a non-member owner the same way:
+    // its audit INSERT and its UPDATE of another group's row are refused by
+    // the tenancy policies, and the clear guard admits the clear only in a
+    // maintenance-role frame, so every un-retraction errors with nothing
+    // written (loud).
+    ("epigraph_unretract_mass_function", 184),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2018,6 +2031,46 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_require_role_holder", 166),
     ("epigraph_agent_is_retired", 166),
     ("epigraph_role_agent_write_check", 166),
+    // 173 (ruling R-66), the audit report's tenancy stamp from its fragment.
+    // Under a non-member owner its read of the FORCEd `harvester_fragments` is
+    // filtered, so a report on a private fragment raises 23503 (loud).
+    ("epigraph_audit_report_inherit_tenancy", 173),
+    // 173, the reports-follow-their-fragment re-stamp. Only a privileged
+    // session changes a fragment's owner (115's owner guard; 115 limits 089's
+    // stamp to bypass sessions), and the reports' owner guard and row
+    // security admit that session itself, so a non-member owner does not
+    // stop a re-own. A visibility-only change from an application session
+    // (arm (d)) runs the report UPDATE under that session's row security;
+    // not measured under a non-member owner.
+    ("epigraph_fragment_audit_reports_follow", 173),
+    // 180, legacy fleet parents. The rule reads `agents` (FORCEd, but its
+    // SELECT policy admits every row), `operator_links` (FORCEd; read only
+    // by a maintenance session or a maintenance-owned definer frame) and
+    // `agent_keys`, `human_operators` and `oauth_clients` (no RLS). The
+    // registration calls it on the attestor's session, which is not a
+    // maintenance session, so under a non-member owner the `operator_links`
+    // read sees no row, the operator-link conjunct is false and every legacy
+    // parent is refused AID03: fail CLOSED (quiet, the host falls back to a
+    // parentless registration and alerts). The `human_operators` and
+    // `oauth_clients` legs are NOT EXISTS reads: no owner filters them today
+    // (no RLS; an owner without SELECT fails loudly, 42501), but they would
+    // fail OPEN on their own if those tables were ever put under RLS. The
+    // link leg still fails the whole rule closed in that case.
+    ("epigraph_is_legacy_fleet_parent", 180),
+    // The record runs only for a maintenance session, whose own
+    // `epigraph_bypass()` (keyed on `session_user`) admits its reads of the
+    // FORCEd `operator_links`, `agent_prompt_snapshots` and
+    // `agent_succession` under any owner. Its `agent_succession` INSERT is
+    // admitted only by `epigraph_definer_bypass()` (the owner), so under a
+    // non-member owner every record is refused and the transaction writes
+    // nothing: fail CLOSED (loud).
+    ("epigraph_record_legacy_succession", 180),
+    // 181 (ruling R-56), the group admin's re-key mark. Under a non-member
+    // owner its `groups` UPDATE meets `groups_tenancy` as the session and is
+    // refused for every admin who did not create the group (42501, loud: the
+    // member removal is refused whole, the pre-181 behaviour); its GRA02 arm
+    // refuses a filtered UPDATE rather than dropping the mark silently.
+    ("epigraph_mark_group_reseal_required", 181),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2148,6 +2201,12 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
         // ('epigraph_maintenance', ..) = true, ('epigraph', ..) = true
         // (superuser), ('epigraph_seed', ..) = false. So the app-owned case
         // this exists to catch still fails, which is the point.
+        //
+        // OVERLOADS (179 added mode-taking overloads of two registered
+        // verbs): the register names a function, not a signature, so every
+        // overload of the name is checked by reporting the WORST-owned one
+        // (`false` sorts first). A bare `LIMIT 1` would check whichever
+        // overload the catalog returned first and could pass a misowned one.
         // ==============================================================
         let owner: Option<(String, bool)> = sqlx::query_as(
             "SELECT r.rolname, pg_has_role(r.rolname, $2, 'MEMBER')
@@ -2155,6 +2214,7 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                JOIN pg_namespace n ON n.oid = p.pronamespace
                JOIN pg_roles r ON r.oid = p.proowner
               WHERE n.nspname = 'public' AND p.proname = $1
+              ORDER BY pg_has_role(r.rolname, $2, 'MEMBER') ASC, p.oid
               LIMIT 1",
         )
         .bind(f)
@@ -2679,6 +2739,18 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
             false,
         ),
+        // 179: the mode-taking overloads of the same two verbs (a binding
+        // that admits the holder and the role's attached agents only).
+        (
+            "epigraph_bind_group_role",
+            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+            false,
+        ),
+        (
+            "epigraph_define_group_role",
+            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            false,
+        ),
         (
             "epigraph_end_group_role_binding",
             "public.epigraph_end_group_role_binding(uuid, text)",
@@ -2737,6 +2809,27 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_role_agent_write_check()",
             false,
         ),
+        // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
+        // own maintenance-owned frame, so an app grant would be an existence
+        // oracle over links the application role cannot read; recording a
+        // succession after the fact is a maintenance act.
+        (
+            "epigraph_is_legacy_fleet_parent",
+            "public.epigraph_is_legacy_fleet_parent(uuid)",
+            false,
+        ),
+        (
+            "epigraph_record_legacy_succession",
+            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+            false,
+        ),
+        // 181: the member-removal route marks the re-key obligation through
+        // it on the request DSN; without the grant every removal is 42501.
+        (
+            "epigraph_mark_group_reseal_required",
+            "public.epigraph_mark_group_reseal_required(uuid)",
+            true,
+        ),
     ];
 
     let app_exists: bool =
@@ -2749,15 +2842,31 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
     }
     let mut failures = 0usize;
     for (name, signature, app_must_execute) in GRANTS {
-        let present: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_proc p
-                              JOIN pg_namespace n ON n.oid = p.pronamespace
-                             WHERE n.nspname = 'public' AND p.proname = $1)",
-        )
-        .bind(name)
-        .fetch_one(pool)
-        .await?;
+        // Presence by SIGNATURE, not by name: a name can exist through an
+        // older overload while the registered signature is installed by a
+        // migration not applied yet (179's text overloads beside 165's
+        // boolean verbs), and `has_function_privilege` RAISES on a signature
+        // it cannot resolve, which would abort this pre-flight.
+        let present: bool = sqlx::query_scalar("SELECT to_regprocedure($1) IS NOT NULL")
+            .bind(signature)
+            .fetch_one(pool)
+            .await?;
         if !present {
+            let name_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                                  JOIN pg_namespace n ON n.oid = p.pronamespace
+                                 WHERE n.nspname = 'public' AND p.proname = $1)",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+            if name_exists {
+                eprintln!(
+                    "NOTE: skipping the EXECUTE check for {signature}: public.{name} exists, but \
+                     not with that signature (the migration that installs it is not applied \
+                     yet, or the register drifted). That signature is UNCHECKED, not passing."
+                );
+            }
             continue;
         }
         let app_can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
@@ -3401,6 +3510,10 @@ mod definer_register_tests {
         // own transaction-local setting; EXECUTE is the maintenance role's
         // alone.
         "epigraph_team_group_actor",
+        // 170 (ruling R-13): the challenge resolution-column guard, read as
+        // the caller (or the maintenance owner of 168's resolution definer,
+        // which is what lets that definer through).
+        "epigraph_challenge_resolution_guard",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,
@@ -3915,6 +4028,51 @@ mod definer_register_tests {
         }
     }
 
+    /// `verify`'s app-grant check runs as a PRE-FLIGHT, before later
+    /// migrations apply, so a database below 179 (which has 165's boolean
+    /// `epigraph_bind_group_role` / `epigraph_define_group_role` but not 179's
+    /// text overloads) must be CHECKED, not aborted: an entry whose SIGNATURE
+    /// is not installed is skipped, although a function of that NAME exists.
+    /// CONTROL: at head every entry is checked and passes, and a stray grant
+    /// on an overload that IS installed is still reported.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_skips_an_overload_whose_migration_is_not_applied(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for stmt in [
+            "DROP FUNCTION public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+            "DROP FUNCTION public.epigraph_bind_group_role(text, uuid, text, text, text)",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+        }
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("a database below 179 is checked, not aborted"),
+            0,
+            "the uninstalled overloads are skipped; every installed entry still passes"
+        );
+        sqlx::query(
+            "GRANT EXECUTE ON FUNCTION \
+             public.epigraph_bind_group_role(text, uuid, text, boolean, text) TO epigraph_app",
+        )
+        .execute(&pool)
+        .await
+        .expect("stray grant");
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check"),
+            1,
+            "CONTROL: the installed boolean overload is still checked"
+        );
+    }
+
     /// `verify`'s 166 coverage check passes on a database migrated to head,
     /// and fails for a table the application role is handed after the
     /// migration ran (the deployed-database drift a clean-migrate ratchet
@@ -3973,5 +4131,41 @@ mod definer_register_tests {
             1,
             "a table whose trigger was dropped is reported"
         );
+    }
+
+    /// `verify`'s app-grant check covers migration 180's two definers: a
+    /// stray EXECUTE grant to the application role on the legacy-parent rule
+    /// (an existence oracle over the FORCEd `operator_links`) or on the
+    /// after-the-fact record is reported. CONTROL: at head both pass.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_reports_an_app_grant_on_a_180_definer(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for (n, signature) in [
+            "public.epigraph_is_legacy_fleet_parent(uuid)",
+            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(&format!(
+                "GRANT EXECUTE ON FUNCTION {signature} TO epigraph_app"
+            ))
+            .execute(&pool)
+            .await
+            .expect("stray grant");
+            assert_eq!(
+                super::verify_operator_function_grants(&pool)
+                    .await
+                    .expect("check"),
+                n + 1,
+                "a stray app grant on {signature} is reported"
+            );
+        }
     }
 }

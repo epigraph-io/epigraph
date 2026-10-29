@@ -81,6 +81,22 @@ pub enum IngestExecutorError {
     #[error("workflow row insert failed: {0}")]
     WorkflowInsert(String),
 
+    /// The plan's `(canonical_name, generation)` is already held by a
+    /// `workflows` row this ingest's stamp cannot read (migration 183: the row
+    /// carries its plan's tenancy). Writing this plan's claims and `executes`
+    /// edges under that row would extend a plan the ingest has no view of, so
+    /// nothing is written. Raised before any claim or edge; the message never
+    /// names the row's id or group. A caller's payload conflict, not a fault:
+    /// retrying the same payload is refused again.
+    #[error(
+        "workflow {canonical_name:?} generation {generation} already exists and is not readable \
+         by this ingest. Nothing was written"
+    )]
+    WorkflowOutsideView {
+        canonical_name: String,
+        generation: i32,
+    },
+
     /// Plan structure violated an executor invariant.
     #[error("plan inconsistency: {0}")]
     PlanInconsistency(String),

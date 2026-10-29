@@ -316,6 +316,384 @@ async fn arm_arms_when_every_recent_writer_is_bound(pool: PgPool) {
         .expect("armed: the human still writes");
 }
 
+/// A `('public', group)` claim by `agent` written `age_days` ago together with
+/// its author's `AUTHORED` edge, in ONE transaction, as the submit paths write
+/// a claim (both rows carry that transaction's timestamp).
+async fn submitted_claim(pool: &PgPool, agent: Uuid, group: Uuid, age_days: i32) -> Uuid {
+    claim_with_authored_edge(pool, agent, agent, "submit_claim", group, age_days).await
+}
+
+/// A `('public', group)` claim authored as `author`, written `age_days` ago
+/// together with ONE `AUTHORED` edge from `edge_source` carrying `{"tool":
+/// tool}`, in ONE transaction (both rows carry that transaction's timestamp).
+/// With `edge_source != author` this is the #600 shape: a claim written under
+/// another author, the calling agent recorded by the edge.
+async fn claim_with_authored_edge(
+    pool: &PgPool,
+    author: Uuid,
+    edge_source: Uuid,
+    tool: &str,
+    group: Uuid,
+    age_days: i32,
+) -> Uuid {
+    let agent = author;
+    let id = Uuid::new_v4();
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, \
+                 now() - make_interval(days => $6), now() - make_interval(days => $6))",
+    )
+    .bind(id)
+    .bind(format!("census probe {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(agent)
+    .bind(group)
+    .bind(age_days)
+    .execute(&mut *tx)
+    .await
+    .expect("seed claim");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, created_at) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', jsonb_build_object('tool', $4::text), \
+                 now() - make_interval(days => $3))",
+    )
+    .bind(edge_source)
+    .bind(id)
+    .bind(age_days)
+    .bind(tool)
+    .execute(&mut *tx)
+    .await
+    .expect("seed the author's AUTHORED edge");
+    tx.commit().await.expect("commit");
+    id
+}
+
+/// `actor` supersedes `old` (the act AND the edge migration, on this
+/// privileged pool), as the request paths and their cascade do. Returns the
+/// successor, after checking that the retired claim's own `AUTHORED` edge now
+/// sits on it too: the shape the census must see through.
+async fn supersede_as(pool: &PgPool, old: Uuid, author: Uuid, actor: Uuid) -> Uuid {
+    let new = supersede_raw(pool, old, actor).await;
+    let mut sources: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT source_id FROM edges WHERE relationship = 'AUTHORED' AND target_id = $1",
+    )
+    .bind(new)
+    .fetch_all(pool)
+    .await
+    .expect("AUTHORED edges");
+    sources.sort();
+    let mut want = vec![author, actor];
+    want.sort();
+    assert_eq!(
+        sources, want,
+        "calibration: the successor carries the actor's edge AND the author's migrated one"
+    );
+    new
+}
+
+/// `actor` supersedes `old` (the act AND the edge migration, on this
+/// privileged pool), with no calibration: the second hop of a chain, whose
+/// successor's edges the census tests themselves are about.
+async fn supersede_raw(pool: &PgPool, old: Uuid, actor: Uuid) -> Uuid {
+    let (new, _) = epigraph_db::ClaimRepository::supersede(
+        pool,
+        epigraph_core::ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        epigraph_core::TruthValue::clamped(0.6),
+        "census probe",
+        epigraph_db::SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
+    new
+}
+
+/// Backlog 73085534 (ruling R-23): a supersession's successor is counted for
+/// the agent that PERFORMED it. A bound human authored the claim; an unbound
+/// agent superseded it. The successor inherits the human's author id (and the
+/// human's own `AUTHORED` edge, moved by the cascade), so attributing by
+/// author hid the unbound writer that arming would refuse.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_counts_the_agent_that_superseded_not_the_inherited_author(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "census-actor").await;
+    let old = submitted_claim(&pool, human, group, 0).await;
+    supersede_as(&pool, old, human, unbound).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t1"),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout
+            .contains(&format!("UNBOUND\t{unbound}\t1 claim(s)")),
+        "the superseding agent is a live writer: {}",
+        dry.show()
+    );
+}
+
+/// The converse: an unbound author whose last claim is older than the window
+/// is NOT a live writer because a bound human superseded that claim today.
+/// Attributing the successor to its inherited author listed the quiet author
+/// and refused `--apply`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_count_an_inherited_author_as_a_live_writer(pool: PgPool) {
+    let (quiet, group) = fixture::seed_agent_with_group(&pool, "census-quiet-author").await;
+    let (human, _) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let old = submitted_claim(&pool, quiet, group, 60).await;
+    supersede_as(&pool, old, quiet, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(
+        !r.stdout.contains(&quiet.to_string()),
+        "the quiet author wrote nothing in the window: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        r.show()
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "nothing unbound wrote, so --apply arms");
+}
+
+/// Backlog 73085534 (ruling R-23) across a CHAIN: the quiet author's 60-day-old
+/// claim is superseded twice today by the bound human. Both successors are the
+/// human's writes. The second supersession must not strip the first act's
+/// record off v1 (it used to move onto v2), or v1 falls back to its inherited
+/// author and the quiet author is listed as a live writer again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_count_an_inherited_author_after_a_chain_of_supersessions(pool: PgPool) {
+    let (quiet, group) = fixture::seed_agent_with_group(&pool, "census-quiet-author").await;
+    let (human, _) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let v0 = submitted_claim(&pool, quiet, group, 60).await;
+    let v1 = supersede_as(&pool, v0, quiet, human).await;
+    supersede_raw(&pool, v1, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(
+        !r.stdout.contains(&quiet.to_string()),
+        "the quiet author wrote nothing in the window: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        r.show()
+    );
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "nothing unbound wrote, so --apply arms");
+}
+
+/// The converse chain: the unbound agent U restates the human's claim (v1),
+/// then the human restates U's v1 (v2). U wrote v1, so U is a live writer; the
+/// second supersession must not carry U's record onto v2 and drop U from the
+/// census.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_still_counts_the_first_actor_of_a_chain_of_supersessions(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "census-actor").await;
+    let v0 = submitted_claim(&pool, human, group, 0).await;
+    let v1 = supersede_as(&pool, v0, human, unbound).await;
+    supersede_raw(&pool, v1, human).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains(&format!("UNBOUND\t{unbound}\t1 claim(s)")),
+        "U wrote v1: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t1"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// Only a supersession's OWN act edge re-attributes a claim. A #600-shaped
+/// claim (authored as the bound human S, its calling agent C recorded by an
+/// `AUTHORED` edge in the same transaction) that is then marked a duplicate
+/// gains a `supersedes` pointer, but no supersession wrote it: the census
+/// keeps attributing it to its author, as for every other claim. The dedup's
+/// repair is left deferred here (the act alone), the state in which the
+/// claim's own edge is still on it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_reattribute_a_marked_duplicate_to_its_calling_agent(pool: PgPool) {
+    let (s, group) = fixture::seed_agent_with_group(&pool, "census-system-author").await;
+    make_human(&pool, s).await;
+    let (caller, _) = fixture::seed_agent_with_group(&pool, "census-600-caller").await;
+    let canonical = submitted_claim(&pool, s, group, 0).await;
+    let dup = claim_with_authored_edge(&pool, s, caller, "ingest_document", group, 0).await;
+
+    let before = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        before.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "CALIBRATION: the #600 claim is attributed to its author: {}",
+        before.show()
+    );
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("the dedup's act");
+    }
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("the duplicate");
+    assert_eq!(supersedes, Some(canonical), "CALIBRATION: marked");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&caller.to_string()),
+        "marking a duplicate is not a supersession by the claim's calling agent: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// The act's edge is the one written in the act's OWN transaction. An
+/// `AUTHORED` edge added onto the successor LATER (here by another unbound
+/// agent C, even one carrying the act's tool and marker, as only a direct
+/// database writer could) does not re-attribute it: the
+/// census counts B, who superseded, and not C.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_ignores_an_authored_edge_added_after_the_act(pool: PgPool) {
+    let (human, group) = fixture::seed_agent_with_group(&pool, "census-human").await;
+    make_human(&pool, human).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "census-actor-b").await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "census-later-c").await;
+    let v0 = submitted_claim(&pool, human, group, 0).await;
+    let v1 = supersede_as(&pool, v0, human, b).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, created_at) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true, \
+                   \"supersede_act\": \"supersede_claim\"}', \
+                 now() + interval '1 minute')",
+    )
+    .bind(c)
+    .bind(v1)
+    .execute(&pool)
+    .await
+    .expect("a later AUTHORED edge from C");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains(&format!("UNBOUND\t{b}\t1 claim(s)")),
+        "B superseded: {}",
+        dry.show()
+    );
+    assert!(
+        !dry.stdout.contains(&c.to_string()),
+        "C's later edge is not the act's: {}",
+        dry.show()
+    );
+}
+
+/// Only a claim that records a supersession (`supersedes` set) can be
+/// re-attributed. A claim that supersedes nothing, authored as the bound
+/// human S, whose same-transaction `AUTHORED` edge from C spells a
+/// supersession tool, is still S's write: the edge's properties alone do not
+/// make the claim a successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_reattribute_a_claim_that_supersedes_nothing(pool: PgPool) {
+    let (s, group) = fixture::seed_agent_with_group(&pool, "census-plain-author").await;
+    make_human(&pool, s).await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "census-plain-caller").await;
+    let plain = claim_with_authored_edge(&pool, s, c, "supersede_claim", group, 0).await;
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(plain)
+            .fetch_one(&pool)
+            .await
+            .expect("the claim");
+    assert_eq!(supersedes, None, "CALIBRATION: no supersession");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&c.to_string()),
+        "a claim that supersedes nothing keeps its author: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// The act's edge is told apart by its reserved marker (`supersede_act`), not
+/// by its `tool` spelling, which any edge writer can set. A marked duplicate
+/// (it carries a `supersedes` pointer) whose same-transaction `AUTHORED` edge
+/// from C spells `tool = supersede_claim` without the marker is still its
+/// author's write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn census_does_not_take_a_tool_spelling_for_the_act_marker(pool: PgPool) {
+    let (s, group) = fixture::seed_agent_with_group(&pool, "census-spelled-author").await;
+    make_human(&pool, s).await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "census-spelled-caller").await;
+    let canonical = submitted_claim(&pool, s, group, 0).await;
+    let dup = claim_with_authored_edge(&pool, s, c, "supersede_claim", group, 0).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("the dedup's act");
+    }
+    let supersedes: Option<Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(dup)
+            .fetch_one(&pool)
+            .await
+            .expect("the duplicate");
+    assert_eq!(supersedes, Some(canonical), "CALIBRATION: marked");
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        !dry.stdout.contains(&c.to_string()),
+        "a tool spelling is not the act's marker: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // link-legacy-authors
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2098,4 +2476,71 @@ async fn arm_census_output_is_unchanged_with_an_empty_allowlist(pool: PgPool) {
         "{}",
         refused.show()
     );
+}
+
+/// Backlog 73085534 (ruling R-23) in the ALLOWLIST census: an allowlisted
+/// service S supersedes the human's claim in a group S's operator does not
+/// write. The successor inherits the human's author id, but S wrote it, so S is
+/// OUT-OF-SCOPE for that group (and nothing is UNBOUND).
+///
+/// Verified to fail: `out_of_scope_allowlisted_writers` alone reverted to
+/// attributing by `claims.agent_id` (the successor counted for the human, S
+/// not listed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_lists_an_allowlisted_agent_that_superseded_outside_its_operators_groups(
+    pool: PgPool,
+) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let v0 = submitted_claim(&pool, human, s_group, 0).await;
+
+    let before = run_op(&pool, &["arm-operator-binding"]).await;
+    assert!(
+        !before.stdout.contains("OUT-OF-SCOPE"),
+        "CALIBRATION: the human's own claim is in neither list: {}",
+        before.show()
+    );
+    supersede_as(&pool, v0, human, s).await;
+
+    let dry = run_op(&pool, &["arm-operator-binding"]).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout
+            .contains(&format!("OUT-OF-SCOPE\t{s}\t{s_group}\t1 claim(s)")),
+        "S wrote the successor outside its operator's groups: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("UNBOUND-RECENT-WRITERS\t0"),
+        "{}",
+        dry.show()
+    );
+}
+
+/// The converse: an allowlisted service S whose only claim in the group is
+/// older than the window is NOT out of scope because the in-scope human
+/// superseded that claim today. The successor inherits S's author id; counting
+/// it for S listed S and refused `--apply`.
+///
+/// Verified to fail: `out_of_scope_allowlisted_writers` alone reverted to
+/// attributing by `claims.agent_id` (S listed OUT-OF-SCOPE, `--apply`
+/// refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn arm_census_does_not_list_an_allowlisted_inherited_author_as_out_of_scope(pool: PgPool) {
+    let (human, _) = fixture::seed_agent_with_group(&pool, "human").await;
+    make_human(&pool, human).await;
+    let (s, s_group) = fixture::seed_agent_with_group(&pool, "service").await;
+    let client = client_for(&pool, s, "service").await;
+    allow_direct(&pool, client, human).await;
+    let v0 = submitted_claim(&pool, s, s_group, 60).await;
+    supersede_as(&pool, v0, s, human).await;
+
+    let r = run_op(&pool, &["arm-operator-binding", "--apply"]).await;
+    assert!(!r.stdout.contains("OUT-OF-SCOPE"), "{}", r.show());
+    assert!(!r.stdout.contains(&s.to_string()), "{}", r.show());
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(armed(&pool).await, "{}", r.show());
 }

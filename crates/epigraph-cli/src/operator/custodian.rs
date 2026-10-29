@@ -22,7 +22,8 @@
 //! corpus, whose authors are retired or unbound identities by construction):
 //! on the maintenance DSN, in ONE transaction, the supersede act
 //! (`ClaimRepository::supersede_act_conn`: retire, restate under the inherited
-//! author and owner, the `supersedes` edge), the edge migration
+//! author and owner, the `supersedes` edge, and the actor's `AUTHORED` edge on
+//! the successor), the edge migration
 //! (`migrate_superseded_edges_conn`: strengthening edges follow the
 //! successor; `contradicts` / `refutes` stay, and so does `executes` when the
 //! old claim is not public), and
@@ -414,12 +415,15 @@ pub async fn custodial_supersede(
     }
 
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    // The successor keeps the inherited author; the custodian who restated it
+    // is recorded as its `AUTHORED` edge (backlog 73085534, ruling R-23).
     let (new, old_id) = ClaimRepository::supersede_act_conn(
         &mut tx,
         ClaimId::from_uuid(req.claim),
         &req.content,
         truth,
         &req.reason,
+        epigraph_db::SupersedeActor::new(req.actor, epigraph_db::SupersedeTool::CustodialSupersede),
     )
     .await?;
     let migration = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new).await?;
