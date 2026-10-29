@@ -9,7 +9,7 @@
 //! to spine-destination weight).
 
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::PgConnection;
 
 use crate::bridge::candidates::is_safe_table_name;
 
@@ -32,8 +32,12 @@ pub struct SpineUmbrella {
 /// Targets without a theme assignment (`claims.theme_id IS NULL`) are dropped
 /// — they don't contribute to spine-destination weight. If no targets have
 /// themes, returns an empty Vec.
+///
+/// Runs on `conn` because the candidate table is normally a TEMP table
+/// (`bridge::candidates::CandidateTableLifetime::Transaction`), visible only
+/// in the transaction that built it: pass `&mut *tx`.
 pub async fn compute_spine_destination(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     candidates_table: &str,
     top_n: usize,
 ) -> Result<Vec<SpineUmbrella>, sqlx::Error> {
@@ -48,7 +52,7 @@ pub async fn compute_spine_destination(
          JOIN claims c ON c.id = ct.target_id \
          JOIN claim_themes ct_th ON ct_th.id = c.theme_id"
     );
-    let total: i64 = sqlx::query_scalar(&total_sql).fetch_one(pool).await?;
+    let total: i64 = sqlx::query_scalar(&total_sql).fetch_one(&mut *conn).await?;
     if total == 0 {
         return Ok(Vec::new());
     }
@@ -66,7 +70,7 @@ pub async fn compute_spine_destination(
     );
     let rows: Vec<(String, i64)> = sqlx::query_as(&agg_sql)
         .bind(top_n as i64)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
 
     let total_f = total as f64;
