@@ -1937,7 +1937,7 @@ pub async fn submit_packet(
             } else {
                 match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
-                        // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
+                        // Provider-agnostic pgvector literal (Jina, OpenAI, ...).
                         let pgvector_str = format!(
                             "[{}]",
                             embedding
@@ -1946,24 +1946,34 @@ pub async fn submit_packet(
                                 .collect::<Vec<_>>()
                                 .join(",")
                         );
-                        if let Err(e) =
-                            sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                                .bind(&pgvector_str)
-                                .bind(claim_id)
-                                .execute(&state.db_pool)
-                                .await
+                        // Stored on the authority that wrote the claim: a
+                        // transaction stamped with the caller's viewer. On the
+                        // unstamped `db_pool` row security refused this UPDATE
+                        // for every writer (`AppState::store_claim_embedding_as`).
+                        match state
+                            .store_claim_embedding_as(
+                                &viewer,
+                                claim_id,
+                                &pgvector_str,
+                                "submit_packet.embed",
+                            )
+                            .await
                         {
-                            tracing::warn!(
-                                claim_id = %claim_id,
-                                error = %e,
-                                "Failed to store claim embedding"
-                            );
-                        } else {
-                            tracing::debug!(
+                            Ok(true) => tracing::debug!(
                                 claim_id = %claim_id,
                                 embedding_dim = embedding.len(),
                                 "Generated and stored embedding for claim"
-                            );
+                            ),
+                            Ok(false) => tracing::warn!(
+                                claim_id = %claim_id,
+                                "Claim embedding matched no row (claim missing, sealed, \
+                                 superseded, or not writable by the caller); no vector stored"
+                            ),
+                            Err(e) => tracing::warn!(
+                                claim_id = %claim_id,
+                                error = %e,
+                                "Failed to store claim embedding"
+                            ),
                         }
                     }
                     Err(e) => {
@@ -2048,31 +2058,39 @@ pub async fn submit_packet(
                                     .collect::<Vec<_>>()
                                     .join(",")
                             );
-                            if let Err(e) = sqlx::query(
-                                "UPDATE evidence SET embedding = $1::vector WHERE id = $2",
-                            )
-                            .bind(&pgvector_str)
-                            .bind(evidence_id)
-                            .execute(&state.db_pool)
-                            .await
+                            // Same authority as the packet's insert, for the
+                            // same reason as the claim's vector above.
+                            match state
+                                .store_evidence_embedding_as(
+                                    &viewer,
+                                    evidence_id,
+                                    &pgvector_str,
+                                    "submit_packet.embed_figure",
+                                )
+                                .await
                             {
-                                tracing::warn!(
+                                Ok(true) => {
+                                    let mode = if embedding_service.as_multimodal().is_some() {
+                                        "image"
+                                    } else {
+                                        "caption"
+                                    };
+                                    tracing::debug!(
+                                        evidence_id = %evidence_id,
+                                        embedding_dim = embedding.len(),
+                                        mode,
+                                        "Generated and stored figure evidence embedding"
+                                    );
+                                }
+                                Ok(false) => tracing::warn!(
+                                    evidence_id = %evidence_id,
+                                    "Figure evidence embedding matched no row; no vector stored"
+                                ),
+                                Err(e) => tracing::warn!(
                                     evidence_id = %evidence_id,
                                     error = %e,
                                     "Failed to store figure evidence embedding"
-                                );
-                            } else {
-                                let mode = if embedding_service.as_multimodal().is_some() {
-                                    "image"
-                                } else {
-                                    "caption"
-                                };
-                                tracing::debug!(
-                                    evidence_id = %evidence_id,
-                                    embedding_dim = embedding.len(),
-                                    mode,
-                                    "Generated and stored figure evidence embedding"
-                                );
+                                ),
                             }
                         }
                         Err(e) => {
