@@ -7,10 +7,10 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::bridge::candidates::{build_candidate_table, drop_candidate_table};
+use epigraph_cli::bridge::candidates::{build_candidate_table, CandidateTableLifetime};
 use epigraph_cli::bridge::components::{compute_components, ComponentSummary};
 use epigraph_cli::bridge::spine::compute_spine_destination;
-use epigraph_cli::rerank::{rerank_candidates_table, RerankConfig};
+use epigraph_cli::rerank::{find_candidates_from_table, rerank_candidates, RerankConfig};
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
@@ -153,12 +153,21 @@ async fn sweep_dry_run_with_two_small_components(pool: PgPool) {
         assert_ne!(small.component_id, target.component_id, "must skip target");
 
         let table = format!("test_sweep_{}", Uuid::new_v4().simple());
-        let count = build_candidate_table(&pool, &table, &source_atoms, &target_atoms, 0.5, 10)
-            .await
-            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let count = build_candidate_table(
+            &mut tx,
+            &table,
+            CandidateTableLifetime::Transaction,
+            &source_atoms,
+            &target_atoms,
+            0.5,
+            10,
+        )
+        .await
+        .unwrap();
         assert!(count > 0, "expected at least one candidate pair");
 
-        let spine = compute_spine_destination(&pool, &table, 5).await.unwrap();
+        let spine = compute_spine_destination(&mut tx, &table, 5).await.unwrap();
         if !spine.is_empty() {
             spine_seen = true;
             // Targets are all under theme "X".
@@ -174,14 +183,14 @@ async fn sweep_dry_run_with_two_small_components(pool: PgPool) {
             limit: None,
             verbose: false,
         };
-        let summary = rerank_candidates_table(&pool, &table, &config)
+        let candidates = find_candidates_from_table(&mut tx, &table, &config)
             .await
             .unwrap();
+        tx.commit().await.unwrap();
+        let summary = rerank_candidates(&pool, candidates, &config).await.unwrap();
         assert_eq!(summary.edges_created, 0, "dry-run must not create edges");
         total_edges_created += summary.edges_created;
         total_processed += 1;
-
-        drop_candidate_table(&pool, &table).await.unwrap();
     }
 
     assert_eq!(total_processed, 2, "expected 2 small components processed");

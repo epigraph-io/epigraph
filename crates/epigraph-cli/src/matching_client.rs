@@ -2,8 +2,8 @@
 //!
 //! The engine crate (`epigraph-engine::matching::verifier`) defines the trait;
 //! we cannot define this impl there because `epigraph-cli` already depends on
-//! `epigraph-engine`. This module wraps [`crate::rerank::rerank_candidates_table`]
-//! and harvests per-pair verdicts from the extended [`RerankSummary::per_pair_verdicts`]
+//! `epigraph-engine`. This module wraps [`crate::rerank::find_candidates_from_table`]
+//! and [`crate::rerank::rerank_candidates`] and harvests per-pair verdicts from the extended [`RerankSummary::per_pair_verdicts`]
 //! channel (no edges written — dry-run only).
 //!
 //! [`VerifierClient`]: epigraph_engine::matching::verifier::VerifierClient
@@ -16,17 +16,22 @@ use epigraph_engine::matching::verifier::{Verdict, VerifierClient, REJECTED_RELA
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::rerank::{rerank_candidates_table, PerPairVerdict, RerankConfig, RerankSummary};
+use crate::rerank::{
+    find_candidates_from_table, rerank_candidates, PerPairVerdict, RerankConfig, RerankSummary,
+};
 
 /// Wraps the Phase 7 reranker as a [`VerifierClient`].
 ///
 /// Each `verify()` call:
-/// 1. Creates a transient temp table named `matcher_verify_<uuid>` (safe
-///    identifier characters only).
+/// 1. Opens one transaction and creates a `TEMP` table named
+///    `matcher_verify_<uuid>` (safe identifier characters only) with
+///    `ON COMMIT DROP`.
 /// 2. Inserts the pairs, deduplicated to canonical `(min, max)` order so the
 ///    reranker doesn't bill us twice for `(A,B)` and `(B,A)`.
-/// 3. Calls `rerank_candidates_table` with `dry_run=true`. Edges are NOT
-///    written by the reranker — the matcher policy layer owns that.
+/// 3. Reads the candidates back with `find_candidates_from_table` in the same
+///    transaction, commits (which drops the table), then runs
+///    `rerank_candidates` with `dry_run=true`. Edges are NOT written by the
+///    reranker — the matcher policy layer owns that.
 /// 4. Joins the per-pair verdicts back to the input order via
 ///    [`align_verdicts`]. Pairs the reranker returned no row for yield `None`
 ///    ("no answer"), which the pipeline skips; the LLM's own `valid: false`
@@ -212,44 +217,48 @@ impl VerifierClient for RerankBridgesClient {
         canon.dedup();
 
         let table = format!("matcher_verify_{}", Uuid::new_v4().simple());
-        // CREATE TEMP TABLE is per-session, but sqlx's pool routes successive
-        // .execute(&pool) calls to different connections — the temp table
-        // wouldn't be visible from the connection that later runs the
-        // rerank query. Use a regular table with a UUID-suffixed name
-        // (still safe-identifier per find_candidates_from_table) and drop
-        // it explicitly at the end.
-        sqlx::query(&format!(
-            "CREATE TABLE {table}
-             (source_id uuid NOT NULL, target_id uuid NOT NULL)"
-        ))
-        .execute(&self.pool)
-        .await?;
-
-        // Always attempt to clean up the table, even if subsequent work
-        // errors. Defer via a guard wouldn't help across an early-return
-        // through `?`; explicit cleanup after the body is simpler.
-        let result = async {
-            for (a, b) in &canon {
-                sqlx::query(&format!(
-                    "INSERT INTO {table} (source_id, target_id) VALUES ($1, $2)"
-                ))
-                .bind(a)
-                .bind(b)
-                .execute(&self.pool)
-                .await?;
-            }
-
-            rerank_candidates_table(&self.pool, &table, &self.config)
+        // The scratch table is a TEMP table, read in the session that created
+        // it. A regular table would need CREATE on a schema, which neither the
+        // application role nor the maintenance login holds (by design), and a
+        // TEMP table is invisible to any other pooled connection — so the
+        // create, the insert and the candidate read all run on ONE transaction.
+        // A transaction rather than a bare acquired connection because only a
+        // transaction keeps one server session behind a transaction-mode
+        // pooler (`EPIGRAPH_SESSION_GUC_MODE=transaction`). The maintenance
+        // bypass is keyed on the login (`session_user`), so it holds here as on
+        // any other statement on this pool.
+        //
+        // `ON COMMIT DROP` removes the table on commit, and a `?` below drops
+        // `tx`, which rolls back and removes it too: no exit path leaves it
+        // behind, and nothing has to remember to drop it. The transaction ends
+        // before the LLM calls, so it is never held open across them.
+        let (sources, targets): (Vec<Uuid>, Vec<Uuid>) = canon.iter().copied().unzip();
+        let candidates = {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(&format!(
+                "CREATE TEMP TABLE {table} \
+                 (source_id uuid NOT NULL, target_id uuid NOT NULL) ON COMMIT DROP"
+            ))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!(
+                "INSERT INTO {table} (source_id, target_id) \
+                 SELECT * FROM unnest($1::uuid[], $2::uuid[])"
+            ))
+            .bind(&sources)
+            .bind(&targets)
+            .execute(&mut *tx)
+            .await?;
+            let candidates = find_candidates_from_table(&mut tx, &table, &self.config)
                 .await
-                .map_err(|e| anyhow::anyhow!(e))
-        }
-        .await;
+                .map_err(|e| anyhow::anyhow!(e))?;
+            tx.commit().await?;
+            candidates
+        };
 
-        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-            .execute(&self.pool)
-            .await;
-
-        let summary = result?;
+        let summary = rerank_candidates(&self.pool, candidates, &self.config)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // Fail loudly BEFORE handing the pipeline a vector of `None`s it would
         // (correctly) skip and the sweep would (incorrectly) read as "the

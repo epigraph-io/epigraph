@@ -1603,6 +1603,107 @@ impl AppState {
         Ok(ClaimWriteTx::Unscoped(tx))
     }
 
+    /// Store a claim's embedding after the claim's own write committed, on the
+    /// SAME authority that wrote it: a [`Self::begin_claim_write`] transaction
+    /// stamped with the request's `viewer`.
+    ///
+    /// # Why not `db_pool`
+    ///
+    /// An `UPDATE claims SET embedding` on the unstamped pool carries no
+    /// writable set. Migration 077's `claims_tenancy` lets that session SEE a
+    /// public row (`USING … visibility = 'public'`) and then refuses the new
+    /// row (`WITH CHECK owner_group_id = ANY(epigraph_writable_groups())`, an
+    /// empty set): "new row violates row-level security policy for table
+    /// \"claims\"". The claim-write routes swallowed that refusal by design (a
+    /// failed embed must not unwind a committed claim), so they answered 2xx
+    /// and left the claim with no vector, invisible to dense recall. The
+    /// viewer that just passed the INSERT's `WITH CHECK` passes the UPDATE's.
+    ///
+    /// # Why `store_embedding_if_unsealed`
+    ///
+    /// The provider round trip sits between the commit and this store, and a
+    /// claim can be sealed or superseded inside that window. The repository
+    /// call takes the row lock first, re-checks `claim_encryption` and
+    /// `is_current`, and splices the viewer's `{WRITABLE:c}` predicate so the
+    /// statement's qual agrees with the stamp. The caller generates the vector
+    /// BEFORE calling this, so no transaction is held across the provider call.
+    ///
+    /// # The unscoped fallback fails closed
+    ///
+    /// `begin_claim_write` falls back to a plain `db_pool` transaction only for
+    /// a test-built state with no `ScopedPool`. A production process without
+    /// one would run this UPDATE unstamped, which `claims_tenancy` refuses:
+    /// the vector is not stored and the caller logs why. Nothing is admitted.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` when the vector landed. `Ok(false)` when the statement ran and
+    /// matched no row (claim missing, sealed, superseded, or not writable by
+    /// `viewer`). `Err` names a failed begin/stamp, statement, or commit.
+    #[cfg(feature = "db")]
+    pub async fn store_claim_embedding_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+        embedding_pgvector: &str,
+        handler: &'static str,
+    ) -> Result<bool, String> {
+        let mut tx = self
+            .begin_claim_write(viewer, handler)
+            .await
+            .map_err(|e| format!("could not begin a viewer-stamped transaction: {e:?}"))?;
+        let stored = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+            &mut tx,
+            viewer,
+            claim_id,
+            embedding_pgvector,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("the embedding UPDATE ran but could not commit: {e}"))?;
+        Ok(stored)
+    }
+
+    /// Store an evidence row's embedding after the packet that inserted it
+    /// committed, on a [`Self::begin_claim_write`] transaction stamped with the
+    /// same `viewer`. The evidence twin of [`Self::store_claim_embedding_as`],
+    /// for the same reason: `evidence` carries the same generic tenancy policy
+    /// as `claims`, so the unstamped UPDATE is refused by its `WITH CHECK`.
+    /// Stored through `EvidenceRepository::store_embedding_as`, which splices
+    /// the viewer's `{WRITABLE:e}` predicate and skips a sealed row.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` when a row was updated, `Ok(false)` when none matched, `Err`
+    /// on a failed begin/stamp, statement, or commit.
+    #[cfg(feature = "db")]
+    pub async fn store_evidence_embedding_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        evidence_id: Uuid,
+        embedding_pgvector: &str,
+        handler: &'static str,
+    ) -> Result<bool, String> {
+        let mut tx = self
+            .begin_claim_write(viewer, handler)
+            .await
+            .map_err(|e| format!("could not begin a viewer-stamped transaction: {e:?}"))?;
+        let stored = epigraph_db::EvidenceRepository::store_embedding_as(
+            &mut tx,
+            viewer,
+            epigraph_core::EvidenceId::from_uuid(evidence_id),
+            embedding_pgvector,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("the embedding UPDATE ran but could not commit: {e}"))?;
+        Ok(stored)
+    }
+
     /// Create new application state with database pool and custom signature verification state
     #[cfg(feature = "db")]
     pub fn with_db_and_signature_state(

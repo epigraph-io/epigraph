@@ -936,8 +936,9 @@ pub(crate) async fn create_claim_core(
     })?;
 
     // Embed inline, best-effort. Mirrors POST /api/v1/submit/packet
-    // (routes/submit.rs:1480-1507). Failures are warned but never fail the
-    // claim create — embedding is recoverable via backfill; the claim is not.
+    // (`routes/submit.rs::submit_packet`, step 8). Failures are warned but
+    // never fail the claim create — embedding is recoverable via backfill;
+    // the claim is not.
     // Skip embedding when privacy_tier != "public" — encrypted/fully_private
     // claims have placeholder or ciphertext content that wouldn't yield a
     // useful semantic vector.
@@ -953,24 +954,34 @@ pub(crate) async fn create_claim_core(
                             .collect::<Vec<_>>()
                             .join(",")
                     );
-                    if let Err(e) =
-                        sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                            .bind(&pgvector_str)
-                            .bind(claim_uuid)
-                            .execute(&state.db_pool)
-                            .await
+                    // On the authority that wrote the claim (the caller's
+                    // stamp), never the unstamped `db_pool`, where row
+                    // security refused this UPDATE for every writer
+                    // (`AppState::store_claim_embedding_as`).
+                    match state
+                        .store_claim_embedding_as(
+                            viewer,
+                            claim_uuid,
+                            &pgvector_str,
+                            "create_claim.embed",
+                        )
+                        .await
                     {
-                        tracing::warn!(
-                            claim_id = %claim_uuid,
-                            error = %e,
-                            "Failed to store embedding on create_claim"
-                        );
-                    } else {
-                        tracing::debug!(
+                        Ok(true) => tracing::debug!(
                             claim_id = %claim_uuid,
                             embedding_dim = embedding.len(),
                             "Generated and stored embedding on create_claim"
-                        );
+                        ),
+                        Ok(false) => tracing::warn!(
+                            claim_id = %claim_uuid,
+                            "create_claim embedding matched no row (claim missing, sealed, \
+                             superseded, or not writable by the caller); no vector stored"
+                        ),
+                        Err(e) => tracing::warn!(
+                            claim_id = %claim_uuid,
+                            error = %e,
+                            "Failed to store embedding on create_claim"
+                        ),
                     }
                 }
                 Err(e) => {
