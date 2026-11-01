@@ -1808,6 +1808,20 @@ pub async fn evolve_step(
         // parent by raising at WITH CHECK, not with a zero-row retire.
         e @ epigraph_db::DbError::WriteRefused { .. } => ApiError::from(e),
         e if e.is_write_authority_refusal() => ApiError::from(e),
+        // A parent the caller can READ but not write (backlog 50aa4027): the
+        // claims tenancy policy refuses the retire or the successor INSERT at
+        // its WITH CHECK (42501, the transaction aborted, nothing written). A
+        // denial, 403, as `versioning.rs::supersede_claim` answers it.
+        e if crate::errors::db_is_insufficient_privilege(&e) => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "evolve_step",
+                claim = %parent_id,
+                error = %e,
+                "the database refused the step evolution"
+            );
+            crate::errors::write_refused("step")
+        }
         other => ApiError::InternalError {
             message: other.to_string(),
         },

@@ -81,6 +81,22 @@ fn evolve_caller_error(e: epigraph_db::DbError) -> McpError {
         epigraph_db::DbError::NotFound { id, .. } => {
             invalid_params(format!("parent step {id} not found"))
         }
+        // A parent the caller can READ but not write (backlog 50aa4027): the
+        // claims tenancy policy refuses the retire or the successor INSERT at
+        // its WITH CHECK (42501, the transaction aborted, nothing written).
+        // The same denial class as a WriteRefused, so the same code; the
+        // HTTP twin answers 403. Mapped here, not in `db_caller_error`, so no
+        // other tool's 42501 changes meaning.
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } if d.code().as_deref() == Some("42501") => McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::from(
+                "evolve_step: no write authority over the group that owns this step. \
+                 Nothing was written.",
+            ),
+            data: None,
+        },
         other => crate::errors::db_caller_error(other),
     }
 }
