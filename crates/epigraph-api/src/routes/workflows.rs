@@ -2870,7 +2870,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
-        e @ (E::ChainRewireRefused { .. } | E::StepNotWritable { .. }) => ApiError::Forbidden {
+        e @ (E::ChainRewireRefused { .. }
+        | E::StepNotWritable { .. }
+        | E::GroupNotWritable { .. }) => ApiError::Forbidden {
             reason: e.to_string(),
         },
         E::Repo(db) if db.is_write_authority_refusal() => ApiError::from(db),
@@ -3416,6 +3418,7 @@ pub async fn add_step(
     let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        auth.agent_id,
         &req.canonical_name,
         &req.step_text,
         req.position,

@@ -1891,6 +1891,159 @@ async fn a_public_step_reused_by_a_private_generation_does_not_admit_a_non_membe
     assert_eq!(outcome_written(&pool, w1).await, (Some(1), 0));
 }
 
+/// MCP `add_step` as `viewer` (with `auth` over HTTP, `None` on stdio).
+async fn mcp_add_step(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    name: &str,
+    text: &str,
+) -> Result<(), String> {
+    epigraph_mcp::tools::step_ops::add_step(
+        server,
+        viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: name.to_string(),
+            step_text: text.to_string(),
+            position: None,
+        },
+        auth,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
+/// Set `agent`'s live membership of `group` to `role` (harness).
+async fn set_role(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    let n = sqlx::query(
+        "UPDATE group_memberships SET role = $3 \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("set the role")
+    .rows_affected();
+    assert_eq!(n, 1, "one live membership of {agent} in {group}");
+}
+
+/// R-98 Q5(a) review addendum (backlog 630af617 (1)): the step a GROUP plan
+/// gains lands in the plan's group on the system agent's stamp, which writes
+/// that group whoever called, so the CALLER itself must write the group. A
+/// caller with workflow authority (the recorded submitter) that holds only a
+/// READER membership, or none, is refused with nothing written, over REST,
+/// MCP over HTTP and MCP over stdio. A writer is admitted (calibration) and
+/// its step lands in the group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_writer_cannot_add_a_step_to_a_group_plan(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-add-step-non-writer";
+    let out = w
+        .api
+        .ingest_ok(
+            &h,
+            &declared(extraction(name, 0, &[&["acme non-writer op"]]), w.g, None),
+        )
+        .await;
+    let wf = uuid_of(&out["workflow_id"]);
+    let rest_add = |tok: String, text: &'static str| {
+        let api = &w.api;
+        async move {
+            api.call(
+                Method::POST,
+                "/api/v1/workflows/steps",
+                &tok,
+                Some(&json!({"canonical_name": name, "step_text": text})),
+            )
+            .await
+        }
+    };
+    let before = executes_count(&pool, wf).await;
+
+    // The submitter, now a READER of the plan's group.
+    set_role(&pool, w.g, w.h, "reader").await;
+    let (s, b) = rest_add(h.clone(), "acme reader rest step").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST: a reader is refused: {b}");
+    let h_viewer = epigraph_db::Viewer::resolve(&pool, w.h)
+        .await
+        .expect("viewer");
+    let err = mcp_add_step(
+        &w.c_server,
+        &h_viewer,
+        Some(&http_auth(w.h)),
+        name,
+        "acme reader http step",
+    )
+    .await
+    .expect_err("MCP over HTTP: a reader is refused");
+    assert!(err.contains("does not write"), "{err}");
+
+    // A NON-member recorded as the submitter.
+    set_role(&pool, w.g, w.h, "admin").await;
+    set_submitter(&pool, wf, w.h2).await;
+    let (s, b) = rest_add(token(w.h2, WRITE_SCOPES), "acme stranger rest step").await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "REST: a non-member is refused: {b}"
+    );
+    assert_eq!(
+        executes_count(&pool, wf).await,
+        before,
+        "nothing was written by any refused call"
+    );
+    assert_eq!(claims_with_content(&pool, "acme reader rest step").await, 0);
+    assert_eq!(claims_with_content(&pool, "acme reader http step").await, 0);
+    assert_eq!(
+        claims_with_content(&pool, "acme stranger rest step").await,
+        0
+    );
+
+    // stdio: the curator's own plan, the curator a reader, then a writer.
+    let stdio_name = "acme-add-step-non-writer-stdio";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction(stdio_name, 0, &[&["acme stdio non-writer op"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator declares the plan into the team group");
+    set_role(&pool, w.g, w.c, "reader").await;
+    let c_viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let refused = mcp_add_step(
+        &w.c_server,
+        &c_viewer,
+        None,
+        stdio_name,
+        "acme reader stdio step",
+    )
+    .await;
+    assert!(refused.is_err(), "stdio: a reader is refused: {refused:?}");
+    assert_eq!(
+        claims_with_content(&pool, "acme reader stdio step").await,
+        0
+    );
+
+    // CALIBRATION: the submitter as a writer again, over REST.
+    set_submitter(&pool, wf, w.h).await;
+    let (s, b) = rest_add(h.clone(), "acme writer rest step").await;
+    assert_eq!(s, StatusCode::OK, "REST: the writing submitter adds: {b}");
+    let step = uuid_of(&b["step_claim_id"]);
+    assert_eq!(
+        claim_tenancy(&pool, step).await,
+        ("group".to_string(), w.g),
+        "the writer's step lands in the plan's group"
+    );
+}
+
 /// Both MCP entry points (`report_hierarchical_outcome` and
 /// `report_workflow_outcome`'s hierarchical branch), as `agent`, on
 /// `workflow_id`. Each call's result as `Ok(())` or `Err(message)`.
