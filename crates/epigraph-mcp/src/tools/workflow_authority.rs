@@ -196,7 +196,8 @@ pub(crate) async fn require_workflow_authority(
     // stdio (backlog 222289f3): no token, so the caller is this server's own
     // agent, checked against the target row on its own stamp.
     let Some(auth) = auth else {
-        let arm = stdio_workflow_authority(server, caller, workflow_id, owner, tool_name).await?;
+        let arm =
+            stdio_workflow_authority(server, conn, caller, workflow_id, owner, tool_name).await?;
         return Ok(grant(arm));
     };
     let caller_agent = caller.agent_id();
@@ -267,6 +268,7 @@ pub(crate) async fn require_workflow_authority(
 /// or the operator link cannot be read.
 async fn stdio_workflow_authority(
     server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     caller: WriteIdentity,
     workflow_id: uuid::Uuid,
     owner: Option<uuid::Uuid>,
@@ -307,23 +309,16 @@ async fn stdio_workflow_authority(
             t
         }
         // No tenancy-aware pool (a development superuser): the in-query
-        // predicate alone, as every reader on that configuration.
-        None => {
-            let mut conn = server.pool.acquire().await.map_err(|e| {
+        // predicate alone, on the act's own (unstamped) connection, as every
+        // reader on that configuration.
+        None => epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+            .await
+            .map_err(|e| {
                 internal_error_logged(
                     format!("{tool_name}: could not read the workflow as the stdio caller"),
                     e,
                 )
-            })?;
-            epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut conn, &viewer, workflow_id)
-                .await
-                .map_err(|e| {
-                    internal_error_logged(
-                        format!("{tool_name}: could not read the workflow as the stdio caller"),
-                        e,
-                    )
-                })?
-        }
+            })?,
     };
     let Some((visibility, owner_group)) = tenancy else {
         return Err(crate::errors::invalid_params(format!(
