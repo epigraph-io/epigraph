@@ -2157,6 +2157,29 @@ restart.
   after 114 and 126; apply BEFORE a binary with the matching readers serves
   (they name `retracted_at`). **Applied to throwaway databases only, NOT to
   any deployed database.**
+- **186**: public `maintenance_delete_retention` —
+  `GRANT DELETE ON public.recall_events, public.events TO epigraph_maintenance`,
+  role-guarded like 158, and nothing else. The retention job
+  `prune_recall_events` runs through `MaintenancePool` (an application-role
+  DELETE on the FORCE-RLS `recall_events` matches zero rows), but 070 gave the
+  maintenance role no DELETE, so on a NOSUPERUSER maintenance login its dry
+  run worked and its real run failed with "permission denied for table
+  recall_events". The two tables are exactly the job's two DELETE targets;
+  neither is an FK target, and `events_cascade_edges` (an INVOKER trigger)
+  deletes from `edges`, where the role already holds DELETE (115). The role
+  already held SELECT, INSERT and UPDATE on both (070); row security is
+  unchanged. **Effective reach:** any session acting as
+  `epigraph_maintenance` can delete any row of either table; the age and
+  telemetry-type filters are the job's. A telemetry-only definer is the
+  follow-up if `events` is ever closed to the application role's own DELETE
+  (allowlisted today in `app_role_table_lockdown.rs`); the file header says
+  why it is not done here. Sets `lock_timeout = '3s'`. Behaviour in
+  `epigraph-cli/tests/prune_recall_events_maintenance.rs`. Undo in the file
+  header. Checked before claiming: no migration on main, open PR, origin
+  branch or local worktree carries a `186`. **Deploy order:** none against
+  other migrations or the binaries (a grant; the shipped job already issues
+  both statements). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
