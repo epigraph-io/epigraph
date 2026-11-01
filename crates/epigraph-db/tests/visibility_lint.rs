@@ -3439,6 +3439,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "workflow.rs",
+        "tenancy_of",
+        "READ of `workflows` only: one row's `(visibility, owner_group_id)` by primary key, so \
+         a write that EXTENDS a plan (a step `add_step` adds, a new generation an ingest \
+         creates) takes the row's tenancy (ruling R-98). It runs on the ingest system agent's \
+         stamped transaction that writes the extension, so `workflows`' row security bounds it \
+         to the rows that stamp reads; the caller's authority is `require_workflow_authority` \
+         over the same row, and a reader's view is `tenancy_as_viewer`.",
+    ),
+    (
+        "workflow.rs",
         "executes_plan_indices",
         "READ of `edges`: the target, `plan_index` and publicness of each live `executes` edge \
          of one workflow, which decides the `plan_index` of the one edge `add_step` writes; no \

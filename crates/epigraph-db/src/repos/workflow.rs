@@ -2054,6 +2054,25 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`,
+    /// or `None` when the connection's stamp does not read it. The write paths
+    /// that EXTEND a plan run it on the system-agent-stamped transaction that
+    /// writes the extension, so the extension takes the row's tenancy (ruling
+    /// R-98: a step added to a group plan, a new generation of a group
+    /// lineage); a reader's view goes through [`Self::tenancy_as_viewer`].
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn tenancy_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
     /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`
     /// as `viewer` reads it, or `None` when `viewer` cannot read the row,
     /// exactly as for an unknown id (backlog 222289f3: the stdio workflow

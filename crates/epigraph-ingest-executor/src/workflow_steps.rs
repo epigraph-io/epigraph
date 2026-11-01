@@ -439,7 +439,19 @@ pub async fn add_step(
     // every workflow private to whoever last edited it. A parameter here would
     // therefore only widen the ways to get it wrong, so the declaration is
     // derived from the author the row already names.
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?;
+    //
+    // A GROUP plan is the exception (ruling R-98 Q5(a), backlog 630af617):
+    // its new step takes the `workflows` row's tenancy, read under the row
+    // lock taken above, so the step, its `executes` edge and its chain edges
+    // (the endpoint meet) are the plan's group and not public. The system
+    // agent's stamp writes that group (a declared ingest required it); if it
+    // no longer does, the INSERT is refused and nothing is written.
+    let decl = match epigraph_db::WorkflowRepository::tenancy_of(&mut *conn, workflow_id).await? {
+        Some((visibility, group)) if visibility == "group" => {
+            epigraph_core::TenancyDecl::group(group)
+        }
+        _ => epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?,
+    };
 
     let claim_created = sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \
