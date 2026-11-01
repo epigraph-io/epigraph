@@ -724,17 +724,19 @@ async fn executes_edge_of(pool: &PgPool, workflow_id: Uuid, target: Uuid) -> (St
     .expect("harness: the added step's executes edge")
 }
 
-/// A step added to a group-private plan is a public claim, and its
-/// `executes` edge is public and world-owned, so every reader sees that edge
-/// and its properties. An index on it derived from the plan's group-private
-/// edges would tell a non-member the private plan's size (an append) or a
-/// private step's position (an insert). So no step added to a plan with a
-/// non-public `executes` edge is indexed, even when the workflow-ingest stamp
-/// is a writer of the group and could see and move every one of them.
+/// A step added to a group-private plan takes the plan's group (ruling R-98,
+/// backlog 630af617: the restricted plan's `workflows` row is re-tenanted
+/// with its claims, and a new step inherits the row's tenancy), so its
+/// `executes` edge is `('group', G)`. It is still left unindexed: an index
+/// derived from the plan's group-private edges is withheld for every add to a
+/// plan with a non-public `executes` edge, even when the workflow-ingest stamp
+/// is a writer of the group and could see and move every one of them. The
+/// submitting curator must itself write G to add a step (R-98 review), so it
+/// is made a writer here.
 ///
-/// A non-member sees the one public edge as unindexed: no item, no index, no
-/// gap that counts the hidden items. A member reads the published items
-/// unchanged, with no duplicate and no gap.
+/// A non-member sees no edge of the plan, before or after the adds (the
+/// unknown-plan 404). A member reads the published items unchanged, with no
+/// duplicate and no gap.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(pool: PgPool) {
     let w = private_workflow(&pool).await;
@@ -742,6 +744,7 @@ async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(p
     // derivable, so the test covers the derivation, not a blind stamp.
     let system = ingest_system_agent(&pool).await;
     add_member(&pool, w.g, system, "writer").await;
+    add_member(&pool, w.g, w.curator, "writer").await;
     let curator = token(w.curator, WRITE_SCOPES);
     let reader = token(w.reader, READ_SCOPES);
     let stranger = token(w.stranger, READ_SCOPES);
@@ -753,19 +756,16 @@ async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(p
     let (visibility, owner, properties) = executes_edge_of(&pool, w.workflow_id, appended).await;
     assert_eq!(
         (visibility.as_str(), owner),
-        ("public", Uuid::nil()),
-        "calibration: every reader sees the added step's edge"
+        ("group", w.g),
+        "R-98: the added step's edge carries the plan's group"
     );
     assert_eq!(properties, json!({"level": 2}), "no plan_index on it");
 
     let (status, p) = w.api.plan_status(&stranger, w.workflow_id).await;
-    assert_eq!(status, StatusCode::OK, "{p}");
-    assert_eq!(item_ids(&p), Vec::<Uuid>::new(), "{p}");
-    assert_eq!(p["unindexed_edges"], json!(1), "{p}");
     assert_eq!(
-        p["plan_index_gaps"],
-        json!(0),
-        "no count of hidden items: {p}"
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-member still has no plan to read: {p}"
     );
 
     let p = w.api.plan(&reader, w.workflow_id).await;
@@ -782,9 +782,8 @@ async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(p
         executes_edge_of(&pool, w.workflow_id, mid).await.2,
         json!({"level": 2})
     );
-    let (_, p) = w.api.plan_status(&stranger, w.workflow_id).await;
-    assert_eq!(item_ids(&p), Vec::<Uuid>::new(), "{p}");
-    assert_eq!(p["plan_index_gaps"], json!(0), "{p}");
+    let (status, p) = w.api.plan_status(&stranger, w.workflow_id).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{p}");
     let p = w.api.plan(&reader, w.workflow_id).await;
     assert_items_are_the_vectors(&p);
     assert_eq!(p["unindexed_edges"], json!(2), "{p}");
