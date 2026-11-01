@@ -7,8 +7,11 @@
 //!
 //! # Running
 //!
+//! Against a fresh `*_test` database migrated from empty (repository
+//! `CLAUDE.md`, "Test database"):
+//!
 //! ```bash
-//! DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test \
+//! DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test \
 //!   cargo test -p epigraph-api --test idempotency_2p5_tests
 //! ```
 

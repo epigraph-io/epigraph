@@ -62,11 +62,18 @@ pub async fn assert_disposable_db(pool: &PgPool) {
         "refusing to run destructive claim fixtures against database {db:?}.\n\
          These tests DROP the uq_claims_content_hash_agent constraint and run a \
          table-wide dedup DELETE on `claims`.\n\
-         Point DATABASE_URL at a scratch database (e.g. epigraph_db_repo_test), or \
-         set {DESTRUCTIVE_OPT_IN}=1 if {db:?} really is disposable."
+         Point DATABASE_URL at a fresh scratch database migrated from empty (a \
+         `*_test` name), or set {DESTRUCTIVE_OPT_IN}=1 if {db:?} really is disposable."
     );
 }
 
+/// The `DATABASE_URL` pool, migrated to this tree's head, or `None` (skip)
+/// when `DATABASE_URL` is unset or unreachable.
+///
+/// A database that IS reachable but will not migrate is a panic, not a skip
+/// (backlog acffb2c4): a shared database left at a pre-tenancy version fails
+/// closed at migration 060, and swallowing that error turned every test
+/// using this pool into a silent skip.
 pub async fn try_test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPoolOptions::new()
@@ -75,8 +82,38 @@ pub async fn try_test_pool() -> Option<PgPool> {
         .await
         .ok()?;
     assert_disposable_db(&pool).await;
-    sqlx::migrate!("../../migrations").run(&pool).await.ok()?;
+    if let Err(why) = migrate_test_db(&pool).await {
+        panic!("{why}");
+    }
     Some(pool)
+}
+
+/// Migrate `pool`'s database to this tree's head; on failure, the migration
+/// error plus [`stale_test_db_help`].
+pub async fn migrate_test_db(pool: &PgPool) -> Result<(), String> {
+    let Err(e) = sqlx::migrate!("../../migrations").run(pool).await else {
+        return Ok(());
+    };
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|_| "?".to_string());
+    Err(format!(
+        "test database {db:?} does not migrate to this tree's head: {e}\n{}",
+        stale_test_db_help()
+    ))
+}
+
+/// The procedure for a test database that is not at this tree's head.
+pub fn stale_test_db_help() -> &'static str {
+    "A database that was not migrated 001 -> head from empty (one left at a \
+     pre-tenancy version, or provisioned outside the public migration series) \
+     cannot run these suites and cannot be repaired in place. Do what CI does: \
+     create a FRESH database whose name ends in `_test` and migrate it from \
+     empty (`createdb <name>_test`, then `MIGRATION_DATABASE_URL=<its DSN> cargo \
+     run -p epigraph-api --bin epigraph-migrate`), and point DATABASE_URL at it. \
+     Never reuse a shared one. #[sqlx::test] suites are unaffected: each test \
+     gets a private database."
 }
 
 #[macro_export]
