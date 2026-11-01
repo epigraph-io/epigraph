@@ -2054,6 +2054,32 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`
+    /// as `viewer` reads it, or `None` when `viewer` cannot read the row,
+    /// exactly as for an unknown id (backlog 222289f3: the stdio workflow
+    /// authority decides on the CALLER's own view of the target row). Run it
+    /// on `viewer`'s STAMPED connection, so the in-query predicate and the row
+    /// security agree.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn tenancy_as_viewer(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT w.visibility::text, w.owner_group_id \
+               FROM workflows w WHERE w.id = $1 /* {VISIBILITY:w} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, Uuid)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
     /// Every `workflows` row descended from `id` through `workflows.parent_id`
     /// (later generations and variants), transitively, in walk order and
     /// without `id` itself.

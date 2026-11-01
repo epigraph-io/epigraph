@@ -7,7 +7,9 @@
 //! `claims:admin` path; a workflow with NO record (every workflow written
 //! before batch H-b — nothing recorded who created them) is platform corpus
 //! (U005, default decision A) and is mutable over that transport ONLY through
-//! the audited `claims:admin` path. stdio is unchanged for both. See
+//! the audited `claims:admin` path. Over stdio (backlog 222289f3) a submitted
+//! workflow admits only its submitter or the submitter's operator, and a
+//! legacy one a stdio caller that reads and writes it. See
 //! `src/tools/workflow_authority.rs` for the measurement.
 //!
 //! The decision is Rust-side and data-driven (`workflows.metadata`), so this
@@ -364,8 +366,9 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
     );
 
     // CALIBRATION: the lineage the stranger was refused on IS deletable — a
-    // stdio delete_step (unchecked) drives its head to 0.05 — so the refusal
-    // above was the authority gate, not an unknown lineage.
+    // stdio delete_step (the legacy stdio arm: the server agent reads the
+    // public row) drives its head to 0.05 — so the refusal above was the
+    // authority gate, not an unknown lineage.
     let public = fixture::public_viewer(&pool).await;
     tools::step_ops::delete_step(
         &server,
@@ -490,9 +493,10 @@ async fn a_legacy_workflow_is_mutable_only_through_the_audited_admin_arm(pool: P
     assert_eq!(workflow_admin_audits(&pool, admin).await, 2);
 }
 
-/// stdio is unchanged (the batch H-b bar): a stdio caller is not checked, on a
-/// legacy workflow as on a submitted one. Passes before and after U005; it
-/// pins that the legacy rule did not reach stdio.
+/// A stdio caller that reads a legacy (unrecorded) workflow and writes its
+/// owner group is admitted (the stdio legacy arm, backlog 222289f3: stdio has
+/// no audited admin path to send it to), and the write is recorded as a
+/// `workflows.caller_write` row with `arm = "legacy"` and no token.
 #[sqlx::test(migrations = "../../migrations")]
 async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
@@ -514,8 +518,21 @@ async fn stdio_still_mutates_a_legacy_workflow(pool: PgPool) {
         None,
     )
     .await
-    .expect("stdio is not checked, legacy or not");
+    .expect("the stdio legacy arm admits a readable public legacy row");
     assert_eq!(steps(&pool, "h3-legacy-stdio").await, before + 1);
+    let row: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT details->>'arm', details->>'transport', details->>'client_id' \
+           FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'action' = 'add_step'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("one stdio provenance row");
+    assert_eq!(
+        row,
+        (Some("legacy".into()), Some("stdio".into()), None),
+        "recorded as the stdio legacy arm, with no token"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -648,12 +665,13 @@ async fn an_ingest_with_null_metadata_still_records_its_caller(pool: PgPool) {
     );
 }
 
-/// stdio is unchanged (the batch H-b bar changes stdio only for #374): a stdio
-/// caller is not checked against the recorded submitter, as `patch_claim`'s
-/// whole-patch ownership check is HTTP-only. The submitter IS still recorded
-/// for a stdio ingest, so an HTTP stranger cannot take the workflow over.
+/// stdio is checked against the recorded submitter (backlog 222289f3,
+/// reversing the batch H-b bar): the stdio agent is refused on a workflow an
+/// HTTP caller submitted, with nothing written. A stdio ingest records the
+/// stdio agent as the submitter, so an HTTP stranger cannot take that one over,
+/// and the stdio agent itself still adds to it.
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
+async fn stdio_is_checked_and_a_stdio_ingest_is_still_owned(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let server_agent = server.server_agent_id().await.expect("server agent");
     let public = fixture::public_viewer(&pool).await;
@@ -670,14 +688,25 @@ async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
     )
     .await
     .expect("ingest over HTTP");
-    tools::step_ops::add_step(
+    let before = steps(&pool, "h3-http-owned-stdio").await;
+    let err = tools::step_ops::add_step(
         &server,
         &public,
         add("h3-http-owned-stdio", "a stdio step"),
         None,
     )
     .await
-    .expect("stdio is not checked, as before batch H-b");
+    .expect_err("a stdio caller that did not submit the workflow is refused");
+    assert!(
+        err.message.contains("was submitted by agent"),
+        "refused by the submitter rule: {}",
+        err.message
+    );
+    assert_eq!(
+        steps(&pool, "h3-http-owned-stdio").await,
+        before,
+        "nothing written"
+    );
 
     tools::workflow_ingest::ingest_workflow(
         &server,
@@ -704,6 +733,15 @@ async fn stdio_is_unchanged_but_a_stdio_ingest_is_still_owned(pool: PgPool) {
     )
     .await
     .expect_err("an HTTP stranger must not add to a stdio agent's workflow");
+    // CALIBRATION: the stdio submitter is admitted on its own workflow.
+    tools::step_ops::add_step(
+        &server,
+        &public,
+        add("h3-stdio-owned", "the stdio submitter's step"),
+        None,
+    )
+    .await
+    .expect("the stdio submitter adds to its own workflow");
 }
 
 async fn generation_rows(pool: &PgPool, canonical: &str) -> Vec<(i32, Option<String>)> {

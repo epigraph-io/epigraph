@@ -179,7 +179,8 @@ pub async fn add_step(
         })?;
     }
     // The arm that admitted the caller is recorded with the write: the admin
-    // arm's audit row, or the provenance row of any other authenticated arm.
+    // arm's audit row, or the provenance row of any other arm (stdio included,
+    // backlog 222289f3).
     if let Some((head, grant)) = authority {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
@@ -259,7 +260,8 @@ pub async fn delete_step(
         .await
         .map_err(map_step_err)?;
     // The arm that admitted the caller is recorded with the write: the admin
-    // arm's audit row, or the provenance row of any other authenticated arm.
+    // arm's audit row, or the provenance row of any other arm (stdio included,
+    // backlog 222289f3).
     if let Some((head, grant)) = authority {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,

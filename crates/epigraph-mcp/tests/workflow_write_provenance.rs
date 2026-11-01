@@ -578,21 +578,39 @@ async fn a_legacy_workflow_stays_admin_only(pool: PgPool) {
     .await;
 }
 
-/// stdio is unchanged: no gate, and no provenance row (there is no token).
+/// stdio is gated and recorded (backlog 222289f3): a stdio caller that is not
+/// the submitter is refused with no row; the stdio agent's own workflow admits
+/// it, and the write records one `workflows.caller_write` row naming the
+/// acting agent, with `transport = "stdio"` and no token.
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_writes_record_no_provenance(pool: PgPool) {
+async fn stdio_writes_are_gated_and_record_provenance(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let h = human(&pool, "h").await;
     workflow_submitted_by(&pool, &server, "wp-stdio", h).await;
     let viewer = tools::viewer::request_viewer(&server, None)
         .await
         .expect("stdio viewer");
+    let pinned = viewer.principal().expect("the server's pinned agent");
     let before = steps(&pool, "wp-stdio").await;
     tools::step_ops::add_step(&server, &viewer, add("wp-stdio", "a stdio step"), None)
         .await
-        .expect("stdio is not gated");
-    assert_eq!(steps(&pool, "wp-stdio").await, before + 1);
+        .expect_err("a stdio caller that is not the submitter is refused");
+    assert_eq!(steps(&pool, "wp-stdio").await, before, "nothing written");
     assert_eq!(provenance_total(&pool).await, 0);
+
+    let wf = workflow_submitted_by(&pool, &server, "wp-stdio-own", pinned).await;
+    let before = steps(&pool, "wp-stdio-own").await;
+    tools::step_ops::add_step(&server, &viewer, add("wp-stdio-own", "a stdio step"), None)
+        .await
+        .expect("the stdio submitter is admitted");
+    assert_eq!(steps(&pool, "wp-stdio-own").await, before + 1);
+    let rows = provenance(&pool, wf).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0].1;
+    assert_eq!(d["arm"], "submitter", "{d}");
+    assert_eq!(d["transport"], "stdio", "{d}");
+    assert_eq!(d["acting_agent"], pinned.to_string(), "{d}");
+    assert!(d["client_id"].is_null() && d["token_jti"].is_null(), "{d}");
 }
 
 /// Row security admits the provenance INSERT on the system-stamped

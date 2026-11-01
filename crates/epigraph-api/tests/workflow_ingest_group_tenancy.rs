@@ -2948,21 +2948,20 @@ async fn over_mcp_deprecating_a_declared_generation_is_its_groups_alone(pool: Pg
     assert_eq!(workflow_truth(&pool, w1).await, t1, "W1 is untouched");
 }
 
-/// CHARACTERIZATION (operator question, R-74 residual): a cascading
-/// deprecation walks the lineage on the ingest system agent's stamp, which
-/// reads every group the system agent serves, not on the caller's.
+/// A cascading deprecation walks the lineage on the ingest system agent's
+/// stamp, which reads every group the system agent serves, not on the
+/// caller's (R-74 residual; the walk itself is backlog 4c6e8a17).
 ///
 /// Over the authenticated transport only a caller of the system agent's own
 /// operator reaches the walk (any other is refused OPL02 first, writing
 /// nothing), and each descendant then needs the caller's workflow authority.
-/// On the stdio transport, which checks no workflow authority (the process
-/// holds the DSN; not a trust boundary), a fleet agent of that operator that
-/// does NOT read W2's group cascades W1's deprecation into W2: W2 is
-/// deprecated and its id is reported to the agent.
+/// Since backlog 222289f3 the stdio transport checks workflow authority too,
+/// against every target of the cascade: a fleet agent of that operator is
+/// refused on W1 (its human submitted W1, and a bound agent is not admitted),
+/// and even as W1's recorded submitter it is refused on W2, a descendant it
+/// cannot read, without W2 being named. All-or-nothing: neither row moves.
 #[sqlx::test(migrations = "../../migrations")]
-async fn characterization_a_stdio_cascade_deprecates_a_descendant_the_agent_cannot_read(
-    pool: PgPool,
-) {
+async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool: PgPool) {
     let w = world(&pool).await;
     let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-cascade", w.g).await;
     let reads_g: bool = sqlx::query_scalar(
@@ -2977,25 +2976,44 @@ async fn characterization_a_stdio_cascade_deprecates_a_descendant_the_agent_cann
         !reads_g,
         "premise: the fleet agent is not a member of W2's group"
     );
+    let (t1, t2) = (
+        workflow_truth(&pool, w1).await,
+        workflow_truth(&pool, w2).await,
+    );
 
     let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.f_server, None)
         .await
         .expect("the stdio viewer");
-    let params: epigraph_mcp::types::DeprecateWorkflowParams = serde_json::from_value(json!({
-        "workflow_id": w1.to_string(), "reason": "probe", "cascade": true
-    }))
-    .expect("the tool's parameters");
-    let out =
-        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params, None)
+    let params = || -> epigraph_mcp::types::DeprecateWorkflowParams {
+        serde_json::from_value(json!({
+            "workflow_id": w1.to_string(), "reason": "probe", "cascade": true
+        }))
+        .expect("the tool's parameters")
+    };
+    let err =
+        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params(), None)
             .await
-            .unwrap_or_else(|e| panic!("the stdio cascade runs: {}", e.message));
-    let body = tool_json(&out);
-    assert_eq!(
-        body["deprecated_ids"],
-        json!([w1.to_string(), w2.to_string()]),
-        "CHARACTERIZATION: the cascade deprecates (and names) W2: {body}"
+            .expect_err("the fleet agent did not submit W1");
+    assert!(
+        err.message.contains("submitted by agent"),
+        "{}",
+        err.message
     );
-    assert!((workflow_truth(&pool, w2).await - 0.05).abs() < 1e-9);
+    assert!(!err.message.contains(&w2.to_string()), "{}", err.message);
+
+    // Even as W1's recorded submitter, the hidden descendant refuses the cascade.
+    set_submitter(&pool, w1, w.f).await;
+    let err =
+        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params(), None)
+            .await
+            .expect_err("W2 is a descendant the fleet agent cannot read");
+    assert!(
+        !err.message.contains(&w2.to_string()),
+        "the refusal must not name the hidden descendant: {}",
+        err.message
+    );
+    assert_eq!(workflow_truth(&pool, w1).await, t1, "W1 is untouched");
+    assert_eq!(workflow_truth(&pool, w2).await, t2, "W2 is untouched");
 }
 
 /// CHARACTERIZATION: `DELETE /api/v1/workflows/:id` deprecates FLAT workflow
