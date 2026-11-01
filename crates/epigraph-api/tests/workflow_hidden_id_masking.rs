@@ -574,3 +574,75 @@ async fn evolve_of_a_step_a_hidden_workflow_executes_answers_as_a_missing_parent
         "MCP: not called platform corpus: {text}"
     );
 }
+
+/// `store_workflow` (REST `POST /api/v1/workflows` and the MCP tool) is idempotent
+/// on `(slugify(goal), 0)`, so a goal whose slug is the hidden plan's
+/// `canonical_name` is a re-ingest of the hidden row. The non-member's answer,
+/// and the REST `workflow.created` event it emits, leave the id out; the
+/// member's answer carries it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool) {
+    let w = world(&pool).await;
+    // `w.name` is already a slug, so it slugifies to itself.
+    let body = json!({"goal": w.name, "steps": ["a stored step"]});
+
+    let (s, out) = w
+        .api
+        .post("/api/v1/workflows", &token(w.outsider), &body)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    assert!(
+        out.get("workflow_id").is_none(),
+        "REST store_workflow by a non-member leaves the id out: {out}"
+    );
+    assert_names_nothing_hidden(&w, "REST store_workflow", &out.to_string());
+    let events: Vec<Value> = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE event_type = 'workflow.created' \
+           AND payload->>'canonical_name' = $1",
+    )
+    .bind(&w.name)
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(events.len(), 1, "one event for the re-ingest: {events:?}");
+    assert_names_nothing_hidden(&w, "REST workflow.created event", &events[0].to_string());
+
+    let auth = auth_for(w.outsider);
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(&auth))
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::StoreWorkflowParams =
+        serde_json::from_value(body.clone()).expect("params");
+    let out = tool_answer(
+        epigraph_mcp::tools::workflows::store_workflow(&w.server, &viewer, params, Some(&auth))
+            .await,
+    )
+    .expect("the MCP store_workflow re-ingest succeeds");
+    assert_eq!(out["already_ingested"], json!(true), "{out}");
+    assert!(
+        out.get("workflow_id").is_none(),
+        "MCP store_workflow by a non-member leaves the id out: {out}"
+    );
+    assert_names_nothing_hidden(&w, "MCP store_workflow", &out.to_string());
+
+    // The member's answers carry the id.
+    let (s, out) = w
+        .api
+        .post("/api/v1/workflows", &token(w.member), &body)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(out["workflow_id"], json!(w.workflow), "{out}");
+    let auth = auth_for(w.member);
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(&auth))
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::StoreWorkflowParams =
+        serde_json::from_value(body).expect("params");
+    let out = tool_answer(
+        epigraph_mcp::tools::workflows::store_workflow(&w.server, &viewer, params, Some(&auth))
+            .await,
+    )
+    .expect("the member's MCP store_workflow");
+    assert_eq!(out["workflow_id"], json!(w.workflow.to_string()), "{out}");
+}
