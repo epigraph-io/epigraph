@@ -2180,6 +2180,50 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **190**: public `definer_search_path_pg_temp_last` (backlog 368ce622).
+  (1) Re-states the OAuth refresh-token and access-token revocation definers
+  (`epigraph_refresh_token_on_reuse`, `_check`, `_revoke`, `_revoke_by_hash`,
+  `_revoke_client` from 118, `epigraph_access_token_revoke` from 141) on 172's
+  form: `SET search_path = pg_catalog, pg_temp`, built-ins written
+  `pg_catalog.now()` / `pg_catalog.jsonb_build_object(`, no other byte of the
+  body changed, owner and ACL kept (the file grants and revokes nothing),
+  behind an md5 precondition on all six bodies (`55000`, nothing changed,
+  over any other body). (2) A catalog sweep appends `, pg_temp` to the path of
+  every SECURITY DEFINER function that does not list it (29 at 186, all
+  `pg_catalog, public`): without it the session's temporary schema is searched
+  first for relation and type names. `ALTER FUNCTION .. SET search_path`
+  changes neither a body nor any other configuration entry. (3) A
+  postcondition refuses if any definer still lacks a trailing `pg_temp`.
+  Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/definer_search_path_ratchet.rs`: every definer pins a path
+  with `pg_temp` last (no allowlist); the definers whose path still names
+  `public` (197 at 190) are exactly `PUBLIC_PATH_REGISTER`, which may only
+  shrink, so a NEW definer must use 172's form or be registered visibly; a
+  pg_catalog-only definer names every `public` relation, type and function
+  qualified; the six bodies' shape; what 190 changed (paths and the six bodies
+  only), its md5 precondition and its sweep's refusal. Slot: 190 is assigned
+  to this batch and is free on `main` and in every open PR. **Deploy order:**
+  none against the binaries (no signature or behaviour changes); after 118
+  and 141. A later `CREATE OR REPLACE` of any definer replaces its path, so it
+  must pin one with `pg_temp` last. The sweep runs once, when 190 applies: a
+  definer created by a migration numbered below 190 that is applied AFTER
+  190 (an out-of-order apply) is not swept, so it must pin `pg_temp` last
+  itself. The sweep refuses (`55000`, nothing changed) a path that lists
+  `pg_temp` anywhere but last.
+  **Predeploy checks:** (1) `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  to_regprocedure('public.epigraph_refresh_token_revoke(uuid, text)')` must
+  print `4b72ecd708b56548ca5eae0b0e9e8fbb` (and likewise for the other five,
+  listed in the file); any other value means 190 refuses and the migration run
+  stops there. (2) The definers the sweep will change: `SELECT
+  p.oid::regprocedure, p.proconfig FROM pg_proc p WHERE p.prosecdef AND
+  p.pronamespace = 'public'::regnamespace AND NOT EXISTS (SELECT 1 FROM
+  unnest(p.proconfig) c WHERE c ~ '^search_path=(.*[ ,"])?pg_temp"?$')`
+  is expected to list exactly the 29 `pg_catalog, public` definers the file
+  header names (the six it re-states and the 23 in its UNDO); a row with
+  `pg_temp` before another schema means 190 refuses. Undo: the file header
+  (the six `CREATE OR REPLACE` statements only, no GRANT or REVOKE, and the
+  23 named path reverts). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
