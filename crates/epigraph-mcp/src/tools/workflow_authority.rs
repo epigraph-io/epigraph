@@ -101,7 +101,11 @@
 //!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
-//!   the wrong object and the wrong verb.
+//!   the wrong object and the wrong verb. It names them only to a caller that
+//!   can READ the row (backlog c831df4a, ruling R-100): the act's transaction is
+//!   often the ingest system agent's, which reads groups the caller does not,
+//!   so the caller's own view is checked first, and a row it cannot read gets
+//!   the call site's not-found answer, with no id, no submitter and no arm.
 //!
 //! The system-agent stamp is unchanged for the rows these writes make: the
 //! caller is recorded in the provenance row, not by re-authoring the rows,
@@ -145,11 +149,22 @@ impl WorkflowGrant {
 /// Refuse the caller unless it has authority over workflow `workflow_id`; see
 /// the module doc for the rule and the order of its arms.
 ///
+/// `not_found` is the CALL SITE's answer for a workflow that does not exist
+/// (a step tool's unknown name, `evolve_step`'s unknown parent, ...). Over the
+/// authenticated transport a row the caller cannot READ gets exactly that
+/// answer, before any arm runs and before any text names the row or its
+/// submitter (backlog c831df4a, ruling R-100: ids stay deterministic, so the
+/// answer must not confirm one). The act's transaction may be stamped with
+/// the ingest system agent, which reads groups the caller does not; the
+/// caller's own view decides. This also closes the admin arm over a row the
+/// caller cannot read, as the REST `deprecate_workflow` gate already does.
+///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
-/// "cannot retire it" wording, which named the wrong object and verb), or an
-/// internal error if the submitter, the operator link or the admin grant
-/// cannot be read.
+/// "cannot retire it" wording, which named the wrong object and verb), the
+/// call site's not-found answer for a row the caller cannot read, or an
+/// internal error if the caller's view, the submitter, the operator link or
+/// the admin grant cannot be read.
 pub(crate) async fn require_workflow_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -157,6 +172,7 @@ pub(crate) async fn require_workflow_authority(
     caller: WriteIdentity,
     workflow_id: uuid::Uuid,
     tool_name: &'static str,
+    not_found: &(dyn Fn() -> McpError + Send + Sync),
 ) -> Result<WorkflowGrant, McpError> {
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
@@ -177,23 +193,44 @@ pub(crate) async fn require_workflow_authority(
         return Ok(grant(WorkflowArm::Unchecked));
     };
     let caller_agent = caller.agent_id();
+    // The CALLER's view of the row (backlog c831df4a). A row it cannot read is
+    // answered as the call site answers an unknown one; nothing below names it.
+    let Some((visibility, _)) =
+        caller_view_of(server, conn, caller_agent, workflow_id, tool_name).await?
+    else {
+        return Err(not_found());
+    };
     // A workflow with NO recorded submitter (written before batch H-b) is
     // platform corpus (U005, default decision A; the D1 ruling keeps the
     // legacy corpus platform-owned). There is no submitter to match and no
     // operator to derive, so the only arm is the audited admin arm. When the
     // custodian role lands (#529), its check replaces `claims:admin` here.
+    // A GROUP row with no record (a plan migration 183 backfilled into its
+    // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
-        let subject = format!(
-            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
-             written before batch H-b)"
-        );
+        let (subject, kind) = if visibility == "group" {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (a group workflow written \
+                     before batch H-b)"
+                ),
+                "a workflow with no recorded submitter",
+            )
+        } else {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (legacy platform \
+                     workflow, written before batch H-b)"
+                ),
+                "a legacy platform workflow",
+            )
+        };
         let needs = "a live claims:admin grant (the audited claims:admin path)";
         return match admin_arm(conn, auth, caller_agent, &subject, needs, tool_name).await? {
             Some(()) => Ok(grant(WorkflowArm::Admin)),
             None => Err(crate::errors::invalid_params(format!(
-                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on a \
-                 legacy platform workflow requires the audited claims:admin path. Nothing was \
-                 written."
+                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on \
+                 {kind} requires the audited claims:admin path. Nothing was written."
             ))),
         };
     };
@@ -221,6 +258,35 @@ pub(crate) async fn require_workflow_authority(
          the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
          Nothing was written."
     )))
+}
+
+/// `(visibility, owner_group_id)` of workflow `workflow_id` as the caller
+/// `caller_agent` reads it, on the act's own connection (so the answer is
+/// what both that connection's stamp and the caller read), or `None` when the
+/// caller cannot read it (backlog c831df4a).
+async fn caller_view_of(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    workflow_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<Option<(String, uuid::Uuid)>, McpError> {
+    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not resolve the caller's view"),
+                e,
+            )
+        })?;
+    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not read the workflow as the caller"),
+                e,
+            )
+        })
 }
 
 /// The AUDITED admin arm, shared by a submitted workflow (after its submitter

@@ -273,6 +273,7 @@ async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing
         }))
         .expect("request");
     let r = epigraph_api::routes::workflows::add_step(
+        ViewerExtractor(Viewer::resolve(&pool, a).await.expect("viewer")),
         State(state),
         Some(Extension(token(a, ClientType::Human))),
         Json(req),

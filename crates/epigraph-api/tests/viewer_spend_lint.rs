@@ -1082,7 +1082,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimRepository::evolve_step_conn",
             "record_api_lineage_writes",
-            "require_api_lineage_authority",
             "versioning::admin_session_or_deferral",
         ],
     ),
@@ -1322,7 +1321,61 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "workflows.rs",
         "workflow_ingest_submitter",
-        &["WorkflowRepository::ingest_anchors", "workflow_authority"],
+        &["WorkflowRepository::ingest_anchors"],
+    ),
+    // backlog c831df4a: the step routes and the lineage gate hand the caller's
+    // viewer to `workflow_authority`, which reads the target row through it
+    // (`WorkflowRepository::tenancy_as_viewer`, viewed) before any answer names
+    // the row. Unviewed, by design:
+    // * the step routes' system-ingest transaction and the executor's step
+    //   write on it (the rows are the system agent's; the caller's authority
+    //   is the gate), the AUTHORED edges and the per-write provenance / admin
+    //   audit rows;
+    // * the head / lineage resolution, which must see every workflow the
+    //   write would touch so each is authority-checked (an unreadable one is
+    //   then refused by the viewed read);
+    // * the gate's own arms, which run only on a row the caller reads: the
+    //   recorded submitter, the submitter's operator and the admin grant.
+    (
+        "workflows.rs",
+        "add_step",
+        &[
+            "audit_api_admin_workflow_write",
+            "begin_system_ingest_stamped_tx",
+            "epigraph_ingest_executor::add_step",
+            "record_api_authorship",
+            "record_api_caller_workflow_write",
+        ],
+    ),
+    (
+        "workflows.rs",
+        "delete_step",
+        &[
+            "audit_api_admin_workflow_write",
+            "begin_system_ingest_stamped_tx",
+            "epigraph_ingest_executor::delete_step",
+            "record_api_caller_workflow_write",
+        ],
+    ),
+    (
+        "workflows.rs",
+        "require_api_lineage_authority",
+        &["WorkflowRepository::workflows_executing_step_lineage"],
+    ),
+    (
+        "workflows.rs",
+        "require_api_workflow_authority",
+        &["WorkflowRepository::head_by_canonical"],
+    ),
+    (
+        "workflows.rs",
+        "workflow_authority",
+        &[
+            "AgentRepository::operator_of_author",
+            "WorkflowRepository::submitter_of",
+            "api_admin_arm",
+            "api_admin_arm",
+        ],
     ),
 ];
 

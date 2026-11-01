@@ -108,8 +108,15 @@ async fn require_authority_over(
     else {
         return Ok(None);
     };
+    // A head the caller cannot read is answered as the executor answers an
+    // unknown name (backlog c831df4a).
+    let not_found = || {
+        map_step_err(epigraph_ingest_executor::StepOpError::WorkflowNotFound(
+            canonical_name.to_string(),
+        ))
+    };
     let grant = crate::tools::workflow_authority::require_workflow_authority(
-        server, conn, auth, caller, head, tool_name,
+        server, conn, auth, caller, head, tool_name, &not_found,
     )
     .await?;
     Ok(Some((head, grant)))
