@@ -1371,15 +1371,19 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
             .unwrap();
     assert_eq!(linked, Some(a1));
 
+    // Migration 188: the approval is a maintenance act (the application role
+    // may not EXECUTE the definer; see
+    // `the_app_role_cannot_approve_an_oauth_client`).
     let approver = seed_client(&pool, "active").await;
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
     OAuthClientRepository::approve(
-        &app,
+        &maint,
         client,
         &["claims:read".into(), "claims:write".into()],
         approver,
     )
     .await
-    .expect("approve on the application role");
+    .expect("approve on the maintenance role");
     let (status, scopes): (String, Vec<String>) =
         sqlx::query_as("SELECT status, granted_scopes FROM oauth_clients WHERE id = $1")
             .bind(client)
@@ -1398,6 +1402,80 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(audited, 1, "an approval leaves an audit row");
+}
+
+/// Migration 188 (backlog ca3968f6): the application role may not EXECUTE
+/// `epigraph_oauth_client_approve`, so an application session cannot activate
+/// a pending client with a scope set of its choosing (here `claims:admin`, an
+/// admin-only scope the definer itself never filters). The client stays
+/// `pending` with nothing granted and no `oauth.client_approved` row is
+/// written. The maintenance role (the definer's owner) still approves, audited.
+///
+/// Fails on 187 and earlier: 118's GRANT EXECUTE lets the application session
+/// activate the client with `claims:admin`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
+    let app_exec: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('epigraph_app', \
+            'public.epigraph_oauth_client_approve(uuid, text[], uuid)'::regprocedure, 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert!(
+        !app_exec,
+        "epigraph_app must not EXECUTE epigraph_oauth_client_approve"
+    );
+
+    let state_of = |client: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Vec<String>, i64)>(
+                "SELECT c.status, c.granted_scopes, \
+                        (SELECT count(*) FROM security_events e \
+                          WHERE e.event_type = 'oauth.client_approved' \
+                            AND e.details->>'oauth_client_id' = c.id::text) \
+                   FROM oauth_clients c WHERE c.id = $1",
+            )
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("client row")
+        }
+    };
+
+    let pending = seed_client(&pool, "pending").await;
+    let app = app_pool(&pool, 2).await;
+    let r = sqlx::query_scalar::<_, bool>(
+        "SELECT public.epigraph_oauth_client_approve($1, ARRAY['claims:admin'], NULL)",
+    )
+    .bind(pending)
+    .fetch_one(&app)
+    .await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "the application role approved a client"
+    );
+    let e = OAuthClientRepository::approve(&app, pending, &["claims:admin".into()], pending)
+        .await
+        .expect_err("the repository approval on the application role");
+    assert_eq!(db_err_code(&e).as_deref(), Some("42501"));
+    assert_eq!(
+        state_of(pending).await,
+        ("pending".to_string(), vec!["claims:read".to_string()], 0),
+        "a refused approval leaves the client pending, its grant unchanged and unaudited"
+    );
+
+    // Control: the maintenance role approves, and the approval is audited.
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    OAuthClientRepository::approve(&maint, pending, &["claims:write".into()], pending)
+        .await
+        .expect("approve on the maintenance role");
+    assert_eq!(
+        state_of(pending).await,
+        ("active".to_string(), vec!["claims:write".to_string()], 1)
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

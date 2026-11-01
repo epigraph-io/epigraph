@@ -2180,6 +2180,24 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **188**: public `revoke_app_client_approve` (backlog ca3968f6).
+  `REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid,
+  text[], uuid) FROM epigraph_app`, role-guarded, and nothing else. 118 granted
+  it for the REST admin approval, but the definer writes the caller's
+  `granted_scopes` verbatim and the `clients:admin` / admin-only-scope checks
+  live in the route, so any application session could activate a pending
+  client with any scope set. Approval is now a maintenance act: a maintenance
+  session calls the definer (still audited, `oauth.client_approved`), and
+  `POST /api/v1/admin/clients/:id/approve` answers 501 MOVED after its own
+  refusals (D9: a request unit holds no maintenance connection). The body,
+  owner and `search_path` pin are untouched (no CREATE OR REPLACE); 122's
+  reactivation guard stays. Pinned by
+  `epigraph-db/tests/app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`
+  and `epigraph-api/tests/admin_scope_mint.rs::approval_hands_out_admin_scopes_only_while_unarmed`.
+  Sets `lock_timeout = '3s'`. Undo in the file header. **Deploy order:**
+  with or after the binary that answers the route 501 (an older binary with
+  188 applied answers it 500). **Applied to throwaway databases only, NOT to
+  any deployed database.**
 
 ## `-- no-transaction` migrations
 

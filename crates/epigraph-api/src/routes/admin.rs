@@ -275,8 +275,16 @@ pub struct ApproveClientResponse {
 
 /// POST /api/v1/admin/clients/:id/approve
 ///
-/// Promotes a pending OAuth client to active with explicit scope grant.
-/// Requires `clients:admin` scope.
+/// Promoting a pending OAuth client to active is a MAINTENANCE act (migration
+/// 188, backlog ca3968f6): the application role may not EXECUTE
+/// `epigraph_oauth_client_approve`, whose body writes the caller's
+/// `granted_scopes` verbatim, and a request-serving process holds no
+/// maintenance connection (operator decision D9). So this route runs its
+/// refusals (`clients:admin`, `platform:admin`, migration 128's armed
+/// admin-only scopes) and then answers 501 MOVED, approving nothing. A
+/// maintenance session approves through the definer directly
+/// (`OAuthClientRepository::approve` on a maintenance pool), which keeps its
+/// `oauth.client_approved` audit row.
 #[cfg(feature = "db")]
 pub async fn approve_client(
     State(state): State<AppState>,
@@ -303,40 +311,37 @@ pub async fn approve_client(
                 .to_string(),
         });
     }
-    match crate::oauth::scopes::hand_out(pool, &req.granted_scopes).await {
-        crate::oauth::scopes::HandOut::Allowed => {}
-        crate::oauth::scopes::HandOut::Warned(admin) => tracing::warn!(
-            client = %id,
-            approved_by = %auth.client_id,
-            scopes = ?admin,
-            "approving a client with admin-only scopes while admin-scope enforcement is unarmed"
-        ),
-        crate::oauth::scopes::HandOut::Refused(admin) => {
-            return Err(ApiError::Forbidden {
-                reason: format!(
-                    "admin-only scopes {admin:?} cannot be granted while admin-scope enforcement \
-                     is armed; admin acts need an elevation"
-                ),
-            })
-        }
+    if let crate::oauth::scopes::HandOut::Refused(admin) =
+        crate::oauth::scopes::hand_out(pool, &req.granted_scopes).await
+    {
+        return Err(ApiError::Forbidden {
+            reason: format!(
+                "admin-only scopes {admin:?} cannot be granted while admin-scope enforcement is \
+                 armed; admin acts need an elevation"
+            ),
+        });
     }
 
-    use epigraph_db::repos::oauth_client::OAuthClientRepository;
-    OAuthClientRepository::approve(pool, id, &req.granted_scopes, auth.client_id)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: e.to_string(),
-        })?;
-
-    Ok((
-        StatusCode::OK,
-        Json(ApproveClientResponse {
-            client_id: id,
-            status: "active".to_string(),
-            granted_scopes: req.granted_scopes,
-        }),
-    ))
+    // Every check passed, and nothing here may approve: the definer is
+    // maintenance-only (migration 188). Say where it runs instead.
+    tracing::info!(
+        client = %id,
+        requested_by = %auth.client_id,
+        "client approval requested on a request unit; it runs on a maintenance session"
+    );
+    Err(ApiError::MaintenanceSurfaceNotServed {
+        surface: "approve_client".to_string(),
+        runs_on_kind: "none",
+        runs_on_name: CLIENT_APPROVAL_NOT_SERVED.to_string(),
+    })
 }
+
+/// `runs_on.name` for `POST /api/v1/admin/clients/:id/approve` (migration 188):
+/// no operator verb approves a client yet, so the answer names the definer a
+/// maintenance session calls.
+pub const CLIENT_APPROVAL_NOT_SERVED: &str =
+    "client approval is maintenance-only: call epigraph_oauth_client_approve on a maintenance \
+     session";
 
 // =============================================================================
 // ENTITY-TYPE REGISTRATION
