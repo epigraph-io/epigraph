@@ -91,7 +91,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("edges_staging", OPERATIONAL),
     ("entities", REGISTRY),
     ("entity_types", REGISTRY),
-    ("events", OPERATIONAL),
     ("experiment_results", OPERATIONAL),
     ("experiments", OPERATIONAL),
     ("factors", DERIVED_BP),
@@ -1844,6 +1843,71 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
     .await
     .unwrap();
     assert_eq!(left, 0, "the cascade cleared the children");
+}
+
+/// Migration 189 (backlog 796c55aa): `events` is append-only for the
+/// application role. It keeps INSERT (the event bus and every best-effort
+/// publish) and SELECT, but an application session can neither delete a
+/// provenance event (`claim.created` here), nor rewrite one, nor truncate the
+/// table. A refused delete also leaves the edge that names the event: the
+/// INVOKER trigger `events_cascade_edges` never runs.
+///
+/// Fails on 188 and earlier: the application role holds DELETE and UPDATE on
+/// `events` (`("events", OPERATIONAL)` was allowlisted), so the delete removes
+/// the event and its edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
+    let app = app_pool(&pool, 2).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "b03-events").await;
+
+    // Control: the request path still appends (and reads) events.
+    let payload = serde_json::json!({ "claim_id": Uuid::new_v4() });
+    let event = epigraph_db::EventRepository::insert(&app, "claim.created", Some(agent), &payload)
+        .await
+        .expect("an event INSERT on the application role");
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE id = $1")
+        .bind(event)
+        .fetch_one(&app)
+        .await
+        .expect("an event SELECT on the application role");
+    assert_eq!(seen, 1);
+
+    // An edge that names the event (seeded on the superuser pool).
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'event', $2, 'agent', 'TEST_EDGE')",
+    )
+    .bind(event)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("an edge naming the event");
+
+    let r = sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(event)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "DELETE events");
+    let r = sqlx::query("UPDATE events SET payload = '{}'::jsonb WHERE id = $1")
+        .bind(event)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE events");
+    let r = sqlx::query("TRUNCATE events").execute(&app).await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "TRUNCATE events");
+
+    let (events_left, edges_left, kept): (i64, i64, serde_json::Value) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM events WHERE id = $1), \
+                (SELECT count(*) FROM edges WHERE source_id = $1), \
+                (SELECT payload FROM events WHERE id = $1)",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(events_left, 1, "the provenance event survives");
+    assert_eq!(edges_left, 1, "the edge naming it survives");
+    assert_eq!(kept, payload, "its payload is unchanged");
 }
 
 /// Migration 118 section 7: an application session cannot write an `oauth.`
