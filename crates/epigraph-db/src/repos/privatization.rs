@@ -2729,7 +2729,7 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_scalar::<_, Uuid>(
+        let moved = sqlx::query_scalar::<_, Uuid>(
             r#"
             UPDATE public.claims c
                SET visibility = 'group', owner_group_id = $2, updated_at = now()
@@ -2743,7 +2743,40 @@ impl PrivatizationRepository {
         .bind(target_group_id)
         .fetch_all(&mut *conn)
         .await
-        .map_err(|source| DbError::QueryFailed { source })
+        .map_err(|source| DbError::QueryFailed { source })?;
+        // The PLAN goes with its claims (ruling R-98 Q8(a), backlog 630af617):
+        // a PUBLIC `workflows` row executing, at levels 0..2, a claim of this
+        // batch that now sits in the target group becomes ('group', target),
+        // the shape migration 183's backfill gives a privatized plan. Without
+        // it the row stayed public and the outcome report, which decides on
+        // the row (R-74), admitted a non-member over a private plan. Keyed on
+        // the claims' state AFTER the statement above, not on `moved`, so a
+        // re-run batch (whose claims did not move again) still converges. A
+        // row already in some group stays there (it is private either way).
+        // Not reversed by `restore_claims_conn`: a revert leaves the row
+        // private (fail-closed), stated there.
+        sqlx::query(
+            r#"
+            UPDATE public.workflows w
+               SET visibility = 'group', owner_group_id = $2
+             WHERE w.visibility = 'public'
+               AND w.id IN (
+                   SELECT e.source_id
+                     FROM public.edges e
+                     JOIN public.claims c ON c.id = e.target_id
+                    WHERE e.source_type = 'workflow' AND e.target_type = 'claim'
+                      AND e.relationship = 'executes'
+                      AND e.target_id = ANY($1)
+                      AND c.visibility = 'group' AND c.owner_group_id = $2
+                      AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$')
+            "#,
+        )
+        .bind(claim_ids)
+        .bind(target_group_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        Ok(moved)
     }
 
     /// Restore a batch of claims to the tenancy the freeze recorded.
@@ -2782,6 +2815,15 @@ impl PrivatizationRepository {
     /// scope `SET` would leave it armed on a pooled connection for whatever ran
     /// next — the hazard [`Self::select`] documents for `statement_timeout`,
     /// with a far worse payload.
+    ///
+    /// # It does NOT widen a `workflows` row back
+    ///
+    /// [`Self::restrict_claims_conn`] re-tenants a public plan's `workflows`
+    /// row into the target group with its claims (ruling R-98). This revert
+    /// restores claims only, so such a row stays ('group', target): the plan
+    /// is readable by the group alone until a maintenance session re-tenants
+    /// it. Fail-closed, and recorded as a follow-up rather than guessed here
+    /// (no pre-image of the row is frozen).
     ///
     /// **The sealed arm of that guard is NOT reachable from here and must not
     /// be.** It has no GUC override by design (sec F11), so a revert of a plan

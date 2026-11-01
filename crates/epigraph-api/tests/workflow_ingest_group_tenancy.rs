@@ -1891,6 +1891,79 @@ async fn a_public_step_reused_by_a_private_generation_does_not_admit_a_non_membe
     assert_eq!(outcome_written(&pool, w1).await, (Some(1), 0));
 }
 
+/// R-98 Q8(a) (backlog 630af617 (4)): privatizing a plan's level 0..2 claims
+/// (`restrict_claims_conn`, the privatization apply step, on a privileged
+/// session) re-tenants its PUBLIC `workflows` row into the target group, so
+/// the plan is private as a unit: a non-member's outcome report is the
+/// unknown-id answer and writes nothing, while a member of the group still
+/// reports. Before, the row stayed public, and the report gate decided on the
+/// row (R-74) and admitted the non-member over a plan whose every claim was
+/// private.
+#[sqlx::test(migrations = "../../migrations")]
+async fn restricting_a_plans_claims_re_tenants_its_workflows_row(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-restrict-plan";
+    let out = w
+        .api
+        .ingest_ok(&h, &extraction(name, 0, &[&["acme restrict op"]]))
+        .await;
+    let wf = uuid_of(&out["workflow_id"]);
+    let row = || async {
+        sqlx::query_as::<_, (String, Uuid)>(
+            "SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1",
+        )
+        .bind(wf)
+        .fetch_one(&pool)
+        .await
+        .expect("the row")
+    };
+    assert_eq!(row().await.0, "public", "fixture: a public plan");
+    let structural: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT e.target_id FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND (c.properties->>'level')::int <= 2",
+    )
+    .bind(wf)
+    .fetch_all(&pool)
+    .await
+    .expect("the plan's structural claims");
+    assert!(!structural.is_empty());
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let moved = PrivatizationRepository::restrict_claims_conn(&mut conn, &structural, w.og)
+        .await
+        .expect("restrict the plan's claims");
+    drop(conn);
+    assert_eq!(moved.len(), structural.len(), "every claim moved");
+    assert_eq!(
+        row().await,
+        ("group".to_string(), w.og),
+        "the privatized plan's row is re-tenanted with it"
+    );
+
+    let uri = format!("/api/v1/workflows/hierarchical/{wf}/outcome");
+    let (status, out) = w
+        .api
+        .call(
+            Method::POST,
+            &uri,
+            &token(w.h2, WRITE_SCOPES),
+            Some(&outcome_body()),
+        )
+        .await;
+    assert_eq!(
+        (status, outcome_written(&pool, wf).await),
+        (StatusCode::NOT_FOUND, (None, 0)),
+        "a non-member's report is the unknown-id answer and writes nothing: {out}"
+    );
+    let (status, out) = w
+        .api
+        .call(Method::POST, &uri, &h, Some(&outcome_body()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the group's member reports: {out}");
+}
+
 /// MCP `add_step` as `viewer` (with `auth` over HTTP, `None` on stdio).
 async fn mcp_add_step(
     server: &epigraph_mcp::server::EpiGraphMcpFull,

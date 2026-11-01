@@ -1267,8 +1267,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "privatization.rs",
         "restrict_claims_conn",
-        "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode. \
-         This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
+        "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode — \
+         and of the tenancy of each PUBLIC `workflows` row executing a now-restricted level 0..2 \
+         claim (ruling R-98: the plan goes with its claims). This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
          privatization UPDATE would narrow it to what somebody can already see, which is the \
          opposite of the operation. The authorisation is FINAL-PLAN §6.5.5's re-validation in the \
          job handler; the D4 admin surface is what §0.1 grants this write to.",
