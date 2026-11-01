@@ -1066,6 +1066,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::set_truth_value",
         ],
     ),
+    // the existence check is the caller's viewed read (backlog 08061583);
+    // the insert stays on the pool because `behavioral_executions` has no row
+    // security (the workflow was already read through the caller's view).
+    (
+        "workflows.rs",
+        "record_behavioral_execution",
+        &["BehavioralExecutionRepository::create"],
+    ),
     // write on a transaction stamped with the caller's viewer, after the
     // database's lineage-authority check for the caller.
     (

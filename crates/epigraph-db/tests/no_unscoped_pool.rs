@@ -722,7 +722,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// to the caller's stamped read and both post-ingest goal embeds to the
 /// system-agent stamp (`routes/workflows.rs` 8 -> 4), read off
 /// `the_scanner_is_not_vacuous`'s own failure.
-const HIGH_WATER: usize = 226;
+///
+/// 226 -> 225 (backlog 08061583): `record_behavioral_execution`'s workflow
+/// existence check moved to the caller's stamped read (`routes/workflows.rs`
+/// 4 -> 3), read off `the_scanner_is_not_vacuous`'s own failure (`left: 225,
+/// right: 226`). No file reached zero.
+const HIGH_WATER: usize = 225;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1120,7 +1125,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 8 -> 4 (ruling R-74, migration 183): `get_workflow`'s two reads moved to
     // the caller's stamped read, and both post-commit goal embeds to the
     // system-agent stamp (`store_workflow_goal_embedding`).
-    ("routes/workflows.rs", 4),
+    // 4 -> 3 (backlog 08061583): `record_behavioral_execution`'s workflow
+    // existence check moved to the caller's stamped read. Its insert stays on
+    // the pool: `behavioral_executions` has no row security.
+    ("routes/workflows.rs", 3),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

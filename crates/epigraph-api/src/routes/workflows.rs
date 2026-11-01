@@ -2097,6 +2097,7 @@ pub async fn deprecate_workflow(
 /// agents can answer "which workflow works best for goals like THIS one?"
 #[cfg(feature = "db")]
 pub async fn record_behavioral_execution(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path(workflow_id): Path<Uuid>,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -2112,20 +2113,46 @@ pub async fn record_behavioral_execution(
         })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    // Verify the referenced workflow exists
-    let _exists = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to check workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The referenced workflow must be one the CALLER can read (backlog
+    // 08061583). This was `SELECT id FROM claims WHERE id = $1 AND 'workflow'
+    // = ANY(labels)` on the raw pool: on the application role an unstamped
+    // session reads public rows only, so a member's own group-private
+    // workflow answered 404, and on a session that bypasses row security a
+    // hidden workflow answered differently from a missing one. Now it is
+    // `deprecate_workflow`'s read: the caller's viewer-stamped connection, a
+    // workflow-labelled claim, and the SAME 404 for a hidden, unlabelled or
+    // missing id.
+    {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "record_behavioral_execution",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = epigraph_db::ClaimRepository::get_by_id_with_labels(
+            &mut *read,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to check workflow: {e}"),
+        })?;
+        match found {
+            Some((_, labels)) if labels.iter().any(|l| l == "workflow") => {}
+            _ => {
+                return Err(ApiError::NotFound {
+                    entity: "workflow".into(),
+                    id: workflow_id.to_string(),
+                })
+            }
+        }
+    }
 
     // Attempt to generate a goal embedding if an embedder is available
     let mut embedding_pgvec: Option<String> = None;
