@@ -308,32 +308,118 @@ async fn drift_guard_rejects_a_pre_060_table_shape(pool: PgPool) {
 ///
 /// Absence is not fatal here on purpose: the fatal assertion belongs in
 /// `AppState::with_db` (PR-17), where a production process can refuse to boot.
-/// What IS asserted is the one property 060 decides and nothing else checks —
-/// every role it creates is `NOLOGIN`. These roles exist to be `GRANT`ed to and
-/// to be tested by `pg_has_role` in 070; a role that can log in is an
-/// authentication surface nobody meant to open.
+///
+/// What IS asserted is the login posture, which is not the same for all three
+/// (backlog bb200b7b). 060 creates every one of them `NOLOGIN`
+/// ([`tenancy_roles_are_created_nologin`]). `epigraph_maintenance` and
+/// `epigraph_seed` must STAY `NOLOGIN`: they exist to be `GRANT`ed to and to be
+/// tested by `pg_has_role` (067, 070), and a role that can log in is an
+/// authentication surface nobody meant to open. `epigraph_app` is different:
+/// `ALTER ROLE epigraph_app LOGIN PASSWORD ..` is the out-of-band 11d runbook
+/// step that arms the PR-17 posture refusals (migration 077, docs/deploy.md),
+/// so on an armed cluster it logs in by design. Roles are cluster-global, so a
+/// fresh CI container (where it is still NOLOGIN) can never observe that, and
+/// the old "all three NOLOGIN" assertion failed on every armed cluster. What
+/// must hold for `epigraph_app` either way is that it is the plain role RLS is
+/// written against: never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB.
 ///
 /// (The old "0 or 3" assertion could not fail: the `DO` block wraps each
 /// iteration in its own `BEGIN … EXCEPTION`, so 1 and 2 are unreachable by
 /// construction — which is exactly what it claimed to prove.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn tenancy_roles_are_nologin(pool: PgPool) {
-    let rows = sqlx::query(
-        "SELECT rolname, rolcanlogin FROM pg_roles \
-         WHERE rolname IN ('epigraph_app', 'epigraph_maintenance', 'epigraph_seed') \
-         ORDER BY rolname",
+    let rows: Vec<TenancyRole> = sqlx::query_as(
+        "SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb \
+           FROM pg_roles \
+          WHERE rolname IN ('epigraph_app', 'epigraph_maintenance', 'epigraph_seed') \
+          ORDER BY rolname",
     )
     .fetch_all(&pool)
     .await
     .expect("pg_roles lookup");
 
-    for row in &rows {
-        let name: String = row.get("rolname");
-        let can_login: bool = row.get("rolcanlogin");
-        assert!(
-            !can_login,
-            "role `{name}` must be NOLOGIN — migration 060 creates it that way"
-        );
+    let violations = tenancy_role_posture_violations(&rows);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// `(rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb)`.
+type TenancyRole = (String, bool, bool, bool, bool, bool);
+
+/// Every way `rows` breaks the tenancy roles' login posture (see
+/// [`tenancy_roles_are_nologin`]), one message each.
+fn tenancy_role_posture_violations(rows: &[TenancyRole]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, login, superuser, bypassrls, createrole, createdb) in rows {
+        if name == "epigraph_app" {
+            for (attr, set) in [
+                ("SUPERUSER", superuser),
+                ("BYPASSRLS", bypassrls),
+                ("CREATEROLE", createrole),
+                ("CREATEDB", createdb),
+            ] {
+                if *set {
+                    out.push(format!(
+                        "role `epigraph_app` must not be {attr}: it is the role row security \
+                         is written against (LOGIN is allowed, armed out of band)"
+                    ));
+                }
+            }
+        } else if *login {
+            out.push(format!(
+                "role `{name}` must be NOLOGIN: migration 060 creates it that way and nothing \
+                 arms it to log in"
+            ));
+        }
+    }
+    out
+}
+
+/// 060 itself creates every tenancy role `NOLOGIN`: the half of the posture a
+/// cluster armed out of band can no longer show for `epigraph_app`.
+#[test]
+fn tenancy_roles_are_created_nologin() {
+    assert!(
+        MIGRATION_060.contains("ARRAY['epigraph_app','epigraph_maintenance','epigraph_seed']")
+            && MIGRATION_060.contains("EXECUTE format('CREATE ROLE %I NOLOGIN', r);"),
+        "migration 060 must create epigraph_app, epigraph_maintenance and epigraph_seed NOLOGIN"
+    );
+}
+
+/// The posture rule itself, on the rows an armed and a misconfigured cluster
+/// would return: an armed `epigraph_app` (LOGIN, plain) passes, the other two
+/// roles may never log in, and `epigraph_app` may never carry a bypass or
+/// administrative attribute.
+#[test]
+fn the_tenancy_role_posture_admits_only_a_plain_armed_app_login() {
+    let row = |name: &str, login, superuser, bypassrls| -> TenancyRole {
+        (name.to_string(), login, superuser, bypassrls, false, false)
+    };
+    let fresh = [
+        row("epigraph_app", false, false, false),
+        row("epigraph_maintenance", false, false, false),
+        row("epigraph_seed", false, false, false),
+    ];
+    assert!(tenancy_role_posture_violations(&fresh).is_empty());
+    let armed = [
+        row("epigraph_app", true, false, false),
+        row("epigraph_maintenance", false, false, false),
+        row("epigraph_seed", false, false, false),
+    ];
+    assert!(
+        tenancy_role_posture_violations(&armed).is_empty(),
+        "the 11d runbook's armed epigraph_app is the intended state"
+    );
+    for bad in [
+        row("epigraph_maintenance", true, false, false),
+        row("epigraph_seed", true, false, false),
+        row("epigraph_app", true, false, true),
+        row("epigraph_app", false, true, false),
+        ("epigraph_app".to_string(), true, false, false, true, false),
+        ("epigraph_app".to_string(), true, false, false, false, true),
+    ] {
+        let v = tenancy_role_posture_violations(std::slice::from_ref(&bad));
+        assert_eq!(v.len(), 1, "{bad:?} must be exactly one violation: {v:?}");
+        assert!(v[0].contains(&format!("`{}`", bad.0)), "{v:?}");
     }
 }
 
