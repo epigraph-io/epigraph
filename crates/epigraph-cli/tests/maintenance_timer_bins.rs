@@ -844,3 +844,106 @@ async fn the_unmark_cli_reverts_an_applys_marks_all_or_nothing(pool: PgPool) {
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;
 }
+
+/// A dedup chain (Y marked onto X, then X onto W; two sweeps build it): Y
+/// alone is refused, since its canonical is itself a marked duplicate, and an
+/// apply's marks listing both un-mark X first (newest first) and then Y,
+/// whose canonical the same run made current again (`revert_label_dedup`'s
+/// preflight rule).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_unmarks_a_chain_from_the_canonical_end_in_one_run(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (a1, a2, a3) = (
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+    );
+    let content = "chained restatement";
+    let x = seed_embedded(&pool, a1, content, 0.9, &pgvec(0, 0.0)).await;
+    let y = seed_embedded(&pool, a2, content, 0.4, &pgvec(0, 0.001)).await;
+    let r = run(
+        SWEEP,
+        &["--acting-agent", &op, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let w = seed_embedded(&pool, a3, content, 0.95, &pgvec(0, 0.0005)).await;
+    let r = run(
+        SWEEP,
+        &["--acting-agent", &op, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(
+        claim_state(&pool, y).await,
+        (false, Some(x)),
+        "CALIBRATION: Y onto X"
+    );
+    assert_eq!(
+        claim_state(&pool, x).await,
+        (false, Some(w)),
+        "CALIBRATION: X onto W"
+    );
+    let ey = identity_edge(&pool, y).await.expect("Y's identity edge");
+    let ex = identity_edge(&pool, x).await.expect("X's identity edge");
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    // Y alone: its canonical is still a marked duplicate.
+    let yid = y.to_string();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &yid, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    let why = report["unmarks"][0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("itself retired") && why.contains(&format!("un-mark {x} first")),
+        "{report}"
+    );
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
+
+    // Both marks, in apply order: X is un-marked first, then Y.
+    let file = std::env::temp_dir().join(format!("unmark-chain-{}.json", Uuid::new_v4().simple()));
+    std::fs::write(
+        &file,
+        serde_json::json!({"applied_marks": [
+            {"unit": "u1", "dup": y, "canonical": x, "rule": "strong_id", "matched_on": "a",
+             "identity_edge": ey},
+            {"unit": "u2", "dup": x, "canonical": w, "rule": "strong_id", "matched_on": "a",
+             "identity_edge": ex},
+        ]})
+        .to_string(),
+    )
+    .expect("write the marks file");
+    let path = file.to_string_lossy().into_owned();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    assert_eq!(report["steps"][0]["claim_id"], x.to_string(), "{report}");
+    assert_eq!(report["steps"][1]["claim_id"], y.to_string(), "{report}");
+    assert_eq!(claim_state(&pool, x).await, (true, None));
+    assert_eq!(claim_state(&pool, y).await, (true, None));
+    assert_eq!(claim_state(&pool, w).await, (true, None));
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
