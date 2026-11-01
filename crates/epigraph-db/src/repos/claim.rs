@@ -8209,7 +8209,8 @@ impl ClaimRepository {
     ///   current.
     /// - `DbError::WriteRefused` for `supersedes` when the retire of a parent
     ///   the locked read returned changed no row (for example a trigger
-    ///   skipped it). Defensive: the claims tenancy policy refuses a readable
+    ///   skipped it), and for either edge type when the lineage back-fill of
+    ///   a parent with no lineage yet changed no row (backlog 41646a94). Defensive: the claims tenancy policy refuses a readable
     ///   parent the session may not write by raising at its WITH CHECK
     ///   (`QueryFailed`, SQLSTATE 42501, the transaction aborted), not by
     ///   matching zero rows.
@@ -8324,12 +8325,26 @@ impl ClaimRepository {
         let lineage_id = match existing_lineage {
             Some(l) => l,
             None => {
+                // The back-fill must land on the parent, or the successor
+                // below carries a lineage id its parent does not, which
+                // splits the lineage silently (backlog 41646a94). An UPDATE
+                // that changes no row reports success, so the count is the
+                // only signal; refused as the zero-row retire above is.
                 let new_lineage = Uuid::new_v4();
-                sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
-                    .bind(new_lineage)
-                    .bind(parent_uuid)
-                    .execute(&mut *tx)
-                    .await?;
+                let backfilled =
+                    sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+                        .bind(new_lineage)
+                        .bind(parent_uuid)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                if backfilled != 1 {
+                    return Err(DbError::WriteRefused {
+                        entity: "Claim".to_string(),
+                        id: parent_uuid,
+                        action: "evolve_step lineage back-fill".to_string(),
+                    });
+                }
                 new_lineage
             }
         };
