@@ -2784,36 +2784,6 @@ pub mod __test_only {
 /// a plain substring search, so this comment deliberately does NOT spell the
 /// attribute out — a mention inside a doc comment IS the first match.
 #[cfg(test)]
-mod recall_fault_tests {
-    /// A failed recall step tells the caller WHICH step failed and keeps the
-    /// error itself server-side (backlog e0f0cb68 (2)). Before, these sites
-    /// were `internal_error(format!("step: {e}"))`, whose reply was the fixed
-    /// redacted message alone, so the step was lost along with the error.
-    #[test]
-    #[tracing_test::traced_test]
-    fn a_failed_recall_step_names_the_step_and_logs_the_cause() {
-        let e = super::recall_fault(
-            "the kNN search failed",
-            "relation \"claims_ann_9d2f\" does not exist at db-host-9d2f",
-        );
-        assert_eq!(e.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
-        assert_eq!(
-            e.message,
-            "recall_with_context: the kNN search failed; the detail is in the server log"
-        );
-        assert!(
-            !e.message.contains("db-host-9d2f"),
-            "the cause reached the caller: {}",
-            e.message
-        );
-        assert!(
-            logs_contain("db-host-9d2f"),
-            "the withheld cause must reach the server log"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::{recall_audit_owner_group, AuditOwnerUnresolved};
     use epigraph_db::{AgentRepository, GroupMembershipRepository, GroupRepository, ScopedPool};
@@ -2997,6 +2967,33 @@ mod tests {
                 .await
                 .unwrap(),
             "the revocation must stand"
+        );
+    }
+
+    /// A failed recall step tells the caller WHICH step failed and keeps the
+    /// error itself server-side (backlog e0f0cb68 (2)). Before, these sites
+    /// were `internal_error(format!("step: {e}"))`, whose reply was the fixed
+    /// redacted message alone, so the step was lost along with the error.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_failed_recall_step_names_the_step_and_logs_the_cause() {
+        let e = super::recall_fault(
+            "the kNN search failed",
+            "relation \"claims_ann_9d2f\" does not exist at db-host-9d2f",
+        );
+        assert_eq!(e.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            e.message,
+            "recall_with_context: the kNN search failed; the detail is in the server log"
+        );
+        assert!(
+            !e.message.contains("db-host-9d2f"),
+            "the cause reached the caller: {}",
+            e.message
+        );
+        assert!(
+            logs_contain("db-host-9d2f"),
+            "the withheld cause must reach the server log"
         );
     }
 }
