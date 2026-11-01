@@ -1601,6 +1601,14 @@ async fn one_revert_after_apply_restores_labels_marks_and_the_index(pool: PgPool
         .await
         .expect_err("an un-mark needs the administrative connection");
     assert_eq!(code(&err), "ADMIN_CONNECTION_REQUIRED", "{err:?}");
+    // It names the operator path for the marks and the label-only revert.
+    assert!(
+        err.message
+            .contains("`unmark_duplicate` CLI (`--applied-marks`)")
+            && err.message.contains("`applied_units` only"),
+        "{}",
+        err.message
+    );
     assert_eq!(snapshot(&pool, &ids).await, after, "nothing written");
 
     // THE REVERT: one call, the label writes newest first, then the mark.

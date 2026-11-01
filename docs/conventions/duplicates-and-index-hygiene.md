@@ -20,16 +20,34 @@ or hides it. Use this page to decide.
 | Two claims that say the same thing but should BOTH stay current (two sources, two scopes, two owners) | An `EQUIVALENT_TO` edge (HTTP `POST /api/v1/edges`, scope `edges:write`, that exact casing; no MCP tool writes it). Or `link_epistemic` with `corroborates` when one should support the other's belief. | Nothing is retired. `EQUIVALENT_TO` moves no belief. `corroborates` does. |
 | Items of an operational index family (a lead list, a tracker): duplicates, past-due items, partial retirements | `plan_label_dedup`, then `apply_label_dedup` | Duplicates are marked through `mark_duplicate`'s act, and the rest is label bookkeeping. See [label-dedup.md](label-dedup.md). |
 
-## A mark is one-way on a request server today
+## An un-mark is an operator job
 
 An un-mark (`unmark_duplicate`, HTTP `POST /api/v1/claims/:id/undedup`, and
 `revert_label_dedup` for a label-dedup apply) runs the dedup's reversal on
 the server's administrative (maintenance) connection. It has no deferred form.
 
 Request-serving MCP and HTTP servers hold no maintenance connection, so there
-these calls are refused with nothing written. No shipped surface runs the
-reversal anywhere else either: unlike the sweep, there is no operator CLI for
-an un-mark. Treat a mark as one-way.
+these calls are refused with nothing written. An operator runs the un-mark
+with the `unmark_duplicate` CLI (epigraph-cli) on the maintenance DSN, as the
+sweep runs:
+
+- `unmark_duplicate --acting-agent <operator> --claim-id <dup>` checks the
+  un-mark read-only and writes nothing (dry run by default). Add
+  `--canonical <id>` and `--identity-edge <id>` to refuse a claim marked since
+  onto another claim, or marked again.
+- `--applied-marks <file>` takes an `apply_label_dedup` response and un-marks
+  each of its marks newest first, with the canonical and identity edge the
+  apply recorded. Every mark is checked before any is un-marked; one refusal
+  writes nothing. Revert the apply's label writes with `revert_label_dedup`
+  and `applied_units` only, which needs no maintenance connection.
+- `--apply` un-marks. Each un-mark is audited as cause `undedup` naming
+  `--acting-agent`, and the restored claim is re-embedded when the CLI has an
+  `OPENAI_API_KEY` (otherwise `embed_backfill` fills it). It does not run
+  beside a cascade replay: while the replay holds its lock, nothing is
+  written; run it again.
+
+So a mark is not one-way, but undoing one takes an operator. Mark only what
+you are sure of.
 
 Where an un-mark does run, it puts back only rows that are still where the
 dedup left them. A row a later write has changed is left alone and reported

@@ -749,13 +749,19 @@ a 2-connection maintenance pool). The timers add, while they run:
 `replay_deferred_cascades` up to 11 (the `MaintenancePool` cap, see below) and
 `drain_jobs` up to 4 plus the one connection that holds its advisory lock.
 
-**The timers refuse the fallback.** `replay_deferred_cascades`, `drain_jobs` and
-the `sweep_semantic_duplicates` CLI require `MAINTENANCE_DATABASE_URL` to be SET:
+**The timers refuse the fallback.** `replay_deferred_cascades`, `drain_jobs`,
+the `sweep_semantic_duplicates` CLI and the `unmark_duplicate` CLI (the only
+process that completes an un-mark: an un-mark has no deferred form, so MCP
+`unmark_duplicate`, HTTP `POST /api/v1/claims/:id/undedup` and
+`revert_label_dedup` with marks refuse on a request server) require
+`MAINTENANCE_DATABASE_URL` to be SET:
 the documented fallback to `DATABASE_URL` is refused, so the application DSN
 never runs maintenance work. `drain_jobs` also refuses a connection that does
 not satisfy `epigraph_bypass()`, whether or not row security is active yet.
-Each takes its own session advisory lock, so a hand-run beside the timer does
-nothing (`{"locked": true}`, exit 0). `replay_deferred_cascades --report-only`
+Each timer and the sweep take their own session advisory lock, so a hand-run
+beside the timer does nothing (`{"locked": true}`, exit 0); `unmark_duplicate`
+takes the replay's lock instead and, while a replay holds it, exits 1 with
+nothing written. `replay_deferred_cascades --report-only`
 prints `{"pending","stuck","oldest_age_s"}` in a read-only transaction and
 takes no lock (the staleness check).
 
