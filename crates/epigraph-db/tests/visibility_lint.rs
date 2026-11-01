@@ -2273,6 +2273,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "group_membership.rs",
+        "agent_writes_group_conn",
+        "READ of NO table directly: whether ONE named agent holds a live writer/admin \
+         membership of ONE group, through migration 077's `epigraph_live_memberships` definer \
+         (the read `Viewer::resolve` is built from). It answers a question about the CALLER of a \
+         write made on another principal's stamp (`add_step` into a group plan, on the \
+         workflow-ingest system agent's stamp, ruling R-98), so a viewer predicate would ask \
+         about the wrong principal; it returns one boolean and no row reaches a caller.",
+    ),
+    (
+        "group_membership.rs",
         "session_can_write_group_conn",
         "READ of NO table: it evaluates `$1 = ANY(epigraph_writable_groups())` over the \
          caller's stamped connection, i.e. the `epigraph.writable_group_ids` GUC (migration 067), \
