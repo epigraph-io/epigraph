@@ -790,6 +790,44 @@ async fn h_the_owner_arm_skips_retracted_rows_and_still_refuses_cd02(pool: PgPoo
     assert!(exists(&pool, "mass_functions", own_retracted_2).await);
 }
 
+/// (h2) The CD02-count half of the owner-arm predicate on its own: an edge
+/// whose ONLY row is another group's public RETRACTED row. 117's owner arm
+/// counted it as a readable row the session cannot delete and refused the
+/// whole call `CD02: 1 of 1`; after 194 the candidate select skips it, so the
+/// call deletes nothing, is not refused, and the row stays.
+#[sqlx::test(migrations = "../../migrations")]
+async fn h2_the_owner_arm_neither_counts_nor_deletes_another_writers_retracted_row(pool: PgPool) {
+    let (writer, group) = fixture::seed_agent_with_group(&pool, "h10-h2-owner").await;
+    let (other, other_group) = fixture::seed_agent_with_group(&pool, "h10-h2-other").await;
+    let f = frame(&pool).await;
+    let a = claim(&pool, writer, group).await;
+    let o = claim(&pool, other, other_group).await;
+    let e = edge(&pool, a, o).await;
+    let foreign_retracted = bba(&pool, o, f, other, Some(e)).await;
+    retracted::retract_through_definer(&pool, foreign_retracted).await;
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
+            .bind(foreign_retracted)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        owner,
+        Some(other_group),
+        "fixture: the retracted row belongs to the other writer's group"
+    );
+
+    let mut app = app_conn(&pool, writer).await;
+    let n = delete_edge_bbas(&mut app, &[e], EdgeBbaCascade::RetractionCascade)
+        .await
+        .expect("another writer's retracted row is not counted toward CD02");
+    assert_eq!(n, 0, "nothing on the edge is the session's to delete");
+    assert!(
+        exists(&pool, "mass_functions", foreign_retracted).await,
+        "the retracted row is kept"
+    );
+}
+
 /// (i) The privileged arm (a maintenance session calling the definer) deletes
 /// the edges' live rows and keeps the retracted ones, of every owner.
 #[sqlx::test(migrations = "../../migrations")]
