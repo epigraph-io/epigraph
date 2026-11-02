@@ -37,7 +37,13 @@
 //!    `FOR UPDATE` (every FK insert that names a frame takes `FOR KEY SHARE` on
 //!    it, so no new BBA or assignment can land mid-run), and the plan is
 //!    re-derived and must equal the printed one.
-//! 5. Only the frames are deleted by this module; the companion rows go by the
+//! 5. A companion row that is a RETRACTED BBA (migration 184) is purged first,
+//!    through `epigraph_purge_mass_functions` with the run's reason (one
+//!    `mass_functions.purge` audit row carrying each purged row): migration
+//!    194 refuses any other delete of a retracted row, the frame's cascade
+//!    included (SPEC section 11 phase 1, K4b). The dry run prints the count as
+//!    `PURGE\tmass_functions\t<n>`.
+//! 6. Only the frames are deleted by this module; the companion rows go by the
 //!    foreign keys' `ON DELETE CASCADE`. A referential action runs as the
 //!    child table's owner and consults no row-security policy, which is why
 //!    `epigraph_maintenance` needs DELETE on `frames` alone (migration 158)
@@ -45,14 +51,14 @@
 //!    The role holds DELETE on `mass_functions` (115) and none on
 //!    `claim_frames`, `ds_combined_beliefs` or `ds_bayesian_divergence`
 //!    (070); the cascade reaches all four regardless.
-//! 6. The transaction's census (`pg_stat_xact_user_tables`, which counts the
+//! 7. The transaction's census (`pg_stat_xact_user_tables`, which counts the
 //!    cascade's deletes too) must be exactly the planned frames in `frames`,
-//!    the planned companion rows in each cascade table, and nothing anywhere
-//!    else. A row the plan did not see (a policy-filtered read, a write that
+//!    the planned companion rows in each cascade table (purged rows included),
+//!    the purge's own grant rows and audit row, and nothing anywhere else. A row the plan did not see (a policy-filtered read, a write that
 //!    slipped past the locks) makes the counts differ, and the transaction is
 //!    rolled back.
-//! 7. One `security_events` row (`operator.frames_deleted`) naming the frames,
-//!    the cascade counts and the reason, then the commit.
+//! 8. One `security_events` row (`operator.frames_deleted`) naming the frames,
+//!    the cascade counts, the purge count and the reason, then the commit.
 //!
 //! # Residual race: edges
 //!
@@ -77,6 +83,12 @@ use uuid::Uuid;
 
 /// The `security_events.event_type` of an applied run.
 pub const EVENT: &str = "operator.frames_deleted";
+
+/// The table migration 194's purge definer appends its audit row to.
+const PURGE_EVENT_TABLE: &str = "security_events";
+/// Migration 194's purge-grant table, which the purge definer fills and
+/// empties inside this run's transaction.
+const PURGE_GRANT_TABLE: &str = "mass_function_purge_grants";
 
 /// The tables that `ON DELETE CASCADE` from `frames.id`, each keyed on
 /// `(frame_id, claim_id)`. This module never deletes from them: the FK
@@ -144,6 +156,9 @@ struct Plan {
     /// Over every refused frame, which kinds of reason occurred.
     refusal_kinds: RefusalKinds,
     missing: Vec<Uuid>,
+    /// The RETRACTED `mass_functions` rows on the deletable frames, in id
+    /// order: purged through migration 194's definer before the delete.
+    purge: Vec<Uuid>,
 }
 
 impl Plan {
@@ -284,6 +299,20 @@ async fn plan(
         }
         out.deletable.push(row.clone());
     }
+    // The retracted rows the frames' cascade would reach: migration 194
+    // refuses that cascade, so they are purged first. A row on a refused frame
+    // is not listed (that frame is not deleted).
+    let deletable = out.ids();
+    if !deletable.is_empty() {
+        out.purge = sqlx::query_scalar(
+            "SELECT id FROM mass_functions \
+              WHERE frame_id = ANY($1) AND retracted_at IS NOT NULL ORDER BY id",
+        )
+        .bind(&deletable)
+        .fetch_all(&mut *conn)
+        .await
+        .context("planning: reading the retracted mass functions to purge")?;
+    }
     Ok(out)
 }
 
@@ -295,6 +324,7 @@ fn print_plan(p: &Plan, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
     for (table, n) in &p.cascade {
         writeln!(out, "CASCADE\t{table}\t{n}")?;
     }
+    writeln!(out, "PURGE\tmass_functions\t{}", p.purge.len())?;
     for id in &p.missing {
         writeln!(out, "MISSING\t{id}\tnot a frame; skipped")?;
     }
@@ -423,6 +453,28 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
             expected.insert(table.to_string(), (0, 0, want));
         }
     }
+    // Migration 194 (H10): a retracted row is deleted only by the purge
+    // definer, so the frames' cascade would be refused SR09 on one. Purge them
+    // first, with the run's reason; the definer writes one audit row and
+    // leaves no grant row. Their count is already in the planned
+    // `mass_functions` deletes.
+    if !dry.purge.is_empty() {
+        let purged: i32 = sqlx::query_scalar("SELECT public.epigraph_purge_mass_functions($1, $2)")
+            .bind(&dry.purge)
+            .bind(&opts.reason)
+            .fetch_one(&mut *tx)
+            .await
+            .context("purging the frames' retracted mass functions")?;
+        let want = i64::try_from(dry.purge.len())?;
+        if i64::from(purged) != want {
+            bail!(
+                "purged {purged} retracted mass function(s), the plan has {want}; rolled back, \
+                 nothing was written"
+            );
+        }
+        expected.insert(PURGE_GRANT_TABLE.to_string(), (want, 0, want));
+        expected.insert(PURGE_EVENT_TABLE.to_string(), (1, 0, 0));
+    }
     let got = sqlx::query("DELETE FROM frames WHERE id = ANY($1)")
         .bind(&ids)
         .execute(&mut *tx)
@@ -453,6 +505,8 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
             "created_at": f.created_at,
         })).collect::<Vec<_>>(),
         "cascade": dry.cascade,
+        "purged_retracted": dry.purge.len(),
+        "purged_retracted_ids": dry.purge,
         "companion_claims": opts.companions,
         "missing": dry.missing,
         "reason": opts.reason,
