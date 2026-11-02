@@ -35,8 +35,9 @@ impl EdgeBbaCascade {
     }
 }
 
-/// Delete every `mass_functions` row keyed `perspective_id = <one of
-/// edge_ids>`, returning how many went.
+/// Delete the `mass_functions` rows keyed `perspective_id = <one of
+/// edge_ids>` that this session may delete (see the two paths below),
+/// returning how many went.
 ///
 /// One statement, two paths, decided by migration 114's
 /// `epigraph_session_is_privileged_writer()` (the test the attach trigger and
@@ -53,7 +54,12 @@ impl EdgeBbaCascade {
 ///   `CD02` (42501) when a readable row is not the session's, and appends one
 ///   `security_events` row per call that deleted anything. Another writer's
 ///   rows are removed only by the administrative cascade on the maintenance
-///   connection (`epigraph_engine::admin_cascade`).
+///   connection (`epigraph_engine::admin_cascade`). Until migration 194
+///   re-bodies that definer (SPEC §11 phase 1, S-1), its owner arm still
+///   deletes the session's OWN retracted rows too, and counts another
+///   writer's retracted row toward `CD02`: on this path, and on a
+///   cascade run on a stamped caller transaction, the retracted-row keep is
+///   the privileged branch's only.
 ///
 /// `sqlx::Result` rather than `DbError` so the match-candidate repository,
 /// which speaks `sqlx::Result`, calls it unchanged.
