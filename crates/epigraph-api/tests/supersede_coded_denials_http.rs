@@ -369,4 +369,208 @@ async fn a_claims_admin_outside_the_owner_group_is_the_named_group_write_denial(
     );
     assert!(!reason.contains("CX03"), "{reason}");
     assert_nothing_written(&pool, c, "claims:admin").await;
+
+    // CONTROL: the same claims:admin caller on a public claim X authored in a
+    // group the caller DOES write lands, so the 403 is the owner group's and
+    // the admin path itself works.
+    let admin_group = viewer(&pool, admin)
+        .await
+        .writable_groups()
+        .first()
+        .copied()
+        .expect("fixture: the admin writes its personal group");
+    let writable = claim_of(&pool, x, admin_group, "X's public claim, the admin's group").await;
+    http_supersede(
+        &pool,
+        &state,
+        admin,
+        &["claims:write", "claims:admin"],
+        writable,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("CONTROL: claims:admin supersedes in its own group: {e:?}"));
+    assert!(!is_current(&pool, writable).await, "CONTROL: it landed");
+}
+
+/// Revoke the application role's EXECUTE on migration 120's deferral definer,
+/// the deploy fault a missing grant is: the deferral then fails with an
+/// UNCODED `42501` ("permission denied for function ...") that is no refusal
+/// of the caller. Calibrated: the role really lost the privilege.
+async fn revoke_deferral_execute(pool: &PgPool) {
+    const DEFERRAL: &str = "public.epigraph_record_cascade_deferral(text, uuid, uuid, uuid, \
+                            uuid[], jsonb, text)";
+    sqlx::query(&format!(
+        "REVOKE EXECUTE ON FUNCTION {DEFERRAL} FROM epigraph_app, PUBLIC"
+    ))
+    .execute(pool)
+    .await
+    .expect("revoke the deferral's EXECUTE");
+    let granted: bool =
+        sqlx::query_scalar("SELECT has_function_privilege('epigraph_app', $1, 'EXECUTE')")
+            .bind(DEFERRAL)
+            .fetch_one(pool)
+            .await
+            .expect("read the privilege");
+    assert!(
+        !granted,
+        "calibration: epigraph_app no longer runs the deferral"
+    );
+}
+
+/// K5, the deferral's fault arm (code-lens review), HTTP twin of the MCP test
+/// of the same name: the supersede deferral answers ONLY CX03 as the caller's
+/// 403. Any other deferral error stays the 500 `admin_session_or_deferral`
+/// gives the other claim acts, never the group-write 403, which would tell an
+/// author who writes the group that it does not.
+///
+/// End to end: the author supersedes its own claim on an app-role state with
+/// no maintenance connection, so the act lands in the transaction and the
+/// deferral INSERT then fails on the revoked grant. Nothing commits. Red
+/// before the fix: 403 with the group-write words.
+///
+/// CONTROL first: before the revoke the same supersession lands and records
+/// its deferral.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deferral_fault_that_is_not_cx03_stays_a_server_fault(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, hg) = seed_agent_with_group(&pool, "k5-http-fault-author").await;
+
+    let control = claim_of(
+        &pool,
+        h,
+        hg,
+        "the author's claim, superseded before the fault",
+    )
+    .await;
+    http_supersede(&pool, &state, h, &["claims:write"], control)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: the author supersedes its own claim: {e:?}"));
+    assert!(!is_current(&pool, control).await, "CONTROL: it landed");
+    assert_eq!(
+        deferrals(&pool).await,
+        1,
+        "CONTROL: its deferral was recorded"
+    );
+
+    revoke_deferral_execute(&pool).await;
+    let c = claim_of(
+        &pool,
+        h,
+        hg,
+        "the author's claim, superseded after the fault",
+    )
+    .await;
+    let e = http_supersede(&pool, &state, h, &["claims:write"], c)
+        .await
+        .expect_err("the deferral cannot be recorded, so nothing commits");
+    let (status, reason) = rendered(e).await;
+    assert_eq!(
+        status, 500,
+        "a missing grant is a server fault, not the caller's denial: {reason}"
+    );
+    assert!(
+        !reason.contains(GROUP_WRITE_REFUSED),
+        "the author writes the group; the reply must not say it does not: {reason}"
+    );
+    assert!(is_current(&pool, c).await, "nothing retired");
+    assert_eq!(successors(&pool, c).await, 0, "no successor");
+    assert_eq!(deferrals(&pool).await, 1, "no second deferral");
+}
+
+/// A REAL database error with SQLSTATE `42501` and `message`, raised on the
+/// harness connection (no policy, no grant change) and converted as every repo
+/// call converts it. Calibrated: `DbError::QueryFailed` carrying the database
+/// error, the shape the supersede mapper reads.
+async fn raised_42501(pool: &PgPool, message: &str) -> epigraph_db::DbError {
+    let sql = format!(
+        "DO $$ BEGIN RAISE EXCEPTION '{}' USING ERRCODE = '42501'; END $$",
+        message.replace('\'', "''")
+    );
+    let raw = sqlx::query(&sql)
+        .execute(pool)
+        .await
+        .expect_err("the DO block raises");
+    let e = epigraph_db::DbError::from(raw);
+    match &e {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => {
+            assert_eq!(d.code().as_deref(), Some("42501"), "calibration: {e:?}");
+            assert_eq!(d.message(), message, "calibration: {e:?}");
+        }
+        other => panic!("calibration: a raw 42501 arrives as QueryFailed: {other:?}"),
+    }
+    e
+}
+
+/// K5, the coded-versus-uncoded `42501` split (test-lens review): a `42501`
+/// opening with a REVIEWED caller-refusal code (`epigraph_db::caller_refusal_code`,
+/// here 176's TEN01) keeps its code: 403 with the database's own reviewed
+/// text, through `From<DbError> for ApiError`, the arm the MCP twin's
+/// `db_caller_error` mirrors and a reviewed supersede list will extend. Red
+/// before the fix: the route's generic 42501 arm answered the group-write 403
+/// and dropped the code.
+///
+/// CONTROL: row security's uncoded 42501 through the same mapper is still the
+/// group-write 403.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_listed_coded_42501_keeps_its_code(pool: PgPool) {
+    let claim = Uuid::new_v4();
+    let listed = "TEN01: a probe of a reviewed refusal";
+    assert_eq!(
+        epigraph_db::caller_refusal_code(listed),
+        Some("TEN01"),
+        "calibration: TEN01 is a reviewed caller-refusal code"
+    );
+    let (status, reason) =
+        rendered(supersede_refusal(claim, raised_42501(&pool, listed).await)).await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(
+        reason.starts_with("TEN01:"),
+        "a reviewed coded refusal keeps its code: {reason}"
+    );
+    assert!(!reason.contains(GROUP_WRITE_REFUSED), "{reason}");
+
+    let (u_status, u_reason) = rendered(supersede_refusal(
+        claim,
+        raised_42501(
+            &pool,
+            "new row violates row-level security policy for table \"claims\"",
+        )
+        .await,
+    ))
+    .await;
+    assert_eq!(u_status, 403, "CONTROL: {u_reason}");
+    assert!(
+        u_reason.contains(GROUP_WRITE_REFUSED),
+        "CONTROL: row security's uncoded 42501 is the group-write 403: {u_reason}"
+    );
+}
+
+/// The UNLISTED coded `42501` on HTTP, pinned as it is (not a fix): a code no
+/// reviewed list names (`ZZ99`) still takes the route's generic 42501 arm, a
+/// group-write 403 with the code dropped, because `From<DbError>` would
+/// redact an unreviewed message to a 500. The MCP twin keeps the text (as
+/// `INTERNAL_ERROR`). The asymmetry is the reviewed supersede refusal list's
+/// to close: a code it adds becomes `caller_refusal_code`'s and takes the
+/// listed arm above on both transports.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unlisted_coded_42501_is_the_group_write_403_until_reviewed(pool: PgPool) {
+    let unlisted = "ZZ99: a probe refusal";
+    assert_eq!(
+        epigraph_db::caller_refusal_code(unlisted),
+        None,
+        "calibration: ZZ99 is on no reviewed list"
+    );
+    let (status, reason) = rendered(supersede_refusal(
+        Uuid::new_v4(),
+        raised_42501(&pool, unlisted).await,
+    ))
+    .await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(reason.contains(GROUP_WRITE_REFUSED), "pinned: {reason}");
+    assert!(
+        !reason.contains("ZZ99"),
+        "pinned: the unreviewed text is not sent: {reason}"
+    );
 }

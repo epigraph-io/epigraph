@@ -712,3 +712,41 @@ pub(crate) async fn unmark_duplicate_expecting(
         "belief_cascade": belief_cascade,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::opens_with_refusal_code;
+
+    /// The boundaries of the refusal-code grammar the supersede mapper splits
+    /// `42501` on (two to five ASCII capitals, exactly two digits, a colon, at
+    /// the very start), which is `errors::coded`'s grammar byte for byte.
+    #[test]
+    fn opens_with_refusal_code_admits_exactly_the_code_grammar() {
+        for coded in [
+            "CX03: the act",
+            "OPL01: unbound",
+            "ABCDE12: five capitals",
+            "AB12:",
+        ] {
+            assert!(opens_with_refusal_code(coded), "{coded:?} is coded");
+        }
+        for uncoded in [
+            "A12: one capital",
+            "ABCDEF12: six capitals",
+            "FA4: one digit",
+            "FA123: three digits",
+            "FA04 no colon",
+            "FA04",
+            " CX03: leading space",
+            "cx03: lower case",
+            "new row violates row-level security policy for table \"claims\"",
+            "permission denied for function epigraph_record_cascade_deferral",
+            "",
+        ] {
+            assert!(
+                !opens_with_refusal_code(uncoded),
+                "{uncoded:?} is not coded"
+            );
+        }
+    }
+}

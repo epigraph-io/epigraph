@@ -440,3 +440,165 @@ async fn a_stdio_author_outside_the_owner_group_is_a_named_denial(pool: PgPool) 
     assert!(!err.message.contains("CX03"), "{err:?}");
     assert_nothing_written(&pool, c, "stdio").await;
 }
+
+/// Revoke the application role's EXECUTE on migration 120's deferral definer,
+/// the deploy fault a missing grant is: the deferral then fails with an
+/// UNCODED `42501` ("permission denied for function ...") that is no refusal
+/// of the caller. Calibrated: the role really lost the privilege.
+async fn revoke_deferral_execute(pool: &PgPool) {
+    const DEFERRAL: &str = "public.epigraph_record_cascade_deferral(text, uuid, uuid, uuid, \
+                            uuid[], jsonb, text)";
+    sqlx::query(&format!(
+        "REVOKE EXECUTE ON FUNCTION {DEFERRAL} FROM epigraph_app, PUBLIC"
+    ))
+    .execute(pool)
+    .await
+    .expect("revoke the deferral's EXECUTE");
+    let granted: bool =
+        sqlx::query_scalar("SELECT has_function_privilege('epigraph_app', $1, 'EXECUTE')")
+            .bind(DEFERRAL)
+            .fetch_one(pool)
+            .await
+            .expect("read the privilege");
+    assert!(
+        !granted,
+        "calibration: epigraph_app no longer runs the deferral"
+    );
+}
+
+/// K5, the deferral's fault arm (code-lens review): the supersede deferral
+/// answers ONLY CX03 as the caller's denial. Any other deferral error is the
+/// server's fault and stays `INTERNAL_ERROR`, as `admin_session_or_deferral`
+/// answers it for the other claim acts; it is never the group-write denial,
+/// which would tell an author who writes the group that it does not.
+///
+/// Driven end to end: the author supersedes its own claim on an app-role
+/// server with no maintenance connection, so the act lands in the transaction
+/// and the deferral INSERT then fails on the revoked grant. Nothing commits.
+/// Red before the fix: `INVALID_REQUEST` with the group-write words.
+///
+/// CONTROL first: before the revoke the same author's supersession lands and
+/// records its deferral, so the fault is the grant and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deferral_fault_that_is_not_cx03_stays_a_server_fault(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "k5-fault-author").await;
+
+    let control = claim_of(
+        &pool,
+        h,
+        hg,
+        "the author's claim, superseded before the fault",
+    )
+    .await;
+    supersede_as(&pool, &server, h, control)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: the author supersedes its own claim: {e:?}"));
+    assert!(!is_current(&pool, control).await, "CONTROL: it landed");
+    assert_eq!(
+        deferrals(&pool).await,
+        1,
+        "CONTROL: its deferral was recorded"
+    );
+
+    revoke_deferral_execute(&pool).await;
+    let c = claim_of(
+        &pool,
+        h,
+        hg,
+        "the author's claim, superseded after the fault",
+    )
+    .await;
+    let err = supersede_as(&pool, &server, h, c)
+        .await
+        .expect_err("the deferral cannot be recorded, so nothing commits");
+    assert_eq!(
+        err.code,
+        ErrorCode::INTERNAL_ERROR,
+        "a missing grant is a server fault, not the caller's denial: {err:?}"
+    );
+    assert!(
+        !err.message.contains(GROUP_WRITE_REFUSED),
+        "the author writes the group; the reply must not say it does not: {err:?}"
+    );
+    assert!(is_current(&pool, c).await, "nothing retired");
+    assert_eq!(successors(&pool, c).await, 0, "no successor");
+    assert_eq!(deferrals(&pool).await, 1, "no second deferral");
+}
+
+/// A REAL database error with SQLSTATE `42501` and `message`, raised on the
+/// harness connection (no policy, no grant change) and converted as every repo
+/// call converts it. Calibrated: it arrives as `DbError::QueryFailed` carrying
+/// the database error, which is the shape the supersede mappers read.
+async fn raised_42501(pool: &PgPool, message: &str) -> epigraph_db::DbError {
+    let sql = format!(
+        "DO $$ BEGIN RAISE EXCEPTION '{}' USING ERRCODE = '42501'; END $$",
+        message.replace('\'', "''")
+    );
+    let raw = sqlx::query(&sql)
+        .execute(pool)
+        .await
+        .expect_err("the DO block raises");
+    let e = epigraph_db::DbError::from(raw);
+    match &e {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => {
+            assert_eq!(d.code().as_deref(), Some("42501"), "calibration: {e:?}");
+            assert_eq!(d.message(), message, "calibration: {e:?}");
+        }
+        other => panic!("calibration: a raw 42501 arrives as QueryFailed: {other:?}"),
+    }
+    e
+}
+
+/// K5, the coded-versus-uncoded `42501` split (test-lens review): a `42501`
+/// whose message opens with a refusal code OTHER than CX03 keeps its code. It
+/// is not rewritten to the group-write denial (that arm is for row security's
+/// uncoded text), and goes on to `errors::db_caller_error`, the shared mapper
+/// a reviewed refusal list will extend.
+///
+/// The code is `ZZ99`, which no `DbError` arm claims (RT07, also `42501`, is
+/// converted to `Refused` before any mapper sees it). Today's class is pinned:
+/// `db_caller_error` relays an unlisted coded refusal as `INTERNAL_ERROR` with
+/// its text, so a reviewed list turning it into `INVALID_REQUEST` is a visible
+/// change here.
+///
+/// CONTROL: an uncoded `42501` (row security's words) through the same mapper
+/// is the group-write denial, so the split is what decides.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_coded_42501_other_than_cx03_keeps_its_code(pool: PgPool) {
+    let claim = Uuid::new_v4();
+    let coded = supersede_refusal(claim, raised_42501(&pool, "ZZ99: a probe refusal").await);
+    assert!(
+        coded.message.starts_with("ZZ99:"),
+        "a coded refusal keeps its code: {coded:?}"
+    );
+    assert!(
+        !coded.message.contains(GROUP_WRITE_REFUSED),
+        "a coded refusal is not the group-write denial: {coded:?}"
+    );
+    assert_eq!(
+        coded.code,
+        ErrorCode::INTERNAL_ERROR,
+        "pinned: db_caller_error relays an unlisted coded refusal as INTERNAL_ERROR: {coded:?}"
+    );
+
+    let uncoded = supersede_refusal(
+        claim,
+        raised_42501(
+            &pool,
+            "new row violates row-level security policy for table \"claims\"",
+        )
+        .await,
+    );
+    assert_eq!(
+        uncoded.code,
+        ErrorCode::INVALID_REQUEST,
+        "CONTROL: {uncoded:?}"
+    );
+    assert!(
+        uncoded.message.contains(GROUP_WRITE_REFUSED),
+        "CONTROL: row security's uncoded 42501 is the group-write denial: {uncoded:?}"
+    );
+}
