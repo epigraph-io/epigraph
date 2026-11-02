@@ -238,6 +238,17 @@ pub fn db_caller_error(e: epigraph_db::DbError) -> McpError {
             message: Cow::from(e.to_string()),
             data: None,
         },
+        // A supersede-architecture refusal (SPEC section 7.2; migration 194's
+        // SR09): the database's coded MESSAGE, reviewed for the caller (row ids
+        // are in DETAIL), as a caller error. `internal_error` would send the
+        // same text as -32603.
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(db),
+        } if epigraph_db::supersede_refusal_code(db.message()).is_some() => McpError {
+            code: ErrorCode::INVALID_REQUEST,
+            message: Cow::from(db.message().to_string()),
+            data: None,
+        },
         other => internal_error(other),
     }
 }
