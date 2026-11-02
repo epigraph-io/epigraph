@@ -49,17 +49,16 @@ impl EdgeBbaCascade {
 ///   an invalidation, a dedup's orphan repair or a match-candidate retire
 ///   never removes it;
 /// * any other session calls `epigraph_cascade_delete_edge_bbas` (115, reduced
-///   to its owner arm by migration 117), which deletes only the session's OWN
-///   rows (owner group in its writable set), refuses the whole call with
-///   `CD02` (42501) when a readable row is not the session's, and appends one
-///   `security_events` row per call that deleted anything. Another writer's
-///   rows are removed only by the administrative cascade on the maintenance
-///   connection (`epigraph_engine::admin_cascade`). Until migration 194
-///   re-bodies that definer (SPEC §11 phase 1, S-1), its owner arm still
-///   deletes the session's OWN retracted rows too, and counts another
-///   writer's retracted row toward `CD02`: on this path, and on a
-///   cascade run on a stamped caller transaction, the retracted-row keep is
-///   the privileged branch's only.
+///   to its owner arm by migration 117, re-bodied by migration 194), which
+///   deletes only the session's OWN live rows (owner group in its writable
+///   set), refuses the whole call with `CD02` (42501) when a readable LIVE row
+///   is not the session's, and appends one `security_events` row per call
+///   that deleted anything. A retracted row, the session's own or another
+///   writer's, is neither deleted nor counted toward `CD02` (194's
+///   `retracted_at IS NULL` on the owner-arm candidate select), so the
+///   retracted-row keep holds on this path too. Another writer's live rows
+///   are removed only by the administrative cascade on the maintenance
+///   connection (`epigraph_engine::admin_cascade`).
 ///
 /// `sqlx::Result` rather than `DbError` so the match-candidate repository,
 /// which speaks `sqlx::Result`, calls it unchanged.
