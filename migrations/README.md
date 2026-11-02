@@ -2199,7 +2199,10 @@ restart.
   `operator.link_retired` / `operator.link_unretired` row with the reason and
   `via` (the verb, or `direct`). Adds the retire-only guard
   `operator_links_retire_only` (BEFORE UPDATE, INVOKER: for every login but a
-  superuser only `retired` false -> true; OLR04 / 42501 otherwise),
+  superuser only `retired` false -> true, OLR04 / 42501 otherwise; and that
+  flip only once the agent holds no live writer/admin row in the operator
+  group, OLR03 / 55000, so a maintenance login's direct UPDATE meets the
+  verb's precondition; the direct path is not serialised by 107's lock),
   `GRANT UPDATE (retired)` to the maintenance role, the UPDATE policy
   `operator_links_definer_retire` (`epigraph_definer_bypass()`), and the
   RESTRICTIVE `security_events_operator_link_retire_privileged` reserving both

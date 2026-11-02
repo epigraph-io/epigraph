@@ -59,15 +59,32 @@
 --     superuser can) row naming the operator, the group, the before and
 --     after state, the reason and revoked count when the verb passed them,
 --     `via` (`epigraph_retire_operator_link`, or `direct` for any other
---     statement) and `session_user`. An UPDATE that leaves `retired` as it
---     was writes nothing. The function keeps 122's `public, pg_temp` path,
---     signature, owner and ACL (185's precedent for a re-body).
+--     statement) and `session_user`. `via` and the reason are ADVISORY: they
+--     come from a session-settable setting, so a maintenance login could set
+--     it before a direct UPDATE; `recorded_by` (`session_user`) is the
+--     attribution, and (c) holds a direct UPDATE to the verb's precondition
+--     either way. An UPDATE that leaves `retired` as it was writes nothing.
+--     The function keeps 122's `public, pg_temp` path, signature, owner and
+--     ACL (185's precedent for a re-body).
 -- (c) A retire-only guard, `operator_links_retire_only` (BEFORE UPDATE, an
---     INVOKER: it reads only OLD/NEW and the login): for every login but a
---     superuser, an UPDATE may only flip `retired` from false to true. An
---     un-retire, or a change to any other column, is refused (OLR04, 42501).
---     A superuser stays outside it, as it is outside every other guard here
---     (it can disable a trigger); its un-retire is audited by (b).
+--     INVOKER): for every login but a superuser, an UPDATE may only flip
+--     `retired` from false to true. An un-retire, or a change to any other
+--     column, is refused (OLR04, 42501). And the verb's precondition lives on
+--     the TABLE too (122 section 1c's convention: a maintenance login's
+--     direct write meets the definer's checks): a false -> true flip while
+--     the agent still holds a live `writer` / `admin` row in the link's
+--     operator group is refused (OLR03, 55000, the verb's HINT). Inside the
+--     verb those rows are already revoked by an earlier command when
+--     `revoke_membership` is true, so the verb passes. The guard reads
+--     `group_memberships` as the invoker; every session that passes (d)'s
+--     UPDATE policy passes `group_memberships_tenancy` by the same
+--     `epigraph_definer_bypass()` arm, so no row can be hidden from it. It
+--     takes no lock: a direct statement is NOT serialised against the link
+--     writers by 107's advisory lock (taking it here, after the row lock,
+--     would invert the verb's order and could deadlock); the verb is the
+--     serialised path. A superuser stays outside the guard, as it is outside
+--     every other guard here (it can disable a trigger); its un-retire is
+--     audited by (b).
 -- (d) The grants the verb's UPDATE needs and nothing more: UPDATE on the one
 --     column `retired` for the maintenance role, and an UPDATE policy that
 --     admits only a maintenance-owned frame or member
@@ -190,6 +207,21 @@ BEGIN
                         'a retired link is permanent and a link is never re-pointed (agent %); '
                         'nothing was changed', OLD.agent_id
             USING ERRCODE = '42501';
+    END IF;
+    -- ZERO write authority is a precondition of a retire on EVERY path, not
+    -- only the verb's (107/122 section 7).
+    IF NOT OLD.retired AND NEW.retired
+       AND EXISTS (SELECT 1 FROM public.group_memberships m
+                    WHERE m.group_id = OLD.operator_group_id
+                      AND m.agent_id = OLD.agent_id
+                      AND m.revoked_at IS NULL
+                      AND m.role IN ('writer', 'admin')) THEN
+        RAISE EXCEPTION 'OLR03: agent % holds a live writer/admin membership in operator '
+                        'group %, and a retired identity may hold no write authority there; '
+                        'nothing was changed', OLD.agent_id, OLD.operator_group_id
+            USING ERRCODE = '55000',
+                  HINT = 'Revoke that membership in the same act: epigraph-operator '
+                         'retire-link --revoke-membership.';
     END IF;
     RETURN NEW;
 END $$;
@@ -327,9 +359,10 @@ DO $$ BEGIN
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_retire_operator_link(uuid, text, boolean) '
                 'TO epigraph_maintenance';
-        -- The verb runs as this role, so it holds the one column it writes;
-        -- the retire-only guard and the audit hold a direct write by the
-        -- same role to the same rule and the same record.
+        -- The verb runs as this role, so it holds the one column it writes.
+        -- A direct write by the same role meets the same rules on the table:
+        -- (c) admits only a false -> true flip of an agent with zero write
+        -- authority in the operator group, and (b) audits it.
         EXECUTE 'GRANT UPDATE (retired) ON public.operator_links TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN

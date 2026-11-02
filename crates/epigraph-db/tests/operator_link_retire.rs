@@ -186,6 +186,69 @@ async fn a_direct_retire_of_a_live_link_is_audited(pool: PgPool) {
     );
 }
 
+/// A maintenance login's DIRECT `UPDATE operator_links SET retired = true`
+/// (191 grants it the column, because the verb runs as that role) meets the
+/// verb's precondition on the table: while the agent still holds a live
+/// writer/admin row in the operator group it is refused (OLR03, 55000) and
+/// nothing changes, so a retired identity never keeps write authority there.
+/// Once that row is gone the same statement lands and is audited `via =
+/// direct`, naming the session, with no reason (the direct path carries none).
+///
+/// Verified to fail: the writer-row check removed from 191's
+/// `operator_links_retire_only` -> the first direct UPDATE lands with the
+/// writer row live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_direct_retire_needs_zero_write_authority(pool: PgPool) {
+    let (_, agent, group) = live_linked(&pool, "maint-direct").await;
+    assert_eq!(live_writer_rows(&pool, group, agent).await, 1, "PREMISE");
+    let direct = |pool: PgPool| async move {
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let r =
+                sqlx::query("UPDATE public.operator_links SET retired = true WHERE agent_id = $1")
+                    .bind(agent)
+                    .execute(&mut *conn)
+                    .await;
+            (conn, r)
+        })
+        .await
+    };
+
+    let before = footprint(&pool, agent).await;
+    let err = direct(pool.clone())
+        .await
+        .expect_err("a live writer row refuses the direct retire");
+    let db = err.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("55000"), "{db}");
+    assert!(db.message().starts_with("OLR03:"), "{}", db.message());
+    assert_eq!(
+        footprint(&pool, agent).await,
+        before,
+        "OLR03 changes nothing"
+    );
+
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("the writer row is revoked first");
+    let done = direct(pool.clone())
+        .await
+        .expect("with zero write authority the direct retire lands");
+    assert_eq!(done.rows_affected(), 1);
+    assert_eq!(link_retired(&pool, agent).await, Some(true));
+    let rows = retire_audit(&pool, agent).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (kind, d) = &rows[0];
+    assert_eq!(kind, "operator.link_retired");
+    assert_eq!(d["via"], serde_json::json!("direct"));
+    assert_eq!(d["recorded_by"], serde_json::json!("epigraph_maintenance"));
+    assert!(d["reason"].is_null(), "{d}");
+}
+
 /// The verb, on a maintenance session (`session_user` = the NOSUPERUSER
 /// maintenance role): with the agent's live writer row still in the
 /// operator's group it REFUSES (OLR03, nothing changed: a retire that did not
@@ -372,8 +435,10 @@ async fn the_application_role_cannot_retire_or_forge_the_audit(pool: PgPool) {
 
 /// A retired link is permanent and a link is never re-pointed: a maintenance
 /// session's direct UPDATE that un-retires (OLR04) or re-points (no column
-/// grant) a link is refused 42501 and changes nothing, although 191 lets the
-/// same session flip `retired` to true.
+/// grant) a link is refused 42501 and changes nothing. (191 lets the same
+/// session flip `retired` to true only once the agent holds no live
+/// writer/admin row in the operator group: see
+/// `a_maintenance_direct_retire_needs_zero_write_authority`.)
 ///
 /// Verified to fail: 191's `operator_links_retire_only` trigger dropped -> the
 /// un-retire lands.
