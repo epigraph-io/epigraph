@@ -522,3 +522,217 @@ async fn a_stdio_non_submitter_cannot_mutate_a_public_lineage(pool: PgPool) {
     }
     assert_eq!(snapshot(&pool, name).await, before, "nothing written");
 }
+
+/// The lineage's `name` ingested by the member into a fresh team group `g`,
+/// as in the first test; returns `(g, member's agent id)`.
+async fn private_lineage(
+    pool: &PgPool,
+    member_server: &EpiGraphMcpFull,
+    name: &str,
+) -> (Uuid, Uuid) {
+    let (member_viewer, member) = stdio(pool, member_server, MEMBER_SEED).await;
+    ingest(
+        member_server,
+        &member_viewer,
+        &format!("{name}-warmup"),
+        None,
+    )
+    .await;
+    let g = team_group(pool, member).await;
+    let member_viewer = tools::viewer::request_viewer(member_server, None)
+        .await
+        .expect("the member's viewer, now in the group");
+    ingest(member_server, &member_viewer, name, Some(g)).await;
+    let row: (String, Uuid) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM workflows WHERE canonical_name = $1",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("the row");
+    assert_eq!(row, ("group".to_string(), g), "CALIBRATION: private");
+    (g, member)
+}
+
+/// Every refusal of `outcomes`, insisting that none was admitted.
+fn all_refused(outcomes: &[(&'static str, Option<String>)]) -> Vec<(&'static str, String)> {
+    outcomes
+        .iter()
+        .map(|(tool, outcome)| match outcome {
+            Some(message) => (*tool, message.clone()),
+            None => panic!("{tool} was admitted; all outcomes: {outcomes:?}"),
+        })
+        .collect()
+}
+
+/// The group-write half of the stdio arm. The lineage's own SUBMITTER, a
+/// writer of its group when it ingested, is demoted to READER: it still
+/// reads the row, so only the "writes the owner group" check stands between
+/// it and a write that lands in the group on the system agent's stamp. Every
+/// tool refuses with that check's text. Then its membership is REVOKED: it no
+/// longer reads the row, and every tool refuses without naming it. Nothing is
+/// written either time. CALIBRATION: as a writer again it is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stdio_submitter_who_no_longer_writes_the_group_is_refused(pool: PgPool) {
+    let member_server = app_role_server(&pool, MEMBER_SEED).await;
+    let name = "stdio-auth-demoted";
+    let (g, member) = private_lineage(&pool, &member_server, name).await;
+    let wf = head(&pool, name).await;
+    let before = snapshot(&pool, name).await;
+
+    let n = sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(g)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("demote")
+    .rows_affected();
+    assert_eq!(n, 1, "CALIBRATION: one live membership demoted");
+    let viewer = tools::viewer::request_viewer(&member_server, None)
+        .await
+        .expect("the reader's viewer");
+    let outcomes = every_tool(&pool, &member_server, &viewer, name, "reader", None).await;
+    for (tool, message) in all_refused(&outcomes) {
+        assert!(
+            message.contains("does not write")
+                && message.contains("owner group")
+                && message.contains(&member.to_string()),
+            "{tool}: refused by the group-write check: {message}"
+        );
+    }
+    assert_eq!(
+        snapshot(&pool, name).await,
+        before,
+        "the reader wrote nothing"
+    );
+
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(g)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("revoke");
+    let viewer = tools::viewer::request_viewer(&member_server, None)
+        .await
+        .expect("the revoked agent's viewer");
+    let outcomes = every_tool(&pool, &member_server, &viewer, name, "revoked", None).await;
+    for (tool, message) in all_refused(&outcomes) {
+        assert!(
+            tool == "deprecate_workflow" || !message.contains(&wf.to_string()),
+            "{tool}: the refusal must not name the now-hidden workflow: {message}"
+        );
+        let expected = match tool {
+            // The gate's own masked refusal.
+            "add_step" | "delete_step" | "improve_workflow_hierarchy" => "can read matches",
+            // Both resolve their target on the caller's view first, and the
+            // hidden step / row reads as absent.
+            "evolve_step" => "not found",
+            _ => "can read",
+        };
+        assert!(
+            message.contains(expected),
+            "{tool}: refused as a row the caller cannot read ({expected:?}): {message}"
+        );
+    }
+    assert_eq!(
+        snapshot(&pool, name).await,
+        before,
+        "the revoked agent wrote nothing"
+    );
+
+    // CALIBRATION: a writer again, the same agent is admitted (add_step).
+    let n = sqlx::query(
+        "UPDATE group_memberships SET revoked_at = NULL, role = 'writer' \
+          WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(g)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("re-admit as a writer")
+    .rows_affected();
+    assert_eq!(n, 1, "CALIBRATION: the one membership row");
+    let viewer = tools::viewer::request_viewer(&member_server, None)
+        .await
+        .expect("the writer's viewer");
+    tools::step_ops::add_step(&member_server, &viewer, add(name, "writer again add"), None)
+        .await
+        .unwrap_or_else(|e| panic!("CALIBRATION: the writer adds: {}", e.message));
+}
+
+/// The undeclared-signer arm (`--agent-key` / `--agent-model` absent) admits
+/// a non-submitter with a WARN only AFTER the read and group-write checks. An
+/// outsider server with a generated signer identity is refused by every tool
+/// on a group-private lineage, nothing written and the id not named. The
+/// accepted residual is pinned too: on a PUBLIC lineage another agent
+/// submitted, that server is admitted and the write is recorded as
+/// `arm = undeclared_signer` over stdio.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undeclared_signer_stdio_outsider_cannot_mutate_a_group_private_lineage(pool: PgPool) {
+    let member_server = app_role_server(&pool, MEMBER_SEED).await;
+    let outsider_server = app_role_server(&pool, OUTSIDER_SEED)
+        .await
+        .with_generated_signer_identity();
+    let (outsider_viewer, outsider) = stdio(&pool, &outsider_server, OUTSIDER_SEED).await;
+    let name = "stdio-auth-undeclared";
+    let (_g, member) = private_lineage(&pool, &member_server, name).await;
+    assert_ne!(member, outsider);
+    let wf = head(&pool, name).await;
+    let before = snapshot(&pool, name).await;
+    let outcomes = every_tool(
+        &pool,
+        &outsider_server,
+        &outsider_viewer,
+        name,
+        "undeclared",
+        None,
+    )
+    .await;
+    for (tool, message) in all_refused(&outcomes) {
+        assert!(
+            tool == "deprecate_workflow" || !message.contains(&wf.to_string()),
+            "{tool}: the refusal must not name the hidden workflow: {message}"
+        );
+    }
+    assert_eq!(snapshot(&pool, name).await, before, "nothing written");
+
+    // The residual, pinned: a PUBLIC lineage the member submitted.
+    let (member_viewer, _) = stdio(&pool, &member_server, MEMBER_SEED).await;
+    let public = "stdio-auth-undeclared-public";
+    ingest(&member_server, &member_viewer, public, None).await;
+    tools::step_ops::add_step(
+        &outsider_server,
+        &outsider_viewer,
+        add(public, "undeclared public add"),
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "the accepted residual: an undeclared stdio signer is admitted on a public lineage: {}",
+            e.message
+        )
+    });
+    let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'workflows.caller_write' \
+          AND details->>'acting_agent' = $1",
+    )
+    .bind(outsider.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("caller writes");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["arm"], "undeclared_signer", "{}", rows[0]);
+    assert_eq!(rows[0]["transport"], "stdio", "{}", rows[0]);
+    assert!(
+        rows[0]["client_id"].is_null() && rows[0]["token_jti"].is_null(),
+        "{}",
+        rows[0]
+    );
+}
