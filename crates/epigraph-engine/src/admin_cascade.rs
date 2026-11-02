@@ -824,6 +824,7 @@ pub async fn apply_after_dedup(
             "false_bindings_not_copied": r.skipped_false_bindings,
             "bbas_pooled": r.pooled_bbas.len(),
             "bbas_kept_on_duplicate": r.kept_on_duplicate.len(),
+            "bbas_kept_on_duplicate_by_retracted_holder": r.kept_on_duplicate_by_retracted_holder.len(),
         }),
         record: serde_json::to_value(&r.revert).ok()
     );
