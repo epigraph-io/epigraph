@@ -34,31 +34,25 @@ fn src() -> PathBuf {
 /// Files allowed to keep the pattern, how many sites each, and why.
 ///
 /// `errors.rs` defines the helper, and its own redaction test calls it with a
-/// `format!` on purpose; its count is exact. `tools/recall.rs` belongs to
-/// another session's work and is grandfathered at its count on 2026-10-26 as
-/// a CEILING: work in that file may remove sites without editing this test,
-/// but may not add one. Lower the number as its sites are converted.
-const ALLOWED: &[(&str, usize, Bound, &str)] = &[
-    (
-        "errors.rs",
-        1,
-        Bound::Exact,
-        "the helper's own test of its redaction (internal_error_withholds_the_error_text_and_logs_it)",
-    ),
-    (
-        "tools/recall.rs",
-        12,
-        Bound::AtMost,
-        "grandfathered: owned by another session's open work; convert, then lower this",
-    ),
-];
+/// `format!` on purpose; its count is exact. Nothing else is allowlisted:
+/// `tools/recall.rs`, grandfathered at 12 sites on 2026-10-26, was converted
+/// (backlog e0f0cb68 (2)), so it is scanned like every other file.
+const ALLOWED: &[(&str, usize, Bound, &str)] = &[(
+    "errors.rs",
+    1,
+    Bound::Exact,
+    "the helper's own test of its redaction (internal_error_withholds_the_error_text_and_logs_it)",
+)];
 
 /// How an allowlisted file's count is held.
 #[derive(Clone, Copy, Debug)]
 enum Bound {
     /// Exactly this many: a change in either direction fails.
     Exact,
-    /// No more than this many.
+    /// No more than this many: a CEILING for a grandfathered file, which may
+    /// lose sites without editing this test but may not gain one. No file
+    /// holds one today; kept so the next grandfathering is not a redesign.
+    #[allow(dead_code)]
     AtMost,
 }
 

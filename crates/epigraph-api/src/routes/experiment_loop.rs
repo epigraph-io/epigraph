@@ -35,7 +35,9 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct CreateExperimentRequest {
     pub hypothesis_id: Uuid,
-    pub agent_id: Uuid,
+    /// The experiment's creator. Omitted, it is the caller; named, it must BE
+    /// the caller ([`caller_author`], backlog d817613e).
+    pub agent_id: Option<Uuid>,
     pub method_ids: Option<Vec<Uuid>>,
     pub protocol: Option<String>,
 }
@@ -56,7 +58,9 @@ pub struct AddMeasurementsRequest {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
-    pub agent_id: Uuid,
+    /// The analysis's and the BBA's author. Omitted, it is the caller; named,
+    /// it must BE the caller ([`caller_author`], backlog d817613e).
+    pub agent_id: Option<Uuid>,
     pub direction: String,
     pub scope_limitations: Vec<serde_json::Value>,
     /// Expected value under hypothesis — effect_size = |measured - expected|.
@@ -89,10 +93,40 @@ fn require_write_scope(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])
 }
 
+/// The author of what an experiment write records: the authenticated caller
+/// (backlog d817613e; the evidence-author rule `belief.rs::submit_evidence`
+/// follows since 2026-10-22).
+///
+/// `experiments.created_by`, `analyses.agent_id` and the analysis BBA's
+/// `source_agent_id` took the body's `agent_id`, so a caller holding
+/// `claims:write` on the hypothesis could file an experiment, or evidence on
+/// the hypothesis, in another agent's name. An omitted `agent_id` is the
+/// caller's own; a named one that is not the caller is `403`. Checked after
+/// the scope and before anything is read, so the refusal says nothing about
+/// the hypothesis, and before anything is written.
+#[cfg(feature = "db")]
+fn caller_author(
+    viewer: &epigraph_db::visibility::Viewer,
+    named: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let Some(caller) = viewer.principal() else {
+        return Err(ApiError::Forbidden {
+            reason: "an experiment write needs an authenticated author".to_string(),
+        });
+    };
+    if named.is_some_and(|n| n != caller) {
+        return Err(ApiError::Forbidden {
+            reason: "agent_id must be the authenticated caller's own agent id, or omitted"
+                .to_string(),
+        });
+    }
+    Ok(caller)
+}
+
 /// What a route does with the hypothesis it reaches.
 #[cfg(feature = "db")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum HypothesisAccess {
+pub(crate) enum HypothesisAccess {
     Read,
     Write,
 }
@@ -124,7 +158,7 @@ fn admit(
 ///
 /// A missing or unreadable hypothesis is one `404` (`hypothesis`).
 #[cfg(feature = "db")]
-async fn require_hypothesis(
+pub(crate) async fn require_hypothesis(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     hypothesis_id: Uuid,
@@ -208,6 +242,7 @@ pub async fn create_experiment(
     Json(req): Json<CreateExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_write_scope(auth_ctx, "POST /api/v1/experiments/new")?;
+    let author = caller_author(&viewer, req.agent_id)?;
     require_hypothesis(
         &state,
         &viewer,
@@ -220,7 +255,7 @@ pub async fn create_experiment(
     let id = epigraph_db::ExperimentRepository::create(
         &state.db_pool,
         req.hypothesis_id,
-        req.agent_id,
+        author,
         req.method_ids.as_deref(),
         req.protocol.as_deref(),
         None,
@@ -432,6 +467,7 @@ pub async fn analyze_result(
         })?
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    let author = caller_author(&viewer, req.agent_id)?;
 
     // Load result
     let result = epigraph_db::ExperimentResultRepository::get(&state.db_pool, result_id)
@@ -585,7 +621,7 @@ pub async fn analyze_result(
         RETURNING id
         "#,
     )
-    .bind(req.agent_id)
+    .bind(author)
     .bind(serde_json::json!({
         "scope_limitations": req.scope_limitations,
         "error_budget": {
@@ -670,7 +706,7 @@ pub async fn analyze_result(
         &state.db_pool,
         experiment.hypothesis_id,
         frame_id.0,
-        Some(req.agent_id),
+        Some(author),
         &masses_json,
         None,
         Some("error_derived"),

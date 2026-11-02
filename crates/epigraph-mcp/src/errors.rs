@@ -32,7 +32,8 @@ pub const INTERNAL_ERROR_MESSAGE: &str = "internal error; the detail is in the s
 ///
 /// One exception: a refusal the codebase itself authored
 /// ([`designed_refusal`]) is sent as it was written, because it is the
-/// caller's remedy. It is recognised from the error's type, never from the
+/// caller's remedy, and logged at `warn` ([`log_designed_refusal`]) the way
+/// the HTTP mapper logs it. It is recognised from the error's type, never from the
 /// rendered `Display` of `e`, so it only applies where `e` reaches this call
 /// unwrapped (`.map_err(internal_error)`): a coded refusal formatted into a
 /// `String` first (`internal_error(format!("ctx: {e}"))`) is redacted.
@@ -42,6 +43,7 @@ pub const INTERNAL_ERROR_MESSAGE: &str = "internal error; the detail is in the s
 /// error to keep server-side.
 pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
     if let Some(text) = designed_refusal(&e) {
+        log_designed_refusal(&e, &text);
         return internal_error_text(text);
     }
     tracing::error!(target: "mcp.internal_error", detail = %e, "internal error");
@@ -84,6 +86,43 @@ fn designed_refusal(e: &dyn std::any::Any) -> Option<String> {
         };
     }
     e.downcast_ref::<sqlx::Error>().and_then(database)
+}
+
+/// Log a designed refusal [`internal_error`] is about to send as written
+/// (backlog 365e0749): `warn`, target `mcp.internal_error`, with the fields
+/// and message the HTTP mapper (`From<DbError> for ApiError`) logs for the
+/// same refusal, so an operator finds it in the MCP journal too.
+///
+/// * a coded database refusal: `detail` (its message) and `db_detail`, the
+///   database's DETAIL, which the reply withholds (migration 176 moved
+///   disclosure-sensitive text there), so the log is the only place it is
+///   kept;
+/// * a repo-authored `DbError::Refused`: `?kind` and `detail`.
+fn log_designed_refusal(e: &dyn std::any::Any, text: &str) {
+    let source = match e.downcast_ref::<epigraph_db::DbError>() {
+        Some(epigraph_db::DbError::Refused { kind, .. }) => {
+            tracing::warn!(
+                target: "mcp.internal_error",
+                ?kind,
+                detail = %text,
+                "the repository refused the request"
+            );
+            return;
+        }
+        Some(epigraph_db::DbError::QueryFailed { source }) => Some(source),
+        Some(_) => None,
+        None => e.downcast_ref::<sqlx::Error>(),
+    };
+    let db_detail = source
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(|d| d.try_downcast_ref::<sqlx::postgres::PgDatabaseError>())
+        .and_then(sqlx::postgres::PgDatabaseError::detail);
+    tracing::warn!(
+        target: "mcp.internal_error",
+        detail = %text,
+        db_detail = ?db_detail,
+        "the database refused the request"
+    );
 }
 
 /// Whether a database message opens with a schema refusal code: two to five
@@ -617,6 +656,73 @@ mod tests {
             message: "violated".to_string(),
         });
         assert_eq!(other.message, INTERNAL_ERROR_MESSAGE, "{}", other.message);
+    }
+
+    /// A designed refusal is sent as written AND logged (backlog 365e0749):
+    /// before, `internal_error` returned it before its log line, so the MCP
+    /// journal never showed it while the HTTP mapper logs the same refusal at
+    /// `warn`. The fields match the HTTP `Refused` arm (`?kind`, `detail`).
+    /// The uncoded path keeps its own `internal error` line (calibration).
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_designed_refusal_reaches_the_caller_as_written_and_is_logged() {
+        const MESSAGE: &str = "mark_duplicate: canonical c-5b17 is not current; refusing";
+        let designed = internal_error(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message: MESSAGE.to_string(),
+        });
+        assert_eq!(designed.message, MESSAGE, "the caller's text is unchanged");
+        assert!(
+            logs_contain("the repository refused the request"),
+            "a repo-authored refusal leaves a log line"
+        );
+        assert!(
+            logs_contain("c-5b17"),
+            "the line carries the refusal's text"
+        );
+        assert!(logs_contain("State"), "the line carries the refusal's kind");
+        assert!(
+            logs_contain("WARN"),
+            "logged at warn, the HTTP mapper's level"
+        );
+        // By field NAME, on the refusal's own line, under the MCP target.
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("the repository refused the request"))
+                .ok_or("no repository-refusal line")?;
+            for field in [
+                "WARN",
+                "mcp.internal_error",
+                "kind=State",
+                "detail=mark_duplicate: canonical c-5b17",
+            ] {
+                if !line.contains(field) {
+                    return Err(format!("the refusal's line lacks `{field}`: {line}"));
+                }
+            }
+            Ok(())
+        });
+
+        let uncoded = internal_error(epigraph_db::DbError::from(sqlx::Error::Protocol(
+            "worker at db-host-a91e failed".to_string(),
+        )));
+        assert_eq!(uncoded.message, INTERNAL_ERROR_MESSAGE);
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| {
+                    l.contains("db-host-a91e")
+                        && l.contains("mcp.internal_error")
+                        && l.contains("ERROR")
+                })
+                .then_some(())
+                .ok_or_else(|| {
+                    "calibration: the redacted path logs its detail at error under \
+                     mcp.internal_error, on one line"
+                        .to_string()
+                })
+        });
     }
 
     /// The schema-code gate decides which database text reaches the caller,

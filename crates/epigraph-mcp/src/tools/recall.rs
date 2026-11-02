@@ -9,8 +9,20 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{internal_error, internal_error_logged, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
+
+/// A `recall_with_context` step failed on the server: the caller reads which
+/// step (designed text), and the error itself goes to the server log
+/// (`internal_error_logged`). Replaces `internal_error(format!("step: {e}"))`,
+/// which sent the caller only the fixed redacted message and so discarded the
+/// step too (backlog e0f0cb68 (2), tests/internal_error_format_ratchet.rs).
+fn recall_fault(step: &str, cause: impl std::fmt::Display) -> McpError {
+    internal_error_logged(
+        format!("recall_with_context: {step}; the detail is in the server log"),
+        cause,
+    )
+}
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -896,7 +908,7 @@ pub async fn recall_with_context(
         }
         None => detect_centroid_dim(&server.centroid_population, &server.pool, viewer)
             .await
-            .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
+            .map_err(|e| recall_fault("could not detect the centroid dimension", e))?,
     };
 
     // Spec §3.4: explicit 3072 against an unpopulated column must error
@@ -911,7 +923,7 @@ pub async fn recall_with_context(
             Some(frac) if frac > 0.0 => Ok(frac),
             _ => cache.refresh(&server.pool, viewer).await,
         }
-        .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
+        .map_err(|e| recall_fault("could not check the 3072-dim embedding population", e))?;
         if frac == 0.0 {
             return Err(invalid_params(
                 "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
@@ -925,7 +937,7 @@ pub async fn recall_with_context(
         .embedder
         .generate_at_dim(&params.query, centroid_dim)
         .await
-        .map_err(|e| internal_error(format!("embed query: {e}")))?;
+        .map_err(|e| recall_fault("could not embed the query", e))?;
     let pgvec = crate::embed::format_pgvector(&query_embedding);
 
     // Resolve + existence-check the optional (frame, perspective) lens ONCE,
@@ -1019,7 +1031,7 @@ async fn apply_graph_expansion(
         pool, viewer, &seed_ids, depth, since,
     )
     .await
-    .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    .map_err(|e| recall_fault("graph expansion could not traverse from the seed claims", e))?;
 
     // No level filter on the emitted rows. Backlog 4e856a99 added one
     // (`ClaimRepository::paragraph_level_ids`, removed with it) so that
@@ -1068,7 +1080,7 @@ async fn apply_graph_expansion(
     let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
     let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, viewer, &all_ids)
         .await
-        .map_err(|e| internal_error(format!("in_epistemic_degree_batch: {e}")))?;
+        .map_err(|e| recall_fault("could not read the candidates' epistemic degree", e))?;
 
     combined.sort_by(|a, b| {
         let score = |h: &epigraph_db::ClaimEmbeddingHit| {
@@ -1185,7 +1197,7 @@ async fn recall_with_context_post_embed(
             config,
         )
         .await
-        .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+        .map_err(|e| recall_fault("diverse retrieval failed", e))?;
 
         if selected.is_empty() {
             // No themes, themes that do not cover this query's neighbourhood,
@@ -1203,7 +1215,7 @@ async fn recall_with_context_post_embed(
                 epigraph_db::EmbeddingSeedScope::AllClaims,
             )
             .await
-            .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
+            .map_err(|e| recall_fault("the kNN fallback search failed", e))?
         } else {
             selected
                 .into_iter()
@@ -1229,14 +1241,14 @@ async fn recall_with_context_post_embed(
             epigraph_db::EmbeddingSeedScope::AllClaims,
         )
         .await
-        .map_err(|e| internal_error(format!("kNN: {e}")))?
+        .map_err(|e| recall_fault("the kNN search failed", e))?
     };
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
         let corpus_scope = compute_corpus_scope(&server.pool, viewer)
             .await
-            .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+            .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
         let event_id = Uuid::new_v4();
         spawn_recall_audit(
             server,
@@ -1300,7 +1312,7 @@ async fn recall_with_context_post_embed(
         let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
         let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, viewer, &ids)
             .await
-            .map_err(|e| internal_error(format!("rerank content fetch: {e}")))?;
+            .map_err(|e| recall_fault("could not fetch claim content for reranking", e))?;
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
             .iter()
             .filter_map(|h| {
@@ -1395,7 +1407,7 @@ async fn recall_with_context_post_embed(
         epistemic_limit,
     )
     .await
-    .map_err(|e| internal_error(format!("batch fetch: {e}")))?;
+    .map_err(|e| recall_fault("could not fetch the context batch", e))?;
 
     // Backlog 14b98adc: the min_truth gate below reads the DS pignistic
     // probability, not `claims.truth_value` — which no DS write path refreshes,
@@ -1747,7 +1759,7 @@ async fn recall_with_context_post_embed(
 
     let corpus_scope = compute_corpus_scope(&server.pool, viewer)
         .await
-        .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+        .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
 
     // Recall audit log (backlog 8cbffa0e) — same fire-and-forget contract as
     // `tools::memory::recall`: spawned after the response is assembled so an
@@ -2955,6 +2967,33 @@ mod tests {
                 .await
                 .unwrap(),
             "the revocation must stand"
+        );
+    }
+
+    /// A failed recall step tells the caller WHICH step failed and keeps the
+    /// error itself server-side (backlog e0f0cb68 (2)). Before, these sites
+    /// were `internal_error(format!("step: {e}"))`, whose reply was the fixed
+    /// redacted message alone, so the step was lost along with the error.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_failed_recall_step_names_the_step_and_logs_the_cause() {
+        let e = super::recall_fault(
+            "the kNN search failed",
+            "relation \"claims_ann_9d2f\" does not exist at db-host-9d2f",
+        );
+        assert_eq!(e.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            e.message,
+            "recall_with_context: the kNN search failed; the detail is in the server log"
+        );
+        assert!(
+            !e.message.contains("db-host-9d2f"),
+            "the cause reached the caller: {}",
+            e.message
+        );
+        assert!(
+            logs_contain("db-host-9d2f"),
+            "the withheld cause must reach the server log"
         );
     }
 }
