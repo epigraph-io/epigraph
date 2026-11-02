@@ -25,15 +25,14 @@ fn mark_duplicate_description() -> String {
 fn mark_duplicate_description_names_the_unmark_paths() {
     let d = mark_duplicate_description();
     for needle in [
-        // The tool and route that reverse a mark where the administrative
-        // connection is held.
-        "unmark_duplicate",
+        // The route that reverses a mark where the administrative connection
+        // is held (the MCP tool twin is pinned against the manifest below).
         "POST /api/v1/claims/:id/undedup",
         // Where it is not (every request-serving server): the operator CLI on
         // the maintenance connection.
         "`unmark_duplicate` CLI",
-        "operator",
-        "maintenance",
+        "maintenance DSN",
+        "takes an operator",
     ] {
         assert!(d.contains(needle), "description lacks {needle:?}: {d}");
     }
@@ -41,10 +40,26 @@ fn mark_duplicate_description_names_the_unmark_paths() {
 
 #[test]
 fn mark_duplicate_description_no_longer_says_a_mark_is_one_way() {
-    let d = mark_duplicate_description();
+    let d = mark_duplicate_description().to_ascii_lowercase();
+    // The old advice, and the rewordings that would restore it.
+    for phrase in ["one-way", "one way", "irreversib", "cannot be undone"] {
+        assert!(
+            !d.contains(phrase),
+            "a mark can be un-marked (by an operator on a request server), so the description \
+             must not call it {phrase:?}: {d}"
+        );
+    }
+}
+
+/// Regression pin: the description sends an agent to `unmark_duplicate`, so
+/// the served manifest must carry a tool of that name. A rename or removal
+/// would otherwise leave the description pointing at nothing.
+#[test]
+fn the_unmark_tool_the_description_names_is_served() {
     assert!(
-        !d.to_ascii_lowercase().contains("one-way"),
-        "a mark can be un-marked (by an operator on a request server), so the description \
-         must not call it one-way: {d}"
+        EpiGraphMcpFull::static_tools()
+            .iter()
+            .any(|t| t.name == "unmark_duplicate"),
+        "mark_duplicate's description names unmark_duplicate, which tools/list must serve"
     );
 }
