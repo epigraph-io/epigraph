@@ -111,6 +111,11 @@ use epigraph_db::EdgeRepository;
 /// `SUPPORTS` / `CONTRADICTS` / `CORROBORATES` and refused the lower-case
 /// `contradicts` / `corroborates` MCP `link_epistemic` writes, so one
 /// relationship lived in two spellings (backlog 3ce5e00c).
+///
+/// `supersedes` is not here in any spelling (supersede SPEC K12a, ruling R-132
+/// "supersedes = revision only"): the lineage edge is written only by the
+/// supersession act, which retires the claim it names in the same
+/// transaction. `create_edge` refuses it by name ([`SUPERSEDES_ACT_ONLY`]).
 const VALID_RELATIONSHIPS: &[&str] = &[
     "supports",
     "contradicts",
@@ -123,7 +128,6 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "authored_by",
     "derived_from",
     "uses_evidence",
-    "supersedes",
     "challenges",
     "generated",
     "attributed_to",   // prov:wasAttributedTo — Claim → Author Agent
@@ -168,7 +172,6 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "cites",                 // claim → claim (citation link)
     "qualifies",             // claim → claim (scope caveat; belief-neutral, lower-case only)
     "EQUIVALENT_TO",         // claim → claim (semantic equivalence)
-    "supersedes",            // claim → claim (version chain)
     "revises",               // claim → claim (concurrent branch from common ancestor)
     "enables",               // claim → claim (enablement)
     "has_method_capability", // method → capability (method graph)
@@ -187,7 +190,6 @@ const VALID_RELATIONSHIPS: &[&str] = &[
     "REFINES", // synthesis → synthesis (upper-case form; lower-case "refines" above is claim → claim refinement)
     "COMPOSED_OF", // synthesis → synthesis (prereq composition)
     "METHODOLOGY", // claim → claim (methodology relation, traversal)
-    "SUPERSEDES", // upper-case alias of lower-case "supersedes" above; synthesis-side callers use upper-case per PROV-O convention
     "INSTANTIATES", // claim → claim (paper claim is an instance of textbook concept; cross-source anchor 2026-05-18-cross-source-anchor §3)
 ];
 
@@ -336,6 +338,21 @@ pub fn is_valid_relationship(s: &str) -> bool {
     VALID_RELATIONSHIPS.contains(&epigraph_core::edge::relationships::canonical_relationship(
         s,
     ))
+}
+
+/// The refusal for a generic edge write of `supersedes` in any spelling
+/// (supersede SPEC K12a, ruling R-132): the generic create and the staged
+/// promote answer it, so a lineage edge never exists without the retirement it
+/// records.
+pub const SUPERSEDES_ACT_ONLY: &str =
+    "relationship 'supersedes' (in any spelling) is written only by the supersession act \
+     (POST /api/v1/claims/{id}/supersede, MCP supersede_claim), which retires the claim it \
+     replaces in the same write; a generic edge write cannot create it; nothing was written";
+
+/// Whether `s` is the lineage relationship, in any ASCII case.
+#[must_use]
+pub fn is_lineage_relationship(s: &str) -> bool {
+    s.eq_ignore_ascii_case("supersedes")
 }
 
 /// Trigger DS recomputation on the target claim when an epistemic edge is
@@ -667,7 +684,8 @@ pub struct NeighborhoodResponse {
 /// Validation:
 /// - source_id != target_id when source_type == target_type (no self-loops)
 /// - source_type and target_type must be valid entity types
-/// - relationship must be from the allowed set
+/// - relationship must be from the allowed set; `supersedes`, in any
+///   spelling, is refused by name ([`SUPERSEDES_ACT_ONLY`])
 #[cfg(feature = "db")]
 pub async fn create_edge(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -725,7 +743,14 @@ pub async fn create_edge(
         });
     }
 
-    // Validate relationship
+    // Validate relationship. The lineage edge first, by name: it belongs to
+    // the supersession act (K12a, ruling R-132), whatever its spelling.
+    if is_lineage_relationship(&request.relationship) {
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: SUPERSEDES_ACT_ONLY.to_string(),
+        });
+    }
     if !is_valid_relationship(&request.relationship) {
         return Err(ApiError::ValidationError {
             field: "relationship".to_string(),
@@ -992,20 +1017,6 @@ pub async fn create_edge(
                 }),
             )
             .await;
-
-        // If this is a supersedes edge, also emit claim.superseded
-        if response.relationship.eq_ignore_ascii_case("supersedes") {
-            event_store
-                .push(
-                    "claim.superseded".to_string(),
-                    actor_id,
-                    serde_json::json!({
-                        "superseded_claim_id": response.target_id,
-                        "superseded_by_claim_id": response.source_id,
-                    }),
-                )
-                .await;
-        }
     }
 
     let status = if was_created {
@@ -2995,7 +3006,16 @@ mod tests {
         assert!(is_valid_relationship("authored_by"));
         assert!(is_valid_relationship("derived_from"));
         assert!(is_valid_relationship("uses_evidence"));
-        assert!(is_valid_relationship("supersedes"));
+        // Inverted by ruling R-132 ("supersedes = revision only"; supersede
+        // SPEC K12a): the lineage edge is the supersession act's, in every
+        // spelling, and `create_edge` refuses it by name.
+        assert!(!is_valid_relationship("supersedes"));
+        assert!(!is_valid_relationship("SUPERSEDES"));
+        assert!(is_lineage_relationship("supersedes"));
+        assert!(is_lineage_relationship("SUPERSEDES"));
+        assert!(is_lineage_relationship("Supersedes"));
+        assert!(!is_lineage_relationship("supports"));
+        assert!(!is_lineage_relationship("superseded"));
         assert!(is_valid_relationship("challenges"));
         assert!(is_valid_relationship("generated"));
         assert!(is_valid_relationship("attributed_to"));
