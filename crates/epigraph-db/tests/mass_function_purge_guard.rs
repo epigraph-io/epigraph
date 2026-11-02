@@ -681,18 +681,40 @@ async fn e_the_purge_definer_deletes_audits_and_leaves_no_grant(pool: PgPool) {
     }
     assert!(exists(&pool, "mass_functions", w.retracted).await);
 
+    // A third, edge-keyed row, so the audit's perspective field is checked
+    // against a real value rather than for presence.
+    let group: Uuid = sqlx::query_scalar("SELECT owner_group_id FROM claims WHERE id = $1")
+        .bind(w.claim)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim's group");
+    let source = claim(&pool, w.writer, group).await;
+    let e1 = edge(&pool, source, w.claim).await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "h10-purge-edge-source").await;
+    let edge_row = bba(&pool, w.claim, w.frame, third, Some(e1)).await;
+
+    // The purge on a STAMPED maintenance transaction: the audit row names the
+    // session principal (SPEC §2.8, "the purge definer's caller stamp").
+    let mut tx = m.begin().await.unwrap();
+    sqlx::query("SELECT set_config('epigraph.principal_id', $1, true)")
+        .bind(w.writer.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("stamp the maintenance transaction");
     let n: i32 = sqlx::query_scalar("SELECT public.epigraph_purge_mass_functions($1, $2)")
-        .bind(vec![w.retracted, w.live, Uuid::new_v4()])
+        .bind(vec![w.retracted, w.live, edge_row, Uuid::new_v4()])
         .bind("h10 test purge")
-        .fetch_one(&m)
+        .fetch_one(&mut *tx)
         .await
         .expect("the maintenance role purges");
+    tx.commit().await.unwrap();
     assert_eq!(
-        n, 2,
-        "two rows existed and both went; an unknown id deletes nothing"
+        n, 3,
+        "three rows existed and all went; an unknown id deletes nothing"
     );
     assert!(!exists(&pool, "mass_functions", w.retracted).await);
     assert!(!exists(&pool, "mass_functions", w.live).await);
+    assert!(!exists(&pool, "mass_functions", edge_row).await);
 
     let grants: i64 = sqlx::query_scalar("SELECT count(*) FROM public.mass_function_purge_grants")
         .fetch_one(&pool)
@@ -703,31 +725,46 @@ async fn e_the_purge_definer_deletes_audits_and_leaves_no_grant(pool: PgPool) {
         "the definer deletes its grant rows in its own transaction"
     );
 
-    let audits: Vec<serde_json::Value> = sqlx::query_scalar(
-        "SELECT details FROM security_events WHERE event_type = 'mass_functions.purge'",
+    let audits: Vec<(Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT agent_id, details FROM security_events WHERE event_type = 'mass_functions.purge'",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(audits.len(), 1, "one audit row per purge call: {audits:?}");
-    let a = &audits[0];
+    let (agent, a) = &audits[0];
+    assert_eq!(
+        *agent,
+        Some(w.writer),
+        "the audit row names the purging session's principal: {a}"
+    );
     assert_eq!(a["reason"], "h10 test purge", "{a}");
-    assert_eq!(a["deleted"], 2, "{a}");
+    assert_eq!(a["requested"], 4, "four distinct ids were passed: {a}");
+    assert_eq!(a["deleted"], 3, "{a}");
     let rows = a["rows"]
         .as_array()
         .unwrap_or_else(|| panic!("rows array: {a}"));
-    assert_eq!(rows.len(), 2, "{a}");
-    for (id, retracted) in [(w.retracted, true), (w.live, false)] {
+    assert_eq!(rows.len(), 3, "{a}");
+    let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    for (id, retracted, perspective) in [
+        (w.retracted, true, None),
+        (w.live, false, None),
+        (edge_row, false, Some(e1)),
+    ] {
         let row = rows
             .iter()
             .find(|r| r["id"] == id.to_string())
             .unwrap_or_else(|| panic!("the audit names {id}: {a}"));
         assert_eq!(row["claim_id"], w.claim.to_string(), "{row}");
         assert_eq!(row["frame_id"], w.frame.to_string(), "{row}");
-        assert!(row.get("perspective_id").is_some(), "{row}");
+        assert_eq!(
+            row["perspective_id"],
+            perspective.map_or(serde_json::Value::Null, |p| p.to_string().into()),
+            "{row}"
+        );
         assert_eq!(!row["retracted_at"].is_null(), retracted, "{row}");
-        assert!(
-            row.get("masses").is_some(),
+        assert_eq!(
+            row["masses"], masses,
             "the audit keeps the purged assessment: {row}"
         );
     }
