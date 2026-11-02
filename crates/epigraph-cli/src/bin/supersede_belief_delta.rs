@@ -70,7 +70,21 @@ async fn run(cli: Cli) -> Result<(), String> {
         .create_new(true)
         .open(&cli.json)
         .map_err(|e| format!("{}: {e}", cli.json.display()))?;
+    // This run created the file: if it fails, remove it again, so a re-run is
+    // not refused over an empty report.
+    let result = measure_into(&cli, &opts, &mut out).await;
+    if result.is_err() {
+        drop(out);
+        let _ = std::fs::remove_file(&cli.json);
+    }
+    result
+}
 
+async fn measure_into(
+    cli: &Cli,
+    opts: &DeltaOptions,
+    out: &mut std::fs::File,
+) -> Result<(), String> {
     let maint = epigraph_cli::MaintenancePool::connect("supersede_belief_delta")
         .await
         .map_err(|e| e.to_string())?;
@@ -79,7 +93,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let (conn, viewer) = session.split();
-    let report = run_read_only(conn, viewer, &opts).await?;
+    let report = run_read_only(conn, viewer, opts).await?;
 
     let body = serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?;
     out.write_all(&body)
