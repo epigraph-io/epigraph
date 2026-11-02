@@ -298,6 +298,27 @@ async fn analyzing_a_result_is_attributed_to_the_caller() {
         (0, 0),
         "nothing is attributed to the group admin"
     );
+
+    // Named as itself, on a second experiment: admitted, and authored by the
+    // caller (a rule that refused ANY named agent_id would fail here).
+    let (experiment2, result2) = seed_experiment(&w.pool, w.hypothesis, w.owner).await;
+    let path2 = format!("/api/v1/experiments/{experiment2}/results/{result2}/analyze");
+    let (status, body) = post(w.addr, w.writer, &path2, analyze_body(Some(w.writer))).await;
+    assert_eq!(status, 200, "naming itself is admitted: {body}");
+    let (bbas, analyses, _, status) = footprint(&w.pool, w.hypothesis, experiment2, w.writer).await;
+    assert!(bbas >= 1, "the caller's BBA is on the hypothesis");
+    assert_eq!(
+        (analyses, status.as_str()),
+        (2, "complete"),
+        "the second analysis is the caller's and the experiment completes"
+    );
+    let (owner_bbas, owner_analyses, _, _) =
+        footprint(&w.pool, w.hypothesis, experiment2, w.owner).await;
+    assert_eq!(
+        (owner_bbas, owner_analyses),
+        (0, 0),
+        "still nothing is attributed to the group admin"
+    );
 }
 
 // ── POST /api/v1/experiments/design ────────────────────────────────────────
