@@ -1028,10 +1028,12 @@ Undo: `docs/runbooks/149-undo.sql` (it records one
   supersede is `epigraph-operator custodial-supersede` (migration 123; "The
   custodian role" below), and a hand-written retire plus INSERT is not one.
   The act also writes the `supersedes` edge from the successor to its
-  predecessor, moves the predecessor's strengthening edges to the successor
-  (weakening ones stay), records a `platform.custodial_act` naming the
-  custodian's assignment, and leaves the successor's embedding to the
-  embedding backfill. The "human supersedes its own
+  predecessor, records a `supersede` cascade deferral naming the custodian
+  (the edge migration, in which strengthening edges follow the successor and
+  weakening ones stay, and the belief cascade run from it in the next
+  `replay_deferred_cascades` run), records a `platform.custodial_act` naming
+  the custodian's assignment, all in one transaction, and leaves the
+  successor's embedding to the embedding backfill. The "human supersedes its own
   legacy author's claim" admission applies to rows in the human's own group.
   Revising the corpus IN PLACE (an UPDATE of content, truth value, labels, or
   retiring a claim) is not governed by the binding trigger ("Scope" above;

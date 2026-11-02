@@ -55,8 +55,10 @@
 //!   explicit window, end an assignment, and list them. Every change is
 //!   audited by the table's own trigger.
 //! * `custodial-supersede` — revise a platform-corpus claim on the custodian's
-//!   authority: the act, its edge migration and a `platform.custodial_act`
-//!   audit row naming the assignment, in one transaction.
+//!   authority: the act, a `supersede` cascade deferral naming the custodian
+//!   and a `platform.custodial_act` audit row naming the assignment, in one
+//!   transaction; the edge migration and the belief cascade run from the
+//!   deferral in `replay_deferred_cascades`.
 //!
 //! And a registered human's passkeys (migration 124; see [`passkey`]):
 //!
