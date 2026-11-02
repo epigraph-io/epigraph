@@ -1235,6 +1235,12 @@ async fn require_privileged_session(
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
 ///
+/// Neither direction moves a RETRACTED edge (`valid_to` set): it is history
+/// about the retired claim, as the dedup and merge cascades already treat
+/// it. Nor a lineage edge in either spelling: `lower(relationship) <>
+/// 'supersedes'`, so a legacy upper-case `SUPERSEDES` row stays where it is
+/// (supersede SPEC §5.1, K2).
+///
 /// Neither direction moves a dedup identity edge
 /// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
 /// [`DUPLICATE_IDENTITY_PROPERTY`]), as [`repair_marked_duplicate`] does not:
@@ -1311,7 +1317,8 @@ async fn migrate_superseded_edges(
     let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE edges SET target_id = $1 \
          WHERE target_id = $2 AND target_type = 'claim' \
-           AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           AND lower(relationship) <> 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
@@ -1334,7 +1341,8 @@ async fn migrate_superseded_edges(
     let resourced: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE edges SET source_id = $1 \
          WHERE source_id = $2 AND source_type = 'claim' \
-           AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           AND lower(relationship) <> 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
@@ -6491,7 +6499,7 @@ impl ClaimRepository {
     ///
     /// * `supersede` MINTS `new_uuid` in this transaction, so no pre-existing
     ///   edge can already name it (the only one that does is the `supersedes`
-    ///   edge inserted above, excluded by `relationship != 'supersedes'`).
+    ///   edge inserted above, excluded by `lower(relationship) <> 'supersedes'`).
     ///   Contrast `mark_duplicate`, whose canonical claim pre-exists and
     ///   routinely already has edges — there the guards are load-bearing.
     /// * The remaining shape — a pre-existing `old -rel-> old` self-edge that
@@ -11624,7 +11632,9 @@ async fn migrate_consolidated_edges(
     source_ids: &[Uuid],
 ) -> Result<ConsolidateEdgeMigration, DbError> {
     let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
-    // Collect every LIVE non-supersedes edge touching a source, dropping those
+    // Collect every LIVE non-supersedes edge (either spelling: a legacy
+    // upper-case `SUPERSEDES` is lineage too, SPEC §5.1) touching a source,
+    // dropping those
     // interior to the merge (both endpoints inside the source set) — those
     // would collapse to merged→merged self-loops. A retracted edge stays where
     // it is: it is history, and leaving it makes a second run a no-op.
@@ -11661,7 +11671,7 @@ async fn migrate_consolidated_edges(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
         SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
         FROM edges e
-        WHERE e.relationship != 'supersedes'
+        WHERE lower(e.relationship) <> 'supersedes'
           AND e.valid_to IS NULL
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
@@ -12350,7 +12360,10 @@ async fn repair_marked_duplicate(
     //      accumulate (migration 017 explicitly allows multiple AUTHORED
     //      edges per triple).
     //
-    // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+    // The 'supersedes' edges (dedup/lineage trail) are preserved throughout,
+    // in either spelling: a legacy upper-case `SUPERSEDES` edge is lineage
+    // too, so neither the collision guards nor the re-points touch it
+    // (supersede SPEC §5.1, K2).
     //
     // A NON-PUBLIC duplicate also keeps its `executes` edges
     // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
@@ -12407,7 +12420,7 @@ async fn repair_marked_duplicate(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
          UPDATE edges AS e SET valid_to = now()
          WHERE e.target_id = $2 AND e.target_type = 'claim'
-         AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+         AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
          AND NOT (e.relationship = ANY($3))
          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
          AND e.source_type = 'claim' AND e.source_id != $1
@@ -12437,7 +12450,7 @@ async fn repair_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              UPDATE edges AS e SET valid_to = now()
              WHERE e.source_id = $2 AND e.source_type = 'claim'
-             AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
              AND NOT (e.relationship = ANY($3))
              AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
              AND e.target_type = 'claim' AND e.target_id != $1
@@ -12555,7 +12568,8 @@ async fn repair_marked_duplicate(
 
     let retargeted: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE edges SET target_id = $1 \
-         WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+         WHERE target_id = $2 AND target_type = 'claim' \
+           AND lower(relationship) <> 'supersedes' \
            AND valid_to IS NULL \
            -- Retracted edges do NOT migrate. A withdrawn assertion was made
            -- ABOUT the duplicate; re-pointing it at the canonical claim would
@@ -12841,7 +12855,8 @@ async fn repair_marked_duplicate(
     // `DedupRepair::resourced_edges`).
     let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "UPDATE edges SET source_id = $1 \
-         WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+         WHERE source_id = $2 AND source_type = 'claim' \
+           AND lower(relationship) <> 'supersedes' \
            AND valid_to IS NULL \
            -- Retracted edges do NOT migrate. A withdrawn assertion was made
            -- ABOUT the duplicate; re-pointing it at the canonical claim would
