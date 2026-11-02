@@ -1,6 +1,7 @@
 //! SPEC §11 phase 1, K4a, through the MCP tools: a RETRACTED mass function
 //! (migration 184, rulings R-79 / R-103) survives `supersede_claim` (inline
-//! and deferred-then-replayed), `mark_duplicate` and `delete_edge` with its
+//! and deferred-then-replayed), `mark_duplicate` (its repair and its re-wire
+//! of re-sourced edges), `unmark_duplicate` and `delete_edge` with its
 //! maintenance replay; each act completes, and the cascades count what they
 //! kept.
 //!
@@ -23,8 +24,10 @@ use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::edge_mutation::do_delete_edge;
-use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim};
-use epigraph_mcp::types::{DeleteEdgeParams, MarkDuplicateParams, SupersedeClaimParams};
+use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim, unmark_duplicate};
+use epigraph_mcp::types::{
+    DeleteEdgeParams, MarkDuplicateParams, SupersedeClaimParams, UnmarkDuplicateParams,
+};
 use retracted::{retract_through_definer, row_state};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -362,6 +365,231 @@ async fn mark_duplicate_inline_keeps_retracted_rows_and_the_live_copy_they_block
         "the caller's counts report the kept live copy: {touched}"
     );
     assert_eq!(touched["duplicate_copies_dropped"], 0, "{touched}");
+}
+
+/// A BBA on the harness with the given masses, method and (optional) key
+/// parts.
+#[allow(clippy::too_many_arguments)]
+async fn harness_row(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Option<Uuid>,
+    perspective: Option<Uuid>,
+    masses: serde_json::Value,
+    method: Option<&str>,
+) -> Uuid {
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        agent,
+        perspective,
+        &masses,
+        None,
+        method,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store a BBA")
+}
+
+async fn binary_frame(pool: &PgPool) -> Uuid {
+    let (_scoped, v) = fixture::bypass(pool).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_engine::edge_factor::ensure_binary_frame(&mut conn, &v)
+        .await
+        .expect("binary frame")
+}
+
+async fn is_current(pool: &PgPool, id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read is_current")
+}
+
+/// Site 8 on the dedup path through `mark_duplicate` with the cascade inline
+/// (SPEC §11 K4a item 8 skips per KEY). The duplicate's outgoing edge `dup ->
+/// x` holds a retracted edge BBA of the duplicate's author and another
+/// agent's live one; the canonical has a different author. The re-sourced
+/// edge's live row is invalidated, the retracted one is kept and counted, and
+/// the edge is re-wired from the canonical under the canonical's author,
+/// whose key the retracted row does not hold.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_inline_rewires_a_resourced_edge_past_another_keys_retracted_row(
+    pool: PgPool,
+) {
+    let server = app_role_server(&pool, true).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "k4a-mcp-s8d-h").await;
+    let (c, _) = fixture::seed_agent_with_group(&pool, "k4a-mcp-s8d-c").await;
+    let (x, xg) = fixture::seed_agent_with_group(&pool, "k4a-mcp-s8d-x").await;
+    let dup = claim_of(&pool, h, hg, "k4a mcp s8d duplicate").await;
+    // Another author's claim in the caller's group: the caller writes it as a
+    // group writer, and the re-wire is keyed on ITS author.
+    let canonical = claim_of(&pool, c, hg, "k4a mcp s8d canonical").await;
+    let xc = claim_of(&pool, x, xg, "k4a mcp s8d downstream").await;
+    let bf = binary_frame(&pool).await;
+    epigraph_db::FrameRepository::assign_claim(&pool, canonical, bf, Some(0))
+        .await
+        .expect("bind the canonical");
+    harness_row(
+        &pool,
+        canonical,
+        bf,
+        Some(c),
+        None,
+        serde_json::json!({"0": 0.9, "0,1": 0.1}),
+        None,
+    )
+    .await;
+    let ex = edge(&pool, dup, xc).await;
+    let rx = harness_bba(&pool, xc, bf, h, ex).await;
+    let lx = harness_bba(&pool, xc, bf, x, ex).await;
+    retract_through_definer(&pool, rx).await;
+
+    let r = mark_duplicate(
+        &server,
+        &viewer(&pool, h).await,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&human(h)),
+    )
+    .await
+    .expect("the caller's dedup");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(
+        row_state(&pool, rx).await,
+        Some((xc, true)),
+        "the retracted edge BBA on the re-sourced edge is kept for audit"
+    );
+    let cascade = &body["belief_cascade"];
+    assert_eq!(
+        cascade["errors"],
+        serde_json::json!([]),
+        "the cascade completes with no error: {cascade}"
+    );
+    assert_eq!(
+        row_state(&pool, lx).await,
+        None,
+        "the live row is invalidated"
+    );
+    let rewired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = $1 AND perspective_id = $2 AND source_agent_id = $3 \
+            AND retracted_at IS NULL",
+    )
+    .bind(xc)
+    .bind(ex)
+    .bind(c)
+    .fetch_one(&pool)
+    .await
+    .expect("count the canonical's re-wired row");
+    assert_eq!(
+        rewired, 1,
+        "the edge is re-wired from the canonical under its author: {cascade}"
+    );
+    assert_eq!(
+        cascade["retracted_key_kept"], 1,
+        "the caller's copy counts the kept retracted row: {cascade}"
+    );
+}
+
+/// Site 3 through `unmark_duplicate` (inline; an un-mark is never deferred):
+/// the input the mark pooled onto the canonical finds its slot on the
+/// duplicate held by a RETRACTED cached combination. The retracted row is
+/// kept, the input does not return, it is reported drifted, and the un-mark
+/// itself lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmark_duplicate_keeps_a_retracted_cached_key_and_reports_drift(pool: PgPool) {
+    let server = app_role_server(&pool, true).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "k4a-mcp-s3").await;
+    let dup = claim_of(&pool, h, hg, "k4a mcp s3 duplicate").await;
+    let canonical = claim_of(&pool, h, hg, "k4a mcp s3 canonical").await;
+    // Not bound to the duplicate, so the repair binds nothing onto the
+    // canonical and the un-mark removes no frame binding (the maintenance
+    // role holds no DELETE on `claim_frames`, migration 158).
+    let f = frame(&pool, "s3").await;
+    let input = harness_row(
+        &pool,
+        dup,
+        f,
+        None,
+        None,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+    )
+    .await;
+    let v = viewer(&pool, h).await;
+    let r = mark_duplicate(
+        &server,
+        &v,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&human(h)),
+    )
+    .await
+    .expect("the author's dedup");
+    assert_eq!(first_text(&r)["cascade"]["status"], "applied");
+    assert_eq!(
+        row_state(&pool, input).await,
+        Some((canonical, false)),
+        "calibration: the mark pooled the input onto the canonical"
+    );
+    let cached = harness_row(
+        &pool,
+        dup,
+        f,
+        None,
+        None,
+        serde_json::json!({"0": 0.5, "0,1": 0.5}),
+        Some("Dempster"),
+    )
+    .await;
+    retract_through_definer(&pool, cached).await;
+
+    let r = unmark_duplicate(
+        &server,
+        &v,
+        UnmarkDuplicateParams {
+            claim_id: dup.to_string(),
+        },
+        Some(&human(h)),
+    )
+    .await
+    .expect("the author's un-mark");
+    let body = first_text(&r);
+    assert_eq!(
+        row_state(&pool, cached).await,
+        Some((dup, true)),
+        "the retracted cached row is kept for audit"
+    );
+    assert_eq!(
+        row_state(&pool, input).await,
+        Some((canonical, false)),
+        "the input whose slot a retracted row holds does not return"
+    );
+    let touched = &body["cascade"]["touched"];
+    assert_eq!(
+        (&touched["cached_rows_cleared"], &touched["drifted"]),
+        (&serde_json::json!(0), &serde_json::json!(1)),
+        "nothing retracted is cleared; the blocked input is reported drifted: {body}"
+    );
+    assert!(
+        is_current(&pool, dup).await,
+        "calibration: the un-mark landed: {body}"
+    );
 }
 
 /// A server agent, its personal group and viewer.
