@@ -111,6 +111,16 @@ async fn main() {
     for flag in epigraph_engine::belief_modes::unrecognised() {
         tracing::warn!("belief-mode flag ignored: {flag}");
     }
+    // Calibration (backlog 7cb71243): resolved and journalled at boot, like the
+    // belief modes, so a CALIBRATION_PATH that does not load or an empty
+    // evidence-type vocabulary is reported at startup. Reported, not fatal.
+    tracing::info!(
+        calibration = %epigraph_engine::calibration::CalibrationConfig::cached_source(),
+        "calibration loaded at startup"
+    );
+    for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
+        tracing::error!("calibration: {problem}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,

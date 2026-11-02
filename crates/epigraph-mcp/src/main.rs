@@ -557,6 +557,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for flag in epigraph_engine::belief_modes::unrecognised() {
         tracing::warn!("belief-mode flag ignored: {flag}");
     }
+    // Calibration (backlog 7cb71243): resolved here, at boot, and journalled
+    // under this crate's target for the same reason, so a CALIBRATION_PATH
+    // that does not load, or an empty evidence-type vocabulary, shows in the
+    // log at startup instead of only as a blank "Known keys" in a DS warning.
+    // Reported, not fatal: on stdio this binary is every agent container's
+    // memory tools.
+    tracing::info!(
+        calibration = %epigraph_engine::calibration::CalibrationConfig::cached_source(),
+        "calibration loaded at startup"
+    );
+    for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
+        tracing::error!("calibration: {problem}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN, and this binary is one on every transport (`--listen`

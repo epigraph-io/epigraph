@@ -17,11 +17,13 @@
 //! **perspective override → per-frame override → named global profile → built-in default.**
 //!
 //! - *Built-in default*: [`BeliefProfile::builtin`], the defaults table below.
-//!   Its tables (weights, aliases, methodology, journals) are EMPTY: today's
-//!   code gets them from `calibration.toml`, and when that file cannot be
-//!   loaded the process runs with empty tables
-//!   ([`CalibrationConfig::default_for_phase2_fallback`]). Keeping the
-//!   built-in tables empty keeps that behaviour exact.
+//!   Its tables (weights, aliases, methodology, journals) are EMPTY: the
+//!   served tables always come from a calibration, either the file
+//!   `CALIBRATION_PATH` names or the `calibration.toml` compiled into the
+//!   binary ([`CalibrationConfig::embedded`]); a process no longer runs with
+//!   empty tables because the file is missing (backlog 7cb71243). The empty
+//!   built-in tables are what [`CalibrationConfig::default_for_phase2_fallback`]
+//!   mirrors as a test fixture.
 //! - *Named global profile*: `calibration.toml`. Its existing sections
 //!   (`[evidence_type_weights]`, `[evidence_locality]`, ...) fill the tables
 //!   and scalars they always filled, then an optional
