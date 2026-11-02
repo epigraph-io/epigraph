@@ -40,7 +40,8 @@
 //!
 //! * the raw pool: `state.db_pool`, or a local bound to it;
 //! * a connection: `&mut *x` (a `ScopedRead`, `ScopedTx` or `Transaction`
-//!   deref), or `&mut x` where `x` is a `let mut` bound from a connection
+//!   deref), or `&mut x` where `x` is a `let mut` (or an `if let` / `while
+//!   let` `Ok(mut x)` / `Some(mut x)` / `Err(mut x)`) bound from a connection
 //!   constructor (`read_as`, `write_as`, `begin_claim_write`, `begin_as`,
 //!   `maintenance`, `Connection::begin`, `.begin()`, `.acquire()`), from
 //!   `state`, or from another connection;
@@ -377,10 +378,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["derivation_scope::retain_for_cache"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The REFUTES edge write runs on a transaction bound by
-    // `if let Ok(mut tx) = state.write_as(..)` and passed as `&mut tx`, a
-    // binding this scanner does not recognise as a connection, so it is not
-    // measured here.
+    // The signed REFUTES edge write runs on a transaction stamped with the
+    // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,
+    // passed as `&mut tx`): the edge trigger and WITH CHECK decide the write,
+    // as for create_edge.
     (
         "conventions.rs",
         "forget_convention",
@@ -388,6 +389,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
             "ClaimRepository::update_truth_value",
+            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
@@ -1737,11 +1739,16 @@ fn handlers(code: &str, sql: &str) -> Vec<Handler> {
 }
 
 /// `let [mut] <name> [: T] = <rhs>;` bindings in `[a, b)`, as
-/// `(name, is_mut, let_offset, rhs_start, rhs_end)`.
+/// `(name, is_mut, let_offset, rhs_start, rhs_end)`, plus the refutable
+/// `if let` / `while let` form [`if_let_binding`] reads.
 fn lets(code: &str, a: usize, b: usize) -> Vec<(String, bool, usize, usize, usize)> {
     let s = code.as_bytes();
     let mut out = Vec::new();
     for at in words(code, "let", a, b) {
+        if let Some(binding) = if_let_binding(code, at, b) {
+            out.push(binding);
+            continue;
+        }
         let mut j = skip_ws(s, at + 3);
         let mut is_mut = false;
         if s[j..].starts_with(b"mut") && !is_ident(s[j + 3]) {
@@ -1788,6 +1795,71 @@ fn lets(code: &str, a: usize, b: usize) -> Vec<(String, bool, usize, usize, usiz
         out.push((name, is_mut, at, rhs_start, k));
     }
     out
+}
+
+/// The `let` at `at` as `if let <Ctor>([mut] <name>) = <rhs> {` (or `while
+/// let`), `<Ctor>` one of `Ok` / `Some` / `Err`: the binding a connection
+/// constructor's result is unwrapped into (`if let Ok(mut tx) =
+/// state.write_as(..)`). The right-hand side is the scrutinee, which ends at the
+/// `{` that opens the body at bracket depth 0 (a scrutinee cannot be a bare
+/// struct literal, so that `{` is the body's). Any other shape is `None`.
+fn if_let_binding(code: &str, at: usize, b: usize) -> Option<(String, bool, usize, usize, usize)> {
+    let s = code.as_bytes();
+    let mut k = at;
+    while k > 0 && s[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    let mut w = k;
+    while w > 0 && is_ident(s[w - 1]) {
+        w -= 1;
+    }
+    if !matches!(&code[w..k], "if" | "while") {
+        return None;
+    }
+    let mut j = skip_ws(s, at + 3);
+    let ctor = ident_at(s, j);
+    if !matches!(ctor, "Ok" | "Some" | "Err") {
+        return None;
+    }
+    j = skip_ws(s, j + ctor.len());
+    if j >= b || s[j] != b'(' {
+        return None;
+    }
+    j = skip_ws(s, j + 1);
+    let mut is_mut = false;
+    if s[j..].starts_with(b"mut") && !is_ident(s[j + 3]) {
+        is_mut = true;
+        j = skip_ws(s, j + 3);
+    }
+    let name = ident_at(s, j).to_string();
+    if name.is_empty() {
+        return None;
+    }
+    j = skip_ws(s, j + name.len());
+    if j >= b || s[j] != b')' {
+        return None;
+    }
+    j = skip_ws(s, j + 1);
+    if j >= b || s[j] != b'=' || matches!(s[j + 1], b'=' | b'>') {
+        return None;
+    }
+    let rhs_start = j + 1;
+    let (mut depth, mut k) = (0i32, rhs_start);
+    while k < b {
+        match s[k] {
+            b'{' if depth == 0 => break,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    Some((name, is_mut, at, rhs_start, k))
 }
 
 const CONNECTION_CTORS: &[&str] = &[
@@ -2649,5 +2721,68 @@ pub async fn stamped(
         vec!["Repo::get", "sqlx::query_scalar(SELECT).fetch_optional"],
         "reads on a connection stamped with the viewer are measured unviewed unless \
          the viewer reaches the statement; stamping is row security only"
+    );
+}
+
+/// A connection bound by a refutable pattern, `if let Ok(mut tx) = <ctor>` /
+/// `while let Some(mut c) = <ctor>`, is a connection like a `let mut` one:
+/// a call handed `&mut tx` is measured (backlog 109ead0f). Its right-hand side
+/// is the scrutinee only, which ends at the `{` that opens the body, so a
+/// pool read inside the body does not make the binding a connection.
+#[test]
+fn the_scanner_sees_a_connection_bound_by_if_let() {
+    let src = r##"
+pub async fn if_let_write(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(mut tx) = state.write_as(&viewer, "if_let_write").await {
+        if Repo::write(&mut tx, id).await.is_ok() {
+            let _ = tx.commit().await;
+        }
+    }
+    if let Ok(mut tx) = state.write_as(&viewer, "viewed").await {
+        let _ = Repo::write_as(&mut tx, &viewer, id).await;
+    }
+    while let Some(mut conn) = state.db_pool.try_acquire() {
+        Repo::drain(&mut conn).await;
+    }
+    Ok(())
+}
+
+pub async fn if_let_decoys(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    // Not a connection: the scrutinee names neither state nor a connection.
+    if let Ok(mut guard) = lock.write() {
+        touch(&mut guard);
+    }
+    // The scrutinee ends at the body's `{`: the pool read inside the body
+    // does not make `n` a connection.
+    if let Some(mut n) = counter.next() {
+        let _ = Repo::get(&state.db_pool, id).await;
+        bump(&mut n);
+    }
+    let mut tx = state.write_as(&viewer, "plain").await?;
+    Repo::write(&mut tx, id).await?;
+    Ok(())
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "if_let_write"),
+        vec!["Repo::drain", "Repo::write", "db_pool.try_acquire"],
+        "a call handed `&mut tx` where `tx` is bound by `if let Ok(mut tx) = <ctor>` \
+         (or `while let Some(mut ..)`) is a database call; one that also passes the \
+         viewer is viewed"
+    );
+    assert_eq!(
+        labels(&m, "if_let_decoys"),
+        vec!["Repo::get", "Repo::write"],
+        "an if-let binding from a non-connection scrutinee is not a connection, the \
+         scrutinee stops at the body's `{{`, and the `let mut` form is unchanged"
     );
 }
