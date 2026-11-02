@@ -2057,9 +2057,11 @@ it unarmed.
    closed). The elevate grant is unaffected either way (read scopes plus
    `platform:admin`). A token without an admin-only scope never reads it.
    The paths that hand scopes OUT follow the same switch: client approval
-   (`POST /api/v1/admin/clients/:id/approve`) approves an admin-only scope
-   only while unarmed (with a warning in the log) and refuses it (403) while
-   armed or when the switch cannot be read; it never grants `platform:admin`.
+   (`POST /api/v1/admin/clients/:id/approve`) refuses an admin-only scope
+   (403) while armed or when the switch cannot be read, and never grants
+   `platform:admin`; since migration 188 it approves nothing on a request
+   unit (501 MOVED: the approval definer is maintenance-only, so a
+   maintenance session calls `epigraph_oauth_client_approve` directly).
    Registration (`POST /oauth/register`), which grants a fixed set whatever it
    is asked, refuses (400) a request naming an admin-only scope while armed.
 

@@ -20,9 +20,9 @@
 //! * an application login is refused by the binary before it deletes
 //!   anything, and the application role's own DELETE on `recall_events`
 //!   (which it holds as a grant) matches no row under FORCE row security.
-//!   Only `recall_events` is asserted for that: `events` has no row security,
-//!   and the application role's DELETE there is a separate, allowlisted
-//!   posture (`app_role_table_lockdown.rs`, `OPERATIONAL`).
+//!   On `events` (no row security) the application role holds no DELETE at
+//!   all since migration 189, so its own DELETE of the expired telemetry row
+//!   is refused with 42501 and the row stays.
 //!
 //! The logins are created per test (roles are cluster-global, so each name is
 //! unique) and dropped at the end; neither is a superuser. The superuser
@@ -211,7 +211,8 @@ async fn a_maintenance_login_prunes_expired_recall_and_telemetry_rows(pool: PgPo
 /// The application role prunes nothing: the binary refuses its login before
 /// any DELETE, and the role's own DELETE on `recall_events` (a grant it holds)
 /// matches no row under FORCE row security, which is why the job needs the
-/// maintenance login at all.
+/// maintenance login at all. Its own DELETE on `events` is refused (42501)
+/// since migration 189, so the expired telemetry row survives that too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_application_role_prunes_no_recall_row(pool: PgPool) {
     let (app_may_delete, forced): (bool, bool) = sqlx::query_as(
@@ -243,6 +244,18 @@ async fn the_application_role_prunes_no_recall_row(pool: PgPool) {
 
     let app_pool = PgPool::connect(&app_url).await.expect("app login pool");
     let deleted = RecallEventRepository::prune_older_than(&app_pool, 90).await;
+    // Migration 189: the application login's own DELETE on `events` (no row
+    // security there) is refused outright, not filtered.
+    let events_delete = sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(s.telemetry_expired)
+        .execute(&app_pool)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.into_owned()))
+                .unwrap_or_else(|| e.to_string())
+        });
     app_pool.close().await;
     drop_login(&pool, &app_role).await;
 
@@ -267,6 +280,11 @@ async fn the_application_role_prunes_no_recall_row(pool: PgPool) {
         deleted.expect("the application role's DELETE is a grant it holds"),
         0,
         "the application role deleted recall_events rows it does not own"
+    );
+    assert_eq!(
+        events_delete,
+        Err("42501".to_string()),
+        "the application login's own DELETE on events (189 revokes it)"
     );
     assert_all_present(&pool, &s, "after the application role's attempts").await;
 }

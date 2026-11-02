@@ -2272,19 +2272,33 @@ async fn the_registry_keys_on_its_client_and_holds_for_direct_writes(pool: PgPoo
     );
 }
 
-/// Delta review round 3 SEC-R3-1: the application role cannot take an OAuth
-/// client back out of `suspended` or `revoked` through 118's approval definer
-/// (the REST admin approval, which it may EXECUTE). So a human whose recorded
-/// client a maintenance session suspended stays un-registered, and that human's
-/// live agent stays refused. A revoked client stays revoked too. Promoting a
-/// `pending` client on the application role and re-activating on a privileged
-/// session both still work.
+/// Delta review round 3 SEC-R3-1: a non-privileged session cannot take an
+/// OAuth client back out of `suspended` or `revoked` through 118's approval
+/// definer. So a human whose recorded client a maintenance session suspended
+/// stays un-registered, and that human's live agent stays refused. A revoked
+/// client stays revoked too. Promoting a `pending` client on a non-privileged
+/// session and re-activating on a privileged session both still work.
+///
+/// Since migration 188 the application role may not EXECUTE the definer at all
+/// (`app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`),
+/// which would make every 42501 below the missing grant's rather than the
+/// guard's. The guard stays as a second layer for any other non-privileged
+/// route to the table, so this test re-grants EXECUTE to `epigraph_app` in its
+/// own throwaway database and keeps measuring the guard.
 ///
 /// Verified to fail: the `oauth_clients_reactivation_guard` trigger dropped ->
 /// the application role's approval re-activates B's suspended client, and Y is
 /// `live_link` again ("re-activated a suspended client").
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_a_privileged_session_reactivates_a_suspended_or_revoked_client(pool: PgPool) {
+    // See the doc comment: isolate the guard from 188's REVOKE.
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid, text[], uuid) \
+         TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-grant the definer to the application role, for this test only");
     let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
     let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
     link_live(&pool, y, b).await;

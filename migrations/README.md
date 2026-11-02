@@ -2180,6 +2180,51 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **188**: public `revoke_app_client_approve` (backlog ca3968f6).
+  `REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid,
+  text[], uuid) FROM epigraph_app`, role-guarded, and nothing else. 118 granted
+  it for the REST admin approval, but the definer writes the caller's
+  `granted_scopes` verbatim and the `clients:admin` / admin-only-scope checks
+  live in the route, so any application session could activate a pending
+  client with any scope set. Approval is now a maintenance act: a maintenance
+  session calls the definer (still audited, `oauth.client_approved`), and
+  `POST /api/v1/admin/clients/:id/approve` answers 501 MOVED after its own
+  refusals (D9: a request unit holds no maintenance connection). The body,
+  owner and `search_path` pin are untouched (no CREATE OR REPLACE); 122's
+  reactivation guard stays. Pinned by
+  `epigraph-db/tests/app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`
+  and `epigraph-api/tests/admin_scope_mint.rs::approval_refuses_admin_scopes_and_otherwise_answers_moved`.
+  Sets `lock_timeout = '3s'`. Undo in the file header. **Deploy order:**
+  with or after the binary that answers the route 501 (an older binary with
+  188 applied answers it 500). **Applied to throwaway databases only, NOT to
+  any deployed database.**
+- **189**: public `events_app_append_only` (backlog 796c55aa).
+  `REVOKE UPDATE, DELETE, TRUNCATE ON public.events FROM epigraph_app`,
+  role-guarded, and nothing else: the application role keeps SELECT and
+  INSERT (the event bus and best-effort publishes). TRUNCATE was never held
+  (077 grants the four DML privileges only) and is revoked as defence in depth.
+  `events` has no row security, so before this any application session could
+  delete or rewrite a provenance event (`claim.created`, ...), and each delete
+  also removed the edges naming it through `events_cascade_edges` (INVOKER).
+  Every writer was enumerated (file header): the only DELETE is the telemetry
+  prune, which runs on a maintenance login through 186's maintenance DELETE,
+  which this file leaves intact and does not re-grant; the only UPDATE is
+  `AgentRepository::delete`'s `actor_id` detach, which already deleted nothing
+  on the application role (`agents` has no DELETE policy) and now refuses with
+  42501. Removes `("events", OPERATIONAL)` from
+  `app_role_table_lockdown.rs::ALLOWLIST`. **Deferred:** 186's suggested
+  type-restricted prune definer (replacing the maintenance role's table-wide
+  DELETE on `events`) is not added here; the maintenance role can still delete
+  or rewrite any `events` row (follow-up, file header). Pinned by
+  `app_role_table_lockdown.rs::the_app_role_cannot_delete_or_rewrite_events`,
+  `::the_maintenance_role_still_deletes_events_the_app_role_cannot`, the
+  allowlist ratchet, and
+  `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the retention job
+  still prunes on a maintenance login; an application login's own DELETE on
+  `events` is refused). Sets `lock_timeout = '3s'`. Undo in the file header.
+  **Deploy order:** after 186 (numeric order); none against the binaries (no
+  shipped request-path statement needs the revoked privileges). **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
