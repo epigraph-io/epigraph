@@ -46,6 +46,16 @@ sweep runs:
   beside a cascade replay: while the replay holds its lock, nothing is
   written; run it again.
 
+The dry run's `chain` is what the check read; the act reads the canonical's
+chain again when it commits, so `current_canonical_id` in the `--apply`
+report is the one it was restored against.
+
+The sweep does not remember an un-mark. An un-marked claim is current again,
+with no `supersedes`, so once it is embedded again the next
+`sweep_semantic_duplicates --apply` marks it again if its content is still
+identical to another current claim's. Run the un-mark when no sweep will
+undo it, or change one of the two claims first.
+
 So a mark is not one-way, but undoing one takes an operator. Mark only what
 you are sure of.
 

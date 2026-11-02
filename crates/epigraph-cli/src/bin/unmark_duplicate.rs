@@ -35,7 +35,10 @@
 //! consolidated since is followed to its current replacement, operator ruling
 //! R-11). A canonical that is itself still a marked duplicate is admissible
 //! only when the same run un-marks it first. If any target is refused, the
-//! report lists why and nothing is written.
+//! report lists why and nothing is written. The act reads the chain again
+//! when it commits (it must, for a canonical this run un-marks first), so the
+//! `--apply` report's `current_canonical_id` is the canonical it was restored
+//! against, which a write between the check and the act can have moved.
 //!
 //! DRY RUN BY DEFAULT: without `--apply` it prints that check and writes
 //! nothing. With `--apply`, each un-mark is
