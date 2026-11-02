@@ -287,3 +287,34 @@ async fn a_retracted_bba_from_the_retired_source_survives_the_invalidation(pool:
         "the cascade completes: {body}"
     );
 }
+
+/// The keying is the edge id, not the perspective row's type: a BBA keyed on
+/// a stayed edge whose perspective row is not typed `'edge'` (a legacy row:
+/// `ensure_edge_perspective` keeps an existing row's type) is invalidated
+/// like any other, as the cascade's delete by edge id already treats it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_legacy_typed_edge_perspective_is_invalidated_too(pool: PgPool) {
+    let server = server(&pool).await;
+    let refuter = seed_claim_with_belief(&pool, 0.9, 0.95, Some(0.92)).await;
+    let target = seed_claim(&pool, "k10 legacy-typed target", 0.5).await;
+    let refutes = wire(&pool, &server, refuter, target, "refutes").await;
+    sqlx::query("UPDATE perspectives SET perspective_type = 'analytical' WHERE id = $1")
+        .bind(refutes)
+        .execute(&pool)
+        .await
+        .expect("retype the edge's perspective as a legacy row would be");
+
+    let body = supersede(&pool, &server, refuter).await;
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+
+    assert_eq!(
+        keyed_on(&pool, refutes).await,
+        0,
+        "the BBA keyed on the stayed edge is invalidated whatever its perspective's type"
+    );
+    assert_eq!(
+        scalars(&pool, target).await,
+        (None, None, None),
+        "its only BBA gone, the target is unbacked"
+    );
+}
