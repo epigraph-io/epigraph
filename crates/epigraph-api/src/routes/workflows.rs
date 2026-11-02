@@ -2236,6 +2236,12 @@ pub async fn ingest_workflow(
         tenancy,
         embed,
     } = request;
+    // Supersede SPEC K12a: a `supersedes` relationship is the act's alone.
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(|reason| ApiError::ValidationError {
+            field: "relationships".to_string(),
+            reason,
+        })?;
     let declared_group = tenancy.map(|t| t.owner_group_id);
     // The caller's OWN membership of a declared group, before anything is
     // begun (`require_caller_writes_group`). A viewer with no principal names

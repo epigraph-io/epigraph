@@ -118,6 +118,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     auth: Option<&epigraph_auth::AuthContext>,
     declared_group: Option<uuid::Uuid>,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
+    // Supersede SPEC K12a: a `supersedes` relationship is the act's alone.
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(invalid_params)?;
     // H3 (batch H-b): the submitter is recorded by THIS entry point, never
     // taken from the caller's metadata; see `tools::workflow_authority`.
     let caller = server.write_identity(auth, viewer).await?;
