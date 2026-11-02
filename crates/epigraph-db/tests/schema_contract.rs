@@ -423,6 +423,245 @@ fn the_tenancy_role_posture_admits_only_a_plain_armed_app_login() {
     }
 }
 
+/// No migration in the tree gives any role a login (backlog bb200b7b).
+///
+/// [`tenancy_roles_are_nologin`] has to admit an armed `epigraph_app` LOGIN,
+/// so on a fresh CI cluster it no longer notices a migration that grants one.
+/// This ratchet does, statically: every login is an out-of-band operator step
+/// (077's and 161's headers; docs/deploy.md), because this repository is public
+/// and a login without a credential is pointless while one with a credential
+/// must never land here. It covers every role, so a dynamic
+/// `format('ALTER ROLE %I LOGIN', r)` over the tenancy roles is caught too.
+#[test]
+fn no_migration_grants_a_role_login() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read migrations/")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .collect();
+    files.sort();
+    assert!(files.len() > 100, "read the whole series: {}", files.len());
+
+    let mut grants = Vec::new();
+    let mut seen = Vec::new();
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let sql = std::fs::read_to_string(path).expect("read migration");
+        for st in role_statements(&sql) {
+            if st.grants_login {
+                grants.push(format!("{name}: {} {} ... LOGIN", st.verb, st.role));
+            }
+            seen.push((name.clone(), st));
+        }
+    }
+    assert!(
+        grants.is_empty(),
+        "migrations must never grant a login:\n{}",
+        grants.join("\n")
+    );
+
+    // The scanner reads real statements through comment and string stripping:
+    // 060's dynamic CREATE ROLE and 161's literal one are both seen, NOLOGIN.
+    for (file, role) in [
+        ("060_group_tenancy_tables.sql", "%I"),
+        (
+            "161_agent_identity_lineage.sql",
+            "epigraph_identity_attestor",
+        ),
+    ] {
+        assert!(
+            seen.iter()
+                .any(|(f, st)| f == file && st.verb == "CREATE ROLE" && st.role == role),
+            "{file}: CREATE ROLE {role} not seen; seen: {:?}",
+            seen.iter().filter(|(f, _)| f == file).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The scanner behind [`no_migration_grants_a_role_login`], on synthetic SQL.
+#[test]
+fn the_role_login_scanner_flags_only_uncommented_login_grants() {
+    let grants = |sql: &str| -> Vec<String> {
+        role_statements(sql)
+            .into_iter()
+            .filter(|s| s.grants_login)
+            .map(|s| s.role)
+            .collect()
+    };
+    for (sql, role) in [
+        ("ALTER ROLE epigraph_app LOGIN;", "epigraph_app"),
+        (
+            "ALTER ROLE epigraph_seed WITH LOGIN PASSWORD 'x';",
+            "epigraph_seed",
+        ),
+        (
+            "alter role \"epigraph_maintenance\" login;",
+            "epigraph_maintenance",
+        ),
+        (
+            "DO $$ BEGIN EXECUTE format('ALTER ROLE %I LOGIN', r); END $$;",
+            "%I",
+        ),
+        ("CREATE USER epigraph_app;", "epigraph_app"),
+        (
+            "CREATE ROLE epigraph_seed LOGIN NOINHERIT;",
+            "epigraph_seed",
+        ),
+        // An apostrophe inside a comment does not open a string that would
+        // swallow the statement after it.
+        (
+            "-- the app's role\nALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+        (
+            "/* the app's role */ ALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+        // `--` inside a string literal is not a comment.
+        (
+            "RAISE NOTICE 'a -- b'; ALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+    ] {
+        assert_eq!(grants(sql), vec![role.to_string()], "{sql}");
+    }
+    for sql in [
+        "CREATE ROLE epigraph_seed NOLOGIN;",
+        "ALTER ROLE epigraph_app NOLOGIN;",
+        "CREATE USER epigraph_app NOLOGIN;",
+        "EXECUTE format('CREATE ROLE %I NOLOGIN', r);",
+        "-- `ALTER ROLE epigraph_app LOGIN PASSWORD '...'` is out of band\nSELECT 1;",
+        "/* ALTER ROLE epigraph_app LOGIN */ SELECT 1;",
+        "/* outer /* ALTER ROLE x LOGIN; */ ALTER ROLE epigraph_app LOGIN; */ SELECT 1;",
+        "ALTER ROLE epigraph_app SET search_path = public; SELECT 'LOGIN';",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE epigraph_maintenance GRANT SELECT ON TABLES TO epigraph_app;",
+    ] {
+        assert_eq!(grants(sql), Vec::<String>::new(), "{sql}");
+    }
+}
+
+/// One `CREATE|ALTER ROLE|USER` statement found by [`role_statements`].
+#[derive(Debug)]
+struct RoleStatement {
+    /// `"CREATE ROLE"`, `"ALTER USER"`, ...
+    verb: String,
+    /// The role token as written, quotes trimmed (`%I` for a `format()` one).
+    role: String,
+    /// `LOGIN` appears in the statement, or it is a `CREATE USER` (which
+    /// defaults to LOGIN) without `NOLOGIN`.
+    grants_login: bool,
+}
+
+/// Every `CREATE|ALTER ROLE|USER` statement in `sql`, after stripping
+/// comments, including ones inside string literals (dynamic `EXECUTE`). A
+/// statement runs to the next `;`.
+fn role_statements(sql: &str) -> Vec<RoleStatement> {
+    let code = strip_sql_comments(sql);
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for c in code.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '%' | '"') {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            tokens.push(std::mem::take(&mut word));
+        }
+        if c == ';' {
+            tokens.push(";".to_string());
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+
+    let up = |i: usize| tokens.get(i).map(|t| t.to_ascii_uppercase());
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        let (Some(a), Some(b)) = (up(i), up(i + 1)) else {
+            continue;
+        };
+        if !matches!(a.as_str(), "CREATE" | "ALTER") || !matches!(b.as_str(), "ROLE" | "USER") {
+            continue;
+        }
+        let Some(role) = tokens.get(i + 2).filter(|t| *t != ";") else {
+            continue;
+        };
+        let body: Vec<String> = tokens[i + 3..]
+            .iter()
+            .take_while(|t| *t != ";")
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        let has = |kw: &str| body.iter().any(|t| t == kw);
+        out.push(RoleStatement {
+            verb: format!("{a} {b}"),
+            role: role.trim_matches('"').to_string(),
+            grants_login: has("LOGIN") || (a == "CREATE" && b == "USER" && !has("NOLOGIN")),
+        });
+    }
+    out
+}
+
+/// `sql` without `--` line comments and (nested) `/* */` block comments.
+/// Single-quoted literals are kept verbatim, so a `--` inside one is not a
+/// comment; an apostrophe inside a comment does not open a literal.
+fn strip_sql_comments(sql: &str) -> String {
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let (mut i, mut depth, mut in_str) = (0usize, 0usize, false);
+    while i < cs.len() {
+        let (c, next) = (cs[i], cs.get(i + 1).copied());
+        if depth > 0 {
+            match (c, next) {
+                ('/', Some('*')) => {
+                    depth += 1;
+                    i += 2;
+                }
+                ('*', Some('/')) => {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        out.push(' ');
+                    }
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        if in_str {
+            out.push(c);
+            if c == '\'' {
+                if next == Some('\'') {
+                    out.push('\'');
+                    i += 1;
+                } else {
+                    in_str = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match (c, next) {
+            ('-', Some('-')) => {
+                while i < cs.len() && cs[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                depth = 1;
+                i += 2;
+            }
+            _ => {
+                in_str = c == '\'';
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 // =============================================================================
 // PR-02 — agents.key_kind (migration 061)
 // =============================================================================
