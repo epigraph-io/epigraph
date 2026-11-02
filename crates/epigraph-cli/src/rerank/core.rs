@@ -3,12 +3,15 @@
 //! Two entry points:
 //! - [`rerank_global_join`] — original behaviour: scan all pairs above similarity
 //!   threshold (drives the `rerank_bridges` CLI default mode).
-//! - [`rerank_candidates_table`] — read pairs from a caller-supplied temp table
-//!   (drives `bridge_component` / `bridge_sweep`, issue #53).
+//! - [`rerank_candidates_table`] — read pairs from a caller-supplied table
+//!   that any pool connection can see (`rerank_bridges --candidates-table`).
+//! - [`find_candidates_from_table`] + [`rerank_candidates`] — the same, split
+//!   so the read can run in the session that owns a TEMP scratch table
+//!   (drives `bridge_component` / `bridge_sweep` / the cross-source verifier).
 //!
-//! Both share the same batch loop, prompt, and edge-creation helpers.
+//! All share the same batch loop, prompt, and edge-creation helpers.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::enrichment::llm_client::{create_llm_client, LlmError, LlmProvider};
@@ -283,13 +286,16 @@ pub async fn rerank_global_join(
     rerank_inner(pool, candidates, config).await
 }
 
-/// Rerank pairs from a caller-supplied temp table. The table must have
+/// Rerank pairs from a caller-supplied table. The table must have
 /// `(source_id uuid, target_id uuid)` columns; any extra columns are ignored.
 /// Similarity is recomputed in SQL for consistency with the global path.
 ///
-/// Introduced for issue #53 (cross-component bridge sweep). The caller —
-/// e.g. `bridge_component` — populates the table via a per-source kNN insert
-/// before calling this function.
+/// The table is read on a connection taken from `pool`, so it must be a
+/// regular table (e.g. one an operator passes to `rerank_bridges
+/// --candidates-table`). A TEMP table is visible only in the session that
+/// created it, which a pool connection is in general not: for that case run
+/// [`find_candidates_from_table`] on the owning connection or transaction,
+/// then [`rerank_candidates`] on the pool.
 ///
 /// Caveats for callers (Tasks 4/5):
 /// - `config.min_similarity` is **ignored** in this path — selection is the
@@ -303,7 +309,25 @@ pub async fn rerank_candidates_table(
     candidates_table: &str,
     config: &RerankConfig,
 ) -> Result<RerankSummary, RerankError> {
-    let candidates = find_candidates_from_table(pool, candidates_table, config).await?;
+    let candidates = {
+        let mut conn = pool.acquire().await?;
+        find_candidates_from_table(&mut conn, candidates_table, config).await?
+    };
+    rerank_inner(pool, candidates, config).await
+}
+
+/// Run the LLM batch loop over candidates already read by
+/// [`find_candidates_from_table`].
+///
+/// Edge checks and (unless `config.dry_run`) edge writes run on `pool`. The
+/// candidates are owned values, so the connection or transaction they were
+/// read on — and any TEMP scratch table on it — can be released before the
+/// loop's LLM calls start.
+pub async fn rerank_candidates(
+    pool: &PgPool,
+    candidates: Vec<CandidatePair>,
+    config: &RerankConfig,
+) -> Result<RerankSummary, RerankError> {
     rerank_inner(pool, candidates, config).await
 }
 
@@ -390,8 +414,19 @@ async fn find_candidates_global(
         .collect())
 }
 
-async fn find_candidates_from_table(
-    pool: &PgPool,
+/// Read the candidate pairs listed in `candidates_table` (columns
+/// `(source_id uuid, target_id uuid)`), joined to their claims, on `conn`.
+///
+/// Pairs without an embedding on either side, and pairs already connected by
+/// an edge in either direction, are dropped; `config.limit` caps the rest,
+/// highest similarity first. `config.min_similarity` is ignored here.
+///
+/// `conn` must be a session that can see the table. For a TEMP table that is
+/// the connection or transaction that created it — pass `&mut *tx`. Running
+/// this on any other pool connection fails with "relation does not exist",
+/// which is why it takes a connection rather than a pool.
+pub async fn find_candidates_from_table(
+    conn: &mut PgConnection,
     candidates_table: &str,
     config: &RerankConfig,
 ) -> Result<Vec<CandidatePair>, RerankError> {
@@ -443,7 +478,7 @@ async fn find_candidates_from_table(
             f64,
         ),
     >(&query)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     Ok(rows
