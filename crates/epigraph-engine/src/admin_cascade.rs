@@ -480,6 +480,7 @@ pub async fn report_for_caller(
                 }
             })
             .collect(),
+        retracted_key_kept: 0,
     }
 }
 

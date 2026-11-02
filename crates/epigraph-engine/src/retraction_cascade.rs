@@ -156,6 +156,11 @@ pub struct CascadeReport {
     pub unbacked: Vec<Uuid>,
     /// Best-effort failures, already logged at `warn`. Never returned as `Err`.
     pub errors: Vec<String>,
+    /// Retracted edge-keyed BBAs (migration 184) the cascade found on an edge
+    /// it invalidated and KEPT: neither deleted nor re-wired, because a
+    /// retracted row is kept for audit and holds its key (rulings R-79,
+    /// R-103).
+    pub retracted_key_kept: u64,
 }
 
 impl CascadeReport {
