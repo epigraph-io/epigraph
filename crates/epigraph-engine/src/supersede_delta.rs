@@ -259,10 +259,6 @@ SELECT count(*)
    AND COALESCE(h.is_current, true)
    AND mf.retracted_at IS NOT NULL"#;
 
-/// The canonical binary frame's name (`edge_factor::ensure_binary_frame`
-/// creates it under this name; the delta only reads it).
-const BINARY_FRAME_NAME: &str = "binary_truth";
-
 /// Which measurements a run makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct DeltaItems {
@@ -501,10 +497,16 @@ async fn measure(
     if !(opts.items.k10_retro || opts.items.k12b) {
         return Ok(report);
     }
-    let frame_id = epigraph_db::FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
-        .await
-        .map_err(|e| format!("read the binary frame: {e}"))?
-        .map(|f| f.id);
+    // The name the cascade's frame lookup uses (`edge_factor`); read, never
+    // created here.
+    let frame_id = epigraph_db::FrameRepository::get_by_name(
+        &mut *conn,
+        viewer,
+        crate::edge_factor::BINARY_FRAME_NAME,
+    )
+    .await
+    .map_err(|e| format!("read the binary frame: {e}"))?
+    .map(|f| f.id);
 
     let mut k10_rows = Vec::new();
     if opts.items.k10_retro {

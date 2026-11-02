@@ -31,7 +31,7 @@ use crate::epistemic_interval::{
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 
-const BINARY_FRAME_NAME: &str = "binary_truth";
+pub(crate) const BINARY_FRAME_NAME: &str = "binary_truth";
 // belief-profile: allow-literal (array length of a fixed hypothesis list)
 const BINARY_HYPOTHESES: [&str; 2] = ["TRUE", "FALSE"];
 
