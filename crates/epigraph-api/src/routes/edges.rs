@@ -343,16 +343,15 @@ pub fn is_valid_relationship(s: &str) -> bool {
 /// The refusal for a generic edge write of `supersedes` in any spelling
 /// (supersede SPEC K12a, ruling R-132): the generic create and the staged
 /// promote answer it, so a lineage edge never exists without the retirement it
-/// records.
-pub const SUPERSEDES_ACT_ONLY: &str =
-    "relationship 'supersedes' (in any spelling) is written only by the supersession act \
-     (POST /api/v1/claims/{id}/supersede, MCP supersede_claim), which retires the claim it \
-     replaces in the same write; a generic edge write cannot create it; nothing was written";
+/// records. The shared text every generic writer answers
+/// (`epigraph_core::edge::relationships::SUPERSEDES_ACT_ONLY`).
+pub const SUPERSEDES_ACT_ONLY: &str = epigraph_core::edge::relationships::SUPERSEDES_ACT_ONLY;
 
-/// Whether `s` is the lineage relationship, in any ASCII case.
+/// Whether `s` is the lineage relationship, in any ASCII case: the shared
+/// predicate (`epigraph_core::edge::relationships::is_lineage_relationship`).
 #[must_use]
 pub fn is_lineage_relationship(s: &str) -> bool {
-    s.eq_ignore_ascii_case("supersedes")
+    epigraph_core::edge::relationships::is_lineage_relationship(s)
 }
 
 /// Trigger DS recomputation on the target claim when an epistemic edge is

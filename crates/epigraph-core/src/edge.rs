@@ -212,6 +212,22 @@ pub mod relationships {
     /// Claim supersedes an older version
     pub const SUPERSEDES: &str = "supersedes";
 
+    /// The refusal every generic edge writer answers a [`SUPERSEDES`] edge
+    /// with, in any spelling (supersede SPEC K12a, ruling R-132): the lineage
+    /// edge is written only by the supersession act, in the same write as the
+    /// retirement it records, so a generic writer never creates one.
+    pub const SUPERSEDES_ACT_ONLY: &str =
+        "relationship 'supersedes' (in any spelling) is written only by the supersession act \
+         (POST /api/v1/claims/{id}/supersede, MCP supersede_claim), which retires the claim it \
+         replaces in the same write; a generic edge write cannot create it; nothing was written";
+
+    /// Whether `relationship` is the lineage relationship [`SUPERSEDES`], in
+    /// any ASCII case. The one predicate every generic writer refuses on.
+    #[must_use]
+    pub fn is_lineage_relationship(relationship: &str) -> bool {
+        relationship.eq_ignore_ascii_case(SUPERSEDES)
+    }
+
     /// Two claims describe the same entity from different sources
     pub const EQUIVALENT_TO: &str = "equivalent_to";
 
