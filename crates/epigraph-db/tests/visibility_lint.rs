@@ -1267,12 +1267,39 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "privatization.rs",
         "restrict_claims_conn",
-        "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode — \
-         and of the tenancy of each PUBLIC `workflows` row executing a now-restricted level 0..2 \
-         claim (ruling R-98: the plan goes with its claims). This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
+        "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode. \
+         This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
          privatization UPDATE would narrow it to what somebody can already see, which is the \
          opposite of the operation. The authorisation is FINAL-PLAN §6.5.5's re-validation in the \
          job handler; the D4 admin surface is what §0.1 grants this write to.",
+    ),
+    (
+        "privatization.rs",
+        "restrict_plan_workflows_conn",
+        "WRITE of `workflows.visibility` and `workflows.owner_group_id`: the plan half of \
+         `restrict` (ruling R-98 Q8(a)), moving a PUBLIC row into the target group only when \
+         every level 0..2 claim it executes is now there. It reads `edges` and `claims` to decide \
+         that and takes no `Viewer` for `restrict_claims_conn`'s reason: a viewer-narrowed read \
+         of the plan's claims would decide on the rows somebody can see. Runs in the apply \
+         batch's maintenance transaction behind the handler's re-validation; returns the moved \
+         ids and their pre-images, which the batch records in the audit trail.",
+    ),
+    (
+        "privatization.rs",
+        "record_workflow_moves_conn",
+        "WRITE (INSERT) of `privatization_audit` rows recording the `workflows` rows an apply \
+         batch moved, with their pre-images. Same table and argument as \
+         `record_item_audit_conn`: the audit trail is append-only and maintenance-only, and the \
+         values written come from the batch's own UPDATE, not from a caller.",
+    ),
+    (
+        "privatization.rs",
+        "restore_plan_workflows_conn",
+        "WRITE of `workflows` tenancy back to the pre-image the plan's own `item.apply` audit \
+         rows recorded, plus an `item.revert` audit row each. Only rows still carrying the \
+         plan's stamp are restored, the rule `restore_claims_conn` follows; a viewer predicate \
+         would narrow a revert to what somebody can already see. Runs in the revert handler's \
+         maintenance transaction once every claim is back.",
     ),
     (
         "privatization.rs",

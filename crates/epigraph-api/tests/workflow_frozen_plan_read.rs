@@ -244,6 +244,12 @@ async fn restrict(pool: &PgPool, workflow_id: Uuid, claims: &[Uuid], g: Uuid) {
         .await
         .expect("restrict");
     assert_eq!(moved.len(), claims.len(), "every claim moved");
+    // The plan half of `restrict` (R-98 Q8(a)), as the apply batch runs it:
+    // the row moves only when `claims` is its whole plan (a test restricting
+    // part of it keeps a public row, as before R-98).
+    PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, g)
+        .await
+        .expect("restrict the plan's row");
     let off: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'executes' \
             AND target_id = ANY($2) AND NOT (visibility = 'group' AND owner_group_id = $3)",

@@ -448,6 +448,16 @@ async fn restrict_plan(pool: &PgPool, workflow_id: Uuid, g: Uuid) -> Vec<Uuid> {
         .await
         .expect("restrict the plan's claims");
     assert_eq!(moved.len(), claims.len(), "every plan claim moved");
+    // The plan half of `restrict` (R-98 Q8(a)), as the apply batch runs it:
+    // the whole plan is private now, so its row goes with it.
+    let rows = PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, g)
+        .await
+        .expect("restrict the plan's row");
+    assert_eq!(
+        rows.iter().map(|r| r.workflow_id).collect::<Vec<_>>(),
+        vec![workflow_id],
+        "the fully restricted plan's row moves with it"
+    );
     let edge_tenancy: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT visibility::text, owner_group_id FROM edges \
           WHERE source_id = $1 AND relationship = 'executes'",

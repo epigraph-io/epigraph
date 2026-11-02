@@ -1934,8 +1934,14 @@ async fn restricting_a_plans_claims_re_tenants_its_workflows_row(pool: PgPool) {
     let moved = PrivatizationRepository::restrict_claims_conn(&mut conn, &structural, w.og)
         .await
         .expect("restrict the plan's claims");
-    drop(conn);
     assert_eq!(moved.len(), structural.len(), "every claim moved");
+    // The plan half, as the apply batch runs it (the unit rule and the
+    // audited round trip are tests/privatization_workflow_rows.rs).
+    let rows = PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, w.og)
+        .await
+        .expect("restrict the plan's row");
+    drop(conn);
+    assert_eq!(rows.len(), 1, "the plan's one row moves: {rows:?}");
     assert_eq!(
         row().await,
         ("group".to_string(), w.og),

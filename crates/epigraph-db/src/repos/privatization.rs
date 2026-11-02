@@ -575,6 +575,22 @@ pub struct PlanWorkItem {
     pub before_owner_group_id: Uuid,
 }
 
+/// A `workflows` row an apply batch moved into the target group with its
+/// plan, and the tenancy it had before
+/// ([`PrivatizationRepository::restrict_plan_workflows_conn`]). The pre-image
+/// is what [`PrivatizationRepository::record_workflow_moves_conn`] writes to
+/// the plan's audit trail and what
+/// [`PrivatizationRepository::restore_plan_workflows_conn`] puts back.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WorkflowMove {
+    /// The `workflows` row.
+    pub workflow_id: Uuid,
+    /// Its `visibility` before the move (always `public` today).
+    pub before_visibility: String,
+    /// Its `owner_group_id` before the move.
+    pub before_owner_group_id: Uuid,
+}
+
 /// A state transition [`PrivatizationRepository::transition_plan_conn`] performs.
 ///
 /// An enum rather than four functions, so the guard conditions that make each
@@ -2729,7 +2745,7 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let moved = sqlx::query_scalar::<_, Uuid>(
+        sqlx::query_scalar::<_, Uuid>(
             r#"
             UPDATE public.claims c
                SET visibility = 'group', owner_group_id = $2, updated_at = now()
@@ -2743,40 +2759,217 @@ impl PrivatizationRepository {
         .bind(target_group_id)
         .fetch_all(&mut *conn)
         .await
-        .map_err(|source| DbError::QueryFailed { source })?;
-        // The PLAN goes with its claims (ruling R-98 Q8(a), backlog 630af617):
-        // a PUBLIC `workflows` row executing, at levels 0..2, a claim of this
-        // batch that now sits in the target group becomes ('group', target),
-        // the shape migration 183's backfill gives a privatized plan. Without
-        // it the row stayed public and the outcome report, which decides on
-        // the row (R-74), admitted a non-member over a private plan. Keyed on
-        // the claims' state AFTER the statement above, not on `moved`, so a
-        // re-run batch (whose claims did not move again) still converges. A
-        // row already in some group stays there (it is private either way).
-        // Not reversed by `restore_claims_conn`: a revert leaves the row
-        // private (fail-closed), stated there.
-        sqlx::query(
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// `restrict`, the plan half: move into the target group every PUBLIC
+    /// `workflows` row whose plan this batch completed, and return each moved
+    /// row with its pre-image (ruling R-98 Q8(a), backlog 630af617 (4)).
+    ///
+    /// # A row moves only with its WHOLE plan
+    ///
+    /// A row is moved when (a) it executes, at levels 0..2, one of
+    /// `moved_claim_ids` (claims THIS batch moved, from
+    /// [`Self::restrict_claims_conn`]), and (b) EVERY level 0..2 claim it
+    /// executes is now `('group', target_group_id)`. Level 3 operation atoms
+    /// are content-addressed across documents and say nothing about the plan
+    /// (migration 183's rule), so they neither anchor nor block a move. Every
+    /// `executes` edge counts, retracted or not, as the plan readers and 183's
+    /// backfill count them.
+    ///
+    /// So a row with one structural claim still public, or private to ANOTHER
+    /// group, is not part of this privatization as a unit and stays where it
+    /// is: moving it would hide a public plan from every reader outside the
+    /// target group, or take a plan away from the other group's members. A
+    /// row already in some group is left alone too (it is private either way).
+    ///
+    /// # Evaluated on the batch's own state, under its lock
+    ///
+    /// It runs in the apply batch's transaction, after the claims UPDATE and
+    /// behind [`Self::begin_batch_conn`]'s global lock, and locks the rows it
+    /// moves (`FOR UPDATE`). So the decision is the handler's re-validation of
+    /// these rows: it is made on the state at apply, never on a set frozen at
+    /// plan time, and a row that gained a public step or was re-tenanted since
+    /// the plan was frozen is not moved. Because the anchor is the claims this
+    /// batch moved and the predicate reads the post-UPDATE state, a row moves
+    /// in the batch that moves its LAST structural claim.
+    ///
+    /// The caller records the returned pre-images in the plan's audit trail
+    /// ([`Self::record_workflow_moves_conn`]) on the same transaction; that
+    /// record is what [`Self::restore_plan_workflows_conn`] reverses. (It is
+    /// an audit row, not a plan item: plan items are the frozen, digested set
+    /// the handler re-hashes before every run, and a row decided at apply is
+    /// not part of it.)
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restrict_plan_workflows_conn(
+        conn: &mut PgConnection,
+        moved_claim_ids: &[Uuid],
+        target_group_id: Uuid,
+    ) -> Result<Vec<WorkflowMove>, DbError> {
+        if moved_claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, WorkflowMove>(
             r#"
+            WITH completed AS (
+                SELECT w.id,
+                       w.visibility::text AS before_visibility,
+                       w.owner_group_id AS before_owner_group_id
+                  FROM public.workflows w
+                 WHERE w.visibility = 'public'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM public.edges e
+                         JOIN public.claims c ON c.id = e.target_id
+                        WHERE e.source_id = w.id
+                          AND e.source_type = 'workflow' AND e.target_type = 'claim'
+                          AND e.relationship = 'executes'
+                          AND e.target_id = ANY($1)
+                          AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$')
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM public.edges e
+                         JOIN public.claims c ON c.id = e.target_id
+                        WHERE e.source_id = w.id
+                          AND e.source_type = 'workflow' AND e.target_type = 'claim'
+                          AND e.relationship = 'executes'
+                          AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$'
+                          AND NOT (c.visibility = 'group' AND c.owner_group_id = $2))
+                 ORDER BY w.id
+                   FOR UPDATE OF w
+            )
             UPDATE public.workflows w
                SET visibility = 'group', owner_group_id = $2
-             WHERE w.visibility = 'public'
-               AND w.id IN (
-                   SELECT e.source_id
-                     FROM public.edges e
-                     JOIN public.claims c ON c.id = e.target_id
-                    WHERE e.source_type = 'workflow' AND e.target_type = 'claim'
-                      AND e.relationship = 'executes'
-                      AND e.target_id = ANY($1)
-                      AND c.visibility = 'group' AND c.owner_group_id = $2
-                      AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$')
+              FROM completed k
+             WHERE w.id = k.id
+            RETURNING w.id AS workflow_id, k.before_visibility, k.before_owner_group_id
             "#,
         )
-        .bind(claim_ids)
+        .bind(moved_claim_ids)
         .bind(target_group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Record the `workflows` rows an apply batch moved
+    /// ([`Self::restrict_plan_workflows_conn`]) in the plan's audit trail: one
+    /// `privatization_audit` row each, `kind = 'workflow'`,
+    /// `action = 'item.apply'`, with the row's pre-image as the `before_*`
+    /// pair and `('group', target_group_id)` as the `after_*` pair. Written on
+    /// the batch's transaction, so a move and its record commit together.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_workflow_moves_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        moves: &[WorkflowMove],
+        target_group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        if moves.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
+        let visibilities: Vec<String> = moves.iter().map(|m| m.before_visibility.clone()).collect();
+        let owners: Vec<Uuid> = moves.iter().map(|m| m.before_owner_group_id).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, before_owner_group_id,
+                    after_visibility, after_owner_group_id, correlation_id)
+            SELECT $1, $2, 'item.apply', 'workflow', m.id, m.v, m.o, 'group', $6, $7
+              FROM unnest($3::uuid[], $4::text[], $5::uuid[]) AS m(id, v, o)
+            "#,
+        )
+        .bind(plan_id)
+        .bind(actor_agent_id)
+        .bind(&ids)
+        .bind(&visibilities)
+        .bind(&owners)
+        .bind(target_group_id)
+        .bind(correlation_id)
         .execute(&mut *conn)
         .await
-        .map_err(|source| DbError::QueryFailed { source })?;
-        Ok(moved)
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Revert, the plan half: put every `workflows` row this plan moved back
+    /// to the pre-image its `item.apply` audit row recorded, and record each
+    /// restore (`kind = 'workflow'`, `action = 'item.revert'`). Returns how
+    /// many rows it restored.
+    ///
+    /// The pre-image is the plan's FIRST `item.apply` record for the row (a
+    /// row moves once per apply; a re-dispatched apply finds it no longer
+    /// public). As [`Self::restore_claims_conn`] does for claims, only a row
+    /// that still carries this plan's stamp, `('group', target_group_id)`, is
+    /// restored; a row some later decision re-tenanted is left alone.
+    ///
+    /// The revert handler calls this once its claims are all back (the batch
+    /// that finds no `applied` item left), so an interrupted or aborted revert
+    /// leaves the row private, never public over private claims.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restore_plan_workflows_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        target_group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        sqlx::query(
+            r#"
+            WITH recorded AS (
+                SELECT DISTINCT ON (a.entity_id)
+                       a.entity_id, a.before_visibility, a.before_owner_group_id
+                  FROM public.privatization_audit a
+                 WHERE a.plan_id = $1 AND a.kind = 'workflow' AND a.action = 'item.apply'
+                   AND a.entity_id IS NOT NULL
+                   AND a.before_visibility IS NOT NULL
+                   AND a.before_owner_group_id IS NOT NULL
+                 ORDER BY a.entity_id, a.id
+            ), stamped AS (
+                SELECT w.id, r.before_visibility, r.before_owner_group_id
+                  FROM public.workflows w
+                  JOIN recorded r ON r.entity_id = w.id
+                 WHERE w.visibility = 'group' AND w.owner_group_id = $2
+                 ORDER BY w.id
+                   FOR UPDATE OF w
+            ), restored AS (
+                UPDATE public.workflows w
+                   SET visibility = k.before_visibility,
+                       owner_group_id = k.before_owner_group_id
+                  FROM stamped k
+                 WHERE w.id = k.id
+                RETURNING w.id, k.before_visibility, k.before_owner_group_id
+            )
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, before_owner_group_id,
+                    after_visibility, after_owner_group_id, correlation_id)
+            SELECT $1, $3, 'item.revert', 'workflow', r.id, 'group', $2,
+                   r.before_visibility, r.before_owner_group_id, $4
+              FROM restored r
+            "#,
+        )
+        .bind(plan_id)
+        .bind(target_group_id)
+        .bind(actor_agent_id)
+        .bind(correlation_id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
     }
 
     /// Restore a batch of claims to the tenancy the freeze recorded.
@@ -2816,14 +3009,11 @@ impl PrivatizationRepository {
     /// next — the hazard [`Self::select`] documents for `statement_timeout`,
     /// with a far worse payload.
     ///
-    /// # It does NOT widen a `workflows` row back
+    /// # Claims only
     ///
-    /// [`Self::restrict_claims_conn`] re-tenants a public plan's `workflows`
-    /// row into the target group with its claims (ruling R-98). This revert
-    /// restores claims only, so such a row stays ('group', target): the plan
-    /// is readable by the group alone until a maintenance session re-tenants
-    /// it. Fail-closed, and recorded as a follow-up rather than guessed here
-    /// (no pre-image of the row is frozen).
+    /// The `workflows` rows the apply moved with their plans (ruling R-98)
+    /// are restored by [`Self::restore_plan_workflows_conn`], once every claim
+    /// is back.
     ///
     /// **The sealed arm of that guard is NOT reachable from here and must not
     /// be.** It has no GUC override by design (sec F11), so a revert of a plan
