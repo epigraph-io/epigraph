@@ -821,6 +821,30 @@ async fn retract_and_unretract_leave_a_compound_whose_decomposition_is_hidden_un
         "calibration: the standalone twin is vacated"
     );
     assert!(close(cached(&pool, twin).await, (0.0, 1.0, 0.5)));
+    // CALIBRATION of the un-retract leg: on the standalone twin the same tool
+    // DOES refold (so `belief_recomputed:false` below is the guard, not an
+    // un-retract that never refreshes).
+    let res = unretract_bba(
+        &server,
+        &owner_viewer,
+        UnretractBbaParams {
+            mass_function_id: twin_only.to_string(),
+            reason: "twin restored".to_string(),
+        },
+        Some(&owner_auth),
+    )
+    .await
+    .expect("un-retract the twin's only BBA");
+    assert_eq!(
+        first_text(&res)["belief_recomputed"],
+        true,
+        "calibration: un-retracting on the standalone twin refolds it"
+    );
+    let twin_after = cached(&pool, twin).await;
+    assert!(
+        !close(twin_after, (0.0, 1.0, 0.5)),
+        "calibration: the twin's cache moved off the vacuous value: {twin_after:?}"
+    );
 
     let res = retract_bba(
         &server,

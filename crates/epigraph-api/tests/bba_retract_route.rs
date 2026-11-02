@@ -855,13 +855,28 @@ async fn retract_and_unretract_leave_a_compound_whose_decomposition_is_hidden_un
     let owner = common::mint_token_with_agent(&["claims:write"], w.owner);
 
     let twin_before = cache(&w, w.claim).await;
-    let (status, body) = retract(&w, &owner, bba(&w, w.claim, w.p_support).await, "twin").await;
+    let twin_bba = bba(&w, w.claim, w.p_support).await;
+    let (status, body) = retract(&w, &owner, twin_bba, "twin").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body["belief_recomputed"], true,
         "calibration: a standalone claim is refolded: {body}"
     );
-    assert!(!close(cache(&w, w.claim).await, twin_before));
+    let twin_retracted = cache(&w, w.claim).await;
+    assert!(!close(twin_retracted, twin_before));
+    // CALIBRATION of the un-retract leg: the same refresh on the standalone
+    // twin DOES run and refold (so `belief_recomputed:false` below is the
+    // guard, not an un-retract that never refreshes).
+    let (status, body) = unretract(&w, &owner, twin_bba, "twin restored").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["belief_recomputed"], true,
+        "calibration: un-retracting on a standalone claim refolds it: {body}"
+    );
+    assert!(
+        !close(cache(&w, w.claim).await, twin_retracted),
+        "calibration: the twin's cache moved off its post-retract value"
+    );
 
     let target = bba(&w, compound, w.p_support).await;
     let (status, body) = retract(&w, &owner, target, "withdrawn").await;
