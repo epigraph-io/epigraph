@@ -374,9 +374,9 @@ async fn migrate_rest(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> 
 
 /// (a), shape 2: `claims`, `frames` and `mass_functions` are owned by a
 /// NOSUPERUSER role that is NOT a maintenance member when 194 is applied (the
-/// table owner on a production deployment is not measured; SPEC §14, M0-21).
-/// The cascade then runs as that role, for which `epigraph_definer_bypass()`
-/// is false and the grant helper must still answer.
+/// deployed table-owner shape is not fixed by the schema, so both shapes are
+/// pinned). The cascade then runs as that role, for which
+/// `epigraph_definer_bypass()` is false and the grant helper must still answer.
 #[sqlx::test(migrations = false)]
 async fn a_b1_attack_is_refused_sr09_when_a_nosuperuser_non_maintenance_role_owns_the_tables(
     pool: PgPool,
