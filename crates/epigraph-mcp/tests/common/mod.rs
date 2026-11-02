@@ -76,9 +76,16 @@ pub async fn assert_disposable_db(pool: &PgPool) {
 /// using this pool into a silent skip.
 pub async fn try_test_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
+    try_test_pool_at(&url).await
+}
+
+/// [`try_test_pool`] for an explicit `url`: `None` (skip) when it cannot be
+/// connected to; a panic carrying the migration error and
+/// [`stale_test_db_help`] when it connects but will not migrate to head.
+pub async fn try_test_pool_at(url: &str) -> Option<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(3)
-        .connect(&url)
+        .connect(url)
         .await
         .ok()?;
     assert_disposable_db(&pool).await;
