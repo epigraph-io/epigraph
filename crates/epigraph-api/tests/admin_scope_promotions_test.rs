@@ -401,6 +401,65 @@ async fn promote_staged_edges_refuses_the_supersede_act_marker() {
         .unwrap();
 }
 
+/// K12a (supersede SPEC section 11; ruling R-132 "supersedes = revision
+/// only"): a staged `supersedes` edge, in any spelling, is not promoted on
+/// either branch. The promote copies a staged row's relationship verbatim
+/// (only the case-folded four are lower-cased), so before K12a it published a
+/// lineage edge that retires nothing. The request is refused whole (400 on
+/// `relationship`, naming the act and the staged row), nothing is written and
+/// the row stays `approved`; the clean-row positive controls above run the
+/// same statements.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_staged_edges_refuses_a_staged_supersedes_edge() {
+    let _serial = PROMOTE_SERIAL.lock().await;
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    for rel in ["supersedes", "SUPERSEDES", "Supersedes"] {
+        let (staged, s_src, s_tgt) =
+            stage_approved_edge(&pool, rel, serde_json::json!({"note": "k12a"})).await;
+        for body in [
+            serde_json::json!({"edge_ids": [staged]}),
+            serde_json::json!({}),
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+                .bearer_auth(admin_token())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            assert_eq!(
+                status, 400,
+                "{rel} {body}: expected 400, got {status}: {text}"
+            );
+            assert!(
+                text.contains("written only by the supersession act")
+                    && text.contains(&staged.to_string()),
+                "{rel} {body}: the refusal names the act and the staged row: {text}"
+            );
+            assert_eq!(
+                edges_between(&pool, s_src, s_tgt).await,
+                0,
+                "{rel} {body}: no lineage edge"
+            );
+            assert_eq!(staging_status(&pool, staged).await, "approved");
+        }
+        sqlx::query("DELETE FROM edges_staging WHERE id = $1")
+            .bind(staged)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // clusters.rs — 1 handler
 // ---------------------------------------------------------------------------
