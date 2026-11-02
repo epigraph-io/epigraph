@@ -20,12 +20,17 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-fn test_bearer_token() -> String {
+/// A token whose principal is `principal`, the packet's author.
+///
+/// The author, not a random principal: the post-commit embed is stored on the
+/// CALLER's viewer (the authority that wrote the claim), and the claim is owned
+/// by the author's personal group. A caller with no writable membership there
+/// could not have written the claim on a stamped server at all.
+fn test_bearer_token(principal: Uuid) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
     // PR-02 binds every authenticated principal to an `agents.id`; PR-06's
     // `ViewerExtractor` refuses an agentless token with 401 before the handler.
-    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
@@ -62,6 +67,12 @@ async fn submit_packet_with_properties(
         .execute(&pool)
         .await
         .unwrap();
+    // Provision the personal group BEFORE the request, as the token mint does
+    // in production (PR-02), so the caller's viewer can write the claim's
+    // owner group when the request arrives.
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, agent_id)
+        .await
+        .expect("provision the agent's personal group");
 
     let evidence_content = "host observation";
     let evidence_hash = epigraph_crypto::ContentHasher::to_hex(
@@ -106,7 +117,7 @@ async fn submit_packet_with_properties(
         .header(header::CONTENT_TYPE, "application/json")
         .header(
             header::AUTHORIZATION,
-            format!("Bearer {}", test_bearer_token()),
+            format!("Bearer {}", test_bearer_token(agent_id)),
         )
         .body(Body::from(body.to_string()))
         .unwrap();
