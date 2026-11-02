@@ -784,34 +784,45 @@ async fn the_unmark_cli_refuses_and_dry_runs_with_nothing_written(pool: PgPool) 
 /// request-serving server refuses when it carries marks): every mark of the
 /// apply's `applied_marks` is proved admissible before any is un-marked, so
 /// one stale mark leaves all of them in place; a sound file un-marks each.
+///
+/// The stale mark is the FIRST file entry, which `revert_marks` (newest first)
+/// checks and un-marks LAST: a run that checked and applied each target in
+/// turn would already have un-marked the sound second entry by the time it
+/// reached the stale one, so only a whole-run preflight leaves both in place.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_unmark_cli_reverts_an_applys_marks_all_or_nothing(pool: PgPool) {
     let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
     let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
     let operator = seed_agent(&pool).await;
-    let (s1, w1, _, e1) = swept_pair(&pool, &app_url, &maint_url, operator, "pair one", 0).await;
-    let (s2, w2, _, e2) = swept_pair(&pool, &app_url, &maint_url, operator, "pair two", 10).await;
+    let (s1, w1, t1, e1) = swept_pair(&pool, &app_url, &maint_url, operator, "pair one", 0).await;
+    let (s2, w2, t2, e2) = swept_pair(&pool, &app_url, &maint_url, operator, "pair two", 10).await;
     let op = operator.to_string();
-    let marks = |second_edge: Uuid| {
+    let marks = |first_edge: Uuid| {
         serde_json::json!({
             "status": "applied",
             "applied_marks": [
                 {"unit": "cluster:one", "dup": w1, "canonical": s1, "rule": "strong_id",
-                 "matched_on": "id-1", "identity_edge": e1},
+                 "matched_on": "id-1", "identity_edge": first_edge},
                 {"unit": "cluster:two", "dup": w2, "canonical": s2, "rule": "strong_id",
-                 "matched_on": "id-2", "identity_edge": second_edge},
+                 "matched_on": "id-2", "identity_edge": e2},
             ],
         })
     };
-    let write = |name: &str, v: &serde_json::Value| {
+    let mut written = Vec::new();
+    let mut write = |name: &str, v: &serde_json::Value| {
         let p = std::env::temp_dir().join(format!("unmark-{}-{name}", Uuid::new_v4().simple()));
         std::fs::write(&p, v.to_string()).expect("write the marks file");
+        written.push(p.clone());
         p.to_string_lossy().into_owned()
     };
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
 
-    // The second mark names an identity edge the claim no longer carries:
-    // nothing is un-marked, not even the sound first one.
-    let stale = write("stale.json", &marks(Uuid::new_v4()));
+    // The FIRST mark names an identity edge its claim no longer carries:
+    // nothing is un-marked, not even the sound second one, which is checked
+    // (and would be un-marked) first.
+    let stale_edge = Uuid::new_v4();
+    let stale = write("stale.json", &marks(stale_edge));
     let r = run(
         UNMARK,
         &["--acting-agent", &op, "--applied-marks", &stale, "--apply"],
@@ -819,11 +830,47 @@ async fn the_unmark_cli_reverts_an_applys_marks_all_or_nothing(pool: PgPool) {
         Some(&maint_url),
     );
     assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
-    assert_eq!(claim_state(&pool, w1).await, (false, Some(s1)));
-    assert_eq!(claim_state(&pool, w2).await, (false, Some(s2)));
-    assert!(undedup_rows(&pool, w1).await.is_empty());
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert_eq!(plan["admissible"], false, "{plan}");
+    let unmarks = plan["unmarks"].as_array().expect("unmarks");
+    assert_eq!(unmarks.len(), 2, "{plan}");
+    // CALIBRATION: the sound mark is the one checked first, and admissible,
+    // so this run is the case an interleaved check-then-apply gets wrong.
+    assert_eq!(unmarks[0]["claim_id"], w2.to_string(), "{plan}");
+    assert_eq!(unmarks[0]["admissible"], true, "{plan}");
+    assert_eq!(unmarks[1]["claim_id"], w1.to_string(), "{plan}");
+    assert_eq!(unmarks[1]["admissible"], false, "{plan}");
+    assert!(
+        unmarks[1]["reason"].as_str().is_some_and(|s| {
+            s.contains("no longer carries the mark") && s.contains(&stale_edge.to_string())
+        }),
+        "{plan}"
+    );
+    for (s, w, t, e) in [(s1, w1, t1, e1), (s2, w2, t2, e2)] {
+        assert_eq!(
+            claim_state(&pool, w).await,
+            (false, Some(s)),
+            "{w} un-marked"
+        );
+        assert_eq!(
+            identity_edge(&pool, w).await,
+            Some(e),
+            "{w}'s identity edge"
+        );
+        assert_eq!(
+            supports_into(&pool, t).await,
+            vec![s],
+            "{w}'s edge moved back"
+        );
+        assert!(undedup_rows(&pool, w).await.is_empty(), "{w} audited");
+    }
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
 
-    let sound = write("sound.json", &marks(e2));
+    let sound = write("sound.json", &marks(e1));
     let r = run(
         UNMARK,
         &["--acting-agent", &op, "--applied-marks", &sound, "--apply"],
@@ -838,9 +885,14 @@ async fn the_unmark_cli_reverts_an_applys_marks_all_or_nothing(pool: PgPool) {
     assert_eq!(report["steps"][1]["claim_id"], w1.to_string(), "{report}");
     assert_eq!(claim_state(&pool, w1).await, (true, None));
     assert_eq!(claim_state(&pool, w2).await, (true, None));
+    assert_eq!(supports_into(&pool, t1).await, vec![w1]);
+    assert_eq!(supports_into(&pool, t2).await, vec![w2]);
     assert_eq!(undedup_rows(&pool, w1).await.len(), 1);
     assert_eq!(undedup_rows(&pool, w2).await.len(), 1);
 
+    for p in written {
+        let _ = std::fs::remove_file(p);
+    }
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;
 }
