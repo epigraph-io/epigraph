@@ -495,6 +495,50 @@ async fn c_a_maintenance_session_without_a_grant_cannot_delete_a_retracted_bba(p
     );
 }
 
+/// (c2) The FRAME cascade (`mass_functions_frame_id_fkey ON DELETE CASCADE`,
+/// SPEC §7.3 H10's second delete path): a NOSUPERUSER maintenance session's
+/// `DELETE FROM frames` over a frame holding a retracted BBA, with no purge
+/// first, is refused SR09, and the frame and both its BBAs survive. A control
+/// frame holding only a live BBA deletes cleanly on the same session first,
+/// so the refusal is the retracted row's and not another FK's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn c2_a_frame_delete_that_cascades_onto_a_retracted_bba_is_refused(pool: PgPool) {
+    let w = world(&pool).await;
+    let control_frame = frame(&pool).await;
+    let control_bba = bba(&pool, w.claim, control_frame, w.writer, None).await;
+    let m = maintenance(&pool).await;
+
+    let n = sqlx::query("DELETE FROM frames WHERE id = $1")
+        .bind(control_frame)
+        .execute(&m)
+        .await
+        .expect("control: a frame holding only a live BBA deletes")
+        .rows_affected();
+    assert_eq!(n, 1, "control: the frame delete takes its frame");
+    assert!(
+        !exists(&pool, "mass_functions", control_bba).await,
+        "control: the frame's live BBA goes with it (ON DELETE CASCADE)"
+    );
+
+    let r = sqlx::query("DELETE FROM frames WHERE id = $1")
+        .bind(w.frame)
+        .execute(&m)
+        .await;
+    assert_sr09(
+        refusal(r, "a frame delete cascading onto a retracted BBA"),
+        "(c2)",
+    );
+    assert!(exists(&pool, "frames", w.frame).await, "the frame survives");
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted BBA survives"
+    );
+    assert!(
+        exists(&pool, "mass_functions", w.live).await,
+        "the live BBA rolls back with the delete"
+    );
+}
+
 async fn grant_table_exists(pool: &PgPool) {
     let t: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('public.mass_function_purge_grants')::text")
