@@ -401,6 +401,73 @@ async fn promote_staged_edges_refuses_the_supersede_act_marker() {
         .unwrap();
 }
 
+/// X-2 (supersede SPEC section 11 phase 1, SF-27; backlog 69c78f9a): a
+/// REGRESSION PIN, not a red test. Both statement arms of the promote (named
+/// `edge_ids`, promote-all) already refuse a staged row whose `properties`
+/// carry a reserved act key; this pins each arm against each key with the
+/// exact text `epigraph_db::reserved_edge_property_refusal` gives for that
+/// row (the dedup tests above pin only the dedup text, the supersede-act test
+/// only the key's name): 400, the staged row named, no edge between its
+/// endpoints, and the row still `approved`.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_staged_edges_refuses_each_reserved_key_on_each_arm() {
+    let _serial = PROMOTE_SERIAL.lock().await;
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    for (relationship, properties) in [
+        (
+            "same_as",
+            serde_json::json!({"dedup": {"tool": "forged", "rule": "none"}}),
+        ),
+        (
+            "AUTHORED",
+            serde_json::json!({"supersede_act": "supersede_claim"}),
+        ),
+    ] {
+        let expected = epigraph_db::reserved_edge_property_refusal(&properties)
+            .expect("calibration: the key is reserved");
+        let (staged, s_src, s_tgt) =
+            stage_approved_edge(&pool, relationship, properties.clone()).await;
+        for body in [
+            serde_json::json!({"edge_ids": [staged]}),
+            serde_json::json!({}),
+        ] {
+            let resp = reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/edges-staging/promote"))
+                .bearer_auth(admin_token())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let text = resp.text().await.unwrap();
+            assert_eq!(status, 400, "{properties} {body}: got {status}: {text}");
+            assert!(
+                text.contains(expected) && text.contains(&staged.to_string()),
+                "{properties} {body}: the refusal carries the reserved-key text and names \
+                 the row: {text}"
+            );
+            assert_eq!(
+                edges_between(&pool, s_src, s_tgt).await,
+                0,
+                "{properties} {body}: nothing promoted"
+            );
+            assert_eq!(staging_status(&pool, staged).await, "approved");
+        }
+        sqlx::query("DELETE FROM edges_staging WHERE id = $1")
+            .bind(staged)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
 /// K12a (supersede SPEC section 11; ruling R-132 "supersedes = revision
 /// only"): a staged `supersedes` edge, in any spelling, is not promoted on
 /// either branch. The promote copies a staged row's relationship verbatim
