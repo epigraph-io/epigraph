@@ -587,9 +587,41 @@ pub(crate) fn oauth_principal(
 /// The answer `supersede_claim` gives when the database refuses its act on
 /// `claim_id` (`supersede_act_conn`) or the act's cascade deferral
 /// ([`supersede_session_or_deferral`]): one mapper for both, so a refusal
-/// reads the same whichever statement raised it.
+/// reads the same whichever statement raised it (supersede SPEC K5). A denial
+/// is 403 with its code in the reason, and nothing was written (the act and
+/// its deferral share one transaction):
+///
+/// 1. migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`), recognised
+///    by its message code BEFORE the generic `42501` arm, which would drop the
+///    code: the session does not write the claim's group
+///    ([`epigraph_auth::claim_act::supersede_not_recorded_message`]);
+/// 2. row security's `42501`: the group-write refusal;
+/// 3. `WriteRefused`, a repo `Refused`, "not found";
+/// 4. everything else through `From<DbError> for ApiError`, which answers
+///    OPL01 / OPL02 / ROL01 as 403 with their codes and a fault as a 500.
 #[cfg(feature = "db")]
 pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    if let epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::Database(d),
+    } = &e
+    {
+        let cx03 = format!(
+            "{}:",
+            epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
+        );
+        if d.code().as_deref() == Some("42501") && d.message().starts_with(&cx03) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "supersede_claim",
+                claim = %claim_id,
+                detail = %d.message(),
+                "the cascade deferral refused the supersession"
+            );
+            return ApiError::Forbidden {
+                reason: epigraph_auth::claim_act::supersede_not_recorded_message(claim_id),
+            };
+        }
+    }
     if crate::errors::db_is_insufficient_privilege(&e) {
         tracing::warn!(
             target: "tenancy.scoped_write",
@@ -618,18 +650,15 @@ pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
     if matches!(e, epigraph_db::DbError::Refused { .. }) {
         return ApiError::from(e);
     }
-    // Map DB errors to appropriate API errors
-    let msg = e.to_string();
-    if msg.contains("not found") {
-        ApiError::NotFound {
+    if e.to_string().contains("not found") {
+        return ApiError::NotFound {
             entity: "Claim".to_string(),
             id: claim_id.to_string(),
-        }
-    } else {
-        ApiError::InternalError {
-            message: format!("Supersession failed: {msg}"),
-        }
+        };
     }
+    // The operator binding's OPL01 / OPL02 and 166's ROL01 are 403 with their
+    // codes there; a fault stays a redacted 500.
+    ApiError::from(e)
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -650,7 +679,8 @@ pub async fn supersede_session_or_deferral<'s>(
     ),
     ApiError,
 > {
-    session_or_deferral(state, tx, trigger, deferral_failed).await
+    let claim_id = trigger.subject_id;
+    session_or_deferral(state, tx, trigger, |e| supersede_refusal(claim_id, e)).await
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act

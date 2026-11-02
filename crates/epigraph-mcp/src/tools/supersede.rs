@@ -116,14 +116,84 @@ pub async fn supersede_claim(
 /// The answer `supersede_claim` gives when the database refuses its act on
 /// `claim` (`supersede_act_conn`) or the act's cascade deferral
 /// ([`supersede_session_or_deferral`]): one mapper for both, so a refusal
-/// reads the same whichever statement raised it.
-pub fn supersede_refusal(_claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError {
-    match e {
-        // Readable as current but not retirable by this session: a denial of
-        // authority (INVALID_REQUEST), with nothing written.
-        e @ epigraph_db::DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
-        other => internal_error(other),
+/// reads the same whichever statement raised it (supersede SPEC K5). Every
+/// denial is `INVALID_REQUEST` with its code in the text, and nothing was
+/// written (the act and its deferral share one transaction):
+///
+/// 1. migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`), recognised
+///    by its message code before any SQLSTATE arm: the session does not write
+///    the claim's group ([`epigraph_auth::claim_act::supersede_not_recorded_message`]);
+/// 2. an UNCODED `42501`, row security refusing the act (`claims_tenancy`'s
+///    WITH CHECK: the stamp, the caller's own or the borrowed server agent's,
+///    does not write the claim's owner group), with the HTTP route's words
+///    ([`SUPERSEDE_GROUP_WRITE_REFUSED`]). A coded `42501` keeps its own code
+///    and goes on to step 3;
+/// 3. everything else through [`crate::errors::db_caller_error`], which names
+///    OPL01 / OPL02 / ROL01 and `WriteRefused` as denials and keeps a fault a
+///    fault.
+pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError {
+    let database = match &e {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } if d.code().as_deref() == Some("42501") => Some(d.message().to_string()),
+        _ => None,
+    };
+    if let Some(message) = database {
+        let cx03 = format!(
+            "{}:",
+            epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
+        );
+        if message.starts_with(&cx03) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                tool = "supersede_claim",
+                claim = %claim,
+                detail = %message,
+                "the cascade deferral refused the supersession"
+            );
+            return caller_denial(epigraph_auth::claim_act::supersede_not_recorded_message(
+                claim,
+            ));
+        }
+        if !opens_with_refusal_code(&message) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                tool = "supersede_claim",
+                claim = %claim,
+                detail = %message,
+                "the database refused the supersession"
+            );
+            return caller_denial(SUPERSEDE_GROUP_WRITE_REFUSED.to_string());
+        }
     }
+    crate::errors::db_caller_error(e)
+}
+
+/// Row security's refusal of a supersession, in the words the HTTP route
+/// answers it with (`epigraph_api::errors::write_refused("claim")`).
+pub const SUPERSEDE_GROUP_WRITE_REFUSED: &str =
+    "no write authority over the group that owns this claim; nothing was written";
+
+/// A denial of authority: `INVALID_REQUEST` with designed text.
+fn caller_denial(message: String) -> McpError {
+    McpError {
+        code: rmcp::model::ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(message),
+        data: None,
+    }
+}
+
+/// Whether a database message opens with a schema refusal code (two to five
+/// ASCII capitals, two digits, a colon: `FA04: ...`), the convention the
+/// migrations' designed refusals follow.
+fn opens_with_refusal_code(message: &str) -> bool {
+    let b = message.as_bytes();
+    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
+    (2..=5).contains(&caps)
+        && b.len() > caps + 2
+        && b[caps].is_ascii_digit()
+        && b[caps + 1].is_ascii_digit()
+        && b[caps + 2] == b':'
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -138,7 +208,8 @@ pub async fn supersede_session_or_deferral<'s>(
     tx: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
-    session_or_deferral(server, tx, trigger, internal_error).await
+    let claim = trigger.subject_id;
+    session_or_deferral(server, tx, trigger, |e| supersede_refusal(claim, e)).await
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
