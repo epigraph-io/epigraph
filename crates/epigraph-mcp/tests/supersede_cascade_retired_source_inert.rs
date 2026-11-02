@@ -396,3 +396,100 @@ async fn a_supersede_leaves_other_retired_claims_bbas_alone(pool: PgPool) {
         );
     }
 }
+
+/// Both walks in one supersede: the predecessor's supporting edge MOVES to
+/// the successor (its BBA invalidated and re-derived from the successor, its
+/// factor minted over the new pair: K3) while its refuting edge STAYS (its BBA
+/// invalidated, nothing re-derived: K10(2)); both holders are recomputed in
+/// the one repair pass, after both invalidations, and each ends coherent
+/// with the fold of what it still holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_supersede_rewires_moved_edges_and_invalidates_stayed_ones(pool: PgPool) {
+    let server = server(&pool).await;
+    let p = seed_claim_with_belief(&pool, 0.9, 0.95, Some(0.92)).await;
+    let y = seed_claim(&pool, "k10+k3 supported, moves", 0.5).await;
+    let t = seed_claim(&pool, "k10+k3 refuted, stays", 0.5).await;
+    let y_other = seed_claim_with_belief(&pool, 0.6, 0.7, Some(0.65)).await;
+    let t_other = seed_claim_with_belief(&pool, 0.55, 0.75, Some(0.6)).await;
+    let supports = wire(&pool, &server, p, y, "supports").await;
+    let refutes = wire(&pool, &server, p, t, "refutes").await;
+    wire(&pool, &server, y_other, y, "supports").await;
+    wire(&pool, &server, t_other, t, "supports").await;
+    let y_before = scalars(&pool, y).await.2.expect("PREMISE: Y cached");
+    let t_before = scalars(&pool, t).await.2.expect("PREMISE: T cached");
+
+    let body = supersede(&pool, &server, p).await;
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let report = &body["belief_cascade"];
+    assert!(ids(report, "errors").is_empty(), "{report}");
+    let successor = common::parse_uuid_field(&body, "new_claim_id");
+
+    // The moved edge.
+    let (src, dst): (Uuid, Uuid) =
+        sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+            .bind(supports)
+            .fetch_one(&pool)
+            .await
+            .expect("supports edge");
+    assert_eq!(
+        (src, dst),
+        (successor, y),
+        "PREMISE: supports moved to the successor"
+    );
+    let factor: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factors WHERE properties->>'source_edge_id' = $1::text \
+            AND variable_ids @> ARRAY[$2, $3]::uuid[] AND cardinality(variable_ids) = 2",
+    )
+    .bind(supports)
+    .bind(successor)
+    .bind(y)
+    .fetch_one(&pool)
+    .await
+    .expect("count factors");
+    assert_eq!(
+        factor, 1,
+        "the moved edge has its factor over (successor, Y)"
+    );
+    // `invalidate_and_rewire`'s documented outcome after a supersede: the
+    // successor is inserted without an interval, so the re-derivation is
+    // `SourceFactorless` and the moved edge carries no BBA until it earns one.
+    assert_eq!(
+        keyed_on(&pool, supports).await,
+        0,
+        "the predecessor's interval no longer rides the moved edge"
+    );
+
+    // The stayed edge.
+    let (src, _): (Uuid, Uuid) =
+        sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+            .bind(refutes)
+            .fetch_one(&pool)
+            .await
+            .expect("refutes edge");
+    assert_eq!(src, p, "PREMISE: refutes stays on the retired claim (#398)");
+    assert_eq!(keyed_on(&pool, refutes).await, 0, "the stayed BBA is gone");
+
+    for (claim, before) in [(y, y_before), (t, t_before)] {
+        let after = scalars(&pool, claim)
+            .await
+            .2
+            .expect("each keeps its other supporter, so a cache");
+        assert!(
+            (after - before).abs() > 1e-9,
+            "{claim}: dropping the predecessor's row moves it: before={before}, after={after}"
+        );
+        let coherent = preview_betp(&pool, claim).await.expect("one BBA left");
+        assert!(
+            (after - coherent).abs() < 1e-12,
+            "{claim}: cache {after} is the fold of what survives {coherent}"
+        );
+    }
+    let mut targets = ids(report, "targets");
+    targets.sort();
+    let mut expected = vec![y, t];
+    expected.sort();
+    assert_eq!(
+        targets, expected,
+        "both walks' holders, once each: {report}"
+    );
+}
