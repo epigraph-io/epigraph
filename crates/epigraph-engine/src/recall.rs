@@ -4,8 +4,9 @@
 //! crates can call it with `(pool, scoped, viewer, embedder, query, limit,
 //! min_truth)` without spawning MCP-over-stdio.
 //!
-//! The MCP handler in `tools/memory.rs` becomes a thin adapter that delegates
-//! here and shapes the result into a `CallToolResult`.
+//! The MCP `recall` tool (`tools/memory.rs::recall`) does NOT delegate here: it
+//! runs its own hybrid / lexical pipeline. This function has no production
+//! caller in this workspace; its consumer is episcience's synthesis pipeline.
 //!
 //! # Fallback behaviour
 //!
@@ -179,7 +180,7 @@ pub async fn recall(
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
-        // to text search. This matches the existing MCP behaviour.
+        // to the current-only text search.
         text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
     };
 
