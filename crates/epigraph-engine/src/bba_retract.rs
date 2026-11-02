@@ -33,11 +33,14 @@
 //! **Viewer.** As every legacy cache writer, the fold and the vacate read what
 //! the caller can see and offer the result to the one global cache under the
 //! migration-114 non-owner rule (`written` / `vacated` says whether the cache
-//! took it). On an application session, `edges` row security can hide a
-//! compound's decomposition so that it reads as a standalone claim (the
-//! `claim_role` module doc); such a compound whose own last BBA is retracted
-//! could be vacated. That is the caveat `recompute_atom_cache_with` documents
-//! for every per-request site (PR-5b1).
+//! took it). Whether the claim is a compound is NOT read through the viewer:
+//! the owner lookup decides it with migration 193's definer-rights
+//! `epigraph_claim_is_compound` (backlog 0dc20fad), so a compound whose
+//! decomposition the caller's row security hides still has no owner, before
+//! or after the retraction, and is neither refolded nor vacated here. (The
+//! vacate's own refusal ladder reads roles through the viewer, the caveat
+//! `recompute_atom_cache_with` documents for every per-request site, PR-5b1;
+//! this module reaches it only for a claim that had an owner.)
 //!
 //! **PR-5b1.** This site is a lifecycle act that removes evidence:
 //! `edge_factor::CacheWriteCause::EvidenceRemoved` (ruling O24) names "a

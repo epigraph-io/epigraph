@@ -242,6 +242,19 @@ async fn assert_one_spelling(pool: &PgPool, ids: &[Uuid]) {
             role == "procedural",
             "IS_PROCEDURAL_SQL and CLAIM_ROLE_SQL disagree on {id}: role {role}"
         );
+        // Migration 193's definer-rights copy of IS_COMPOUND_SQL (the
+        // cached-belief owner guard, backlog 0dc20fad) agrees on every role
+        // fixture; its body is pinned textually in
+        // `claim_is_compound_definer.rs`.
+        let definer: bool = sqlx::query_scalar("SELECT public.epigraph_claim_is_compound($1)")
+            .bind(*id)
+            .fetch_one(pool)
+            .await
+            .expect("epigraph_claim_is_compound");
+        assert_eq!(
+            definer, is_compound,
+            "epigraph_claim_is_compound and IS_COMPOUND_SQL disagree on {id}: role {role}"
+        );
     }
 }
 

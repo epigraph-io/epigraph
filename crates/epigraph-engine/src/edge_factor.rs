@@ -1449,7 +1449,10 @@ async fn recompute_combined_belief(
 /// `decomposes_to` out-edge, not under a workflow root), whose belief is a
 /// query over its leaves rather than a fold of its own BBAs. So this function
 /// never makes a claim's cache emptier than it was. Every caller inherits
-/// both, including the per-write `routes::assess` refresh.
+/// both, including the per-write `routes::assess` refresh. The compound test
+/// reads with definer rights (migration 193, `epigraph_claim_is_compound`),
+/// so it holds on an application session whose row security hides the
+/// compound's decomposition (backlog 0dc20fad).
 ///
 /// The one exception is ruling R-80: a claim whose every BBA the derivation
 /// scope rule keeps out of its cache gets full ignorance in place of its old

@@ -2180,6 +2180,29 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **193**: public `claim_is_compound_definer` (backlog 0dc20fad) —
+  `public.epigraph_claim_is_compound(uuid) RETURNS boolean`, SECURITY
+  DEFINER, owned by `epigraph_maintenance`, STABLE, `SET search_path =
+  pg_catalog, pg_temp` (172's form). Its body is `claim_role::IS_COMPOUND_SQL`
+  over the claims row `c`, every relation `public.`-qualified and `now()` as
+  `pg_catalog.now()`, and nothing else. `MassFunctionRepository::
+  cache_owner_frame_for_claim`'s compound guard calls it instead of splicing
+  the predicate, so on an application session whose row security hides a
+  compound's whole decomposition the compound still has no cache owner (the
+  per-request refreshes of `assess` and BBA retract / un-retract no longer
+  refold or vacate it). Reveals one boolean per claim id. EXECUTE revoked from
+  PUBLIC, granted to `epigraph_app` and `epigraph_maintenance` (role-guarded
+  like 184); registered at 193 in `tenancy_backfill.rs`
+  `DEFERRED_DEFINER_FUNCTIONS` (it fails open under a non-bypassing owner).
+  Body pinned to the Rust template by
+  `epigraph-db/tests/claim_is_compound_definer.rs`; agreement over the role
+  fixtures by `claim_role.rs::assert_one_spelling`. Undo in the file header
+  (a `DROP FUNCTION`, only after rolling the binary back). Checked before
+  claiming: no migration on main, open PR or origin branch carries a `193`.
+  **Deploy order:** apply BEFORE a binary whose owner lookup calls the
+  function serves (without it every owner lookup errors 42883); an older
+  binary ignores it. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
