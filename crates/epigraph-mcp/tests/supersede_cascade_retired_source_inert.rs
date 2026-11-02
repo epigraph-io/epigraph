@@ -318,3 +318,81 @@ async fn a_legacy_typed_edge_perspective_is_invalidated_too(pool: PgPool) {
         "its only BBA gone, the target is unbacked"
     );
 }
+
+/// Retire `claim` by a plain flip: a retirement the K10(2) arm never saw.
+async fn retire_by_flip(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("retire by a plain flip");
+}
+
+/// The invalidation is scoped to the claim THIS supersede retires, and to
+/// CURRENT holders: another claim retired earlier keeps its frozen BBA on its
+/// current target (sweeping those is the retroactive OD-10 decision, which no
+/// cascade applies), and a BBA the retired claim froze onto an ALREADY-retired
+/// holder is not touched (that holder serves no belief). A refutes edge from
+/// the superseded claim onto a current target is the positive control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_supersede_leaves_other_retired_claims_bbas_alone(pool: PgPool) {
+    let server = server(&pool).await;
+    // R2: retired earlier, still weighing on a current T2.
+    let r2 = seed_claim_with_belief(&pool, 0.85, 0.9, Some(0.87)).await;
+    let t2 = seed_claim(&pool, "k10 other retired claim's target", 0.5).await;
+    let r2_edge = wire(&pool, &server, r2, t2, "refutes").await;
+    retire_by_flip(&pool, r2).await;
+    let t2_before = scalars(&pool, t2).await;
+    assert!(t2_before.2.is_some(), "PREMISE: T2 has a cache");
+
+    // R1: the claim this test supersedes, with a current target T1 and a
+    // holder H that was retired before the supersede.
+    let r1 = seed_claim_with_belief(&pool, 0.9, 0.95, Some(0.92)).await;
+    let t1 = seed_claim(&pool, "k10 superseded claim's target", 0.5).await;
+    let h = seed_claim(&pool, "k10 already retired holder", 0.5).await;
+    let t1_edge = wire(&pool, &server, r1, t1, "refutes").await;
+    let h_edge = wire(&pool, &server, r1, h, "contradicts").await;
+    retire_by_flip(&pool, h).await;
+    assert_eq!(
+        keyed_on(&pool, h_edge).await,
+        1,
+        "PREMISE: the retired holder keeps its edge-keyed row"
+    );
+
+    let body = supersede(&pool, &server, r1).await;
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let report = &body["belief_cascade"];
+    assert!(ids(report, "errors").is_empty(), "{report}");
+
+    assert_eq!(
+        keyed_on(&pool, t1_edge).await,
+        0,
+        "CONTROL: the superseded claim's own refutes BBA on a current target is invalidated"
+    );
+    assert_eq!(
+        keyed_on(&pool, r2_edge).await,
+        1,
+        "another retired claim's BBA on its current target is not swept by this supersede"
+    );
+    assert_eq!(
+        scalars(&pool, t2).await,
+        t2_before,
+        "that target's cache is bit-identical"
+    );
+    assert_eq!(
+        keyed_on(&pool, h_edge).await,
+        1,
+        "a BBA held by an already-retired claim is not touched"
+    );
+    let targets = ids(report, "targets");
+    assert!(targets.contains(&t1), "CONTROL: {report}");
+    for absent in [t2, h] {
+        assert!(
+            !targets.contains(&absent),
+            "{absent} is not a target of this supersede: {report}"
+        );
+    }
+}
