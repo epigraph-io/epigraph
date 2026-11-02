@@ -10,11 +10,13 @@
 //! # Fallback behaviour
 //!
 //! If `embedder.generate_query` fails (e.g. no API key), the function falls
-//! back to text search via `ClaimRepository::list`. This matches the existing
-//! MCP behaviour.
+//! back to an ILIKE text search over **current** claims via
+//! `ClaimRepository::list_filtered`. Both legs serve current rows only: the
+//! semantic leg reads `search_by_embedding_current`, and the fallback filters
+//! `is_current` in SQL before `LIMIT` (supersede SPEC K11).
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, PgPool, ScopedPool};
+use epigraph_db::{ClaimListFilter, ClaimRepository, PgPool, ScopedPool};
 use epigraph_embeddings::EmbeddingService;
 use thiserror::Error;
 
@@ -59,6 +61,12 @@ pub struct RecallResult {
     pub is_contested: bool,
     /// The three strongest contesters (by their own `truth_value`).
     pub contesting_claim_ids: Vec<uuid::Uuid>,
+    /// The claim row's own `is_current`, as read on the row this result was
+    /// built from (never a literal). Both legs select current rows only, so it
+    /// is `true` unless the claim was retired between the semantic leg's ANN
+    /// page and its `get_by_id` read; it is carried so that a consumer can
+    /// check currency without a second read rather than assume it.
+    pub is_current: bool,
 }
 
 /// Format a `Vec<f32>` as a pgvector string literal `[a,b,c,...]`.
@@ -72,8 +80,9 @@ fn format_pgvector(vec: &[f32]) -> String {
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
 ///
-/// Falls back to `ClaimRepository::list` text search when `embedder` returns
-/// an error (e.g. embeddings disabled, no API key).
+/// Falls back to an ILIKE text search over current claims
+/// ([`text_search_fallback`]) when `embedder` returns an error (e.g.
+/// embeddings disabled, no API key).
 ///
 /// # Parameters
 /// - `pool`      — live database connection pool the recall READS on
@@ -155,6 +164,8 @@ pub async fn recall(
                                 dispute_count: 0,
                                 is_contested: false,
                                 contesting_claim_ids: Vec::new(),
+                                // `get_by_id` post-fixes the row's real state.
+                                is_current: claim.is_current,
                             });
                         }
                     }
@@ -377,7 +388,17 @@ async fn effective_beliefs(
     }
 }
 
-/// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
+/// Text-search fallback: `content ILIKE '%query%'` over **current** claims,
+/// newest first.
+///
+/// The currency predicate is `ClaimListFilter::is_current`, which
+/// `ClaimRepository::list_filtered` applies in SQL before `LIMIT`. It must not
+/// move after the fetch: the page is ordered by `created_at`, so a retired
+/// revision is usually NEWER than the current match it competes with, and a
+/// filter over the already-cut page would drop it and leave the page short or
+/// empty instead of serving the current match (supersede SPEC K11).
+/// `ClaimRepository::list`, which this used to call, has no currency
+/// predicate at all.
 async fn text_search_fallback(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -385,7 +406,12 @@ async fn text_search_fallback(
     limit: i64,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let claims = ClaimRepository::list(pool, viewer, limit, 0, Some(query)).await?;
+    let filter = ClaimListFilter {
+        search: Some(query),
+        is_current: Some(true),
+        ..ClaimListFilter::default()
+    };
+    let claims = ClaimRepository::list_filtered(pool, viewer, &filter, limit, 0).await?;
     // Same one-round-trip DS resolution the semantic leg does, so the two legs
     // cannot gate on different columns (backlog 14b98adc).
     let scores = effective_beliefs(
@@ -412,6 +438,7 @@ async fn text_search_fallback(
             dispute_count: 0,
             is_contested: false,
             contesting_claim_ids: Vec::new(),
+            is_current: c.is_current,
         })
         .collect())
 }
