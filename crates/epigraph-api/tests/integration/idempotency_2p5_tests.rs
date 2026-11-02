@@ -196,13 +196,17 @@ async fn create_agent_is_idempotent_on_public_key(pool: PgPool) {
 /// Mint a Bearer token carrying `epigraph:write` so it clears the
 /// `submit/packet` scope gate (mirrors `submit_persistence_tests::test_bearer_token`).
 fn submit_bearer_token() -> String {
+    submit_bearer_token_for(Uuid::new_v4())
+}
+
+/// [`submit_bearer_token`] bound to a chosen `principal`.
+fn submit_bearer_token_for(principal: Uuid) -> String {
     use epigraph_api::oauth::JwtConfig;
     let jwt_config = JwtConfig::from_secret(b"epigraph-dev-secret-change-in-production!!");
     // PR-02 binds every authenticated principal to an `agents.id`, and PR-06's
     // `ViewerExtractor` refuses an agentless token with 401 before the handler
     // runs. Bind the token to a principal so this fixture reflects a shape a
     // real client can actually hold.
-    let principal = Uuid::new_v4();
     let (token, _) = jwt_config
         .issue_access_token(
             principal,
@@ -220,14 +224,20 @@ fn submit_bearer_token() -> String {
 /// POST a packet to `/api/v1/submit/packet` with an `epigraph:write` token,
 /// returning (status, body string).
 async fn post_packet(router: &Router, packet: serde_json::Value) -> (StatusCode, String) {
+    post_packet_with_token(router, packet, &submit_bearer_token()).await
+}
+
+/// [`post_packet`] with a caller-chosen bearer token.
+async fn post_packet_with_token(
+    router: &Router,
+    packet: serde_json::Value,
+    bearer: &str,
+) -> (StatusCode, String) {
     let request = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/submit/packet")
         .header(header::CONTENT_TYPE, "application/json")
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", submit_bearer_token()),
-        )
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
         .body(Body::from(packet.to_string()))
         .expect("Failed to build request");
 
@@ -701,6 +711,14 @@ async fn submit_packet_dedup_does_not_re_embed(pool: PgPool) {
         .await
         .expect("agent creation should succeed");
     let agent_uuid: Uuid = created_agent.id.into();
+    // The author submits as itself, with its personal group provisioned first
+    // (as the token mint does in production): the post-commit embed is stored
+    // on the CALLER's viewer, which must be able to write the claim's owner
+    // group, as it must on a stamped server for the INSERT itself.
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, agent_uuid)
+        .await
+        .expect("provision the agent's personal group");
+    let bearer = submit_bearer_token_for(agent_uuid);
 
     let claim_content = "A claim that should be embedded once and never re-embedded on dedup";
     let packet = evidence_packet(agent_uuid, claim_content);
@@ -708,7 +726,7 @@ async fn submit_packet_dedup_does_not_re_embed(pool: PgPool) {
     let router = create_test_router_with_embedder(pool.clone());
 
     // 1. Create path → claim is embedded.
-    let (status_1, body_1) = post_packet(&router, packet.clone()).await;
+    let (status_1, body_1) = post_packet_with_token(&router, packet.clone(), &bearer).await;
     assert_eq!(
         status_1,
         StatusCode::CREATED,
@@ -740,7 +758,7 @@ async fn submit_packet_dedup_does_not_re_embed(pool: PgPool) {
         .expect("nulling the embedding should succeed");
 
     // 3. Dedup path (same router, no idempotency_key) → must NOT re-embed.
-    let (status_2, body_2) = post_packet(&router, packet).await;
+    let (status_2, body_2) = post_packet_with_token(&router, packet, &bearer).await;
     assert_eq!(
         status_2,
         StatusCode::CREATED,

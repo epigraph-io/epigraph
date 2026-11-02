@@ -518,8 +518,8 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 ///
 /// [`sqlx_call_offsets`] requires INVOCATION syntax — `sqlx::query(` — so
 /// `sqlx::query!` MACRO writes are not counted. `submit.rs` has one
-/// (`UPDATE claims SET trace_id = …`), which is why its count here is 4 and a
-/// plain grep of the file finds 5. The exclusion is inherited from the read-side
+/// (`UPDATE claims SET trace_id = …`), which is why its count here is one less
+/// than a plain grep of the file for `UPDATE`/`DELETE` statements finds. The exclusion is inherited from the read-side
 /// scan, where it is what keeps prose out of the count, and it is left in place
 /// rather than special-cased: a macro write is unspliceable by construction and
 /// belongs in `write_gate_lint.rs::MACRO_WRITE_SITES`, whose remedy is a
@@ -530,7 +530,11 @@ const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
 const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("assess.rs", 1),
     ("belief.rs", 1),
-    ("claims.rs", 4),
+    // 4 -> 3 (backlog 1e2315a9): `create_claim_core`'s post-commit
+    // `UPDATE claims SET embedding` became
+    // `ClaimRepository::store_embedding_if_unsealed` on a transaction stamped
+    // with the caller's viewer (`AppState::store_claim_embedding_as`).
+    ("claims.rs", 3),
     ("computation.rs", 2),
     ("conventions.rs", 2),
     ("hypothesis.rs", 2),
@@ -538,8 +542,12 @@ const ROUTE_LAYER_WRITES: &[(&str, usize)] = &[
     ("rag.rs", 2),
     ("reasoning.rs", 2),
     ("revoke_signature.rs", 1),
-    // 4, not 5: the fifth is a `sqlx::query!` macro — see the note above.
-    ("submit.rs", 4),
+    // The `sqlx::query!` macro write is not counted — see the note above.
+    // 4 -> 2 (backlog 1e2315a9): `submit_packet`'s post-commit claim and
+    // figure-evidence `UPDATE ... SET embedding` moved onto a transaction
+    // stamped with the caller's viewer (`AppState::store_claim_embedding_as`,
+    // `store_evidence_embedding_as`).
+    ("submit.rs", 2),
     // 4 -> 2 (batch H-a): `report_outcome`'s two unstamped, result-discarding
     // `UPDATE claims` (truth value, counters) became
     // `ClaimRepository::update_truth_value_conn` / `set_properties_conn` on a
