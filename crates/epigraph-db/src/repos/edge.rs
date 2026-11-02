@@ -1839,10 +1839,10 @@ impl EdgeRepository {
     ///   the claims of every OTHER writer's BBA keyed on the edge, which it
     ///   removes. Recorded even when only the caller's own BBAs existed, so
     ///   their claims are re-derived.
-    /// * (a) it then deletes the caller's OWN edge-keyed BBAs, scoped
+    /// * (a) it then deletes the caller's OWN live edge-keyed BBAs, scoped
     ///   explicitly to the session's writable set (the same set the definer
     ///   read), so a privileged stamped session is held to the same owner
-    ///   scope as the application role.
+    ///   scope as the application role. A retracted one is kept for audit.
     ///
     /// [`EdgeWithdrawal::BeingDeleted`] first closes the row's window
     /// (`valid_to = now()`, the transaction's start, so `valid_to <= now()`
@@ -1917,11 +1917,14 @@ impl EdgeRepository {
             reason,
         )
         .await?;
-        // (a) The caller's own rows.
+        // (a) The caller's own LIVE rows. A retracted one (migration 184) is
+        // kept for audit and stays keyed on the withdrawn edge, where nothing
+        // folds it (rulings R-79, R-103).
         let deleted = sqlx::query(
             "DELETE FROM mass_functions \
               WHERE perspective_id = $1 \
-                AND owner_group_id = ANY (public.epigraph_writable_groups())",
+                AND owner_group_id = ANY (public.epigraph_writable_groups()) \
+                AND retracted_at IS NULL",
         )
         .bind(edge_id)
         .execute(&mut *conn)
