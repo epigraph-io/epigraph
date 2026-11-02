@@ -1236,6 +1236,35 @@ impl MassFunctionRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
+    /// How many RETRACTED rows (migration 184) `viewer` can read keyed on
+    /// `perspective_id`. The retraction cascade asks this for an edge it has
+    /// just invalidated: [`delete_edge_bbas`] keeps those rows, and each one
+    /// holds its key (operator ruling R-103), so the cascade neither deletes
+    /// nor re-wires them and reports how many it kept.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_retracted_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        perspective_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT count(*) FROM mass_functions
+             WHERE perspective_id = $1
+               AND retracted_at IS NOT NULL /* {VISIBILITY:mass_functions} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(perspective_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(u64::try_from(q.fetch_one(executor).await?).unwrap_or(0))
+    }
+
     /// Delete every LIVE mass function of a claim. A RETRACTED row (migration
     /// 184) is kept for audit (rulings R-79, R-103): it is neither deleted nor
     /// counted, and its presence is not a refusal.

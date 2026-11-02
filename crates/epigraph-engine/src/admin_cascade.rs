@@ -447,6 +447,7 @@ pub async fn report_for_caller(
             );
             return CascadeReport {
                 invalidated_bbas: report.invalidated_bbas,
+                retracted_key_kept: report.retracted_key_kept,
                 errors: vec![
                     "the cascade report could not be filtered to the caller's view; the \
                      details are in the audit row"
@@ -480,7 +481,7 @@ pub async fn report_for_caller(
                 }
             })
             .collect(),
-        retracted_key_kept: 0,
+        retracted_key_kept: report.retracted_key_kept,
     }
 }
 
@@ -668,6 +669,7 @@ async fn record_belief(
     details["belief"] = belief_counts(report);
     let full = serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
@@ -721,6 +723,7 @@ async fn record_belief(
 fn belief_counts(report: &CascadeReport) -> serde_json::Value {
     serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets.len(),
         "recomputed": report.recomputed.len(),
         "unbacked": report.unbacked.len(),

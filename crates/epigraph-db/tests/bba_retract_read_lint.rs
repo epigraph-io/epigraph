@@ -64,6 +64,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "mark_duplicate_act_attributed_conn", 1, "dedup guard: whether the duplicate holds ANY stored BBA the repair will move; retracted rows move with their marks"),
     ("crates/epigraph-db/src/repos/claim.rs", "repair_marked_duplicate", 7, "dedup repair: moves, snapshots and collision-checks stored rows, retracted ones included with their marks; no fold"),
     ("crates/epigraph-db/src/repos/claim.rs", "reverse_marked_duplicate", 3, "dedup undo: puts the repair's rows back, retracted ones included with their marks; no fold"),
+    ("crates/epigraph-db/src/repos/mass_function.rs", "count_retracted_for_perspective", 1, "counts RETRACTED rows only, for the retraction cascade's kept-key report (K4a); no fold"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "exists_for_perspective", 1, "edge wake-up gate (\"has this edge ever been wired\"): a retracted edge BBA counts as wired, so a re-asserted edge does not silently re-derive it"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "get_by_id", 1, "one row by id, for audit and the retract target lookup; returns a retracted row as stored"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "list_claim_ids", 1, "recompute enumerator: a claim whose every BBA is retracted still enters, so its recompute reads the (filtered) empty fold"),

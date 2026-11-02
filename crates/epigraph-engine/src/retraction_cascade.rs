@@ -376,6 +376,15 @@ pub async fn cascade_after_dedup(
 /// Only edges that actually carried a BBA become targets. An edge whose source
 /// was factorless at wire time has no derived record to repair, so recomputing
 /// its target would be a write with no cause — the cascade stays surgical.
+///
+/// A RETRACTED edge BBA (migration 184) is kept for audit (rulings R-79,
+/// R-103): the invalidation deletes live rows only, and an edge that still
+/// holds a retracted row is NOT re-wired. The retracted row holds the edge's
+/// key: re-writing it is refused by 184's rewrite guard (RT07, no bypass), and
+/// `auto_wire_edge_if_epistemic`'s wake-up gate counts it as wired, so an
+/// attempt would only roll the edge back with an error. Its live rows are
+/// still invalidated and its target repaired from what survives. Every
+/// retracted row so kept is counted in [`CascadeReport::retracted_key_kept`].
 #[allow(clippy::too_many_arguments)]
 async fn invalidate_and_rewire(
     conn: &mut sqlx::PgConnection,
@@ -446,8 +455,21 @@ async fn invalidate_and_rewire(
                 continue;
             }
         };
+        let kept = match MassFunctionRepository::count_retracted_for_perspective(
+            &mut *sp, viewer, *edge_id,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                report.note_error(&format!("count retracted BBAs for edge {edge_id}"), e);
+                let _ = sp.rollback().await;
+                continue;
+            }
+        };
         if deleted == 0 {
             let _ = sp.rollback().await;
+            report.retracted_key_kept += kept;
             continue;
         }
 
@@ -464,20 +486,21 @@ async fn invalidate_and_rewire(
         // The BBA is already deleted at that point, so silence here would mean
         // evidence destroyed with `CascadeReport::errors` still empty —
         // precisely the state C1(b) promises the caller can rule out.
-        if auto_wire_edge_if_epistemic(
-            &mut sp,
-            viewer,
-            /* was_created */ false,
-            *edge_id,
-            source_id,
-            "claim",
-            *target_id,
-            "claim",
-            relationship,
-            source_agent_id,
-        )
-        .await
-        .is_none()
+        if kept == 0
+            && auto_wire_edge_if_epistemic(
+                &mut sp,
+                viewer,
+                /* was_created */ false,
+                *edge_id,
+                source_id,
+                "claim",
+                *target_id,
+                "claim",
+                relationship,
+                source_agent_id,
+            )
+            .await
+            .is_none()
         {
             // Rolled back, not committed: `auto_wire_edge_if_epistemic` swallows
             // its own failure, and inside the savepoint that failure may have
@@ -522,6 +545,7 @@ async fn invalidate_and_rewire(
             continue;
         }
         report.invalidated_bbas += deleted;
+        report.retracted_key_kept += kept;
 
         if visited.insert(*target_id) {
             queued.push(*target_id);
