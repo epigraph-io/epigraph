@@ -109,6 +109,9 @@ def _exists(cur, mf_id: str) -> bool:
 @pytest.fixture
 def world(tmp_path):
     try:
+        # MAINTENANCE-DSN-EXEMPT: a test fixture on the CI-provisioned disposable
+        # `_test` database (guarded above), not an operator script; it never
+        # reads a deployment's DSN.
         conn = psycopg2.connect(TEST_DSN)
     except Exception as e:  # noqa: BLE001
         _unavailable(f"test DB unavailable: {e}")
