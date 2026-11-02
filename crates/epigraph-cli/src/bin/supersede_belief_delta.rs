@@ -12,8 +12,9 @@
 //!   current claims, the retracted rows an invalidation would keep, and
 //!   what removing the live ones does to each holder's served value;
 //! * `k12b`: the live BBAs keyed on `supersedes` edges and what removing
-//!   them would do (no deployed path removes them: a separate decision),
-//!   plus the sheaf half, which moves no served obstruction.
+//!   them would do (no deployed path removes them: a separate decision).
+//!   The sheaf half moves no served obstruction: the sheaf readers never
+//!   select `supersedes`.
 //!
 //! Every read runs in ONE `REPEATABLE READ READ ONLY` transaction on the
 //! maintenance connection (`epigraph_engine::supersede_delta::run_read_only`);

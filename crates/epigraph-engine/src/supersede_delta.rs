@@ -407,9 +407,6 @@ pub struct K12bReport {
     /// separate cleanup decision would change.
     pub ds_counterfactual: bool,
     pub ds_delta: DeltaBlock,
-    /// The sheaf readers never select `supersedes` (see the module docs),
-    /// so K12(b)'s restriction change moves no served obstruction.
-    pub sheaf_reads_supersedes: bool,
 }
 
 /// The R-131 measurement.
@@ -582,7 +579,6 @@ async fn measure(
             ds_rows_by_spelling: by_spelling,
             ds_counterfactual: true,
             ds_delta,
-            sheaf_reads_supersedes: false,
         });
     }
     if opts.items.k10_retro && opts.items.k12b {

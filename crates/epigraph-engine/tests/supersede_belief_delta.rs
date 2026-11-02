@@ -332,7 +332,7 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     let k12b = report.k12b.as_ref().expect("k12b block");
     assert_eq!(k12b.ds_rows, 1, "{k12b:?}");
     assert_eq!(ids(&k12b.ds_delta.claims), vec![w.lineage_target]);
-    assert!(k12b.ds_counterfactual && !k12b.sheaf_reads_supersedes);
+    assert!(k12b.ds_counterfactual);
 
     let r131 = report.r131.as_ref().expect("r131 block");
     assert_eq!(
@@ -527,5 +527,36 @@ fn the_delta_calls_no_write_path() {
                 );
             }
         }
+    }
+}
+
+/// K12(b)'s sheaf half moves no served obstruction: the sheaf readers select
+/// an explicit relationship list that names no `supersedes` (read-only pin on
+/// the repository's text; the readers' owner may change their filters, not
+/// this list's membership, without this test noticing).
+#[test]
+fn the_sheaf_readers_select_no_supersedes_edge() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("../epigraph-db/src/repos/sheaf.rs");
+    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    for reader in ["get_epistemic_edge_pairs", "get_claim_neighbor_betp_pairs"] {
+        assert!(
+            src.contains(&format!("fn {reader}")),
+            "the pin reads the file that defines {reader}"
+        );
+    }
+    let lists: Vec<&str> = src
+        .lines()
+        .filter(|l| l.contains("lower(e.relationship) IN ("))
+        .collect();
+    assert!(
+        lists.len() >= 2,
+        "both readers' relationship lists are found: {lists:?}"
+    );
+    for l in lists {
+        assert!(
+            l.contains("'refutes'") && !l.to_ascii_lowercase().contains("supersedes"),
+            "a sheaf reader's relationship list names supersedes: {l}"
+        );
     }
 }
