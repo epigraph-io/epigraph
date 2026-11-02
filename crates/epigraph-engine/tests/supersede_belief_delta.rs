@@ -15,7 +15,11 @@
 //!
 //! The fixture is a retirement the K10(2) arm never saw (a claim retired
 //! before it existed): a refuter R retired by a plain `is_current` flip, so
-//! its stayed edges' BBAs still weigh on current claims.
+//! its stayed edges' BBAs still weigh on current claims. It also holds rows
+//! each selection must NOT return (a `supersedes`-keyed row on a retired
+//! holder, a retracted `supersedes`-keyed row, a withdrawn factorless edge),
+//! and one claim that loses rows to BOTH K10(3) and K12(b), so the `combined`
+//! block is checked against the real writes too.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -48,6 +52,13 @@ struct World {
     kept_holder: Uuid,
     lineage_edge: Uuid,
     lineage_target: Uuid,
+    /// Loses a K10(3) row (from the retired refuter) AND a K12(b) row.
+    overlap: Uuid,
+    overlap_lineage_edge: Uuid,
+    /// Holds a live `supersedes`-keyed row, but is retired.
+    retired_lineage_holder: Uuid,
+    /// Holds only a RETRACTED `supersedes`-keyed row.
+    retracted_lineage_holder: Uuid,
     bystander: Uuid,
     r131: Vec<(Uuid, Uuid)>,
 }
@@ -107,6 +118,81 @@ async fn stamp(conn: &mut sqlx::PgConnection, pool: &PgPool, agent: Uuid) {
     .expect("stamp the session");
 }
 
+/// A public claim owned by `group` (so `owner` may retract rows it holds).
+async fn owned_claim(pool: &PgPool, owner: Uuid, group: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(tag)
+    .bind(&hash)
+    .bind(owner)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("a public claim owned by the owner's group");
+    id
+}
+
+/// Store a BBA on `holder` keyed on `edge` (a pre-K12(b) `supersedes` row:
+/// nothing wires one any more) and return its id.
+async fn store_on_edge(pool: &PgPool, holder: Uuid, frame: Uuid, agent: Uuid, edge: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge, Some(agent))
+        .await
+        .expect("edge perspective");
+    MassFunctionRepository::store_with_perspective(
+        &mut *conn,
+        holder,
+        frame,
+        Some(agent),
+        Some(edge),
+        &serde_json::json!({"1": 0.7, "0,1": 0.3}),
+        None,
+        Some("edge_factor"),
+        Some(0.9),
+        Some("contradicts"),
+        "cross",
+        None,
+    )
+    .await
+    .expect("the pre-K12(b) supersedes BBA");
+    sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1 AND claim_id = $2")
+        .bind(edge)
+        .bind(holder)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the stored row")
+}
+
+/// Retract `row` as `owner` through the real repository path.
+async fn retract_as(pool: &PgPool, owner: Uuid, row: Uuid) {
+    let p = pool.clone();
+    let retracted = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = MassFunctionRepository::retract_conn(&mut conn, row, "k0 fixture", None).await;
+        (conn, r)
+    })
+    .await
+    .expect("the owner retracts the row through the real path");
+    assert_eq!(retracted.status.as_str(), "retracted", "PREMISE");
+}
+
+async fn retire(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("retire by a plain flip");
+}
+
 async fn world(pool: &PgPool) -> World {
     let (scoped, bypass) = fixture::bypass(pool).await;
     let public = fixture::public_viewer(pool).await;
@@ -123,26 +209,16 @@ async fn world(pool: &PgPool) -> World {
     let supporter = believed(pool, agent, "k0 supporter", 0.6, 0.7).await;
     let refuted = fixture::seed_public_claim(pool, agent, "k0 refuted").await;
     let lonely = fixture::seed_public_claim(pool, agent, "k0 lonely").await;
-    let kept_holder: Uuid = {
-        let id = Uuid::new_v4();
-        let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
-        sqlx::query(
-            "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
-                                 visibility, owner_group_id) \
-             VALUES ($1, 'k0 kept holder', $2, 0.5, $3, true, 'public', $4)",
-        )
-        .bind(id)
-        .bind(&hash)
-        .bind(owner)
-        .bind(group)
-        .execute(pool)
-        .await
-        .expect("a public claim owned by the owner's group");
-        id
-    };
+    let kept_holder = owned_claim(pool, owner, group, "k0 kept holder").await;
+    // The overlap claim: refuted by R AND (below) holding a supersedes row,
+    // with a supporter that survives both removals.
+    let overlap = fixture::seed_public_claim(pool, agent, "k0 overlap").await;
+    let overlap_supporter = believed(pool, agent, "k0 overlap supporter", 0.65, 0.75).await;
     wire(pool, &public, agent, retired, refuted, "refutes").await;
     wire(pool, &public, agent, supporter, refuted, "supports").await;
     wire(pool, &public, agent, retired, lonely, "contradicts").await;
+    wire(pool, &public, agent, retired, overlap, "refutes").await;
+    wire(pool, &public, agent, overlap_supporter, overlap, "supports").await;
     let kept_edge = wire(pool, &public, agent, retired, kept_holder, "contradicts").await;
     let kept_row: Uuid =
         sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
@@ -150,24 +226,9 @@ async fn world(pool: &PgPool) -> World {
             .fetch_one(pool)
             .await
             .expect("the row to retract");
-    let p = pool.clone();
-    let retracted = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
-        stamp(&mut conn, &p, owner).await;
-        let r = MassFunctionRepository::retract_conn(&mut conn, kept_row, "k0 fixture", None).await;
-        (conn, r)
-    })
-    .await
-    .expect("the owner retracts the row through the real path");
-    assert_eq!(retracted.status.as_str(), "retracted", "PREMISE");
+    retract_as(pool, owner, kept_row).await;
     // The retirement the K10(2) arm never saw.
-    sqlx::query(
-        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
-          WHERE id = $1",
-    )
-    .bind(retired)
-    .execute(pool)
-    .await
-    .expect("retire the refuter");
+    retire(pool, retired).await;
     let successor = fixture::seed_public_claim(pool, agent, "k0 successor").await;
 
     // K12(b): a graph-only lineage edge between current claims whose target
@@ -177,35 +238,39 @@ async fn world(pool: &PgPool) -> World {
     let other = believed(pool, agent, "k0 other supporter", 0.7, 0.8).await;
     wire(pool, &public, agent, other, lineage_target, "supports").await;
     let lineage_edge = edge(pool, newer, lineage_target, "supersedes").await;
+    store_on_edge(pool, lineage_target, frame, agent, lineage_edge).await;
+    let overlap_lineage_edge = edge(pool, newer, overlap, "SUPERSEDES").await;
+    store_on_edge(pool, overlap, frame, agent, overlap_lineage_edge).await;
     let mut conn = pool.acquire().await.expect("acquire");
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, lineage_edge, Some(agent))
+    for holder in [lineage_target, overlap] {
+        epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            &mut conn, &public, holder, frame,
+        )
         .await
-        .expect("edge perspective");
-    MassFunctionRepository::store_with_perspective(
-        &mut *conn,
-        lineage_target,
-        frame,
-        Some(agent),
-        Some(lineage_edge),
-        &serde_json::json!({"1": 0.7, "0,1": 0.3}),
-        None,
-        Some("edge_factor"),
-        Some(0.9),
-        Some("contradicts"),
-        "cross",
-        None,
-    )
-    .await
-    .expect("the pre-K12(b) supersedes BBA");
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        &mut conn,
-        &public,
-        lineage_target,
-        frame,
-    )
-    .await
-    .expect("its cache folds both rows");
+        .expect("its cache folds every row it holds");
+    }
     drop(conn);
+
+    // NOT selected by K12(b): a live supersedes-keyed row on a RETIRED
+    // holder, and a RETRACTED supersedes-keyed row on a current holder.
+    let retired_lineage_holder =
+        fixture::seed_public_claim(pool, agent, "k0 retired lineage holder").await;
+    let e = edge(pool, newer, retired_lineage_holder, "supersedes").await;
+    let row = store_on_edge(pool, retired_lineage_holder, frame, agent, e).await;
+    retire(pool, retired_lineage_holder).await;
+    let still: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE id = $1 AND retracted_at IS NULL",
+    )
+    .bind(row)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(still, 1, "PREMISE: the retired holder keeps its live row");
+    let retracted_lineage_holder =
+        owned_claim(pool, owner, group, "k0 retracted lineage holder").await;
+    let e = edge(pool, newer, retracted_lineage_holder, "supersedes").await;
+    let row = store_on_edge(pool, retracted_lineage_holder, frame, agent, e).await;
+    retract_as(pool, owner, row).await;
 
     // A bystander: a supported claim no selection touches.
     let s2 = believed(pool, agent, "k0 bystander supporter", 0.8, 0.9).await;
@@ -221,14 +286,36 @@ async fn world(pool: &PgPool) -> World {
     let e1 = edge(pool, c1, c2, "corroborates").await;
     let e2 = edge(pool, c2, c1, "corroborates").await;
     let e3 = edge(pool, c3, c4, "refutes").await;
+    // NOT selected by R-131: a factorless corroborates edge between current
+    // claims that is no longer in force.
+    let c5 = fixture::seed_public_claim(pool, agent, "k0 c5").await;
+    let c6 = fixture::seed_public_claim(pool, agent, "k0 c6").await;
+    let e4 = edge(pool, c5, c6, "corroborates").await;
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+        .bind(e4)
+        .execute(pool)
+        .await
+        .expect("withdraw the edge");
     let dropped =
         sqlx::query("DELETE FROM factors WHERE properties->>'source_edge_id' = ANY($1::text[])")
-            .bind(vec![e1.to_string(), e2.to_string(), e3.to_string()])
+            .bind(vec![
+                e1.to_string(),
+                e2.to_string(),
+                e3.to_string(),
+                e4.to_string(),
+            ])
             .execute(pool)
             .await
             .expect("drop the trigger's factors (a casefold UPDATE never minted them)")
             .rows_affected();
     assert!(dropped >= 2, "PREMISE: the trigger minted their factors");
+    let e4_factors: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM factors WHERE properties->>'source_edge_id' = $1")
+            .bind(e4.to_string())
+            .fetch_one(pool)
+            .await
+            .expect("count");
+    assert_eq!(e4_factors, 0, "PREMISE: the withdrawn edge is factorless");
 
     World {
         _scoped: scoped,
@@ -240,6 +327,10 @@ async fn world(pool: &PgPool) -> World {
         kept_holder,
         lineage_edge,
         lineage_target,
+        overlap,
+        overlap_lineage_edge,
+        retired_lineage_holder,
+        retracted_lineage_holder,
         bystander,
         r131: vec![(c1, e1), (c1, e2), (c3, e3)],
     }
@@ -257,6 +348,18 @@ async fn cache(pool: &PgPool, id: Uuid) -> Cache {
 
 fn ids(claims: &[ClaimDelta]) -> Vec<Uuid> {
     claims.iter().map(|c| c.id).collect()
+}
+
+fn sorted(mut v: Vec<Uuid>) -> Vec<Uuid> {
+    v.sort();
+    v
+}
+
+fn find(claims: &[ClaimDelta], id: Uuid) -> &ClaimDelta {
+    claims
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("{id} is in the block: {claims:?}"))
 }
 
 fn close(a: Option<f64>, b: Option<f64>) -> bool {
@@ -300,12 +403,14 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
             k10.retired_sources,
             k10.retracted_key_kept
         ),
-        (2, 2, 1, 1),
-        "two live rows on two edges from one retired source; the retracted one is kept: {k10:?}"
+        (3, 3, 1, 1),
+        "three live rows on three edges from one retired source; the retracted one is kept: {k10:?}"
     );
-    let mut expected = vec![w.refuted, w.lonely];
-    expected.sort();
-    assert_eq!(ids(&k10.delta.claims), expected, "{k10:?}");
+    assert_eq!(
+        ids(&k10.delta.claims),
+        sorted(vec![w.refuted, w.lonely, w.overlap]),
+        "{k10:?}"
+    );
     assert!(
         !ids(&k10.delta.claims).contains(&w.kept_holder),
         "a holder whose only row from the retired claim is retracted is not affected"
@@ -330,21 +435,56 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     assert_eq!(lonely.outcome, DeltaOutcome::Unbacked, "{lonely:?}");
 
     let k12b = report.k12b.as_ref().expect("k12b block");
-    assert_eq!(k12b.ds_rows, 1, "{k12b:?}");
-    assert_eq!(ids(&k12b.ds_delta.claims), vec![w.lineage_target]);
+    assert_eq!(
+        k12b.ds_rows, 2,
+        "only the live rows on CURRENT holders: not the retired holder's live row, not the \
+         retracted row: {k12b:?}"
+    );
+    assert_eq!(
+        k12b.ds_rows_by_spelling,
+        [("SUPERSEDES".to_string(), 1), ("supersedes".to_string(), 1)]
+            .into_iter()
+            .collect(),
+        "both spellings are selected and counted apart"
+    );
+    assert_eq!(
+        ids(&k12b.ds_delta.claims),
+        sorted(vec![w.lineage_target, w.overlap]),
+        "{k12b:?}"
+    );
+    for absent in [w.retired_lineage_holder, w.retracted_lineage_holder] {
+        assert!(
+            !ids(&k12b.ds_delta.claims).contains(&absent),
+            "{absent}: a retired holder, or a holder of only a retracted row, is not affected"
+        );
+    }
     assert!(k12b.ds_counterfactual);
 
     let r131 = report.r131.as_ref().expect("r131 block");
     assert_eq!(
         (r131.edges, r131.slots_minted, r131.edges_on_held_slots),
         (3, 2, 0),
-        "three factorless edges, two slots (the symmetric pair shares one): {r131:?}"
+        "three factorless edges in force (not the withdrawn one), two slots (the symmetric pair \
+         shares one): {r131:?}"
     );
 
     let combined = report.combined.as_ref().expect("combined block");
-    let mut union = vec![w.refuted, w.lonely, w.lineage_target];
-    union.sort();
-    assert_eq!(ids(&combined.claims), union);
+    assert_eq!(
+        ids(&combined.claims),
+        sorted(vec![w.refuted, w.lonely, w.lineage_target, w.overlap])
+    );
+    let both = find(&combined.claims, w.overlap);
+    assert_eq!(
+        (both.causes.clone(), both.rows_removed, both.outcome),
+        (vec!["k10_retro", "k12b_ds"], 2, DeltaOutcome::Recomputed),
+        "the overlap claim loses one row to each cause and keeps its supporter: {both:?}"
+    );
+    assert!(
+        (both.new.and_then(|n| n.betp)).is_some()
+            && find(&k10.delta.claims, w.overlap).new != both.new
+            && find(&k12b.ds_delta.claims, w.overlap).new != both.new,
+        "the combined value differs from each single-cause value, so it is a real union fold"
+    );
     for block in [&k10.delta, &k12b.ds_delta, combined] {
         assert!(
             !ids(&block.claims).contains(&w.bystander),
@@ -353,6 +493,42 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     }
 
     // ── The oracle: the real write paths over the same rows ──
+    // K12(b) alone on the overlap claim, in a transaction rolled back: the
+    // real removal + repair, before K10(2) runs, so the single-cause value can
+    // be compared with what the write path does (the final state below holds
+    // both removals, which is the `combined` value).
+    {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        let n = MassFunctionRepository::delete_for_perspective(&mut *tx, w.overlap_lineage_edge)
+            .await
+            .expect("remove the overlap's supersedes BBA");
+        assert_eq!(n, 1);
+        let r = epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal(
+            &mut tx,
+            &w.viewer,
+            &[w.overlap],
+            n,
+        )
+        .await;
+        assert!(r.errors.is_empty(), "{r:?}");
+        let written: Cache =
+            sqlx::query_as("SELECT belief, plausibility, pignistic_prob FROM claims WHERE id = $1")
+                .bind(w.overlap)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("read inside the transaction");
+        let predicted = find(&k12b.ds_delta.claims, w.overlap)
+            .new
+            .expect("a prediction");
+        assert!(
+            close(written.0, predicted.belief)
+                && close(written.1, predicted.plausibility)
+                && close(written.2, predicted.betp),
+            "K12(b) alone on the overlap claim: wrote {written:?}, predicted {predicted:?}"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+
     let r = epigraph_engine::retraction_cascade::cascade_after_supersede(
         &mut conn,
         &w.viewer,
@@ -373,19 +549,33 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     .expect("count");
     assert_eq!(kept, 1, "the retracted row is kept");
 
-    let n = MassFunctionRepository::delete_for_perspective(&mut *conn, w.lineage_edge)
-        .await
-        .expect("remove the supersedes BBA");
-    assert_eq!(n, 1);
+    let mut n = 0;
+    for e in [w.lineage_edge, w.overlap_lineage_edge] {
+        let one = MassFunctionRepository::delete_for_perspective(&mut *conn, e)
+            .await
+            .expect("remove the supersedes BBA");
+        assert_eq!(one, 1);
+        n += one;
+    }
     let r = epigraph_engine::retraction_cascade::cascade_after_edge_withdrawal(
         &mut conn,
         &w.viewer,
-        &[w.lineage_target],
+        &[w.lineage_target, w.overlap],
         n,
     )
     .await;
     assert!(r.errors.is_empty(), "{r:?}");
-    assert_written_as_predicted(&pool, &k12b.ds_delta.claims).await;
+    // The overlap claim now holds BOTH removals: its single-cause K12(b)
+    // value was checked in the rolled-back transaction above.
+    let k12b_only: Vec<ClaimDelta> = k12b
+        .ds_delta
+        .claims
+        .iter()
+        .filter(|c| c.id != w.overlap)
+        .cloned()
+        .collect();
+    assert_written_as_predicted(&pool, &k12b_only).await;
+    assert_written_as_predicted(&pool, &combined.claims).await;
 
     let mut minted = 0;
     for (claim, e) in &w.r131 {
