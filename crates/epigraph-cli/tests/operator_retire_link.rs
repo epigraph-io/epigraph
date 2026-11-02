@@ -142,8 +142,11 @@ async fn retire_link_retires_a_live_link_once_and_audits_it(pool: PgPool) {
         ],
         &dsn,
     );
-    let recorded_by: Option<String> = sqlx::query_scalar(
-        "SELECT details ->> 'recorded_by' FROM security_events \
+    // The committed audit row: who, why (the --reason passed through, not a
+    // constant) and how many rows the same act revoked.
+    let audit: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT details ->> 'recorded_by', details ->> 'reason', \
+                details ->> 'memberships_revoked' FROM security_events \
           WHERE agent_id = $1 AND event_type = 'operator.link_retired'",
     )
     .bind(agent)
@@ -191,7 +194,15 @@ async fn retire_link_retires_a_live_link_once_and_audits_it(pool: PgPool) {
         applied.show()
     );
     assert_eq!(applied_state, (Some(true), 0, 1));
-    assert_eq!(recorded_by.as_deref(), Some(role.as_str()));
+    assert_eq!(
+        audit,
+        Some((
+            Some(role.clone()),
+            Some("key retired".to_string()),
+            Some("1".to_string())
+        )),
+        "one audit row: the login, the reason given, one membership revoked"
+    );
 
     assert_eq!(again.code, 0, "a repeat is idempotent: {}", again.show());
     assert!(

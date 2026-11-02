@@ -184,6 +184,63 @@ async fn a_direct_retire_of_a_live_link_is_audited(pool: PgPool) {
         1,
         "no row for a no-op"
     );
+
+    // A superuser stays outside the retire-only guard (it can disable a
+    // trigger anyway), so its un-retire is possible; it is audited too.
+    sqlx::query("UPDATE operator_links SET retired = false WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&pool)
+        .await
+        .expect("a superuser un-retires the link directly");
+    let rows = retire_audit(&pool, agent).await;
+    assert_eq!(rows.len(), 2, "the un-retire writes one more row: {rows:?}");
+    let (kind, d) = &rows[1];
+    assert_eq!(kind, "operator.link_unretired");
+    assert_eq!(d["retired_before"], serde_json::json!(true));
+    assert_eq!(d["retired"], serde_json::json!(false));
+    assert_eq!(d["via"], serde_json::json!("direct"));
+    assert_eq!(d["recorded_by"], serde_json::json!(me));
+}
+
+/// The verb's audit context (reason, revoked count, `via`) is its own
+/// UPDATE's only: it is cleared right after, so a later direct retire in the
+/// SAME transaction is audited `via = direct` with no reason, never with the
+/// verb's.
+///
+/// Verified to fail: the clearing `set_config(..., '', true)` after the verb's
+/// UPDATE removed -> agent B's row carries the verb's reason and `via`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_verbs_audit_context_does_not_leak_to_a_later_retire(pool: PgPool) {
+    let (_, a, _) = live_linked(&pool, "ctx-a").await;
+    let (_, b, _) = live_linked(&pool, "ctx-b").await;
+    let mut tx = pool.begin().await.expect("begin");
+    let r: RetireRow = sqlx::query_as(RETIRE)
+        .bind(a)
+        .bind("verb reason")
+        .bind(true)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the verb retires A");
+    assert_eq!(r.0, "retired");
+    sqlx::query("UPDATE operator_links SET retired = true WHERE agent_id = $1")
+        .bind(b)
+        .execute(&mut *tx)
+        .await
+        .expect("a direct retire of B in the same transaction");
+    tx.commit().await.expect("commit");
+
+    let ra = retire_audit(&pool, a).await;
+    assert_eq!(ra.len(), 1, "{ra:?}");
+    assert_eq!(ra[0].1["reason"], serde_json::json!("verb reason"));
+    assert_eq!(
+        ra[0].1["via"],
+        serde_json::json!("epigraph_retire_operator_link")
+    );
+    let rb = retire_audit(&pool, b).await;
+    assert_eq!(rb.len(), 1, "{rb:?}");
+    assert_eq!(rb[0].1["via"], serde_json::json!("direct"), "{}", rb[0].1);
+    assert!(rb[0].1["reason"].is_null(), "{}", rb[0].1);
+    assert!(rb[0].1["memberships_revoked"].is_null(), "{}", rb[0].1);
 }
 
 /// A maintenance login's DIRECT `UPDATE operator_links SET retired = true`
