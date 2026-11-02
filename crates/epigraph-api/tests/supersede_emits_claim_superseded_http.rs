@@ -129,8 +129,13 @@ async fn a_rest_supersession_emits_one_claim_superseded(pool: PgPool) {
 }
 
 /// A refused supersession pushes none: neither a caller the per-claim rule
-/// refuses (a bystander), nor one the database refuses after the act ran (a
-/// `claims:admin` caller whose stamp does not write the claim's group).
+/// refuses (a bystander), nor one row security refuses inside the act (a
+/// `claims:admin` caller whose stamp does not write the claim's group), so
+/// the push sits after the act on the success path. Neither refusal happens
+/// after a successful act: no failure between the act and the commit is
+/// reachable at head without fault injection, so the push's placement after
+/// `tx.commit()` (rather than between the act and the commit) is guarded by
+/// its code position, not by this test.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_refused_supersession_emits_no_claim_superseded(pool: PgPool) {
     let state = app_role_state(&pool).await;
