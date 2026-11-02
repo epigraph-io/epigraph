@@ -13107,7 +13107,9 @@ async fn reverse_marked_duplicate(
     // returning input's slot on the duplicate may since hold the duplicate's
     // re-derived CACHED combination (the cascade recomputed it); that row is
     // derived and is cleared so the input can return. Any other occupant of
-    // the slot is a later write: the row stays where it is (drifted).
+    // the slot is a later write: the row stays where it is (drifted). So is a
+    // RETRACTED cached row (migration 184): it is kept for audit and holds its
+    // key (rulings R-79, R-103), so the input it blocks is reported drifted.
     let moved_ids: Vec<Uuid> = record.moved_bbas.iter().map(|m| m.id).collect();
     let moved_json =
         serde_json::to_value(&record.moved_bbas).map_err(|e| DbError::InvalidData {
@@ -13118,7 +13120,7 @@ async fn reverse_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions k
               USING mass_functions m
-              WHERE k.claim_id = $2 AND {}
+              WHERE k.claim_id = $2 AND {} AND k.retracted_at IS NULL
                 AND m.id = ANY($3) AND m.claim_id = ANY($1)
                 AND m.frame_id = k.frame_id
                 AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
@@ -13164,7 +13166,9 @@ async fn reverse_marked_duplicate(
     // only beside an edge that is in force again: every one of them is keyed
     // to an edge, and a BBA on a retracted edge is exactly the orphan the
     // repair exists to prevent. One whose id or key is taken again is a later
-    // write's and is skipped.
+    // write's and is skipped (`ON CONFLICT DO NOTHING`, no conflict target, so
+    // a key a RETRACTED row holds is skipped too and its row reported
+    // drifted; the retracted row is not touched).
     if !record.deleted_bbas.is_empty() {
         let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
         let asked: Vec<Uuid> = record
