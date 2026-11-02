@@ -43,7 +43,10 @@ impl EdgeBbaCascade {
 /// the dedup move already use):
 ///
 /// * a PRIVILEGED session (superuser, BYPASSRLS, a maintenance member) runs the
-///   plain `DELETE` it always ran;
+///   plain `DELETE` of the edge's LIVE rows: a RETRACTED row (migration 184)
+///   is kept for audit and stays keyed on its edge (rulings R-79, R-103), so
+///   an invalidation, a dedup's orphan repair or a match-candidate retire
+///   never removes it;
 /// * any other session calls `epigraph_cascade_delete_edge_bbas` (115, reduced
 ///   to its owner arm by migration 117), which deletes only the session's OWN
 ///   rows (owner group in its writable set), refuses the whole call with
@@ -70,7 +73,8 @@ pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
         WITH acc AS (SELECT public.epigraph_session_is_privileged_writer() AS priv),
         own AS (
             DELETE FROM mass_functions
-             WHERE perspective_id = ANY($1) AND (SELECT priv FROM acc)
+             WHERE perspective_id = ANY($1) AND retracted_at IS NULL
+               AND (SELECT priv FROM acc)
             RETURNING 1
         )
         SELECT CASE WHEN acc.priv THEN (SELECT count(*) FROM own)
