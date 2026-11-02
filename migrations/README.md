@@ -2180,6 +2180,50 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **194**: public `retracted_bba_delete_guard` (H10; operator rulings
+  R-79 / R-103; SPEC section 10.1 S-1). A RETRACTED mass function is deleted
+  only by the audited purge definer, including the deletes the `ON DELETE
+  CASCADE` foreign keys from `claims` and `frames` perform. Adds
+  `mass_function_purge_grants` (one row names one `mass_functions` id for the
+  current transaction; `REVOKE ALL` from PUBLIC and `epigraph_app`;
+  `epigraph_maintenance` gets SELECT, INSERT, DELETE), the helper
+  `epigraph_mf_purge_granted(uuid)` (STABLE definer, executable by
+  `epigraph_app`, `epigraph_maintenance` and a non-superuser owner of
+  `mass_functions`, the role an FK cascade runs as), the purge definer
+  `epigraph_purge_mass_functions(uuid[], text)` (maintenance only; a reason
+  of 1..2000 chars; grants, deletes, clears its grants, and appends one
+  `mass_functions.purge` security event carrying every deleted row whole and
+  the reason), and the guard trigger `mass_functions_retracted_delete_guard`
+  (`BEFORE DELETE ... FOR EACH ROW WHEN (OLD.retracted_at IS NOT NULL)`,
+  SECURITY INVOKER) that refuses `SR09` (42501) any delete of a retracted row
+  no grant of the current transaction names. The exception is the grant
+  ONLY: no session setting and no `epigraph_definer_bypass()`, both of which
+  an FK cascade started by an application session can satisfy. Re-bodies
+  117's `epigraph_cascade_delete_edge_bbas(uuid[], text)` with `retracted_at
+  IS NULL` on its privileged DELETE and on its owner arm's candidate select
+  (so a retracted row is neither deleted nor counted toward CD02), stating
+  `search_path = pg_catalog, public, pg_temp`, behind a precondition on 117's
+  md5 (`39f3eacd53e7717a323759ec91b5c2c0`) and on a `proconfig` of exactly
+  117's or slot 190's path (`55000` otherwise, nothing changed; 194 does not
+  depend on 190). The new definers are on 172's form (`pg_catalog,
+  pg_temp`, every name qualified). Claim and frame hard-deletes purge first,
+  then delete (`epigraph-operator delete-frames` does). **Residual** (184's
+  posture): a maintenance login can insert a grant row directly. Sets
+  `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/mass_function_purge_guard.rs` (incl. the FK-cascade
+  attack under a superuser and a NOSUPERUSER non-maintenance table owner,
+  the precondition, the undo); FK actions on `claims`, `edges` and
+  `mass_functions` in `epigraph-db/tests/fk_action_guard_ratchet.rs`. Undo:
+  `docs/runbooks/194-undo.sql`. Checked before claiming: no migration on
+  main, open PR, origin branch or local worktree carries a `194`.
+  **Deploy order (binding):** only AFTER the release that keeps retracted
+  rows on every privileged delete path (SPEC phase 1 K4a) is installed on
+  every binary that deletes `mass_functions` on a privileged connection; the
+  purge callers (`epigraph-operator delete-frames`) after the migrate.
+  **Predeploy check:** `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid
+  = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
+  text)')` must print 117's md5 and one of the two paths.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
