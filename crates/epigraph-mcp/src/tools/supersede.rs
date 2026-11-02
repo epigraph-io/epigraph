@@ -363,11 +363,13 @@ pub async fn mark_duplicate(
 
 /// The refusal an un-mark gets on a server without the administrative
 /// connection: unlike a mark, an un-mark has no deferred form (migration 117's
-/// deferral definer accepts no such cause), so nothing is written.
+/// deferral definer accepts no such cause), so nothing is written. It names
+/// the operator CLI that runs the un-mark instead (backlog e8113079).
 pub const UNMARK_NEEDS_ADMIN_CONNECTION: &str =
     "unmark_duplicate needs this server's administrative (maintenance) connection: an \
      un-mark is the dedup's act and its reversal together and cannot be deferred to the \
-     replay; nothing was written";
+     replay; nothing was written. An operator runs it as the `unmark_duplicate` CLI on the \
+     maintenance DSN";
 
 pub async fn unmark_duplicate(
     server: &EpiGraphMcpFull,
