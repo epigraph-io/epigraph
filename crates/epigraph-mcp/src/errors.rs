@@ -685,15 +685,44 @@ mod tests {
             logs_contain("WARN"),
             "logged at warn, the HTTP mapper's level"
         );
+        // By field NAME, on the refusal's own line, under the MCP target.
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("the repository refused the request"))
+                .ok_or("no repository-refusal line")?;
+            for field in [
+                "WARN",
+                "mcp.internal_error",
+                "kind=State",
+                "detail=mark_duplicate: canonical c-5b17",
+            ] {
+                if !line.contains(field) {
+                    return Err(format!("the refusal's line lacks `{field}`: {line}"));
+                }
+            }
+            Ok(())
+        });
 
         let uncoded = internal_error(epigraph_db::DbError::from(sqlx::Error::Protocol(
             "worker at db-host-a91e failed".to_string(),
         )));
         assert_eq!(uncoded.message, INTERNAL_ERROR_MESSAGE);
-        assert!(
-            logs_contain("db-host-a91e") && logs_contain("mcp.internal_error"),
-            "calibration: the redacted path still logs under mcp.internal_error"
-        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|l| {
+                    l.contains("db-host-a91e")
+                        && l.contains("mcp.internal_error")
+                        && l.contains("ERROR")
+                })
+                .then_some(())
+                .ok_or_else(|| {
+                    "calibration: the redacted path logs its detail at error under \
+                     mcp.internal_error, on one line"
+                        .to_string()
+                })
+        });
     }
 
     /// The schema-code gate decides which database text reaches the caller,

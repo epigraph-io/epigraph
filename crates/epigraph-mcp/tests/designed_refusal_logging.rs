@@ -97,4 +97,23 @@ async fn a_coded_database_refusal_is_logged_with_its_detail_and_sent_without_it(
         "the log line carries the refusal's message (detail): {logs}"
     );
     assert!(logs.contains("WARN"), "logged at warn: {logs}");
+
+    // The fields are the HTTP mapper's, by NAME, on the refusal's own line,
+    // under the MCP journal's target: renaming `db_detail` or `detail`, or
+    // dropping the target, is a regression.
+    let line = logs
+        .lines()
+        .find(|l| l.contains("the database refused the request"))
+        .expect("the refusal's line");
+    for field in [
+        "WARN",
+        "mcp.internal_error",
+        "detail=GRM05: the roster refused this change",
+        &format!("db_detail=Some(\"{DETAIL}\")"),
+    ] {
+        assert!(
+            line.contains(field),
+            "the refusal's line carries `{field}`: {line}"
+        );
+    }
 }
