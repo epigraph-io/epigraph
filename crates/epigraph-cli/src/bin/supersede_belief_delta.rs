@@ -86,6 +86,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         .and_then(|()| out.write_all(b"\n"))
         .map_err(|e| format!("{}: {e}", cli.json.display()))?;
 
+    println!(
+        "transaction: read_only={}, isolation={}",
+        report.transaction_read_only, report.transaction_isolation
+    );
     if let Some(r) = &report.r131 {
         println!(
             "r131: {} factorless edges, {} slots a mint would fill, {} on held slots",

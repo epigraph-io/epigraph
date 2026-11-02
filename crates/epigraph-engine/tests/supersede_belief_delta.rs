@@ -471,6 +471,14 @@ async fn the_delta_is_read_only_and_a_run_changes_nothing(pool: PgPool) {
         "PREMISE: the run measured something"
     );
     assert_eq!(
+        (
+            first.transaction_read_only.as_str(),
+            first.transaction_isolation.as_str()
+        ),
+        ("on", "repeatable read"),
+        "the run itself was measured in one REPEATABLE READ READ ONLY transaction"
+    );
+    assert_eq!(
         serde_json::to_vec_pretty(&first).expect("json"),
         serde_json::to_vec_pretty(&second).expect("json"),
         "two runs on one snapshot are byte-identical"
@@ -506,6 +514,9 @@ fn the_delta_calls_no_write_path() {
         "INSERT ",
         "UPDATE ",
         "DELETE ",
+        // Only `begin_read_only` opens a transaction, and nothing commits.
+        ".begin(",
+        ".commit(",
     ];
     for rel in [
         "src/supersede_delta.rs",

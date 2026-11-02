@@ -431,6 +431,11 @@ pub struct R131Report {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct DeltaReport {
     pub items: DeltaItems,
+    /// `current_setting('transaction_read_only')` inside the run: `on`.
+    pub transaction_read_only: String,
+    /// `current_setting('transaction_isolation')` inside the run:
+    /// `repeatable read`.
+    pub transaction_isolation: String,
     pub served_value: &'static str,
     pub r131: Option<R131Report>,
     pub k10_retro: Option<K10RetroReport>,
@@ -483,8 +488,18 @@ async fn measure(
     viewer: &epigraph_db::visibility::Viewer,
     opts: &DeltaOptions,
 ) -> Result<DeltaReport, String> {
+    // Read back from the server, so a report proves the transaction it was
+    // measured in (SPEC §11 K0: one REPEATABLE READ READ ONLY transaction).
+    let (read_only, isolation): (String, String) = sqlx::query_as(
+        "SELECT current_setting('transaction_read_only'), current_setting('transaction_isolation')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| format!("read the transaction's mode: {e}"))?;
     let mut report = DeltaReport {
         items: opts.items,
+        transaction_read_only: read_only,
+        transaction_isolation: isolation,
         served_value: "the DS cache on claims (BetP, Bel, Pl); BP marginals are not served",
         ..DeltaReport::default()
     };
