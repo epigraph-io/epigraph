@@ -220,7 +220,11 @@ class RollbackKeepsRetractedRows(unittest.TestCase):
     """SPEC section 11 phase 1, K4b: migration 194 (H10) refuses any delete of a
     RETRACTED mass function outside its audited purge definer, so the
     rollback's DELETE must skip retracted ids (and report them) instead of
-    failing the whole rollback with SR09."""
+    failing the whole rollback with SR09.
+
+    These pin the SQL text and the report wording only: the cursor's counts
+    are canned, so no count here is asserted back. The database behaviour is
+    test_migrate_provenance_bba_db.py's."""
 
     def manifest(self, ids):
         path = Path(self.tmp.name) / "run.jsonl"
@@ -260,14 +264,12 @@ class RollbackKeepsRetractedRows(unittest.TestCase):
         self.assertIn(self.retracted, out, "the skipped id is reported")
         self.assertIn("skipped 1 retracted", out)
         self.assertNotIn("already absent", out, "a skipped row is not an absent row")
-        self.assertEqual(deleted, 2)
 
     def test_the_dry_run_counts_only_live_rows_and_names_the_retracted_ones(self):
         cur, deleted, out = self.run_rollback(execute=False)
         counts = [s for s, _ in cur.statements if s.startswith("SELECT COUNT(*) AS n FROM mass_functions")]
         self.assertEqual(len(counts), 1, cur.statements)
         self.assertIn("AND retracted_at IS NULL", counts[0])
-        self.assertIn("would delete 2 BBAs", out)
         self.assertIn("would skip 1 retracted", out)
         self.assertIn(self.retracted, out)
         self.assertFalse(any(s.startswith("DELETE") for s, _ in cur.statements))
