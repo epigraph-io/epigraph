@@ -266,33 +266,74 @@ async fn replay_consolidate(pool: &PgPool, merged: Uuid, sources: Vec<Uuid>) {
 /// The `properties` a supersession act edge carries
 /// (`ClaimRepository::supersede_act_conn`).
 fn act_marker() -> serde_json::Value {
+    act_marker_of(epigraph_db::SupersedeTool::SupersedeClaim.as_str())
+}
+
+/// [`act_marker`] for the act written by `tool` (a [`SupersedeTool`] value:
+/// `supersede_claim` or the custodial supersede's).
+///
+/// [`SupersedeTool`]: epigraph_db::SupersedeTool
+fn act_marker_of(tool: &str) -> serde_json::Value {
     serde_json::json!({
-        "tool": "supersede_claim",
+        "tool": tool,
         "was_created": true,
-        epigraph_db::SUPERSEDE_ACT_PROPERTY: "supersede_claim",
+        epigraph_db::SUPERSEDE_ACT_PROPERTY: tool,
     })
+}
+
+/// `(target, in force)` of each edge in `ids`: what a moved edge must show.
+async fn targets(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, bool)> {
+    ends(pool, ids)
+        .await
+        .into_iter()
+        .map(|(_, t, live)| (t, live))
+        .collect()
 }
 
 // ── K1: agent authorship and act edges ──────────────────────────────────────
 
 /// Incoming authorship on one retired claim `x`: another agent's `AUTHORED`,
 /// a third agent's `asserts`, and a claim-sourced edge carrying the reserved
-/// act marker (SPEC §5.2 rule 2 is keyed on the marker, not on the source;
-/// no shipped writer can write the marker since the reserved-property
-/// refusals, so this one is harness-written). `control` is a third claim's
-/// `supports`, which every replacement act moves: it proves the migration ran.
+/// act marker with tool value `act_tool` (SPEC §5.2 rule 2 is keyed on the
+/// marker, not on the source; it is harness-written here: the generic edge
+/// writers that run the reserved-property refusal reject the marker, though
+/// MCP `link_epistemic` / `link_hierarchical` do not run it yet).
+///
+/// Then the boundary, edges every replacement act still moves: `control` is
+/// a third claim's `supports` (it proves the migration ran), and
+/// `claim_asserts` / `claim_authored` are CLAIM-sourced `asserts` and
+/// `AUTHORED` without the marker. R-133 keeps only AGENT-sourced authorship
+/// (SPEC §5.1), so these two follow the act like any other edge; they pin the
+/// `source_type = 'agent'` conjunct of each function's exclusion.
 struct Authorship {
     authored: Uuid,
     asserts: Uuid,
     marked: Uuid,
     control: Uuid,
+    claim_asserts: Uuid,
+    claim_authored: Uuid,
 }
 
-async fn seed_authorship(pool: &PgPool, author: Uuid, group: Uuid, x: Uuid) -> Authorship {
+impl Authorship {
+    /// The edges the act must move, in a fixed order.
+    fn moved(&self) -> [Uuid; 3] {
+        [self.control, self.claim_asserts, self.claim_authored]
+    }
+}
+
+async fn seed_authorship(
+    pool: &PgPool,
+    author: Uuid,
+    group: Uuid,
+    x: Uuid,
+    act_tool: &str,
+) -> Authorship {
     let (w1, _) = fixture::seed_agent_with_group(pool, "k1-authored-by").await;
     let (w2, _) = fixture::seed_agent_with_group(pool, "k1-asserted-by").await;
     let y = claim_of(pool, author, group, "k1 a third claim").await;
     let z = claim_of(pool, author, group, "k1 a marked source").await;
+    let ca = claim_of(pool, author, group, "k1 an asserting claim").await;
+    let cw = claim_of(pool, author, group, "k1 an authoring claim").await;
     Authorship {
         authored: edge(pool, (w1, "agent"), (x, "claim"), "AUTHORED", None).await,
         asserts: edge(pool, (w2, "agent"), (x, "claim"), "asserts", None).await,
@@ -301,10 +342,12 @@ async fn seed_authorship(pool: &PgPool, author: Uuid, group: Uuid, x: Uuid) -> A
             (z, "claim"),
             (x, "claim"),
             "supports",
-            Some(act_marker()),
+            Some(act_marker_of(act_tool)),
         )
         .await,
         control: edge(pool, (y, "claim"), (x, "claim"), "supports", None).await,
+        claim_asserts: edge(pool, (ca, "claim"), (x, "claim"), "asserts", None).await,
+        claim_authored: edge(pool, (cw, "claim"), (x, "claim"), "AUTHORED", None).await,
     }
 }
 
@@ -328,7 +371,14 @@ async fn supersede_leaves_agent_authorship_and_act_edges_on_the_retired_claim(po
     .fetch_one(&pool)
     .await
     .expect("the first act's act edge on its successor");
-    let a = seed_authorship(&pool, author, group, x).await;
+    let a = seed_authorship(
+        &pool,
+        author,
+        group,
+        x,
+        epigraph_db::SupersedeTool::SupersedeClaim.as_str(),
+    )
+    .await;
     let before = ends(&pool, &[a.authored, a.asserts, a.marked, act_edge]).await;
 
     let n = supersede_act(&pool, author, group, x).await;
@@ -337,9 +387,11 @@ async fn supersede_leaves_agent_authorship_and_act_edges_on_the_retired_claim(po
 
     assert!(!is_current(&pool, x).await, "the act retired x");
     assert_eq!(
-        ends(&pool, &[a.control]).await[0].1,
-        n,
-        "the control supports edge followed the successor: the migration ran"
+        targets(&pool, &a.moved()).await,
+        vec![(n, true); 3],
+        "the control supports, the claim-sourced asserts and the claim-sourced \
+         AUTHORED followed the successor: the migration ran, and only AGENT \
+         authorship stays"
     );
     assert_eq!(
         ends(&pool, &[a.authored, a.asserts, a.marked, act_edge]).await,
@@ -358,7 +410,16 @@ async fn dedup_repair_leaves_agent_authorship_and_act_edges_on_the_duplicate(poo
     let (author, group) = fixture::seed_agent_with_group(&pool, "k1-dedup").await;
     let dup = claim_of(&pool, author, group, "k1 the duplicate").await;
     let canonical = claim_of(&pool, author, group, "k1 the canonical").await;
-    let a = seed_authorship(&pool, author, group, dup).await;
+    // The custodial supersede's tool value, so both SUPERSEDE_ACT_TOOLS
+    // entries are pinned across the K1 tests.
+    let a = seed_authorship(
+        &pool,
+        author,
+        group,
+        dup,
+        epigraph_db::SupersedeTool::CustodialSupersede.as_str(),
+    )
+    .await;
     let act_edge = edge(
         &pool,
         (author, "agent"),
@@ -377,11 +438,12 @@ async fn dedup_repair_leaves_agent_authorship_and_act_edges_on_the_duplicate(poo
         !is_current(&pool, dup).await,
         "the act retired the duplicate"
     );
-    let control = ends(&pool, &[a.control]).await[0];
     assert_eq!(
-        (control.1, control.2),
-        (canonical, true),
-        "the control supports edge followed the canonical: the repair ran"
+        targets(&pool, &a.moved()).await,
+        vec![(canonical, true); 3],
+        "the control supports, the claim-sourced asserts and the claim-sourced \
+         AUTHORED followed the canonical: the repair ran, and only AGENT \
+         authorship stays"
     );
     assert_eq!(
         ends(&pool, &[a.authored, a.asserts, a.marked, act_edge]).await,
@@ -399,8 +461,22 @@ async fn consolidate_leaves_agent_authorship_and_act_edges_on_the_sources(pool: 
     let (author, group) = fixture::seed_agent_with_group(&pool, "k1-merge").await;
     let s1 = claim_of(&pool, author, group, "k1 source one").await;
     let s2 = claim_of(&pool, author, group, "k1 source two").await;
-    let a1 = seed_authorship(&pool, author, group, s1).await;
-    let a2 = seed_authorship(&pool, author, group, s2).await;
+    let a1 = seed_authorship(
+        &pool,
+        author,
+        group,
+        s1,
+        epigraph_db::SupersedeTool::SupersedeClaim.as_str(),
+    )
+    .await;
+    let a2 = seed_authorship(
+        &pool,
+        author,
+        group,
+        s2,
+        epigraph_db::SupersedeTool::CustodialSupersede.as_str(),
+    )
+    .await;
     let act1 = edge(
         &pool,
         (author, "agent"),
@@ -434,14 +510,13 @@ async fn consolidate_leaves_agent_authorship_and_act_edges_on_the_sources(pool: 
     replay_consolidate(&pool, merged, vec![s1, s2]).await;
 
     assert!(!is_current(&pool, s1).await && !is_current(&pool, s2).await);
+    let moved: Vec<Uuid> = a1.moved().into_iter().chain(a2.moved()).collect();
     assert_eq!(
-        ends(&pool, &[a1.control, a2.control])
-            .await
-            .iter()
-            .map(|e| e.1)
-            .collect::<Vec<_>>(),
-        vec![merged, merged],
-        "both control supports edges followed the merge: the migration ran"
+        targets(&pool, &moved).await,
+        vec![(merged, true); 6],
+        "both sources' control supports, claim-sourced asserts and claim-sourced \
+         AUTHORED followed the merge: the migration ran, and only AGENT \
+         authorship stays"
     );
     assert_eq!(
         ends(&pool, &kept).await,

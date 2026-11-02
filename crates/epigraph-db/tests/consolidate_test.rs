@@ -399,6 +399,71 @@ async fn agent_authored_edges_stay_on_the_retired_sources(pool: PgPool) {
     );
 }
 
+/// The other half of the R-133 boundary (supersede SPEC §5.1): only an
+/// AGENT's `AUTHORED` stays on its source. A non-agent `AUTHORED` (here one
+/// claim `w` authoring both sources) still migrates onto the merged claim and
+/// still ACCUMULATES there: migration 017 lets `AUTHORED` repeat per triple,
+/// so `migrate_consolidated_edges` takes it out of the per-slot dedup.
+/// Without that rule the second copy shares the first's `(w, AUTHORED,
+/// incoming)` slot and is retracted as redundant; with the agent conjunct
+/// dropped from the candidate select both would stay on the sources.
+/// A regression pin of behaviour already on main (SPEC §12); its evidence is
+/// the mutation probes recorded with the batch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn non_agent_authored_edges_still_migrate_and_accumulate(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, agent, "acc a", &[]).await;
+    let s2 = seed_claim(&pool, agent, "acc b", &[]).await;
+    let w = seed_claim(&pool, agent, "acc author", &[]).await;
+    let edges: Vec<Uuid> = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+                 VALUES ($1,$2,'claim','claim','AUTHORED'), ($1,$3,'claim','claim','AUTHORED')
+         RETURNING id",
+    )
+    .bind(w)
+    .bind(s1)
+    .bind(s2)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(edges.len(), 2);
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "merged acc",
+        0.8,
+        ConsolidateMode::Merge,
+        "acc",
+        agent,
+    )
+    .await
+    .expect("consolidate");
+
+    let mut ends: Vec<(Uuid, Uuid, bool)> = Vec::new();
+    for e in &edges {
+        ends.push(
+            sqlx::query_as(
+                "SELECT source_id, target_id, valid_to IS NULL FROM edges WHERE id = $1",
+            )
+            .bind(e)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        );
+    }
+    assert_eq!(
+        ends,
+        vec![(w, res.merged_id, true), (w, res.merged_id, true)],
+        "both of w's AUTHORED edges moved onto the merge and both stay in force"
+    );
+    assert_eq!(
+        count_edges(&pool, w, res.merged_id, "AUTHORED").await,
+        2,
+        "the two copies accumulate on the merged claim (migration 017)"
+    );
+}
+
 /// An already-merged source must not be re-merged — that would rewrite its
 /// forwarding pointer and orphan the first merge's lineage.
 #[sqlx::test(migrations = "../../migrations")]
