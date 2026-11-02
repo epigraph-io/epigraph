@@ -1227,9 +1227,10 @@ async fn require_privileged_session(
 /// runs this same function knowing nothing of the original caller.
 ///
 /// EVERY supersession leaves its agents'
-/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges, and any edge carrying
-/// the reserved act marker ([`SUPERSEDE_ACT_PROPERTY`]), on the retired claim
-/// (ruling R-133, supersede SPEC §5.1).
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges, and any incoming edge
+/// carrying the reserved act marker ([`SUPERSEDE_ACT_PROPERTY`]), on the
+/// retired claim (ruling R-133, supersede SPEC §5.1). The marker is tested on
+/// the incoming re-point only: an act edge points AT the claim it records.
 ///
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
@@ -1303,7 +1304,7 @@ async fn migrate_superseded_edges(
     // the record of its writer. It is told apart by its reserved marker
     // (`SUPERSEDE_ACT_PROPERTY`, $7), never by `tool`, which any edge writer
     // can spell, and the marker alone decides (supersede SPEC §5.2 rule 2):
-    // an edge carrying it stays whatever its source.
+    // an incoming edge carrying it stays whatever its source.
     let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
@@ -6469,8 +6470,8 @@ impl ClaimRepository {
     ///
     /// Every supersession, lineage or not, leaves agents' `asserts` /
     /// `AUTHORED` edges ([`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`]) and
-    /// any edge carrying the act marker ([`SUPERSEDE_ACT_PROPERTY`]) on the
-    /// retired claim: they record who stated or wrote THAT content, and the
+    /// any incoming edge carrying the act marker ([`SUPERSEDE_ACT_PROPERTY`])
+    /// on the retired claim: they record who stated or wrote THAT content, and the
     /// successor (an evolve_step successor is written by its caller) is
     /// content they never saw. The dedup and merge cascades apply the same
     /// rule.

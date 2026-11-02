@@ -213,9 +213,12 @@ async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrot
     assert_eq!(author, a, "v2 still inherits the chain's author");
 }
 
-/// The act's reserved marker (`supersede_act`), which no caller can write, is
-/// what tells an act edge apart; a property that merely spells a supersession
-/// `tool` (any edge writer could set one) pins nothing. Shown on a
+/// The act's reserved marker (`supersede_act`) is what tells an act edge
+/// apart: the act writes it, and the generic edge writers that run the
+/// reserved-property refusal reject it (MCP `link_epistemic` and
+/// `link_hierarchical` do not run it yet; supersede SPEC K12a audits them). A
+/// property that merely spells a supersession `tool` (any edge writer could
+/// set one) pins nothing. Shown on a
 /// CLAIM-sourced `AUTHORED` edge spelling the tool: it is an ordinary edge of
 /// the retired claim and moves onto the successor like every other.
 ///
