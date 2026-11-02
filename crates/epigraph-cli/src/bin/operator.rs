@@ -93,12 +93,14 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey, reown,
-    reown_linked, restrict, retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, arm, bind, binding_client, client_scope, client_status, confirmations,
+    custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey,
+    reown, reown_linked, restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -498,6 +500,16 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Suspend ONE OAuth client (`oauth_clients.id`): status `suspended`, every
+    /// live refresh chain revoked, one `oauth.client_suspended` audit row, in
+    /// one transaction. Already-minted access tokens stay valid until they
+    /// expire (printed). Idempotent; a revoked client is refused.
+    SuspendClient(ClientStatusArgs),
+    /// Revoke ONE OAuth client (`oauth_clients.id`), final: status `revoked`,
+    /// every live refresh chain revoked, one `oauth.client_revoked` audit row,
+    /// in one transaction. Already-minted access tokens stay valid until they
+    /// expire (printed). Idempotent.
+    RevokeClient(ClientStatusArgs),
     /// Allow ONE service or agent OAuth client's agent to write as a bound
     /// agent of a registered human operator (migration 149's author-binding
     /// allowlist), without linking it: the client keeps its HTTP token. The
@@ -909,6 +921,20 @@ enum GroupMemberAction {
         #[arg(long)]
         role: String,
     },
+}
+
+/// The arguments `suspend-client` and `revoke-client` share.
+#[derive(clap::Args)]
+struct ClientStatusArgs {
+    /// The client's `oauth_clients.id` (not its `client_id` string).
+    #[arg(long)]
+    client: Uuid,
+    /// Recorded in the audit row. Required, not blank.
+    #[arg(long)]
+    reason: String,
+    /// Commit. Without it, the change and its audit row roll back.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// The arguments every `group-member` verb shares.
@@ -1693,6 +1719,20 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the retire and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        cmd @ (Command::SuspendClient(_) | Command::RevokeClient(_)) => {
+            let (act, a) = match cmd {
+                Command::SuspendClient(a) => (client_status::StatusAct::Suspend, a),
+                Command::RevokeClient(a) => (client_status::StatusAct::Revoke, a),
+                _ => unreachable!("matched above"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome =
+                client_status::run(&mut conn, act, a.client, &a.reason, a.apply, &who).await?;
+            for line in client_status::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
         }
         Command::AllowAuthorBindingClient {
             client,
