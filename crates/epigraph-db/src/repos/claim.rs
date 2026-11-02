@@ -1165,15 +1165,19 @@ async fn non_public_frozen_relationships(
     })
 }
 
-/// Relationships an AGENT holds on a step that a step-lineage supersession
-/// leaves on the retired step (incoming edges with `source_type = 'agent'`).
+/// Relationships an AGENT holds on a claim that every replacement leaves on
+/// the retired claim (incoming edges with `source_type = 'agent'`): a
+/// supersession, step lineage or not ([`migrate_superseded_edges`]), a dedup
+/// ([`repair_marked_duplicate`]) and a merge ([`migrate_consolidated_edges`]).
 ///
-/// `evolve_step` writes its successor under the CALLER's `agent_id`, not the
-/// retired step's (unlike the supersede act, which keeps the old author). An
-/// agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
-/// content; carried onto the successor it would record the agent asserting
-/// content it never saw. (Scope U047 sub-decision A, default "exclude"; the
-/// opposite ruling is removing this constant's use.)
+/// An agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
+/// content. Carried onto a successor (which `evolve_step` writes under the
+/// caller's `agent_id`), a canonical or a merged claim, it would record the
+/// agent asserting content it never saw, and strip the retired claim of the
+/// record of who stated it. Ruling R-133 generalised this from step lineages
+/// (U047 sub-decision A) to every replacement (supersede SPEC §5.1, K1).
+/// Edges from other sources (a paper's `asserts`, a workflow's `AUTHORED`)
+/// keep the relationship's ordinary rule.
 pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
 /// Refuse a non-privileged session, naming `what` needs the privilege.
@@ -1218,10 +1222,14 @@ async fn require_privileged_session(
 ///
 /// A STEP-LINEAGE supersession (old and new share a non-null
 /// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
-/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step, and its agents'
-/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step. The rule is
 /// derived from the rows, not from a caller flag, because the deferred replay
 /// runs this same function knowing nothing of the original caller.
+///
+/// EVERY supersession leaves its agents'
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges, and any edge carrying
+/// the reserved act marker ([`SUPERSEDE_ACT_PROPERTY`]), on the retired claim
+/// (ruling R-133, supersede SPEC §5.1).
 ///
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
@@ -1276,14 +1284,20 @@ async fn migrate_superseded_edges(
             frozen.push(rel);
         }
     }
-    let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
+    // An agent's authorship stays on the claim it authored in every
+    // supersession, lineage or not (ruling R-133; see the constant's doc).
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     // A supersession's own act edge (backlog 73085534, R-23) records who
     // wrote the claim it points at, so it stays on that claim when the claim
     // is itself superseded: carried onto the successor it would credit the
     // earlier actor with a claim it never wrote and strip the retired claim of
     // the record of its writer. It is told apart by its reserved marker
     // (`SUPERSEDE_ACT_PROPERTY`, $7), never by `tool`, which any edge writer
-    // can spell.
+    // can spell, and the marker alone decides (supersede SPEC §5.2 rule 2):
+    // an edge carrying it stays whatever its source.
     let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
@@ -1301,8 +1315,7 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
-           AND NOT (source_type = 'agent' AND relationship = 'AUTHORED' \
-                    AND COALESCE(properties->>$7 = ANY($6), false)) \
+           AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
@@ -6439,12 +6452,20 @@ impl ClaimRepository {
     /// `step_follows` / `phase_follows` in either direction (they link the
     /// frozen steps `executes` names, which is the id set
     /// `workflow_steps::ordered_steps` walks), `revises` in either direction
-    /// (the lineage's branch history, like `supersedes`) and agents'
-    /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
-    /// caller, not by the agents that asserted the old content) on the retired
-    /// step. A supersession made here writes no `step_lineage_id`, so the
-    /// lineage rule does not apply to it. The rule is read from the rows,
-    /// because the deferred replay knows nothing of the original caller.
+    /// (the lineage's branch history, like `supersedes`) on the retired step.
+    /// A supersession made here writes no `step_lineage_id`, so the lineage
+    /// rule does not apply to it. The rule is read from the rows, because the
+    /// deferred replay knows nothing of the original caller.
+    ///
+    /// ## Agent authorship stays (ruling R-133)
+    ///
+    /// Every supersession, lineage or not, leaves agents' `asserts` /
+    /// `AUTHORED` edges ([`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`]) and
+    /// any edge carrying the act marker ([`SUPERSEDE_ACT_PROPERTY`]) on the
+    /// retired claim: they record who stated or wrote THAT content, and the
+    /// successor (an evolve_step successor is written by its caller) is
+    /// content they never saw. The dedup and merge cascades apply the same
+    /// rule.
     ///
     /// ## Non-public steps keep their `executes` (OD-32)
     ///
@@ -11065,8 +11086,11 @@ impl ClaimRepository {
     ///   duplicate rows that feed the same Dempster-Shafer mass twice through
     ///   `auto_create_factor_from_edge`. Belief corruption, not an error.
     ///
-    /// `AUTHORED` is excluded from deduplication (migration 017 explicitly
-    /// allows it to accumulate) and `supersedes` from migration entirely.
+    /// An agent's `asserts` / `AUTHORED` edge, and an edge carrying the act
+    /// marker ([`SUPERSEDE_ACT_PROPERTY`]), stay on their source (ruling
+    /// R-133). Any other `AUTHORED` is excluded from deduplication (migration
+    /// 017 explicitly allows it to accumulate), and `supersedes` from
+    /// migration entirely.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` on a bad source set (wrong count,
@@ -11615,7 +11639,21 @@ async fn migrate_consolidated_edges(
     // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
     // candidate either: it names the claim its duplicate supersedes, so it is
     // neither moved nor retracted (see `migrate_superseded_edges`).
+    //
+    // An agent's authorship of a source (`source_type = 'agent'`
+    // `asserts` / `AUTHORED`) and an edge carrying the act marker are not
+    // candidates either: they record who stated or wrote THAT source, and the
+    // merged claim is content they never saw (ruling R-133, as in
+    // `migrate_superseded_edges`). They stay on the retired source.
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
         .collect();
@@ -11628,6 +11666,8 @@ async fn migrate_consolidated_edges(
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+          AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
+          AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11639,6 +11679,9 @@ async fn migrate_consolidated_edges(
     )
     .bind(source_ids)
     .bind(&frozen)
+    .bind(&agent_authorship)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -11656,7 +11699,10 @@ async fn migrate_consolidated_edges(
             to_delete.push(*id);
             continue;
         }
-        // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
+        // An agent's AUTHORED never reaches here: it stays on its source
+        // (ruling R-133, the candidate select above). A non-agent AUTHORED
+        // (a workflow's, a claim's) still migrates and is never deduped,
+        // because migration 017 lets AUTHORED accumulate.
         if relationship == "AUTHORED" {
             survivors.push(*id);
             continue;
@@ -12315,6 +12361,18 @@ async fn repair_marked_duplicate(
     // today; the outgoing clauses and the claim-sourced incoming collision
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
+    // Agents' authorship of the duplicate and act-marked edges stay on it
+    // (ruling R-133, as in `migrate_superseded_edges`). Both point AT the
+    // claim they record, so the incoming re-point tests them; the collision
+    // guards never meet an agent-sourced edge (they act on claim-sourced ones).
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     // The act's identity edge, which keys this repair's revert record (a
     // mark made before identity edges existed has none).
@@ -12508,11 +12566,19 @@ async fn repair_marked_duplicate(
            -- A dedup identity edge names the claim its duplicate SUPERSEDES;
            -- it stays with it when that claim is itself marked a duplicate.
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
+           -- An agent's authorship of the duplicate, and an edge carrying
+           -- the act marker, record who stated or wrote THAT content; the
+           -- canonical is content they never saw (ruling R-133).
+           AND NOT (source_type = 'agent' AND relationship = ANY($4)) \
+           AND NOT COALESCE(properties->>$6 = ANY($5), false) \
          RETURNING id",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
     .bind(&frozen)
+    .bind(&agent_authorship)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
