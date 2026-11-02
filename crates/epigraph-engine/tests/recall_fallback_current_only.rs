@@ -22,7 +22,7 @@
 mod fixture;
 
 use epigraph_core::{ClaimId, TruthValue};
-use epigraph_db::{ClaimRepository, SupersedeActor, SupersedeTool};
+use epigraph_db::{ClaimRepository, SupersedeActor, SupersedeTool, Viewer};
 use epigraph_embeddings::{config::EmbeddingConfig, providers::MockProvider, EmbeddingService};
 use epigraph_engine::recall::recall;
 use sqlx::PgPool;
@@ -89,15 +89,17 @@ async fn engine_recall_fallback_never_serves_a_retired_row(pool: PgPool) {
     let doomed = seed_claim(&pool, agent, "quorvane flux pinning, the first draft", 1).await;
 
     // Control: before retirement the fallback returns both, so an absence
-    // below is currency deciding, not the fixture being unretrievable.
+    // below is currency deciding, not the fixture being unretrievable. The
+    // ORDER is pinned too: the post-LIMIT guard below only bites while the
+    // doomed draft is the newest match, i.e. while the page is newest first.
     let before = recall(&pool, &scoped, &viewer, &failing, query, 10, 0.0)
         .await
         .expect("recall");
     let before_ids: Vec<&str> = before.iter().map(|r| r.claim_id.as_str()).collect();
-    assert!(
-        before_ids.contains(&current.to_string().as_str())
-            && before_ids.contains(&doomed.to_string().as_str()),
-        "control: both matches must be served while both are current, got {before_ids:?}"
+    assert_eq!(
+        before_ids,
+        vec![doomed.to_string().as_str(), current.to_string().as_str()],
+        "control: both matches must be served, newest first, while both are current"
     );
 
     // Retire the newer match through the real supersede act. The revision
@@ -143,5 +145,57 @@ async fn engine_recall_fallback_never_serves_a_retired_row(pool: PgPool) {
         full_ids,
         vec![current.to_string().as_str()],
         "with room for every match the fallback must serve exactly the current one"
+    );
+}
+
+/// The fallback's statement changed with K11 (`ClaimRepository::list` became
+/// `list_filtered`, whose viewer splice binds at a different position), so the
+/// viewer must still decide what the swapped statement serves. Row-level
+/// security does not filter the harness pool's reads, so the viewer predicate
+/// spliced into the fallback's SQL is the only thing that keeps a
+/// group-private row from a public viewer here: stripping that splice from
+/// `list_filtered` turns the public-viewer assertion red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn engine_recall_fallback_respects_viewer(pool: PgPool) {
+    let scoped = fixture::scoped_pool(&pool).await;
+    let failing = MockProvider::new(EmbeddingConfig::openai(1536)).with_failures(1.0);
+    assert!(
+        failing.generate_query("probe").await.is_err(),
+        "fixture: the provider must refuse to embed, or the semantic leg runs instead"
+    );
+    let query = "zelquar lattice note";
+
+    let (member, group) = fixture::seed_agent_with_group(&pool, "k11-fallback-viewer").await;
+    let private =
+        fixture::seed_group_claim(&pool, member, group, "zelquar lattice note, private").await;
+    let open = fixture::seed_public_claim(&pool, member, "zelquar lattice note, public").await;
+
+    // Public viewer: the public match is served (so the fallback ran and the
+    // query matches), the group-private match is not.
+    let public = fixture::public_viewer(&pool).await;
+    let served = recall(&pool, &scoped, &public, &failing, query, 10, 0.0)
+        .await
+        .expect("recall");
+    let served_ids: Vec<&str> = served.iter().map(|r| r.claim_id.as_str()).collect();
+    assert!(
+        served_ids.contains(&open.to_string().as_str()),
+        "control: the public match must be served to the public viewer, got {served_ids:?}"
+    );
+    assert!(
+        !served_ids.contains(&private.to_string().as_str()),
+        "the text fallback served a group-private claim ({private}) to the public viewer: \
+         got {served_ids:?}"
+    );
+
+    // Member of the owning group: the same private row IS served, so its
+    // absence above is the viewer deciding, not the row being unreachable.
+    let owner = Viewer::resolve(&pool, member).await.expect("member viewer");
+    let mine = recall(&pool, &scoped, &owner, &failing, query, 10, 0.0)
+        .await
+        .expect("recall");
+    let mine_ids: Vec<&str> = mine.iter().map(|r| r.claim_id.as_str()).collect();
+    assert!(
+        mine_ids.contains(&private.to_string().as_str()),
+        "the owning group's member must be served its private match, got {mine_ids:?}"
     );
 }
