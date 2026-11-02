@@ -359,3 +359,391 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
         "each act records whether --allow-owned admitted it"
     );
 }
+
+// ── K8: the custodial supersede runs the belief cascade (SPEC §3.1, §11 K8) ──
+
+const REPLAY: &str = env!("CARGO_BIN_EXE_replay_deferred_cascades");
+
+/// A per-test LOGIN role, `NOSUPERUSER NOBYPASSRLS`, member of `parent`, and
+/// its DSN. Roles are cluster-global: the name is unique and the caller drops
+/// it. The superuser fixture pool only seeds rows and reads results.
+async fn create_login(pool: &PgPool, parent: &str) -> (String, String) {
+    let role = format!("k8_{}_{}", parent, Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{password}' IN ROLE {parent}"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the login");
+    let base = fixture::database_url_for(pool).await;
+    let scheme_end = base.find("://").expect("a scheme") + 3;
+    let host_path = &base[base.find('@').expect("credentials in the DSN") + 1..];
+    let url = format!("{}{role}:{password}@{host_path}", &base[..scheme_end]);
+    (role, url)
+}
+
+async fn drop_login(pool: &PgPool, role: &str) {
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(pool)
+        .await;
+}
+
+/// `epigraph-operator` on an explicit maintenance DSN (not the fixture's).
+fn run_op_on(dsn: &str, args: &[&str]) -> Run {
+    let out = Command::new(BIN)
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
+        .env(DSN_ENV, dsn)
+        .output()
+        .expect("spawn epigraph-operator");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// `replay_deferred_cascades`, the deferred-cascade replay the timer runs, on
+/// the application and maintenance DSNs.
+fn replay(app_dsn: &str, maint_dsn: &str) -> Run {
+    let out = Command::new(REPLAY)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", app_dsn)
+        .env("MAINTENANCE_DATABASE_URL", maint_dsn)
+        .env("RUST_LOG", "warn")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn replay_deferred_cascades");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// A world-owned corpus claim carrying a cached interval, so an edge out of it
+/// wires a real edge-keyed BBA on its target.
+async fn insert_claim_with_interval(pool: &PgPool, author: Uuid, bel: f64, pl: f64) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, belief, plausibility) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(format!("corpus claim with an interval {id}"))
+    .bind(id.as_bytes().repeat(2))
+    .bind(author)
+    .bind(WORLD)
+    .bind(bel)
+    .bind(pl)
+    .execute(pool)
+    .await
+    .expect("claim with an interval");
+    id
+}
+
+/// Live BBAs on `claim` keyed on `edge` (edge-keyed: `perspective_id` is the
+/// edge id).
+async fn edge_bbas(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+    )
+    .bind(claim)
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("edge-keyed BBAs")
+}
+
+/// Every `cascade.deferred` row, as `(id, agent_id, details)`.
+async fn deferrals(pool: &PgPool) -> Vec<(Uuid, Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT id, agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.deferred' ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("deferrals")
+}
+
+/// SPEC §11 K8 (backlog D22, I18) and the phase-0 addendum: a custodial
+/// supersede of a WORLD-owned corpus claim (the population the custodial path
+/// exists for: custodial-only by I16), run by the real binary as a REAL
+/// maintenance login (`NOSUPERUSER NOBYPASSRLS`, member of
+/// `epigraph_maintenance`), records a `supersede` deferral through 120's
+/// `epigraph_record_cascade_deferral` naming the custodian, in the act's own
+/// transaction; the deferred-cascade replay then runs the whole supersede
+/// cascade from it.
+///
+/// * The deferral passes 120's PRIVILEGED arm (`v_priv` = `epigraph_bypass()`,
+///   session_user a member of `epigraph_maintenance`): the maintenance session
+///   has no stamped principal, so the non-privileged arm would refuse CX02;
+///   the control below shows exactly that refusal for the same act on an
+///   application login. No CX02/CX03 on the custodial run.
+/// * The deferral names the custodian (`agent_id`), the predecessor and the
+///   successor, and the act record links it (`cascade_deferral_event_id`).
+/// * A dry run and a CUS04-refused run leave no deferral (act and deferral
+///   commit together or not at all).
+/// * After the replay: one `cascade.admin_applied` row replaying that
+///   deferral under the custodian's name, whose ids row lists the incoming
+///   strengthening edge as retargeted and the outgoing one as resourced (the
+///   migrated set the supersede cascade's factor regeneration keys on); the
+///   edges have moved (`contradicts` stays); and the belief cascade ran: the
+///   target's BBA frozen from the RETIRED claim's interval, keyed on the
+///   outgoing edge, is invalidated, and the target's cache, which no row backs
+///   any more, is cleared.
+///
+/// Verified to fail on the base: no deferral row (the custodial path recorded
+/// none and ran no belief cascade; its inline edge migration left the replay
+/// nothing to move).
+#[sqlx::test(migrations = "../../migrations")]
+async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_replay(pool: PgPool) {
+    let (a, _) = fixture::seed_human_operator(&pool, "k8-custodian-a").await;
+    let (b, _) = fixture::seed_human_operator(&pool, "k8-custodian-b").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "k8-legacy").await;
+    let old = insert_claim_with_interval(&pool, legacy, 0.8, 0.9).await;
+    let target = insert_claim(&pool, legacy, WORLD).await;
+    let supporter = insert_claim(&pool, legacy, WORLD).await;
+    let critic = insert_claim(&pool, legacy, WORLD).await;
+    let incoming = edge(&pool, supporter, old, "supports").await;
+    let outgoing = edge(&pool, old, target, "supports").await;
+    let contradicts = edge(&pool, critic, old, "contradicts").await;
+
+    // The outgoing edge's BBA on the target, wired from the predecessor's
+    // interval by the engine's own edge-factor path.
+    {
+        let (_scoped, viewer) = fixture::bypass(&pool).await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let wired = epigraph_engine::edge_factor::auto_wire_ds_for_edge(
+            &mut conn, &viewer, outgoing, legacy, old, target, "supports",
+        )
+        .await
+        .expect("wire the outgoing edge");
+        assert!(
+            matches!(
+                wired,
+                epigraph_engine::edge_factor::EdgeFactorOutcome::Wired
+            ),
+            "precondition: the outgoing edge carries a BBA ({wired:?})"
+        );
+    }
+    assert_eq!(edge_bbas(&pool, target, outgoing).await, 1, "precondition");
+    let target_belief: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .expect("target cache");
+    assert!(
+        target_belief.is_some(),
+        "precondition: the target's cache is backed by that BBA"
+    );
+
+    let ia = fixture::make_custodian(&pool, a).await;
+    let ib = fixture::make_custodian(&pool, b).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let (app_role, app_dsn) = create_login(&pool, "epigraph_app").await;
+    let attrs: (bool, bool) =
+        sqlx::query_as("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1")
+            .bind(&maint_role)
+            .fetch_one(&pool)
+            .await
+            .expect("the login's attributes");
+    assert_eq!(
+        attrs,
+        (false, false),
+        "the custodial run must exercise epigraph_bypass(), not a superuser short-circuit"
+    );
+
+    let (a_s, ia_s, ib_s, old_s) = (
+        a.to_string(),
+        ia.to_string(),
+        ib.to_string(),
+        old.to_string(),
+    );
+    let run = |assignment: &str, apply: bool| {
+        let args = supersede_args(&old_s, assignment, &a_s, apply);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_op_on(&maint_dsn, &refs)
+    };
+
+    // A dry run and a refused run leave no deferral.
+    let dry = run(&ia_s, false);
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    let refused = run(&ib_s, true);
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(refused.stderr.contains("CUS04"), "{}", refused.show());
+    assert!(
+        deferrals(&pool).await.is_empty(),
+        "a rolled-back act leaves no deferral"
+    );
+
+    // The custodial supersede: committed, with its deferral.
+    let applied = run(&ia_s, true);
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(
+        !applied.stderr.contains("CX02") && !applied.stderr.contains("CX03"),
+        "{}",
+        applied.show()
+    );
+    let new: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("one successor");
+    let rows = deferrals(&pool).await;
+    assert_eq!(rows.len(), 1, "one deferral for the one act: {rows:?}");
+    let (deferral_id, deferral_agent, d) = &rows[0];
+    assert_eq!(*deferral_agent, Some(a), "the deferral names the custodian");
+    assert_eq!(d["cause"], "supersede", "{d}");
+    assert_eq!(d["recorded_by"], "epigraph_record_cascade_deferral", "{d}");
+    assert_eq!(
+        d["session_user"], maint_role,
+        "recorded on the maintenance login's own session: {d}"
+    );
+    assert_eq!(d["trigger"]["agent_id"], a.to_string(), "{d}");
+    assert_eq!(d["trigger"]["subject_id"], old.to_string(), "{d}");
+    assert_eq!(d["trigger"]["object_id"], new.to_string(), "{d}");
+    let act_link: Option<String> = sqlx::query_scalar(
+        "SELECT details->'details'->>'cascade_deferral_event_id' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1",
+    )
+    .bind(&old_s)
+    .fetch_one(&pool)
+    .await
+    .expect("the custodial act");
+    assert_eq!(
+        act_link,
+        Some(deferral_id.to_string()),
+        "the custodial act record names the cascade it owes"
+    );
+
+    // Control (120's non-privileged arm): the same act's deferral asked for on
+    // an APPLICATION login, which carries no stamped principal, is CX02. So it
+    // is the privileged arm that admitted the custodial run's.
+    {
+        let mut app = <sqlx::PgConnection as sqlx::Connection>::connect(&app_dsn)
+            .await
+            .expect("connect as the application login");
+        let err = sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_record_cascade_deferral('supersede', $1, $2, $3, \
+                    ARRAY[]::uuid[], NULL, 'k8 control')",
+        )
+        .bind(a)
+        .bind(old)
+        .bind(new)
+        .fetch_one(&mut app)
+        .await
+        .expect_err("an unstamped application session cannot record it");
+        assert!(err.to_string().contains("CX02"), "{err}");
+    }
+
+    // The replay runs the cascade the deferral names.
+    let r = replay(&app_dsn, &maint_dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    let report: serde_json::Value = serde_json::from_str(r.stdout.trim()).expect("replay JSON");
+    assert_eq!(report["applied"], 1, "{report}");
+    let applied_rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = 'supersede' \
+            AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(&old_s)
+    .fetch_all(&pool)
+    .await
+    .expect("applied rows");
+    assert_eq!(applied_rows.len(), 1, "{applied_rows:?}");
+    let (applied_id, applied_agent, ad) = &applied_rows[0];
+    assert_eq!(
+        *applied_agent,
+        Some(a),
+        "the cascade is the custodian's: {ad}"
+    );
+    assert_eq!(
+        ad["replay_of"]["deferred_event_id"],
+        deferral_id.to_string(),
+        "it replays the custodial run's deferral: {ad}"
+    );
+    let touched: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' \
+            AND details->>'applied_event_id' = $1",
+    )
+    .bind(applied_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the applied ids row");
+    assert_eq!(
+        touched["edges_retargeted"],
+        serde_json::json!([incoming]),
+        "the cascade migrated the incoming strengthening edge: {touched}"
+    );
+    assert_eq!(
+        touched["edges_resourced"],
+        serde_json::json!([outgoing]),
+        "the cascade migrated the outgoing strengthening edge: {touched}"
+    );
+    let ends: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2), \
+                (SELECT target_id FROM edges WHERE id = $3)",
+    )
+    .bind(incoming)
+    .bind(outgoing)
+    .bind(contradicts)
+    .fetch_one(&pool)
+    .await
+    .expect("edge ends");
+    assert_eq!(
+        ends,
+        (new, new, old),
+        "the strengthening edges follow the successor; contradicts stays"
+    );
+    assert_eq!(
+        edge_bbas(&pool, target, outgoing).await,
+        0,
+        "the BBA frozen from the retired claim's interval is invalidated"
+    );
+    let target_belief: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .expect("target cache");
+    assert_eq!(
+        target_belief, None,
+        "the target's cache, backed by nothing now, is re-derived (cleared)"
+    );
+    let pending: i64 = {
+        let r = Command::new(REPLAY)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("DATABASE_URL", &app_dsn)
+            .env("MAINTENANCE_DATABASE_URL", &maint_dsn)
+            .env("RUST_LOG", "warn")
+            .arg("--report-only")
+            .current_dir(std::env::temp_dir())
+            .output()
+            .expect("spawn the report");
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&r.stdout).trim()).expect("JSON");
+        v["pending"].as_i64().expect("pending count")
+    };
+    assert_eq!(pending, 0, "the custodial cascade is no longer pending");
+
+    drop_login(&pool, &maint_role).await;
+    drop_login(&pool, &app_role).await;
+}
