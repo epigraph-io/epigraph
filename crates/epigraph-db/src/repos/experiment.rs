@@ -226,6 +226,12 @@ impl ExperimentRepository {
     /// `false` as a refusal of the whole promotion, so a promotion never leaves
     /// two copies.
     ///
+    /// A RETRACTED row (migration 184) is never retired: it is kept for audit
+    /// (rulings R-79, R-103), so the statement answers `false` and the
+    /// promotion is refused. That is the case when the row was retracted after
+    /// the caller read it (the REST route reads it outside the promotion's
+    /// transaction).
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the statement fails.
     #[instrument(skip(executor, viewer))]
@@ -239,6 +245,7 @@ impl ExperimentRepository {
         let sql = viewer.splice_write(
             "DELETE FROM mass_functions AS mf \
               WHERE mf.id = $1 AND mf.claim_id = $2 AND mf.frame_id = $3 \
+                AND mf.retracted_at IS NULL \
                 /* {WRITABLE:mf} */",
             4,
         );

@@ -635,6 +635,11 @@ pub struct DedupRepair {
     /// holds (the same source counted once), an `attributed_v1` row, or every
     /// such row when the canonical is a compound.
     pub kept_on_duplicate: Vec<Uuid>,
+    /// The duplicate's LIVE edge-keyed copies (part 2) left on it because the
+    /// canonical holds the same key with a RETRACTED row (migration 184): the
+    /// retracted row holds its key (ruling R-103), so the copy can neither
+    /// move onto it nor be dropped in its favour.
+    pub kept_on_duplicate_by_retracted_holder: Vec<Uuid>,
     /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
     /// pooled onto it.
     pub canonical_is_compound: bool,
@@ -12467,13 +12472,17 @@ async fn repair_marked_duplicate(
     // statement (migration 117).
     let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
     // The rows are about to be deleted, so the revert record keeps them whole.
+    // Only LIVE rows: `delete_edge_bbas` keeps a retracted one (migration 184,
+    // rulings R-79 / R-103) keyed on its retracted edge, so the record must
+    // not name it as deleted.
     let mut deleted_rows: Vec<serde_json::Value> = if deleted_edge_ids.is_empty() {
         Vec::new()
     } else {
         sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              SELECT to_jsonb(mf) FROM mass_functions mf
-              WHERE mf.perspective_id = ANY($1) ORDER BY mf.id"#,
+              WHERE mf.perspective_id = ANY($1) AND mf.retracted_at IS NULL
+              ORDER BY mf.id"#,
         )
         .bind(&deleted_edge_ids)
         .fetch_all(&mut *conn)
@@ -12530,6 +12539,7 @@ async fn repair_marked_duplicate(
     let mut moved_bbas = 0_u64;
     let mut dropped_duplicate_copies = 0_u64;
     let mut skipped_false_bindings = 0_u64;
+    let mut kept_on_duplicate_by_retracted_holder: Vec<Uuid> = Vec::new();
     let mut copied_frames: Vec<Uuid> = Vec::new();
     let mut canonical_frame_inputs: Vec<Uuid> = Vec::new();
     let mut moved_rows: Vec<MovedBba> = Vec::new();
@@ -12628,22 +12638,35 @@ async fn repair_marked_duplicate(
 
         // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
         // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
-        // 034): when `canonical` already holds a row for an incoming
-        // perspective, the DUPLICATE's copy is dropped and the canonical keeps
-        // its own. Both carry the same edge, frame and source agent; only the
-        // moment their masses were frozen differs, and the canonical's row may
-        // be another writer's contribution, which a dedup does not destroy
-        // (migration 115 section 4's rule, now the only one).
+        // 034): when `canonical` already holds a LIVE row for an incoming
+        // perspective, the duplicate's LIVE copy is dropped and the canonical
+        // keeps its own. Both carry the same edge, frame and source agent; only
+        // the moment their masses were frozen differs, and the canonical's row
+        // may be another writer's contribution, which a dedup does not destroy
+        // (migration 115 section 4's rule).
+        //
+        // A RETRACTED row on either side (migration 184) changes that (rulings
+        // R-79 / R-103: kept for audit, and it holds its key):
+        // * a retracted duplicate copy is never dropped; it stays where it is;
+        // * a live duplicate copy whose canonical holder is retracted is not
+        //   dropped either (the holder counts for nothing, so dropping the copy
+        //   would leave the evidence folded nowhere and recoverable only by an
+        //   un-mark) and cannot move onto the held key: it is KEPT on the
+        //   duplicate, as part 3 keeps a non-edge row, and reported.
+        // The move below skips every row the canonical holds the key of, so
+        // neither kind is moved.
         let dropped: Vec<serde_json::Value> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions d
               WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+                AND d.retracted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM mass_functions c
                      WHERE c.claim_id = $1
                        AND c.perspective_id = d.perspective_id
                        AND c.frame_id = d.frame_id
-                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
+                       AND c.retracted_at IS NULL)
              RETURNING to_jsonb(d)"#,
         )
         .bind(canon_uuid)
@@ -12653,19 +12676,48 @@ async fn repair_marked_duplicate(
         .await?;
         dropped_duplicate_copies = dropped.len() as u64;
         deleted_rows.extend(dropped);
+        kept_on_duplicate_by_retracted_holder = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT d.id FROM mass_functions d
+              WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+                AND d.retracted_at IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM mass_functions c
+                     WHERE c.claim_id = $1
+                       AND c.perspective_id = d.perspective_id
+                       AND c.frame_id = d.frame_id
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
+                       AND c.retracted_at IS NOT NULL)
+              ORDER BY d.id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&retargeted_ids)
+        .fetch_all(&mut *conn)
+        .await?;
 
         // The move keeps "a writer's contribution is the writer's" (migration
         // 114). Onto a PUBLIC canonical, a row keeps its owner and comes out
         // writer-owned whenever that owner is not the canonical's (so a later
         // insert on the canonical does not re-stamp it to the canonical's
         // owner); onto a group-private canonical it becomes the claim's own
-        // row, as every derived row of a private claim is.
+        // row, as every derived row of a private claim is. A row whose key the
+        // canonical holds (only the kept rows above remain so) is not moved:
+        // the move would collide with the holder on migration 034's unique key.
+        // A retracted row the canonical does not hold moves with its edge, its
+        // retraction intact (184's guards admit a move).
         let moved: Vec<MovedBba> = sqlx::query_as(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              WITH before AS (
                  SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
                    FROM mass_functions b
-                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3))
+                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mass_functions c
+                         WHERE c.claim_id = $1
+                           AND c.perspective_id = b.perspective_id
+                           AND c.frame_id = b.frame_id
+                           AND c.source_agent_id IS NOT DISTINCT FROM b.source_agent_id))
              {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
         ))
         .bind(canon_uuid)
@@ -12855,6 +12907,7 @@ async fn repair_marked_duplicate(
         skipped_false_bindings,
         pooled_bbas,
         kept_on_duplicate,
+        kept_on_duplicate_by_retracted_holder,
         canonical_is_compound,
         revert: DedupRevert {
             identity_edge,
@@ -13069,7 +13122,9 @@ async fn reverse_marked_duplicate(
     // returning input's slot on the duplicate may since hold the duplicate's
     // re-derived CACHED combination (the cascade recomputed it); that row is
     // derived and is cleared so the input can return. Any other occupant of
-    // the slot is a later write: the row stays where it is (drifted).
+    // the slot is a later write: the row stays where it is (drifted). So is a
+    // RETRACTED cached row (migration 184): it is kept for audit and holds its
+    // key (rulings R-79, R-103), so the input it blocks is reported drifted.
     let moved_ids: Vec<Uuid> = record.moved_bbas.iter().map(|m| m.id).collect();
     let moved_json =
         serde_json::to_value(&record.moved_bbas).map_err(|e| DbError::InvalidData {
@@ -13080,7 +13135,7 @@ async fn reverse_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions k
               USING mass_functions m
-              WHERE k.claim_id = $2 AND {}
+              WHERE k.claim_id = $2 AND {} AND k.retracted_at IS NULL
                 AND m.id = ANY($3) AND m.claim_id = ANY($1)
                 AND m.frame_id = k.frame_id
                 AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
@@ -13126,7 +13181,9 @@ async fn reverse_marked_duplicate(
     // only beside an edge that is in force again: every one of them is keyed
     // to an edge, and a BBA on a retracted edge is exactly the orphan the
     // repair exists to prevent. One whose id or key is taken again is a later
-    // write's and is skipped.
+    // write's and is skipped (`ON CONFLICT DO NOTHING`, no conflict target, so
+    // a key a RETRACTED row holds is skipped too and its row reported
+    // drifted; the retracted row is not touched).
     if !record.deleted_bbas.is_empty() {
         let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
         let asked: Vec<Uuid> = record
