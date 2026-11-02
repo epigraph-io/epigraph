@@ -190,6 +190,44 @@ fn act_marker() -> serde_json::Value {
     })
 }
 
+/// The deferred-cascade replay, on a NOSUPERUSER maintenance login.
+async fn replay_now(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayReport {
+    let url = fixture::database_url_for(pool).await;
+    let maintenance = fixture::downgraded_pool(pool, "epigraph_maintenance").await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("ScopedPool")
+            .with_maintenance_pool(maintenance);
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, admin_viewer) = session.split();
+    epigraph_engine::admin_cascade::replay_deferred(
+        conn,
+        admin_viewer,
+        "k2-mcp",
+        50,
+        epigraph_engine::admin_cascade::DEFAULT_MAX_FAILURES,
+    )
+    .await
+    .expect("replay")
+}
+
+/// Retract edge `id` (set `valid_to`) on the harness, and check it took.
+async fn retract(pool: &PgPool, id: Uuid) {
+    let retracted: bool = sqlx::query_scalar(
+        "UPDATE edges SET valid_to = now() - interval '1 hour' WHERE id = $1 \
+         RETURNING valid_to IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("retract the edge");
+    assert!(retracted, "fixture: edge {id} is retracted");
+}
+
 // ── K1: agent authorship and act edges ──────────────────────────────────────
 
 /// Another agent's `AUTHORED` and a third agent's `asserts` into `x`, and a
@@ -340,4 +378,79 @@ async fn consolidate_claims_leaves_agent_authorship_and_act_edges_on_the_sources
         before,
         "agent AUTHORED, agent asserts and the act edge stay on their sources"
     );
+}
+
+// ── K2: retracted edges ─────────────────────────────────────────────────────
+
+/// A retracted incoming and a retracted outgoing edge on the predecessor, and
+/// their live twins (the controls, which move).
+struct Retracted {
+    x: Uuid,
+    y: Uuid,
+    z: Uuid,
+    incoming: Uuid,
+    outgoing: Uuid,
+    live_in: Uuid,
+    live_out: Uuid,
+}
+
+async fn seed_retracted(pool: &PgPool, author: Uuid, group: Uuid) -> Retracted {
+    let x = claim_of(pool, author, group, "k2 mcp predecessor").await;
+    let y = claim_of(pool, author, group, "k2 mcp supporter").await;
+    let z = claim_of(pool, author, group, "k2 mcp supported claim").await;
+    let incoming = edge(pool, (y, "claim"), (x, "claim"), "supports", None).await;
+    let outgoing = edge(pool, (x, "claim"), (z, "claim"), "supports", None).await;
+    retract(pool, incoming).await;
+    retract(pool, outgoing).await;
+    Retracted {
+        x,
+        y,
+        z,
+        incoming,
+        outgoing,
+        live_in: edge(pool, (y, "claim"), (x, "claim"), "corroborates", None).await,
+        live_out: edge(pool, (x, "claim"), (z, "claim"), "corroborates", None).await,
+    }
+}
+
+async fn assert_retracted_stayed(pool: &PgPool, r: &Retracted, before: &[Ends], n: Uuid) {
+    assert_eq!(
+        ends(pool, &[r.live_in, r.live_out]).await,
+        vec![(r.y, n, true), (n, r.z, true)],
+        "the live controls followed the successor: the cascade ran"
+    );
+    assert_eq!(
+        ends(pool, &[r.incoming, r.outgoing]).await,
+        before,
+        "the retracted incoming and outgoing edges stay on the predecessor"
+    );
+}
+
+/// The supersede, cascade inline.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_inline_leaves_retracted_edges_on_the_predecessor(pool: PgPool) {
+    let server = app_role_server(&pool, true).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-mcp-inline").await;
+    let r = seed_retracted(&pool, author, group).await;
+    let before = ends(&pool, &[r.incoming, r.outgoing]).await;
+
+    let n = supersede_via_mcp(&server, &pool, author, r.x, "applied").await;
+
+    assert_retracted_stayed(&pool, &r, &before, n).await;
+}
+
+/// The supersede with no maintenance connection: deferred, then replayed on
+/// the maintenance login.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_deferred_replay_leaves_retracted_edges_on_the_predecessor(pool: PgPool) {
+    let server = app_role_server(&pool, false).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-mcp-deferred").await;
+    let r = seed_retracted(&pool, author, group).await;
+    let before = ends(&pool, &[r.incoming, r.outgoing]).await;
+
+    let n = supersede_via_mcp(&server, &pool, author, r.x, "deferred").await;
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+
+    assert_retracted_stayed(&pool, &r, &before, n).await;
 }

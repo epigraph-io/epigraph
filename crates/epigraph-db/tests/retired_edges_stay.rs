@@ -97,6 +97,39 @@ async fn ends(pool: &PgPool, ids: &[Uuid]) -> Vec<Ends> {
     out
 }
 
+async fn relationship_of(pool: &PgPool, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT relationship FROM edges WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("edge")
+}
+
+/// Retract edge `id` (set `valid_to`) on the harness, and check it took.
+async fn retract(pool: &PgPool, id: Uuid) {
+    let retracted: bool = sqlx::query_scalar(
+        "UPDATE edges SET valid_to = now() - interval '1 hour' WHERE id = $1 \
+         RETURNING valid_to IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("retract the edge");
+    assert!(retracted, "fixture: edge {id} is retracted");
+}
+
+/// A legacy upper-case lineage edge, checked byte-exact after the write (a
+/// write path that folded it would make the test pass for the wrong reason).
+async fn upper_lineage(pool: &PgPool, newer: Uuid, older: Uuid) -> Uuid {
+    let id = edge(pool, (newer, "claim"), (older, "claim"), "SUPERSEDES", None).await;
+    assert_eq!(
+        relationship_of(pool, id).await,
+        "SUPERSEDES",
+        "fixture: the legacy spelling is stored byte-exact"
+    );
+    id
+}
+
 async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
     sqlx::query_scalar("SELECT COALESCE(is_current, true) FROM claims WHERE id = $1")
         .bind(claim)
@@ -414,5 +447,139 @@ async fn consolidate_leaves_agent_authorship_and_act_edges_on_the_sources(pool: 
         ends(&pool, &kept).await,
         before,
         "agent AUTHORED, agent asserts, the marked edges and the act edges stay on their sources"
+    );
+}
+
+// ── K2: retracted edges and lineage edges of either spelling ────────────────
+
+/// The supersede cascade: a retracted incoming and a retracted outgoing edge
+/// are history about the predecessor and stay on it; their live twins (the
+/// controls) move.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_leaves_retracted_edges_on_the_predecessor(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-retracted").await;
+    let x = claim_of(&pool, author, group, "k2 the predecessor").await;
+    let y = claim_of(&pool, author, group, "k2 a supporter").await;
+    let z = claim_of(&pool, author, group, "k2 a supported claim").await;
+    let incoming = edge(&pool, (y, "claim"), (x, "claim"), "supports", None).await;
+    let outgoing = edge(&pool, (x, "claim"), (z, "claim"), "supports", None).await;
+    retract(&pool, incoming).await;
+    retract(&pool, outgoing).await;
+    let live_in = edge(&pool, (y, "claim"), (x, "claim"), "corroborates", None).await;
+    let live_out = edge(&pool, (x, "claim"), (z, "claim"), "corroborates", None).await;
+    let before = ends(&pool, &[incoming, outgoing]).await;
+
+    let n = supersede_act(&pool, author, group, x).await;
+    replay_supersede(&pool, x, n).await;
+    replay_supersede(&pool, x, n).await;
+
+    assert_eq!(
+        ends(&pool, &[live_in, live_out]).await,
+        vec![(y, n, true), (n, z, true)],
+        "the live controls followed the successor: the migration ran"
+    );
+    assert_eq!(
+        ends(&pool, &[incoming, outgoing]).await,
+        before,
+        "the retracted incoming and outgoing edges stay on the predecessor"
+    );
+}
+
+/// The supersede cascade: a legacy upper-case `SUPERSEDES` edge in either
+/// direction on the predecessor is lineage and is never re-pointed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_leaves_upper_case_lineage_edges_on_the_predecessor(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-upper-supersede").await;
+    let x = claim_of(&pool, author, group, "k2 the predecessor").await;
+    let newer = claim_of(&pool, author, group, "k2 a legacy newer claim").await;
+    let older = claim_of(&pool, author, group, "k2 a legacy older claim").await;
+    let incoming = upper_lineage(&pool, newer, x).await;
+    let outgoing = upper_lineage(&pool, x, older).await;
+    let control = edge(&pool, (newer, "claim"), (x, "claim"), "supports", None).await;
+    let before = ends(&pool, &[incoming, outgoing]).await;
+
+    let n = supersede_act(&pool, author, group, x).await;
+    replay_supersede(&pool, x, n).await;
+    replay_supersede(&pool, x, n).await;
+
+    assert_eq!(
+        ends(&pool, &[control]).await[0].1,
+        n,
+        "the control followed the successor: the migration ran"
+    );
+    assert_eq!(
+        ends(&pool, &[incoming, outgoing]).await,
+        before,
+        "both upper-case lineage edges stay on the predecessor"
+    );
+}
+
+/// The dedup repair: upper-case `SUPERSEDES` edges on the duplicate are
+/// neither re-pointed (the two re-points) nor retracted as a colliding copy of
+/// a triple the canonical already holds (the two collision guards).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dedup_repair_leaves_upper_case_lineage_edges_on_the_duplicate(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-upper-dedup").await;
+    let dup = claim_of(&pool, author, group, "k2 the duplicate").await;
+    let canonical = claim_of(&pool, author, group, "k2 the canonical").await;
+    let newer = claim_of(&pool, author, group, "k2 a legacy newer claim").await;
+    let older = claim_of(&pool, author, group, "k2 a legacy older claim").await;
+    let shared_newer = claim_of(&pool, author, group, "k2 a newer claim of both").await;
+    let shared_older = claim_of(&pool, author, group, "k2 an older claim of both").await;
+    let incoming = upper_lineage(&pool, newer, dup).await;
+    let outgoing = upper_lineage(&pool, dup, older).await;
+    // The canonical holds the same triples, so the collision guards see these.
+    let colliding_in = upper_lineage(&pool, shared_newer, dup).await;
+    upper_lineage(&pool, shared_newer, canonical).await;
+    let colliding_out = upper_lineage(&pool, dup, shared_older).await;
+    upper_lineage(&pool, canonical, shared_older).await;
+    let control = edge(&pool, (newer, "claim"), (dup, "claim"), "supports", None).await;
+    let kept = [incoming, outgoing, colliding_in, colliding_out];
+    let before = ends(&pool, &kept).await;
+
+    dedup_act(&pool, author, group, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+    replay_dedup(&pool, dup, canonical).await;
+
+    let c = ends(&pool, &[control]).await[0];
+    assert_eq!(
+        (c.1, c.2),
+        (canonical, true),
+        "the control followed the canonical: the repair ran"
+    );
+    assert_eq!(
+        ends(&pool, &kept).await,
+        before,
+        "every upper-case lineage edge stays, in force, on the duplicate"
+    );
+}
+
+/// The merge cascade: upper-case `SUPERSEDES` edges on a source are not
+/// candidates (neither moved nor retracted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_leaves_upper_case_lineage_edges_on_the_sources(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k2-upper-merge").await;
+    let s1 = claim_of(&pool, author, group, "k2 source one").await;
+    let s2 = claim_of(&pool, author, group, "k2 source two").await;
+    let newer = claim_of(&pool, author, group, "k2 a legacy newer claim").await;
+    let older = claim_of(&pool, author, group, "k2 a legacy older claim").await;
+    let incoming = upper_lineage(&pool, newer, s1).await;
+    let outgoing = upper_lineage(&pool, s2, older).await;
+    let control = edge(&pool, (newer, "claim"), (s1, "claim"), "supports", None).await;
+    let before = ends(&pool, &[incoming, outgoing]).await;
+
+    let merged = consolidate_act(&pool, author, group, vec![s1, s2]).await;
+    replay_consolidate(&pool, merged, vec![s1, s2]).await;
+    replay_consolidate(&pool, merged, vec![s1, s2]).await;
+
+    assert_eq!(
+        ends(&pool, &[control]).await[0].1,
+        merged,
+        "the control followed the merge: the migration ran"
+    );
+    assert_eq!(
+        ends(&pool, &[incoming, outgoing]).await,
+        before,
+        "both upper-case lineage edges stay on their sources"
     );
 }
