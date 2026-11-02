@@ -79,6 +79,11 @@ fn guards(sql: &str) -> usize {
     flat.matches("retracted_at IS NULL").count() + flat.matches("{not_retracted}").count()
 }
 
+/// The unguarded delete sites of one comment-free SQL text.
+fn unguarded(sql: &str) -> usize {
+    delete_sites(sql).saturating_sub(guards(sql))
+}
+
 /// Every delete site (guarded or not) and every unguarded one, keyed
 /// `(path, unit)`.
 #[allow(clippy::type_complexity)]
@@ -89,7 +94,7 @@ fn measure(
     BTreeMap<(String, String), usize>,
 ) {
     let mut all: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let mut unguarded: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut open: BTreeMap<(String, String), usize> = BTreeMap::new();
     for s in rust {
         let view = rust_view(&s.text);
         let units = RustUnits::new(&view.code);
@@ -104,13 +109,13 @@ fn measure(
             }
             let key = (s.path.clone(), units.unit_at(lit.start).0);
             *all.entry(key.clone()).or_default() += d;
-            let n = d.saturating_sub(guards(&sql));
+            let n = unguarded(&sql);
             if n > 0 {
-                *unguarded.entry(key).or_default() += n;
+                *open.entry(key).or_default() += n;
             }
         }
     }
-    (all, unguarded)
+    (all, open)
 }
 
 /// The ratchet's verdict over the unguarded sites, one line per finding.
@@ -243,6 +248,62 @@ fn only_a_real_delete_is_a_site_and_only_live_sql_guards_it() {
         delete_sites(&commented).saturating_sub(guards(&commented)),
         1,
         "a guard in a comment guards nothing"
+    );
+}
+
+/// A guard binds to the DELETE's OWN target, in the DELETE's own clauses: a
+/// `retracted_at IS NULL` on another table reference (inside an `EXISTS`
+/// subquery, or on a `USING` table) guards nothing, and neither the keyword
+/// case nor an `ONLY` hides a delete site. Without this, dropping the
+/// predicate on the target of `repair_marked_duplicate`'s part-2 drop (whose
+/// `EXISTS` still names `c.retracted_at IS NULL`) would leave the ratchet
+/// green.
+#[test]
+fn a_guard_inside_a_subquery_does_not_guard_the_delete() {
+    let subquery = "DELETE FROM mass_functions d WHERE d.claim_id = $1 AND EXISTS (SELECT 1 \
+                    FROM mass_functions c WHERE c.claim_id = $2 AND c.retracted_at IS NULL)";
+    assert_eq!(
+        unguarded(subquery),
+        1,
+        "a guard on the subquery's row does not guard the delete"
+    );
+    let using = "DELETE FROM mass_functions k USING mass_functions m \
+                 WHERE k.claim_id = $1 AND m.id = $2 AND m.retracted_at IS NULL";
+    assert_eq!(
+        unguarded(using),
+        1,
+        "a guard on the USING table does not guard the delete"
+    );
+    assert_eq!(
+        unguarded(&subquery.replace(
+            "WHERE d.claim_id",
+            "WHERE d.retracted_at IS NULL AND d.claim_id"
+        )),
+        0,
+        "the same delete with a guard on its own target passes"
+    );
+    assert_eq!(
+        unguarded(&using.replace("AND m.id", "AND k.retracted_at IS NULL AND m.id")),
+        0,
+        "the USING delete with a guard on its own target passes"
+    );
+    assert_eq!(
+        unguarded("delete from only mass_functions where id = $1"),
+        1,
+        "keyword case and ONLY do not hide a delete site"
+    );
+    assert_eq!(
+        unguarded("delete from mass_functions as mf where mf.id = $1 and mf.retracted_at is null"),
+        0,
+        "a lower-case guard on the target guards it"
+    );
+    assert_eq!(
+        unguarded(
+            "WITH gone AS (DELETE FROM mass_functions WHERE claim_id = $1 RETURNING 1) \
+             SELECT count(*) FROM mass_functions WHERE retracted_at IS NULL"
+        ),
+        1,
+        "a guard after the delete's own statement guards nothing"
     );
 }
 
