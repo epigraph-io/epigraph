@@ -114,9 +114,10 @@ pub async fn supersede_claim(
 }
 
 /// The answer `supersede_claim` gives when the database refuses its act on
-/// `claim` (`supersede_act_conn`) or the act's cascade deferral
-/// ([`supersede_session_or_deferral`]): one mapper for both, so a refusal
-/// reads the same whichever statement raised it (supersede SPEC K5). Every
+/// `claim` (`supersede_act_conn`) (supersede SPEC K5). Its first arm, CX03, is
+/// also the answer to a refused cascade deferral
+/// ([`supersede_deferral_refusal`]), so CX03 reads the same whichever
+/// statement raised it. Every
 /// denial is `INVALID_REQUEST` with its code in the text, and nothing was
 /// written (the act and its deferral share one transaction):
 ///
@@ -132,29 +133,10 @@ pub async fn supersede_claim(
 ///    OPL01 / OPL02 / ROL01 and `WriteRefused` as denials and keeps a fault a
 ///    fault.
 pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError {
-    let database = match &e {
-        epigraph_db::DbError::QueryFailed {
-            source: sqlx::Error::Database(d),
-        } if d.code().as_deref() == Some("42501") => Some(d.message().to_string()),
-        _ => None,
-    };
-    if let Some(message) = database {
-        let cx03 = format!(
-            "{}:",
-            epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
-        );
-        if message.starts_with(&cx03) {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                tool = "supersede_claim",
-                claim = %claim,
-                detail = %message,
-                "the cascade deferral refused the supersession"
-            );
-            return caller_denial(epigraph_auth::claim_act::supersede_not_recorded_message(
-                claim,
-            ));
-        }
+    if let Some(denial) = cx03_denial(claim, &e) {
+        return denial;
+    }
+    if let Some(message) = database_42501(&e) {
         if !opens_with_refusal_code(&message) {
             tracing::warn!(
                 target: "tenancy.scoped_write",
@@ -167,6 +149,58 @@ pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError
         }
     }
     crate::errors::db_caller_error(e)
+}
+
+/// The message of a database error with SQLSTATE `42501`, or `None`.
+fn database_42501(e: &epigraph_db::DbError) -> Option<String> {
+    match e {
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } if d.code().as_deref() == Some("42501") => Some(d.message().to_string()),
+        _ => None,
+    }
+}
+
+/// Migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`) as the
+/// caller's denial, or `None` for any other error.
+///
+/// The definer raises CX03 when the deferral names no committed act of the
+/// session's own: either the act did not land, or the session does not write
+/// both claims' group. On the supersede path the act runs first in the same
+/// transaction, so only the authority arm is reachable there, and that is what
+/// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
+fn cx03_denial(claim: uuid::Uuid, e: &epigraph_db::DbError) -> Option<McpError> {
+    let message = database_42501(e)?;
+    let cx03 = format!(
+        "{}:",
+        epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
+    );
+    if !message.starts_with(&cx03) {
+        return None;
+    }
+    tracing::warn!(
+        target: "tenancy.scoped_write",
+        tool = "supersede_claim",
+        claim = %claim,
+        detail = %message,
+        "the cascade deferral refused the supersession"
+    );
+    Some(caller_denial(
+        epigraph_auth::claim_act::supersede_not_recorded_message(claim),
+    ))
+}
+
+/// The answer to a failed supersede DEFERRAL: CX03 is the caller's denial
+/// ([`supersede_refusal`]'s first arm, the same text); anything else is the
+/// server's fault, answered as [`admin_session_or_deferral`] answers it for the
+/// other claim acts. Not the act mapper: an uncoded `42501` here is a deploy
+/// fault (a missing EXECUTE grant on the definer), not row security refusing
+/// the caller, so it must not read as the group-write denial.
+pub fn supersede_deferral_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError {
+    match cx03_denial(claim, &e) {
+        Some(denial) => denial,
+        None => internal_error(e),
+    }
 }
 
 /// Row security's refusal of a supersession, in the words the HTTP route
@@ -197,8 +231,9 @@ fn opens_with_refusal_code(message: &str) -> bool {
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
-/// refusal is answered by [`supersede_refusal`] for the trigger's subject (the
-/// retired claim). The other claim acts keep [`admin_session_or_deferral`].
+/// refusal is answered by [`supersede_deferral_refusal`] for the trigger's
+/// subject (the retired claim): CX03 as the caller's denial, anything else as
+/// a fault. The other claim acts keep [`admin_session_or_deferral`].
 ///
 /// # Errors
 /// The deferral INSERT's error, mapped: the caller propagates it and nothing
@@ -209,7 +244,10 @@ pub async fn supersede_session_or_deferral<'s>(
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
     let claim = trigger.subject_id;
-    session_or_deferral(server, tx, trigger, |e| supersede_refusal(claim, e)).await
+    session_or_deferral(server, tx, trigger, |e| {
+        supersede_deferral_refusal(claim, e)
+    })
+    .await
 }
 
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
