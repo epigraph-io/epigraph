@@ -1236,7 +1236,9 @@ impl MassFunctionRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
-    /// Delete all mass functions for a claim
+    /// Delete every LIVE mass function of a claim. A RETRACTED row (migration
+    /// 184) is kept for audit (rulings R-79, R-103): it is neither deleted nor
+    /// counted, and its presence is not a refusal.
     ///
     /// Returns the number of rows deleted.
     ///
@@ -1255,8 +1257,10 @@ impl MassFunctionRepository {
         let mut tx = pool.begin().await?;
         let counts: (i64, i64) = sqlx::query_as(
             r#"
-            WITH seen AS (SELECT 1 FROM mass_functions WHERE claim_id = $1),
-                 done AS (DELETE FROM mass_functions WHERE claim_id = $1 RETURNING 1)
+            WITH seen AS (SELECT 1 FROM mass_functions
+                           WHERE claim_id = $1 AND retracted_at IS NULL),
+                 done AS (DELETE FROM mass_functions
+                           WHERE claim_id = $1 AND retracted_at IS NULL RETURNING 1)
             SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )
