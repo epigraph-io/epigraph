@@ -67,12 +67,7 @@ pub async fn supersede_claim(
         epigraph_db::SupersedeActor::new(caller, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
-    .map_err(|e| match e {
-        // Readable as current but not retirable by this session: a denial of
-        // authority (INVALID_REQUEST), with nothing written.
-        e @ epigraph_db::DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
-        other => internal_error(other),
-    })?;
+    .map_err(|e| supersede_refusal(old, e))?;
 
     let trigger = CascadeTrigger::new(
         CascadeCause::Supersede,
@@ -85,7 +80,7 @@ pub async fn supersede_claim(
     // none (not configured, or unusable), the deferral is recorded in the act's
     // own transaction, attributed to the principal it is stamped with, so the
     // act and its audit row commit together (or neither does).
-    let (mut session, deferred) = admin_session_or_deferral(server, &mut tx, &trigger).await?;
+    let (mut session, deferred) = supersede_session_or_deferral(server, &mut tx, &trigger).await?;
     tx.commit().await.map_err(internal_error)?;
 
     // THE CASCADE (backlog 20e9ed83; migration 117): migrate the retired
@@ -118,6 +113,34 @@ pub async fn supersede_claim(
     )]))
 }
 
+/// The answer `supersede_claim` gives when the database refuses its act on
+/// `claim` (`supersede_act_conn`) or the act's cascade deferral
+/// ([`supersede_session_or_deferral`]): one mapper for both, so a refusal
+/// reads the same whichever statement raised it.
+pub fn supersede_refusal(_claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError {
+    match e {
+        // Readable as current but not retirable by this session: a denial of
+        // authority (INVALID_REQUEST), with nothing written.
+        e @ epigraph_db::DbError::WriteRefused { .. } => crate::errors::db_caller_error(e),
+        other => internal_error(other),
+    }
+}
+
+/// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
+/// refusal is answered by [`supersede_refusal`] for the trigger's subject (the
+/// retired claim). The other claim acts keep [`admin_session_or_deferral`].
+///
+/// # Errors
+/// The deferral INSERT's error, mapped: the caller propagates it and nothing
+/// commits.
+pub async fn supersede_session_or_deferral<'s>(
+    server: &'s EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
+    session_or_deferral(server, tx, trigger, internal_error).await
+}
+
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx`, so the act and its audit row
@@ -130,12 +153,23 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     tx: &mut sqlx::PgConnection,
     trigger: &CascadeTrigger,
 ) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
+    session_or_deferral(server, tx, trigger, internal_error).await
+}
+
+/// [`admin_session_or_deferral`] with the deferral's error answered by
+/// `refusal`.
+async fn session_or_deferral<'s>(
+    server: &'s EpiGraphMcpFull,
+    tx: &mut sqlx::PgConnection,
+    trigger: &CascadeTrigger,
+    refusal: impl FnOnce(epigraph_db::DbError) -> McpError,
+) -> Result<(Option<epigraph_db::MaintenanceSession<'s>>, CascadeStatus), McpError> {
     match crate::maintenance::admin_cascade_session(server).await {
         Ok(session) => Ok((Some(session), CascadeStatus::default())),
         Err(reason) => {
             let status = admin_cascade::record_deferral(&mut *tx, trigger, &reason)
                 .await
-                .map_err(internal_error)?;
+                .map_err(refusal)?;
             Ok((None, status))
         }
     }

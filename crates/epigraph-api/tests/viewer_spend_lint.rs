@@ -1047,8 +1047,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimRepository::supersede_act_conn",
             "ClaimVersionRepository::create",
-            "admin_session_or_deferral",
             "sqlx::query_as(SELECT).fetch_all",
+            "supersede_session_or_deferral",
         ],
     ),
     (

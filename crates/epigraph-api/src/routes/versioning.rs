@@ -403,48 +403,7 @@ pub async fn supersede_claim(
         epigraph_db::SupersedeActor::new(acting_agent, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
-    .map_err(|e| {
-        if crate::errors::db_is_insufficient_privilege(&e) {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                handler = "supersede_claim",
-                claim = %claim_id,
-                error = %e,
-                "the database refused the supersession"
-            );
-            return crate::errors::write_refused("claim");
-        }
-        // The session reads the claim as current but its retirement matched
-        // no row (an UPDATE policy that hides it): a denial, and the act wrote
-        // nothing. `From<DbError>` answers it 403.
-        if matches!(e, epigraph_db::DbError::WriteRefused { .. }) {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                handler = "supersede_claim",
-                claim = %claim_id,
-                error = %e,
-                "the database refused to retire the claim"
-            );
-            return ApiError::from(e);
-        }
-        // A repo-authored refusal (e.g. the claim is already superseded) is
-        // answered by its kind (operator ruling R-55), not by its text.
-        if matches!(e, epigraph_db::DbError::Refused { .. }) {
-            return ApiError::from(e);
-        }
-        // Map DB errors to appropriate API errors
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: claim_id.to_string(),
-            }
-        } else {
-            ApiError::InternalError {
-                message: format!("Supersession failed: {msg}"),
-            }
-        }
-    })?;
+    .map_err(|e| supersede_refusal(claim_id, e))?;
 
     let now = Utc::now();
     let new_claim_id = ClaimId::from_uuid(new_uuid);
@@ -517,7 +476,7 @@ pub async fn supersede_claim(
         Some(new_uuid),
     );
     #[cfg(feature = "db")]
-    let (mut session, deferred) = admin_session_or_deferral(&state, &mut tx, &trigger).await?;
+    let (mut session, deferred) = supersede_session_or_deferral(&state, &mut tx, &trigger).await?;
 
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the supersession: {e}"),
@@ -625,6 +584,75 @@ pub(crate) fn oauth_principal(
     }
 }
 
+/// The answer `supersede_claim` gives when the database refuses its act on
+/// `claim_id` (`supersede_act_conn`) or the act's cascade deferral
+/// ([`supersede_session_or_deferral`]): one mapper for both, so a refusal
+/// reads the same whichever statement raised it.
+#[cfg(feature = "db")]
+pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "supersede_claim",
+            claim = %claim_id,
+            error = %e,
+            "the database refused the supersession"
+        );
+        return crate::errors::write_refused("claim");
+    }
+    // The session reads the claim as current but its retirement matched
+    // no row (an UPDATE policy that hides it): a denial, and the act wrote
+    // nothing. `From<DbError>` answers it 403.
+    if matches!(e, epigraph_db::DbError::WriteRefused { .. }) {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "supersede_claim",
+            claim = %claim_id,
+            error = %e,
+            "the database refused to retire the claim"
+        );
+        return ApiError::from(e);
+    }
+    // A repo-authored refusal (e.g. the claim is already superseded) is
+    // answered by its kind (operator ruling R-55), not by its text.
+    if matches!(e, epigraph_db::DbError::Refused { .. }) {
+        return ApiError::from(e);
+    }
+    // Map DB errors to appropriate API errors
+    let msg = e.to_string();
+    if msg.contains("not found") {
+        ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: claim_id.to_string(),
+        }
+    } else {
+        ApiError::InternalError {
+            message: format!("Supersession failed: {msg}"),
+        }
+    }
+}
+
+/// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
+/// refusal is answered by [`supersede_refusal`] for the trigger's subject (the
+/// retired claim). The other claim acts keep [`admin_session_or_deferral`].
+///
+/// # Errors
+/// The deferral INSERT's error, mapped: nothing commits.
+#[cfg(feature = "db")]
+pub async fn supersede_session_or_deferral<'s>(
+    state: &'s AppState,
+    tx: &mut sqlx::PgConnection,
+    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
+) -> Result<
+    (
+        Option<epigraph_db::MaintenanceSession<'s>>,
+        epigraph_engine::admin_cascade::CascadeStatus,
+    ),
+    ApiError,
+> {
+    session_or_deferral(state, tx, trigger, deferral_failed).await
+}
+
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx` (stamped with the caller's
@@ -645,15 +673,39 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     ),
     ApiError,
 > {
+    session_or_deferral(state, tx, trigger, deferral_failed).await
+}
+
+/// The generic answer to a failed deferral INSERT: a database error.
+#[cfg(feature = "db")]
+fn deferral_failed(e: epigraph_db::DbError) -> ApiError {
+    ApiError::DatabaseError {
+        message: format!("Failed to record the deferred cascade: {e}"),
+    }
+}
+
+/// [`admin_session_or_deferral`] with the deferral's error answered by
+/// `refusal`.
+#[cfg(feature = "db")]
+async fn session_or_deferral<'s>(
+    state: &'s AppState,
+    tx: &mut sqlx::PgConnection,
+    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
+    refusal: impl FnOnce(epigraph_db::DbError) -> ApiError,
+) -> Result<
+    (
+        Option<epigraph_db::MaintenanceSession<'s>>,
+        epigraph_engine::admin_cascade::CascadeStatus,
+    ),
+    ApiError,
+> {
     match state.admin_cascade_session().await {
         Ok(session) => Ok((Some(session), Default::default())),
         Err(reason) => {
             let status =
                 epigraph_engine::admin_cascade::record_deferral(&mut *tx, trigger, &reason)
                     .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: format!("Failed to record the deferred cascade: {e}"),
-                    })?;
+                    .map_err(refusal)?;
             Ok((None, status))
         }
     }
