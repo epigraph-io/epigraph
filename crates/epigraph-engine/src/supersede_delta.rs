@@ -45,8 +45,12 @@ use uuid::Uuid;
 /// current claim. `$1` (`uuid[]`): the retired sources to read, or NULL for
 /// every retired claim.
 ///
-/// * Only `perspective_type = 'edge'` perspectives: a BBA is edge-keyed when
-///   its perspective is the edge's own (`PerspectiveRepository::ensure_edge_perspective`).
+/// * A BBA is edge-keyed when its `perspective_id` is the edge's id, whatever
+///   the perspective row's `perspective_type`: the same keying the cascade's
+///   delete (`delete_for_perspective`, by edge id) and the backfill's
+///   `REWIRE_EDGE_QUERY` use. `ensure_edge_perspective` types a new row
+///   `'edge'` but keeps an existing one (`ON CONFLICT DO NOTHING`), and nothing
+///   backfills the type, so a type predicate could miss legacy rows.
 /// * Retracted rows are never selected (SPEC §4, "retracted BBAs"; ruling
 ///   R-79): an invalidation skips them, so they are kept.
 /// * The edge's own in-force state is NOT a predicate: a BBA keyed on a
@@ -56,8 +60,7 @@ pub const RETIRED_SOURCE_EDGE_BBAS_SQL: &str = r#"-- VISIBILITY-EXEMPT: maintena
 SELECT mf.id, mf.claim_id, e.id, e.source_id, lower(e.relationship),
        (e.valid_to IS NULL OR e.valid_to > now())
   FROM mass_functions mf
-  JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge'
-  JOIN edges e ON e.id = p.id
+  JOIN edges e ON e.id = mf.perspective_id
   JOIN claims s ON s.id = e.source_id
   JOIN claims h ON h.id = mf.claim_id
  WHERE e.source_type = 'claim'
@@ -68,13 +71,12 @@ SELECT mf.id, mf.claim_id, e.id, e.source_id, lower(e.relationship),
  ORDER BY e.id, mf.claim_id, mf.id"#;
 
 /// Live BBAs keyed on a `supersedes` edge of either spelling, held by a
-/// current claim. Same perspective rule as [`RETIRED_SOURCE_EDGE_BBAS_SQL`].
+/// current claim. Same keying rule as [`RETIRED_SOURCE_EDGE_BBAS_SQL`].
 pub const SUPERSEDES_EDGE_BBAS_SQL: &str = r#"-- VISIBILITY-EXEMPT: maintenance read; the dry-run delta runs on the privileged connection.
 SELECT mf.id, mf.claim_id, e.id, e.source_id, lower(e.relationship),
        (e.valid_to IS NULL OR e.valid_to > now())
   FROM mass_functions mf
-  JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge'
-  JOIN edges e ON e.id = p.id
+  JOIN edges e ON e.id = mf.perspective_id
   JOIN claims h ON h.id = mf.claim_id
  WHERE lower(e.relationship) = 'supersedes'
    AND COALESCE(h.is_current, true)
@@ -249,8 +251,7 @@ pub fn slots_minted(edges: &[FactorlessEdge]) -> Vec<String> {
 const RETIRED_SOURCE_RETRACTED_BBAS_SQL: &str = r#"-- VISIBILITY-EXEMPT: maintenance read; the dry-run delta runs on the privileged connection.
 SELECT count(*)
   FROM mass_functions mf
-  JOIN perspectives p ON p.id = mf.perspective_id AND p.perspective_type = 'edge'
-  JOIN edges e ON e.id = p.id
+  JOIN edges e ON e.id = mf.perspective_id
   JOIN claims s ON s.id = e.source_id
   JOIN claims h ON h.id = mf.claim_id
  WHERE e.source_type = 'claim'
