@@ -487,7 +487,7 @@ async fn measure(
 ) -> Result<DeltaReport, String> {
     let mut report = DeltaReport {
         items: opts.items,
-        served_value: "claims.pignistic_prob (the DS cache); BP marginals are not served",
+        served_value: "the DS cache on claims (BetP, Bel, Pl); BP marginals are not served",
         ..DeltaReport::default()
     };
     if opts.items.r131 {
