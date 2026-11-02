@@ -298,8 +298,9 @@ pub async fn approve_client(
     // Admin-only scopes (elevation plan EL-9). `platform:admin` is minted by
     // the elevate grant alone and no client may hold it, so it is refused
     // whatever the switch says. The admin-only set follows migration 128's
-    // switch: armed (or unreadable), refused; unarmed, approved as before,
-    // with a warning naming them.
+    // switch: armed (or unreadable), refused; unarmed, they fall through to
+    // the 501 below like every other request (this route approves nothing
+    // since migration 188).
     if req
         .granted_scopes
         .iter()

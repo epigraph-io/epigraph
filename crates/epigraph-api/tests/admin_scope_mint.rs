@@ -829,7 +829,7 @@ fn approve_path(client: Uuid) -> String {
 /// chokepoint not applied to the route's scope check (the armed approvals
 /// succeed); an unreadable switch read as unarmed (fail open).
 #[sqlx::test(migrations = "../../migrations")]
-async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
+async fn approval_refuses_admin_scopes_and_otherwise_answers_moved(pool: PgPool) {
     let st = state(&pool).await;
     let jwt = st.jwt_config.clone();
     let app = create_router(st);
@@ -965,6 +965,15 @@ async fn the_approve_route_approves_nothing_even_on_a_privileged_dsn(pool: PgPoo
         status_and_granted(&pool, client).await,
         ("pending".to_string(), vec![])
     );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'oauth.client_approved' \
+            AND details->>'oauth_client_id' = $1::text",
+    )
+    .bind(client)
+    .fetch_one(&pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audited, 0, "a 501 leaves no approval audit row");
 }
 
 fn registration(name: &str, scope: Option<&str>) -> Value {

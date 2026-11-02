@@ -2193,7 +2193,7 @@ restart.
   owner and `search_path` pin are untouched (no CREATE OR REPLACE); 122's
   reactivation guard stays. Pinned by
   `epigraph-db/tests/app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`
-  and `epigraph-api/tests/admin_scope_mint.rs::approval_hands_out_admin_scopes_only_while_unarmed`.
+  and `epigraph-api/tests/admin_scope_mint.rs::approval_refuses_admin_scopes_and_otherwise_answers_moved`.
   Sets `lock_timeout = '3s'`. Undo in the file header. **Deploy order:**
   with or after the binary that answers the route 501 (an older binary with
   188 applied answers it 500). **Applied to throwaway databases only, NOT to

@@ -1414,18 +1414,6 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
 /// activate the client with `claims:admin`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
-    let app_exec: bool = sqlx::query_scalar(
-        "SELECT has_function_privilege('epigraph_app', \
-            'public.epigraph_oauth_client_approve(uuid, text[], uuid)'::regprocedure, 'EXECUTE')",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("catalog");
-    assert!(
-        !app_exec,
-        "epigraph_app must not EXECUTE epigraph_oauth_client_approve"
-    );
-
     let state_of = |client: Uuid| {
         let pool = pool.clone();
         async move {
@@ -1465,6 +1453,44 @@ async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
         ("pending".to_string(), vec!["claims:read".to_string()], 0),
         "a refused approval leaves the client pending, its grant unchanged and unaudited"
     );
+
+    // Catalog: 188 took EXECUTE on the approve definer from the application
+    // role, and ONLY that one: 118's other application-executable OAuth and
+    // agent-key definers (the mint, refresh, consent and key-status paths)
+    // stay EXECUTE-able.
+    let app_exec: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('epigraph_app', \
+            'public.epigraph_oauth_client_approve(uuid, text[], uuid)'::regprocedure, 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert!(
+        !app_exec,
+        "epigraph_app must not EXECUTE epigraph_oauth_client_approve"
+    );
+    for kept in [
+        "public.epigraph_refresh_token_check(bytea)",
+        "public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)",
+        "public.epigraph_refresh_token_revoke(uuid, text)",
+        "public.epigraph_refresh_token_revoke_by_hash(bytea)",
+        "public.epigraph_refresh_token_revoke_client(uuid)",
+        "public.epigraph_oauth_code_consume(bytea)",
+        "public.epigraph_oauth_session_to_consent(text, text, uuid, text[])",
+        "public.epigraph_oauth_session_take(text)",
+        "public.epigraph_oauth_client_lock_for_link(uuid)",
+        "public.epigraph_oauth_client_link_agent(uuid, uuid)",
+        "public.epigraph_agent_key_set_status(uuid, text, text, uuid)",
+    ] {
+        let may: bool = sqlx::query_scalar(
+            "SELECT has_function_privilege('epigraph_app', $1::text::regprocedure, 'EXECUTE')",
+        )
+        .bind(kept)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("catalog {kept}: {e}"));
+        assert!(may, "epigraph_app lost EXECUTE on {kept}");
+    }
 
     // Control: the maintenance role approves, and the approval is audited.
     let maint = role_pool(&pool, "epigraph_maintenance").await;
