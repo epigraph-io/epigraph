@@ -128,7 +128,10 @@ async fn the_supersede_cascade_keeps_retracted_edge_bbas_and_counts_them(pool: P
             .expect("binary frame")
     };
     let e1 = edge(&pool, a, b, "supports").await;
-    let e2 = edge(&pool, a, b, "refutes").await;
+    // `corroborates`, not a weakening relationship: weakening edges stay on
+    // the retired claim (`WEAKENING_RELATIONSHIPS`), so only a supporting
+    // one is re-pointed and walked.
+    let e2 = edge(&pool, a, b, "corroborates").await;
     let e3 = edge(&pool, a, c, "supports").await;
     let r1 = bba(&pool, b, bf, Some(author), Some(e1), Some("edge_factor")).await;
     let r2 = bba(&pool, b, bf, Some(author), Some(e2), Some("edge_factor")).await;
