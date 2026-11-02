@@ -1011,4 +1011,10 @@ async fn delete_frames_purges_a_retracted_companion_bba_then_deletes_the_frame(p
     let audit = audit_rows(&pool).await;
     assert_eq!(audit.len(), 1, "{audit:?}");
     assert_eq!(audit[0]["purged_retracted"], 1, "{}", audit[0]);
+    assert_eq!(
+        audit[0]["purged_retracted_ids"],
+        serde_json::json!([r_bba.to_string()]),
+        "the operator audit names the purged row: {}",
+        audit[0]
+    );
 }
