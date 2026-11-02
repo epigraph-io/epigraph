@@ -1685,7 +1685,9 @@ pub async fn deprecate_workflow(
 ///   caller without authority is refused before it takes or waits for any
 ///   lineage row lock; one refusal writes nothing. A legacy row with no
 ///   recorded submitter gets U005's rule (admin-only over the authenticated
-///   transport); stdio is unchecked, the batch H-b bar.
+///   transport); on stdio the target must be readable on the caller's own
+///   stamp, a group target's group writable by it, and then the submitter or
+///   its operator (backlog 222289f3; `workflow_authority`'s stdio arms).
 /// * Then every `workflows` row sharing a `canonical_name` with a target is
 ///   locked, so two concurrent deprecations of one lineage cannot each keep a
 ///   claim the other is retiring.

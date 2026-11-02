@@ -2054,6 +2054,51 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`,
+    /// or `None` when the connection's stamp does not read it. The write paths
+    /// that EXTEND a plan run it on the system-agent-stamped transaction that
+    /// writes the extension, so the extension takes the row's tenancy (ruling
+    /// R-98: a step added to a group plan, a new generation of a group
+    /// lineage); a reader's view goes through [`Self::tenancy_as_viewer`].
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn tenancy_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<(String, Uuid)>, sqlx::Error> {
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
+    /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`
+    /// as `viewer` reads it, or `None` when `viewer` cannot read the row,
+    /// exactly as for an unknown id (backlog 222289f3: the stdio workflow
+    /// authority decides on the CALLER's own view of the target row). Run it
+    /// on `viewer`'s STAMPED connection, so the in-query predicate and the row
+    /// security agree.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn tenancy_as_viewer(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<(String, Uuid)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT w.visibility::text, w.owner_group_id \
+               FROM workflows w WHERE w.id = $1 /* {VISIBILITY:w} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (String, Uuid)>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
     /// Every `workflows` row descended from `id` through `workflows.parent_id`
     /// (later generations and variants), transitively, in walk order and
     /// without `id` itself.
