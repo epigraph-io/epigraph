@@ -1,6 +1,8 @@
 -- Migration 189: `events` is append-only for the application role (backlog
--- 796c55aa). `epigraph_app` loses UPDATE, DELETE and TRUNCATE on
--- `public.events`; it keeps SELECT and INSERT.
+-- 796c55aa). `epigraph_app` loses UPDATE and DELETE on `public.events`; it
+-- keeps SELECT and INSERT. TRUNCATE is revoked too, as defence in depth: 077
+-- granted the application role only SELECT / INSERT / UPDATE / DELETE, so it
+-- never held TRUNCATE and that part of the REVOKE changes nothing today.
 --
 -- WHY. `events` has no row security, and the application role held every
 -- table privilege on it (README: SELECT / INSERT / UPDATE / DELETE on all
@@ -19,9 +21,9 @@
 --     is untouched.
 --   * DELETE: `RecallEventRepository::prune_telemetry_events`, called only by
 --     `prune_recall_events` on `epigraph_cli::MaintenancePool` (a maintenance
---     login; it refuses an application session). Unaffected by this file. Its
---     maintenance DELETE is a separate grant (open PR #729, migration 186);
---     this file neither depends on nor duplicates it.
+--     login; it refuses an application session). Unaffected by this file:
+--     the maintenance role's DELETE on `events` is 186's grant, which this
+--     file leaves intact and does not re-grant.
 --   * UPDATE: `AgentRepository::delete` detaches `events.actor_id` before
 --     deleting an agent. `agents` has row security and no DELETE policy, so on
 --     the application role that call already deleted nothing; it now fails at
@@ -31,18 +33,27 @@
 --   * No migration-defined function or trigger writes `events`.
 --
 -- WHAT IS UNCHANGED. Row security (still none on `events`); the maintenance
--- role's grants (070: SELECT / INSERT / UPDATE); the triggers
+-- role's grants (070: SELECT / INSERT / UPDATE; 186: DELETE); the triggers
 -- (`events_cascade_edges`, 166's `role_agent_write_check`); and the
 -- `events_actor_id_fkey` referential check, which runs as the table owner.
 -- No column-level grant on `events` exists, so the table-level REVOKE leaves
 -- the application role no UPDATE path.
 --
--- DEPLOY ORDER: none against other migrations or the binaries. No shipped
--- request-path statement needs the revoked privileges. Independent of 186
--- (either order, with or without it).
+-- DEFERRED, DELIBERATELY: 186's header says that if `events` is closed to
+-- application writes, a type-restricted prune definer should replace its
+-- table-wide maintenance DELETE on `events` in the same change. This file is
+-- that closing change and does NOT add the definer: the maintenance role
+-- keeps 186's DELETE (and 070's UPDATE) on every `events` row, so any session
+-- acting as `epigraph_maintenance` can still delete or rewrite a provenance
+-- event. Narrowing the maintenance role on `events` to a telemetry-only
+-- definer is a follow-up (it changes `prune_telemetry_events` and the
+-- retention job, not the application role).
+--
+-- DEPLOY ORDER: after 186 (numeric order); none against the binaries. No
+-- shipped request-path statement needs the revoked privileges.
 --
 -- UNDO:
---   GRANT UPDATE, DELETE, TRUNCATE ON public.events TO epigraph_app;
+--   GRANT UPDATE, DELETE ON public.events TO epigraph_app;
 --   (and re-add ("events", OPERATIONAL) to app_role_table_lockdown.rs.)
 -- Checked before claiming: no `origin/main` migration, open PR or origin
 -- branch carries a `189`.
