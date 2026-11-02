@@ -254,8 +254,11 @@ pub(crate) async fn require_workflow_authority(
 ///
 /// 1. The caller must READ the row on its OWN stamp (the system-ingest stamp
 ///    the write runs on reads every group the system agent writes). A row it
-///    cannot read is refused exactly as an unknown one would read to it,
-///    without its id or submitter.
+///    cannot read is refused without its id or submitter. That text is NOT a
+///    tool's own not-found text (an unknown `canonical_name` reaches the
+///    executor's "workflow not found"), so a stdio caller can still tell that
+///    a hidden name exists: the reveal residual ruling R-100 accepted, as the
+///    HTTP twins' 403 does.
 /// 2. A GROUP row: the caller must hold a live writer/admin membership of the
 ///    row's owner group, the group the write lands in.
 /// 3. A recorded submitter: the submitter, or its operator (the operator
