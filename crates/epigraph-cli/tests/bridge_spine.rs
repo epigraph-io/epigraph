@@ -98,7 +98,9 @@ async fn spine_aggregates_top_themes(pool: PgPool) {
         .unwrap();
     }
 
-    let umbrellas = compute_spine_destination(&pool, &table, 3).await.unwrap();
+    let umbrellas = compute_spine_destination(&mut pool.acquire().await.unwrap(), &table, 3)
+        .await
+        .unwrap();
 
     // 3 of 4 candidates have themes (t_d is dropped).
     // Total = 3. A weight = 2/3, B weight = 1/3.
@@ -144,7 +146,9 @@ async fn spine_returns_empty_when_no_targets_have_themes(pool: PgPool) {
     .await
     .unwrap();
 
-    let umbrellas = compute_spine_destination(&pool, &table, 3).await.unwrap();
+    let umbrellas = compute_spine_destination(&mut pool.acquire().await.unwrap(), &table, 3)
+        .await
+        .unwrap();
     assert!(umbrellas.is_empty());
 
     sqlx::query(&format!("DROP TABLE {table}"))
@@ -195,7 +199,9 @@ async fn spine_top_n_truncates_lowest_weight_umbrellas(pool: PgPool) {
     }
 
     // top_n = 2 → C is dropped, A and B remain ordered by count desc.
-    let umbrellas = compute_spine_destination(&pool, &table, 2).await.unwrap();
+    let umbrellas = compute_spine_destination(&mut pool.acquire().await.unwrap(), &table, 2)
+        .await
+        .unwrap();
     assert_eq!(umbrellas.len(), 2);
     assert_eq!(umbrellas[0].umbrella, "A");
     assert_eq!(umbrellas[0].count, 3);
