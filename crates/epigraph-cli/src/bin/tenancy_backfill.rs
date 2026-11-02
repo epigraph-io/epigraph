@@ -1628,6 +1628,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // maintenance-role frame, so every un-retraction errors with nothing
     // written (loud).
     ("epigraph_unretract_mass_function", 184),
+    // 193 (backlog 0dc20fad), the definer-rights compound test of the
+    // cached-belief owner lookup. Fails OPEN under a non-member owner: its
+    // reads of the FORCEd `claims` and `edges` are then row-security filtered
+    // exactly as the caller's would be, so a compound whose decomposition the
+    // caller cannot see reads as "not a compound" and the per-request refresh
+    // refolds or vacates its cache, which is the defect the function closes.
+    // The stake that makes the owner a control here.
+    ("epigraph_claim_is_compound", 193),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

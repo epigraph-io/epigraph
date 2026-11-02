@@ -35,7 +35,11 @@
 //! `get_belief`, `get_perspective_belief` and its batch). For a viewer who can
 //! see the evidence rows its BBAs reference, the next recompute therefore
 //! cannot re-inflate what the write left honest, and those readers agree with
-//! the cache. The atom fold (`atom_items`) still calls
+//! the cache. Two combines that are not a Dempster fold apply the same-human
+//! rule alone ([`reduce_same_owner_siblings`]) before combining: the BP seed's
+//! pairwise adaptive combine (REST `routes/computation.rs`) and MCP
+//! `compare_methods`, which then folds the reduced inputs under each method it
+//! compares. The atom fold (`atom_items`) still calls
 //! [`combine_with_source_dependence`] for its legacy-grouping comparison.
 //!
 //! Source keys are read through the caller's viewer
@@ -385,8 +389,35 @@ pub async fn bba_sources_for_rows(
     let keys = source_keys_for_rows(&mut *conn, viewer, rows).await?;
     let agents: Vec<Uuid> = rows.iter().filter_map(|r| r.source_agent_id).collect();
     let humans = epigraph_db::AgentRepository::humans_of(&mut *conn, &agents, true).await?;
-    Ok(rows
-        .iter()
+    Ok(assemble_bba_sources(rows, keys, &humans))
+}
+
+/// [`bba_sources_for_rows`] read on a pool instead of one connection: for a
+/// read-only caller with no stamped connection to hand (MCP
+/// `compare_methods` on a server built without a `ScopedPool`), which reads
+/// its rows on the same pool.
+///
+/// # Errors
+/// `DbError` if a read fails.
+pub async fn bba_sources_for_rows_on_pool(
+    pool: &sqlx::PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    rows: &[MassFunctionRow],
+) -> Result<Vec<BbaSource>, epigraph_db::DbError> {
+    let keys = source_keys_for_rows(pool, viewer, rows).await?;
+    let agents: Vec<Uuid> = rows.iter().filter_map(|r| r.source_agent_id).collect();
+    let humans = epigraph_db::AgentRepository::humans_of(pool, &agents, true).await?;
+    Ok(assemble_bba_sources(rows, keys, &humans))
+}
+
+/// Each row's [`BbaSource`] from its same-source key and the live human of
+/// its source agent (an agent bound to no live human is its own owner).
+fn assemble_bba_sources(
+    rows: &[MassFunctionRow],
+    keys: Vec<Option<SourceKey>>,
+    humans: &HashMap<Uuid, Uuid>,
+) -> Vec<BbaSource> {
+    rows.iter()
         .zip(keys)
         .map(|(r, source)| BbaSource {
             agent_id: r.source_agent_id,
@@ -395,7 +426,7 @@ pub async fn bba_sources_for_rows(
                 .map(|a| humans.get(&a).copied().unwrap_or(a)),
             source,
         })
-        .collect())
+        .collect()
 }
 
 /// Whether any owner speaks through at least two distinct agents among

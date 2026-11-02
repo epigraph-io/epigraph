@@ -467,25 +467,33 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// a cycle or a tree deeper than [`super::claim_role::ROLE_MAX_DEPTH`] finds
 /// no procedural root, so its compounds stay frozen: the safe direction.
 ///
-/// The role read carries no viewer splice (role is structure: a viewer that
-/// cannot see a decomposition must not be able to refold the compound's
-/// cache for everyone). That holds as written on a connection that bypasses
-/// row security, which is how the bulk recomputers run; on an application
-/// connection (the per-write `routes::assess` refresh) the server's row
-/// security still filters the role read, as the
-/// [`claim_role`](super::claim_role) module doc states.
+/// The role is read with definer rights, through migration 193's
+/// [`IS_COMPOUND_DEFINER_CALL`] (`public.epigraph_claim_is_compound`, whose
+/// body is [`super::claim_role::IS_COMPOUND_SQL`] schema-qualified): role is
+/// structure, and a viewer that cannot see a decomposition must not be able
+/// to refold the compound's cache for everyone. On an application connection
+/// (the per-request refreshes: `routes::assess`, REST and MCP BBA retract and
+/// un-retract) row security filters `edges` and `claims` whatever the query
+/// splices, so the inline predicate read there found no compound when every
+/// child was private to a group the caller is not in, and failed OPEN
+/// (backlog 0dc20fad). The definer reads the whole graph on every connection,
+/// so the guard holds closed on a filtered one exactly as on a connection
+/// that bypasses row security. The scalar subquery evaluates it once per
+/// query, not once per candidate row.
 fn with_frozen_compound_excluded(sql: &str) -> String {
     assert!(
         sql.contains(NOT_FROZEN_COMPOUND_MARKER),
         "owner query has no {NOT_FROZEN_COMPOUND_MARKER} marker:\n{sql}"
     );
-    let predicate = format!(
-        "AND NOT EXISTS (SELECT 1 FROM claims owner_role \
-                          WHERE owner_role.id = $1 AND {})",
-        super::claim_role::is_compound_sql("owner_role")
-    );
+    let predicate = format!("AND NOT (SELECT {IS_COMPOUND_DEFINER_CALL})");
     sql.replace(NOT_FROZEN_COMPOUND_MARKER, &predicate)
 }
+
+/// Migration 193's definer-rights compound test of the claim bound as `$1`:
+/// TRUE exactly when [`super::claim_role::IS_COMPOUND_SQL`] holds for it on
+/// the whole graph, whatever the caller's row security lets it see. Never
+/// NULL.
+pub const IS_COMPOUND_DEFINER_CALL: &str = "public.epigraph_claim_is_compound($1)";
 
 /// Replace [`NOT_INGEST_TEMPLATE_MARKER`] in `sql` with `AND NOT <predicate>`
 /// ([`ingest_template_predicate`]), so the query reads no ingest template
