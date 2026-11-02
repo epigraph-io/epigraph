@@ -11,9 +11,15 @@
 //! nothing, audit included; an apply removes exactly the listed frames and
 //! their companion rows, leaves every other frame and claim row alone, skips
 //! an id that is not a frame, and writes one `security_events` row; and the
-//! same apply works as a real NOSUPERUSER maintenance login.
+//! same apply works as a real NOSUPERUSER maintenance login. After migration
+//! 194 (H10) a companion claim's RETRACTED BBA on a listed frame is purged
+//! through `epigraph_purge_mass_functions`, with the operator's reason, before
+//! the frame delete (SPEC section 11 phase 1, K4b; S-1 test (m)).
 
 mod viewer_fixture;
+
+#[path = "../../epigraph-db/tests/support/retracted_bba_fixture.rs"]
+mod retracted;
 
 use sqlx::PgPool;
 use std::io::Write as _;
@@ -903,4 +909,106 @@ async fn delete_frames_refuses_a_group_private_claims_bba_as_a_non_superuser_mai
         "the private claim lost its BBA"
     );
     assert!(audit_rows(&pool).await.is_empty());
+}
+
+/// S-1 test (m), K4b: a listed frame whose companion claim holds a RETRACTED
+/// BBA (made by migration 184's definer) beside a live one. Migration 194
+/// refuses the frame's `ON DELETE CASCADE` onto the retracted row, so
+/// `delete-frames` purges it through `epigraph_purge_mass_functions` first,
+/// with the operator's reason, then deletes the frame. The dry run shows the
+/// purge and writes nothing; the apply, as a real NOSUPERUSER maintenance
+/// login, removes the frame and both rows, writes ONE `mass_functions.purge`
+/// row naming exactly the retracted row, and its census accounts for the
+/// purge's grant rows and audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_purges_a_retracted_companion_bba_then_deletes_the_frame(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "k4b-frames").await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "k4b-frames-2").await;
+    let t = seed_frame(&pool, &format!("test-frame-k4b-{}", Uuid::new_v4())).await;
+    let tc = fixture::seed_group_claim(&pool, owner, group, "a k4b test companion claim").await;
+    seed_bba(&pool, tc, t, owner).await;
+    let r_bba = seed_bba(&pool, tc, t, second).await;
+    retracted::retract_through_definer(&pool, r_bba).await;
+    assign(&pool, tc, t).await;
+
+    let ids = ids_file(&[t]);
+    let companions = ids_file(&[tc]);
+    let dry = run_op(
+        &pool,
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--companion-claims-file",
+            &companions,
+            "--reason",
+            "k4b test",
+        ],
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.lines().any(|l| l == "PURGE\tmass_functions\t1"),
+        "the dry run shows the retracted row the apply will purge\n{}",
+        dry.show()
+    );
+    assert!(frame_exists(&pool, t).await);
+    assert_eq!(bbas_on(&pool, tc).await, 2, "a dry run deletes nothing");
+
+    let (role, dsn) = maintenance_login(&pool).await;
+    let r = run_with_dsn(
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--companion-claims-file",
+            &companions,
+            "--apply",
+            "--confirm-delete",
+            "1",
+            "--reason",
+            "k4b test",
+        ],
+        &dsn,
+    );
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&pool)
+        .await
+        .expect("drop role");
+
+    assert_eq!(r.code, 0, "the apply purges, then deletes\n{}", r.show());
+    assert!(
+        !frame_exists(&pool, t).await,
+        "the frame is gone\n{}",
+        r.show()
+    );
+    assert_eq!(bbas_on(&pool, tc).await, 0, "both companion rows went");
+    let purges: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'mass_functions.purge'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("purge audit rows");
+    assert_eq!(purges.len(), 1, "one purge call: {purges:?}");
+    assert_eq!(
+        purges[0]["reason"], "k4b test",
+        "the operator's reason: {}",
+        purges[0]
+    );
+    let rows = purges[0]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the retracted row is purged: {}",
+        purges[0]
+    );
+    assert_eq!(rows[0]["id"], r_bba.to_string(), "{}", purges[0]);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM mass_function_purge_grants").await,
+        0,
+        "no grant row is left"
+    );
+    let audit = audit_rows(&pool).await;
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0]["purged_retracted"], 1, "{}", audit[0]);
 }
