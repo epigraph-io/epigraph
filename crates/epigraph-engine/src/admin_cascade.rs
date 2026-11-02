@@ -799,7 +799,7 @@ pub async fn apply_after_supersede(
             )
         }
     };
-    let report = cascade_after_supersede(&mut *admin, admin_viewer, new_id).await;
+    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, new_id).await;
     let belief = record_belief(admin, trigger, applied_id, &report).await;
     let status = applied(applied_id, &touched, Some((&report, belief)));
     (status, report_for_caller(admin, caller, &report).await)
