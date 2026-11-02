@@ -999,3 +999,161 @@ async fn the_unmark_cli_unmarks_a_chain_from_the_canonical_end_in_one_run(pool: 
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;
 }
+
+/// Operator ruling R-11 at the CLI: a duplicate whose canonical was
+/// SUPERSEDED after the mark is un-marked against the canonical's current
+/// replacement. The mark it must find is still the RECORDED one (`--canonical`
+/// names the canonical the claim was marked onto, as MCP `unmark_duplicate`'s
+/// gate compares it), the plan shows the chain from that canonical to its
+/// replacement, and the edge the dedup repair moved (and the supersede then
+/// carried on to the replacement) comes back to the duplicate, while the
+/// supersede itself stands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_follows_a_superseded_canonical(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, _) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "revised later", 0).await;
+
+    // The canonical is superseded after the mark, as the supersede routes do
+    // it: the act, then its edges carried on to the replacement.
+    let replacement = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(strong)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the canonical's author");
+        let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(strong),
+            &format!("revised later, revised {}", Uuid::new_v4()),
+            epigraph_core::TruthValue::clamped(0.5),
+            "revision",
+            epigraph_db::SupersedeActor::new(author, epigraph_db::SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("supersede act");
+        epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, strong, replacement)
+            .await
+            .expect("edge migration");
+        replacement
+    };
+    assert_eq!(
+        claim_state(&pool, weak).await,
+        (false, Some(strong)),
+        "CALIBRATION: still marked onto the recorded canonical"
+    );
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "CALIBRATION: the canonical is retired"
+    );
+    assert_eq!(
+        supports_into(&pool, third).await,
+        vec![replacement],
+        "CALIBRATION: the moved edge followed the canonical to its replacement"
+    );
+    let (op, dup, canon, repl) = (
+        operator.to_string(),
+        weak.to_string(),
+        strong.to_string(),
+        replacement.to_string(),
+    );
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    // The dry run names the recorded canonical and follows it to the
+    // replacement.
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert_eq!(plan["admissible"], true, "{plan}");
+    assert_eq!(plan["unmarks"][0]["canonical_id"], canon, "{plan}");
+    assert_eq!(
+        plan["unmarks"][0]["chain"],
+        serde_json::json!([canon, repl]),
+        "{plan}"
+    );
+
+    // The replacement is not the canonical the claim was marked onto.
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &repl,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert!(
+        plan["unmarks"][0]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains(&format!("duplicate of {canon}, not of {repl}"))),
+        "{plan}"
+    );
+    assert_eq!(claim_state(&pool, weak).await, (false, Some(strong)));
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a dry run or refused run wrote a row"
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    let result = &report["steps"][0]["result"];
+    assert_eq!(result["canonical_id"], canon, "{report}");
+    assert_eq!(result["current_canonical_id"], repl, "{report}");
+    assert_eq!(claim_state(&pool, weak).await, (true, None));
+    assert_eq!(
+        identity_edge(&pool, weak).await,
+        None,
+        "identity edge in force"
+    );
+    assert_eq!(supports_into(&pool, third).await, vec![weak]);
+    // The supersede stands: the canonical stays retired, its replacement
+    // current.
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "the supersede was undone"
+    );
+    assert_eq!(claim_state(&pool, replacement).await, (true, Some(strong)));
+    assert_eq!(undedup_rows(&pool, weak).await.len(), 1);
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
