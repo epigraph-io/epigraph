@@ -446,6 +446,18 @@ jobs:
         run: |
           cargo clippy -p epigraph-api --features genai --all-targets --locked -- -D warnings
           cargo clippy -p epigraph-cli --features genai --all-targets --locked -- -D warnings
+      - name: TLS feature clippy
+        # `tls` (axum-server + rustls: src/tls.rs's PEM loader and its explicit
+        # crypto-provider choice) is off by default and no other step enables
+        # it, so that code and its two tests had no compile or lint signal
+        # (backlog ed3fff02). The workspace Clippy step above passes with a
+        # clippy-only defect in the tls-gated impl; this one refuses it.
+        run: cargo clippy -p epigraph-api --features tls --all-targets --locked -- -D warnings
+      - name: TLS feature tests
+        # tests/tls_pem_loading.rs and tests/tls_provider_choice.rs declare
+        # required-features = ["tls"], so every other test step skips them.
+        # No database: they handshake against the loaded config in-process.
+        run: cargo test -p epigraph-api --features tls --locked --test tls_pem_loading --test tls_provider_choice
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
