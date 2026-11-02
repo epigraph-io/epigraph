@@ -897,7 +897,10 @@ impl std::fmt::Display for UnmarkRefusal {
 /// whose reversal failed would leave a current claim with its edges and BBAs
 /// still on the canonical. The request paths therefore establish the caller's
 /// write authority FIRST, by running the same act on the caller's stamped
-/// transaction and rolling it back.
+/// transaction and rolling it back. Under operator decision D9 no request
+/// path holds that connection, so in production the un-mark runs from the
+/// `unmark_duplicate` operator CLI (epigraph-cli), which calls this with the
+/// maintenance session's viewer as both admin and caller.
 ///
 /// A canonical superseded or consolidated since the mark is followed to the
 /// current one, and the duplicate is restored against it (operator ruling

@@ -7,6 +7,13 @@
 //! * `sweep_semantic_duplicates` (new): `--acting-agent` is required and must
 //!   exist; the default is a dry run that writes nothing; `--apply` collapses
 //!   through the audited administrative cascade; the sweep's own lock.
+//! * `unmark_duplicate` (backlog e8113079): the only shipped process that can
+//!   un-mark a duplicate, since a request-serving server holds no maintenance
+//!   connection and an un-mark has no deferred form. A mark the sweep made is
+//!   restored exactly (the moved edge back on the duplicate, the identity edge
+//!   retracted) and audited as `undedup` naming the acting operator; every
+//!   refusal, the dry run and a held replay lock write nothing; a label-dedup
+//!   apply's marks are preflighted as a whole before any is un-marked.
 //!
 //! The logins are created per test (roles are cluster-global, so each name is
 //! unique) and dropped at the end; neither is a superuser. The superuser
@@ -22,6 +29,7 @@ use uuid::Uuid;
 
 const REPLAY: &str = env!("CARGO_BIN_EXE_replay_deferred_cascades");
 const SWEEP: &str = env!("CARGO_BIN_EXE_sweep_semantic_duplicates");
+const UNMARK: &str = env!("CARGO_BIN_EXE_unmark_duplicate");
 const DIM: usize = 1536;
 
 async fn create_login(pool: &PgPool, parent: &str) -> (String, String) {
@@ -454,6 +462,697 @@ async fn the_sweep_cli_is_a_dry_run_by_default_and_audits_each_applied_collapse(
     .await
     .expect("exactly one applied row for the pair");
     assert_eq!((who, cause.as_str()), (Some(operator), "dedup"));
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+// ── unmark_duplicate (backlog e8113079) ─────────────────────────────────────
+
+/// Two identical claims on their own embedding axis (so each pair is its own
+/// cluster), a third claim's `supports` edge into the weaker one, and the
+/// sweep's `--apply` collapsing the pair through the real act and repair (the
+/// repair the replay timer runs in production). Returns
+/// `(strong, weak, third, identity_edge)`.
+async fn swept_pair(
+    pool: &PgPool,
+    app_url: &str,
+    maint_url: &str,
+    operator: Uuid,
+    content: &str,
+    axis: usize,
+) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (a1, a2) = (seed_agent(pool).await, seed_agent(pool).await);
+    let strong = seed_embedded(pool, a1, content, 0.9, &pgvec(axis, 0.0)).await;
+    let weak = seed_embedded(pool, a2, content, 0.4, &pgvec(axis, 0.001)).await;
+    let third = viewer_fixture::seed_public_claim(pool, a1, &format!("{content}: support")).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports')",
+    )
+    .bind(third)
+    .bind(weak)
+    .execute(pool)
+    .await
+    .expect("the edge into the duplicate");
+    let op = operator.to_string();
+    let r = run(
+        SWEEP,
+        &["--acting-agent", &op, "--apply"],
+        app_url,
+        Some(maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let edge = identity_edge(pool, weak)
+        .await
+        .expect("CALIBRATION: the sweep marked the pair");
+    assert_eq!(
+        supports_into(pool, third).await,
+        vec![strong],
+        "CALIBRATION: the dedup repair re-pointed the edge onto the canonical"
+    );
+    (strong, weak, third, edge)
+}
+
+/// The in-force dedup identity edge out of `dup`.
+async fn identity_edge(pool: &PgPool, dup: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM edges WHERE source_id = $1 AND relationship = 'same_as' \
+            AND properties ? 'dedup' AND valid_to IS NULL",
+    )
+    .bind(dup)
+    .fetch_optional(pool)
+    .await
+    .expect("identity edge")
+}
+
+/// Every claim `source`'s in-force `supports` edges point at.
+async fn supports_into(pool: &PgPool, source: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT target_id FROM edges WHERE source_id = $1 AND relationship = 'supports' \
+            AND valid_to IS NULL ORDER BY target_id",
+    )
+    .bind(source)
+    .fetch_all(pool)
+    .await
+    .expect("supports edges")
+}
+
+/// `(is_current, supersedes)` of `id`.
+async fn claim_state(pool: &PgPool, id: Uuid) -> (bool, Option<Uuid>) {
+    sqlx::query_as("SELECT COALESCE(is_current, true), supersedes FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("claim state")
+}
+
+/// The `cascade.admin_applied` rows of cause `undedup` whose subject is `dup`.
+async fn undedup_rows(pool: &PgPool, dup: Uuid) -> Vec<(Option<Uuid>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = 'undedup' \
+            AND details#>>'{trigger,subject_id}' = $1::text",
+    )
+    .bind(dup)
+    .fetch_all(pool)
+    .await
+    .expect("undedup rows")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_restores_a_swept_duplicate_exactly_and_audits_it(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, edge) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "un-mark me", 0).await;
+    let (op, dup, canon, edge_s) = (
+        operator.to_string(),
+        weak.to_string(),
+        strong.to_string(),
+        edge.to_string(),
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+            "--identity-edge",
+            &edge_s,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    let step = &report["steps"][0];
+    assert_eq!(step["ok"], true, "{report}");
+    assert_eq!(step["result"]["canonical_id"], canon, "{report}");
+    assert_eq!(step["result"]["current_canonical_id"], canon, "{report}");
+    assert_eq!(step["result"]["cascade"]["status"], "applied", "{report}");
+    // No provider in the child's environment: nothing to embed with, said.
+    assert_eq!(step["result"]["embedded"], false, "{report}");
+
+    // The duplicate is current again, its mark gone, and the edge the repair
+    // moved onto the canonical is back on it.
+    assert_eq!(claim_state(&pool, weak).await, (true, None));
+    assert_eq!(claim_state(&pool, strong).await, (true, None));
+    assert_eq!(
+        identity_edge(&pool, weak).await,
+        None,
+        "identity edge in force"
+    );
+    let retired: bool = sqlx::query_scalar("SELECT valid_to IS NOT NULL FROM edges WHERE id = $1")
+        .bind(edge)
+        .fetch_one(&pool)
+        .await
+        .expect("the identity edge row");
+    assert!(
+        retired,
+        "the identity edge was deleted rather than retracted"
+    );
+    assert_eq!(supports_into(&pool, third).await, vec![weak]);
+
+    // Audited once, as cause `undedup`, naming the acting operator, reversed
+    // from the record the sweep's repair kept.
+    let rows = undedup_rows(&pool, weak).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (who, details) = &rows[0];
+    assert_eq!(*who, Some(operator));
+    assert!(details["reversed_event_id"].is_string(), "{details}");
+    assert_eq!(details["touched"]["edges_retargeted_back"], 1, "{details}");
+
+    // A second run finds no mark: refused, nothing written.
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &dup, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    assert!(
+        r.stdout.contains("is not a marked duplicate"),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(count(&pool, events).await, before);
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_refuses_and_dry_runs_with_nothing_written(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, edge) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "keep me marked", 0).await;
+    let (op, dup, canon) = (operator.to_string(), weak.to_string(), strong.to_string());
+    let stranger = Uuid::new_v4().to_string();
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+    let still_marked = |pool: PgPool| async move {
+        assert_eq!(claim_state(&pool, weak).await, (false, Some(strong)));
+        assert_eq!(identity_edge(&pool, weak).await, Some(edge));
+        assert_eq!(supports_into(&pool, third).await, vec![strong]);
+        assert_eq!(
+            count(&pool, events).await,
+            before,
+            "a refused run wrote a row"
+        );
+    };
+
+    // No configured maintenance DSN: refused even when DATABASE_URL itself
+    // could bypass row security, so the application DSN never runs it.
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &dup, "--apply"],
+        &maint_url,
+        None,
+    );
+    assert_ne!(r.code, Some(0), "{}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("runs only on an explicitly configured MAINTENANCE_DATABASE_URL"),
+        "{}",
+        r.stderr
+    );
+    still_marked(pool.clone()).await;
+
+    // --acting-agent is required, and must be an agent.
+    let r = run(UNMARK, &["--claim-id", &dup], &app_url, Some(&maint_url));
+    assert_ne!(r.code, Some(0));
+    assert!(r.stderr.contains("--acting-agent"), "{}", r.stderr);
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &stranger, "--claim-id", &dup, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}", r.stderr);
+    assert!(r.stderr.contains("is not an agent"), "{}", r.stderr);
+    still_marked(pool.clone()).await;
+
+    // Refusals of the target, each read-only: not a marked duplicate, marked
+    // onto another canonical than expected, carrying another identity edge.
+    for (args, why) in [
+        (
+            vec!["--claim-id", canon.as_str()],
+            "is not a marked duplicate",
+        ),
+        (
+            vec!["--claim-id", dup.as_str(), "--canonical", stranger.as_str()],
+            "not of",
+        ),
+        (
+            vec![
+                "--claim-id",
+                dup.as_str(),
+                "--identity-edge",
+                stranger.as_str(),
+            ],
+            "no longer carries the mark",
+        ),
+    ] {
+        let mut argv = vec!["--acting-agent", op.as_str(), "--apply"];
+        argv.extend(args);
+        let r = run(UNMARK, &argv, &app_url, Some(&maint_url));
+        assert_eq!(r.code, Some(1), "{argv:?}\n{}\n{}", r.stdout, r.stderr);
+        let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+        assert_eq!(report["admissible"], false, "{report}");
+        assert!(
+            report["unmarks"][0]["reason"]
+                .as_str()
+                .is_some_and(|s| s.contains(why)),
+            "{argv:?}: {report}"
+        );
+        still_marked(pool.clone()).await;
+    }
+
+    // The default is a dry run: the plan, admissible, and nothing written.
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &dup],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["dry_run"], true, "{report}");
+    assert_eq!(report["admissible"], true, "{report}");
+    assert_eq!(report["unmarks"][0]["canonical_id"], canon, "{report}");
+    assert_eq!(
+        report["unmarks"][0]["chain"],
+        serde_json::json!([canon]),
+        "{report}"
+    );
+    still_marked(pool.clone()).await;
+
+    // A replay run holds its lock: the un-mark is not applied beside it.
+    let holder = hold_lock(&pool, epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY).await;
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &dup, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("replay"), "{}", r.stderr);
+    still_marked(pool.clone()).await;
+    release_lock(
+        holder,
+        epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY,
+    )
+    .await;
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// The marks half of a label-dedup revert (`revert_label_dedup`, which a
+/// request-serving server refuses when it carries marks): every mark of the
+/// apply's `applied_marks` is proved admissible before any is un-marked, so
+/// one stale mark leaves all of them in place; a sound file un-marks each.
+///
+/// The stale mark is the FIRST file entry, which `revert_marks` (newest first)
+/// checks and un-marks LAST: a run that checked and applied each target in
+/// turn would already have un-marked the sound second entry by the time it
+/// reached the stale one, so only a whole-run preflight leaves both in place.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_reverts_an_applys_marks_all_or_nothing(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (s1, w1, t1, e1) = swept_pair(&pool, &app_url, &maint_url, operator, "pair one", 0).await;
+    let (s2, w2, t2, e2) = swept_pair(&pool, &app_url, &maint_url, operator, "pair two", 10).await;
+    let op = operator.to_string();
+    let marks = |first_edge: Uuid| {
+        serde_json::json!({
+            "status": "applied",
+            "applied_marks": [
+                {"unit": "cluster:one", "dup": w1, "canonical": s1, "rule": "strong_id",
+                 "matched_on": "id-1", "identity_edge": first_edge},
+                {"unit": "cluster:two", "dup": w2, "canonical": s2, "rule": "strong_id",
+                 "matched_on": "id-2", "identity_edge": e2},
+            ],
+        })
+    };
+    let mut written = Vec::new();
+    let mut write = |name: &str, v: &serde_json::Value| {
+        let p = std::env::temp_dir().join(format!("unmark-{}-{name}", Uuid::new_v4().simple()));
+        std::fs::write(&p, v.to_string()).expect("write the marks file");
+        written.push(p.clone());
+        p.to_string_lossy().into_owned()
+    };
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    // The FIRST mark names an identity edge its claim no longer carries:
+    // nothing is un-marked, not even the sound second one, which is checked
+    // (and would be un-marked) first.
+    let stale_edge = Uuid::new_v4();
+    let stale = write("stale.json", &marks(stale_edge));
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &stale, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert_eq!(plan["admissible"], false, "{plan}");
+    let unmarks = plan["unmarks"].as_array().expect("unmarks");
+    assert_eq!(unmarks.len(), 2, "{plan}");
+    // CALIBRATION: the sound mark is the one checked first, and admissible,
+    // so this run is the case an interleaved check-then-apply gets wrong.
+    assert_eq!(unmarks[0]["claim_id"], w2.to_string(), "{plan}");
+    assert_eq!(unmarks[0]["admissible"], true, "{plan}");
+    assert_eq!(unmarks[1]["claim_id"], w1.to_string(), "{plan}");
+    assert_eq!(unmarks[1]["admissible"], false, "{plan}");
+    assert!(
+        unmarks[1]["reason"].as_str().is_some_and(|s| {
+            s.contains("no longer carries the mark") && s.contains(&stale_edge.to_string())
+        }),
+        "{plan}"
+    );
+    for (s, w, t, e) in [(s1, w1, t1, e1), (s2, w2, t2, e2)] {
+        assert_eq!(
+            claim_state(&pool, w).await,
+            (false, Some(s)),
+            "{w} un-marked"
+        );
+        assert_eq!(
+            identity_edge(&pool, w).await,
+            Some(e),
+            "{w}'s identity edge"
+        );
+        assert_eq!(
+            supports_into(&pool, t).await,
+            vec![s],
+            "{w}'s edge moved back"
+        );
+        assert!(undedup_rows(&pool, w).await.is_empty(), "{w} audited");
+    }
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
+
+    let sound = write("sound.json", &marks(e1));
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &sound, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    // Newest first, as revert_label_dedup un-marks.
+    assert_eq!(report["steps"][0]["claim_id"], w2.to_string(), "{report}");
+    assert_eq!(report["steps"][1]["claim_id"], w1.to_string(), "{report}");
+    assert_eq!(claim_state(&pool, w1).await, (true, None));
+    assert_eq!(claim_state(&pool, w2).await, (true, None));
+    assert_eq!(supports_into(&pool, t1).await, vec![w1]);
+    assert_eq!(supports_into(&pool, t2).await, vec![w2]);
+    assert_eq!(undedup_rows(&pool, w1).await.len(), 1);
+    assert_eq!(undedup_rows(&pool, w2).await.len(), 1);
+
+    for p in written {
+        let _ = std::fs::remove_file(p);
+    }
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// A dedup chain (Y marked onto X, then X onto W; two sweeps build it): Y
+/// alone is refused, since its canonical is itself a marked duplicate, and an
+/// apply's marks listing both un-mark X first (newest first) and then Y,
+/// whose canonical the same run made current again (`revert_label_dedup`'s
+/// preflight rule).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_unmarks_a_chain_from_the_canonical_end_in_one_run(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (a1, a2, a3) = (
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+        seed_agent(&pool).await,
+    );
+    let content = "chained restatement";
+    let x = seed_embedded(&pool, a1, content, 0.9, &pgvec(0, 0.0)).await;
+    let y = seed_embedded(&pool, a2, content, 0.4, &pgvec(0, 0.001)).await;
+    let r = run(
+        SWEEP,
+        &["--acting-agent", &op, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let w = seed_embedded(&pool, a3, content, 0.95, &pgvec(0, 0.0005)).await;
+    let r = run(
+        SWEEP,
+        &["--acting-agent", &op, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(
+        claim_state(&pool, y).await,
+        (false, Some(x)),
+        "CALIBRATION: Y onto X"
+    );
+    assert_eq!(
+        claim_state(&pool, x).await,
+        (false, Some(w)),
+        "CALIBRATION: X onto W"
+    );
+    let ey = identity_edge(&pool, y).await.expect("Y's identity edge");
+    let ex = identity_edge(&pool, x).await.expect("X's identity edge");
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    // Y alone: its canonical is still a marked duplicate.
+    let yid = y.to_string();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &yid, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    let why = report["unmarks"][0]["reason"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("itself retired") && why.contains(&format!("un-mark {x} first")),
+        "{report}"
+    );
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
+
+    // Both marks, in apply order: X is un-marked first, then Y.
+    let file = std::env::temp_dir().join(format!("unmark-chain-{}.json", Uuid::new_v4().simple()));
+    std::fs::write(
+        &file,
+        serde_json::json!({"applied_marks": [
+            {"unit": "u1", "dup": y, "canonical": x, "rule": "strong_id", "matched_on": "a",
+             "identity_edge": ey},
+            {"unit": "u2", "dup": x, "canonical": w, "rule": "strong_id", "matched_on": "a",
+             "identity_edge": ex},
+        ]})
+        .to_string(),
+    )
+    .expect("write the marks file");
+    let path = file.to_string_lossy().into_owned();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    assert_eq!(report["steps"][0]["claim_id"], x.to_string(), "{report}");
+    assert_eq!(report["steps"][1]["claim_id"], y.to_string(), "{report}");
+    assert_eq!(claim_state(&pool, x).await, (true, None));
+    assert_eq!(claim_state(&pool, y).await, (true, None));
+    assert_eq!(claim_state(&pool, w).await, (true, None));
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Operator ruling R-11 at the CLI: a duplicate whose canonical was
+/// SUPERSEDED after the mark is un-marked against the canonical's current
+/// replacement. The mark it must find is still the RECORDED one (`--canonical`
+/// names the canonical the claim was marked onto, as MCP `unmark_duplicate`'s
+/// gate compares it), the plan shows the chain from that canonical to its
+/// replacement, and the edge the dedup repair moved (and the supersede then
+/// carried on to the replacement) comes back to the duplicate, while the
+/// supersede itself stands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_follows_a_superseded_canonical(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, _) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "revised later", 0).await;
+
+    // The canonical is superseded after the mark, as the supersede routes do
+    // it: the act, then its edges carried on to the replacement.
+    let replacement = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(strong)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the canonical's author");
+        let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(strong),
+            &format!("revised later, revised {}", Uuid::new_v4()),
+            epigraph_core::TruthValue::clamped(0.5),
+            "revision",
+            epigraph_db::SupersedeActor::new(author, epigraph_db::SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("supersede act");
+        epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, strong, replacement)
+            .await
+            .expect("edge migration");
+        replacement
+    };
+    assert_eq!(
+        claim_state(&pool, weak).await,
+        (false, Some(strong)),
+        "CALIBRATION: still marked onto the recorded canonical"
+    );
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "CALIBRATION: the canonical is retired"
+    );
+    assert_eq!(
+        supports_into(&pool, third).await,
+        vec![replacement],
+        "CALIBRATION: the moved edge followed the canonical to its replacement"
+    );
+    let (op, dup, canon, repl) = (
+        operator.to_string(),
+        weak.to_string(),
+        strong.to_string(),
+        replacement.to_string(),
+    );
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    // The dry run names the recorded canonical and follows it to the
+    // replacement.
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert_eq!(plan["admissible"], true, "{plan}");
+    assert_eq!(plan["unmarks"][0]["canonical_id"], canon, "{plan}");
+    assert_eq!(
+        plan["unmarks"][0]["chain"],
+        serde_json::json!([canon, repl]),
+        "{plan}"
+    );
+
+    // The replacement is not the canonical the claim was marked onto.
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &repl,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON plan");
+    assert!(
+        plan["unmarks"][0]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains(&format!("duplicate of {canon}, not of {repl}"))),
+        "{plan}"
+    );
+    assert_eq!(claim_state(&pool, weak).await, (false, Some(strong)));
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a dry run or refused run wrote a row"
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON report");
+    assert_eq!(report["status"], "reverted", "{report}");
+    let result = &report["steps"][0]["result"];
+    assert_eq!(result["canonical_id"], canon, "{report}");
+    assert_eq!(result["current_canonical_id"], repl, "{report}");
+    assert_eq!(claim_state(&pool, weak).await, (true, None));
+    assert_eq!(
+        identity_edge(&pool, weak).await,
+        None,
+        "identity edge in force"
+    );
+    assert_eq!(supports_into(&pool, third).await, vec![weak]);
+    // The supersede stands: the canonical stays retired, its replacement
+    // current.
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "the supersede was undone"
+    );
+    assert_eq!(claim_state(&pool, replacement).await, (true, Some(strong)));
+    assert_eq!(undedup_rows(&pool, weak).await.len(), 1);
 
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;

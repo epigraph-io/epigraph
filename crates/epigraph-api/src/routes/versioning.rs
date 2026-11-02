@@ -1070,7 +1070,8 @@ pub async fn unmark_duplicate(
         .map_err(|reason| ApiError::Conflict {
             reason: format!(
                 "an un-mark needs this server's administrative (maintenance) connection and \
-                 cannot be deferred; nothing was written ({reason})"
+                 cannot be deferred; nothing was written ({reason}). An operator runs it as \
+                 the `unmark_duplicate` CLI on the maintenance DSN"
             ),
         })?;
 
