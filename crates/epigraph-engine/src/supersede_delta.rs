@@ -242,7 +242,6 @@ pub fn slots_minted(edges: &[FactorlessEdge]) -> Vec<String> {
     slots
 }
 
-#[allow(dead_code)]
 /// Retracted BBAs keyed on an edge whose source is a retired claim, held by
 /// a current claim: the rows the K10 invalidation keeps (SPEC §4,
 /// "retracted BBAs"; the cascade audit's `retracted_key_kept`). Read for its
@@ -259,7 +258,6 @@ SELECT count(*)
    AND COALESCE(h.is_current, true)
    AND mf.retracted_at IS NOT NULL"#;
 
-#[allow(dead_code)]
 /// The canonical binary frame's name (`edge_factor::ensure_binary_frame`
 /// creates it under this name; the delta only reads it).
 const BINARY_FRAME_NAME: &str = "binary_truth";
@@ -483,22 +481,118 @@ pub async fn run_read_only(
 }
 
 async fn measure(
-    _conn: &mut sqlx::PgConnection,
-    _viewer: &epigraph_db::visibility::Viewer,
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
     opts: &DeltaOptions,
 ) -> Result<DeltaReport, String> {
-    // Neutral stand-in for the red commit: measures nothing.
-    Ok(DeltaReport {
+    let mut report = DeltaReport {
         items: opts.items,
         served_value: "claims.pignistic_prob (the DS cache); BP marginals are not served",
-        r131: opts.items.r131.then(R131Report::default),
-        k10_retro: opts.items.k10_retro.then(K10RetroReport::default),
-        k12b: opts.items.k12b.then(K12bReport::default),
-        combined: (opts.items.k10_retro && opts.items.k12b).then(DeltaBlock::default),
-    })
+        ..DeltaReport::default()
+    };
+    if opts.items.r131 {
+        report.r131 = Some(r131_report(&mut *conn).await?);
+    }
+    if !(opts.items.k10_retro || opts.items.k12b) {
+        return Ok(report);
+    }
+    let frame_id = epigraph_db::FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+        .await
+        .map_err(|e| format!("read the binary frame: {e}"))?
+        .map(|f| f.id);
+
+    let mut k10_rows = Vec::new();
+    if opts.items.k10_retro {
+        k10_rows = retired_source_edge_bbas(&mut *conn, None)
+            .await
+            .map_err(|e| format!("K10(3) selection: {e}"))?;
+        let retracted: i64 = sqlx::query_scalar(RETIRED_SOURCE_RETRACTED_BBAS_SQL)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| format!("K10(3) retracted count: {e}"))?;
+        let delta = delta_block(
+            &mut *conn,
+            viewer,
+            frame_id,
+            &[("k10_retro", &k10_rows)],
+            opts.top,
+        )
+        .await?;
+        let edges: std::collections::BTreeSet<Uuid> = k10_rows.iter().map(|r| r.edge_id).collect();
+        let not_in_force: std::collections::BTreeSet<Uuid> = k10_rows
+            .iter()
+            .filter(|r| !r.edge_in_force)
+            .map(|r| r.edge_id)
+            .collect();
+        let sources: std::collections::BTreeSet<Uuid> =
+            k10_rows.iter().map(|r| r.source_id).collect();
+        let mut by_relationship = std::collections::BTreeMap::new();
+        for r in &k10_rows {
+            *by_relationship.entry(r.relationship.clone()).or_insert(0) += 1;
+        }
+        report.k10_retro = Some(K10RetroReport {
+            live_rows: k10_rows.len(),
+            edges: edges.len(),
+            edges_not_in_force: not_in_force.len(),
+            retired_sources: sources.len(),
+            retracted_key_kept: retracted,
+            by_relationship,
+            delta,
+        });
+    }
+    let mut k12b_rows = Vec::new();
+    if opts.items.k12b {
+        k12b_rows = supersedes_edge_bbas(&mut *conn)
+            .await
+            .map_err(|e| format!("K12(b) selection: {e}"))?;
+        let spelling: Vec<(Uuid, String)> = sqlx::query_as(
+            "-- VISIBILITY-EXEMPT: maintenance read; the dry-run delta runs on the privileged connection.
+             SELECT id, relationship FROM edges WHERE id = ANY($1)",
+        )
+        .bind(k12b_rows.iter().map(|r| r.edge_id).collect::<Vec<_>>())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| format!("K12(b) spellings: {e}"))?;
+        let spelling: std::collections::HashMap<Uuid, String> = spelling.into_iter().collect();
+        let mut by_spelling = std::collections::BTreeMap::new();
+        for r in &k12b_rows {
+            let s = spelling
+                .get(&r.edge_id)
+                .cloned()
+                .unwrap_or_else(|| r.relationship.clone());
+            *by_spelling.entry(s).or_insert(0) += 1;
+        }
+        let ds_delta = delta_block(
+            &mut *conn,
+            viewer,
+            frame_id,
+            &[("k12b_ds", &k12b_rows)],
+            opts.top,
+        )
+        .await?;
+        report.k12b = Some(K12bReport {
+            ds_rows: k12b_rows.len(),
+            ds_rows_by_spelling: by_spelling,
+            ds_counterfactual: true,
+            ds_delta,
+            sheaf_reads_supersedes: false,
+        });
+    }
+    if opts.items.k10_retro && opts.items.k12b {
+        report.combined = Some(
+            delta_block(
+                &mut *conn,
+                viewer,
+                frame_id,
+                &[("k10_retro", &k10_rows), ("k12b_ds", &k12b_rows)],
+                opts.top,
+            )
+            .await?,
+        );
+    }
+    Ok(report)
 }
 
-#[allow(dead_code)]
 async fn r131_report(conn: &mut sqlx::PgConnection) -> Result<R131Report, String> {
     let edges = r131_factorless_edges(&mut *conn)
         .await
@@ -521,7 +615,6 @@ async fn r131_report(conn: &mut sqlx::PgConnection) -> Result<R131Report, String
     })
 }
 
-#[allow(dead_code)]
 /// The claims holding any of `sets`' rows, and what removing every one of
 /// those rows does to each, as the cascade's repair would leave it.
 async fn delta_block(
@@ -666,7 +759,6 @@ async fn delta_block(
     })
 }
 
-#[allow(dead_code)]
 fn totals(claims: &[ClaimDelta], top: usize) -> DeltaTotals {
     let mut t = DeltaTotals {
         claims: claims.len(),
