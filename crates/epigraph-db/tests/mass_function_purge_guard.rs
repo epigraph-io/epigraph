@@ -538,6 +538,47 @@ async fn d_residual_a_maintenance_session_that_writes_a_grant_row_can_delete(poo
     assert!(!exists(&pool, "mass_functions", w.retracted).await);
 }
 
+/// (d2) A grant admits ONLY the row it names: the helper matches
+/// `mf_id = p_id` as well as the transaction. A maintenance transaction that
+/// grants one retracted row and then deletes two is refused SR09 as a whole,
+/// and both rows survive. Without the row predicate, any grant in the
+/// transaction would admit every retracted row the statement reaches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d2_a_grant_admits_only_the_row_it_names(pool: PgPool) {
+    grant_table_exists(&pool).await;
+    let w = world(&pool).await;
+    let (third, _) = fixture::seed_agent_with_group(&pool, "h10-third-source").await;
+    let r2 = bba(&pool, w.claim, w.frame, third, None).await;
+    retracted::retract_through_definer(&pool, r2).await;
+
+    let m = maintenance(&pool).await;
+    let mut tx = m.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, 'one row')",
+    )
+    .bind(w.retracted)
+    .execute(&mut *tx)
+    .await
+    .expect("the maintenance role holds INSERT on the grant table");
+    let r = sqlx::query("DELETE FROM mass_functions WHERE id = ANY($1)")
+        .bind(vec![w.retracted, r2])
+        .execute(&mut *tx)
+        .await;
+    assert_sr09(
+        refusal(r, "a delete of two retracted rows under a grant for one"),
+        "(d2)",
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the granted row rolls back with the refused statement"
+    );
+    assert!(
+        exists(&pool, "mass_functions", r2).await,
+        "the ungranted retracted row survives"
+    );
+}
+
 /// (f) A grant written by an EARLIER transaction admits nothing: the helper
 /// matches `xact_id = pg_current_xact_id()`.
 #[sqlx::test(migrations = "../../migrations")]
