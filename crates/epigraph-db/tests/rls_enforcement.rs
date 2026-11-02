@@ -1935,6 +1935,15 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
     "migration 118: the bearer secret's image; every lookup by hash is a definer",
 )];
 
+/// Tables the application role must NOT read at all, by design: `(table,
+/// why)`. Exact in both directions: each must exist and grant `epigraph_app`
+/// no SELECT, table- or column-level.
+const NO_APP_SELECT: &[(&str, &str)] = &[(
+    "mass_function_purge_grants",
+    "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
+     (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
+)];
+
 /// Every relation in `public` is reachable by `epigraph_app` on a FRESH migrate.
 ///
 /// **This test must NOT call `grant_app_privileges`.** That fixture re-issues
@@ -1951,7 +1960,8 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// A table on [`COLUMN_RESTRICTED_SELECT`] has its table-level SELECT replaced
 /// by column grants on purpose. It must still be reachable (every column but
 /// the named one readable), and the named column must NOT be: the list is
-/// exact in both directions.
+/// exact in both directions. A table on [`NO_APP_SELECT`] is not readable by
+/// the application role at all, also on purpose, and must stay so.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool: PgPool) {
     let restricted: Vec<&str> = COLUMN_RESTRICTED_SELECT
@@ -1967,9 +1977,25 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
     .fetch_all(&pool)
     .await
     .expect("privilege sweep");
+    for (table, why) in NO_APP_SELECT {
+        assert!(!why.trim().is_empty(), "{table}: no justification");
+        let readable: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('epigraph_app', ('public.' || $1)::regclass, 'SELECT') \
+                 OR has_any_column_privilege('epigraph_app', ('public.' || $1)::regclass, 'SELECT')",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{table} is on NO_APP_SELECT but does not exist: {e}"));
+        assert!(
+            !readable,
+            "epigraph_app can read {table}, which is on NO_APP_SELECT ({why})"
+        );
+    }
     let missing: Vec<String> = missing
         .into_iter()
         .filter(|t| !restricted.contains(&t.as_str()))
+        .filter(|t| !NO_APP_SELECT.iter().any(|(n, _)| *n == t.as_str()))
         .collect();
     for (table, withheld, why) in COLUMN_RESTRICTED_SELECT {
         assert!(!why.trim().is_empty(), "{table}: no justification");
