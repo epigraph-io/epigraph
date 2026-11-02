@@ -29,6 +29,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 #[derive(Debug, serde::Serialize)]
 pub struct IngestWorkflowResponse {
+    /// Empty, and then not serialized, for a re-ingest of a row the caller
+    /// cannot read (backlog c831df4a): the answer must not hand over the id
+    /// of a workflow the caller cannot see.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub canonical_name: String,
     pub generation: i32,
@@ -158,6 +162,15 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // recorded with the write (`record_caller_workflow_write`).
     let mut grants: Vec<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)> =
         Vec::with_capacity(2);
+    // An anchor the caller cannot read (a lineage head or linked parent in a
+    // group it is not in) is refused without naming it (backlog c831df4a).
+    let not_found = || {
+        invalid_params(format!(
+            "workflow_ingest: canonical_name '{}' (generation {}) extends a workflow lineage \
+             this caller cannot read. Nothing was written.",
+            extraction.source.canonical_name, extraction.source.generation
+        ))
+    };
     if creating {
         let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -175,6 +188,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 caller,
                 anchor,
                 "workflow_ingest",
+                &not_found,
             )
             .await?;
             admin_write |= grant.is_admin();
@@ -266,6 +280,20 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         )
         .await?;
     }
+    // A re-ingest reports the EXISTING row, which the system agent's stamp
+    // found and the caller may not read (a group plan outside its groups).
+    // Its id is then left out of the answer (backlog c831df4a, ruling R-100),
+    // and so not handed to the post-commit goal embedding either.
+    let caller_reads_row = !result.already_ingested
+        || epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, result.workflow_id)
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    "workflow ingest: could not read the workflow as the caller",
+                    e,
+                )
+            })?
+            .is_some();
     tx.commit().await.map_err(|e| {
         crate::errors::internal_error_logged("workflow ingest: could not commit", e)
     })?;
@@ -307,7 +335,11 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
 
     let inserted = result.inserted.clone();
     let response = IngestWorkflowResponse {
-        workflow_id: result.workflow_id.to_string(),
+        workflow_id: if caller_reads_row {
+            result.workflow_id.to_string()
+        } else {
+            String::new()
+        },
         canonical_name: result.canonical_name,
         generation: result.generation,
         claims_ingested: result.claims_ingested,
@@ -687,6 +719,8 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub parent_canonical_name: String,
     pub parent_generation: i32,
     pub new_generation: i32,
+    /// Left out as in [`IngestWorkflowResponse::workflow_id`].
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub claims_ingested: usize,
     pub already_ingested: bool,

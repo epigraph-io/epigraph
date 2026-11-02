@@ -2404,7 +2404,9 @@ pub struct PaperResponse {
 
 #[derive(Debug, Serialize)]
 pub struct StoreWorkflowResponse {
-    /// `workflows.id` (deterministic from canonical_name + generation).
+    /// `workflows.id` (deterministic from canonical_name + generation). Left
+    /// out for a re-ingest of a row the caller cannot read (backlog c831df4a).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub canonical_name: String,
     pub goal: String,

@@ -65,6 +65,13 @@ pub struct EvolveStepResponse {
     pub belief_cascade: Option<CascadeReport>,
 }
 
+/// The answer for a parent step that does not exist, shared by the act's
+/// `NotFound` and the authority gate's unreadable workflow (backlog c831df4a),
+/// so the two cannot be told apart.
+fn parent_not_found(id: Uuid) -> McpError {
+    invalid_params(format!("parent step {id} not found"))
+}
+
 /// `evolve_step_conn`'s refusals for the caller (backlog 769989ae): its
 /// `Conflict` (superseding a step that is no longer current) is the caller's
 /// to fix, INVALID_PARAMS as name-mode's retired-head refusal is, rather than
@@ -78,9 +85,23 @@ pub struct EvolveStepResponse {
 fn evolve_caller_error(e: epigraph_db::DbError) -> McpError {
     match e {
         epigraph_db::DbError::Conflict { reason } => invalid_params(reason),
-        epigraph_db::DbError::NotFound { id, .. } => {
-            invalid_params(format!("parent step {id} not found"))
-        }
+        epigraph_db::DbError::NotFound { id, .. } => parent_not_found(id),
+        // A parent the caller can READ but not write (backlog 50aa4027): the
+        // claims tenancy policy refuses the retire or the successor INSERT at
+        // its WITH CHECK (42501, the transaction aborted, nothing written).
+        // The same denial class as a WriteRefused, so the same code; the
+        // HTTP twin answers 403. Mapped here, not in `db_caller_error`, so no
+        // other tool's 42501 changes meaning.
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } if d.code().as_deref() == Some("42501") => McpError {
+            code: rmcp::model::ErrorCode::INVALID_REQUEST,
+            message: std::borrow::Cow::from(
+                "evolve_step: no write authority over the group that owns this step. \
+                 Nothing was written.",
+            ),
+            data: None,
+        },
         other => crate::errors::db_caller_error(other),
     }
 }
@@ -280,11 +301,22 @@ async fn require_lineage_authority(
                     e,
                 )
             })?;
+    // A workflow the caller cannot read that executes the lineage (a group
+    // plan reusing a public step) is answered as an unknown parent, never by
+    // its id (backlog c831df4a).
+    let not_found = || parent_not_found(parent);
     let mut grants = Vec::with_capacity(workflows.len());
     for workflow in workflows {
-        let grant =
-            require_workflow_authority(server, &mut *conn, auth, caller, workflow, "evolve_step")
-                .await?;
+        let grant = require_workflow_authority(
+            server,
+            &mut *conn,
+            auth,
+            caller,
+            workflow,
+            "evolve_step",
+            &not_found,
+        )
+        .await?;
         grants.push((workflow, grant));
     }
     Ok(grants)

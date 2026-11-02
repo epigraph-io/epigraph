@@ -245,19 +245,19 @@ async fn evolve_step_supersedes_whose_retire_is_refused_returns_403_and_writes_n
 }
 
 /// `supersedes` on a PUBLIC step the caller can read but does not own, on the
-/// application role with the real row-security policies and no stand-in: a
-/// refusal with nothing written and the lineage's one current head intact
-/// (backlog d34f5096).
+/// application role with the real row-security policies and no stand-in: 403
+/// with nothing written and the lineage's one current head intact (backlogs
+/// d34f5096, 50aa4027).
 ///
-/// A regression pin, green before and after the d34f5096 fix. It measures what
-/// the real policies do on the path the stand-in above exercises: the parent's
-/// `SELECT ... FOR UPDATE` returns the readable row, and the claims tenancy
-/// policy refuses the write by RAISING at its WITH CHECK (SQLSTATE 42501, the
-/// transaction aborted), not by matching zero rows. The successor inherits the
-/// parent's owner group and INSERT and UPDATE share that WITH CHECK, so "may
-/// write the successor but not retire the predecessor" cannot arise through
-/// the claims policies today. Only the invariant is pinned, not the status:
-/// the route currently answers that refusal 500, a separate defect.
+/// It measures what the real policies do on the path the stand-in above
+/// exercises: the parent's `SELECT ... FOR UPDATE` returns the readable row,
+/// and the claims tenancy policy refuses the write by RAISING at its WITH
+/// CHECK (SQLSTATE 42501, the transaction aborted), not by matching zero rows.
+/// The successor inherits the parent's owner group and INSERT and UPDATE share
+/// that WITH CHECK, so "may write the successor but not retire the
+/// predecessor" cannot arise through the claims policies today. The route
+/// answered that refusal 500 until backlog 50aa4027 gave it the opt-in
+/// `db_is_insufficient_privilege -> write_refused` arm `supersede_claim` has.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolve_step_supersedes_of_a_readable_step_the_caller_cannot_write_is_refused_and_writes_nothing(
     pool: PgPool,
@@ -285,9 +285,14 @@ async fn evolve_step_supersedes_of_a_readable_step_the_caller_cannot_write_is_re
 
     let content = format!("successor by a reader {}", Uuid::new_v4());
     let (status, body) = evolve_as(&pool, &state, b, parent, &content, "supersedes").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a step the caller may read but not write is a 403 denial, not a server fault: {body}"
+    );
     assert!(
-        !status.is_success(),
-        "a step the caller may read but not write is refused: {status} {body}"
+        body.contains("no write authority over the group that owns this step"),
+        "the denial says what was refused: {body}"
     );
     assert_eq!(
         claims_with_content(&pool, &content).await,
@@ -310,4 +315,56 @@ async fn evolve_step_supersedes_of_a_readable_step_the_caller_cannot_write_is_re
     assert_eq!(status, StatusCode::OK, "the owner may supersede: {body}");
     assert_eq!(claims_with_content(&pool, &content).await, 1);
     assert_eq!(current_heads(&pool, parent).await, 1, "one current head");
+}
+
+/// The case backlog 50aa4027 was measured on: a PUBLIC step owned by the WORLD
+/// group, which every viewer reads and nobody writes. `supersedes` and
+/// `revises` by an ordinary caller are both the database's 42501 WITH CHECK
+/// refusal (the retire for `supersedes`, the successor INSERT for a `revises`
+/// of a parent that already has a lineage), and both answer 403 with nothing
+/// written, not 500. There is no owner control here: nobody writes the world
+/// group, which is the point.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_on_a_world_owned_public_step_is_403_and_writes_nothing(pool: PgPool) {
+    let (author, _) = seed_agent_with_group(&pool, "world-author").await;
+    let (caller, _) = seed_agent_with_group(&pool, "world-reader").await;
+    let parent = viewer_fixture::seed_public_claim(
+        &pool,
+        author,
+        &format!("a world-owned public step {}", Uuid::new_v4()),
+    )
+    .await;
+    // A lineage already, so `revises` reaches the successor INSERT rather
+    // than the back-fill UPDATE.
+    sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+        .bind(Uuid::new_v4())
+        .bind(parent)
+        .execute(&pool)
+        .await
+        .expect("give the parent a lineage");
+    let state = app_role_state(&pool).await;
+
+    for edge_type in ["supersedes", "revises"] {
+        let content = format!("{edge_type} of a world-owned step {}", Uuid::new_v4());
+        let (status, body) = evolve_as(&pool, &state, caller, parent, &content, edge_type).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{edge_type} of a readable step the caller cannot write is 403: {body}"
+        );
+        assert!(
+            body.contains("nothing was written"),
+            "{edge_type}: the denial says nothing was written: {body}"
+        );
+        assert_eq!(
+            claims_with_content(&pool, &content).await,
+            0,
+            "{edge_type}: no successor"
+        );
+        assert_eq!(
+            current_heads(&pool, parent).await,
+            1,
+            "{edge_type}: one current head"
+        );
+    }
 }

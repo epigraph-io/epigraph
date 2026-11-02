@@ -2075,10 +2075,14 @@ impl WorkflowRepository {
 
     /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`
     /// as `viewer` reads it, or `None` when `viewer` cannot read the row,
-    /// exactly as for an unknown id (backlog 222289f3: the stdio workflow
-    /// authority decides on the CALLER's own view of the target row). Run it
-    /// on `viewer`'s STAMPED connection, so the in-query predicate and the row
-    /// security agree.
+    /// exactly as for an unknown id. The workflow authority gates run it with
+    /// the CALLER's viewer before any answer names the row: the stdio arm
+    /// decides on the caller's own view of the target row (backlog 222289f3),
+    /// and the MCP `tools/workflow_authority.rs` / REST `routes/workflows.rs`
+    /// gates run it on the act's own transaction to word refusals (backlog
+    /// c831df4a), so the in-query predicate narrows whatever that transaction's
+    /// stamp reads to what the caller reads. On `viewer`'s own STAMPED
+    /// connection the in-query predicate and the row security agree.
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.

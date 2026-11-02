@@ -3152,8 +3152,10 @@ async fn over_mcp_the_hierarchical_embedding_path_finds_a_declared_generation_on
 /// join to `workflows` (whose row security would drop a row the caller cannot
 /// read). A caller who holds workflow authority over the public W1, and writes
 /// the shared step's owning group, but does not read W2's group is refused
-/// evolving the step W1 and W2 both execute, and nothing is written. A member
-/// who holds authority over both evolves it.
+/// evolving the step W1 and W2 both execute, and nothing is written. The
+/// refusal is the missing-parent 404 and does not name W2 (backlog c831df4a:
+/// it used to be a 403 naming the hidden row). A member who holds authority
+/// over both evolves it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(pool: PgPool) {
     let w = world(&pool).await;
@@ -3186,10 +3188,14 @@ async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(po
     let (status, out) = evolve(w.h2, refused).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "the hidden W2 stays in the authority set: {out}"
+        StatusCode::NOT_FOUND,
+        "the hidden W2 stays in the authority set, answered as a missing parent: {out}"
     );
-    assert!(out.to_string().contains("Nothing was written"), "{out}");
+    assert_eq!(out["details"]["id"], json!(step.to_string()), "{out}");
+    assert!(
+        !out.to_string().contains(&w2.to_string()),
+        "the refusal does not name the hidden W2: {out}"
+    );
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(claims_with_content(&pool, refused).await, 0);
     assert!(
@@ -3253,7 +3259,9 @@ async fn over_mcp_evolving_a_step_a_hidden_generation_executes_needs_authority_o
     let err = evolve(w.h2, refused)
         .await
         .expect_err("the hidden W2 stays in the authority set");
-    assert!(err.contains("Nothing was written"), "{err}");
+    // Answered as a missing parent, naming nothing hidden (backlog c831df4a).
+    assert_eq!(err, format!("parent step {step} not found"), "{err}");
+    assert!(!err.contains(&w2.to_string()), "{err}");
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(claims_with_content(&pool, refused).await, 0);
     assert!(

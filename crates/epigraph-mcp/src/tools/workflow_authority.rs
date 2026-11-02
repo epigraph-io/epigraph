@@ -123,7 +123,12 @@
 //!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
-//!   the wrong object and the wrong verb.
+//!   the wrong object and the wrong verb. It names them only to a caller that
+//!   can READ the row (backlog c831df4a, ruling R-100): the act's transaction is
+//!   often the ingest system agent's, which reads groups the caller does not,
+//!   so a REFUSAL to a caller that cannot read the row is the call site's
+//!   not-found answer, with no id, no submitter and no arm. Only the answer
+//!   changes: the arms admit exactly whom they admitted before.
 //!
 //! The system-agent stamp is unchanged for the rows these writes make: the
 //! caller is recorded in the provenance row, not by re-authoring the rows,
@@ -171,11 +176,24 @@ impl WorkflowGrant {
 /// Refuse the caller unless it has authority over workflow `workflow_id`; see
 /// the module doc for the rule and the order of its arms.
 ///
+/// `not_found` is the CALL SITE's answer for a workflow that does not exist
+/// (a step tool's unknown name, `evolve_step`'s unknown parent, ...). Over the
+/// authenticated transport every REFUSAL to a caller that cannot READ the row
+/// is exactly that answer, never text naming the row or its submitter
+/// (backlog c831df4a, ruling R-100: ids stay deterministic, so the answer
+/// must not confirm one). The act's transaction may be stamped with the
+/// ingest system agent, which reads groups the caller does not; the caller's
+/// own view decides what it is told. It does not decide who is admitted: the
+/// ruling masks answers and changes no authority, so the submitter, operator
+/// and admin arms run exactly as before, whether or not the caller reads the
+/// row.
+///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
-/// "cannot retire it" wording, which named the wrong object and verb), or an
-/// internal error if the submitter, the operator link or the admin grant
-/// cannot be read.
+/// "cannot retire it" wording, which named the wrong object and verb), the
+/// call site's not-found answer for a row the caller cannot read, or an
+/// internal error if the caller's view, the submitter, the operator link or
+/// the admin grant cannot be read.
 pub(crate) async fn require_workflow_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -183,6 +201,7 @@ pub(crate) async fn require_workflow_authority(
     caller: WriteIdentity,
     workflow_id: uuid::Uuid,
     tool_name: &'static str,
+    not_found: &(dyn Fn() -> McpError + Send + Sync),
 ) -> Result<WorkflowGrant, McpError> {
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
@@ -201,23 +220,60 @@ pub(crate) async fn require_workflow_authority(
         return Ok(grant(arm));
     };
     let caller_agent = caller.agent_id();
+    // The CALLER's view of the row (backlog c831df4a). It words refusals only:
+    // a refusal to a caller that cannot read the row is answered as the call
+    // site answers an unknown one, and names nothing. Admission is unchanged.
+    let view = caller_view_of(server, conn, caller_agent, workflow_id, tool_name).await?;
+    let readable = view.is_some();
+    let refuse = |text: String| {
+        if readable {
+            crate::errors::invalid_params(text)
+        } else {
+            not_found()
+        }
+    };
     // A workflow with NO recorded submitter (written before batch H-b) is
     // platform corpus (U005, default decision A; the D1 ruling keeps the
     // legacy corpus platform-owned). There is no submitter to match and no
     // operator to derive, so the only arm is the audited admin arm. When the
     // custodian role lands (#529), its check replaces `claims:admin` here.
+    // A GROUP row with no record (a plan migration 183 backfilled into its
+    // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
-        let subject = format!(
-            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
-             written before batch H-b)"
-        );
+        let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
+        let (subject, kind) = if group_row {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (a group workflow written \
+                     before batch H-b)"
+                ),
+                "a workflow with no recorded submitter",
+            )
+        } else {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (legacy platform \
+                     workflow, written before batch H-b)"
+                ),
+                "a legacy platform workflow",
+            )
+        };
         let needs = "a live claims:admin grant (the audited claims:admin path)";
-        return match admin_arm(conn, auth, caller_agent, &subject, needs, tool_name).await? {
+        return match admin_arm(
+            conn,
+            auth,
+            caller_agent,
+            &subject,
+            needs,
+            tool_name,
+            &refuse,
+        )
+        .await?
+        {
             Some(()) => Ok(grant(WorkflowArm::Admin)),
-            None => Err(crate::errors::invalid_params(format!(
-                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on a \
-                 legacy platform workflow requires the audited claims:admin path. Nothing was \
-                 written."
+            None => Err(refuse(format!(
+                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on \
+                 {kind} requires the audited claims:admin path. Nothing was written."
             ))),
         };
     };
@@ -233,13 +289,21 @@ pub(crate) async fn require_workflow_authority(
     // 3. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
-    if admin_arm(conn, auth, caller_agent, &subject, needs, tool_name)
-        .await?
-        .is_some()
+    if admin_arm(
+        conn,
+        auth,
+        caller_agent,
+        &subject,
+        needs,
+        tool_name,
+        &refuse,
+    )
+    .await?
+    .is_some()
     {
         return Ok(grant(WorkflowArm::Admin));
     }
-    Err(crate::errors::invalid_params(format!(
+    Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
          neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
          the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
@@ -365,6 +429,35 @@ async fn stdio_workflow_authority(
     )))
 }
 
+/// `(visibility, owner_group_id)` of workflow `workflow_id` as the caller
+/// `caller_agent` reads it, on the act's own connection (so the answer is
+/// what both that connection's stamp and the caller read), or `None` when the
+/// caller cannot read it (backlog c831df4a).
+async fn caller_view_of(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    workflow_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<Option<(String, uuid::Uuid)>, McpError> {
+    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not resolve the caller's view"),
+                e,
+            )
+        })?;
+    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not read the workflow as the caller"),
+                e,
+            )
+        })
+}
+
 /// The AUDITED admin arm, shared by a submitted workflow (after its submitter
 /// and operator arms) and a legacy one (its only arm). The token's scope is
 /// necessary, not sufficient: its client record must still grant
@@ -374,8 +467,9 @@ async fn stdio_workflow_authority(
 ///
 /// `Ok(Some(()))`: admitted. `Ok(None)`: the token holds no `claims:admin`, so
 /// the caller words its own refusal. `Err`: the token holds `claims:admin` but
-/// its client record grants none (ADM02), refused with `subject` naming the
-/// workflow and `needs` naming the arms that would admit.
+/// its client record grants none (ADM02), refused through `refuse` with
+/// `subject` naming the workflow and `needs` naming the arms that would admit
+/// (`refuse` masks the text for a caller that cannot read the row).
 async fn admin_arm(
     conn: &mut sqlx::PgConnection,
     auth: &epigraph_auth::AuthContext,
@@ -383,6 +477,7 @@ async fn admin_arm(
     subject: &str,
     needs: &str,
     tool_name: &'static str,
+    refuse: &(dyn Fn(String) -> McpError + Send + Sync),
 ) -> Result<Option<()>, McpError> {
     if !auth.has_scope("claims:admin") {
         return Ok(None);
@@ -403,7 +498,7 @@ async fn admin_arm(
     if live {
         return Ok(Some(()));
     }
-    Err(crate::errors::invalid_params(format!(
+    Err(refuse(format!(
         "{subject}; caller agent {caller_agent} holds claims:admin in its token, but the token's \
          client record ({}) grants it no live claims:admin, so the audited admin path refused it \
          (ADM02). {tool_name} requires {needs}. Nothing was written.",
