@@ -1801,8 +1801,13 @@ fn resolve_doi(extraction: &DocumentExtraction) -> String {
         .is_some_and(|ext| !is_placeholder_id(ext));
     if let Some(uri) = &extraction.source.uri {
         if !is_placeholder_id(uri) {
-            // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}
-            if let Some(arxiv) = find_arxiv_id(uri) {
+            // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}. It matches any digit
+            // run, so against an external_id it counts only when the uri
+            // names arXiv (host or `arXiv:` scheme); a date-shaped path
+            // segment must not fabricate a shared arXiv key. Without an
+            // external_id the legacy behaviour is kept so existing keys hold.
+            let names_arxiv = !has_external_id || uri.to_ascii_lowercase().contains("arxiv");
+            if let Some(arxiv) = find_arxiv_id(uri).filter(|_| names_arxiv) {
                 return format!("10.48550/arXiv.{arxiv}");
             }
             let key = canonical_document_key(uri);
@@ -2852,6 +2857,39 @@ mod tests {
         x.uri = Some("https://arxiv.org/abs/2606.04990".to_string());
         x.external_id = Some("lab-copy-1".to_string());
         assert_eq!(resolve_doi(&extraction_of(x)), "10.48550/arXiv.2606.04990");
+
+        let mut p = src("A paper");
+        p.uri = Some("doi:10.1021/acsnano.9b05650".to_string());
+        p.external_id = Some("lab-copy-1".to_string());
+        assert_eq!(resolve_doi(&extraction_of(p)), "10.1021/acsnano.9b05650");
+    }
+
+    /// A shared uri whose path merely contains an arXiv-shaped digit run
+    /// (`2026.1102`, `20261102.14301`) does not name arXiv, so it must not
+    /// outrank external_id: keyed on a fabricated `10.48550/arXiv.*` DOI, two
+    /// different works at that uri merged exactly as b69dfb91 describes.
+    #[test]
+    fn digit_run_in_a_shared_uri_is_not_an_arxiv_identifier() {
+        for uri in [
+            "https://lab.example/eln/2026.1102/notebook",
+            "https://lab.example/eln/entry/20261102.14301",
+        ] {
+            let mut a = src("Sweep variant");
+            a.uri = Some(uri.to_string());
+            a.external_id = Some("run-a".to_string());
+            let mut b = src("Sweep variant");
+            b.uri = Some(uri.to_string());
+            b.external_id = Some("run-b".to_string());
+            let (ka, kb) = (
+                resolve_doi(&extraction_of(a)),
+                resolve_doi(&extraction_of(b)),
+            );
+            assert_ne!(ka, kb, "two works at {uri} merged under one key {ka}");
+            assert!(
+                is_synthetic_key(&ka) && is_synthetic_key(&kb),
+                "external_id, not a digit run in {uri}, keys them: {ka} / {kb}"
+            );
+        }
     }
 
     #[test]
