@@ -108,6 +108,20 @@ pub enum StepOpError {
          its claim, so it was not soft-deleted"
     )]
     StepNotWritable { step_claim_id: Uuid, lineage: Uuid },
+    /// `add_step` into a GROUP plan by a caller that does not itself hold a
+    /// live writer/admin membership of the plan's group (ruling R-98: the new
+    /// step takes the plan's group, and the system agent's stamp writes it;
+    /// inheriting the plan's tenancy must not let a non-writer write into the
+    /// group). The group is not named. Nothing is written.
+    #[error(
+        "workflow {canonical_name:?} belongs to a group the calling agent {caller} does not \
+         write (it holds no live writer or admin membership of it), so it may not add a step \
+         to it; nothing was written"
+    )]
+    GroupNotWritable {
+        canonical_name: String,
+        caller: Uuid,
+    },
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("repo error: {0}")]
@@ -317,6 +331,7 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 /// workflow cannot both take the same index.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
+    caller: Option<Uuid>,
     canonical_name: &str,
     step_text: &str,
     position: Option<u32>,
@@ -328,6 +343,34 @@ pub async fn add_step(
     // Before the plan is read: a concurrent add_step on this workflow waits
     // here, so the two cannot both take the same next `plan_index`.
     epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *conn, workflow_id).await?;
+    // A GROUP plan's new step lands in the plan's group (below), on the
+    // system agent's stamp, which writes that group whoever called. So the
+    // CALLER itself must write the group, decided here before anything is
+    // read or written, on every transport (REST and MCP pass their acting
+    // agent; `None` names no agent and is refused). Not left to row security:
+    // the stamp is not the caller's.
+    let plan_group =
+        match epigraph_db::WorkflowRepository::tenancy_of(&mut *conn, workflow_id).await? {
+            Some((visibility, group)) if visibility == "group" => Some(group),
+            _ => None,
+        };
+    if let Some(group) = plan_group {
+        let writes = match caller {
+            Some(agent) => {
+                epigraph_db::GroupMembershipRepository::agent_writes_group_conn(
+                    &mut *conn, agent, group,
+                )
+                .await?
+            }
+            None => false,
+        };
+        if !writes {
+            return Err(StepOpError::GroupNotWritable {
+                canonical_name: canonical_name.to_string(),
+                caller: caller.unwrap_or_else(Uuid::nil),
+            });
+        }
+    }
     let phase_id = find_phase(&mut *conn, workflow_id).await?;
     let chain = ordered_steps(&mut *conn, workflow_id).await?;
     let plan = plan_edges(&mut *conn, workflow_id).await?;
@@ -439,7 +482,17 @@ pub async fn add_step(
     // every workflow private to whoever last edited it. A parameter here would
     // therefore only widen the ways to get it wrong, so the declaration is
     // derived from the author the row already names.
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?;
+    //
+    // A GROUP plan is the exception (ruling R-98 Q5(a), backlog 630af617):
+    // its new step takes the `workflows` row's tenancy, read under the row
+    // lock taken above, so the step, its `executes` edge and its chain edges
+    // (the endpoint meet) are the plan's group and not public. The system
+    // agent's stamp writes that group (a declared ingest required it); if it
+    // no longer does, the INSERT is refused and nothing is written.
+    let decl = match plan_group {
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        None => epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?,
+    };
 
     let claim_created = sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \

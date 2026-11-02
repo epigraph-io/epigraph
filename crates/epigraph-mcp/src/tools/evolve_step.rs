@@ -256,8 +256,9 @@ pub async fn evolve_step(
 /// [`record_lineage_writes`]. A lineage no workflow executes returns none and
 /// is unaffected.
 ///
-/// stdio (no token) is unchanged, as for every workflow tool (the batch H-b
-/// bar; see `workflow_authority.rs`): the lineage is not even read.
+/// stdio (no token) is checked too (backlog 222289f3): the stdio arms of
+/// `workflow_authority.rs` (the caller reads the workflow row and writes its
+/// owner group; then the submitter or its operator).
 ///
 /// Accepted residual (operator ruling R-21): the set is read under the
 /// caller's row security, so a workflow the caller cannot see that executes
@@ -270,9 +271,6 @@ async fn require_lineage_authority(
     caller: WriteIdentity,
     parent: Uuid,
 ) -> Result<Vec<(Uuid, WorkflowGrant)>, McpError> {
-    if auth.is_none() {
-        return Ok(Vec::new());
-    }
     let workflows =
         epigraph_db::WorkflowRepository::workflows_executing_step_lineage(&mut *conn, parent)
             .await

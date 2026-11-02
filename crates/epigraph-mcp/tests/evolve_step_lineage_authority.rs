@@ -20,8 +20,9 @@
 //! * a server built without a `ScopedPool` gates too;
 //! * the audited admin arm is admitted and recorded; a grantless admin is
 //!   refused ADM02;
-//! * stdio is unchanged (the batch H-b bar, as for the other workflow tools),
-//!   and so is an authenticated evolve of a claim no workflow executes.
+//! * stdio is checked too (backlog 222289f3): a stdio caller that did not
+//!   submit the workflow is refused; an authenticated evolve of a claim no
+//!   workflow executes is unaffected.
 //!
 //! The decision and the record are Rust-side and data-driven, so the superuser
 //! harness observes them faithfully. Whether row security lets the gate SEE
@@ -699,10 +700,11 @@ async fn the_admin_arm_is_audited_and_a_grantless_admin_is_refused(pool: PgPool)
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
 }
 
-/// stdio is unchanged: with no token the gate does not run (the batch H-b bar
-/// every workflow tool keeps), and nothing is recorded.
+/// stdio is checked (backlog 222289f3, reversing the batch H-b bar): with no
+/// token the stdio agent is not the workflow's submitter, so it is refused
+/// with nothing written and nothing recorded.
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_evolve_is_unchanged(pool: PgPool) {
+async fn stdio_evolve_needs_the_submitter(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_o, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let (_wf, step) = ingest_as(
@@ -716,15 +718,20 @@ async fn stdio_evolve_is_unchanged(pool: PgPool) {
     let viewer = tools::viewer::request_viewer(&server, None)
         .await
         .expect("stdio viewer");
-    tools::evolve_step::evolve_step(
+    let err = tools::evolve_step::evolve_step(
         &server,
         &viewer,
         by_id(step, "a stdio revision", "revises"),
         None,
     )
     .await
-    .expect("stdio evolves as before");
-    assert_eq!(claims_with_content(&pool, "a stdio revision").await, 1);
+    .expect_err("a stdio caller that did not submit the workflow is refused");
+    assert!(
+        err.message.contains("was submitted by agent"),
+        "{}",
+        err.message
+    );
+    assert_eq!(claims_with_content(&pool, "a stdio revision").await, 0);
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
     assert!(evolve_rows(&pool, ADMIN_WRITE).await.is_empty());
 }

@@ -697,6 +697,31 @@ impl GroupMembershipRepository {
         Ok(rows)
     }
 
+    /// Whether `agent_id` holds a live `writer` or `admin` membership of
+    /// `group_id`, on `conn` (any stamp): the same live-membership definer
+    /// [`Self::list_live_for_agent`] (and so `Viewer::resolve`) reads, asked
+    /// for one group. For a write made on ANOTHER principal's stamp (the
+    /// workflow-ingest system agent's) that must still be bounded by the
+    /// CALLER's own write authority over the group the row lands in (ruling
+    /// R-98: a step added to a group plan).
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn agent_writes_group_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        group_id: Uuid,
+    ) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) \
+              WHERE group_id = $2 AND role IN ('admin', 'writer'))",
+        )
+        .bind(agent_id)
+        .bind(group_id)
+        .fetch_one(&mut *conn)
+        .await?)
+    }
+
     /// How many REVOKED membership rows `agent_id` holds, read through the
     /// policy's OWN-ROW arm.
     ///
