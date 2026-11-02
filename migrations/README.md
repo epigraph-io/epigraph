@@ -2225,6 +2225,38 @@ restart.
   **Deploy order:** after 186 (numeric order); none against the binaries (no
   shipped request-path statement needs the revoked privileges). **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **191**: public `retire_operator_link` (backlog 4dec90c2). Before it no
+  definer changed an `operator_links` row, the table had no UPDATE policy or
+  maintenance UPDATE grant, and 122's `operator_links_audit` fired on INSERT
+  only, so retiring an existing LIVE link took a raw superuser UPDATE with no
+  audit row. Adds `epigraph_retire_operator_link(agent, reason,
+  revoke_membership)`: SECURITY DEFINER on 172's `pg_catalog, pg_temp` path,
+  owned by and EXECUTE-able by `epigraph_maintenance` only; refuses an
+  elevated session (OLR02) and any non-maintenance session (OLR01, both
+  42501), a blank reason (22004); takes 107's `epigraph.operator_links`
+  advisory lock; returns `no_link` / `already_retired` without writing
+  (idempotent); refuses while the agent holds a live writer/admin row in the
+  link's operator group (OLR03, 55000) unless `revoke_membership` revokes it in
+  the same act; 148's system-agent trigger refuses a registered system agent.
+  Re-bodies 122's `epigraph_operator_links_audit` (md5 precondition on 122's
+  body; its `public, pg_temp` path, owner and ACL kept) and re-creates its
+  trigger AFTER INSERT OR UPDATE OF `retired`: every flip writes one
+  `operator.link_retired` / `operator.link_unretired` row with the reason and
+  `via` (the verb, or `direct`). Adds the retire-only guard
+  `operator_links_retire_only` (BEFORE UPDATE, INVOKER: for every login but a
+  superuser only `retired` false -> true, OLR04 / 42501 otherwise; and that
+  flip only once the agent holds no live writer/admin row in the operator
+  group, OLR03 / 55000, so a maintenance login's direct UPDATE meets the
+  verb's precondition; the direct path is not serialised by 107's lock),
+  `GRANT UPDATE (retired)` to the maintenance role, the UPDATE policy
+  `operator_links_definer_retire` (`epigraph_definer_bypass()`), and the
+  RESTRICTIVE `security_events_operator_link_retire_privileged` reserving both
+  event types. CLI: `epigraph-operator retire-link`. Pinned by
+  `epigraph-db/tests/operator_link_retire.rs`, `schema_contract.rs`
+  (`migration_191_*`) and `epigraph-cli/tests/operator_retire_link.rs`. Undo in
+  the file header. **Deploy order:** none against other migrations; the CLI
+  verb needs 191 (42883 without it). **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -3572,3 +3572,109 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         );
     }
 }
+
+/// Migration 191 (backlog 4dec90c2, the audited retire of a live operator
+/// link): the verb is a SECURITY DEFINER owned by `epigraph_maintenance` on
+/// 172's `pg_catalog, pg_temp` path with an explicit ACL that neither PUBLIC
+/// nor the application role can execute; the maintenance role may UPDATE
+/// exactly the `retired` column of `operator_links` (no other column, no
+/// table-wide UPDATE, no DELETE); the audit trigger fires AFTER INSERT and
+/// UPDATE (of `retired`), and the retire-only guard BEFORE UPDATE. The owner
+/// is pinned because the harness migrates as a superuser, so a silently
+/// no-opped `OWNER TO` would pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
+    let signature = "public.epigraph_retire_operator_link(uuid, text, boolean)";
+    let meta: Option<DefinerCatalogRow> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text, \
+                p.proconfig \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = to_regprocedure($1)",
+    )
+    .bind(signature)
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl, config) =
+        meta.unwrap_or_else(|| panic!("{signature} must exist (migration 191)"));
+    assert!(secdef, "{signature} must be SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+    assert_eq!(vol, "v", "{signature} volatility");
+    assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+    assert_eq!(
+        config,
+        Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+        "{signature} resolves in pg_catalog only, pg_temp last"
+    );
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", false),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+    }
+
+    for (role, privilege, expected) in [
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+    ] {
+        let can: bool =
+            sqlx::query_scalar("SELECT has_table_privilege($1, 'public.operator_links', $2)")
+                .bind(role)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("table privilege");
+        assert_eq!(
+            can, expected,
+            "{role} table-wide {privilege} on operator_links"
+        );
+    }
+    for (role, col, expected) in [
+        ("epigraph_maintenance", "retired", true),
+        ("epigraph_maintenance", "operator_id", false),
+        ("epigraph_maintenance", "operator_group_id", false),
+        ("epigraph_maintenance", "agent_id", false),
+        ("epigraph_maintenance", "created_at", false),
+        ("epigraph_app", "retired", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1, 'public.operator_links', $2, 'UPDATE')",
+        )
+        .bind(role)
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .expect("column privilege");
+        assert_eq!(can, expected, "{role} UPDATE of operator_links.{col}");
+    }
+
+    // pg_trigger.tgtype bits: 1 ROW, 2 BEFORE, 4 INSERT, 8 DELETE, 16 UPDATE.
+    for (trigger, bits) in [
+        ("operator_links_audit", 1 | 4 | 16),
+        ("operator_links_retire_only", 1 | 2 | 16),
+    ] {
+        let tgtype: Option<i16> = sqlx::query_scalar(
+            "SELECT tgtype FROM pg_trigger \
+              WHERE tgrelid = 'public.operator_links'::regclass AND tgname = $1",
+        )
+        .bind(trigger)
+        .fetch_optional(&pool)
+        .await
+        .expect("trigger lookup");
+        let tgtype = tgtype.unwrap_or_else(|| panic!("operator_links must carry {trigger}"));
+        assert_eq!(
+            i32::from(tgtype) & (1 | 2 | 4 | 8 | 16 | 32),
+            bits,
+            "{trigger} timing/events"
+        );
+    }
+}

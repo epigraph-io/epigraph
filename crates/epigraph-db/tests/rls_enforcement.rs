@@ -174,21 +174,17 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          on the maintenance role, and deliberately stops short of FOR ALL, \
          which would have covered DELETE too.",
     ),
-    (
-        "operator_links",
-        "UPDATE",
-        "The operator-link record (107) is written once, by \
-         `epigraph_link_operator`'s definer frame, and never edited: a link is \
-         ended by revoking the agent's membership, not by changing this row. \
-         Under FORCE the absent policy default-denies every non-superuser role, \
-         which is the control.",
-    ),
+    // `(operator_links, UPDATE)` was listed here until migration 191 (backlog
+    // 4dec90c2) gave the retire verb a definer-only UPDATE policy; the
+    // retire-only guard keeps every other change refused.
     (
         "operator_links",
         "DELETE",
-        "Same as UPDATE. The row is the record that the link was declared; \
-         re-pointing an agent to a different operator is a deliberate \
-         superuser act, never an application path.",
+        "The row is the record that the link was declared (107), written once \
+         and only ever retired in place (191's retire-only guard). Re-pointing \
+         an agent to a different operator is a deliberate superuser act, never \
+         an application path. Under FORCE the absent policy default-denies \
+         every non-superuser role, which is the control.",
     ),
     (
         "evidence_visibility_pins",
@@ -1568,6 +1564,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              so every other row still needs 077's attribution arms; an `operator.system_agent*` \
              row needs one of the two session arms beside it (`epigraph_bypass()` / \
              `epigraph_definer_bypass()`), i.e. the maintenance session or 148's audit trigger.",
+        ),
+        (
+            "security_events_operator_link_retire_privileged",
+            "operator.link_retired",
+            "191's RESTRICTIVE insert policy: its row-only arm (the event type is neither \
+             `operator.link_retired` nor `operator.link_unretired`) says WHICH rows the \
+             restriction applies to, and grants nothing. A restrictive policy is AND-ed with the \
+             permissive `security_events_append`, so every other row still needs 077's \
+             attribution arms; a retire audit row needs one of the two session arms beside it \
+             (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the maintenance session or \
+             the `operator_links_audit` trigger.",
         ),
         (
             "challenges_claim_readable",
