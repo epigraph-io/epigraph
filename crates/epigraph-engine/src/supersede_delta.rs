@@ -89,9 +89,9 @@ SELECT mf.id, mf.claim_id, e.id, e.source_id, lower(e.relationship),
 /// function the INSERT trigger and `REGENERATE_EDGE_FACTORS_SQL` both use, and
 /// whether a factor already holds that `(type, pair)` slot (in which case the
 /// mint keeps the existing one, as the trigger's `ON CONFLICT DO NOTHING`
-/// does). Ruling R-131's set. The last column is the "likely migrated"
-/// heuristic of the dry-run plan: the edge is older than one of its
-/// endpoints, the fingerprint of an edge a past cascade re-pointed.
+/// does). Ruling R-131's set (SPEC §11 K0 (i)). The last column is a
+/// "likely migrated" heuristic: the edge is older than one of its endpoints,
+/// the fingerprint of an edge a past cascade re-pointed.
 pub const R131_FACTORLESS_EDGES_SQL: &str = r#"-- VISIBILITY-EXEMPT: maintenance read; the dry-run delta runs on the privileged connection.
 SELECT e.id, e.source_id, e.target_id, lower(e.relationship), ft.factor_type::text,
        ft.factor_type || ':' || array_to_string(
@@ -385,12 +385,16 @@ pub struct DeltaBlock {
 /// The K10(3) measurement.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct K10RetroReport {
-    /// Live rows the invalidation would delete (the dry-run plan's A2 `live_rows`).
+    /// Live rows the invalidation would delete (SPEC §11 K0 (ii)).
     pub live_rows: usize,
     pub edges: usize,
     pub edges_not_in_force: usize,
     pub retired_sources: usize,
-    /// Retracted rows on such edges, which an invalidation keeps.
+    /// Retracted rows keyed on ANY edge whose source is a retired claim,
+    /// held by a current claim: rows an invalidation keeps. Wider than the
+    /// cascade audit's field of the same name, which counts only the
+    /// retracted rows on edges the cascade actually invalidated (an edge
+    /// holding only retracted rows is never visited, but is counted here).
     pub retracted_key_kept: i64,
     pub by_relationship: std::collections::BTreeMap<String, usize>,
     pub delta: DeltaBlock,
@@ -399,8 +403,8 @@ pub struct K10RetroReport {
 /// The K12(b) measurement.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct K12bReport {
-    /// Live BBAs keyed on `supersedes` edges held by current claims (the
-    /// dry-run plan's A3 `on_current_targets`), by spelling.
+    /// Live BBAs keyed on `supersedes` edges held by current claims (SPEC
+    /// §11 K0 (iii)); by spelling in `ds_rows_by_spelling`.
     pub ds_rows: usize,
     pub ds_rows_by_spelling: std::collections::BTreeMap<String, usize>,
     /// No deployed code path removes these rows: the delta is what a
@@ -415,7 +419,7 @@ pub struct K12bReport {
 /// The R-131 measurement.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct R131Report {
-    /// Factorless edges (the dry-run plan's A1 `edges`).
+    /// Factorless edges (SPEC §11 K0 (i)).
     pub edges: usize,
     pub by_relationship: std::collections::BTreeMap<String, usize>,
     pub likely_migrated: usize,
