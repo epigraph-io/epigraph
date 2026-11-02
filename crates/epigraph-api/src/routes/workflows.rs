@@ -3022,13 +3022,13 @@ impl ApiWorkflowGrant {
 /// decision A): only the audited admin arm admits it, and a caller with no
 /// token is refused.
 ///
-/// A row `viewer` (the caller's) cannot READ gets `not_found()`, the call
-/// site's answer for a workflow that does not exist, before any arm runs and
-/// before any text names the row or its submitter (backlog c831df4a, ruling
+/// Every REFUSAL to a caller whose `viewer` cannot READ the row is
+/// `not_found()`, the call site's answer for a workflow that does not exist,
+/// never text naming the row or its submitter (backlog c831df4a, ruling
 /// R-100). `conn` is often the ingest system agent's stamp, which reads groups
-/// the caller does not, so the caller's own view decides. That closes the
-/// admin arm over a row the caller cannot read, as `deprecate_workflow`'s
-/// gate already does.
+/// the caller does not, so the caller's own view decides what it is told. It
+/// does not decide who is admitted: the ruling masks answers and changes no
+/// authority, so the arms run exactly as before.
 #[cfg(feature = "db")]
 async fn workflow_authority(
     conn: &mut sqlx::PgConnection,
@@ -3038,14 +3038,20 @@ async fn workflow_authority(
     workflow_id: Uuid,
     not_found: &(dyn Fn() -> ApiError + Send + Sync),
 ) -> Result<ApiWorkflowGrant, ApiError> {
-    let Some((visibility, _)) =
-        epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut *conn, viewer, workflow_id)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("could not read the workflow as the caller: {e}"),
-            })?
-    else {
-        return Err(not_found());
+    // The caller's view words refusals only (backlog c831df4a); admission is
+    // unchanged.
+    let view = epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut *conn, viewer, workflow_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not read the workflow as the caller: {e}"),
+        })?;
+    let readable = view.is_some();
+    let refuse = |reason: String| {
+        if readable {
+            ApiError::Forbidden { reason }
+        } else {
+            not_found()
+        }
     };
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
@@ -3060,7 +3066,8 @@ async fn workflow_authority(
     // A GROUP row with no record (a plan migration 183 backfilled into its
     // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
-        let subject = if visibility == "group" {
+        let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
+        let subject = if group_row {
             format!(
                 "workflow {workflow_id} has no recorded submitter (a group workflow written \
                  before batch H-b)"
@@ -3071,18 +3078,16 @@ async fn workflow_authority(
                  written before batch H-b)"
             )
         };
-        if api_admin_arm(conn, auth, caller, &subject).await? {
+        if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
             return Ok(ApiWorkflowGrant {
                 owner: None,
                 arm: ApiWorkflowArm::Admin,
             });
         }
-        return Err(ApiError::Forbidden {
-            reason: format!(
-                "{subject}; it is mutable only through the audited claims:admin path, and the \
-                 caller holds no claims:admin. Nothing was written."
-            ),
-        });
+        return Err(refuse(format!(
+            "{subject}; it is mutable only through the audited claims:admin path, and the caller \
+             holds no claims:admin. Nothing was written."
+        )));
     };
     let allowed = |arm| ApiWorkflowGrant {
         owner: Some(owner),
@@ -3103,16 +3108,13 @@ async fn workflow_authority(
         }
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    if api_admin_arm(conn, auth, caller, &subject).await? {
+    if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
         return Ok(allowed(ApiWorkflowArm::Admin));
     }
-    Err(ApiError::Forbidden {
-        reason: format!(
-            "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-             submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
-             written."
-        ),
-    })
+    Err(refuse(format!(
+        "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
+         submitter, its submitter's operator, nor a live claims:admin holder. Nothing was written."
+    )))
 }
 
 /// The PROVENANCE of a write admitted through the submitter or operator arm
@@ -3163,13 +3165,15 @@ async fn record_api_caller_workflow_write(
 /// record (migration 111's predicate), never the scope alone. `Ok(true)`:
 /// admitted. `Ok(false)`: no token, no principal, or no `claims:admin` scope.
 /// A `claims:admin` token whose client record grants none is refused ADM02,
-/// with `subject` naming the workflow.
+/// through `refuse`, with `subject` naming the workflow (masked by `refuse`
+/// for a caller that cannot read the row).
 #[cfg(feature = "db")]
 async fn api_admin_arm(
     conn: &mut sqlx::PgConnection,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     caller: Option<Uuid>,
     subject: &str,
+    refuse: &(dyn Fn(String) -> ApiError + Send + Sync),
 ) -> Result<bool, ApiError> {
     let (Some(a), Some(caller)) = (auth, caller) else {
         return Ok(false);
@@ -3190,13 +3194,11 @@ async fn api_admin_arm(
     if live {
         return Ok(true);
     }
-    Err(ApiError::Forbidden {
-        reason: format!(
-            "{subject}; the token carries claims:admin, but its client record grants no live \
-             claims:admin to this principal, so the audited admin path refused it (ADM02). \
-             Nothing was written."
-        ),
-    })
+    Err(refuse(format!(
+        "{subject}; the token carries claims:admin, but its client record grants no live \
+         claims:admin to this principal, so the audited admin path refused it (ADM02). Nothing \
+         was written."
+    )))
 }
 
 /// Record a cross-owner workflow write admitted through the audited admin arm

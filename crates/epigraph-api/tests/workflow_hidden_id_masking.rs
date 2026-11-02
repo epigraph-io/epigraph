@@ -646,3 +646,261 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
     .expect("the member's MCP store_workflow");
     assert_eq!(out["workflow_id"], json!(w.workflow.to_string()), "{out}");
 }
+
+/// A REST token for `agent` minted on OAuth client `client`, so a test can
+/// give that client a record (or none) for migration 111's admin re-check.
+fn token_for_client(client: Uuid, agent: Uuid, scopes: &[&str]) -> String {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    cfg.issue_access_token(
+        client,
+        scopes.iter().map(|s| (*s).to_string()).collect(),
+        "service",
+        None,
+        Some(agent),
+        chrono::Duration::minutes(60),
+        epigraph_auth::AccessTokenBinding::NONE,
+    )
+    .expect("test JWT")
+    .0
+}
+
+const ADMIN_SCOPES: &[&str] = &["claims:read", "claims:write", "edges:write", "claims:admin"];
+
+/// The MCP twin of [`token_for_client`].
+fn admin_auth(client: Uuid, agent: Uuid) -> epigraph_auth::AuthContext {
+    epigraph_auth::AuthContext {
+        client_id: client,
+        scopes: ADMIN_SCOPES.iter().map(|s| (*s).to_string()).collect(),
+        ..auth_for(agent)
+    }
+}
+
+/// An ACTIVE client record granting `claims:admin` to `agent`, which the
+/// audited admin arm re-checks (ADM02).
+async fn grant_admin(pool: &PgPool, client: Uuid, agent: Uuid) {
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, $2, 'test admin', 'human', ARRAY['claims:admin'], ARRAY['claims:admin'], \
+                 'active', $3)",
+    )
+    .bind(client)
+    .bind(format!("test-admin-{client}"))
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("the admin's client record");
+}
+
+async fn mcp_delete_step(
+    w: &World,
+    auth: &epigraph_auth::AuthContext,
+    name: &str,
+    lineage: Uuid,
+) -> ToolAnswer {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(auth))
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::tools::step_ops::DeleteStepParams = serde_json::from_value(
+        json!({"canonical_name": name, "step_lineage_id": lineage.to_string()}),
+    )
+    .expect("params");
+    tool_answer(
+        epigraph_mcp::tools::step_ops::delete_step(&w.server, &viewer, params, Some(auth)).await,
+    )
+}
+
+/// Every `truth_value` of the lineage's claims, to show a refusal changed none.
+async fn lineage_truths(pool: &PgPool, lineage: Uuid) -> Vec<f64> {
+    sqlx::query_scalar("SELECT truth_value FROM claims WHERE step_lineage_id = $1 ORDER BY id")
+        .bind(lineage)
+        .fetch_all(pool)
+        .await
+        .expect("lineage truths")
+}
+
+/// `(agent_id, details)` of every `workflows.admin_write` row for `delete_step`.
+async fn delete_admin_rows(pool: &PgPool) -> Vec<(Option<Uuid>, Value)> {
+    sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'workflows.admin_write' AND details->>'action' = 'delete_step' \
+          ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("admin rows")
+}
+
+/// `delete_step` over a hidden group workflow, REST and MCP.
+///
+/// * A non-member, and a `claims:admin` token whose client record grants
+///   nothing (ADM02), are refused exactly as for an unknown name, naming
+///   nothing hidden, with the step untouched.
+/// * The masking changes ANSWERS only (ruling R-100), never who is admitted: a
+///   live `claims:admin` holder outside the group, who cannot read the row
+///   either (the grantless call above proves its view: it got the unknown-name
+///   answer, not ADM02), is still admitted through the audited admin arm and
+///   recorded as `workflows.admin_write`, exactly as before the masking.
+/// * The member (the submitter) is admitted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_step_over_a_hidden_workflow_is_masked_for_refusals_and_admits_as_before(
+    pool: PgPool,
+) {
+    let w = world(&pool).await;
+    let unknown = format!("{}-unknown", w.name);
+    let first: Uuid = sqlx::query_scalar(
+        "SELECT c.step_lineage_id FROM claims c JOIN edges e ON e.target_id = c.id \
+           JOIN workflows wf ON wf.id = e.source_id \
+          WHERE wf.id = $1 AND e.relationship = 'executes' AND c.step_lineage_id IS NOT NULL \
+          LIMIT 1",
+    )
+    .bind(w.workflow)
+    .fetch_one(&pool)
+    .await
+    .expect("a step lineage of the hidden plan");
+    let truths = lineage_truths(&pool, first).await;
+    let delete =
+        |name: &str, lineage: Uuid| json!({"canonical_name": name, "step_lineage_id": lineage});
+
+    // Refused callers: the outsider, and an admin token with no live grant.
+    let (admin, _) = fixture::seed_agent_with_group(&pool, "mask-admin").await;
+    let grantless_client = Uuid::new_v4();
+    let refused = [
+        ("outsider", token(w.outsider), auth_for(w.outsider)),
+        (
+            "grantless admin",
+            token_for_client(grantless_client, admin, ADMIN_SCOPES),
+            admin_auth(grantless_client, admin),
+        ),
+    ];
+    for (who, rest_token, mcp_auth) in &refused {
+        let (s_hidden, b_hidden) = w
+            .api
+            .post(
+                "/api/v1/workflows/steps/delete",
+                rest_token,
+                &delete(&w.name, first),
+            )
+            .await;
+        let (s_unknown, b_unknown) = w
+            .api
+            .post(
+                "/api/v1/workflows/steps/delete",
+                rest_token,
+                &delete(&unknown, first),
+            )
+            .await;
+        assert_names_nothing_hidden(
+            &w,
+            &format!("REST delete_step ({who})"),
+            &b_hidden.to_string(),
+        );
+        assert_eq!(s_unknown, StatusCode::NOT_FOUND, "{who}: {b_unknown}");
+        assert_eq!(
+            (s_hidden, b_hidden.to_string().replace(&w.name, "<name>")),
+            (s_unknown, b_unknown.to_string().replace(&unknown, "<name>")),
+            "REST delete_step ({who}) on a hidden workflow answers exactly as on an unknown name"
+        );
+
+        let m_hidden = mcp_delete_step(&w, mcp_auth, &w.name, first).await;
+        let m_unknown = mcp_delete_step(&w, mcp_auth, &unknown, first).await;
+        assert_names_nothing_hidden(&w, &format!("MCP delete_step ({who})"), &text_of(&m_hidden));
+        assert!(
+            m_unknown.is_err(),
+            "{who}: an unknown name is refused: {m_unknown:?}"
+        );
+        assert_eq!(
+            text_of(&m_hidden).replace(&w.name, "<name>"),
+            text_of(&m_unknown).replace(&unknown, "<name>"),
+            "MCP delete_step ({who}) on a hidden workflow answers exactly as on an unknown name"
+        );
+        assert_eq!(
+            lineage_truths(&pool, first).await,
+            truths,
+            "{who}: the step is untouched"
+        );
+    }
+    assert!(
+        delete_admin_rows(&pool).await.is_empty(),
+        "no refused call is audited as an admin write"
+    );
+
+    // Three more lineages, added by the member (the submitter).
+    let mut added = Vec::new();
+    for i in 0..3 {
+        let (s, out) = w
+            .api
+            .post(
+                "/api/v1/workflows/steps",
+                &token(w.member),
+                &json!({"canonical_name": w.name, "step_text": format!("a member step {i}")}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "the member adds step {i}: {out}");
+        added.push(
+            Uuid::parse_str(out["step_lineage_id"].as_str().expect("lineage")).expect("uuid"),
+        );
+    }
+
+    // A live claims:admin holder outside the group: admitted and audited, on
+    // REST and on MCP, exactly as the admin arm admitted it before.
+    let client = Uuid::new_v4();
+    grant_admin(&pool, client, admin).await;
+    let (s, out) = w
+        .api
+        .post(
+            "/api/v1/workflows/steps/delete",
+            &token_for_client(client, admin, ADMIN_SCOPES),
+            &delete(&w.name, first),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the audited admin arm admits REST delete_step: {out}"
+    );
+    mcp_delete_step(&w, &admin_auth(client, admin), &w.name, added[0])
+        .await
+        .expect("the audited admin arm admits MCP delete_step");
+    for lineage in [first, added[0]] {
+        assert!(
+            lineage_truths(&pool, lineage)
+                .await
+                .iter()
+                .any(|t| (t - 0.05).abs() < 1e-9),
+            "the admin's delete drove the head to 0.05"
+        );
+    }
+    let rows = delete_admin_rows(&pool).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one admin_write row per admitted delete: {rows:?}"
+    );
+    for (agent, d) in &rows {
+        assert_eq!(*agent, Some(admin), "the audit row names the admin: {d}");
+        assert_eq!(d["workflow_id"], json!(w.workflow.to_string()), "{d}");
+    }
+
+    // The member (the submitter): admitted on both transports, not audited
+    // as an admin.
+    let (s, out) = w
+        .api
+        .post(
+            "/api/v1/workflows/steps/delete",
+            &token(w.member),
+            &delete(&w.name, added[1]),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "the member deletes over REST: {out}");
+    mcp_delete_step(&w, &auth_for(w.member), &w.name, added[2])
+        .await
+        .expect("the member deletes over MCP");
+    assert_eq!(
+        delete_admin_rows(&pool).await.len(),
+        2,
+        "the member is no admin write"
+    );
+}
