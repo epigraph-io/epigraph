@@ -24,6 +24,8 @@
 //! least one listed frame (nothing is written then, even under `--apply`).
 //! `group-member remove` exits 1 when the agent is not a live member
 //! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
+//! `retire-link` exits 1 when the agent has no operator link (NO-LINK: nothing
+//! to retire, usually a mistyped id); a link already retired exits 0.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -44,6 +46,7 @@
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
+//!     epigraph-operator retire-link --agent <uuid> --reason TEXT [--revoke-membership] [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
@@ -95,7 +98,7 @@ use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
     dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey, reown,
-    reown_linked, restrict, reverse, system_agent, team_group,
+    reown_linked, restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -470,6 +473,27 @@ enum Command {
         /// Recorded on the row and in the audit row.
         #[arg(long)]
         reason: String,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Retire ONE existing LIVE operator link (migration 191): the agent stops
+    /// acting for its operator, which keeps ownership of its claims. Audited
+    /// (`operator.link_retired`) and idempotent (an already-retired link is
+    /// reported and nothing is written). Refused while the agent still holds a
+    /// live writer/admin row in the operator's group, unless
+    /// `--revoke-membership`. Exits 1 when the agent has no link.
+    RetireLink {
+        /// The linked agent's id.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Revoke the agent's live writer/admin rows in the operator's group
+        /// in the same act (a retired identity may hold no write authority).
+        #[arg(long)]
+        revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
         #[arg(long)]
         apply: bool,
@@ -1655,6 +1679,20 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");
             }
             Ok(0)
+        }
+        Command::RetireLink {
+            agent,
+            reason,
+            revoke_membership,
+            apply,
+        } => {
+            let outcome =
+                retire_link::run(&mut conn, agent, &reason, revoke_membership, apply).await?;
+            println!("{}", retire_link::describe(agent, &outcome, apply));
+            if !apply && outcome.exit_code() == 0 {
+                println!("DRY RUN: the retire and its audit row were rolled back.");
+            }
+            Ok(outcome.exit_code())
         }
         Command::AllowAuthorBindingClient {
             client,

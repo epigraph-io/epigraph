@@ -750,6 +750,72 @@ async fn an_elevated_group_admin_marks_no_rekey_obligation(pool: PgPool) {
     assert!(row(pool.clone()).await["reseal_required_at"].is_string());
 }
 
+/// Migration 191's retire of a live operator link is maintenance-only, so an
+/// ELEVATED session (always an application-role session: 125 answers "not
+/// live" to a maintenance or superuser login) cannot reach it: the call is
+/// refused 42501 and the link stays live with its writer row. The same call on
+/// a maintenance session retires it (the calibration: the refusal is the
+/// session, not a malformed call).
+///
+/// Verified to fail with `GRANT EXECUTE ON FUNCTION
+/// epigraph_retire_operator_link(uuid, text, boolean) TO epigraph_app` added to
+/// 191 and its OLR02 elevated refusal removed (the elevated call retires).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_session_retires_no_operator_link(pool: PgPool) {
+    let p = holder(&pool, "arms-retire-p", 16).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "arms-retire-agent").await;
+    let mut raw = pool.acquire().await.expect("acquire");
+    let link = epigraph_db::AgentRepository::link_operator(&mut raw, agent, p.person)
+        .await
+        .expect("a live link to P");
+    drop(raw);
+    let state = |pool: PgPool| async move {
+        sqlx::query_as::<_, (bool, i64)>(
+            "SELECT (SELECT retired FROM operator_links WHERE agent_id = $1), \
+                    (SELECT count(*) FROM group_memberships \
+                      WHERE agent_id = $1 AND group_id = $2 AND revoked_at IS NULL)",
+        )
+        .bind(agent)
+        .bind(link.operator_group_id)
+        .fetch_one(&pool)
+        .await
+        .expect("link state")
+    };
+    assert_eq!(
+        state(pool.clone()).await,
+        (false, 1),
+        "PREMISE: live, with its row"
+    );
+    const RETIRE: &str =
+        "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'elevated', true)";
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, _) = viewers(&pool, &p, live).await;
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused = sqlx::query_scalar::<_, String>(RETIRE)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session retires no link");
+    let db = e.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("42501"), "{db}");
+    assert_eq!(state(pool.clone()).await, (false, 1), "nothing was written");
+
+    let outcome = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let o = sqlx::query_scalar::<_, String>(RETIRE)
+            .bind(agent)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("CALIBRATION: a maintenance session retires it");
+        (conn, o)
+    })
+    .await;
+    assert_eq!(outcome, "retired");
+    assert_eq!(state(pool.clone()).await, (true, 0));
+}
+
 // =====================================================================
 // The standing admin read arms follow the admin-scope switch (migration 129)
 // =====================================================================

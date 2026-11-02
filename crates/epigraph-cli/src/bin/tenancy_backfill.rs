@@ -2071,6 +2071,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // member removal is refused whole, the pre-181 behaviour); its GRA02 arm
     // refuses a filtered UPDATE rather than dropping the mark silently.
     ("epigraph_mark_group_reseal_required", 181),
+    // 191 (backlog 4dec90c2), the audited retire of a live operator link. It
+    // runs only for a maintenance session, whose `epigraph_bypass()` admits
+    // its read of the FORCEd `operator_links`; its UPDATE is admitted only by
+    // `operator_links_definer_retire` (`epigraph_definer_bypass()`, the
+    // owner) and needs the owner's column grant, so under a non-member owner
+    // every retire is refused (42501, loud) and nothing is written: fail
+    // CLOSED.
+    ("epigraph_retire_operator_link", 191),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2829,6 +2837,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_mark_group_reseal_required",
             "public.epigraph_mark_group_reseal_required(uuid)",
             true,
+        ),
+        // 191: retiring a live link is a maintenance act; an app grant would
+        // let the request DSN end an agent's authority (and revoke its
+        // membership) for any agent.
+        (
+            "epigraph_retire_operator_link",
+            "public.epigraph_retire_operator_link(uuid, text, boolean)",
+            false,
         ),
     ];
 
