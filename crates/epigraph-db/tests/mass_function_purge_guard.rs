@@ -996,6 +996,19 @@ async fn j_the_precondition_accepts_only_117s_body_on_the_two_paths(pool: PgPool
     assert_precondition_refusal(migrate_rest(&pool).await, "a third proconfig");
     assert!(!applied_194(&pool).await);
 
+    // 117's body with NO search_path at all (a re-body that dropped the SET
+    // clause): proconfig is NULL, which is neither accepted value.
+    pool.execute(format!("ALTER FUNCTION {CASCADE_DEFINER} RESET search_path").as_str())
+        .await
+        .unwrap();
+    assert_eq!(
+        cascade_definer_facts(&pool).await,
+        (MD5_117.to_string(), Vec::<String>::new()),
+        "fixture: 117's body with no proconfig"
+    );
+    assert_precondition_refusal(migrate_rest(&pool).await, "a NULL proconfig");
+    assert!(!applied_194(&pool).await);
+
     // 117's body on 190's path: applies.
     pool.execute(
         format!("ALTER FUNCTION {CASCADE_DEFINER} SET search_path = pg_catalog, public, pg_temp")
@@ -1017,6 +1030,27 @@ async fn j_the_precondition_accepts_only_117s_body_on_the_two_paths(pool: PgPool
     assert_eq!(
         config,
         vec!["search_path=pg_catalog, public, pg_temp".to_string()]
+    );
+}
+
+/// (j2) 194 refuses (55000, nothing created) when the definer it re-bodies
+/// does not exist at all: an absent function has no md5 to match.
+#[sqlx::test(migrations = false)]
+async fn j2_the_precondition_refuses_an_absent_definer(pool: PgPool) {
+    migrate_below_194(&pool).await;
+    pool.execute(format!("DROP FUNCTION {CASCADE_DEFINER}").as_str())
+        .await
+        .expect("drop the cascade definer");
+    assert_precondition_refusal(migrate_rest(&pool).await, "an absent definer");
+    assert!(!applied_194(&pool).await, "nothing was applied");
+    let created: Option<String> = sqlx::query_scalar("SELECT to_regprocedure($1)::text")
+        .bind(CASCADE_DEFINER)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        created.is_none(),
+        "the refused migration did not create the definer"
     );
 }
 
