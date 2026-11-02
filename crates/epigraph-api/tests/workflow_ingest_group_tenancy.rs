@@ -3516,3 +3516,160 @@ async fn characterization_rest_deprecation_serves_no_hierarchical_row(pool: PgPo
     }
     assert_eq!(workflow_truth(&pool, w2).await, t2, "W2 is unchanged");
 }
+
+/// R-98 Q6(a) review (backlog 630af617 (2)): a NEW generation inherits its
+/// lineage's group, and lands in it on the system agent's stamp, so the
+/// CALLER must write that group. A caller with authority over the lineage
+/// (its submitter) that is only a READER of the group is refused with the
+/// coded `InheritedGroupNotWritable` text, nothing written: over REST (an
+/// undeclared next generation, and a variant inheriting through its linked
+/// parent) and over MCP on the authenticated transport
+/// (`improve_workflow_hierarchy`). On stdio the authority gate refuses the
+/// same reader before the executor runs (its group-write check).
+/// CALIBRATIONS: an explicit declaration into another group the caller writes
+/// still wins; as a writer again the variant is admitted and lands in the
+/// inherited group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_that_does_not_write_the_inherited_group_cannot_add_a_generation(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-inherit-refused";
+    w.api
+        .ingest_ok(
+            &h,
+            &declared(extraction(name, 0, &[&["acme inherit op"]]), w.g, None),
+        )
+        .await;
+    let coded = |text: &str| {
+        text.contains(&format!("inherits group {}", w.g))
+            && text.contains("holds no live writer or admin membership")
+    };
+    set_role(&pool, w.g, w.h, "reader").await;
+    let before = row_counts(&pool).await;
+
+    // REST: the undeclared next generation.
+    let mut gen1 = extraction(name, 1, &[&["acme inherit op"], &["acme inherit new op"]]);
+    gen1["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &gen1).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST next generation: {b}");
+    assert!(coded(&b.to_string()), "REST: the coded refusal: {b}");
+
+    // REST: a variant (another canonical name) linked to the group parent.
+    // Generation 1, so it links `(name, 0)` (`resolve_ingest_parent` looks
+    // one generation down; a generation-0 variant links nothing).
+    let variant = "acme-inherit-variant";
+    let mut child = extraction(variant, 1, &[&["acme inherit variant op"]]);
+    child["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &child).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST linked variant: {b}");
+    assert!(
+        coded(&b.to_string()),
+        "REST variant: the coded refusal: {b}"
+    );
+
+    // MCP over HTTP: improve_workflow_hierarchy with the submitter's token.
+    let h_viewer = epigraph_db::Viewer::resolve(&pool, w.h)
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::ImproveWorkflowHierarchyParams =
+        serde_json::from_value(json!({
+            "parent_canonical_name": name,
+            "extraction": extraction(name, 0, &[&["acme inherit op"], &["acme inherit http op"]]),
+        }))
+        .expect("the tool's parameters");
+    let err = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy(
+        &w.c_server,
+        &h_viewer,
+        params,
+        Some(&http_auth(w.h)),
+    )
+    .await
+    .expect_err("MCP over HTTP: a reader cannot add a generation");
+    assert!(
+        coded(&err.message),
+        "MCP-HTTP: the coded refusal: {}",
+        err.message
+    );
+    assert_eq!(row_counts(&pool).await, before, "nothing was written");
+    assert_eq!(workflows_named(&pool, name).await, 1);
+    assert_eq!(workflows_named(&pool, variant).await, 0);
+
+    // stdio: the curator's own lineage, the curator a reader. (Its operator
+    // `h` must write the group for the curator's declared ingest: OPL02.)
+    set_role(&pool, w.g, w.h, "admin").await;
+    let stdio_name = "acme-inherit-refused-stdio";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction(stdio_name, 0, &[&["acme inherit stdio op"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator declares generation 0 into the team group");
+    set_role(&pool, w.g, w.c, "reader").await;
+    let before = row_counts(&pool).await;
+    let c_viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let params: epigraph_mcp::types::ImproveWorkflowHierarchyParams =
+        serde_json::from_value(json!({
+            "parent_canonical_name": stdio_name,
+            "extraction": extraction(
+                stdio_name, 0, &[&["acme inherit stdio op"], &["acme inherit stdio new op"]]),
+        }))
+        .expect("the tool's parameters");
+    let err = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy(
+        &w.c_server,
+        &c_viewer,
+        params,
+        None,
+    )
+    .await
+    .expect_err("stdio: a reader cannot add a generation");
+    assert!(
+        err.message.contains("does not write"),
+        "stdio: the gate's group-write refusal: {}",
+        err.message
+    );
+    assert_eq!(row_counts(&pool).await, before, "stdio wrote nothing");
+    assert_eq!(workflows_named(&pool, stdio_name).await, 1);
+
+    // CALIBRATION: a writer, the variant is admitted and inherits.
+    let b = w.api.ingest_ok(&h, &child).await;
+    let row: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(uuid_of(&b["workflow_id"]))
+            .fetch_one(&pool)
+            .await
+            .expect("the variant's row");
+    assert_eq!(
+        row,
+        ("group".to_string(), w.g),
+        "a variant inherits its linked parent's group"
+    );
+
+    // CALIBRATION: an explicit declaration into the caller's own operator
+    // group still wins over the inherited one, for a reader of the inherited
+    // group too.
+    // Fresh texts (no claim of the group's generation 0 is reused: linking
+    // one would be refused on its own, as private to a group h does not
+    // write).
+    set_role(&pool, w.g, w.h, "reader").await;
+    let mut own = extraction("acme-inherit-own-texts", 1, &[&["acme inherit own op"]]);
+    own["source"]["canonical_name"] = json!(name);
+    own["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &declared(own, w.og, None)).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the declared generation is admitted: {b}"
+    );
+    let row: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(uuid_of(&b["workflow_id"]))
+            .fetch_one(&pool)
+            .await
+            .expect("the declared generation's row");
+    assert_eq!(row, ("group".to_string(), w.og), "the declaration wins");
+}
