@@ -180,8 +180,8 @@ pub async fn auto_wire_ds_for_edge(
     //      Lets operators tune locality discounting per epistemic context
     //      (binary_truth vs textbook_veracity_* vs research_validity etc.)
     //      without code releases. Set via FrameRepository::set_property.
-    //   2. The served belief profile (calibration.toml, then the built-in
-    //      default when calibration.toml is unreadable).
+    //   2. The served belief profile (`CALIBRATION_PATH`, else the
+    //      compiled-in workspace calibration.toml).
     //
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
