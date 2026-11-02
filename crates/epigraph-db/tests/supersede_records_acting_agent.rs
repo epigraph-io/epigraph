@@ -213,11 +213,17 @@ async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrot
     assert_eq!(author, a, "v2 still inherits the chain's author");
 }
 
-/// The edge migration leaves an `AUTHORED` edge on the retired claim only when
-/// it carries the act's reserved marker (`supersede_act`), which no caller can
-/// write. An edge that merely spells a supersession `tool` (a property any
-/// edge writer could set) is an ordinary authorship edge of the retired claim
-/// and moves onto the successor like every other.
+/// The act's reserved marker (`supersede_act`), which no caller can write, is
+/// what tells an act edge apart; a property that merely spells a supersession
+/// `tool` (any edge writer could set one) pins nothing. Shown on a
+/// CLAIM-sourced `AUTHORED` edge spelling the tool: it is an ordinary edge of
+/// the retired claim and moves onto the successor like every other.
+///
+/// Partly inverted by ruling R-133 (supersede SPEC §11 K1, SF-23): this test
+/// used to make the point with an AGENT-sourced `AUTHORED` edge and assert it
+/// moved. Under R-133 an agent's authorship stays on the retired claim
+/// whatever its properties, so that edge now stays, and the tool-spelling
+/// point is made on a non-agent edge instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_retired_claim(
     pool: PgPool,
@@ -226,7 +232,19 @@ async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_reti
     let x = seed_agent(&pool, "tool-speller-x").await;
     let b = seed_agent(&pool, "actor-b").await;
     let old = seed_claim(&pool, a).await;
+    let speller_claim = seed_claim(&pool, x).await;
     let spelled: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'AUTHORED', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true}') RETURNING id",
+    )
+    .bind(speller_claim)
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .expect("a claim-sourced AUTHORED edge spelling the act's tool");
+    let agent_spelled: Uuid = sqlx::query_scalar(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                             properties) \
          VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', \
@@ -236,27 +254,39 @@ async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_reti
     .bind(old)
     .fetch_one(&pool)
     .await
-    .expect("an AUTHORED edge spelling the act's tool");
+    .expect("an agent AUTHORED edge spelling the act's tool");
 
     let new = supersede_through_the_cascade(&pool, old, b).await;
 
-    let target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
-        .bind(spelled)
-        .fetch_one(&pool)
-        .await
-        .expect("the spelled edge");
+    let target_of = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT target_id FROM edges WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("the spelled edge")
+        }
+    };
     assert_eq!(
-        target, new,
+        target_of(spelled).await,
+        new,
         "an edge without the act's marker moves onto the successor"
     );
-    let on_old: Vec<Uuid> = authored_into(&pool, old)
+    assert_eq!(
+        target_of(agent_spelled).await,
+        old,
+        "an agent's AUTHORED stays on the retired claim, whatever it spells (R-133)"
+    );
+    let on_old: Vec<(Uuid, String)> = authored_into(&pool, old)
         .await
         .into_iter()
-        .map(|(source, _, _)| source)
+        .map(|(source, kind, _)| (source, kind))
         .collect();
-    assert!(
-        on_old.is_empty(),
-        "nothing is pinned to the retired claim: {on_old:?}"
+    assert_eq!(
+        on_old,
+        vec![(x, "agent".to_string())],
+        "only the agent's own authorship is left on the retired claim"
     );
 }
 

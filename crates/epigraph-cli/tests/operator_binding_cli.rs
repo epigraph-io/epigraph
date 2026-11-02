@@ -373,22 +373,55 @@ async fn claim_with_authored_edge(
 
 /// `actor` supersedes `old` (the act AND the edge migration, on this
 /// privileged pool), as the request paths and their cascade do. Returns the
-/// successor, after checking that the retired claim's own `AUTHORED` edge now
-/// sits on it too: the shape the census must see through.
+/// successor in the shape the census must see through: the retired claim's
+/// own `AUTHORED` edge sitting on the successor beside the actor's act edge.
+///
+/// Since ruling R-133 (supersede SPEC §11 K1, SF-23) the cascade no longer
+/// makes that shape: an agent's `AUTHORED` stays on the retired claim, which
+/// the first calibration checks. Earlier cascades did move it, and K1 is
+/// forward-only (no history repair), so successors carrying their inherited
+/// author's moved edge remain in existing data. The helper therefore re-creates
+/// it exactly as the old cascade's re-point did (`UPDATE ... SET target_id`,
+/// the edge's own `created_at` kept), and the second calibration checks it.
+/// Partly inverted by R-133: this helper used to assert that the cascade moved
+/// the edge itself.
 async fn supersede_as(pool: &PgPool, old: Uuid, author: Uuid, actor: Uuid) -> Uuid {
     let new = supersede_raw(pool, old, actor).await;
-    let mut sources: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT source_id FROM edges WHERE relationship = 'AUTHORED' AND target_id = $1",
+    let authored_into = |claim: Uuid| async move {
+        let mut sources: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT source_id FROM edges WHERE relationship = 'AUTHORED' AND target_id = $1",
+        )
+        .bind(claim)
+        .fetch_all(pool)
+        .await
+        .expect("AUTHORED edges");
+        sources.sort();
+        sources
+    };
+    assert_eq!(
+        (authored_into(old).await, authored_into(new).await),
+        (vec![author], vec![actor]),
+        "calibration (R-133): the author's edge stays on the retired claim, the successor \
+         carries only the actor's act edge"
+    );
+    let moved = sqlx::query(
+        "UPDATE edges SET target_id = $2 \
+          WHERE target_id = $1 AND source_id = $3 AND source_type = 'agent' \
+            AND relationship = 'AUTHORED'",
     )
+    .bind(old)
     .bind(new)
-    .fetch_all(pool)
+    .bind(author)
+    .execute(pool)
     .await
-    .expect("AUTHORED edges");
-    sources.sort();
+    .expect("re-create the pre-R-133 shape")
+    .rows_affected();
+    assert_eq!(moved, 1, "exactly the author's own edge");
     let mut want = vec![author, actor];
     want.sort();
     assert_eq!(
-        sources, want,
+        authored_into(new).await,
+        want,
         "calibration: the successor carries the actor's edge AND the author's migrated one"
     );
     new
