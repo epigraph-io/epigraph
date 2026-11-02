@@ -5,7 +5,12 @@
 //!
 //! - `edge.added`      — POST /edges handler
 //! - `edge.deleted`    — DELETE /edges/:id handler
-//! - `claim.superseded`— POST /edges with relationship=supersedes/SUPERSEDES
+//! - `claim.superseded`— POST /claims/:id/supersede (the supersession act),
+//!   after its commit. It used to come from POST /edges with
+//!   relationship=supersedes/SUPERSEDES; ruling R-132 ("supersedes = revision
+//!   only", supersede SPEC K12a/K12d) made that edge the act's alone, so the
+//!   generic route refuses it and the act emits the event
+//!   (`tests/supersede_emits_claim_superseded_http.rs` drives the route).
 //!
 //! `frame.changed` is deferred (no hypothesis-set mutation endpoint exists).
 //!
@@ -158,15 +163,18 @@ async fn test_claim_superseded_payload_schema() {
     );
 }
 
-/// Verify that `eq_ignore_ascii_case("supersedes")` matches both cases —
-/// the guard used in the POST /edges handler to decide whether to emit
-/// `claim.superseded`.
+/// The POST /edges guard that decided whether to emit `claim.superseded`
+/// (`eq_ignore_ascii_case("supersedes")`) is gone with that emission (ruling
+/// R-132, supersede SPEC K12a/K12d). The same case folding now decides the
+/// REFUSAL: `is_lineage_relationship` recognises every spelling, so no
+/// spelling of the lineage edge reaches the generic route's write.
 #[test]
 fn test_supersedes_case_insensitive_match() {
-    assert!("supersedes".eq_ignore_ascii_case("supersedes"));
-    assert!("SUPERSEDES".eq_ignore_ascii_case("supersedes"));
+    use epigraph_api::routes::edges::is_lineage_relationship;
+    assert!(is_lineage_relationship("supersedes"));
+    assert!(is_lineage_relationship("SUPERSEDES"));
     // Other relationships should NOT match
-    assert!(!"supports".eq_ignore_ascii_case("supersedes"));
+    assert!(!is_lineage_relationship("supports"));
 }
 
 // ── handler emission guards ───────────────────────────────────────────────────

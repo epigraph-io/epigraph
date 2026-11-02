@@ -181,6 +181,7 @@ pub async fn ingest_document(
     // the caller was told `queued` and after `ensure_paper_node` wrote the
     // `papers` row. The core re-derives (and re-checks) the same set.
     ingest_claim_labels(&extraction, &doi)?;
+    refuse_lineage_relationships(&extraction)?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -314,6 +315,7 @@ pub async fn ingest_document_inline(
     let title = extraction.source.title.clone();
     // Before any write, for the reason given in `ingest_document` above.
     ingest_claim_labels(&extraction, &doi)?;
+    refuse_lineage_relationships(&extraction)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -388,6 +390,14 @@ async fn ingest_in_request(
             )),
             data: e.data,
         })
+}
+
+/// Refuse a document whose `relationships` name `supersedes` in any spelling
+/// (supersede SPEC K12a): the lineage edge is the supersession act's alone.
+/// A caller payload error, before any write, on every document entry point.
+fn refuse_lineage_relationships(extraction: &DocumentExtraction) -> Result<(), McpError> {
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(invalid_params)
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -965,6 +975,7 @@ pub async fn do_ingest_document(
     // belief about TRUE for a claim the caller placed on a labeled hypothesis.
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+    refuse_lineage_relationships(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1998,6 +2009,7 @@ pub async fn do_ingest_document_spine(
     // belief about TRUE for a claim the caller placed on a labeled hypothesis.
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+    refuse_lineage_relationships(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;

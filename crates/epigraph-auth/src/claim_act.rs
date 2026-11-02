@@ -127,6 +127,25 @@ pub fn not_claim_writer_message(claim_id: Uuid, action: &str) -> String {
     )
 }
 
+/// The code migration 120's cascade-deferral definer
+/// (`epigraph_record_cascade_deferral`) opens its message with when the
+/// deferral does not name a committed act of the session's own: for a
+/// supersede, the session does not write the claims' owning group.
+pub const CASCADE_DEFERRAL_REFUSAL_CODE: &str = "CX03";
+
+/// The caller-facing text both transports answer a supersede's CX03 with
+/// (supersede SPEC K5): the definer's own words ("not recorded as one this
+/// session made") describe its check, not the caller's remedy, so the denial
+/// names what it means for a supersession, keeping the code.
+#[must_use]
+pub fn supersede_not_recorded_message(claim_id: Uuid) -> String {
+    format!(
+        "{CASCADE_DEFERRAL_REFUSAL_CODE}: the supersession of claim {claim_id} cannot be \
+         recorded: the session acting on it does not write the group that owns the claim; \
+         nothing was written"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
