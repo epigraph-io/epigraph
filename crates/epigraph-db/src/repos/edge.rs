@@ -1937,9 +1937,10 @@ impl EdgeRepository {
     }
 
     /// The administrative half of an `edge_retract` cascade, on the
-    /// MAINTENANCE connection: remove every BBA keyed on the edge (keyed on
+    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge (keyed on
     /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
-    /// touched) and return the claims they lived on.
+    /// touched) and return the claims they lived on. A RETRACTED row
+    /// (migration 184) is kept for audit (rulings R-79, R-103).
     ///
     /// STATE-DERIVED: it acts only while the edge row is absent or out of force
     /// (`valid_to <= now()`). An edge in force at the time of the call (its
@@ -1977,6 +1978,7 @@ impl EdgeRepository {
                   WHERE p.id = mf.perspective_id \
                     AND p.id = $1 \
                     AND p.perspective_type = 'edge' \
+                    AND mf.retracted_at IS NULL \
                  RETURNING mf.claim_id) \
              SELECT claim_id FROM gone",
         )
@@ -1995,8 +1997,10 @@ impl EdgeRepository {
     }
 
     /// The edges whose BBAs outlived them: an edge-factor perspective
-    /// (`perspective_type = 'edge'`) with BBAs keyed on it whose edge is absent
-    /// or out of force. The one-shot legacy sweep
+    /// (`perspective_type = 'edge'`) with LIVE BBAs keyed on it whose edge is
+    /// absent or out of force. An edge holding only retracted rows is not
+    /// listed: the removal keeps those (migration 184), so listing it would
+    /// spend the sweep's `limit` on an edge it can do nothing for. The one-shot legacy sweep
     /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
     /// BBAs through the same administrative path as an `edge_retract` replay.
     /// Maintenance connection only.
@@ -2012,7 +2016,8 @@ impl EdgeRepository {
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
              SELECT p.id FROM perspectives p \
               WHERE p.perspective_type = 'edge' \
-                AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.perspective_id = p.id) \
+                AND EXISTS (SELECT 1 FROM mass_functions mf \
+                             WHERE mf.perspective_id = p.id AND mf.retracted_at IS NULL) \
                 AND NOT EXISTS (SELECT 1 FROM edges e \
                                  WHERE e.id = p.id \
                                    AND (e.valid_to IS NULL OR e.valid_to > now())) \
