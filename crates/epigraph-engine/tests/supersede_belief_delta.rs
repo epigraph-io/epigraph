@@ -24,7 +24,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::visibility::Viewer;
+use epigraph_db::visibility::{SystemReason, Viewer};
 use epigraph_db::{ClaimRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
 use epigraph_engine::supersede_delta::{
@@ -59,6 +59,9 @@ struct World {
     retired_lineage_holder: Uuid,
     /// Holds only a RETRACTED `supersedes`-keyed row.
     retracted_lineage_holder: Uuid,
+    /// The group-private holder of a row from the retired refuter, when the
+    /// world was built with one.
+    private_holder: Option<Uuid>,
     bystander: Uuid,
     r131: Vec<(Uuid, Uuid)>,
 }
@@ -194,6 +197,12 @@ async fn retire(pool: &PgPool, id: Uuid) {
 }
 
 async fn world(pool: &PgPool) -> World {
+    world_with(pool, false).await
+}
+
+/// `private`: also give the retired refuter a live row on a GROUP-private
+/// holder in a group no fixture agent below shares.
+async fn world_with(pool: &PgPool, private: bool) -> World {
     let (scoped, bypass) = fixture::bypass(pool).await;
     let public = fixture::public_viewer(pool).await;
     let (agent, _) = fixture::seed_agent_with_group(pool, "k0-author").await;
@@ -220,6 +229,16 @@ async fn world(pool: &PgPool) -> World {
     wire(pool, &public, agent, retired, overlap, "refutes").await;
     wire(pool, &public, agent, overlap_supporter, overlap, "supports").await;
     let kept_edge = wire(pool, &public, agent, retired, kept_holder, "contradicts").await;
+    let private_holder = if private {
+        let (pagent, pgroup) = fixture::seed_agent_with_group(pool, "k0-private").await;
+        let holder = fixture::seed_group_claim(pool, pagent, pgroup, "k0 private holder").await;
+        // The public viewer cannot see a group-private holder; the bypass
+        // viewer on this superuser connection can.
+        wire(pool, &bypass, agent, retired, holder, "refutes").await;
+        Some(holder)
+    } else {
+        None
+    };
     let kept_row: Uuid =
         sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
             .bind(kept_edge)
@@ -331,6 +350,7 @@ async fn world(pool: &PgPool) -> World {
         overlap_lineage_edge,
         retired_lineage_holder,
         retracted_lineage_holder,
+        private_holder,
         bystander,
         r131: vec![(c1, e1), (c1, e2), (c3, e3)],
     }
@@ -760,4 +780,51 @@ fn the_sheaf_readers_select_no_supersedes_edge() {
             "a sheaf reader's relationship list names supersedes: {l}"
         );
     }
+}
+
+/// The run sees, on the maintenance login the binary connects as (NOSUPERUSER,
+/// no BYPASSRLS), exactly what it sees on the superuser test pool, including a
+/// GROUP-private holder in a group the session has no part in: a smaller
+/// count on that login would make every operator figure a selection bug.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_delta_reads_every_row_on_the_maintenance_login(pool: PgPool) {
+    let w = world_with(&pool, true).await;
+    let private = w.private_holder.expect("built with a private holder");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let as_superuser = run_read_only(&mut conn, &w.viewer, &ALL)
+        .await
+        .expect("superuser run");
+    drop(conn);
+    let k10 = as_superuser.k10_retro.as_ref().expect("k10-retro block");
+    assert!(
+        ids(&k10.delta.claims).contains(&private) && k10.live_rows == 4,
+        "PREMISE: the superuser run selects the private holder's row too: {k10:?}"
+    );
+
+    // The binary's own path: a maintenance session on a ScopedPool whose
+    // maintenance pool is the epigraph_maintenance login.
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(maint);
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, viewer) = session.split();
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("current_user");
+    assert_eq!(role, "epigraph_maintenance", "PREMISE: the run's login");
+    let as_maintenance = run_read_only(conn, viewer, &ALL)
+        .await
+        .expect("maintenance run");
+
+    assert_eq!(
+        serde_json::to_value(&as_maintenance).expect("json"),
+        serde_json::to_value(&as_superuser).expect("json"),
+        "the maintenance login measures exactly what the superuser measures"
+    );
 }
