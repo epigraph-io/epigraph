@@ -635,6 +635,11 @@ pub struct DedupRepair {
     /// holds (the same source counted once), an `attributed_v1` row, or every
     /// such row when the canonical is a compound.
     pub kept_on_duplicate: Vec<Uuid>,
+    /// The duplicate's LIVE edge-keyed copies (part 2) left on it because the
+    /// canonical holds the same key with a RETRACTED row (migration 184): the
+    /// retracted row holds its key (ruling R-103), so the copy can neither
+    /// move onto it nor be dropped in its favour.
+    pub kept_on_duplicate_by_retracted_holder: Vec<Uuid>,
     /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
     /// pooled onto it.
     pub canonical_is_compound: bool,
@@ -12840,6 +12845,7 @@ async fn repair_marked_duplicate(
         skipped_false_bindings,
         pooled_bbas,
         kept_on_duplicate,
+        kept_on_duplicate_by_retracted_holder: Vec::new(),
         canonical_is_compound,
         revert: DedupRevert {
             identity_edge,
