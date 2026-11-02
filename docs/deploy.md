@@ -1698,6 +1698,10 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    same transaction. A claim the world group does not own is refused unless
    `--allow-owned` is given, and the act records whether it was (operator
    ruling OQ-8 (a)).
+   The same transaction records a `supersede` cascade deferral naming the
+   custodian: the edge migration and the belief cascade run from it in the
+   next `replay_deferred_cascades` run (the replay timer), as for any deferred
+   supersede.
    The successor has no embedding until the next embedding backfill.
 
 **Rollback.** First roll back every binary that calls a 123 function:

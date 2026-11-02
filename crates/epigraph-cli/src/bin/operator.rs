@@ -169,8 +169,10 @@ enum Command {
         apply: bool,
     },
     /// Revise a platform-corpus claim as the custodian: the supersede act,
-    /// the edge migration and a `platform.custodial_act` audit row naming the
-    /// assignment, in ONE transaction on the maintenance DSN (migration 123).
+    /// its cascade deferral (the edge migration and the belief cascade run
+    /// from it in replay_deferred_cascades) and a `platform.custodial_act`
+    /// audit row naming the assignment, in ONE transaction on the maintenance
+    /// DSN (migration 123).
     /// World-owned claims only unless --allow-owned. Exit 2: the act did not
     /// leave what it must, rolled back.
     CustodialSupersede {
@@ -1187,26 +1189,31 @@ async fn main_inner() -> anyhow::Result<i32> {
             match custodian::custodial_supersede(&mut conn, &req).await? {
                 custodian::SupersedeOutcome::Done(r) => {
                     println!(
-                        "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\tedges_moved={}\t\
-                         custodial_act={}\tassignment={assignment}\tactor={actor}{}",
+                        "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\t\
+                         cascade_deferral={}\tcustodial_act={}\tassignment={assignment}\t\
+                         actor={actor}{}",
                         if r.applied { "" } else { "WOULD BE " },
                         r.old,
                         r.new,
                         r.author,
                         r.owner,
-                        r.edges_moved,
+                        r.cascade_deferral,
                         r.act_event,
                         r.admin_act
                             .map_or_else(String::new, |a| format!("\tact={a}"))
                     );
                     if r.applied {
                         println!(
+                            "NOTE: the edge migration and the belief cascade run from the \
+                             cascade deferral, in the next replay_deferred_cascades run."
+                        );
+                        println!(
                             "NOTE: the successor has no embedding until the next embedding \
                              backfill; it is a live_missing row until then."
                         );
                     } else {
                         println!(
-                            "DRY RUN: the supersede, its edge migration and its audit row were \
+                            "DRY RUN: the supersede, its cascade deferral and its audit row were \
                              rolled back."
                         );
                     }

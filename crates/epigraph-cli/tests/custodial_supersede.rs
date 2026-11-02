@@ -88,6 +88,16 @@ async fn current(pool: &PgPool, claim: Uuid) -> bool {
         .expect("claim")
 }
 
+async fn deferred_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->>'cause' = 'supersede'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("deferrals")
+}
+
 async fn acts(pool: &PgPool) -> Vec<(String, String)> {
     sqlx::query_as(
         "SELECT details->>'assignment_id', details->>'target' FROM security_events \
@@ -134,15 +144,18 @@ async fn supersede(pool: &PgPool, claim: &str, assignment: &str, actor: &str, ap
 /// Armed, on the maintenance DSN: a corpus claim by a RETIRED-linked author
 /// and one by an UNLINKED author are each revised once. The successor is
 /// world/public under the inherited author, one `supersedes` edge links it,
-/// a strengthening edge follows it while a `contradicts` edge stays on the
-/// predecessor, and one `platform.custodial_act` names the assignment. A dry
-/// run writes nothing. An assignment of another holder, an ended one and one
+/// one `platform.custodial_act` names the assignment, and one `supersede`
+/// cascade deferral is recorded per revision; once the deferred-cascade
+/// replay has run (SPEC section 3.1: the custodial act's edge migration is
+/// the supersede cascade's, run from its deferral), a strengthening edge
+/// follows the successor while a `contradicts` edge stays on the
+/// predecessor. A dry run writes nothing. An assignment of another holder, an ended one and one
 /// not yet begun are CUS04 with nothing written; a claim the world group
 /// does not own is refused (exit 1) without `--allow-owned` and revised, under
 /// its own author and group, with it.
 ///
-/// Verified to fail: the edge migration skipped (`migrate_superseded_edges_conn`
-/// not called) -> the strengthening edge stays on the predecessor; the act
+/// Verified to fail: the cascade deferral not recorded -> no deferral row,
+/// and the replay leaves the strengthening edge on the predecessor; the act
 /// committed before its audit record (the supersede committed on its own,
 /// then the record attempted) -> the CUS04 run with another holder's
 /// assignment leaves the predecessor retired; the assignment check skipped
@@ -190,12 +203,18 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     assert!(dry.stdout.contains("WOULD BE SUPERSEDED"), "{}", dry.show());
     assert!(current(&pool, c_ret).await, "a dry run retires nothing");
     assert!(acts(&pool).await.is_empty(), "a dry run records nothing");
+    assert_eq!(deferred_count(&pool).await, 0, "a dry run defers nothing");
 
     // Refused: another holder's assignment.
     let other = supersede(&pool, &c_ret_s, &ib_s, &a_s, true).await;
     assert_eq!(other.code, 1, "{}", other.show());
     assert!(other.stderr.contains("CUS04"), "{}", other.show());
     assert!(current(&pool, c_ret).await, "a refused run retires nothing");
+    assert_eq!(
+        deferred_count(&pool).await,
+        0,
+        "a refused run defers nothing"
+    );
 
     // Applied, on the retired-linked author's corpus claim.
     let applied = supersede(&pool, &c_ret_s, &ia_s, &a_s, true).await;
@@ -243,6 +262,15 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     .await
     .expect("supersedes edge");
     assert_eq!(supersedes_edges, 1);
+    assert_eq!(
+        deferred_count(&pool).await,
+        1,
+        "the revision's cascade deferral"
+    );
+    // The edge migration is the cascade's: it runs from the deferral.
+    let fixture_dsn = fixture::database_url_for(&pool).await;
+    let r = replay(&fixture_dsn, &fixture_dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
     let targets: (Uuid, Uuid) = sqlx::query_as(
         "SELECT (SELECT target_id FROM edges WHERE id = $1), \
                 (SELECT target_id FROM edges WHERE id = $2)",
@@ -340,6 +368,11 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
         acts(&pool).await.len(),
         3,
         "only the three applied revisions (two corpus, one --allow-owned)"
+    );
+    assert_eq!(
+        deferred_count(&pool).await,
+        3,
+        "one cascade deferral per applied revision, none for a refused one"
     );
     // OQ-8 (a): the override is RECORDED on the act, not only admitted.
     let overrides: Vec<(String, Option<String>)> = sqlx::query_as(
