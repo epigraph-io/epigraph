@@ -485,7 +485,8 @@ async fn insert_claim_with_interval(pool: &PgPool, author: Uuid, bel: f64, pl: f
 /// edge id).
 async fn edge_bbas(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2 \
+           AND retracted_at IS NULL",
     )
     .bind(claim)
     .bind(edge)
@@ -771,6 +772,12 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
             .current_dir(std::env::temp_dir())
             .output()
             .expect("spawn the report");
+        assert_eq!(
+            r.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&r.stderr)
+        );
         let v: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&r.stdout).trim()).expect("JSON");
         v["pending"].as_i64().expect("pending count")
