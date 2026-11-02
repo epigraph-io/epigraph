@@ -492,6 +492,21 @@ pub async fn supersede_claim(
         })
         .await;
 
+    // 9a. The staleness event a supersession emits (supersede SPEC K12d,
+    // SF-26), after the commit, to the same store and with the same payload
+    // keys `POST /api/v1/edges` used for a `supersedes` edge before K12a made
+    // that relationship the act's alone. Attributed to the acting agent.
+    super::events::global_event_store()
+        .push(
+            "claim.superseded".to_string(),
+            Some(acting_agent),
+            serde_json::json!({
+                "superseded_claim_id": claim_id,
+                "superseded_by_claim_id": new_uuid,
+            }),
+        )
+        .await;
+
     // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
     // the retired claim's edges onto the replacement, then invalidate the
     // edge-factor BBAs frozen from ITS interval and re-derive them. Those edges
