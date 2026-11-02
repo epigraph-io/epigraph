@@ -6,7 +6,47 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The workspace `calibration.toml`, compiled into every binary that links
+/// this crate. It is what [`CalibrationConfig::cached`] serves when
+/// `CALIBRATION_PATH` is unset or cannot be loaded, so a process never depends
+/// on the build machine's source tree existing at run time (backlog 7cb71243:
+/// agent containers run the host-built binary without the file, and silently
+/// served an EMPTY evidence-type vocabulary). `include_str!` rebuilds the
+/// crate whenever the file changes.
+const EMBEDDED_CALIBRATION: &str = include_str!("../../../calibration.toml");
+
+/// Where the process-wide calibration ([`CalibrationConfig::cached`]) came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalibrationSource {
+    /// Loaded from the file `CALIBRATION_PATH` names.
+    Path(PathBuf),
+    /// The copy compiled into this binary ([`CalibrationConfig::embedded`]).
+    /// `failed_override` is the `CALIBRATION_PATH` that was set but could not
+    /// be loaded, with the error; `None` when the variable was unset.
+    Embedded {
+        failed_override: Option<(PathBuf, String)>,
+    },
+}
+
+impl std::fmt::Display for CalibrationSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(p) => write!(f, "CALIBRATION_PATH={}", p.display()),
+            Self::Embedded {
+                failed_override: None,
+            } => f.write_str("embedded calibration.toml (CALIBRATION_PATH unset)"),
+            Self::Embedded {
+                failed_override: Some((p, _)),
+            } => write!(
+                f,
+                "embedded calibration.toml (CALIBRATION_PATH={} failed to load)",
+                p.display()
+            ),
+        }
+    }
+}
 
 // ── Error Type ──────────────────────────────────────────────────────────────
 
@@ -187,63 +227,129 @@ impl CalibrationConfig {
         Ok(config)
     }
 
-    /// Loads `calibration.toml` from the `CALIBRATION_PATH` env var if set,
-    /// otherwise from the workspace root via `CARGO_MANIFEST_DIR` (best effort).
+    /// The process-wide calibration ([`Self::cached`]), cloned.
     ///
-    /// Falls back to the literal path `"calibration.toml"` (cwd-relative) when
-    /// neither env var is present at runtime. Returns the same
-    /// [`CalibrationError`] variants as [`Self::load`].
+    /// Resolution: the file `CALIBRATION_PATH` names, when set and loadable;
+    /// otherwise the calibration compiled into this binary
+    /// ([`Self::embedded`]). There is no build-path or cwd-relative tier: a
+    /// binary built on one machine and run on another (an agent container, a
+    /// deploy host after a worktree prune) must not change calibration because
+    /// a source tree is or is not present. A set-but-unloadable
+    /// `CALIBRATION_PATH` is logged at ERROR naming the path, and reported by
+    /// [`Self::startup_problems`] for the binaries to journal at boot.
     ///
-    /// Production hot-path callers should treat I/O failure as recoverable
-    /// (e.g. `.ok().map(...).unwrap_or((defaults))`) rather than propagating —
-    /// the engine has reasonable defaults for every locality / weight key.
-    ///
-    /// Backed by a process-wide cache (see [`Self::cached`]): `calibration.toml`
-    /// is read and parsed once, and this returns a clone — the previous per-call
-    /// `fs::read` + TOML parse on hot paths was backlog 03cb3167. On load
-    /// failure the cache holds [`Self::default_for_phase2_fallback`], so this
-    /// returns `Ok(default)` rather than `Err` — matching what every hot-path
-    /// caller already did via `.ok()` / `.unwrap_or_else(default)`.
+    /// Always `Ok`; the `Result` is kept for the existing callers. Changes to
+    /// the file need a process restart (read once, then cached; the per-call
+    /// read + parse on hot paths was backlog 03cb3167).
     pub fn from_workspace_root() -> Result<Self, CalibrationError> {
         Ok(Self::cached().clone())
     }
 
-    /// Process-wide cached calibration config: `calibration.toml` is read and
-    /// parsed exactly once per process, then reused. Hot paths (belief queries,
-    /// edge factors, DS auto-wiring) hit this every request. On load failure
-    /// falls back to [`Self::default_for_phase2_fallback`].
+    /// Process-wide cached calibration config, resolved once per process as
+    /// [`Self::from_workspace_root`] describes. Hot paths (belief queries, edge
+    /// factors, DS auto-wiring) hit this every request.
     ///
     /// NOTE: changes to `calibration.toml` require a process restart to take
     /// effect (this is a deploy-time config, not a runtime-tunable).
     #[must_use]
     pub fn cached() -> &'static Self {
-        static CACHED: std::sync::LazyLock<CalibrationConfig> = std::sync::LazyLock::new(|| {
-            CalibrationConfig::load_from_workspace_root_uncached()
-                .unwrap_or_else(|_| CalibrationConfig::default_for_phase2_fallback())
-        });
+        &Self::cached_with_source().0
+    }
+
+    /// Where [`Self::cached`] came from.
+    #[must_use]
+    pub fn cached_source() -> &'static CalibrationSource {
+        &Self::cached_with_source().1
+    }
+
+    fn cached_with_source() -> &'static (CalibrationConfig, CalibrationSource) {
+        static CACHED: std::sync::LazyLock<(CalibrationConfig, CalibrationSource)> =
+            std::sync::LazyLock::new(|| {
+                CalibrationConfig::resolve(std::env::var_os("CALIBRATION_PATH").map(PathBuf::from))
+            });
         &CACHED
     }
 
-    /// Uncached load: resolve `calibration.toml` (`CALIBRATION_PATH` env →
-    /// workspace root via `CARGO_MANIFEST_DIR` → cwd-relative fallback) and
-    /// parse it. Hot paths should use [`Self::cached`] / [`Self::from_workspace_root`].
-    ///
-    /// # Errors
-    /// Returns [`CalibrationError`] if the file cannot be read or parsed.
-    fn load_from_workspace_root_uncached() -> Result<Self, CalibrationError> {
-        let path = if let Ok(explicit) = std::env::var("CALIBRATION_PATH") {
-            std::path::PathBuf::from(explicit)
-        } else if let Some(manifest_dir) = option_env!("CARGO_MANIFEST_DIR") {
-            // crates/epigraph-engine/ → workspace root is two levels up.
-            std::path::PathBuf::from(manifest_dir)
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|root| root.join("calibration.toml"))
-                .unwrap_or_else(|| std::path::PathBuf::from("calibration.toml"))
-        } else {
-            std::path::PathBuf::from("calibration.toml")
+    /// Resolve the served calibration from an optional explicit path (the
+    /// value of `CALIBRATION_PATH`).
+    fn resolve(explicit: Option<PathBuf>) -> (Self, CalibrationSource) {
+        let Some(path) = explicit else {
+            return (
+                Self::embedded(),
+                CalibrationSource::Embedded {
+                    failed_override: None,
+                },
+            );
         };
-        Self::load(&path)
+        match Self::load(&path) {
+            Ok(cfg) => (cfg, CalibrationSource::Path(path)),
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "CALIBRATION_PATH could not be loaded; serving the calibration compiled into this binary"
+                );
+                (
+                    Self::embedded(),
+                    CalibrationSource::Embedded {
+                        failed_override: Some((path, e.to_string())),
+                    },
+                )
+            }
+        }
+    }
+
+    /// The workspace `calibration.toml` this binary was built with.
+    ///
+    /// # Panics
+    /// Never in a tested build: `embedded_calibration_matches_the_workspace_file`
+    /// parses the same text, so a malformed `calibration.toml` fails the test
+    /// suite before it can ship.
+    #[must_use]
+    pub fn embedded() -> Self {
+        toml::from_str(EMBEDDED_CALIBRATION)
+            .expect("the calibration.toml compiled into this binary parses (pinned by a unit test)")
+    }
+
+    /// What a serving process should report at boot about its calibration, one
+    /// message per problem; empty when there is none (backlog 7cb71243, "fail
+    /// loudly"). Two problems are possible: a `CALIBRATION_PATH` that was set
+    /// but could not be loaded (the shipped calibration is served instead),
+    /// and an empty `[evidence_type_weights]` table, which makes every typed
+    /// BBA combine at the 0.5 unknown-type reliability. The second can only
+    /// come from an explicit `CALIBRATION_PATH` file now, since the embedded
+    /// copy is non-empty.
+    ///
+    /// Reported, not fatal: refusing to start would take every agent
+    /// container's memory tools down, which is worse than the defect.
+    #[must_use]
+    pub fn problems(cfg: &Self, source: &CalibrationSource) -> Vec<String> {
+        let mut out = Vec::new();
+        if let CalibrationSource::Embedded {
+            failed_override: Some((path, error)),
+        } = source
+        {
+            out.push(format!(
+                "CALIBRATION_PATH={} could not be loaded ({error}); serving the calibration \
+                 compiled into this binary instead",
+                path.display()
+            ));
+        }
+        if cfg.evidence_type_weights.is_empty() {
+            out.push(format!(
+                "the evidence-type vocabulary is EMPTY ([evidence_type_weights] in {source}): \
+                 every typed BBA combines at the 0.5 unknown-type reliability"
+            ));
+        }
+        out
+    }
+
+    /// [`Self::problems`] for the process-wide calibration. Calling it forces
+    /// the cache, so a server that calls it at boot resolves its calibration
+    /// before the first request.
+    #[must_use]
+    pub fn startup_problems() -> Vec<String> {
+        Self::problems(Self::cached(), Self::cached_source())
     }
 
     /// Resolve a methodology string to its `(base_support, base_against, base_ignorance)` profile.
@@ -371,10 +477,11 @@ impl CalibrationConfig {
     }
 
     /// Synthetic `CalibrationConfig` for the Phase 2 helper's failure
-    /// path. Returned when `from_workspace_root()` fails (missing
-    /// `calibration.toml`, malformed TOML, …) so the combine path can
-    /// still produce numbers that match the pre-Phase-2 fallback
-    /// hard-codes:
+    /// path, and a test fixture for the pre-Phase-2 invariants. The served
+    /// calibration no longer falls back to it ([`Self::cached`] falls back to
+    /// [`Self::embedded`]; backlog 7cb71243), so the callers' `.unwrap_or_else`
+    /// on [`Self::from_workspace_root`] never reaches it. It still produces
+    /// numbers that match the pre-Phase-2 fallback hard-codes:
     ///   * `evidence_locality.intra_evidence_locality_factor = 0.3`
     ///     (the same value `auto_wire_ds_for_edge` falls back to)
     ///   * `get_evidence_type_weight("anything") = 0.5` (because the
@@ -432,7 +539,6 @@ pub fn canonical_evidence_type(raw: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     /// Locate calibration.toml relative to the workspace root.
     fn calibration_path() -> PathBuf {
@@ -672,6 +778,77 @@ mod tests {
         // Genuinely unknown keys absent.
         assert!(!cfg.evidence_type_weight_present("alien_telepathy"));
         assert!(!cfg.evidence_type_weight_present(""));
+    }
+
+    /// The compiled-in copy is the workspace file, parsed: guards the
+    /// `embedded()` `.expect` and any drift between what ships and what the
+    /// file says (backlog 7cb71243).
+    #[test]
+    fn embedded_calibration_matches_the_workspace_file() {
+        let embedded = CalibrationConfig::embedded();
+        let file = load_config();
+        assert!(
+            !embedded.evidence_type_weights.is_empty(),
+            "the shipped vocabulary must not be empty"
+        );
+        assert_eq!(embedded.evidence_type_weights, file.evidence_type_weights);
+        assert_eq!(embedded.evidence_type_aliases, file.evidence_type_aliases);
+        assert_eq!(embedded.methodology_profiles, file.methodology_profiles);
+        assert_eq!(embedded.methodology_aliases, file.methodology_aliases);
+        assert_eq!(embedded.journal_reliability, file.journal_reliability);
+        assert_eq!(embedded.section_tier_weights, file.section_tier_weights);
+        assert!(
+            (embedded.default_journal_reliability - file.default_journal_reliability).abs()
+                < f64::EPSILON
+        );
+    }
+
+    /// `CALIBRATION_PATH` still overrides, and a set-but-unloadable one falls
+    /// back to the shipped calibration (not the empty one) and says which path
+    /// failed. Driven through `resolve` so it does not depend on this test
+    /// binary's process-wide cache.
+    #[test]
+    fn resolve_prefers_an_explicit_path_and_falls_back_to_embedded() {
+        let (cfg, src) = CalibrationConfig::resolve(Some(calibration_path()));
+        assert_eq!(src, CalibrationSource::Path(calibration_path()));
+        assert!(CalibrationConfig::problems(&cfg, &src).is_empty());
+
+        let missing = PathBuf::from("/nonexistent/7cb71243/calibration.toml");
+        let (cfg, src) = CalibrationConfig::resolve(Some(missing.clone()));
+        assert_eq!(cfg.evidence_type_weights.get("empirical"), Some(&1.0));
+        match &src {
+            CalibrationSource::Embedded {
+                failed_override: Some((p, _)),
+            } => assert_eq!(p, &missing),
+            other => panic!("expected an embedded fallback naming the path, got {other:?}"),
+        }
+        let problems = CalibrationConfig::problems(&cfg, &src);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("/nonexistent/7cb71243/calibration.toml"));
+
+        let (cfg, src) = CalibrationConfig::resolve(None);
+        assert_eq!(
+            src,
+            CalibrationSource::Embedded {
+                failed_override: None
+            }
+        );
+        assert!(CalibrationConfig::problems(&cfg, &src).is_empty());
+    }
+
+    /// An explicit calibration whose vocabulary is empty is the one way left
+    /// to serve the 0.5-everywhere combine; it must be reported.
+    #[test]
+    fn an_empty_vocabulary_is_reported() {
+        let cfg = CalibrationConfig::default_for_phase2_fallback();
+        let src = CalibrationSource::Path(PathBuf::from("/etc/epigraph/calibration.toml"));
+        let problems = CalibrationConfig::problems(&cfg, &src);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("EMPTY") && problems[0].contains("0.5 unknown-type"),
+            "{}",
+            problems[0]
+        );
     }
 
     /// Phase 2 (issue #197): the fallback config used when calibration.toml
