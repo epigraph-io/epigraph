@@ -20,7 +20,11 @@
 //!   server agent's own claim lands (calibration);
 //! * stdio `patch_claim` with `add_labels`: the same refusal, nothing written;
 //! * HTTP `update_labels` by the claim's AUTHOR (who passes the ownership gate)
-//!   on a claim owned by a group it cannot write: the same refusal.
+//!   on a claim owned by a group it cannot write: the same refusal;
+//! * stdio `patch_claim` with `properties` only (no labels): the same
+//!   `UPDATE claims`, so the same refusal, with no label-specific remedy;
+//! * a coded `42501`, or a row-security refusal on ANOTHER table a trigger
+//!   writes, is NOT renamed: only `claims`' own row security is this refusal.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -248,5 +252,119 @@ async fn a_coded_42501_from_a_trigger_keeps_its_own_text(pool: PgPool) {
             .as_ref()
             .is_none_or(|d| d["rule"] != "label_requires_claim_group_writer"),
         "a coded refusal is not the row-security refusal: {e:?}"
+    );
+}
+
+async fn properties_of(pool: &PgPool, claim_id: Uuid) -> Option<serde_json::Value> {
+    sqlx::query_scalar("SELECT properties FROM claims WHERE id = $1")
+        .bind(claim_id)
+        .fetch_one(pool)
+        .await
+        .expect("read properties")
+}
+
+/// A `patch_claim` that touches no label is the same `UPDATE claims` and so
+/// the same refusal; its message names no label-only remedy. Calibration: the
+/// same properties patch lands on the server agent's own claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_patch_claim_properties_only_on_a_foreign_groups_claim_is_a_named_refusal(
+    pool: PgPool,
+) {
+    let (server, agent, viewer) = app_role_server(&pool).await;
+    let (author, author_group) = fixture::seed_agent_with_group(&pool, "props-author").await;
+    let foreign = public_claim_in(&pool, author, author_group, "B's claim, properties").await;
+    let before = (
+        labels_of(&pool, foreign).await,
+        properties_of(&pool, foreign).await,
+    );
+    let patch = |claim: Uuid| PatchClaimParams {
+        claim_id: claim.to_string(),
+        trace_id: None,
+        properties: Some(serde_json::json!({ "pipeline_state": "aged-out-3e7b" })),
+        add_labels: vec![],
+        remove_labels: vec![],
+    };
+
+    let e = patch_claim(&server, &viewer, patch(foreign), None)
+        .await
+        .expect_err("the claim's group refuses the stdio server's stamp");
+    assert_named_refusal(
+        &e,
+        foreign,
+        author_group,
+        "stdio patch_claim, properties only",
+    );
+    assert!(
+        !e.message.contains("Relabel"),
+        "a properties-only patch is not told to relabel: {e:?}"
+    );
+    assert_eq!(
+        (
+            labels_of(&pool, foreign).await,
+            properties_of(&pool, foreign).await
+        ),
+        before,
+        "nothing written"
+    );
+
+    let own_group = personal_group_of(&pool, agent).await;
+    let mine = public_claim_in(&pool, agent, own_group, "own claim, properties").await;
+    patch_claim(&server, &viewer, patch(mine), None)
+        .await
+        .expect("CALIBRATION: the server agent patches its own group's claim");
+    assert_eq!(
+        properties_of(&pool, mine)
+            .await
+            .as_ref()
+            .map(|p| p["pipeline_state"].clone()),
+        Some(serde_json::json!("aged-out-3e7b")),
+        "calibration: the properties landed"
+    );
+}
+
+/// Only `claims`' OWN row-security refusal is renamed. An uncoded `42501` from
+/// another table's row security (here a sink table a trigger on the claim's
+/// UPDATE writes, whose policy admits nothing) is not a statement about the
+/// claim's group, so it keeps the redacted internal-error answer. Forced on
+/// the server agent's OWN claim, which `claims`' row security admits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn another_tables_row_security_refusal_is_not_renamed(pool: PgPool) {
+    let (server, agent, viewer) = app_role_server(&pool).await;
+    let own_group = personal_group_of(&pool, agent).await;
+    let mine = public_claim_in(&pool, agent, own_group, "own claim, sink-refused").await;
+    for stmt in [
+        "CREATE TABLE test_rls_sink (claim_id uuid)".to_string(),
+        "ALTER TABLE test_rls_sink ENABLE ROW LEVEL SECURITY".to_string(),
+        "CREATE POLICY test_rls_sink_none ON test_rls_sink FOR INSERT WITH CHECK (false)"
+            .to_string(),
+        "GRANT INSERT ON test_rls_sink TO PUBLIC".to_string(),
+        "CREATE FUNCTION test_rls_sink_write() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN INSERT INTO test_rls_sink VALUES (NEW.id); RETURN NEW; END $$"
+            .to_string(),
+        "GRANT EXECUTE ON FUNCTION test_rls_sink_write() TO PUBLIC".to_string(),
+        format!(
+            "CREATE TRIGGER test_rls_sink_write BEFORE UPDATE ON claims \
+             FOR EACH ROW WHEN (NEW.id = '{mine}'::uuid) EXECUTE FUNCTION test_rls_sink_write()"
+        ),
+    ] {
+        sqlx::query(&stmt)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    let e = update_labels(&server, &viewer, free_label(mine), None)
+        .await
+        .expect_err("the sink's row security refuses the trigger's INSERT");
+    assert_eq!(
+        e.code,
+        ErrorCode::INTERNAL_ERROR,
+        "another table's row-security refusal is not the claim-group refusal: {e:?}"
+    );
+    assert!(
+        e.data
+            .as_ref()
+            .is_none_or(|d| d["rule"] != "label_requires_claim_group_writer"),
+        "not renamed to the claim-group rule: {e:?}"
     );
 }

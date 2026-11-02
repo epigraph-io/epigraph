@@ -2493,8 +2493,8 @@ fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
         message: std::borrow::Cow::from(format!(
             "cannot {action} claim {claim_id}: the claim is owned by a group this write's \
              identity holds no live writer or admin membership in, so the database refused \
-             the write; nothing was written. Relabel it as a writer of that group (the \
-             owning agent's key), or through the audited admin path over HTTP with a \
+             the write; nothing was written. Make the change as a writer of that group \
+             (the owning agent's key), or through the audited admin path over HTTP with a \
              claims:admin token"
         )),
         data: Some(serde_json::json!({
@@ -2507,10 +2507,16 @@ fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
 }
 
 /// Map the error of a label `UPDATE claims` on a stamped transaction for the
-/// caller: the row-security `WITH CHECK` refusal (uncoded `42501`, "new row
-/// violates row-level security policy") is [`label_not_writer`]; everything
-/// else keeps [`db_caller_error`], so a CODED `42501` a trigger raises (a
-/// designed refusal) still reaches the caller as it was written.
+/// caller: the row-security `WITH CHECK` refusal ON `claims` itself (uncoded
+/// `42501`, "new row violates row-level security policy ... for table
+/// \"claims\"") is [`label_not_writer`]; everything else keeps
+/// [`db_caller_error`], so a CODED `42501` a trigger raises (a designed
+/// refusal), or a row-security refusal on ANOTHER table a trigger writes,
+/// still reaches the caller as it was before.
+///
+/// `patch_claim` routes every write through here, including a
+/// properties-only or trace-only patch: it is the same `UPDATE claims`, so the
+/// same refusal, and the message names no label-specific remedy.
 ///
 /// Mapped at the statement rather than preflighted against the stamp's
 /// writable set, so it changes the ANSWER only, never which writes are
@@ -2521,6 +2527,7 @@ fn label_write_error(e: epigraph_db::DbError, claim_id: Uuid, action: &str) -> M
         epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
             if d.code().as_deref() == Some("42501")
                 && d.message().starts_with("new row violates row-level security policy")
+                && d.message().ends_with("for table \"claims\"")
     );
     if refused_by_row_security {
         tracing::warn!(
