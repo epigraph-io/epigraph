@@ -587,12 +587,19 @@ async fn evolve_step_supersedes_cascade_carries_structural_edges_but_not_execute
     );
 }
 
-/// The carve-out is a STEP-LINEAGE rule, derived from the rows: a plain
-/// supersede of a claim that happens to carry a `step_lineage_id` writes a
-/// successor outside that lineage, so its `executes` and agent edges move as
-/// every supersession's do.
+/// The `executes` carve-out is a STEP-LINEAGE rule, derived from the rows: a
+/// plain supersede of a claim that happens to carry a `step_lineage_id` writes
+/// a successor outside that lineage, so its (public) `executes` moves as every
+/// supersession's does.
+///
+/// The `asserts` half is inverted by ruling R-133 (supersede SPEC §11 K1,
+/// SF-23), which generalises R-113(2) and supersedes U047 sub-decision A for
+/// agent-sourced edges: an agent's `asserts` stays on the retired claim in
+/// every supersession, lineage or not. This test used to be
+/// `plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts` and
+/// pinned the agent edge following the successor.
 #[sqlx::test(migrations = "../../migrations")]
-async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool: PgPool) {
+async fn plain_supersede_of_a_lineage_step_moves_executes_but_leaves_asserts(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let other_agent = seed_agent(&pool).await;
     let step = seed_claim(&pool, agent, "a step with a lineage", 0.7).await;
@@ -629,8 +636,8 @@ async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool
     );
     assert_eq!(
         ends(&pool, asserted).await,
-        (other_agent, new_id),
-        "asserts follows a plain supersede"
+        (other_agent, step),
+        "an agent's asserts stays on the retired claim, lineage or not (R-133)"
     );
 }
 
