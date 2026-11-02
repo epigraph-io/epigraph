@@ -348,3 +348,104 @@ async fn the_definer_body_is_the_one_spelling_of_is_compound(pool: PgPool) {
          expected (whitespace aside):\n{expected}\n\ncatalog:\n{prosrc}"
     );
 }
+
+/// The guard is `AND NOT (SELECT <definer>)`, so a NULL from the definer
+/// would turn it into `AND NULL` and silently drop EVERY owner row. The
+/// definer is documented "never NULL": an id that names no claim, and a
+/// parent whose only child has been superseded (no in-force decomposition
+/// left), both answer FALSE. Decoded as `Option<bool>`, so a NULL fails the
+/// assertion rather than the decode.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_definer_answers_false_never_null_for_an_unknown_or_no_longer_compound_claim(
+    pool: PgPool,
+) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "0dc20fad-null").await;
+    let parent = claim(&pool, agent, group, "public", "parent").await;
+    let child = claim(&pool, agent, group, "public", "only child").await;
+    decomposes_to(&pool, parent, child, "public", group).await;
+    let call = "SELECT public.epigraph_claim_is_compound($1)";
+    let live: Option<bool> = sqlx::query_scalar(call)
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .expect("definer on the live compound");
+    assert_eq!(live, Some(true), "calibration: the parent is a compound");
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(child)
+        .execute(&pool)
+        .await
+        .expect("supersede the only child");
+
+    for (what, id) in [
+        ("unknown id", Uuid::new_v4()),
+        ("parent whose only child is superseded", parent),
+    ] {
+        let got: Option<bool> = sqlx::query_scalar(call)
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("definer call");
+        assert_eq!(
+            got,
+            Some(false),
+            "{what}: the definer must answer FALSE, never NULL"
+        );
+    }
+}
+
+/// `routes::assess` runs the refresh on a plain `db_pool` connection, which
+/// carries no viewer stamp (row security then admits public rows only), not
+/// on a `ScopedPool::begin_as` transaction. The guard must hold on that
+/// connection state too: on an UNSTAMPED `epigraph_app` session the compound
+/// whose only child is private has no owner, while its standalone twin (same
+/// BBA, public) does. The viewer is resolved on the superuser pool BEFORE the
+/// downgrade, as `viewer_fixture::downgraded_pool` requires.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_an_unstamped_app_session_a_compound_with_a_private_decomposition_has_no_cache_owner(
+    pool: PgPool,
+) {
+    let (caller, mine) = fixture::seed_agent_with_group(&pool, "0dc20fad-unstamped").await;
+    let (other, theirs) = fixture::seed_agent_with_group(&pool, "0dc20fad-unstamped-o").await;
+    let f = frame(&pool).await;
+    let hidden = claim(&pool, caller, mine, "public", "compound, private child").await;
+    let child = claim(&pool, other, theirs, "group", "private only child").await;
+    decomposes_to(&pool, hidden, child, "group", theirs).await;
+    let standalone = claim(&pool, caller, mine, "public", "standalone twin").await;
+    for c in [hidden, standalone] {
+        bba(&pool, caller, c, f).await;
+    }
+    let viewer = Viewer::resolve(&pool, caller)
+        .await
+        .expect("resolve caller");
+
+    let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut conn = app.acquire().await.expect("app-role connection");
+    let who: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("current_user");
+    assert_eq!(
+        who, "epigraph_app",
+        "the session must be the application role"
+    );
+    assert!(
+        !inline_is_compound(&mut conn, hidden).await,
+        "calibration: the unstamped session cannot see the private decomposition"
+    );
+    let twin = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, &viewer, standalone)
+        .await
+        .expect("owner lookup of the twin");
+    assert_eq!(
+        twin,
+        Some(f),
+        "calibration: the unstamped session reads the public BBA rows"
+    );
+    let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, &viewer, hidden)
+        .await
+        .expect("owner lookup of the compound");
+    assert_eq!(
+        owner, None,
+        "0dc20fad: on an unstamped app session a compound whose decomposition is hidden must \
+         have no cache owner (it had {owner:?})"
+    );
+}
