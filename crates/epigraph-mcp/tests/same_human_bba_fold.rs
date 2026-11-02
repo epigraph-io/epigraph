@@ -222,3 +222,127 @@ async fn update_with_evidence_by_two_agents_of_one_human_does_not_aggregate(pool
         "agents of different owners must still reinforce: {independent} vs {baseline}"
     );
 }
+
+/// One stored BBA of `agent` on (claim, frame), seeded on the harness pool.
+async fn seed_row(
+    pool: &PgPool,
+    agent: Uuid,
+    claim: Uuid,
+    frame: Uuid,
+    masses: &serde_json::Value,
+) {
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, \
+                                     source_strength) \
+         VALUES ($1, $2, $3, $4, 1.0)",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(masses)
+    .execute(pool)
+    .await
+    .expect("seed BBA row");
+}
+
+/// `compare_methods` on (claim, frame, hypothesis 0): per method name, its
+/// `(belief, plausibility, pignistic_prob)`.
+async fn compare(
+    server: &EpiGraphMcpFull,
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+) -> std::collections::BTreeMap<String, (f64, f64, f64)> {
+    let viewer = fixture::public_viewer(pool).await;
+    let out = tools::ds::compare_methods(
+        server,
+        &viewer,
+        epigraph_mcp::types::CompareMethodsParams {
+            claim_id: claim.to_string(),
+            frame_id: frame.to_string(),
+            hypothesis_index: 0,
+        },
+    )
+    .await
+    .expect("compare_methods");
+    let text = out
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("a text block");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    body["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .map(|r| {
+            (
+                r["method"].as_str().expect("method").to_string(),
+                (
+                    r["belief"].as_f64().expect("belief"),
+                    r["plausibility"].as_f64().expect("plausibility"),
+                    r["pignistic_prob"].as_f64().expect("pignistic_prob"),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Ruling R-36 on MCP `compare_methods` (the fe3ec493 residual): two sibling
+/// agents of one human that stored the SAME masses are one owner's evidence,
+/// so every combination method reports exactly what one of those BBAs alone
+/// gives (the cautious rule is idempotent), never the methods' product of the
+/// two. CONTROL: the same two rows by agents of two different owners still
+/// combine (Dempster's belief rises above the single BBA's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn compare_methods_does_not_aggregate_two_agents_of_one_human(pool: PgPool) {
+    let (server, _) = server_for_new_agent(&pool, 0x51).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("same-human-compare-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let (human, _) = fixture::seed_human_operator(&pool, "same-human-compare").await;
+    let (a1, _) = fixture::seed_agent_with_group(&pool, "same-human-compare-one").await;
+    let (a2, _) = fixture::seed_agent_with_group(&pool, "same-human-compare-two").await;
+    link(&pool, a1, human).await;
+    link(&pool, a2, human).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "same-human-compare-x").await;
+    let masses = serde_json::json!({"0": 0.7, "0,1": 0.3});
+
+    let baseline_claim = fresh_claim(&pool, "same-human compare baseline").await;
+    seed_row(&pool, a1, baseline_claim, frame, &masses).await;
+    let baseline = compare(&server, &pool, baseline_claim, frame).await;
+    assert!(
+        (baseline["Dempster"].0 - 0.7).abs() < 1e-9,
+        "calibration: one BBA's belief is its own mass: {baseline:?}"
+    );
+
+    let claim = fresh_claim(&pool, "same-human compare siblings").await;
+    seed_row(&pool, a1, claim, frame, &masses).await;
+    seed_row(&pool, a2, claim, frame, &masses).await;
+    let siblings = compare(&server, &pool, claim, frame).await;
+    assert_eq!(siblings.len(), baseline.len(), "{siblings:?}");
+    for (method, single) in &baseline {
+        let got = siblings[method];
+        assert!(
+            (got.0 - single.0).abs() < 1e-9
+                && (got.1 - single.1).abs() < 1e-9
+                && (got.2 - single.2).abs() < 1e-9,
+            "{method}: two agents of one human must report one BBA's {single:?}, not \
+             aggregate: got {got:?}"
+        );
+    }
+
+    let control = fresh_claim(&pool, "same-human compare control").await;
+    seed_row(&pool, a1, control, frame, &masses).await;
+    seed_row(&pool, stranger, control, frame, &masses).await;
+    let independent = compare(&server, &pool, control, frame).await;
+    assert!(
+        independent["Dempster"].0 > baseline["Dempster"].0 + 1e-3,
+        "agents of different owners still combine: {independent:?} vs {baseline:?}"
+    );
+}
