@@ -1637,8 +1637,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // so an owner deleting its own claim silently leaves world-owned edges
     // pointing at the deleted row. That is the stake this entry reports.
     ("epigraph_session_writes_node", 115),
+    // Re-bodied by 117 (owner arm only) and 194 (retracted rows kept); the
+    // stake above is unchanged by either.
     ("epigraph_cascade_delete_edge_bbas", 115),
     ("epigraph_cascade_delete_node_edges", 115),
+    // 194 (H10), the purge-grant helper the retracted-row delete guard calls.
+    // Fails CLOSED under a non-member owner: such an owner holds no privilege
+    // on `mass_function_purge_grants` (only `epigraph_maintenance` does), so
+    // its read is refused and every delete of a retracted row, the purge
+    // definer's included, errors with nothing deleted (loud).
+    ("epigraph_mf_purge_granted", 194),
+    // 194 (H10), the audited purge of retracted mass functions. Fails CLOSED
+    // under a non-member owner: its grant INSERT is refused (no privilege on
+    // the grant table) and its `security_events` audit INSERT by the tenancy
+    // policies, so every purge errors with nothing deleted (loud), and a
+    // claim or frame delete that needs one stays refused SR09.
+    ("epigraph_purge_mass_functions", 194),
     // 116, the attested retire of a former shared HTTP signer (batch HTTP-id).
     // Deferred for 107's reason, and fails CLOSED the same way under a
     // non-member owner: the tenancy policies refuse its link and audit writes.
