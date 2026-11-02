@@ -15,21 +15,26 @@
 //!
 //! # What counts
 //!
-//! A **delete site** is a `DELETE FROM mass_functions` (schema qualifier
-//! allowed) in a Rust string literal that is SQL (`belief_lint::is_sql`),
-//! with its SQL comments removed. Scanned: `crates/*/src/**/*.rs`,
-//! `#[cfg(test)]` items excluded. A site is **guarded** by a
-//! `retracted_at IS NULL` (any qualifier) or a `{not_retracted}` format
-//! argument (`mass_function::not_retracted_predicate`) in the same literal.
-//! A literal's unguarded count is its delete sites minus its guards (never
-//! below zero); a unit's count is the sum over its literals. Every unit with a
-//! non-zero count must be in [`REGISTER`] at exactly that count.
+//! A **delete site** is a `DELETE FROM [ONLY] [public.]mass_functions` (any
+//! keyword case) in a Rust string literal that is SQL
+//! (`belief_lint::is_sql`), with its SQL comments removed. Scanned:
+//! `crates/*/src/**/*.rs`, `#[cfg(test)]` items excluded. A site is
+//! **guarded** only by a predicate on the DELETE's OWN target, in the
+//! DELETE's own clauses: the text after the target (and its `[AS] alias`) up
+//! to its `RETURNING`, a `;`, or the parenthesis closing the CTE it sits in,
+//! with every nested parenthesised group (an `EXISTS` subquery, an `ANY($1)`)
+//! left out. In that text the guard is `<alias>.retracted_at IS NULL`,
+//! `mass_functions.retracted_at IS NULL` or an unqualified
+//! `retracted_at IS NULL`, or a `{not_retracted}` format argument
+//! (`mass_function::not_retracted_predicate`). A predicate on a `USING` table
+//! or inside a subquery guards nothing. A unit's count is its unguarded sites;
+//! every unit with a non-zero count must be in [`REGISTER`] at exactly that
+//! count.
 //!
 //! # Known limits, stated so a green run is not read as more
 //!
-//! * A guard is counted per literal, not tied to the DELETE's own `WHERE`: a
-//!   literal whose DELETE is unguarded but whose other clause carries the
-//!   predicate passes.
+//! * The clause scan does not parse SQL string literals: a `(` or `)` inside a
+//!   quoted SQL string would shift its depth count. No scanned delete has one.
 //! * SQL built at runtime from pieces that are not literals, SQL in
 //!   `scripts/` and in `migrations/` (definer bodies; slot 194 guards those),
 //!   and `ON DELETE CASCADE` from `claims` / `frames` are not scanned.
@@ -50,7 +55,8 @@ use std::collections::BTreeMap;
 const REGISTER: &[(&str, &str, usize, &str)] = &[];
 
 /// The comment-free literal with escaped newlines and runs of whitespace
-/// folded to single spaces.
+/// folded to single spaces, upper-cased (so keyword case cannot hide a site
+/// or a guard).
 fn flat(sql: &str) -> String {
     sql.replace("\\\n", " ")
         .replace("\\n", " ")
@@ -58,30 +64,105 @@ fn flat(sql: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+        .to_uppercase()
+}
+
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Each delete site of `mass_functions` in one comment-free SQL text: the
+/// target's alias (if any) and the DELETE's own clauses at depth 0 (see the
+/// module docs).
+fn delete_targets(sql: &str) -> Vec<(Option<String>, String)> {
+    const TABLE: &str = "MASS_FUNCTIONS";
+    let flat = flat(sql);
+    let mut out = Vec::new();
+    for at in find_words(&flat, TABLE) {
+        let before = flat[..at].trim_end();
+        let before = before.strip_suffix("PUBLIC.").unwrap_or(before).trim_end();
+        let before = before.strip_suffix(" ONLY").unwrap_or(before).trim_end();
+        if !before.ends_with("DELETE FROM") {
+            continue;
+        }
+        let mut rest = flat[at + TABLE.len()..].trim_start();
+        if let Some(r) = rest.strip_prefix("AS ") {
+            rest = r.trim_start();
+        }
+        let word_len = rest.bytes().take_while(|&c| is_ident(c)).count();
+        let word = &rest[..word_len];
+        let alias = if word_len > 0 && !matches!(word, "WHERE" | "USING" | "RETURNING") {
+            rest = &rest[word_len..];
+            Some(word.to_string())
+        } else {
+            None
+        };
+        let b = rest.as_bytes();
+        let mut own = String::new();
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'(' {
+                depth += 1;
+                own.push(' ');
+            } else if c == b')' {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                own.push(' ');
+            } else if depth == 0 {
+                if c == b';' {
+                    break;
+                }
+                if rest[i..].starts_with("RETURNING")
+                    && (i == 0 || !is_ident(b[i - 1]))
+                    && b.get(i + "RETURNING".len()).is_none_or(|&n| !is_ident(n))
+                {
+                    break;
+                }
+                own.push(c as char);
+            }
+            i += 1;
+        }
+        out.push((alias, own));
+    }
+    out
 }
 
 /// Delete sites of `mass_functions` in one comment-free SQL text.
 fn delete_sites(sql: &str) -> usize {
-    let flat = flat(sql);
-    find_words(&flat, "mass_functions")
-        .into_iter()
-        .filter(|&at| {
-            let before = flat[..at].trim_end();
-            let before = before.strip_suffix("public.").unwrap_or(before).trim_end();
-            before.ends_with("DELETE FROM")
-        })
-        .count()
+    delete_targets(sql).len()
 }
 
-/// Guards in one comment-free SQL text.
-fn guards(sql: &str) -> usize {
-    let flat = flat(sql);
-    flat.matches("retracted_at IS NULL").count() + flat.matches("{not_retracted}").count()
+/// Whether a DELETE's own clauses carry a guard on its target.
+fn guarded(alias: Option<&str>, own: &str) -> bool {
+    if own.contains("{NOT_RETRACTED}") {
+        return true;
+    }
+    const GUARD: &str = "RETRACTED_AT IS NULL";
+    let b = own.as_bytes();
+    find_words(own, "RETRACTED_AT").into_iter().any(|at| {
+        if !own[at..].starts_with(GUARD) {
+            return false;
+        }
+        if at == 0 || b[at - 1] != b'.' {
+            return true; // unqualified: the target (a subquery is left out)
+        }
+        let q = &own[..at - 1];
+        let start = q.bytes().rposition(|c| !is_ident(c)).map_or(0, |p| p + 1);
+        let qualifier = &q[start..];
+        qualifier == "MASS_FUNCTIONS" || alias == Some(qualifier)
+    })
 }
 
 /// The unguarded delete sites of one comment-free SQL text.
 fn unguarded(sql: &str) -> usize {
-    delete_sites(sql).saturating_sub(guards(sql))
+    delete_targets(sql)
+        .iter()
+        .filter(|(alias, own)| !guarded(alias.as_deref(), own))
+        .count()
 }
 
 /// Every delete site (guarded or not) and every unguarded one, keyed
@@ -245,7 +326,7 @@ fn only_a_real_delete_is_a_site_and_only_live_sql_guards_it() {
         "DELETE FROM mass_functions WHERE id = $1 /* AND retracted_at IS NULL */",
     );
     assert_eq!(
-        delete_sites(&commented).saturating_sub(guards(&commented)),
+        unguarded(&commented),
         1,
         "a guard in a comment guards nothing"
     );
