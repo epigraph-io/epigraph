@@ -1853,8 +1853,11 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
 /// INVOKER trigger `events_cascade_edges` never runs.
 ///
 /// Fails on 188 and earlier: the application role holds DELETE and UPDATE on
-/// `events` (`("events", OPERATIONAL)` was allowlisted), so the delete removes
-/// the event and its edge.
+/// `events` (077; `("events", OPERATIONAL)` was allowlisted), so the delete
+/// removes the event and its edge. The TRUNCATE refusal is a regression pin
+/// only: 077 never granted the application role TRUNCATE, so it passes on the
+/// base too. The maintenance half (186's DELETE still works) is
+/// `the_maintenance_role_still_deletes_events_the_app_role_cannot`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
     let app = app_pool(&pool, 2).await;
@@ -1908,6 +1911,76 @@ async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
     assert_eq!(events_left, 1, "the provenance event survives");
     assert_eq!(edges_left, 1, "the edge naming it survives");
     assert_eq!(kept, payload, "its payload is unchanged");
+}
+
+/// Migrations 186 and 189 together: the maintenance role (the retention job's
+/// `MaintenancePool`) still deletes an `events` row, and 024's INVOKER
+/// trigger `events_cascade_edges` still removes the edge naming it in the same
+/// statement, while the application role holds neither DELETE nor UPDATE.
+/// So 189 closed `events` to the application role only and left 186's
+/// maintenance DELETE intact.
+///
+/// `role_pool` uses SET SESSION AUTHORIZATION, so `session_user` and
+/// `current_user` are both `epigraph_maintenance` (the superuser fixture does
+/// not mask the grant check, and `epigraph_bypass()` admits the cascade's
+/// `DELETE FROM edges` through `edges_delete_owner`).
+///
+/// Fails if 189 (or any later file) also takes DELETE from the maintenance
+/// role: the delete is refused with 42501 and the event and its edge stay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_maintenance_role_still_deletes_events_the_app_role_cannot(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "b03-events-maint").await;
+    let payload = serde_json::json!({ "claim_id": Uuid::new_v4() });
+    let event = epigraph_db::EventRepository::insert(&pool, "claim.created", Some(agent), &payload)
+        .await
+        .expect("seed an event");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'event', $2, 'agent', 'TEST_EDGE')",
+    )
+    .bind(event)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("an edge naming the event");
+
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    let deleted = sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(event)
+        .execute(&maint)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.into_owned()))
+                .unwrap_or_else(|| e.to_string())
+        });
+    maint.close().await;
+
+    let (events_left, edges_left): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM events WHERE id = $1), \
+                (SELECT count(*) FROM edges WHERE source_id = $1)",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    let grants: (bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('epigraph_maintenance', 'public.events', 'DELETE'), \
+                has_table_privilege('epigraph_app', 'public.events', 'DELETE'), \
+                has_table_privilege('epigraph_app', 'public.events', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+
+    assert_eq!(
+        (deleted, events_left, edges_left, grants),
+        (Ok(1), 0, 0, (true, false, false)),
+        "(maintenance DELETE, events left, edges left, (maintenance DELETE grant, app DELETE \
+         grant, app UPDATE grant)): the maintenance role deletes the event and the cascade \
+         removes its edge; the application role holds neither DELETE nor UPDATE"
+    );
 }
 
 /// Migration 118 section 7: an application session cannot write an `oauth.`
