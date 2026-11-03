@@ -511,13 +511,34 @@ pub async fn preview_claim_belief_on_frame(
     claim_id: Uuid,
     frame_id: Uuid,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
+    Ok(
+        preview_claim_belief_on_frame_vacating(conn, viewer, claim_id, frame_id)
+            .await?
+            .map(|(preview, _vacated)| preview),
+    )
+}
+
+/// [`preview_claim_belief_on_frame`], with whether a real run would VACATE
+/// the cache (ruling R-80) rather than write a fold: `Some((preview, true))`
+/// is the full-ignorance value a vacate writes. A dry run that must report a
+/// vacate as its own outcome (the R-173 calibration delta) reads the flag
+/// here instead of inferring it from the value.
+///
+/// # Errors
+/// Same failure modes as [`preview_claim_belief_on_frame`].
+pub async fn preview_claim_belief_on_frame_vacating(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+) -> Result<Option<(CombinedBeliefPreview, bool)>, String> {
     let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
         .ok_or_else(|| format!("frame {frame_id} not found"))?;
     let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
         .map_err(|e| format!("build frame {}: {e}", row.name))?;
-    Ok(compute_combined_belief(
+    compute_combined_belief(
         &mut *conn,
         viewer,
         claim_id,
@@ -525,8 +546,7 @@ pub async fn preview_claim_belief_on_frame(
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
     )
-    .await?
-    .map(|(preview, _vacated)| preview))
+    .await
 }
 
 /// [`preview_claim_belief_on_frame`] over the frame's stored rows as `adjust`
@@ -553,6 +573,41 @@ pub async fn preview_claim_belief_on_frame_adjusted<F>(
 where
     F: FnOnce(Vec<MassFunctionRow>) -> Vec<MassFunctionRow>,
 {
+    preview_claim_belief_on_frame_with_profile(
+        conn,
+        viewer,
+        claim_id,
+        frame_id,
+        BeliefProfile::served(),
+        adjust,
+    )
+    .await
+}
+
+/// [`preview_claim_belief_on_frame_adjusted`] folded under `base` in place of
+/// the served profile ([`BeliefProfile::served`]): the frame tier (its
+/// `belief_profile` object and per-frame keys) is layered over `base`
+/// exactly as the served fold layers it over the served profile. With
+/// `base = BeliefProfile::served()` it IS the adjusted preview.
+///
+/// Added for the R-173 calibration dry run, which folds each claim's owner
+/// frame under two global profiles (the shipped calibration and the empty
+/// vocabulary a process served when it could not load one) through this one
+/// entry point, so the two values differ only in the profile.
+///
+/// # Errors
+/// Same failure modes as [`preview_claim_belief_on_frame`].
+pub async fn preview_claim_belief_on_frame_with_profile<F>(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+    frame_id: Uuid,
+    base: &BeliefProfile,
+    adjust: F,
+) -> Result<Option<CombinedBeliefPreview>, String>
+where
+    F: FnOnce(Vec<MassFunctionRow>) -> Vec<MassFunctionRow>,
+{
     let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
         .await
         .map_err(|e| format!("frame get_by_id: {e}"))?
@@ -571,8 +626,36 @@ where
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
         adjust(stored),
+        // STUB (red): the base is not threaded through yet.
+        BeliefProfile::served(),
     )
     .await
+}
+
+/// The profile the fold of a claim on `frame_id` resolves when `base` is the
+/// global profile: `base`, then the frame tier (the frame's `belief_profile`
+/// object and its per-frame keys), as [`preview_claim_belief_on_frame_with_profile`]
+/// folds under it. Read-only.
+///
+/// # Errors
+/// The frame cannot be read, or is not visible to `viewer`.
+pub async fn frame_fold_profile(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+    base: &BeliefProfile,
+) -> Result<BeliefProfile, String> {
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, frame_id)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {frame_id} not found"))?;
+    Ok(fold_profile(
+        &mut *conn,
+        frame_id,
+        crate::belief_profile::overrides_in(&row.properties),
+        base,
+    )
+    .await)
 }
 
 /// Pure result of combining every BBA on a (claim, frame) pair: the same
@@ -1002,8 +1085,9 @@ pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) ->
 }
 
 /// [`compute_combined_belief`] over the given rows of (claim, frame) instead
-/// of the stored ones, under the same frame tier (`frame_overrides`). `None`
-/// when `all_rows` is empty.
+/// of the stored ones, under the same frame tier (`frame_overrides`) layered
+/// over the global profile `base` (the served profile on every write path).
+/// `None` when `all_rows` is empty.
 async fn compute_combined_belief_over(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1012,6 +1096,7 @@ async fn compute_combined_belief_over(
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
     all_rows: Vec<MassFunctionRow>,
+    base: &BeliefProfile,
 ) -> Result<Option<CombinedBeliefPreview>, String> {
     // Ruling R-22: what this fold computes is the claim's CACHED belief (or a
     // preview of it), which everyone who can read the claim is served, so it
@@ -1026,7 +1111,7 @@ async fn compute_combined_belief_over(
         return Ok(None);
     }
 
-    let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+    let profile = fold_profile(&mut *conn, frame_id, frame_overrides, base).await;
 
     // Discount each BBA, then combine. Same-source BBAs (one agent re-reading
     // one `source_url`) are folded cautiously into one before the Dempster
@@ -1087,12 +1172,14 @@ async fn compute_combined_belief_over(
 }
 
 /// The belief profile the combine of (claim, `frame_id`) folds under: the
-/// served (default) profile, then this frame's tier (its `belief_profile`
-/// object, `frame_overrides`, and the per-frame keys read here).
+/// global profile `base` (the served profile on every write path), then this
+/// frame's tier (its `belief_profile` object, `frame_overrides`, and the
+/// per-frame keys read here).
 async fn fold_profile(
     conn: &mut sqlx::PgConnection,
     frame_id: Uuid,
     frame_overrides: Option<&serde_json::Value>,
+    base: &BeliefProfile,
 ) -> BeliefProfile {
     // Phase 2 (issue #197): the combine path no longer trusts the
     // stored `source_strength` as the authority. Instead we compute
@@ -1123,7 +1210,7 @@ async fn fold_profile(
             .ok()
             .flatten();
 
-    let profile = BeliefProfile::served().resolve(
+    let profile = base.resolve(
         FrameTier {
             overrides: frame_overrides,
             intra_evidence_locality_factor: per_frame_intra,
@@ -1287,6 +1374,7 @@ async fn compute_combined_belief(
         frame,
         frame_overrides,
         rows,
+        BeliefProfile::served(),
     )
     .await?;
     // `None` with input on the frame: the scope rule left none of it.
@@ -1297,7 +1385,13 @@ async fn compute_combined_belief(
                 .await
                 .map_err(|e| format!("derivation scope read: {e}"))? =>
         {
-            let profile = fold_profile(&mut *conn, frame_id, frame_overrides).await;
+            let profile = fold_profile(
+                &mut *conn,
+                frame_id,
+                frame_overrides,
+                BeliefProfile::served(),
+            )
+            .await;
             let ignorance = MassFunction::vacuous(frame.clone());
             let mut preview = preview_of_combined(
                 &mut *conn, viewer, claim_id, frame_id, frame, &profile, &ignorance, 0.0, false,
