@@ -169,6 +169,11 @@ name = "belief_cache_bins"
 path = "tests/belief_cache_bins.rs"
 required-features = ["db"]
 
+[[test]]
+name = "recompute_claim_belief_snapshot"
+path = "tests/recompute_claim_belief_snapshot.rs"
+required-features = ["db"]
+
 # Cohort-v2 waves of `recompute_betp` as real processes (`db`-gated bins).
 [[test]]
 name = "recompute_betp_wave"

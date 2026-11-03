@@ -29,6 +29,25 @@
 //!     epigraph-recompute-belief --input /tmp/claim_ids.txt
 //!     epigraph-recompute-belief --stdin < /tmp/claim_ids.txt
 //!     epigraph-recompute-belief --input /tmp/claim_ids.txt --dry-run
+//!     epigraph-recompute-belief --input /tmp/claim_ids.txt \
+//!         --snapshot /path/wave-1.jsonl [--wave <name>]
+//!
+//! Rollback (`--snapshot <wave file>`): each claim is recomputed in ONE
+//! transaction that locks its row, reads its cache, recomputes, reads the
+//! cache back and, when it changed, appends and syncs a
+//! `belief_cache::WaveRecord` (`before` = the cache found, `written` = the
+//! cache left, `wave` = `--wave`, `at` = the run's start on the database
+//! clock) BEFORE it commits. So every committed write has a record, and
+//! `restore_belief_cache --from <wave file>` undoes exactly this run by
+//! compare-and-swap: a claim goes back to `before` only where it still holds
+//! exactly `written`, and a claim another writer changed since is reported
+//! `superseded_since_wave` and left alone. The wave file must be absent or
+//! empty (one file holds one run), and an empty `<wave file>.scoped.jsonl`
+//! sidecar is created next to it (this binary writes no scoped rows). A file
+//! that cannot be opened stops the run before any write; a record that cannot
+//! be written rolls its claim back and stops the run (exit 3), so no write
+//! lands unrecorded. Unchanged claims are not recorded; `claims.updated_at` is
+//! not part of the record. See `epigraph_cli::recompute_claim_belief`.
 //!
 //! Concurrency is `--concurrency` (default 8). Each task is one DB round-trip
 //! to fetch BBAs + one round-trip to write the recomputed belief. On a local
@@ -39,9 +58,11 @@ use clap::Parser;
 use futures::StreamExt as _;
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
+
+use epigraph_cli::recompute_claim_belief::{recompute_claim_recorded, ClaimRecomputeError};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,7 +86,24 @@ struct Cli {
     /// Print a progress line every N completions. Default 100.
     #[arg(long, default_value_t = 100)]
     progress_every: usize,
+    /// Wave file: record every cache write as a `belief_cache::WaveRecord`
+    /// (`{claim_id, before, written, wave, at}`) so `restore_belief_cache
+    /// --from <wave file>` can undo exactly this run by compare-and-swap. Must
+    /// be absent or empty (one wave file holds one run); a claim whose record
+    /// cannot be written is not written, and the run stops.
+    #[arg(long)]
+    snapshot: Option<PathBuf>,
+    /// The wave name every record carries. Default `recompute_claim_belief`.
+    #[arg(long, requires = "snapshot")]
+    wave: Option<String>,
 }
+
+/// The wave name a `--snapshot` run records when `--wave` is not given.
+const DEFAULT_WAVE: &str = "recompute_claim_belief";
+
+/// Exit code of a run stopped because a wave-file record could not be
+/// written (claims after it were not attempted).
+const EXIT_SNAPSHOT_FAILED: i32 = 3;
 
 #[tokio::main]
 async fn main() {
@@ -120,12 +158,37 @@ async fn run(
         return Ok(());
     }
 
+    // The wave file is opened BEFORE the first write, and `wave_at` is taken
+    // from the database clock in its own statement before it
+    // (`belief_cache::WaveRecord::at`). A file that cannot be opened, or that
+    // already holds a run's records, stops the run here with nothing written.
+    let log = match &cli.snapshot {
+        Some(path) => {
+            let at: chrono::DateTime<chrono::Utc> =
+                sqlx::query_scalar("SELECT now()").fetch_one(&pool).await?;
+            let wave = cli.wave.as_deref().unwrap_or(DEFAULT_WAVE);
+            let log = epigraph_cli::recompute_betp::WaveLog::open(path, wave, at)
+                .map_err(|e| format!("--snapshot: {e}"))?;
+            println!(
+                "wave file: {} (wave {wave}, wave_at {})",
+                path.display(),
+                at.to_rfc3339()
+            );
+            Some(log)
+        }
+        None => None,
+    };
+    let log = log.as_ref();
+
     let total = claim_ids.len();
     let done = Arc::new(AtomicUsize::new(0));
     let claims_with_work = Arc::new(AtomicUsize::new(0));
     let claims_empty = Arc::new(AtomicUsize::new(0));
     let frame_writes = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
+    let recorded = Arc::new(AtomicUsize::new(0));
+    let not_attempted = Arc::new(AtomicUsize::new(0));
+    let stopped = Arc::new(AtomicBool::new(false));
 
     // Bounded concurrent fan-out. Each claim may issue multiple per-frame
     // recomputes — bounding at the claim level keeps the pool ceiling
@@ -166,18 +229,36 @@ async fn run(
             let claims_empty = claims_empty.clone();
             let frame_writes = frame_writes.clone();
             let errors = errors.clone();
+            let recorded = recorded.clone();
+            let not_attempted = not_attempted.clone();
+            let stopped = stopped.clone();
             async move {
-                match recompute_one_claim_cached_belief(&pool, viewer, claim_id).await {
-                    Ok(written) => {
-                        if written > 0 {
+                if stopped.load(Ordering::SeqCst) {
+                    not_attempted.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                // Backlog 696d3a1c: the cache is ONE shared value, written from
+                // the claim's single owner frame, independent of frame names.
+                // An operator one-shot on the DSN the operator supplies (in
+                // practice a superuser, where a tenancy stamp is inert); each
+                // claim is one transaction on one connection.
+                match recompute_claim_recorded(&pool, viewer, claim_id, log).await {
+                    Ok(outcome) => {
+                        if outcome.recomputed {
                             claims_with_work.fetch_add(1, Ordering::Relaxed);
-                            frame_writes.fetch_add(written, Ordering::Relaxed);
+                            frame_writes.fetch_add(1, Ordering::Relaxed);
                         } else {
                             claims_empty.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if outcome.changed && log.is_some() {
+                            recorded.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
                         errors.fetch_add(1, Ordering::Relaxed);
+                        if matches!(e, ClaimRecomputeError::Record(_)) {
+                            stopped.store(true, Ordering::SeqCst);
+                        }
                         eprintln!("  {claim_id}: {e}");
                     }
                 }
@@ -205,36 +286,23 @@ async fn run(
         claims_empty.load(Ordering::Relaxed),
         errors.load(Ordering::Relaxed),
     );
+    if log.is_some() {
+        println!("recorded: {}", recorded.load(Ordering::Relaxed));
+    }
+    if stopped.load(Ordering::SeqCst) {
+        eprintln!(
+            "STOPPED: a wave file record could not be written; that claim was rolled back and \
+             {} claims were not attempted. Every committed write is recorded; restore with \
+             `restore_belief_cache --from <wave file>`, or fix the wave file's volume and re-run \
+             the rest against a NEW wave file.",
+            not_attempted.load(Ordering::Relaxed),
+        );
+        std::process::exit(EXIT_SNAPSHOT_FAILED);
+    }
     if errors.load(Ordering::Relaxed) > 0 {
         std::process::exit(2);
     }
     Ok(())
-}
-
-/// Recompute this claim's cached `claims.{belief, pl, betp, ...}` scalars from
-/// its owner frame (see the module doc).
-///
-/// Returns 1 if the claim's cached scalars were rewritten, 0 otherwise.
-async fn recompute_one_claim_cached_belief(
-    pool: &sqlx::PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-) -> Result<usize, String> {
-    // Backlog 696d3a1c: `claims.{belief, plausibility, mass_on_empty,
-    // pignistic_prob, mass_on_missing}` is ONE shared cache, not per-frame state.
-    // This used to enumerate every frame the claim had BBAs on and recompute each,
-    // which wrote that cache once per frame and let the alphabetically last one
-    // win — reliably clobbering the edge-derived `binary_truth` belief, since
-    // `binary_truth` sorts first. `recompute_claim_cached_belief` picks the single
-    // owning frame instead, independent of frame names.
-    // An operator one-shot on the DSN the operator supplies — in practice a
-    // superuser, where a tenancy stamp is inert. The acquire is mechanical: the
-    // recompute rides ONE connection instead of a checkout per statement.
-    let mut conn = pool.acquire().await.map_err(|e| e.to_string())?;
-    Ok(usize::from(
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, viewer, claim_id)
-            .await?,
-    ))
 }
 
 fn read_claim_ids(cli: &Cli) -> Result<Vec<Uuid>, Box<dyn std::error::Error>> {

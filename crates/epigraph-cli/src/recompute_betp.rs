@@ -525,6 +525,18 @@ impl WaveLog {
         self.at
     }
 
+    /// Record one claim-cache write under this run's own wave name (the
+    /// `recompute_claim_belief --snapshot` writer). Appended, flushed and
+    /// synced before it returns.
+    pub(crate) fn record_claim(
+        &self,
+        claim_id: Uuid,
+        before: CacheColumns,
+        written: CacheColumns,
+    ) -> Result<(), String> {
+        self.record(&self.wave, claim_id, before, written)
+    }
+
     fn record(
         &self,
         wave: &str,
@@ -585,7 +597,9 @@ pub struct WaveClaimOutcome {
     pub scoped_kept: usize,
 }
 
-async fn lock_cache(
+/// Lock `claim_id`'s row (`FOR UPDATE`) and read its cache columns, in the
+/// caller's transaction; `None` when the row is absent or not visible.
+pub(crate) async fn lock_cache(
     tx: &mut sqlx::PgConnection,
     claim_id: Uuid,
 ) -> Result<Option<CacheColumns>, String> {
