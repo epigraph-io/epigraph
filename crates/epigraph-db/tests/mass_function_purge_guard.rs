@@ -979,20 +979,27 @@ async fn applied_194(pool: &PgPool) -> bool {
 }
 
 /// The measurement behind [`MD5_117`]: below 194 the definer is 117's body on
-/// 117's (pre-190) path.
+/// slot 190's path. Slot 190 is in the set below 194, and its sweep changes
+/// the definer's `proconfig` only (`pg_catalog, public` -> `pg_catalog,
+/// public, pg_temp`), so the md5 is 117's either way.
 #[sqlx::test(migrations = false)]
 async fn the_cascade_definer_before_194_is_117s_body(pool: PgPool) {
     migrate_below_194(&pool).await;
     let (md5, config) = cascade_definer_facts(&pool).await;
     assert_eq!(md5, MD5_117, "md5(prosrc) of the definer below 194");
-    assert_eq!(config, vec!["search_path=pg_catalog, public".to_string()]);
+    assert_eq!(
+        config,
+        vec!["search_path=pg_catalog, public, pg_temp".to_string()],
+        "below 194 the definer is on slot 190's path"
+    );
 }
 
 /// (j) 194 refuses (55000, nothing changed) over a body whose md5 is not
 /// 117's, and over a `proconfig` other than the pre- and post-190 paths; it
 /// applies over the post-190 path (slot 190 changes `proconfig` only) and
-/// states `pg_catalog, public, pg_temp` either way. The pre-190 path is every
-/// fresh database's (each `#[sqlx::test]` above).
+/// states `pg_catalog, public, pg_temp` either way. The post-190 path is every
+/// fresh database's (slot 190 is below 194); the pre-190 path is
+/// [`j3_the_precondition_accepts_117s_body_on_the_pre_190_path`].
 #[sqlx::test(migrations = false)]
 async fn j_the_precondition_accepts_only_117s_body_on_the_two_paths(pool: PgPool) {
     migrate_below_194(&pool).await;
@@ -1070,6 +1077,41 @@ async fn j_the_precondition_accepts_only_117s_body_on_the_two_paths(pool: PgPool
     );
 }
 
+/// (j3) 194 applies over 117's own path (`pg_catalog, public`, the
+/// `proconfig` a database has where slot 190's sweep never ran or was undone),
+/// the other value SPEC §7.1 SF-19 admits, and states `pg_catalog, public,
+/// pg_temp` afterwards (SF-12: the re-body never keeps a path without
+/// `pg_temp`). A fresh database no longer reaches 194 on this path, because
+/// slot 190 is below it, so the fixture restores 117's path explicitly.
+#[sqlx::test(migrations = false)]
+async fn j3_the_precondition_accepts_117s_body_on_the_pre_190_path(pool: PgPool) {
+    migrate_below_194(&pool).await;
+    pool.execute(
+        format!("ALTER FUNCTION {CASCADE_DEFINER} SET search_path = pg_catalog, public").as_str(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cascade_definer_facts(&pool).await,
+        (
+            MD5_117.to_string(),
+            vec!["search_path=pg_catalog, public".to_string()]
+        ),
+        "fixture: 117's body on 117's (pre-190) path"
+    );
+    migrate_rest(&pool)
+        .await
+        .expect("194 applies over the pre-190 path");
+    assert!(applied_194(&pool).await);
+    let (md5, config) = cascade_definer_facts(&pool).await;
+    assert_ne!(md5, MD5_117, "194 re-bodied the definer");
+    assert_eq!(
+        config,
+        vec!["search_path=pg_catalog, public, pg_temp".to_string()],
+        "the re-body states pg_temp last over the pre-190 path too"
+    );
+}
+
 /// (j2) 194 refuses (55000, nothing created) when the definer it re-bodies
 /// does not exist at all: an absent function has no md5 to match.
 #[sqlx::test(migrations = false)]
@@ -1091,7 +1133,7 @@ async fn j2_the_precondition_refuses_an_absent_definer(pool: PgPool) {
     );
 }
 
-/// At head (over the pre-190 path every fresh database has), the re-body
+/// At head (194 applied over slot 190's path, as on every fresh database), the re-body
 /// states `pg_catalog, public, pg_temp` (SPEC §7.1 SF-12) and the new objects
 /// are on 172's form.
 #[sqlx::test(migrations = "../../migrations")]
