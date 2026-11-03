@@ -178,5 +178,102 @@ class FrameArity(unittest.TestCase):
         self.assertIn("binary", str(cm.exception))
 
 
+class RollbackCursor:
+    """Answers the rollback's retracted-row SELECT with `retracted` and its
+    count with `live_count`; records every statement and the DELETE's params.
+    Nothing here touches a database."""
+
+    def __init__(self, retracted, live_count, delete_rowcount):
+        self._retracted = [{"id": r} for r in retracted]
+        self._live_count = live_count
+        self._delete_rowcount = delete_rowcount
+        self._pending = None
+        self.statements = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        self.statements.append((s, params))
+        if s.startswith("SELECT id::text AS id FROM mass_functions"):
+            self._pending = ("all", self._retracted)
+        elif s.startswith("SELECT COUNT(*) AS n FROM mass_functions"):
+            self._pending = ("one", {"n": self._live_count})
+        elif s.startswith("DELETE FROM mass_functions"):
+            self.rowcount = self._delete_rowcount
+        elif s.startswith("DELETE FROM claim_frames"):
+            self.rowcount = 1
+        else:
+            raise AssertionError(f"unexpected SQL in test: {s[:80]}")
+
+    def fetchall(self):
+        kind, val = self._pending
+        assert kind == "all"
+        return val
+
+    def fetchone(self):
+        kind, val = self._pending
+        assert kind == "one"
+        return val
+
+
+class RollbackKeepsRetractedRows(unittest.TestCase):
+    """SPEC section 11 phase 1, K4b: migration 194 (H10) refuses any delete of a
+    RETRACTED mass function outside its audited purge definer, so the
+    rollback's DELETE must skip retracted ids (and report them) instead of
+    failing the whole rollback with SR09.
+
+    These pin the SQL text and the report wording only: the cursor's counts
+    are canned, so no count here is asserted back. The database behaviour is
+    test_migrate_provenance_bba_db.py's."""
+
+    def manifest(self, ids):
+        path = Path(self.tmp.name) / "run.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for i in ids:
+                fh.write(json.dumps({"mass_function_id": i, "claim_id": str(uuid.uuid4()),
+                                     "frame_id": FRAME, "created_assignment": False}) + "\n")
+        return str(path)
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.live = [str(uuid.uuid4()) for _ in range(2)]
+        self.retracted = str(uuid.uuid4())
+        self.path = self.manifest(self.live + [self.retracted])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_rollback(self, execute):
+        cur = RollbackCursor([self.retracted], live_count=2, delete_rowcount=2)
+        out = io.StringIO()
+        old = sys.stdout
+        sys.stdout = out
+        try:
+            deleted = mpb.rollback(cur, argparse.Namespace(execute=execute), self.path)
+        finally:
+            sys.stdout = old
+        return cur, deleted, out.getvalue()
+
+    def test_the_delete_skips_retracted_rows_and_reports_them(self):
+        cur, deleted, out = self.run_rollback(execute=True)
+        deletes = [(s, p) for s, p in cur.statements if s.startswith("DELETE FROM mass_functions")]
+        self.assertEqual(len(deletes), 1, cur.statements)
+        sql, params = deletes[0]
+        self.assertIn("AND retracted_at IS NULL", sql)
+        self.assertIn(self.retracted, out, "the skipped id is reported")
+        self.assertIn("skipped 1 retracted", out)
+        self.assertNotIn("already absent", out, "a skipped row is not an absent row")
+
+    def test_the_dry_run_counts_only_live_rows_and_names_the_retracted_ones(self):
+        cur, deleted, out = self.run_rollback(execute=False)
+        counts = [s for s, _ in cur.statements if s.startswith("SELECT COUNT(*) AS n FROM mass_functions")]
+        self.assertEqual(len(counts), 1, cur.statements)
+        self.assertIn("AND retracted_at IS NULL", counts[0])
+        self.assertIn("would skip 1 retracted", out)
+        self.assertIn(self.retracted, out)
+        self.assertFalse(any(s.startswith("DELETE") for s, _ in cur.statements))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4003,3 +4003,107 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
         );
     }
 }
+
+/// Migration 194 (H10; SPEC §2.8, §7.1 "New tables"): the purge-grant table is
+/// no application role's to read or write (077's default privileges would
+/// otherwise grant `epigraph_app` everything on a new table), the maintenance
+/// role holds exactly what its two definers need, the table stays owned by
+/// the migration runner, and the purge definer is executable by the
+/// maintenance role alone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_maintenance_only(
+    pool: PgPool,
+) {
+    let table = "public.mass_function_purge_grants";
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(relowner)::text FROM pg_class WHERE oid = $1::regclass",
+    )
+    .bind(table)
+    .fetch_one(&pool)
+    .await
+    .expect("migration 194 creates the purge-grant table");
+    assert_ne!(
+        owner, "epigraph_maintenance",
+        "the table stays the migration runner's"
+    );
+    assert_ne!(owner, "epigraph_app");
+
+    for privilege in [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "TRUNCATE",
+        "REFERENCES",
+        "TRIGGER",
+    ] {
+        for role in ["epigraph_app", "public"] {
+            let held: bool = sqlx::query_scalar("SELECT has_table_privilege($1, $2, $3)")
+                .bind(role)
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert!(!held, "{role} must hold no {privilege} on {table}");
+        }
+        let maintenance: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('epigraph_maintenance', $1, $2)")
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+        assert_eq!(
+            maintenance,
+            matches!(privilege, "SELECT" | "INSERT" | "DELETE"),
+            "epigraph_maintenance {privilege} on {table}"
+        );
+    }
+    let column_level: bool = sqlx::query_scalar(
+        "SELECT has_any_column_privilege('epigraph_app', $1, 'SELECT') \
+             OR has_any_column_privilege('epigraph_app', $1, 'INSERT') \
+             OR has_any_column_privilege('epigraph_app', $1, 'UPDATE')",
+    )
+    .bind(table)
+    .fetch_one(&pool)
+    .await
+    .expect("column privilege");
+    assert!(
+        !column_level,
+        "no column-level grant to epigraph_app on {table}"
+    );
+
+    for (signature, app_executes) in [
+        ("public.epigraph_purge_mass_functions(uuid[], text)", false),
+        ("public.epigraph_mf_purge_granted(uuid)", true),
+    ] {
+        let (secdef, owner, acl): (bool, String, Option<String>) = sqlx::query_as(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, p.proacl::text \
+               FROM pg_proc p WHERE p.oid = $1::regprocedure",
+        )
+        .bind(signature)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{signature} must exist (migration 194): {e}"));
+        assert!(secdef, "{signature} is SECURITY DEFINER");
+        assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        assert!(
+            acl.is_some(),
+            "{signature} carries an explicit ACL (no PUBLIC default)"
+        );
+        for (role, expected) in [
+            ("public", false),
+            ("epigraph_app", app_executes),
+            ("epigraph_maintenance", true),
+        ] {
+            let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+                .bind(role)
+                .bind(signature)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
+            assert_eq!(can, expected, "{role} EXECUTE {signature}");
+        }
+    }
+}

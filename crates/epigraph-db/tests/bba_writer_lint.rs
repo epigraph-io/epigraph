@@ -62,7 +62,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("scripts/migrate_provenance_bba.py", "rollback", 1, "SPEC §4.1 W13 script: deletes the seed BBAs it inserted"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "<module>", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "main", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
-    ("scripts/tests/test_migrate_provenance_bba.py", "execute", 1, "a test double that matches the statement text of migrate_provenance_bba.py; writes nothing"),
+    ("scripts/tests/test_migrate_provenance_bba.py", "execute", 2, "two test doubles (seed and rollback) that match the statement text of migrate_provenance_bba.py; write nothing"),
+    ("scripts/tests/test_migrate_provenance_bba.py", "test_the_delete_skips_retracted_rows_and_reports_them", 1, "selects the rollback's recorded DELETE text from a test double to assert its retracted_at predicate; writes nothing"),
+    ("scripts/tests/test_migrate_provenance_bba_db.py", "_seed_bba", 1, "the K4b DB arm's fixture: one seed BBA exactly as migrate() writes it, in the CI-provisioned _test database only"),
 ];
 
 /// Is the text before `at` the `fn` keyword (a declaration, not a call)?

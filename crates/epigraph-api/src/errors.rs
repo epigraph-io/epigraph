@@ -784,7 +784,10 @@ impl From<DbError> for ApiError {
             }
             // Migration 176 (backlog e2c22c7c): a designed refusal whose
             // message opens with a code 176 introduced
-            // (`epigraph_db::CALLER_REFUSAL_CODES`). Each of those messages was
+            // (`epigraph_db::CALLER_REFUSAL_CODES`) or a later slot's reviewed
+            // supersede code (`epigraph_db::SUPERSEDE_REFUSAL_CODES`, e.g.
+            // migration 194's SR09); `caller_refusal_code` consults both
+            // lists. Each of those messages was
             // reviewed for what it discloses, so it is the caller's to read;
             // the class follows the SQLSTATE, which 176 kept. Keyed on the
             // listed codes, not on the code SHAPE: an older coded refusal, and

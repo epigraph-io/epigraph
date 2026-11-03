@@ -81,7 +81,9 @@ pub use pool::{
     ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
     MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
-pub use refusal_codes::{caller_refusal_code, CALLER_REFUSAL_CODES};
+pub use refusal_codes::{
+    caller_refusal_code, supersede_refusal_code, CALLER_REFUSAL_CODES, SUPERSEDE_REFUSAL_CODES,
+};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};

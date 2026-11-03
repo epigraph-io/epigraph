@@ -55,6 +55,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-cli/src/belief_cache.rs", "downstream_edges", 1, "restore planner: finds edges whose BBA was WRITTEN after a wave cutoff (a write timestamp, not a fold)"),
     ("crates/epigraph-cli/src/bin/backfill_factors.rs", "const EVIDENCE_QUERY", 1, "existence gate: claims holding NO mass function row; a retracted row still counts as present, so the backfill never re-derives a BBA that was retracted"),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 4, "legacy DEKG migration tool: mass-sum validation, missing-row gate and CONTRIBUTES_TO edge derivation over every stored row; no belief fold"),
+    ("crates/epigraph-cli/src/operator/delete_frames.rs", "plan", 1, "the frame delete's purge list: selects exactly the RETRACTED rows on the frames (retracted_at IS NOT NULL), which migration 194 lets only the purge definer delete; no fold"),
     ("crates/epigraph-cli/src/operator/hide.rs", "print_surfaces", 1, "operator hide report: counts every stored row naming a hidden evidence row, retracted or not (the rows the hide leaves in place)"),
     ("crates/epigraph-cli/src/recompute_betp.rs", "select_wave_cohort", 1, "recompute cohort enumerator: a claim whose every BBA is retracted still enters, so the single atom-cache writer sees its (empty) fold"),
     ("crates/epigraph-cli/src/recompute_betp.rs", "template_row_ids", 1, "ids of ingest-template rows, used only to drop them from rows a filtered reader already returned"),
