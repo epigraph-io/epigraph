@@ -155,9 +155,10 @@ pub async fn assess_claim(
 
     // ── 2. Load calibration config ───────────────────────────────────────
     //
-    // Resolved like every other DS path (`CALIBRATION_PATH`, then the
-    // workspace root), not cwd-relative: `Path::new("calibration.toml")` only
-    // worked when the server happened to start in the repo root.
+    // Resolved like every other DS path (`CALIBRATION_PATH`, else the
+    // compiled-in workspace calibration.toml), not cwd-relative:
+    // `Path::new("calibration.toml")` only worked when the server happened to
+    // start in the repo root.
     let calibration_config =
         CalibrationConfig::from_workspace_root().map_err(|e| ApiError::InternalError {
             message: format!("Failed to load calibration.toml: {e}"),

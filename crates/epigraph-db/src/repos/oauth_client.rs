@@ -321,6 +321,9 @@ impl OAuthClientRepository {
         // Migration 118: the same UPDATE, in `epigraph_oauth_client_approve`
         // (a SECURITY DEFINER that also writes an `oauth.client_approved`
         // security event); the application role holds no UPDATE here.
+        // Migration 188: nor EXECUTE on the definer, so `pool` must be a
+        // maintenance (or privileged) pool; on the application role this
+        // fails with 42501 and approves nothing.
         sqlx::query("SELECT public.epigraph_oauth_client_approve($1, $2, $3)")
             .bind(id)
             .bind(granted_scopes)

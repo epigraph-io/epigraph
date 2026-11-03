@@ -175,16 +175,29 @@ async fn ingest_as(server: &EpiGraphMcpFull, auth: &AuthContext, canonical: &str
 }
 
 /// stdio `add_step`: exactly one `AUTHORED` edge, from this server's pinned
-/// agent, to the new step claim, which the system agent still authors.
+/// agent, to the new step claim, which the system agent still authors. The
+/// workflow is the pinned agent's own (a stdio ingest records it as the
+/// submitter): since backlog 222289f3 stdio `add_step` admits only the
+/// submitter or its operator.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_stdio_add_step_records_the_pinned_agent_as_author(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
-    let (h, _) = fixture::seed_human_operator(&pool, "h").await;
-    ingest_as(&server, &token(h), "ae-stdio", &["ae-stdio op"]).await;
     let viewer = tools::viewer::request_viewer(&server, None)
         .await
         .expect("stdio viewer");
     let pinned = viewer.principal().expect("the server's pinned agent");
+    tools::workflow_ingest::ingest_workflow(
+        &server,
+        &viewer,
+        IngestWorkflowParams {
+            extraction: extraction("ae-stdio", "gen0", &["ae-stdio op"]),
+            tenancy: None,
+            embed: None,
+        },
+        None,
+    )
+    .await
+    .expect("stdio ingest");
 
     let res = tools::step_ops::add_step(&server, &viewer, add("ae-stdio", "a stdio step"), None)
         .await
@@ -197,7 +210,6 @@ async fn a_stdio_add_step_records_the_pinned_agent_as_author(pool: PgPool) {
     );
     let author = claim_author(&pool, step).await;
     assert_ne!(author, pinned, "claims.agent_id stays the system agent");
-    assert_ne!(author, h);
 }
 
 /// HTTP `add_step` by the submitting human: one edge from that principal; the

@@ -447,6 +447,7 @@ pub async fn report_for_caller(
             );
             return CascadeReport {
                 invalidated_bbas: report.invalidated_bbas,
+                retracted_key_kept: report.retracted_key_kept,
                 errors: vec![
                     "the cascade report could not be filtered to the caller's view; the \
                      details are in the audit row"
@@ -480,6 +481,7 @@ pub async fn report_for_caller(
                 }
             })
             .collect(),
+        retracted_key_kept: report.retracted_key_kept,
     }
 }
 
@@ -667,6 +669,7 @@ async fn record_belief(
     details["belief"] = belief_counts(report);
     let full = serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
@@ -720,6 +723,7 @@ async fn record_belief(
 fn belief_counts(report: &CascadeReport) -> serde_json::Value {
     serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets.len(),
         "recomputed": report.recomputed.len(),
         "unbacked": report.unbacked.len(),
@@ -823,6 +827,7 @@ pub async fn apply_after_dedup(
             "false_bindings_not_copied": r.skipped_false_bindings,
             "bbas_pooled": r.pooled_bbas.len(),
             "bbas_kept_on_duplicate": r.kept_on_duplicate.len(),
+            "bbas_kept_on_duplicate_by_retracted_holder": r.kept_on_duplicate_by_retracted_holder.len(),
         }),
         record: serde_json::to_value(&r.revert).ok()
     );
@@ -897,7 +902,10 @@ impl std::fmt::Display for UnmarkRefusal {
 /// whose reversal failed would leave a current claim with its edges and BBAs
 /// still on the canonical. The request paths therefore establish the caller's
 /// write authority FIRST, by running the same act on the caller's stamped
-/// transaction and rolling it back.
+/// transaction and rolling it back. Under operator decision D9 no request
+/// path holds that connection, so in production the un-mark runs from the
+/// `unmark_duplicate` operator CLI (epigraph-cli), which calls this with the
+/// maintenance session's viewer as both admin and caller.
 ///
 /// A canonical superseded or consolidated since the mark is followed to the
 /// current one, and the duplicate is restored against it (operator ruling

@@ -386,6 +386,7 @@ pub async fn store_workflow(
         &decision,
     )
     .await?;
+    let caller_reads_row = caller_reads_ingested_row(&mut tx, &viewer, &result).await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -398,33 +399,29 @@ pub async fn store_workflow(
         let wf_id = result.workflow_id;
         embed_inserted_workflow_claims(&state, embedder.as_ref(), "workflows", &result.inserted)
             .await;
-        // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
-        match embedder.generate(&request.goal).await {
-            Ok(qvec) => {
-                store_workflow_goal_embedding(&state, "workflows", wf_id, &qvec).await;
-            }
-            Err(e) => {
-                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
+        // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
+        // never into a row the caller cannot read (backlog c831df4a).
+        if caller_reads_row {
+            match embedder.generate(&request.goal).await {
+                Ok(qvec) => {
+                    store_workflow_goal_embedding(&state, "workflows", wf_id, &qvec).await;
+                }
+                Err(e) => {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
+                }
             }
         }
     }
 
     // Emit event
-    let _ = epigraph_db::EventRepository::insert(
-        &state.db_pool,
-        "workflow.created",
-        None,
-        &serde_json::json!({
-            "workflow_id": result.workflow_id,
-            "canonical_name": result.canonical_name,
-            "goal": request.goal,
-            "step_count": request.steps.len(),
-            "already_ingested": result.already_ingested,
-        }),
-    )
-    .await;
-
-    Ok(Json(serde_json::json!({
+    let mut event = serde_json::json!({
+        "workflow_id": result.workflow_id,
+        "canonical_name": result.canonical_name,
+        "goal": request.goal,
+        "step_count": request.steps.len(),
+        "already_ingested": result.already_ingested,
+    });
+    let mut body = serde_json::json!({
         "workflow_id": result.workflow_id,
         "canonical_name": result.canonical_name,
         "goal": request.goal,
@@ -432,7 +429,47 @@ pub async fn store_workflow(
         "step_count": request.steps.len(),
         "claims_ingested": result.claims_ingested,
         "already_ingested": result.already_ingested,
-    })))
+    });
+    if !caller_reads_row {
+        omit_workflow_id(&mut event);
+        omit_workflow_id(&mut body);
+    }
+    let _ = epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
+        .await;
+
+    Ok(Json(body))
+}
+
+/// Whether the caller reads the row an ingest reports (backlog c831df4a). A
+/// fresh ingest created it for the caller. A re-ingest reports the EXISTING
+/// row, which the ingest system agent's stamp found and the caller may not
+/// read (a group plan outside its groups); then the answer leaves its id out,
+/// as the MCP twin does (`tools/workflow_ingest.rs`). Read with the caller's
+/// viewer on the ingest's own transaction, before it commits.
+#[cfg(feature = "db")]
+async fn caller_reads_ingested_row(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::Viewer,
+    result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
+) -> Result<bool, ApiError> {
+    if !result.already_ingested {
+        return Ok(true);
+    }
+    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, viewer, result.workflow_id)
+        .await
+        .map(|t| t.is_some())
+        .map_err(|e| ApiError::InternalError {
+            message: format!("workflow ingest: could not read the workflow as the caller: {e}"),
+        })
+}
+
+/// Drop `workflow_id` from an ingest answer about a row the caller cannot
+/// read ([`caller_reads_ingested_row`]).
+#[cfg(feature = "db")]
+fn omit_workflow_id(body: &mut serde_json::Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("workflow_id");
+    }
 }
 
 /// Extract behavioral metadata from a WorkflowRecallResult's properties JSONB.
@@ -1775,7 +1812,7 @@ pub async fn evolve_step(
     // Workflow authority over every workflow executing the parent's
     // step lineage, checked for the SAME principal the step is authored as,
     // on the act's own transaction and before it, so a refusal writes nothing.
-    let grants = require_api_lineage_authority(&mut tx, &auth, agent, parent_id).await?;
+    let grants = require_api_lineage_authority(&mut tx, &auth, &viewer, agent, parent_id).await?;
     let result = epigraph_db::ClaimRepository::evolve_step_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(parent_id),
@@ -1808,6 +1845,20 @@ pub async fn evolve_step(
         // parent by raising at WITH CHECK, not with a zero-row retire.
         e @ epigraph_db::DbError::WriteRefused { .. } => ApiError::from(e),
         e if e.is_write_authority_refusal() => ApiError::from(e),
+        // A parent the caller can READ but not write (backlog 50aa4027): the
+        // claims tenancy policy refuses the retire or the successor INSERT at
+        // its WITH CHECK (42501, the transaction aborted, nothing written). A
+        // denial, 403, as `versioning.rs::supersede_claim` answers it.
+        e if crate::errors::db_is_insufficient_privilege(&e) => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "evolve_step",
+                claim = %parent_id,
+                error = %e,
+                "the database refused the step evolution"
+            );
+            crate::errors::write_refused("step")
+        }
         other => ApiError::InternalError {
             message: other.to_string(),
         },
@@ -2083,6 +2134,7 @@ pub async fn deprecate_workflow(
 /// agents can answer "which workflow works best for goals like THIS one?"
 #[cfg(feature = "db")]
 pub async fn record_behavioral_execution(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path(workflow_id): Path<Uuid>,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
@@ -2098,20 +2150,46 @@ pub async fn record_behavioral_execution(
         })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
-    // Verify the referenced workflow exists
-    let _exists = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM claims WHERE id = $1 AND 'workflow' = ANY(labels)",
-    )
-    .bind(workflow_id)
-    .fetch_optional(&state.db_pool)
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to check workflow: {e}"),
-    })?
-    .ok_or(ApiError::NotFound {
-        entity: "workflow".into(),
-        id: workflow_id.to_string(),
-    })?;
+    // The referenced workflow must be one the CALLER can read (backlog
+    // 08061583). This was `SELECT id FROM claims WHERE id = $1 AND 'workflow'
+    // = ANY(labels)` on the raw pool: on the application role an unstamped
+    // session reads public rows only, so a member's own group-private
+    // workflow answered 404, and on a session that bypasses row security a
+    // hidden workflow answered differently from a missing one. Now it is
+    // `deprecate_workflow`'s read: the caller's viewer-stamped connection, a
+    // workflow-labelled claim, and the SAME 404 for a hidden, unlabelled or
+    // missing id.
+    {
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "record_behavioral_execution",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = epigraph_db::ClaimRepository::get_by_id_with_labels(
+            &mut *read,
+            &viewer,
+            epigraph_core::ClaimId::from_uuid(workflow_id),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to check workflow: {e}"),
+        })?;
+        match found {
+            Some((_, labels)) if labels.iter().any(|l| l == "workflow") => {}
+            _ => {
+                return Err(ApiError::NotFound {
+                    entity: "workflow".into(),
+                    id: workflow_id.to_string(),
+                })
+            }
+        }
+    }
 
     // Attempt to generate a goal embedding if an embedder is available
     let mut embedding_pgvec: Option<String> = None;
@@ -2236,6 +2314,12 @@ pub async fn ingest_workflow(
         tenancy,
         embed,
     } = request;
+    // Supersede SPEC K12a: a `supersedes` relationship is the act's alone.
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(|reason| ApiError::ValidationError {
+            field: "relationships".to_string(),
+            reason,
+        })?;
     let declared_group = tenancy.map(|t| t.owner_group_id);
     // The caller's OWN membership of a declared group, before anything is
     // begun (`require_caller_writes_group`). A viewer with no principal names
@@ -2278,6 +2362,7 @@ pub async fn ingest_workflow(
         &decision,
     )
     .await?;
+    let caller_reads_row = caller_reads_ingested_row(&mut tx, &viewer, &result).await?;
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
@@ -2301,13 +2386,16 @@ pub async fn ingest_workflow(
             &result.inserted,
         )
         .await;
-        // Also embed into workflows.goal_embedding for find_workflow_hierarchical.
-        match embedder.generate(&extraction.source.goal).await {
-            Ok(qvec) => {
-                store_workflow_goal_embedding(&state, "workflows/ingest", wf_id, &qvec).await;
-            }
-            Err(e) => {
-                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
+        // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
+        // never into a row the caller cannot read (backlog c831df4a).
+        if caller_reads_row {
+            match embedder.generate(&extraction.source.goal).await {
+                Ok(qvec) => {
+                    store_workflow_goal_embedding(&state, "workflows/ingest", wf_id, &qvec).await;
+                }
+                Err(e) => {
+                    tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
+                }
             }
         }
     }
@@ -2322,6 +2410,9 @@ pub async fn ingest_workflow(
         "relationships_created": result.relationship_edges_created,
         "already_ingested": result.already_ingested,
     });
+    if !caller_reads_row {
+        omit_workflow_id(&mut body);
+    }
     if declared_group.is_some() {
         body["reused_items"] = result
             .reused_items
@@ -2870,7 +2961,9 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> ApiError {
             message: "workflow has no level-1 phase claim".into(),
         },
         E::Invalid(msg) => ApiError::BadRequest { message: msg },
-        e @ (E::ChainRewireRefused { .. } | E::StepNotWritable { .. }) => ApiError::Forbidden {
+        e @ (E::ChainRewireRefused { .. }
+        | E::StepNotWritable { .. }
+        | E::GroupNotWritable { .. }) => ApiError::Forbidden {
             reason: e.to_string(),
         },
         E::Repo(db) if db.is_write_authority_refusal() => ApiError::from(db),
@@ -2936,13 +3029,38 @@ impl ApiWorkflowGrant {
 /// no record (written before batch H-b) is platform corpus (U005, default
 /// decision A): only the audited admin arm admits it, and a caller with no
 /// token is refused.
+///
+/// Every REFUSAL to a caller whose `viewer` cannot READ the row is
+/// `not_found()`, the call site's answer for a workflow that does not exist,
+/// never text naming the row or its submitter (backlog c831df4a, ruling
+/// R-100). `conn` is often the ingest system agent's stamp, which reads groups
+/// the caller does not, so the caller's own view decides what it is told. It
+/// does not decide who is admitted: the ruling masks answers and changes no
+/// authority, so the arms run exactly as before.
 #[cfg(feature = "db")]
 async fn workflow_authority(
     conn: &mut sqlx::PgConnection,
     auth: Option<&crate::middleware::bearer::AuthContext>,
+    viewer: &epigraph_db::Viewer,
     caller: Option<Uuid>,
     workflow_id: Uuid,
+    not_found: &(dyn Fn() -> ApiError + Send + Sync),
 ) -> Result<ApiWorkflowGrant, ApiError> {
+    // The caller's view words refusals only (backlog c831df4a); admission is
+    // unchanged.
+    let view = epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut *conn, viewer, workflow_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not read the workflow as the caller: {e}"),
+        })?;
+    let readable = view.is_some();
+    let refuse = |reason: String| {
+        if readable {
+            ApiError::Forbidden { reason }
+        } else {
+            not_found()
+        }
+    };
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
         .map_err(|e| ApiError::InternalError {
@@ -2953,23 +3071,31 @@ async fn workflow_authority(
     // match and no operator to derive, so the only arm is the audited admin
     // arm; with no token there is none, and the caller is refused. When the
     // custodian role lands (#529), its check replaces `claims:admin` here.
+    // A GROUP row with no record (a plan migration 183 backfilled into its
+    // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
-        let subject = format!(
-            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
-             written before batch H-b)"
-        );
-        if api_admin_arm(conn, auth, caller, &subject).await? {
+        let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
+        let subject = if group_row {
+            format!(
+                "workflow {workflow_id} has no recorded submitter (a group workflow written \
+                 before batch H-b)"
+            )
+        } else {
+            format!(
+                "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
+                 written before batch H-b)"
+            )
+        };
+        if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
             return Ok(ApiWorkflowGrant {
                 owner: None,
                 arm: ApiWorkflowArm::Admin,
             });
         }
-        return Err(ApiError::Forbidden {
-            reason: format!(
-                "{subject}; it is mutable only through the audited claims:admin path, and the \
-                 caller holds no claims:admin. Nothing was written."
-            ),
-        });
+        return Err(refuse(format!(
+            "{subject}; it is mutable only through the audited claims:admin path, and the caller \
+             holds no claims:admin. Nothing was written."
+        )));
     };
     let allowed = |arm| ApiWorkflowGrant {
         owner: Some(owner),
@@ -2990,16 +3116,13 @@ async fn workflow_authority(
         }
     }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    if api_admin_arm(conn, auth, caller, &subject).await? {
+    if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
         return Ok(allowed(ApiWorkflowArm::Admin));
     }
-    Err(ApiError::Forbidden {
-        reason: format!(
-            "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-             submitter, its submitter's operator, nor a live claims:admin holder. Nothing was \
-             written."
-        ),
-    })
+    Err(refuse(format!(
+        "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
+         submitter, its submitter's operator, nor a live claims:admin holder. Nothing was written."
+    )))
 }
 
 /// The PROVENANCE of a write admitted through the submitter or operator arm
@@ -3050,13 +3173,15 @@ async fn record_api_caller_workflow_write(
 /// record (migration 111's predicate), never the scope alone. `Ok(true)`:
 /// admitted. `Ok(false)`: no token, no principal, or no `claims:admin` scope.
 /// A `claims:admin` token whose client record grants none is refused ADM02,
-/// with `subject` naming the workflow.
+/// through `refuse`, with `subject` naming the workflow (masked by `refuse`
+/// for a caller that cannot read the row).
 #[cfg(feature = "db")]
 async fn api_admin_arm(
     conn: &mut sqlx::PgConnection,
     auth: Option<&crate::middleware::bearer::AuthContext>,
     caller: Option<Uuid>,
     subject: &str,
+    refuse: &(dyn Fn(String) -> ApiError + Send + Sync),
 ) -> Result<bool, ApiError> {
     let (Some(a), Some(caller)) = (auth, caller) else {
         return Ok(false);
@@ -3077,13 +3202,11 @@ async fn api_admin_arm(
     if live {
         return Ok(true);
     }
-    Err(ApiError::Forbidden {
-        reason: format!(
-            "{subject}; the token carries claims:admin, but its client record grants no live \
-             claims:admin to this principal, so the audited admin path refused it (ADM02). \
-             Nothing was written."
-        ),
-    })
+    Err(refuse(format!(
+        "{subject}; the token carries claims:admin, but its client record grants no live \
+         claims:admin to this principal, so the audited admin path refused it (ADM02). Nothing \
+         was written."
+    )))
 }
 
 /// Record a cross-owner workflow write admitted through the audited admin arm
@@ -3130,6 +3253,7 @@ async fn audit_api_admin_workflow_write(
 async fn require_api_workflow_authority(
     conn: &mut sqlx::PgConnection,
     auth: &crate::middleware::bearer::AuthContext,
+    viewer: &epigraph_db::Viewer,
     canonical_name: &str,
 ) -> Result<Option<(Uuid, ApiWorkflowGrant)>, ApiError> {
     let head = epigraph_db::WorkflowRepository::head_by_canonical(&mut *conn, canonical_name)
@@ -3140,7 +3264,15 @@ async fn require_api_workflow_authority(
     let Some(head) = head else {
         return Ok(None);
     };
-    let grant = workflow_authority(conn, Some(auth), auth.agent_id, head).await?;
+    // A head the caller cannot read is answered as the executor answers an
+    // unknown name (backlog c831df4a).
+    let not_found = || {
+        map_step_err(epigraph_ingest_executor::StepOpError::WorkflowNotFound(
+            canonical_name.to_string(),
+        ))
+    };
+    let grant =
+        workflow_authority(conn, Some(auth), viewer, auth.agent_id, head, &not_found).await?;
     Ok(Some((head, grant)))
 }
 
@@ -3176,6 +3308,7 @@ async fn require_api_workflow_authority(
 async fn require_api_lineage_authority(
     conn: &mut sqlx::PgConnection,
     auth: &crate::middleware::bearer::AuthContext,
+    viewer: &epigraph_db::Viewer,
     caller: Uuid,
     parent: Uuid,
 ) -> Result<Vec<(Uuid, ApiWorkflowGrant)>, ApiError> {
@@ -3187,9 +3320,24 @@ async fn require_api_lineage_authority(
                     "evolve_step: could not read the workflows executing the step's lineage: {e}"
                 ),
             })?;
+    // A workflow the caller cannot read that executes the lineage (a group
+    // plan reusing a public step) is answered as an unknown parent, the act's
+    // own `NotFound` answer, never by its id (backlog c831df4a).
+    let not_found = || ApiError::NotFound {
+        entity: "Claim".into(),
+        id: parent.to_string(),
+    };
     let mut grants = Vec::with_capacity(workflows.len());
     for workflow in workflows {
-        let grant = workflow_authority(&mut *conn, Some(auth), Some(caller), workflow).await?;
+        let grant = workflow_authority(
+            &mut *conn,
+            Some(auth),
+            viewer,
+            Some(caller),
+            workflow,
+            &not_found,
+        )
+        .await?;
         grants.push((workflow, grant));
     }
     Ok(grants)
@@ -3308,6 +3456,16 @@ async fn workflow_ingest_submitter(
     let mut inherited: Option<Option<Uuid>> = None;
     let mut admin = false;
     let mut grants = Vec::with_capacity(2);
+    // An anchor the caller cannot read (a lineage head or linked parent in a
+    // group it is not in) is refused without naming it (backlog c831df4a), in
+    // the MCP twin's words.
+    let not_found = || ApiError::Forbidden {
+        reason: format!(
+            "workflow_ingest: canonical_name '{}' (generation {}) extends a workflow lineage \
+             this caller cannot read. Nothing was written.",
+            extraction.source.canonical_name, extraction.source.generation
+        ),
+    };
     if creating {
         let mut checked: Vec<Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -3318,7 +3476,7 @@ async fn workflow_ingest_submitter(
                 continue;
             }
             checked.push(anchor);
-            let grant = workflow_authority(conn, auth, caller, anchor).await?;
+            let grant = workflow_authority(conn, auth, viewer, caller, anchor, &not_found).await?;
             admin |= grant.is_admin();
             inherited.get_or_insert(grant.owner);
             grants.push((anchor, grant));
@@ -3403,6 +3561,7 @@ async fn record_workflow_submitter(
 /// POST /api/v1/workflows/steps - add a step to a hierarchical workflow.
 #[cfg(feature = "db")]
 pub async fn add_step(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<AddStepRequest>,
@@ -3413,9 +3572,11 @@ pub async fn add_step(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let mut tx = begin_system_ingest_stamped_tx(&state, "workflows/steps", auth.agent_id).await?;
-    let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
+    let authority =
+        require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        auth.agent_id,
         &req.canonical_name,
         &req.step_text,
         req.position,
@@ -3474,6 +3635,7 @@ pub async fn add_step(
 /// POST /api/v1/workflows/steps/delete - soft-delete a step lineage.
 #[cfg(feature = "db")]
 pub async fn delete_step(
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(req): Json<DeleteStepRequest>,
@@ -3485,7 +3647,8 @@ pub async fn delete_step(
 
     let mut tx =
         begin_system_ingest_stamped_tx(&state, "workflows/steps/delete", auth.agent_id).await?;
-    let authority = require_api_workflow_authority(&mut tx, &auth, &req.canonical_name).await?;
+    let authority =
+        require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r =
         epigraph_ingest_executor::delete_step(&mut tx, &req.canonical_name, req.step_lineage_id)
             .await

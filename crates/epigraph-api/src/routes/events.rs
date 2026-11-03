@@ -315,7 +315,8 @@ pub const EVENTS_SINCE_OVERLAP_SECS: u64 = 300;
 /// as "not fixed, an in-process bus is not SQL" (plan §4.12's rationale for
 /// deferring webhook fan-out to PR-10). That does not transfer: the ring buffer
 /// is not a no-db artefact. `routes/edges.rs` pushes `edge.added` (payload:
-/// `source_id`, `target_id`) and `claim.superseded`, `routes/belief.rs` pushes
+/// `source_id`, `target_id`), `routes/versioning.rs::supersede_claim` pushes
+/// `claim.superseded` (supersede SPEC K12d), `routes/belief.rs` pushes
 /// `frame.created`, and `routes/community.rs` pushes too — all from
 /// `#[cfg(feature = "db")]` handlers. Leaving step 2 open would have made the
 /// merge the trivial bypass for the filter added one function up.

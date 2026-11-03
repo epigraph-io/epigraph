@@ -38,6 +38,10 @@
 //! * `arm-operator-binding` — turn enforcement ON, once, after reporting every
 //!   unbound agent that wrote recently and every unregistered system role
 //!   (see [`arm`]).
+//! * `retire-link` — retire ONE existing LIVE link (migration 191): the
+//!   audited, idempotent definer flips it to retired, refusing while the agent
+//!   still holds a writer row in the operator's group unless
+//!   `--revoke-membership` revokes it in the same act (see [`retire_link`]).
 //! * `link-legacy-authors` — tie every legacy author to a named human operator with
 //!   a RETIRED link, in one audited definer call (see [`legacy`]).
 //! * `reown-linked` — move the claims a linked author's OWN personal group owns
@@ -51,8 +55,10 @@
 //!   explicit window, end an assignment, and list them. Every change is
 //!   audited by the table's own trigger.
 //! * `custodial-supersede` — revise a platform-corpus claim on the custodian's
-//!   authority: the act, its edge migration and a `platform.custodial_act`
-//!   audit row naming the assignment, in one transaction.
+//!   authority: the act, a `supersede` cascade deferral naming the custodian
+//!   and a `platform.custodial_act` audit row naming the assignment, in one
+//!   transaction; the edge migration and the belief cascade run from the
+//!   deferral in `replay_deferred_cascades`.
 //!
 //! And a registered human's passkeys (migration 124; see [`passkey`]):
 //!
@@ -108,6 +114,14 @@
 //!   (default 24 h), one `oauth.dcr_client_swept` audit row each;
 //!   `list-dcr-clients` — the read-only census behind it.
 //!
+//! And OAuth client containment (backlog 0454cbcd; see [`client_status`]):
+//!
+//! * `suspend-client` / `revoke-client --client <id> --reason TEXT` — move ONE
+//!   client to `suspended` or (final) `revoked`, revoke every live refresh
+//!   chain of it and write one `oauth.client_suspended` / `oauth.client_revoked`
+//!   audit row, in one transaction. Access tokens already minted stay valid
+//!   until they expire (at most 1 h), which each run prints.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -141,6 +155,7 @@ pub mod arm;
 pub mod bind;
 pub mod binding_client;
 pub mod client_scope;
+pub mod client_status;
 pub mod confirmations;
 pub mod custodian;
 pub mod dcr_sweep;
@@ -156,6 +171,7 @@ pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
 pub mod restrict;
+pub mod retire_link;
 pub mod reverse;
 pub mod system_agent;
 pub mod tables;

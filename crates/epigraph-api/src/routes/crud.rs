@@ -1094,7 +1094,9 @@ pub struct PromoteStagedEdgesRequest {
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
 /// Refuses (400, nothing written) when a selected row's `properties` carry
 /// a reserved key (`epigraph_db::RESERVED_EDGE_PROPERTIES`: `dedup`,
-/// `supersede_act`).
+/// `supersede_act`), or when a selected row's relationship is `supersedes` in
+/// any spelling (supersede SPEC K12a, ruling R-132: the lineage edge is the
+/// supersession act's, `crate::routes::edges::SUPERSEDES_ACT_ONLY`).
 #[cfg(feature = "db")]
 pub async fn promote_staged_edges(
     State(state): State<AppState>,
@@ -1116,13 +1118,17 @@ pub async fn promote_staged_edges(
     // act's identity edge and a supersession's act edge, which only the acts
     // write (create and patch refuse them too); a staged row is copied
     // verbatim, so promoting it would publish a forged act record. The whole
-    // request is refused rather than silently promoting the rest.
+    // request is refused rather than silently promoting the rest. `lineage`
+    // does the same for a staged `supersedes` row (any spelling): copied
+    // verbatim it would publish a lineage edge that retires nothing.
     //
     // The one column NOT copied verbatim is a case-folded relationship
     // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
     // lower-case canonical spelling, as every edge writer stores it (backlog
     // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
-    let (promoted_count, reserved): (i64, Vec<Uuid>) = if let Some(ref ids) = request.edge_ids {
+    let (promoted_count, reserved, lineage): (i64, Vec<Uuid>, Vec<Uuid>) = if let Some(ref ids) =
+        request.edge_ids
+    {
         if ids.is_empty() {
             return Err(ApiError::ValidationError {
                 field: "edge_ids".to_string(),
@@ -1131,7 +1137,7 @@ pub async fn promote_staged_edges(
         }
 
         // Promote specific IDs (must be 'approved')
-        sqlx::query_as::<_, (i64, Vec<Uuid>)>(
+        sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>)>(
             "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
@@ -1141,8 +1147,13 @@ pub async fn promote_staged_edges(
             reserved AS (
                 SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
+            lineage AS (
+                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
+            ),
             to_promote AS (
-                SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
+                SELECT * FROM selected
+                WHERE NOT EXISTS (SELECT 1 FROM reserved)
+                  AND NOT EXISTS (SELECT 1 FROM lineage)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1160,7 +1171,8 @@ pub async fn promote_staged_edges(
                 WHERE id IN (SELECT id FROM to_promote)
             )
             SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[])",
         )
         .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(ids)
@@ -1172,7 +1184,7 @@ pub async fn promote_staged_edges(
         })?
     } else {
         // Promote all approved
-        sqlx::query_as::<_, (i64, Vec<Uuid>)>(
+        sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>)>(
             "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
@@ -1182,8 +1194,13 @@ pub async fn promote_staged_edges(
             reserved AS (
                 SELECT id FROM selected WHERE properties ?| $1::text[]
             ),
+            lineage AS (
+                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
+            ),
             to_promote AS (
-                SELECT * FROM selected WHERE NOT EXISTS (SELECT 1 FROM reserved)
+                SELECT * FROM selected
+                WHERE NOT EXISTS (SELECT 1 FROM reserved)
+                  AND NOT EXISTS (SELECT 1 FROM lineage)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1201,7 +1218,8 @@ pub async fn promote_staged_edges(
                 WHERE id IN (SELECT id FROM to_promote)
             )
             SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[])",
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[])",
         )
         .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
@@ -1212,6 +1230,17 @@ pub async fn promote_staged_edges(
         })?
     };
 
+    if !lineage.is_empty() {
+        let ids: Vec<String> = lineage.iter().map(Uuid::to_string).collect();
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: format!(
+                "{} (staged edges with a supersedes relationship: {})",
+                crate::routes::edges::SUPERSEDES_ACT_ONLY,
+                ids.join(", ")
+            ),
+        });
+    }
     if !reserved.is_empty() {
         let ids: Vec<String> = reserved.iter().map(Uuid::to_string).collect();
         return Err(ApiError::ValidationError {

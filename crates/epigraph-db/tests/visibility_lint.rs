@@ -1275,6 +1275,34 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "restrict_plan_workflows_conn",
+        "WRITE of `workflows.visibility` and `workflows.owner_group_id`: the plan half of \
+         `restrict` (ruling R-98 Q8(a)), moving a PUBLIC row into the target group only when \
+         every level 0..2 claim it executes is now there. It reads `edges` and `claims` to decide \
+         that and takes no `Viewer` for `restrict_claims_conn`'s reason: a viewer-narrowed read \
+         of the plan's claims would decide on the rows somebody can see. Runs in the apply \
+         batch's maintenance transaction behind the handler's re-validation; returns the moved \
+         ids and their pre-images, which the batch records in the audit trail.",
+    ),
+    (
+        "privatization.rs",
+        "record_workflow_moves_conn",
+        "WRITE (INSERT) of `privatization_audit` rows recording the `workflows` rows an apply \
+         batch moved, with their pre-images. Same table and argument as \
+         `record_item_audit_conn`: the audit trail is append-only and maintenance-only, and the \
+         values written come from the batch's own UPDATE, not from a caller.",
+    ),
+    (
+        "privatization.rs",
+        "restore_plan_workflows_conn",
+        "WRITE of `workflows` tenancy back to the pre-image the plan's own `item.apply` audit \
+         rows recorded, plus an `item.revert` audit row each. Only rows still carrying the \
+         plan's stamp are restored, the rule `restore_claims_conn` follows; a viewer predicate \
+         would narrow a revert to what somebody can already see. Runs in the revert handler's \
+         maintenance transaction once every claim is back.",
+    ),
+    (
+        "privatization.rs",
         "restore_claims_conn",
         "WRITE of `claims.visibility` and `claims.owner_group_id`, restoring the values the freeze \
          captured. Same argument as `restrict_claims_conn` and one addition: it sets \
@@ -2269,6 +2297,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          reason as `count_own_revoked_rows_conn`: groups_tenancy on the caller's stamped \
          connection is the filter, and 'invisible here' is exactly the answer the caller needs \
          (no LIVE membership). Returns one id or None.",
+    ),
+    (
+        "group_membership.rs",
+        "agent_writes_group_conn",
+        "READ of NO table directly: whether ONE named agent holds a live writer/admin \
+         membership of ONE group, through migration 077's `epigraph_live_memberships` definer \
+         (the read `Viewer::resolve` is built from). It answers a question about the CALLER of a \
+         write made on another principal's stamp (`add_step` into a group plan, on the \
+         workflow-ingest system agent's stamp, ruling R-98), so a viewer predicate would ask \
+         about the wrong principal; it returns one boolean and no row reaches a caller.",
     ),
     (
         "group_membership.rs",
@@ -3436,6 +3474,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          the ingest system agent's stamped transaction (the identity that wrote the row and \
          reads its group); the CLI backfill runs it on its maintenance connection. There is no \
          read for a viewer to filter.",
+    ),
+    (
+        "workflow.rs",
+        "tenancy_of",
+        "READ of `workflows` only: one row's `(visibility, owner_group_id)` by primary key, so \
+         a write that EXTENDS a plan (a step `add_step` adds, a new generation an ingest \
+         creates) takes the row's tenancy (ruling R-98). It runs on the ingest system agent's \
+         stamped transaction that writes the extension, so `workflows`' row security bounds it \
+         to the rows that stamp reads; the caller's authority is `require_workflow_authority` \
+         over the same row, and a reader's view is `tenancy_as_viewer`.",
     ),
     (
         "workflow.rs",

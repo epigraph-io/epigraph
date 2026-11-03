@@ -826,6 +826,20 @@ async fn run_batch(
     )
     .await?;
     if items.is_empty() {
+        // The plan's `workflows` rows go back LAST, in the transaction that
+        // finds every claim restored (ruling R-98 Q8(a)): an interrupted or
+        // aborted revert leaves a moved row private, never public over private
+        // claims. A no-op on apply, and on a re-run of this drain.
+        if direction == Direction::Revert {
+            PrivatizationRepository::restore_plan_workflows_conn(
+                &mut tx,
+                plan.id,
+                dispatched_by,
+                Some(correlation_id),
+                plan.target_group_id,
+            )
+            .await?;
+        }
         tx.commit()
             .await
             .map_err(|source| epigraph_db::DbError::QueryFailed { source })?;
@@ -859,6 +873,28 @@ async fn run_batch(
                 PrivatizationRepository::restrict_claims_conn(&mut tx, &ids, plan.target_group_id)
                     .await?;
             PrivatizationRepository::record_item_audit_conn(&mut tx, audit).await?;
+            // The plan goes with its claims (ruling R-98 Q8(a)): a public
+            // `workflows` row whose every level 0..2 claim is now in the
+            // target group, one of them moved by THIS batch, moves too, and
+            // its pre-image goes into the plan's audit trail on this
+            // transaction. Decided here, under the lock and on the
+            // post-UPDATE state, which is the handler's re-validation of the
+            // rows it moves.
+            let workflows = PrivatizationRepository::restrict_plan_workflows_conn(
+                &mut tx,
+                &changed,
+                plan.target_group_id,
+            )
+            .await?;
+            PrivatizationRepository::record_workflow_moves_conn(
+                &mut tx,
+                plan.id,
+                dispatched_by,
+                Some(correlation_id),
+                &workflows,
+                plan.target_group_id,
+            )
+            .await?;
             changed
         }
         Direction::Revert => {

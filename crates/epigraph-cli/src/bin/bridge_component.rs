@@ -6,9 +6,9 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use epigraph_cli::bridge::candidates::{build_candidate_table, drop_candidate_table};
+use epigraph_cli::bridge::candidates::{build_candidate_table, CandidateTableLifetime};
 use epigraph_cli::bridge::components::{compute_components, ComponentSummary};
-use epigraph_cli::rerank::{rerank_candidates_table, RerankConfig};
+use epigraph_cli::rerank::{find_candidates_from_table, rerank_candidates, RerankConfig};
 
 const USAGE: &str = r#"
 bridge-component — bridge a single disconnected component into the giant CC
@@ -25,7 +25,10 @@ OPTIONS:
   --model <NAME>             Model override
   --dry-run                  Default. Reports candidates + LLM eval; creates no edges.
   --apply                    Commit edges (overrides --dry-run).
-  --keep-tables              Don't drop the temp candidates table on exit.
+  --keep-tables              Build a regular (persistent) candidates table and
+                             keep it. Needs CREATE on the schema, which the
+                             maintenance login does not hold; without this flag
+                             the table is TEMP and vanishes with its transaction.
   --report-out <PATH>        JSON report path (else stdout)
   --limit <N>                Cap LLM evaluations
   -h, --help                 Show this message
@@ -318,9 +321,33 @@ async fn run_pipeline(pool: &PgPool, args: &Args) -> Result<Report, String> {
 
     let table_name = format!("bridge_sweep_{}_candidates", Uuid::new_v4().simple());
 
+    let config = RerankConfig {
+        min_similarity: args.min_similarity,
+        batch_size: args.batch_size,
+        provider: args.provider.clone(),
+        model: args.model.clone(),
+        dry_run: !args.apply,
+        limit: args.limit,
+        verbose: false, // bridge_component owns its own progress logging
+    };
+
+    // Build and read the candidate table in ONE transaction: it is a TEMP
+    // table (no role this runs as holds CREATE on a schema), visible only in
+    // the session that created it. A transaction, not a bare connection, so
+    // the session holds behind a transaction-mode pooler too. Commit drops it
+    // (`ON COMMIT DROP`); every `?` drops `tx`, which rolls back and drops it
+    // too. `--keep-tables` builds a regular table instead, which the commit
+    // keeps. The transaction ends before the LLM calls.
+    let lifetime = if args.keep_tables {
+        CandidateTableLifetime::Persistent
+    } else {
+        CandidateTableLifetime::Transaction
+    };
+    let mut tx = pool.begin().await.map_err(|e| format!("begin: {e}"))?;
     let candidates_count = build_candidate_table(
-        pool,
+        &mut tx,
         &table_name,
+        lifetime,
         &source_atoms,
         &target_atoms,
         args.min_similarity,
@@ -328,18 +355,19 @@ async fn run_pipeline(pool: &PgPool, args: &Args) -> Result<Report, String> {
     )
     .await
     .map_err(|e| format!("build_candidate_table: {e}"))?;
+    let candidates = if candidates_count > 0 {
+        Some(
+            find_candidates_from_table(&mut tx, &table_name, &config)
+                .await
+                .map_err(|e| format!("rerank: {e}"))?,
+        )
+    } else {
+        None
+    };
+    tx.commit().await.map_err(|e| format!("commit: {e}"))?;
 
-    let rerank = if candidates_count > 0 {
-        let config = RerankConfig {
-            min_similarity: args.min_similarity,
-            batch_size: args.batch_size,
-            provider: args.provider.clone(),
-            model: args.model.clone(),
-            dry_run: !args.apply,
-            limit: args.limit,
-            verbose: false, // bridge_component owns its own progress logging
-        };
-        match rerank_candidates_table(pool, &table_name, &config).await {
+    let rerank = match candidates {
+        Some(c) => match rerank_candidates(pool, c, &config).await {
             Ok(s) => Some(RerankReport {
                 candidates_evaluated: s.candidates_evaluated,
                 llm_accepted: s.llm_accepted,
@@ -347,14 +375,9 @@ async fn run_pipeline(pool: &PgPool, args: &Args) -> Result<Report, String> {
                 duration_ms: s.duration_ms,
             }),
             Err(e) => return Err(format!("rerank: {e}")),
-        }
-    } else {
-        None
+        },
+        None => None,
     };
-
-    if !args.keep_tables {
-        let _ = drop_candidate_table(pool, &table_name).await; // best-effort
-    }
 
     Ok(Report {
         component_id: component.component_id,

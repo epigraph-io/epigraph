@@ -180,8 +180,8 @@ pub async fn auto_wire_ds_for_edge(
     //      Lets operators tune locality discounting per epistemic context
     //      (binary_truth vs textbook_veracity_* vs research_validity etc.)
     //      without code releases. Set via FrameRepository::set_property.
-    //   2. The served belief profile (calibration.toml, then the built-in
-    //      default when calibration.toml is unreadable).
+    //   2. The served belief profile (`CALIBRATION_PATH`, else the
+    //      compiled-in workspace calibration.toml).
     //
     // Edge BBAs all land on the binary_truth frame today (see ensure_binary_frame
     // below); if a future edge_factor path writes to a different frame, the
@@ -1449,7 +1449,10 @@ async fn recompute_combined_belief(
 /// `decomposes_to` out-edge, not under a workflow root), whose belief is a
 /// query over its leaves rather than a fold of its own BBAs. So this function
 /// never makes a claim's cache emptier than it was. Every caller inherits
-/// both, including the per-write `routes::assess` refresh.
+/// both, including the per-write `routes::assess` refresh. The compound test
+/// reads with definer rights (migration 193, `epigraph_claim_is_compound`),
+/// so it holds on an application session whose row security hides the
+/// compound's decomposition (backlog 0dc20fad).
 ///
 /// The one exception is ruling R-80: a claim whose every BBA the derivation
 /// scope rule keeps out of its cache gets full ignorance in place of its old

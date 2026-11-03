@@ -21,9 +21,13 @@ fn methodology_relation_is_valid() {
     assert!(is_valid_relationship("METHODOLOGY"));
 }
 
+/// Inverted by ruling R-132 ("supersedes = revision only"; supersede SPEC
+/// K12a): this pinned the upper-case `SUPERSEDES` alias as a valid generic
+/// relationship for the synthesis side. The lineage edge is written only by
+/// the supersession act, in one spelling, so neither spelling is a generic
+/// relationship. (The synthesis side only reads that edge.)
 #[test]
-fn supersedes_uppercase_alias_is_valid() {
-    // Lower-case `supersedes` already exists; this test pins the upper-case alias
-    // that synthesis-side code uses.
-    assert!(is_valid_relationship("SUPERSEDES"));
+fn supersedes_is_not_a_generic_relationship_in_either_spelling() {
+    assert!(!is_valid_relationship("SUPERSEDES"));
+    assert!(!is_valid_relationship("supersedes"));
 }

@@ -308,33 +308,358 @@ async fn drift_guard_rejects_a_pre_060_table_shape(pool: PgPool) {
 ///
 /// Absence is not fatal here on purpose: the fatal assertion belongs in
 /// `AppState::with_db` (PR-17), where a production process can refuse to boot.
-/// What IS asserted is the one property 060 decides and nothing else checks —
-/// every role it creates is `NOLOGIN`. These roles exist to be `GRANT`ed to and
-/// to be tested by `pg_has_role` in 070; a role that can log in is an
-/// authentication surface nobody meant to open.
+///
+/// What IS asserted is the login posture, which is not the same for all three
+/// (backlog bb200b7b). 060 creates every one of them `NOLOGIN`
+/// ([`tenancy_roles_are_created_nologin`]). `epigraph_maintenance` and
+/// `epigraph_seed` must STAY `NOLOGIN`: they exist to be `GRANT`ed to and to be
+/// tested by `pg_has_role` (067, 070), and a role that can log in is an
+/// authentication surface nobody meant to open. `epigraph_app` is different:
+/// `ALTER ROLE epigraph_app LOGIN PASSWORD ..` is the out-of-band 11d runbook
+/// step that arms the PR-17 posture refusals (migration 077, docs/deploy.md),
+/// so on an armed cluster it logs in by design. Roles are cluster-global, so a
+/// fresh CI container (where it is still NOLOGIN) can never observe that, and
+/// the old "all three NOLOGIN" assertion failed on every armed cluster. What
+/// must hold for `epigraph_app` either way is that it is the plain role RLS is
+/// written against: never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB.
 ///
 /// (The old "0 or 3" assertion could not fail: the `DO` block wraps each
 /// iteration in its own `BEGIN … EXCEPTION`, so 1 and 2 are unreachable by
 /// construction — which is exactly what it claimed to prove.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn tenancy_roles_are_nologin(pool: PgPool) {
-    let rows = sqlx::query(
-        "SELECT rolname, rolcanlogin FROM pg_roles \
-         WHERE rolname IN ('epigraph_app', 'epigraph_maintenance', 'epigraph_seed') \
-         ORDER BY rolname",
+    let rows: Vec<TenancyRole> = sqlx::query_as(
+        "SELECT rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb \
+           FROM pg_roles \
+          WHERE rolname IN ('epigraph_app', 'epigraph_maintenance', 'epigraph_seed') \
+          ORDER BY rolname",
     )
     .fetch_all(&pool)
     .await
     .expect("pg_roles lookup");
 
-    for row in &rows {
-        let name: String = row.get("rolname");
-        let can_login: bool = row.get("rolcanlogin");
+    let violations = tenancy_role_posture_violations(&rows);
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+/// `(rolname, rolcanlogin, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb)`.
+type TenancyRole = (String, bool, bool, bool, bool, bool);
+
+/// Every way `rows` breaks the tenancy roles' login posture (see
+/// [`tenancy_roles_are_nologin`]), one message each.
+fn tenancy_role_posture_violations(rows: &[TenancyRole]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (name, login, superuser, bypassrls, createrole, createdb) in rows {
+        if name == "epigraph_app" {
+            for (attr, set) in [
+                ("SUPERUSER", superuser),
+                ("BYPASSRLS", bypassrls),
+                ("CREATEROLE", createrole),
+                ("CREATEDB", createdb),
+            ] {
+                if *set {
+                    out.push(format!(
+                        "role `epigraph_app` must not be {attr}: it is the role row security \
+                         is written against (LOGIN is allowed, armed out of band)"
+                    ));
+                }
+            }
+        } else if *login {
+            out.push(format!(
+                "role `{name}` must be NOLOGIN: migration 060 creates it that way and nothing \
+                 arms it to log in"
+            ));
+        }
+    }
+    out
+}
+
+/// 060 itself creates every tenancy role `NOLOGIN`: the half of the posture a
+/// cluster armed out of band can no longer show for `epigraph_app`.
+#[test]
+fn tenancy_roles_are_created_nologin() {
+    assert!(
+        MIGRATION_060.contains("ARRAY['epigraph_app','epigraph_maintenance','epigraph_seed']")
+            && MIGRATION_060.contains("EXECUTE format('CREATE ROLE %I NOLOGIN', r);"),
+        "migration 060 must create epigraph_app, epigraph_maintenance and epigraph_seed NOLOGIN"
+    );
+}
+
+/// The posture rule itself, on the rows an armed and a misconfigured cluster
+/// would return: an armed `epigraph_app` (LOGIN, plain) passes, the other two
+/// roles may never log in, and `epigraph_app` may never carry a bypass or
+/// administrative attribute.
+#[test]
+fn the_tenancy_role_posture_admits_only_a_plain_armed_app_login() {
+    let row = |name: &str, login, superuser, bypassrls| -> TenancyRole {
+        (name.to_string(), login, superuser, bypassrls, false, false)
+    };
+    let fresh = [
+        row("epigraph_app", false, false, false),
+        row("epigraph_maintenance", false, false, false),
+        row("epigraph_seed", false, false, false),
+    ];
+    assert!(tenancy_role_posture_violations(&fresh).is_empty());
+    let armed = [
+        row("epigraph_app", true, false, false),
+        row("epigraph_maintenance", false, false, false),
+        row("epigraph_seed", false, false, false),
+    ];
+    assert!(
+        tenancy_role_posture_violations(&armed).is_empty(),
+        "the 11d runbook's armed epigraph_app is the intended state"
+    );
+    for bad in [
+        row("epigraph_maintenance", true, false, false),
+        row("epigraph_seed", true, false, false),
+        row("epigraph_app", true, false, true),
+        row("epigraph_app", false, true, false),
+        ("epigraph_app".to_string(), true, false, false, true, false),
+        ("epigraph_app".to_string(), true, false, false, false, true),
+    ] {
+        let v = tenancy_role_posture_violations(std::slice::from_ref(&bad));
+        assert_eq!(v.len(), 1, "{bad:?} must be exactly one violation: {v:?}");
+        assert!(v[0].contains(&format!("`{}`", bad.0)), "{v:?}");
+    }
+}
+
+/// No migration in the tree gives any role a login (backlog bb200b7b).
+///
+/// [`tenancy_roles_are_nologin`] has to admit an armed `epigraph_app` LOGIN,
+/// so on a fresh CI cluster it no longer notices a migration that grants one.
+/// This ratchet does, statically: every login is an out-of-band operator step
+/// (077's and 161's headers; docs/deploy.md), because this repository is public
+/// and a login without a credential is pointless while one with a credential
+/// must never land here. It covers every role, so a dynamic
+/// `format('ALTER ROLE %I LOGIN', r)` over the tenancy roles is caught too.
+#[test]
+fn no_migration_grants_a_role_login() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read migrations/")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sql"))
+        .collect();
+    files.sort();
+    assert!(files.len() > 100, "read the whole series: {}", files.len());
+
+    let mut grants = Vec::new();
+    let mut seen = Vec::new();
+    for path in &files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let sql = std::fs::read_to_string(path).expect("read migration");
+        for st in role_statements(&sql) {
+            if st.grants_login {
+                grants.push(format!("{name}: {} {} ... LOGIN", st.verb, st.role));
+            }
+            seen.push((name.clone(), st));
+        }
+    }
+    assert!(
+        grants.is_empty(),
+        "migrations must never grant a login:\n{}",
+        grants.join("\n")
+    );
+
+    // The scanner reads real statements through comment and string stripping:
+    // 060's dynamic CREATE ROLE and 161's literal one are both seen, NOLOGIN.
+    for (file, role) in [
+        ("060_group_tenancy_tables.sql", "%I"),
+        (
+            "161_agent_identity_lineage.sql",
+            "epigraph_identity_attestor",
+        ),
+    ] {
         assert!(
-            !can_login,
-            "role `{name}` must be NOLOGIN — migration 060 creates it that way"
+            seen.iter()
+                .any(|(f, st)| f == file && st.verb == "CREATE ROLE" && st.role == role),
+            "{file}: CREATE ROLE {role} not seen; seen: {:?}",
+            seen.iter().filter(|(f, _)| f == file).collect::<Vec<_>>()
         );
     }
+}
+
+/// The scanner behind [`no_migration_grants_a_role_login`], on synthetic SQL.
+#[test]
+fn the_role_login_scanner_flags_only_uncommented_login_grants() {
+    let grants = |sql: &str| -> Vec<String> {
+        role_statements(sql)
+            .into_iter()
+            .filter(|s| s.grants_login)
+            .map(|s| s.role)
+            .collect()
+    };
+    for (sql, role) in [
+        ("ALTER ROLE epigraph_app LOGIN;", "epigraph_app"),
+        (
+            "ALTER ROLE epigraph_seed WITH LOGIN PASSWORD 'x';",
+            "epigraph_seed",
+        ),
+        (
+            "alter role \"epigraph_maintenance\" login;",
+            "epigraph_maintenance",
+        ),
+        (
+            "DO $$ BEGIN EXECUTE format('ALTER ROLE %I LOGIN', r); END $$;",
+            "%I",
+        ),
+        ("CREATE USER epigraph_app;", "epigraph_app"),
+        (
+            "CREATE ROLE epigraph_seed LOGIN NOINHERIT;",
+            "epigraph_seed",
+        ),
+        // An apostrophe inside a comment does not open a string that would
+        // swallow the statement after it.
+        (
+            "-- the app's role\nALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+        (
+            "/* the app's role */ ALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+        // `--` inside a string literal is not a comment.
+        (
+            "RAISE NOTICE 'a -- b'; ALTER ROLE epigraph_app LOGIN;",
+            "epigraph_app",
+        ),
+    ] {
+        assert_eq!(grants(sql), vec![role.to_string()], "{sql}");
+    }
+    for sql in [
+        "CREATE ROLE epigraph_seed NOLOGIN;",
+        "ALTER ROLE epigraph_app NOLOGIN;",
+        "CREATE USER epigraph_app NOLOGIN;",
+        "EXECUTE format('CREATE ROLE %I NOLOGIN', r);",
+        "-- `ALTER ROLE epigraph_app LOGIN PASSWORD '...'` is out of band\nSELECT 1;",
+        "/* ALTER ROLE epigraph_app LOGIN */ SELECT 1;",
+        "/* outer /* ALTER ROLE x LOGIN; */ ALTER ROLE epigraph_app LOGIN; */ SELECT 1;",
+        "ALTER ROLE epigraph_app SET search_path = public; SELECT 'LOGIN';",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE epigraph_maintenance GRANT SELECT ON TABLES TO epigraph_app;",
+    ] {
+        assert_eq!(grants(sql), Vec::<String>::new(), "{sql}");
+    }
+}
+
+/// One `CREATE|ALTER ROLE|USER` statement found by [`role_statements`].
+#[derive(Debug)]
+struct RoleStatement {
+    /// `"CREATE ROLE"`, `"ALTER USER"`, ...
+    verb: String,
+    /// The role token as written, quotes trimmed (`%I` for a `format()` one).
+    role: String,
+    /// `LOGIN` appears in the statement, or it is a `CREATE USER` (which
+    /// defaults to LOGIN) without `NOLOGIN`.
+    grants_login: bool,
+}
+
+/// Every `CREATE|ALTER ROLE|USER` statement in `sql`, after stripping
+/// comments, including ones inside string literals (dynamic `EXECUTE`). A
+/// statement runs to the next `;`.
+fn role_statements(sql: &str) -> Vec<RoleStatement> {
+    let code = strip_sql_comments(sql);
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for c in code.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '%' | '"') {
+            word.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            tokens.push(std::mem::take(&mut word));
+        }
+        if c == ';' {
+            tokens.push(";".to_string());
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+
+    let up = |i: usize| tokens.get(i).map(|t| t.to_ascii_uppercase());
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        let (Some(a), Some(b)) = (up(i), up(i + 1)) else {
+            continue;
+        };
+        if !matches!(a.as_str(), "CREATE" | "ALTER") || !matches!(b.as_str(), "ROLE" | "USER") {
+            continue;
+        }
+        let Some(role) = tokens.get(i + 2).filter(|t| *t != ";") else {
+            continue;
+        };
+        let body: Vec<String> = tokens[i + 3..]
+            .iter()
+            .take_while(|t| *t != ";")
+            .map(|t| t.to_ascii_uppercase())
+            .collect();
+        let has = |kw: &str| body.iter().any(|t| t == kw);
+        out.push(RoleStatement {
+            verb: format!("{a} {b}"),
+            role: role.trim_matches('"').to_string(),
+            grants_login: has("LOGIN") || (a == "CREATE" && b == "USER" && !has("NOLOGIN")),
+        });
+    }
+    out
+}
+
+/// `sql` without `--` line comments and (nested) `/* */` block comments.
+/// Single-quoted literals are kept verbatim, so a `--` inside one is not a
+/// comment; an apostrophe inside a comment does not open a literal.
+fn strip_sql_comments(sql: &str) -> String {
+    let cs: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let (mut i, mut depth, mut in_str) = (0usize, 0usize, false);
+    while i < cs.len() {
+        let (c, next) = (cs[i], cs.get(i + 1).copied());
+        if depth > 0 {
+            match (c, next) {
+                ('/', Some('*')) => {
+                    depth += 1;
+                    i += 2;
+                }
+                ('*', Some('/')) => {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        out.push(' ');
+                    }
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        if in_str {
+            out.push(c);
+            if c == '\'' {
+                if next == Some('\'') {
+                    out.push('\'');
+                    i += 1;
+                } else {
+                    in_str = false;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match (c, next) {
+            ('-', Some('-')) => {
+                while i < cs.len() && cs[i] != '\n' {
+                    i += 1;
+                }
+            }
+            ('/', Some('*')) => {
+                depth = 1;
+                i += 2;
+            }
+            _ => {
+                in_str = c == '\'';
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 // =============================================================================
@@ -3569,6 +3894,112 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
             body.contains(fragment),
             "epigraph_role_derived_memberships at head lost {fragment:?} (re-state it from the \
              head body, keeping every delta)"
+        );
+    }
+}
+
+/// Migration 191 (backlog 4dec90c2, the audited retire of a live operator
+/// link): the verb is a SECURITY DEFINER owned by `epigraph_maintenance` on
+/// 172's `pg_catalog, pg_temp` path with an explicit ACL that neither PUBLIC
+/// nor the application role can execute; the maintenance role may UPDATE
+/// exactly the `retired` column of `operator_links` (no other column, no
+/// table-wide UPDATE, no DELETE); the audit trigger fires AFTER INSERT and
+/// UPDATE (of `retired`), and the retire-only guard BEFORE UPDATE. The owner
+/// is pinned because the harness migrates as a superuser, so a silently
+/// no-opped `OWNER TO` would pass every behavioural test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
+    let signature = "public.epigraph_retire_operator_link(uuid, text, boolean)";
+    let meta: Option<DefinerCatalogRow> = sqlx::query_as(
+        "SELECT p.prosecdef, r.rolname::text, p.provolatile::text, p.proacl::text, \
+                p.proconfig \
+           FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+          WHERE p.oid = to_regprocedure($1)",
+    )
+    .bind(signature)
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let (secdef, owner, vol, acl, config) =
+        meta.unwrap_or_else(|| panic!("{signature} must exist (migration 191)"));
+    assert!(secdef, "{signature} must be SECURITY DEFINER");
+    assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+    assert_eq!(vol, "v", "{signature} volatility");
+    assert!(acl.is_some(), "{signature} must carry an EXPLICIT ACL");
+    assert_eq!(
+        config,
+        Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+        "{signature} resolves in pg_catalog only, pg_temp last"
+    );
+    for (role, expected) in [
+        ("public", false),
+        ("epigraph_app", false),
+        ("epigraph_maintenance", true),
+    ] {
+        let can: bool = sqlx::query_scalar("SELECT has_function_privilege($1, $2, 'EXECUTE')")
+            .bind(role)
+            .bind(signature)
+            .fetch_one(&pool)
+            .await
+            .expect("privilege");
+        assert_eq!(can, expected, "{role} EXECUTE on {signature}");
+    }
+
+    for (role, privilege, expected) in [
+        ("epigraph_app", "UPDATE", false),
+        ("epigraph_app", "DELETE", false),
+        ("epigraph_maintenance", "UPDATE", false),
+        ("epigraph_maintenance", "DELETE", false),
+    ] {
+        let can: bool =
+            sqlx::query_scalar("SELECT has_table_privilege($1, 'public.operator_links', $2)")
+                .bind(role)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("table privilege");
+        assert_eq!(
+            can, expected,
+            "{role} table-wide {privilege} on operator_links"
+        );
+    }
+    for (role, col, expected) in [
+        ("epigraph_maintenance", "retired", true),
+        ("epigraph_maintenance", "operator_id", false),
+        ("epigraph_maintenance", "operator_group_id", false),
+        ("epigraph_maintenance", "agent_id", false),
+        ("epigraph_maintenance", "created_at", false),
+        ("epigraph_app", "retired", false),
+    ] {
+        let can: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1, 'public.operator_links', $2, 'UPDATE')",
+        )
+        .bind(role)
+        .bind(col)
+        .fetch_one(&pool)
+        .await
+        .expect("column privilege");
+        assert_eq!(can, expected, "{role} UPDATE of operator_links.{col}");
+    }
+
+    // pg_trigger.tgtype bits: 1 ROW, 2 BEFORE, 4 INSERT, 8 DELETE, 16 UPDATE.
+    for (trigger, bits) in [
+        ("operator_links_audit", 1 | 4 | 16),
+        ("operator_links_retire_only", 1 | 2 | 16),
+    ] {
+        let tgtype: Option<i16> = sqlx::query_scalar(
+            "SELECT tgtype FROM pg_trigger \
+              WHERE tgrelid = 'public.operator_links'::regclass AND tgname = $1",
+        )
+        .bind(trigger)
+        .fetch_optional(&pool)
+        .await
+        .expect("trigger lookup");
+        let tgtype = tgtype.unwrap_or_else(|| panic!("operator_links must carry {trigger}"));
+        assert_eq!(
+            i32::from(tgtype) & (1 | 2 | 4 | 8 | 16 | 32),
+            bits,
+            "{trigger} timing/events"
         );
     }
 }

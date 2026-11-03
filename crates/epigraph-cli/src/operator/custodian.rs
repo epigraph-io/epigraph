@@ -23,15 +23,28 @@
 //! on the maintenance DSN, in ONE transaction, the supersede act
 //! (`ClaimRepository::supersede_act_conn`: retire, restate under the inherited
 //! author and owner, the `supersedes` edge, and the actor's `AUTHORED` edge on
-//! the successor), the edge migration
-//! (`migrate_superseded_edges_conn`: strengthening edges follow the
-//! successor; `contradicts` / `refutes` stay, and so does `executes` when the
-//! old claim is not public), and
+//! the successor), a `supersede` deferral of the administrative cascade
+//! (`epigraph_engine::admin_cascade::record_deferral`, migration 120's
+//! `epigraph_record_cascade_deferral`, naming the actor), and
 //! `epigraph_record_custodial_act` against a NAMED live custodian assignment
 //! of a NAMED human actor (CUS04 otherwise, which rolls the act back). So no
 //! revision lands unrecorded and no record names an authority that did not
 //! hold. It replaces the hand-run SQL sequence the operator-binding runbook
 //! carried for this.
+//!
+//! The cascade is the one every supersede owes (SPEC section 3.1): the edge
+//! migration (strengthening edges follow the successor; `contradicts` /
+//! `refutes` stay, and so does `executes` when the old claim is not public),
+//! the belief re-derivation downstream of it, and its audit rows. It runs from
+//! the deferral, in `replay_deferred_cascades` (`admin_cascade::replay_deferred`
+//! -> `apply_after_supersede`), the same path a request-serving process's
+//! deferred supersede takes, so it is never run twice and never skipped. The
+//! act does NOT migrate the edges itself: the cascade's later steps key on the
+//! edges its own migration moves, and an act that had already moved them would
+//! leave the cascade nothing to act on. The deferral passes 120's privileged
+//! arm (the maintenance session is a member of `epigraph_maintenance`), which
+//! attributes it to the named actor; the act record names the deferral
+//! (`cascade_deferral_event_id`).
 //!
 //! # `--act`: executing a confirmed admin act (migration 130)
 //!
@@ -311,7 +324,9 @@ pub struct SupersedeReport {
     pub new: Uuid,
     pub author: Uuid,
     pub owner: Uuid,
-    pub edges_moved: usize,
+    /// The `cascade.deferred` row the act's transaction wrote: the replay runs
+    /// the edge migration and the belief cascade from it.
+    pub cascade_deferral: Uuid,
     pub act_event: Uuid,
     /// The admin act the supersede executed, when one was named.
     pub admin_act: Option<Uuid>,
@@ -334,7 +349,8 @@ pub enum SupersedeOutcome {
 /// # Errors
 /// A statement failed or the database refused (CUS04 for an assignment that
 /// is not a live custodian assignment of `actor`, OPL0x from the binding
-/// trigger); the transaction is rolled back and nothing is written.
+/// trigger, CX0x from the cascade deferral); the transaction is rolled back
+/// and nothing is written.
 pub async fn custodial_supersede(
     conn: &mut PgConnection,
     req: &SupersedeRequest,
@@ -426,9 +442,6 @@ pub async fn custodial_supersede(
         epigraph_db::SupersedeActor::new(req.actor, epigraph_db::SupersedeTool::CustodialSupersede),
     )
     .await?;
-    let migration = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new).await?;
-    let edges_moved = migration.retargeted.len() + migration.resourced.len();
-
     let successor: (Uuid, Uuid, Option<Uuid>, bool, bool, Vec<u8>) = sqlx::query_as(
         "SELECT n.agent_id, n.owner_group_id, n.supersedes, COALESCE(n.is_current, true), \
                 COALESCE(o.is_current, true), n.content_hash \
@@ -453,6 +466,26 @@ pub async fn custodial_supersede(
         )));
     }
 
+    // SPEC section 3.1 / K8: the supersede's administrative cascade, owed in
+    // the act's own transaction (both commit, or neither). On this
+    // maintenance session 120's definer takes its privileged arm and records
+    // the named actor as the triggering principal.
+    let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
+        epigraph_engine::admin_cascade::CascadeCause::Supersede,
+        Some(req.actor),
+        None,
+        old_id,
+        Some(new),
+    );
+    let cascade_deferral = epigraph_engine::admin_cascade::record_deferral(
+        &mut *tx,
+        &trigger,
+        "a custodial supersede defers its cascade to the deferred-cascade replay",
+    )
+    .await?
+    .audit_event_id
+    .ok_or_else(|| anyhow::anyhow!("the cascade deferral returned no audit row"))?;
+
     let details = json!({
             "new_id": new,
             "old_hash": hex::encode(&old_hash),
@@ -465,7 +498,7 @@ pub async fn custodial_supersede(
             "allow_owned": req.allow_owned,
             "author": author,
             "reason": req.reason,
-            "edges_moved": edges_moved,
+            "cascade_deferral_event_id": cascade_deferral,
     });
     // The record consumes the act (its args recomputed from the stored
     // successor) in this same transaction, or refuses and rolls the act back.
@@ -506,7 +539,7 @@ pub async fn custodial_supersede(
         new,
         author,
         owner,
-        edges_moved,
+        cascade_deferral,
         act_event,
         admin_act: req.act,
         applied: req.apply,

@@ -162,6 +162,13 @@ async fn unmark_without_the_administrative_connection_writes_nothing(pool: PgPoo
         "{}",
         err.message
     );
+    // And says where an un-mark does run (backlog e8113079).
+    assert!(
+        err.message
+            .contains("the `unmark_duplicate` CLI on the maintenance DSN"),
+        "{}",
+        err.message
+    );
     assert_eq!(
         state(&pool, dup).await,
         (Some(canonical), false, 1),

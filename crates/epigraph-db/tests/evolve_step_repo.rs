@@ -297,6 +297,120 @@ async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(p
     );
 }
 
+/// An evolve(revises) of a parent with no lineage yet, whose lineage back-fill
+/// the database skips, must be refused with nothing written (backlog
+/// 41646a94).
+///
+/// `evolve_step_conn` mints a lineage id for such a parent and writes it onto
+/// the parent with an UPDATE before inserting the successor. An UPDATE that
+/// changes no row does not raise, so before the fix the successor was written
+/// carrying a lineage id its parent does not carry: the lineage split
+/// silently, and `workflows_executing_step_lineage` (keyed on the shared id)
+/// no longer reached the parent's workflows from the successor. A `BEFORE
+/// UPDATE` trigger that skips only the parent's `step_lineage_id` change
+/// produces that zero-row back-fill deterministically, as the retire test
+/// above does for `is_current`. The caller's transaction is committed whatever
+/// the call left on it, so the assertions see what a caller that ignored the
+/// error would have persisted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_revises_refuses_when_the_lineage_back_fill_changes_no_row(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let parent = seed_claim(
+        &pool,
+        agent,
+        "parent whose lineage cannot be back-filled",
+        0.7,
+    )
+    .await;
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION aaa_test_skip_lineage_backfill() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NULL; END $$; \
+         CREATE TRIGGER aaa_test_skip_lineage_backfill BEFORE UPDATE ON claims FOR EACH ROW \
+         WHEN (OLD.id = '{parent}'::uuid \
+               AND NEW.step_lineage_id IS DISTINCT FROM OLD.step_lineage_id) \
+         EXECUTE FUNCTION aaa_test_skip_lineage_backfill();"
+    ))
+    .execute(&pool)
+    .await
+    .expect("install the back-fill stand-in");
+
+    let content = "branch of a parent whose lineage cannot be back-filled";
+    let mut tx = pool.begin().await.unwrap();
+    let r = ClaimRepository::evolve_step_conn(
+        &mut tx,
+        ClaimId::from_uuid(parent),
+        content,
+        "revises",
+        Some("unbackfillable"),
+        2,
+        agent,
+    )
+    .await;
+    tx.commit().await.expect("commit");
+
+    // The headline first: no successor carrying a lineage its parent lacks.
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(content)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        successors, 0,
+        "no successor was written with a lineage id its parent does not carry"
+    );
+    let edges: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE target_id = $1")
+        .bind(parent)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(edges, 0, "no revises edge was inserted");
+    let (still_current, lineage): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(still_current, "a revises branch never retires its parent");
+    assert_eq!(lineage, None, "the parent still has no lineage");
+
+    let err =
+        r.expect_err("a branch whose parent's lineage back-fill changed no row must not evolve");
+    assert!(
+        matches!(&err, epigraph_db::DbError::WriteRefused { id, .. } if *id == parent),
+        "a zero-row lineage back-fill is WriteRefused naming the parent; got: {err:?}"
+    );
+
+    // Control: without the stand-in the same branch back-fills the parent and
+    // the successor shares its lineage, so the refusal above is the zero-row
+    // back-fill and not the harness.
+    sqlx::raw_sql("DROP TRIGGER aaa_test_skip_lineage_backfill ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop the stand-in");
+    let ok = ClaimRepository::evolve_step(
+        &pool,
+        ClaimId::from_uuid(parent),
+        content,
+        "revises",
+        None,
+        2,
+        agent,
+    )
+    .await
+    .expect("the same branch evolves once the back-fill can land");
+    let lineage: Option<Uuid> =
+        sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+            .bind(parent)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        lineage,
+        Some(ok.step_lineage_id),
+        "parent and successor share one lineage"
+    );
+}
+
 // ── evolve_step(supersedes) and the supersede edge cascade (backlog 8d3b4527) ──
 //
 // evolve_step(supersedes) retires a step and writes its successor, but the
@@ -473,12 +587,19 @@ async fn evolve_step_supersedes_cascade_carries_structural_edges_but_not_execute
     );
 }
 
-/// The carve-out is a STEP-LINEAGE rule, derived from the rows: a plain
-/// supersede of a claim that happens to carry a `step_lineage_id` writes a
-/// successor outside that lineage, so its `executes` and agent edges move as
-/// every supersession's do.
+/// The `executes` carve-out is a STEP-LINEAGE rule, derived from the rows: a
+/// plain supersede of a claim that happens to carry a `step_lineage_id` writes
+/// a successor outside that lineage, so its (public) `executes` moves as every
+/// supersession's does.
+///
+/// The `asserts` half is inverted by ruling R-133 (supersede SPEC §11 K1,
+/// SF-23), which generalises R-113(2) and supersedes U047 sub-decision A for
+/// agent-sourced edges: an agent's `asserts` stays on the retired claim in
+/// every supersession, lineage or not. This test used to be
+/// `plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts` and
+/// pinned the agent edge following the successor.
 #[sqlx::test(migrations = "../../migrations")]
-async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool: PgPool) {
+async fn plain_supersede_of_a_lineage_step_moves_executes_but_leaves_asserts(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let other_agent = seed_agent(&pool).await;
     let step = seed_claim(&pool, agent, "a step with a lineage", 0.7).await;
@@ -515,8 +636,8 @@ async fn plain_supersede_of_a_lineage_step_still_moves_executes_and_asserts(pool
     );
     assert_eq!(
         ends(&pool, asserted).await,
-        (other_agent, new_id),
-        "asserts follows a plain supersede"
+        (other_agent, step),
+        "an agent's asserts stays on the retired claim, lineage or not (R-133)"
     );
 }
 

@@ -35,22 +35,31 @@ impl EdgeBbaCascade {
     }
 }
 
-/// Delete every `mass_functions` row keyed `perspective_id = <one of
-/// edge_ids>`, returning how many went.
+/// Delete the `mass_functions` rows keyed `perspective_id = <one of
+/// edge_ids>` that this session may delete (see the two paths below),
+/// returning how many went.
 ///
 /// One statement, two paths, decided by migration 114's
 /// `epigraph_session_is_privileged_writer()` (the test the attach trigger and
 /// the dedup move already use):
 ///
 /// * a PRIVILEGED session (superuser, BYPASSRLS, a maintenance member) runs the
-///   plain `DELETE` it always ran;
+///   plain `DELETE` of the edge's LIVE rows: a RETRACTED row (migration 184)
+///   is kept for audit and stays keyed on its edge (rulings R-79, R-103), so
+///   an invalidation, a dedup's orphan repair or a match-candidate retire
+///   never removes it;
 /// * any other session calls `epigraph_cascade_delete_edge_bbas` (115, reduced
 ///   to its owner arm by migration 117), which deletes only the session's OWN
 ///   rows (owner group in its writable set), refuses the whole call with
 ///   `CD02` (42501) when a readable row is not the session's, and appends one
 ///   `security_events` row per call that deleted anything. Another writer's
 ///   rows are removed only by the administrative cascade on the maintenance
-///   connection (`epigraph_engine::admin_cascade`).
+///   connection (`epigraph_engine::admin_cascade`). Until migration 194
+///   re-bodies that definer (SPEC §11 phase 1, S-1), its owner arm still
+///   deletes the session's OWN retracted rows too, and counts another
+///   writer's retracted row toward `CD02`: on this path, and on a
+///   cascade run on a stamped caller transaction, the retracted-row keep is
+///   the privileged branch's only.
 ///
 /// `sqlx::Result` rather than `DbError` so the match-candidate repository,
 /// which speaks `sqlx::Result`, calls it unchanged.
@@ -70,7 +79,8 @@ pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
         WITH acc AS (SELECT public.epigraph_session_is_privileged_writer() AS priv),
         own AS (
             DELETE FROM mass_functions
-             WHERE perspective_id = ANY($1) AND (SELECT priv FROM acc)
+             WHERE perspective_id = ANY($1) AND retracted_at IS NULL
+               AND (SELECT priv FROM acc)
             RETURNING 1
         )
         SELECT CASE WHEN acc.priv THEN (SELECT count(*) FROM own)
@@ -467,25 +477,33 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// a cycle or a tree deeper than [`super::claim_role::ROLE_MAX_DEPTH`] finds
 /// no procedural root, so its compounds stay frozen: the safe direction.
 ///
-/// The role read carries no viewer splice (role is structure: a viewer that
-/// cannot see a decomposition must not be able to refold the compound's
-/// cache for everyone). That holds as written on a connection that bypasses
-/// row security, which is how the bulk recomputers run; on an application
-/// connection (the per-write `routes::assess` refresh) the server's row
-/// security still filters the role read, as the
-/// [`claim_role`](super::claim_role) module doc states.
+/// The role is read with definer rights, through migration 193's
+/// [`IS_COMPOUND_DEFINER_CALL`] (`public.epigraph_claim_is_compound`, whose
+/// body is [`super::claim_role::IS_COMPOUND_SQL`] schema-qualified): role is
+/// structure, and a viewer that cannot see a decomposition must not be able
+/// to refold the compound's cache for everyone. On an application connection
+/// (the per-request refreshes: `routes::assess`, REST and MCP BBA retract and
+/// un-retract) row security filters `edges` and `claims` whatever the query
+/// splices, so the inline predicate read there found no compound when every
+/// child was private to a group the caller is not in, and failed OPEN
+/// (backlog 0dc20fad). The definer reads the whole graph on every connection,
+/// so the guard holds closed on a filtered one exactly as on a connection
+/// that bypasses row security. The scalar subquery evaluates it once per
+/// query, not once per candidate row.
 fn with_frozen_compound_excluded(sql: &str) -> String {
     assert!(
         sql.contains(NOT_FROZEN_COMPOUND_MARKER),
         "owner query has no {NOT_FROZEN_COMPOUND_MARKER} marker:\n{sql}"
     );
-    let predicate = format!(
-        "AND NOT EXISTS (SELECT 1 FROM claims owner_role \
-                          WHERE owner_role.id = $1 AND {})",
-        super::claim_role::is_compound_sql("owner_role")
-    );
+    let predicate = format!("AND NOT (SELECT {IS_COMPOUND_DEFINER_CALL})");
     sql.replace(NOT_FROZEN_COMPOUND_MARKER, &predicate)
 }
+
+/// Migration 193's definer-rights compound test of the claim bound as `$1`:
+/// TRUE exactly when [`super::claim_role::IS_COMPOUND_SQL`] holds for it on
+/// the whole graph, whatever the caller's row security lets it see. Never
+/// NULL.
+pub const IS_COMPOUND_DEFINER_CALL: &str = "public.epigraph_claim_is_compound($1)";
 
 /// Replace [`NOT_INGEST_TEMPLATE_MARKER`] in `sql` with `AND NOT <predicate>`
 /// ([`ingest_template_predicate`]), so the query reads no ingest template
@@ -1232,7 +1250,38 @@ impl MassFunctionRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
-    /// Delete all mass functions for a claim
+    /// How many RETRACTED rows (migration 184) `viewer` can read keyed on
+    /// `perspective_id`. The retraction cascade asks this for an edge it has
+    /// just invalidated: [`delete_edge_bbas`] keeps those rows, and each one
+    /// holds its key (operator ruling R-103), so the cascade neither deletes
+    /// nor re-wires them and reports how many it kept.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn count_retracted_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        perspective_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT count(*) FROM mass_functions
+             WHERE perspective_id = $1
+               AND retracted_at IS NOT NULL /* {VISIBILITY:mass_functions} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(perspective_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(u64::try_from(q.fetch_one(executor).await?).unwrap_or(0))
+    }
+
+    /// Delete every LIVE mass function of a claim. A RETRACTED row (migration
+    /// 184) is kept for audit (rulings R-79, R-103): it is neither deleted nor
+    /// counted, and its presence is not a refusal.
     ///
     /// Returns the number of rows deleted.
     ///
@@ -1251,8 +1300,10 @@ impl MassFunctionRepository {
         let mut tx = pool.begin().await?;
         let counts: (i64, i64) = sqlx::query_as(
             r#"
-            WITH seen AS (SELECT 1 FROM mass_functions WHERE claim_id = $1),
-                 done AS (DELETE FROM mass_functions WHERE claim_id = $1 RETURNING 1)
+            WITH seen AS (SELECT 1 FROM mass_functions
+                           WHERE claim_id = $1 AND retracted_at IS NULL),
+                 done AS (DELETE FROM mass_functions
+                           WHERE claim_id = $1 AND retracted_at IS NULL RETURNING 1)
             SELECT (SELECT count(*) FROM seen), (SELECT count(*) FROM done)
             "#,
         )

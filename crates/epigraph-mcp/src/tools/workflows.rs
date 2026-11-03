@@ -1520,10 +1520,7 @@ pub async fn deprecate_workflow(
             .map_err(internal_error)?;
         tx.rollback().await.map_err(internal_error)?;
         if !is_row {
-            return Err(invalid_params(format!(
-                "no claim you can read and no hierarchical workflows row has id \
-                 {workflow_id}; nothing was deprecated"
-            )));
+            return Err(deprecate_target_not_found(workflow_id));
         }
         return deprecate_hierarchical_workflow(server, auth, caller, workflow_id, cascade, params)
             .await;
@@ -1671,6 +1668,17 @@ pub async fn deprecate_workflow(
     })
 }
 
+/// `deprecate_workflow`'s answer for an id that names nothing the caller can
+/// read. The hierarchical path's authority gate gives the same answer for a
+/// target (or, with `cascade`, a descendant) the caller cannot read, so a
+/// hidden row is not told apart from a missing one (backlog c831df4a).
+fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
+    invalid_params(format!(
+        "no claim you can read and no hierarchical workflows row has id {workflow_id}; \
+         nothing was deprecated"
+    ))
+}
+
 /// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
 /// retire the workflow as a unit (U017; backlog fe874d2a).
 ///
@@ -1685,7 +1693,9 @@ pub async fn deprecate_workflow(
 ///   caller without authority is refused before it takes or waits for any
 ///   lineage row lock; one refusal writes nothing. A legacy row with no
 ///   recorded submitter gets U005's rule (admin-only over the authenticated
-///   transport); stdio is unchecked, the batch H-b bar.
+///   transport); on stdio the target must be readable on the caller's own
+///   stamp, a group target's group writable by it, and then the submitter or
+///   its operator (backlog 222289f3; `workflow_authority`'s stdio arms).
 /// * Then every `workflows` row sharing a `canonical_name` with a target is
 ///   locked, so two concurrent deprecations of one lineage cannot each keep a
 ///   claim the other is retiring.
@@ -1744,9 +1754,10 @@ async fn deprecate_hierarchical_workflow(
     //    refused `claims:write` call first waited on and then held every row of
     //    the lineage until its refusal rolled back, a repeatable contention
     //    lever on anyone's workflow.
+    let not_found = || deprecate_target_not_found(workflow_id);
     for &row in &targets {
         crate::tools::workflow_authority::require_workflow_authority(
-            server, &mut tx, auth, caller, row, TOOL,
+            server, &mut tx, auth, caller, row, TOOL, &not_found,
         )
         .await?;
     }
@@ -1768,7 +1779,7 @@ async fn deprecate_hierarchical_workflow(
     for &row in &targets {
         grants.push(
             crate::tools::workflow_authority::require_workflow_authority(
-                server, &mut tx, auth, caller, row, TOOL,
+                server, &mut tx, auth, caller, row, TOOL, &not_found,
             )
             .await?,
         );

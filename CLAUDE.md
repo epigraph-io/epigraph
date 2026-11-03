@@ -138,12 +138,28 @@ soft-flag still applies.
 ## Test database
 
 Integration tests against the live `epigraph` DB fan out for 30+ minutes
-and pollute production claim state. Use `epigraph_db_repo_test` (or any
-small DB):
+and pollute production claim state. Never point them at it, and never reuse
+a SHARED test database either: one that was not migrated `001 -> head` from
+empty (left at a pre-tenancy version, or provisioned outside the public
+migration series) cannot be migrated forward in place (060 fails closed on
+its pre-060 tables) and turns a full `cargo test -p epigraph-api` run into
+hundreds of failures that look like a code regression. Do what CI does:
+create a FRESH database whose name ends in `_test` and migrate it from empty.
 
 ```bash
-DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test cargo test ...
+createdb -U epigraph <name>_test
+MIGRATION_DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test \
+  cargo run -p epigraph-api --bin epigraph-migrate
+DATABASE_URL=postgres://epigraph:epigraph@localhost/<name>_test cargo test ...
 ```
+
+`#[sqlx::test]` suites are unaffected (each test gets its own database, migrated
+from empty); this matters for the suites that read `DATABASE_URL` directly. The
+shared fixtures stop with that procedure instead of failing obscurely:
+`spawn_app*` in `crates/epigraph-api/tests/common/mod.rs` refuses a database
+below this tree's head, and `try_test_pool` in
+`crates/epigraph-mcp/tests/common/mod.rs` panics when its database will not
+migrate to head (it used to skip silently).
 
 ## Workflow
 
@@ -200,6 +216,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs:1480`
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
+- **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
 - **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
 
