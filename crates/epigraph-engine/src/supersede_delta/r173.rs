@@ -691,16 +691,277 @@ pub(super) async fn snapshot(
     })
 }
 
+/// The stored caches and the roles of `ids`. A role picks a claim's skip
+/// outcome when it has no owner (a compound is left untouched by design).
+async fn stored_and_roles(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+) -> Result<(HashMap<Uuid, (Stored, bool)>, HashMap<Uuid, ClaimRole>), String> {
+    type Row = (
+        Uuid,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<String>,
+        Option<Uuid>,
+        Option<bool>,
+    );
+    let rows: Vec<Row> = sqlx::query_as(
+        "-- VISIBILITY-EXEMPT: maintenance read; the r173 dry run reads every group's rows on the privileged connection.
+         SELECT id, belief, plausibility, pignistic_prob, classification, belief_frame_id, is_current
+           FROM claims WHERE id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("read the candidates' caches: {e}"))?;
+    let stored = rows
+        .into_iter()
+        .map(
+            |(id, belief, plausibility, betp, classification, frame_id, cur)| {
+                (
+                    id,
+                    (
+                        Stored {
+                            belief,
+                            plausibility,
+                            betp,
+                            classification,
+                            frame_id,
+                        },
+                        cur.unwrap_or(true),
+                    ),
+                )
+            },
+        )
+        .collect();
+    let roles = epigraph_db::repos::claim_role::roles_batch(&mut *conn, viewer, ids)
+        .await
+        .map_err(|e| format!("read the candidates' roles: {e}"))?;
+    Ok((stored, roles))
+}
+
 /// Measure `ids` in the current transaction.
-///
-/// STUB (red): measures nothing yet.
 pub(super) async fn measure_ids(
-    _conn: &mut sqlx::PgConnection,
-    _viewer: &epigraph_db::visibility::Viewer,
-    _run: &mut Run,
-    _ids: &[Uuid],
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    run: &mut Run,
+    ids: &[Uuid],
 ) -> Result<Vec<R173Claim>, String> {
-    Ok(Vec::new())
+    let (stored, roles) = stored_and_roles(&mut *conn, viewer, ids).await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let Some((s, is_current)) = stored.get(&id).cloned() else {
+            // Unreadable (removed since enumeration, in a later chunk).
+            out.push(R173Claim::bare(
+                id,
+                true,
+                R173Outcome::SkippedNoInput,
+                Stored::default(),
+            ));
+            continue;
+        };
+        let compound = matches!(roles.get(&id), Some(ClaimRole::Compound { .. }));
+        out.push(measure_claim(&mut *conn, viewer, run, id, s, is_current, compound).await?);
+    }
+    Ok(out)
+}
+
+async fn fold_under(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim: Uuid,
+    frame: Uuid,
+    base: &BeliefProfile,
+) -> Result<Option<Folded>, String> {
+    Ok(
+        preview_claim_belief_on_frame_with_profile(conn, viewer, claim, frame, base, |rows| rows)
+            .await
+            .map_err(|e| format!("fold {claim} on {frame}: {e}"))?
+            .map(Folded::of),
+    )
+}
+
+async fn measure_claim(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    run: &mut Run,
+    id: Uuid,
+    stored: Stored,
+    is_current: bool,
+    compound: bool,
+) -> Result<R173Claim, String> {
+    let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, id)
+        .await
+        .map_err(|e| format!("{id}: owner frame: {e}"))?;
+    let Some(owner) = owner else {
+        let outcome = if compound {
+            R173Outcome::SkippedCompound
+        } else if MassFunctionRepository::get_for_claim(&mut *conn, viewer, id)
+            .await
+            .map_err(|e| format!("{id}: inputs: {e}"))?
+            .is_empty()
+        {
+            R173Outcome::SkippedNoInput
+        } else {
+            R173Outcome::SkippedTemplateOnly
+        };
+        return Ok(R173Claim::bare(id, is_current, outcome, stored));
+    };
+    let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, id, owner)
+        .await
+        .map_err(|e| format!("{id}: owner rows: {e}"))?;
+    let (name, hypotheses, patched, weights, untyped_or_override) = {
+        let fp = run.frame(&mut *conn, viewer, owner).await?;
+        let weights: Vec<(f64, f64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    effective_source_strength_profiled(r, &fp.empty),
+                    effective_source_strength_profiled(r, &fp.full),
+                )
+            })
+            .collect();
+        let untyped_or_override = rows.iter().all(|r| {
+            r.evidence_type.as_ref().is_none_or(|t| {
+                fp.full
+                    .lens
+                    .frame_evidence_type_weights
+                    .contains_key(&t.to_lowercase())
+            })
+        });
+        (
+            fp.name.clone(),
+            fp.hypotheses,
+            fp.patched,
+            weights,
+            untyped_or_override,
+        )
+    };
+    let mut causes = BTreeSet::new();
+    let mut changed_rows = 0;
+    for (r, (we, wf)) in rows.iter().zip(&weights) {
+        if we != wf {
+            changed_rows += 1;
+            causes.insert(
+                r.combination_method
+                    .clone()
+                    .unwrap_or_else(|| "<null>".to_string()),
+            );
+        }
+    }
+    let empty = fold_under(&mut *conn, viewer, id, owner, &run.empty_base).await?;
+    let full = fold_under(&mut *conn, viewer, id, owner, BeliefProfile::served()).await?;
+
+    let mut c = R173Claim::bare(id, is_current, R173Outcome::Unchanged, stored);
+    c.owner_frame = Some(owner);
+    c.owner_frame_name = Some(name);
+    c.owner_frame_patched = patched;
+    c.owner_inputs = rows.len();
+    c.changed_rows = changed_rows;
+    c.causes = causes.into_iter().collect();
+    c.owner_rows_untyped_or_override = untyped_or_override;
+    c.d_cal = match (&empty, &full) {
+        (Some(e), Some(f)) => Some(f.betp - e.betp),
+        _ => None,
+    };
+    c.d_other = match (&empty, c.stored.betp) {
+        (Some(e), Some(s)) => Some(e.betp - s),
+        _ => None,
+    };
+    c.regime = Some(match c.stored.betp {
+        None => Regime::NoCache,
+        Some(s) => {
+            let eq =
+                |v: &Option<Folded>| v.as_ref().is_some_and(|x| (s - x.betp).abs() < REGIME_EPS);
+            match (eq(&empty), eq(&full)) {
+                (true, true) => Regime::CacheEqBoth,
+                (true, false) => Regime::CacheEqEmpty,
+                (false, true) => Regime::CacheEqFull,
+                (false, false) => Regime::Neither,
+            }
+        }
+    });
+    if rows.len() == 1 && empty.is_some() && full.is_some() {
+        c.single_input = single_input(&mut *conn, viewer, &rows[0], hypotheses, weights[0]).await?;
+    }
+    c.empty = empty;
+    c.full = full;
+    if changed_rows == 0 {
+        return Ok(c);
+    }
+
+    let apply = preview_claim_belief_on_frame_vacating(&mut *conn, viewer, id, owner)
+        .await
+        .map_err(|e| format!("{id}: the recompute's value: {e}"))?;
+    let (outcome, apply) = match apply {
+        None => (R173Outcome::ScopeKept, None),
+        Some((p, true)) => (R173Outcome::Vacate, Some(Folded::of(p))),
+        Some((p, false)) => (R173Outcome::Recomputed, Some(Folded::of(p))),
+    };
+    c.outcome = outcome;
+    c.d_apply = match (&apply, c.stored.betp) {
+        (Some(a), Some(s)) => Some(a.betp - s),
+        _ => None,
+    };
+    c.apply = apply;
+    c.list = if outcome == R173Outcome::Recomputed {
+        match c.regime {
+            Some(Regime::CacheEqFull | Regime::CacheEqBoth) => Some(ApplyList::L3),
+            _ if !c.d_cal.is_some_and(|d| d.abs() > MOVE_EPS) => None,
+            Some(Regime::CacheEqEmpty) if c.is_current => Some(ApplyList::L1),
+            Some(Regime::CacheEqEmpty) => Some(ApplyList::L1NotCurrent),
+            _ => Some(ApplyList::L2),
+        }
+    } else {
+        None
+    };
+    Ok(c)
+}
+
+/// The closed form of a single owner row, when its masses sit only on
+/// singletons and the whole frame (check C3); `None` otherwise.
+async fn single_input(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    row: &MassFunctionRow,
+    n: usize,
+    (r_empty, r_full): (f64, f64),
+) -> Result<Option<SingleInput>, String> {
+    let Some(masses) = row.masses.as_object() else {
+        return Ok(None);
+    };
+    let theta = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let shaped = masses.iter().all(|(k, v)| {
+        v.is_number() && (*k == theta || (!k.is_empty() && k.bytes().all(|b| b.is_ascii_digit())))
+    });
+    if !shaped || n == 0 {
+        return Ok(None);
+    }
+    let h = resolve_hypothesis_index(
+        FrameRepository::get_claim_assignment(&mut *conn, viewer, row.claim_id, row.frame_id)
+            .await
+            .map_err(|e| format!("{}: assignment: {e}", row.claim_id))?
+            .and_then(|a| a.hypothesis_index),
+        n,
+    );
+    let mass = |k: &str| {
+        masses
+            .get(k)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    let (m_h, m_t) = (mass(&h.to_string()), mass(&theta));
+    #[allow(clippy::cast_precision_loss)]
+    let n = n as f64;
+    let closed = |r: f64| r * m_h + (r * m_t + 1.0 - r) / n;
+    Ok(Some(SingleInput {
+        r_empty,
+        r_full,
+        e_closed: closed(r_empty),
+        f_closed: closed(r_full),
+    }))
 }
 
 fn in_unit(v: f64) -> bool {
