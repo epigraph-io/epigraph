@@ -164,19 +164,6 @@ const METHODOLOGY_VOCABULARY: &[(&str, Methodology, &str)] = &[
     ("heuristic", Methodology::Heuristic, "abductive"),
 ];
 
-/// Load the evidence-type weight from CalibrationConfig.
-///
-/// I-3: Checks `CALIBRATION_PATH` env var first, then falls back to the
-/// relative path "calibration.toml". On any failure silently returns 0.7 so
-/// that DS wiring is never blocked by a missing config file.
-fn load_evidence_type_weight(evidence_type: &str) -> f64 {
-    let path = std::env::var("CALIBRATION_PATH").unwrap_or_else(|_| "calibration.toml".to_string());
-    epigraph_engine::calibration::CalibrationConfig::load(std::path::Path::new(&path))
-        .ok()
-        .map(|c| c.get_evidence_type_weight(evidence_type))
-        .unwrap_or(0.7)
-}
-
 fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType, String> {
     match s.to_lowercase().as_str() {
         "empirical" => Ok(EvidenceType::Observation {
@@ -416,7 +403,10 @@ async fn prepare_submission(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.clamp(0.0, 1.0);
 
-    let weight = load_evidence_type_weight(&params.evidence_type);
+    // The served calibration (`CALIBRATION_PATH`, else the compiled-in copy),
+    // never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(&params.evidence_type);
     let raw_truth = (confidence * weight).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
@@ -1527,9 +1517,10 @@ pub async fn update_with_evidence(
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
 
-    // Load type_weight from calibration (replaces deleted evidence_weight())
-    // I-3: use helper that checks CALIBRATION_PATH env var before relative path
-    let weight = load_evidence_type_weight(&params.evidence_type);
+    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
+    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(&params.evidence_type);
 
     // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
     //
