@@ -2473,6 +2473,76 @@ async fn gate_retirement_label(
     Ok(Some(grant))
 }
 
+/// The `data.rule` of [`label_not_writer`].
+pub const LABEL_NOT_WRITER_RULE: &str = "label_requires_claim_group_writer";
+
+/// The named refusal for a label write (`update_labels`, `patch_claim`, an
+/// `apply_label_dedup` unit) onto a claim whose owning group the write's stamp
+/// cannot write (backlog 3e7bfee3).
+///
+/// Migration 077's `claims_tenancy` `WITH CHECK` refuses the `UPDATE claims`
+/// with `42501` when the claim's `owner_group_id` is not in the stamp's
+/// writable set. That is a denial of authority, so it is `INVALID_REQUEST`
+/// (like `crate::errors::claim_not_writer`), not the `INTERNAL_ERROR` a server
+/// fault takes: no retry of the same request can succeed. It does not name the
+/// owning group (no claim read surface returns `owner_group_id`), and it names
+/// the two ways in: the audited admin path, or the owning group's own writer.
+fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot {action} claim {claim_id}: the claim is owned by a group this write's \
+             identity holds no live writer or admin membership in, so the database refused \
+             the write; nothing was written. Make the change as a writer of that group \
+             (the owning agent's key), or through the audited admin path over HTTP with a \
+             claims:admin token"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": LABEL_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// Map the error of a label `UPDATE claims` on a stamped transaction for the
+/// caller: the row-security `WITH CHECK` refusal ON `claims` itself (uncoded
+/// `42501`, "new row violates row-level security policy ... for table
+/// \"claims\"") is [`label_not_writer`]; everything else keeps
+/// [`db_caller_error`], so a CODED `42501` a trigger raises (a designed
+/// refusal), or a row-security refusal on ANOTHER table a trigger writes,
+/// still reaches the caller as it was before.
+///
+/// `patch_claim` routes every write through here, including a
+/// properties-only or trace-only patch: it is the same `UPDATE claims`, so the
+/// same refusal, and the message names no label-specific remedy.
+///
+/// Mapped at the statement rather than preflighted against the stamp's
+/// writable set, so it changes the ANSWER only, never which writes are
+/// admitted: the database's own decision stays the one that counts.
+fn label_write_error(e: epigraph_db::DbError, claim_id: Uuid, action: &str) -> McpError {
+    let refused_by_row_security = matches!(
+        &e,
+        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
+            if d.code().as_deref() == Some("42501")
+                && d.message().starts_with("new row violates row-level security policy")
+                && d.message().ends_with("for table \"claims\"")
+    );
+    if refused_by_row_security {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            claim_id = %claim_id,
+            action,
+            error = %e,
+            "label write refused by row security: the claim's owning group is not in the \
+             stamp's writable set; nothing was written"
+        );
+        return label_not_writer(claim_id, action);
+    }
+    db_caller_error(e)
+}
+
 pub async fn update_labels(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -2602,9 +2672,11 @@ pub(crate) async fn relabel_claim(
         .await?
         .labels
     } else {
+        // A claim owned by a group the stamp cannot write: the named
+        // `label_not_writer` refusal, not an internal error (backlog 3e7bfee3).
         ClaimRepository::update_labels_conn(tx, id, add, remove)
             .await
-            .map_err(db_caller_error)?
+            .map_err(|e| label_write_error(e, id, "relabel"))?
     };
     Ok(RelabelOutcome { labels, admin_path })
 }
@@ -2721,7 +2793,7 @@ pub async fn patch_claim(
             },
         )
         .await
-        .map_err(db_caller_error)?;
+        .map_err(|e| label_write_error(e, id, "patch"))?;
         (diff.after_labels, diff.after_props, diff.after_trace)
     };
     tx.commit().await.map_err(internal_error)?;

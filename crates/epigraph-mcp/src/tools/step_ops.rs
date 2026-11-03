@@ -72,11 +72,13 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
         // A denial of authority over a row (the chain edge, the step claim),
         // not a server fault and not a parameter the caller can fix: the same
         // INVALID_REQUEST `db_caller_error` gives migration 105's refusals.
-        E::ChainRewireRefused { .. } | E::StepNotWritable { .. } => McpError {
-            code: rmcp::model::ErrorCode::INVALID_REQUEST,
-            message: std::borrow::Cow::from(e.to_string()),
-            data: None,
-        },
+        E::ChainRewireRefused { .. } | E::StepNotWritable { .. } | E::GroupNotWritable { .. } => {
+            McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::from(e.to_string()),
+                data: None,
+            }
+        }
         // Migration 105's personal-group refusal (the step claim's owner
         // declaration): a denial, as on every other write tool.
         E::Repo(db) if db.is_write_authority_refusal() => crate::errors::db_caller_error(db),
@@ -108,8 +110,15 @@ async fn require_authority_over(
     else {
         return Ok(None);
     };
+    // A head the caller cannot read is answered as the executor answers an
+    // unknown name (backlog c831df4a).
+    let not_found = || {
+        map_step_err(epigraph_ingest_executor::StepOpError::WorkflowNotFound(
+            canonical_name.to_string(),
+        ))
+    };
     let grant = crate::tools::workflow_authority::require_workflow_authority(
-        server, conn, auth, caller, head, tool_name,
+        server, conn, auth, caller, head, tool_name, &not_found,
     )
     .await?;
     Ok(Some((head, grant)))
@@ -157,6 +166,7 @@ pub async fn add_step(
     .await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
+        Some(caller.agent_id()),
         &params.canonical_name,
         &params.step_text,
         params.position,
@@ -179,7 +189,8 @@ pub async fn add_step(
         })?;
     }
     // The arm that admitted the caller is recorded with the write: the admin
-    // arm's audit row, or the provenance row of any other authenticated arm.
+    // arm's audit row, or the provenance row of any other arm (stdio included,
+    // backlog 222289f3).
     if let Some((head, grant)) = authority {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,
@@ -259,7 +270,8 @@ pub async fn delete_step(
         .await
         .map_err(map_step_err)?;
     // The arm that admitted the caller is recorded with the write: the admin
-    // arm's audit row, or the provenance row of any other authenticated arm.
+    // arm's audit row, or the provenance row of any other arm (stdio included,
+    // backlog 222289f3).
     if let Some((head, grant)) = authority {
         crate::tools::workflow_authority::record_workflow_write(
             &mut tx,

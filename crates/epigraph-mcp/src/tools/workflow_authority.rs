@@ -44,14 +44,33 @@
 //! * `add_step`, `delete_step`, `deprecate_workflow` and every new generation
 //!   require, over the AUTHENTICATED transport and when a submitter is
 //!   recorded, in this order: the submitter; its operator (#503, the operator
-//!   itself as on every HTTP gate); or the AUDITED admin arm. stdio is
-//!   unchanged (the batch H-b bar: stdio changes only for #374), as
-//!   `patch_claim`'s whole-patch check is HTTP-only. Agents bound to the
+//!   itself as on every HTTP gate); or the AUDITED admin arm. Agents bound to the
 //!   submitter's human are NOT admitted over HTTP (operator ruling,
 //!   2026-10-13: the shared host credential must not gain edit rights over a
 //!   human's workflows); their authority traces to the human through
 //!   `OPERATED_BY` / the author binding, and their authorship through the
 //!   `AUTHORED` edges below.
+//! * STDIO (backlog 222289f3, reversing the batch H-b bar that left stdio
+//!   unchecked). The writes run on the system agent's stamp, which writes
+//!   every group the system agent is a writer of, so an unchecked stdio caller
+//!   could add a step to, soft-delete the steps of, mint the next generation
+//!   of, or deprecate a GROUP-PRIVATE lineage it could not even read, while the
+//!   REST twins refused the same outsider. The stdio caller (this server's own
+//!   agent, the write identity) is now checked against the TARGET row
+//!   ([`stdio_workflow_authority`]): it must READ the row on its OWN stamp
+//!   (a row it cannot read is refused without naming it) and, for a group row,
+//!   WRITE the row's owner group; then a recorded submitter admits only the
+//!   submitter or its operator (the operator itself, as over HTTP; there is no
+//!   admin arm without a token). Two stdio-only arms remain, both recorded:
+//!   a LEGACY row (no recorded submitter) that passes the read (and group
+//!   write) check is admitted (stdio has no audited admin path to send it to; an operator
+//!   ruling may close this), and a server with NO declared signer identity
+//!   (`--agent-key` / `--agent-model` absent, a random per-process agent) is
+//!   admitted on a submitted row that passes the same check, with a WARN, because
+//!   ownership is undecidable for it, exactly as
+//!   `tools::claims::require_owner_or_admin`'s stdio arm decides for claims.
+//!   The submitter is still INHERITED by a new generation: only the submitter
+//!   or its operator can add one now, so the inheritance names the truth.
 //! * PROVENANCE. Every write admitted over the authenticated transport is
 //!   recorded on its own transaction ([`record_workflow_write`]): the admin
 //!   arm's `workflows.admin_write` row, and for the submitter and operator arms
@@ -63,7 +82,9 @@
 //!   attributed to the session principal, the system agent, because 077's
 //!   `security_events_append` admits no other attribution on that stamp; the
 //!   actor is `acting_agent`. A new generation records one row per anchor it
-//!   was checked against, naming the anchor and the row it created.
+//!   was checked against, naming the anchor and the row it created. A stdio
+//!   write records the same `workflows.caller_write` row with
+//!   `"transport": "stdio"` and no token (`client_id` / `token_jti` null).
 //! * AUTHORSHIP, on EVERY transport (stdio included). Every claim a workflow
 //!   mutation CREATES gets an `AUTHORED` edge (agent -> claim) from the ACTING
 //!   agent (the caller over HTTP, this server's pinned agent on stdio), on the
@@ -96,12 +117,18 @@
 //!   pre-H-b behaviour with a WARN, which left any `claims:write` token able to
 //!   `delete_step` on the whole legacy corpus. A new generation of a legacy
 //!   lineage inherits no record, so platform lineage stays platform. No
-//!   submitter is backfilled: there is no provenance to backfill from. stdio is
-//!   unchanged here as everywhere in this module. When the custodian role
+//!   submitter is backfilled: there is no provenance to backfill from. On
+//!   stdio a legacy row is admitted only to a caller that reads it and, for a
+//!   group row, writes its owner group (see STDIO above). When the custodian role
 //!   (#529) lands, its check replaces `claims:admin` in `admin_arm`.
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
-//!   the wrong object and the wrong verb.
+//!   the wrong object and the wrong verb. It names them only to a caller that
+//!   can READ the row (backlog c831df4a, ruling R-100): the act's transaction is
+//!   often the ingest system agent's, which reads groups the caller does not,
+//!   so a REFUSAL to a caller that cannot read the row is the call site's
+//!   not-found answer, with no id, no submitter and no arm. Only the answer
+//!   changes: the arms admit exactly whom they admitted before.
 //!
 //! The system-agent stamp is unchanged for the rows these writes make: the
 //! caller is recorded in the provenance row, not by re-authoring the rows,
@@ -114,15 +141,19 @@ use crate::write_identity::WriteIdentity;
 /// Which arm of [`require_workflow_authority`] admitted the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkflowArm {
-    /// stdio: the gate does not run (the batch H-b bar), and nothing is
-    /// recorded about the caller.
-    Unchecked,
     /// The caller is the recorded submitter.
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
     /// The AUDITED admin arm.
     Admin,
+    /// stdio only: a row with no recorded submitter (platform corpus) that
+    /// the caller reads (and, for a group row, whose owner group it writes).
+    StdioLegacy,
+    /// stdio only: this server has no declared signer identity, so ownership
+    /// of a submitted row is undecidable; admitted on a row that passes the
+    /// read (and group write) check, with a WARN.
+    StdioUndeclaredSigner,
 }
 
 /// What [`require_workflow_authority`] admitted.
@@ -145,11 +176,24 @@ impl WorkflowGrant {
 /// Refuse the caller unless it has authority over workflow `workflow_id`; see
 /// the module doc for the rule and the order of its arms.
 ///
+/// `not_found` is the CALL SITE's answer for a workflow that does not exist
+/// (a step tool's unknown name, `evolve_step`'s unknown parent, ...). Over the
+/// authenticated transport every REFUSAL to a caller that cannot READ the row
+/// is exactly that answer, never text naming the row or its submitter
+/// (backlog c831df4a, ruling R-100: ids stay deterministic, so the answer
+/// must not confirm one). The act's transaction may be stamped with the
+/// ingest system agent, which reads groups the caller does not; the caller's
+/// own view decides what it is told. It does not decide who is admitted: the
+/// ruling masks answers and changes no authority, so the submitter, operator
+/// and admin arms run exactly as before, whether or not the caller reads the
+/// row.
+///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
-/// "cannot retire it" wording, which named the wrong object and verb), or an
-/// internal error if the submitter, the operator link or the admin grant
-/// cannot be read.
+/// "cannot retire it" wording, which named the wrong object and verb), the
+/// call site's not-found answer for a row the caller cannot read, or an
+/// internal error if the caller's view, the submitter, the operator link or
+/// the admin grant cannot be read.
 pub(crate) async fn require_workflow_authority(
     server: &EpiGraphMcpFull,
     conn: &mut sqlx::PgConnection,
@@ -157,6 +201,7 @@ pub(crate) async fn require_workflow_authority(
     caller: WriteIdentity,
     workflow_id: uuid::Uuid,
     tool_name: &'static str,
+    not_found: &(dyn Fn() -> McpError + Send + Sync),
 ) -> Result<WorkflowGrant, McpError> {
     let owner = epigraph_db::WorkflowRepository::submitter_of(&mut *conn, workflow_id)
         .await
@@ -167,33 +212,68 @@ pub(crate) async fn require_workflow_authority(
             )
         })?;
     let grant = |arm| WorkflowGrant { owner, arm };
-    // AUTHENTICATED TRANSPORT ONLY. The batch H-b bar keeps stdio unchanged
-    // except for #374's retirement label, and stdio is not a trust boundary
-    // here: the process that spawned the server handed it the DSN, the same
-    // argument that keeps `patch_claim`'s whole-patch ownership check
-    // HTTP-only. The submitter is still RECORDED for a stdio ingest, so an
-    // HTTP caller cannot take over a workflow a stdio agent created.
+    // stdio (backlog 222289f3): no token, so the caller is this server's own
+    // agent, checked against the target row on its own stamp.
     let Some(auth) = auth else {
-        return Ok(grant(WorkflowArm::Unchecked));
+        let arm =
+            stdio_workflow_authority(server, conn, caller, workflow_id, owner, tool_name).await?;
+        return Ok(grant(arm));
     };
     let caller_agent = caller.agent_id();
+    // The CALLER's view of the row (backlog c831df4a). It words refusals only:
+    // a refusal to a caller that cannot read the row is answered as the call
+    // site answers an unknown one, and names nothing. Admission is unchanged.
+    let view = caller_view_of(server, conn, caller_agent, workflow_id, tool_name).await?;
+    let readable = view.is_some();
+    let refuse = |text: String| {
+        if readable {
+            crate::errors::invalid_params(text)
+        } else {
+            not_found()
+        }
+    };
     // A workflow with NO recorded submitter (written before batch H-b) is
     // platform corpus (U005, default decision A; the D1 ruling keeps the
     // legacy corpus platform-owned). There is no submitter to match and no
     // operator to derive, so the only arm is the audited admin arm. When the
     // custodian role lands (#529), its check replaces `claims:admin` here.
+    // A GROUP row with no record (a plan migration 183 backfilled into its
+    // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
-        let subject = format!(
-            "workflow {workflow_id} has no recorded submitter (legacy platform workflow, \
-             written before batch H-b)"
-        );
+        let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
+        let (subject, kind) = if group_row {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (a group workflow written \
+                     before batch H-b)"
+                ),
+                "a workflow with no recorded submitter",
+            )
+        } else {
+            (
+                format!(
+                    "workflow {workflow_id} has no recorded submitter (legacy platform \
+                     workflow, written before batch H-b)"
+                ),
+                "a legacy platform workflow",
+            )
+        };
         let needs = "a live claims:admin grant (the audited claims:admin path)";
-        return match admin_arm(conn, auth, caller_agent, &subject, needs, tool_name).await? {
+        return match admin_arm(
+            conn,
+            auth,
+            caller_agent,
+            &subject,
+            needs,
+            tool_name,
+            &refuse,
+        )
+        .await?
+        {
             Some(()) => Ok(grant(WorkflowArm::Admin)),
-            None => Err(crate::errors::invalid_params(format!(
-                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on a \
-                 legacy platform workflow requires the audited claims:admin path. Nothing was \
-                 written."
+            None => Err(refuse(format!(
+                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on \
+                 {kind} requires the audited claims:admin path. Nothing was written."
             ))),
         };
     };
@@ -209,18 +289,173 @@ pub(crate) async fn require_workflow_authority(
     // 3. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
-    if admin_arm(conn, auth, caller_agent, &subject, needs, tool_name)
-        .await?
-        .is_some()
+    if admin_arm(
+        conn,
+        auth,
+        caller_agent,
+        &subject,
+        needs,
+        tool_name,
+        &refuse,
+    )
+    .await?
+    .is_some()
     {
         return Ok(grant(WorkflowArm::Admin));
     }
-    Err(crate::errors::invalid_params(format!(
+    Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
          neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
          the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
          Nothing was written."
     )))
+}
+
+/// The stdio arms of [`require_workflow_authority`] (backlog 222289f3; see the
+/// module doc's STDIO bullet). `caller` is the write identity, this server's
+/// own agent; the `viewer` a tool was handed is NOT consulted, so the check is
+/// on the principal that writes.
+///
+/// 1. The caller must READ the row on its OWN stamp (the system-ingest stamp
+///    the write runs on reads every group the system agent writes). A row it
+///    cannot read is refused without its id or submitter. That text is NOT a
+///    tool's own not-found text (an unknown `canonical_name` reaches the
+///    executor's "workflow not found"), so a stdio caller can still tell that
+///    a hidden name exists: the reveal residual ruling R-100 accepted, as the
+///    HTTP twins' 403 does.
+/// 2. A GROUP row: the caller must hold a live writer/admin membership of the
+///    row's owner group, the group the write lands in.
+/// 3. A recorded submitter: the submitter, or its operator (the operator
+///    itself, as over HTTP); a server with no declared signer identity is
+///    admitted with a WARN (undecidable, as for claims). No submitter: the
+///    legacy stdio arm.
+///
+/// # Errors
+/// A refusal (nothing was written), or an internal error if the caller's view
+/// or the operator link cannot be read.
+async fn stdio_workflow_authority(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    caller: WriteIdentity,
+    workflow_id: uuid::Uuid,
+    owner: Option<uuid::Uuid>,
+    tool_name: &'static str,
+) -> Result<WorkflowArm, McpError> {
+    let caller_agent = caller.agent_id();
+    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not resolve the stdio caller's viewer"),
+                e,
+            )
+        })?;
+    let tenancy = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let mut read = scoped.read_as(&viewer).await.map_err(|e| {
+                internal_error_logged(
+                    format!("{tool_name}: could not read the workflow as the stdio caller"),
+                    e,
+                )
+            })?;
+            let t =
+                epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut read, &viewer, workflow_id)
+                    .await
+                    .map_err(|e| {
+                        internal_error_logged(
+                            format!("{tool_name}: could not read the workflow as the stdio caller"),
+                            e,
+                        )
+                    })?;
+            read.commit().await.map_err(|e| {
+                internal_error_logged(
+                    format!("{tool_name}: could not read the workflow as the stdio caller"),
+                    e,
+                )
+            })?;
+            t
+        }
+        // No tenancy-aware pool (a development superuser): the in-query
+        // predicate alone, on the act's own (unstamped) connection, as every
+        // reader on that configuration.
+        None => epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+            .await
+            .map_err(|e| {
+                internal_error_logged(
+                    format!("{tool_name}: could not read the workflow as the stdio caller"),
+                    e,
+                )
+            })?,
+    };
+    let Some((visibility, owner_group)) = tenancy else {
+        return Err(crate::errors::invalid_params(format!(
+            "{tool_name}: no workflow this caller (agent {caller_agent}) can read matches the \
+             request. Nothing was written."
+        )));
+    };
+    if visibility == "group" && !viewer.writable_groups().contains(&owner_group) {
+        return Err(crate::errors::invalid_params(format!(
+            "{tool_name}: the workflow belongs to a group caller agent {caller_agent} does not \
+             write (it holds no live writer or admin membership of the workflow's owner group). \
+             Nothing was written."
+        )));
+    }
+    let Some(owner) = owner else {
+        return Ok(WorkflowArm::StdioLegacy);
+    };
+    if caller_agent == owner {
+        return Ok(WorkflowArm::Submitter);
+    }
+    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+        return Ok(WorkflowArm::Operator);
+    }
+    if !server.signer_identity_declared {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            submitter = %owner,
+            caller_agent = %caller_agent,
+            tool = tool_name,
+            "workflow mutation allowed on stdio over another agent's workflow: this server has \
+             no declared signer identity (--agent-key / --agent-model absent), so ownership is \
+             undecidable. Pass --agent-key to enforce the submitter rule."
+        );
+        return Ok(WorkflowArm::StdioUndeclaredSigner);
+    }
+    Err(crate::errors::invalid_params(format!(
+        "workflow {workflow_id} was submitted by agent {owner}; stdio caller agent \
+         {caller_agent} is neither that submitter nor its operator. {tool_name} over stdio \
+         requires the workflow's submitter or the submitter's operator (the audited \
+         claims:admin path needs an authenticated transport). Nothing was written."
+    )))
+}
+
+/// `(visibility, owner_group_id)` of workflow `workflow_id` as the caller
+/// `caller_agent` reads it, on the act's own connection (so the answer is
+/// what both that connection's stamp and the caller read), or `None` when the
+/// caller cannot read it (backlog c831df4a).
+async fn caller_view_of(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    workflow_id: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<Option<(String, uuid::Uuid)>, McpError> {
+    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller_agent)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not resolve the caller's view"),
+                e,
+            )
+        })?;
+    epigraph_db::WorkflowRepository::tenancy_as_viewer(conn, &viewer, workflow_id)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not read the workflow as the caller"),
+                e,
+            )
+        })
 }
 
 /// The AUDITED admin arm, shared by a submitted workflow (after its submitter
@@ -232,8 +467,9 @@ pub(crate) async fn require_workflow_authority(
 ///
 /// `Ok(Some(()))`: admitted. `Ok(None)`: the token holds no `claims:admin`, so
 /// the caller words its own refusal. `Err`: the token holds `claims:admin` but
-/// its client record grants none (ADM02), refused with `subject` naming the
-/// workflow and `needs` naming the arms that would admit.
+/// its client record grants none (ADM02), refused through `refuse` with
+/// `subject` naming the workflow and `needs` naming the arms that would admit
+/// (`refuse` masks the text for a caller that cannot read the row).
 async fn admin_arm(
     conn: &mut sqlx::PgConnection,
     auth: &epigraph_auth::AuthContext,
@@ -241,6 +477,7 @@ async fn admin_arm(
     subject: &str,
     needs: &str,
     tool_name: &'static str,
+    refuse: &(dyn Fn(String) -> McpError + Send + Sync),
 ) -> Result<Option<()>, McpError> {
     if !auth.has_scope("claims:admin") {
         return Ok(None);
@@ -261,7 +498,7 @@ async fn admin_arm(
     if live {
         return Ok(Some(()));
     }
-    Err(crate::errors::invalid_params(format!(
+    Err(refuse(format!(
         "{subject}; caller agent {caller_agent} holds claims:admin in its token, but the token's \
          client record ({}) grants it no live claims:admin, so the audited admin path refused it \
          (ADM02). {tool_name} requires {needs}. Nothing was written.",
@@ -320,8 +557,8 @@ pub(crate) async fn audit_admin_workflow_write(
 /// Record the write a [`WorkflowGrant`] admitted, on the SAME transaction as
 /// the write: the admin arm's `workflows.admin_write` row
 /// ([`audit_admin_workflow_write`]); for the submitter and operator arms,
-/// [`record_caller_workflow_write`]; nothing for an
-/// unchecked (stdio) grant. `details` carries the tool's own facts.
+/// [`record_caller_workflow_write`], on either transport. `details` carries
+/// the tool's own facts.
 ///
 /// # Errors
 /// An internal error if the row cannot be written; the caller's write then
@@ -350,16 +587,17 @@ pub(crate) async fn record_workflow_write(
     record_caller_workflow_write(conn, auth, caller, tool_name, workflow_id, grant, details).await
 }
 
-/// The PROVENANCE of a write admitted over the authenticated transport through
-/// the submitter or operator arm: one `workflows.caller_write`
+/// The PROVENANCE of a write admitted through any non-admin arm, on either
+/// transport: one `workflows.caller_write`
 /// `security_events` row on the write's own transaction
 /// (`SecurityEventRepository::workflow_caller_write`), recording the arm, the
 /// acting agent, the human it acted for (`operator`: the caller itself on the
 /// operator arm, null on the submitter arm), the submitter, the tool, the
 /// workflow and the token. The rows the write makes stay authored and stamped
 /// by the system agent; this row records who acted, and the `AUTHORED` edges
-/// who wrote the claims it created. A no-op for an unchecked
-/// (stdio) or admin grant (the admin arm has its own row).
+/// who wrote the claims it created. `transport` says which transport carried
+/// the call; a stdio row has no token (`client_id` / `token_jti` null). A
+/// no-op for an admin grant (the admin arm has its own row).
 ///
 /// # Errors
 /// An internal error if the row cannot be written; the caller's write then
@@ -375,15 +613,26 @@ pub(crate) async fn record_caller_workflow_write(
 ) -> Result<(), McpError> {
     let acting = caller.agent_id();
     let (arm, operator) = match grant.arm {
-        WorkflowArm::Unchecked | WorkflowArm::Admin => return Ok(()),
+        WorkflowArm::Admin => return Ok(()),
         WorkflowArm::Submitter => ("submitter", None),
         WorkflowArm::Operator => ("operator", Some(acting)),
+        WorkflowArm::StdioLegacy => ("legacy", None),
+        WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None),
     };
-    let Some(token) = auth else {
+    let (transport, client_id, token_jti) = match auth {
+        Some(token) => ("http", Some(token.client_id), Some(token.jti)),
+        None => ("stdio", None, None),
+    };
+    if auth.is_some()
+        && matches!(
+            grant.arm,
+            WorkflowArm::StdioLegacy | WorkflowArm::StdioUndeclaredSigner
+        )
+    {
         return Err(internal_error_text(format!(
-            "{tool_name}: a {arm} workflow write with no token to record. Nothing was written."
+            "{tool_name}: a stdio-only {arm} grant on an authenticated call. Nothing was written."
         )));
-    };
+    }
     let record = serde_json::json!({
         "action": tool_name,
         "workflow_id": workflow_id,
@@ -391,8 +640,9 @@ pub(crate) async fn record_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
-        "client_id": token.client_id,
-        "token_jti": token.jti,
+        "transport": transport,
+        "client_id": client_id,
+        "token_jti": token_jti,
         "write": details,
     });
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)

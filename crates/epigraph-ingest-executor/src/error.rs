@@ -47,6 +47,20 @@ pub enum IngestExecutorError {
         group: uuid::Uuid,
     },
 
+    /// A NEW generation of a group lineage inherits its predecessor's group
+    /// (ruling R-98 Q6(a)), and the calling agent itself holds no live
+    /// `writer` / `admin` membership of that group, so it may not extend the
+    /// lineage. Raised before anything is written.
+    #[error(
+        "the new generation inherits group {group} from the lineage it extends (a generation \
+         of a group-private lineage stays in that group), and the calling agent {caller} holds \
+         no live writer or admin membership of it. Nothing was written"
+    )]
+    InheritedGroupNotWritable {
+        caller: uuid::Uuid,
+        group: uuid::Uuid,
+    },
+
     /// A declared-tenancy ingest names a group the workflow-ingest system
     /// agent does not write, so its stamp could not satisfy the row-security
     /// `WITH CHECK` on the claims and edges it would create. Raised on the
@@ -138,6 +152,7 @@ impl IngestExecutorError {
         matches!(
             self,
             Self::CallerNotGroupWriter { .. }
+                | Self::InheritedGroupNotWritable { .. }
                 | Self::DeclaredGroupNotWritable { .. }
                 | Self::ReusedClaimOutsideCallerGroups { .. }
         )

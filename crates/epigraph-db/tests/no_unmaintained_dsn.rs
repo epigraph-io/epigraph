@@ -169,6 +169,14 @@ const EXEMPT: &[(&str, &str)] = &[
         "Single-claim debug lookup by operator-supplied UUID on the read-only role. Not a \
          corpus enumeration and not a write path, so FORCE has nothing to truncate here.",
     ),
+    (
+        "scripts/tests/test_migrate_provenance_bba_db.py",
+        "A pytest DB arm, not an operator script: it connects only to the CI-provisioned \
+         disposable database named by DEDUP_TEST_DATABASE_URL, refuses any name not ending in \
+         _test (the tests/dedup guard), and seeds and removes its own fixture rows as the \
+         harness superuser, which it needs to retract a row through migration 184's definer \
+         on a stamped epigraph_app session.",
+    ),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

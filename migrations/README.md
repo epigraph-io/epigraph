@@ -2180,6 +2180,194 @@ restart.
   other migrations or the binaries (a grant; the shipped job already issues
   both statements). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **188**: public `revoke_app_client_approve` (backlog ca3968f6).
+  `REVOKE EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid,
+  text[], uuid) FROM epigraph_app`, role-guarded, and nothing else. 118 granted
+  it for the REST admin approval, but the definer writes the caller's
+  `granted_scopes` verbatim and the `clients:admin` / admin-only-scope checks
+  live in the route, so any application session could activate a pending
+  client with any scope set. Approval is now a maintenance act: a maintenance
+  session calls the definer (still audited, `oauth.client_approved`), and
+  `POST /api/v1/admin/clients/:id/approve` answers 501 MOVED after its own
+  refusals (D9: a request unit holds no maintenance connection). The body,
+  owner and `search_path` pin are untouched (no CREATE OR REPLACE); 122's
+  reactivation guard stays. Pinned by
+  `epigraph-db/tests/app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`
+  and `epigraph-api/tests/admin_scope_mint.rs::approval_refuses_admin_scopes_and_otherwise_answers_moved`.
+  Sets `lock_timeout = '3s'`. Undo in the file header. **Deploy order:**
+  with or after the binary that answers the route 501 (an older binary with
+  188 applied answers it 500). **Applied to throwaway databases only, NOT to
+  any deployed database.**
+- **189**: public `events_app_append_only` (backlog 796c55aa).
+  `REVOKE UPDATE, DELETE, TRUNCATE ON public.events FROM epigraph_app`,
+  role-guarded, and nothing else: the application role keeps SELECT and
+  INSERT (the event bus and best-effort publishes). TRUNCATE was never held
+  (077 grants the four DML privileges only) and is revoked as defence in depth.
+  `events` has no row security, so before this any application session could
+  delete or rewrite a provenance event (`claim.created`, ...), and each delete
+  also removed the edges naming it through `events_cascade_edges` (INVOKER).
+  Every writer was enumerated (file header): the only DELETE is the telemetry
+  prune, which runs on a maintenance login through 186's maintenance DELETE,
+  which this file leaves intact and does not re-grant; the only UPDATE is
+  `AgentRepository::delete`'s `actor_id` detach, which already deleted nothing
+  on the application role (`agents` has no DELETE policy) and now refuses with
+  42501. Removes `("events", OPERATIONAL)` from
+  `app_role_table_lockdown.rs::ALLOWLIST`. **Deferred:** 186's suggested
+  type-restricted prune definer (replacing the maintenance role's table-wide
+  DELETE on `events`) is not added here; the maintenance role can still delete
+  or rewrite any `events` row (follow-up, file header). Pinned by
+  `app_role_table_lockdown.rs::the_app_role_cannot_delete_or_rewrite_events`,
+  `::the_maintenance_role_still_deletes_events_the_app_role_cannot`, the
+  allowlist ratchet, and
+  `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the retention job
+  still prunes on a maintenance login; an application login's own DELETE on
+  `events` is refused). Sets `lock_timeout = '3s'`. Undo in the file header.
+  **Deploy order:** after 186 (numeric order); none against the binaries (no
+  shipped request-path statement needs the revoked privileges). **Applied to
+  throwaway databases only, NOT to any deployed database.**
+- **190**: public `definer_search_path_pg_temp_last` (backlog 368ce622).
+  (1) Re-states the OAuth refresh-token and access-token revocation definers
+  (`epigraph_refresh_token_on_reuse`, `_check`, `_revoke`, `_revoke_by_hash`,
+  `_revoke_client` from 118, `epigraph_access_token_revoke` from 141) on 172's
+  form: `SET search_path = pg_catalog, pg_temp`, built-ins written
+  `pg_catalog.now()` / `pg_catalog.jsonb_build_object(`, no other byte of the
+  body changed, owner and ACL kept (the file grants and revokes nothing),
+  behind an md5 precondition on all six bodies (`55000`, nothing changed,
+  over any other body). (2) A catalog sweep appends `, pg_temp` to the path of
+  every SECURITY DEFINER function that does not list it (29 at 186, all
+  `pg_catalog, public`): without it the session's temporary schema is searched
+  first for relation and type names. `ALTER FUNCTION .. SET search_path`
+  changes neither a body nor any other configuration entry. (3) A
+  postcondition refuses if any definer still lacks a trailing `pg_temp`.
+  Sets `lock_timeout = '3s'`. Pinned by
+  `epigraph-db/tests/definer_search_path_ratchet.rs`: every definer pins a path
+  with `pg_temp` last (no allowlist); the definers whose path still names
+  `public` (197 at 190) are exactly `PUBLIC_PATH_REGISTER`, which may only
+  shrink, so a NEW definer must use 172's form or be registered visibly; a
+  pg_catalog-only definer names every `public` relation, type and function
+  qualified; the six bodies' shape; what 190 changed (paths and the six bodies
+  only), its md5 precondition and its sweep's refusal. Slot: 190 is assigned
+  to this batch and is free on `main` and in every open PR. **Deploy order:**
+  none against the binaries (no signature or behaviour changes); after 118
+  and 141. A later `CREATE OR REPLACE` of any definer replaces its path, so it
+  must pin one with `pg_temp` last. The sweep runs once, when 190 applies: a
+  definer created by a migration numbered below 190 that is applied AFTER
+  190 (an out-of-order apply) is not swept, so it must pin `pg_temp` last
+  itself. The sweep refuses (`55000`, nothing changed) a path that lists
+  `pg_temp` anywhere but last.
+  **Predeploy checks:** (1) `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  to_regprocedure('public.epigraph_refresh_token_revoke(uuid, text)')` must
+  print `4b72ecd708b56548ca5eae0b0e9e8fbb` (and likewise for the other five,
+  listed in the file); any other value means 190 refuses and the migration run
+  stops there. (2) The definers the sweep will change: `SELECT
+  p.oid::regprocedure, p.proconfig FROM pg_proc p WHERE p.prosecdef AND
+  p.pronamespace = 'public'::regnamespace AND NOT EXISTS (SELECT 1 FROM
+  unnest(p.proconfig) c WHERE c ~ '^search_path=(.*[ ,"])?pg_temp"?$')`
+  is expected to list exactly the 29 `pg_catalog, public` definers the file
+  header names (the six it re-states and the 23 in its UNDO); a row with
+  `pg_temp` before another schema means 190 refuses. Undo: the file header
+  (the six `CREATE OR REPLACE` statements only, no GRANT or REVOKE, and the
+  23 named path reverts). **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **191**: public `retire_operator_link` (backlog 4dec90c2). Before it no
+  definer changed an `operator_links` row, the table had no UPDATE policy or
+  maintenance UPDATE grant, and 122's `operator_links_audit` fired on INSERT
+  only, so retiring an existing LIVE link took a raw superuser UPDATE with no
+  audit row. Adds `epigraph_retire_operator_link(agent, reason,
+  revoke_membership)`: SECURITY DEFINER on 172's `pg_catalog, pg_temp` path,
+  owned by and EXECUTE-able by `epigraph_maintenance` only; refuses an
+  elevated session (OLR02) and any non-maintenance session (OLR01, both
+  42501), a blank reason (22004); takes 107's `epigraph.operator_links`
+  advisory lock; returns `no_link` / `already_retired` without writing
+  (idempotent); refuses while the agent holds a live writer/admin row in the
+  link's operator group (OLR03, 55000) unless `revoke_membership` revokes it in
+  the same act; 148's system-agent trigger refuses a registered system agent.
+  Re-bodies 122's `epigraph_operator_links_audit` (md5 precondition on 122's
+  body; its `public, pg_temp` path, owner and ACL kept) and re-creates its
+  trigger AFTER INSERT OR UPDATE OF `retired`: every flip writes one
+  `operator.link_retired` / `operator.link_unretired` row with the reason and
+  `via` (the verb, or `direct`). Adds the retire-only guard
+  `operator_links_retire_only` (BEFORE UPDATE, INVOKER: for every login but a
+  superuser only `retired` false -> true, OLR04 / 42501 otherwise; and that
+  flip only once the agent holds no live writer/admin row in the operator
+  group, OLR03 / 55000, so a maintenance login's direct UPDATE meets the
+  verb's precondition; the direct path is not serialised by 107's lock),
+  `GRANT UPDATE (retired)` to the maintenance role, the UPDATE policy
+  `operator_links_definer_retire` (`epigraph_definer_bypass()`), and the
+  RESTRICTIVE `security_events_operator_link_retire_privileged` reserving both
+  event types. CLI: `epigraph-operator retire-link`. Pinned by
+  `epigraph-db/tests/operator_link_retire.rs`, `schema_contract.rs`
+  (`migration_191_*`) and `epigraph-cli/tests/operator_retire_link.rs`. Undo in
+  the file header. **Deploy order:** none against other migrations; the CLI
+  verb needs 191 (42883 without it). **Applied to throwaway databases only,
+  NOT to any deployed database.**
+- **193**: public `claim_is_compound_definer` (backlog 0dc20fad) —
+  `public.epigraph_claim_is_compound(uuid) RETURNS boolean`, SECURITY
+  DEFINER, owned by `epigraph_maintenance`, STABLE, `SET search_path =
+  pg_catalog, pg_temp` (172's form). Its body is `claim_role::IS_COMPOUND_SQL`
+  over the claims row `c`, every relation `public.`-qualified and `now()` as
+  `pg_catalog.now()`, and nothing else. `MassFunctionRepository::
+  cache_owner_frame_for_claim`'s compound guard calls it instead of splicing
+  the predicate, so on an application session whose row security hides a
+  compound's whole decomposition the compound still has no cache owner (the
+  per-request refreshes of `assess` and BBA retract / un-retract no longer
+  refold or vacate it). Reveals one boolean per claim id. EXECUTE revoked from
+  PUBLIC, granted to `epigraph_app` and `epigraph_maintenance` (role-guarded
+  like 184); registered at 193 in `tenancy_backfill.rs`
+  `DEFERRED_DEFINER_FUNCTIONS` (it fails open under a non-bypassing owner).
+  Body pinned to the Rust template by
+  `epigraph-db/tests/claim_is_compound_definer.rs`; agreement over the role
+  fixtures by `claim_role.rs::assert_one_spelling`. Undo in the file header
+  (a `DROP FUNCTION`, only after rolling the binary back). Checked before
+  claiming: no migration on main, open PR or origin branch carries a `193`.
+  **Deploy order:** apply BEFORE a binary whose owner lookup calls the
+  function serves (without it every owner lookup errors 42883); an older
+  binary ignores it. **Applied to throwaway databases only, NOT to any
+  deployed database.**
+- **194**: public `retracted_bba_delete_guard` (H10; operator rulings
+  R-79 / R-103; SPEC section 10.1 S-1). A RETRACTED mass function is deleted
+  only by the audited purge definer, including the deletes the `ON DELETE
+  CASCADE` foreign keys from `claims` and `frames` perform. Adds
+  `mass_function_purge_grants` (one row names one `mass_functions` id for the
+  current transaction; `REVOKE ALL` from PUBLIC and `epigraph_app`;
+  `epigraph_maintenance` gets SELECT, INSERT, DELETE), the helper
+  `epigraph_mf_purge_granted(uuid)` (STABLE definer, executable by
+  `epigraph_app`, `epigraph_maintenance` and a non-superuser owner of
+  `mass_functions`, the role an FK cascade runs as), the purge definer
+  `epigraph_purge_mass_functions(uuid[], text)` (maintenance only; a reason
+  of 1..2000 chars; grants, deletes, clears its grants, and appends one
+  `mass_functions.purge` security event carrying every deleted row whole and
+  the reason), and the guard trigger `mass_functions_retracted_delete_guard`
+  (`BEFORE DELETE ... FOR EACH ROW WHEN (OLD.retracted_at IS NOT NULL)`,
+  SECURITY INVOKER) that refuses `SR09` (42501) any delete of a retracted row
+  no grant of the current transaction names. The exception is the grant
+  ONLY: no session setting and no `epigraph_definer_bypass()`, both of which
+  an FK cascade started by an application session can satisfy. Re-bodies
+  117's `epigraph_cascade_delete_edge_bbas(uuid[], text)` with `retracted_at
+  IS NULL` on its privileged DELETE and on its owner arm's candidate select
+  (so a retracted row is neither deleted nor counted toward CD02), stating
+  `search_path = pg_catalog, public, pg_temp`, behind a precondition on 117's
+  md5 (`39f3eacd53e7717a323759ec91b5c2c0`) and on a `proconfig` of exactly
+  117's or slot 190's path (`55000` otherwise, nothing changed; 194 does not
+  depend on 190). The new definers are on 172's form (`pg_catalog,
+  pg_temp`, every name qualified). Claim and frame hard-deletes purge first,
+  then delete (`epigraph-operator delete-frames` does). **Residual** (184's
+  posture): a maintenance login can insert a grant row directly. Sets
+  `lock_timeout = '3s'`. Behaviour in
+  `epigraph-db/tests/mass_function_purge_guard.rs` (incl. the FK-cascade
+  attack under a superuser and a NOSUPERUSER non-maintenance table owner,
+  the precondition, the undo); FK actions on `claims`, `edges` and
+  `mass_functions` in `epigraph-db/tests/fk_action_guard_ratchet.rs`. Undo:
+  `docs/runbooks/194-undo.sql`. Checked before claiming: no migration on
+  main, open PR, origin branch or local worktree carries a `194`.
+  **Deploy order (binding):** only AFTER the release that keeps retracted
+  rows on every privileged delete path (SPEC phase 1 K4a) is installed on
+  every binary that deletes `mass_functions` on a privileged connection; the
+  purge callers (`epigraph-operator delete-frames`) after the migrate.
+  **Predeploy check:** `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid
+  = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
+  text)')` must print 117's md5 and one of the two paths.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

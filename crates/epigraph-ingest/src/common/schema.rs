@@ -103,6 +103,34 @@ pub struct ClaimRelationship {
     pub strength: Option<f64>,
 }
 
+/// Refuse an extraction whose `relationships` name the lineage relationship
+/// `supersedes`, in any spelling (supersede SPEC K12a, ruling R-132).
+///
+/// Both plan builders copy a relationship verbatim into the plan the walks
+/// insert, so without this an ingest would write a `supersedes` edge that
+/// retires nothing: that edge is the supersession act's alone. Every ingest
+/// entry point calls this BEFORE any write and refuses the whole ingest (it
+/// never drops the edge silently). The error names the offending entry and
+/// carries the shared refusal
+/// (`epigraph_core::edge::relationships::SUPERSEDES_ACT_ONLY`).
+///
+/// # Errors
+/// The first entry whose relationship is `supersedes` in any ASCII case.
+pub fn refuse_lineage_relationships(relationships: &[ClaimRelationship]) -> Result<(), String> {
+    use epigraph_core::edge::relationships::{is_lineage_relationship, SUPERSEDES_ACT_ONLY};
+    match relationships
+        .iter()
+        .enumerate()
+        .find(|(_, r)| is_lineage_relationship(&r.relationship))
+    {
+        Some((i, r)) => Err(format!(
+            "relationships[{i}].relationship {:?}: {SUPERSEDES_ACT_ONLY}",
+            r.relationship
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Whether the thesis was derived top-down or bottom-up.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -115,6 +143,40 @@ pub enum ThesisDerivation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rel(relationship: &str) -> ClaimRelationship {
+        ClaimRelationship {
+            source_path: "sections/0/paragraphs/1".to_string(),
+            target_path: "sections/0/paragraphs/0".to_string(),
+            relationship: relationship.to_string(),
+            rationale: None,
+            strength: None,
+        }
+    }
+
+    #[test]
+    fn a_lineage_relationship_is_refused_in_any_spelling_and_named_by_index() {
+        for spelling in ["supersedes", "SUPERSEDES", "Supersedes", "sUpErSeDeS"] {
+            let err = refuse_lineage_relationships(&[rel("supports"), rel(spelling)])
+                .expect_err(spelling);
+            assert!(
+                err.starts_with(&format!("relationships[1].relationship {spelling:?}:"))
+                    && err.contains("written only by the supersession act"),
+                "{spelling}: names the entry and the act: {err}"
+            );
+        }
+        // Not the lineage relationship: a different word, a padded spelling
+        // (no reader treats it as lineage), and the ordinary relationships.
+        refuse_lineage_relationships(&[
+            rel("supports"),
+            rel("contradicts"),
+            rel("refines"),
+            rel("superseded"),
+            rel("supersedes_by"),
+        ])
+        .expect("no lineage relationship");
+        refuse_lineage_relationships(&[]).expect("no relationships");
+    }
 
     #[test]
     fn placeholder_author_names_are_rejected_in_any_case_or_padding() {

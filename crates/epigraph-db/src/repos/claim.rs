@@ -635,6 +635,11 @@ pub struct DedupRepair {
     /// holds (the same source counted once), an `attributed_v1` row, or every
     /// such row when the canonical is a compound.
     pub kept_on_duplicate: Vec<Uuid>,
+    /// The duplicate's LIVE edge-keyed copies (part 2) left on it because the
+    /// canonical holds the same key with a RETRACTED row (migration 184): the
+    /// retracted row holds its key (ruling R-103), so the copy can neither
+    /// move onto it nor be dropped in its favour.
+    pub kept_on_duplicate_by_retracted_holder: Vec<Uuid>,
     /// The canonical has an in-force `decomposes_to` out-edge, so nothing was
     /// pooled onto it.
     pub canonical_is_compound: bool,
@@ -1160,15 +1165,19 @@ async fn non_public_frozen_relationships(
     })
 }
 
-/// Relationships an AGENT holds on a step that a step-lineage supersession
-/// leaves on the retired step (incoming edges with `source_type = 'agent'`).
+/// Relationships an AGENT holds on a claim that every replacement leaves on
+/// the retired claim (incoming edges with `source_type = 'agent'`): a
+/// supersession, step lineage or not ([`migrate_superseded_edges`]), a dedup
+/// ([`repair_marked_duplicate`]) and a merge ([`migrate_consolidated_edges`]).
 ///
-/// `evolve_step` writes its successor under the CALLER's `agent_id`, not the
-/// retired step's (unlike the supersede act, which keeps the old author). An
-/// agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
-/// content; carried onto the successor it would record the agent asserting
-/// content it never saw. (Scope U047 sub-decision A, default "exclude"; the
-/// opposite ruling is removing this constant's use.)
+/// An agent's `asserts` / `AUTHORED` edge records that THAT agent stated THAT
+/// content. Carried onto a successor (which `evolve_step` writes under the
+/// caller's `agent_id`), a canonical or a merged claim, it would record the
+/// agent asserting content it never saw, and strip the retired claim of the
+/// record of who stated it. Ruling R-133 generalised this from step lineages
+/// (U047 sub-decision A) to every replacement (supersede SPEC §5.1, K1).
+/// Edges from other sources (a paper's `asserts`, a workflow's `AUTHORED`)
+/// keep the relationship's ordinary rule.
 pub(crate) const STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS: &[&str] = &["asserts", "AUTHORED"];
 
 /// Refuse a non-privileged session, naming `what` needs the privilege.
@@ -1213,14 +1222,25 @@ async fn require_privileged_session(
 ///
 /// A STEP-LINEAGE supersession (old and new share a non-null
 /// `step_lineage_id`: `evolve_step(supersedes)`) also leaves
-/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step, and its agents'
-/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges. The rule is
+/// [`STEP_LINEAGE_FROZEN_RELATIONSHIPS`] on the retired step. The rule is
 /// derived from the rows, not from a caller flag, because the deferred replay
 /// runs this same function knowing nothing of the original caller.
+///
+/// EVERY supersession leaves its agents'
+/// [`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`] edges, and any incoming edge
+/// carrying the reserved act marker ([`SUPERSEDE_ACT_PROPERTY`]), on the
+/// retired claim (ruling R-133, supersede SPEC §5.1). The marker is tested on
+/// the incoming re-point only: an act edge points AT the claim it records.
 ///
 /// A supersession of a NON-PUBLIC claim also leaves
 /// [`NON_PUBLIC_FROZEN_RELATIONSHIPS`] (`executes`) on it, lineage or not, so a
 /// frozen group-private workflow generation keeps its plan (OD-32).
+///
+/// Neither direction moves a RETRACTED edge (`valid_to` set): it is history
+/// about the retired claim, as the dedup and merge cascades already treat
+/// it. Nor a lineage edge in either spelling: `lower(relationship) <>
+/// 'supersedes'`, so a legacy upper-case `SUPERSEDES` row stays where it is
+/// (supersede SPEC §5.1, K2).
 ///
 /// Neither direction moves a dedup identity edge
 /// ([`DUPLICATE_IDENTITY_RELATIONSHIP`] carrying
@@ -1271,14 +1291,20 @@ async fn migrate_superseded_edges(
             frozen.push(rel);
         }
     }
-    let agent_authorship = step_lineage_set(STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS);
+    // An agent's authorship stays on the claim it authored in every
+    // supersession, lineage or not (ruling R-133; see the constant's doc).
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     // A supersession's own act edge (backlog 73085534, R-23) records who
     // wrote the claim it points at, so it stays on that claim when the claim
     // is itself superseded: carried onto the successor it would credit the
     // earlier actor with a claim it never wrote and strip the retired claim of
     // the record of its writer. It is told apart by its reserved marker
     // (`SUPERSEDE_ACT_PROPERTY`, $7), never by `tool`, which any edge writer
-    // can spell.
+    // can spell, and the marker alone decides (supersede SPEC §5.2 rule 2):
+    // an incoming edge carrying it stays whatever its source.
     let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
@@ -1292,12 +1318,12 @@ async fn migrate_superseded_edges(
     let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE edges SET target_id = $1 \
          WHERE target_id = $2 AND target_type = 'claim' \
-           AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           AND lower(relationship) <> 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
-           AND NOT (source_type = 'agent' AND relationship = 'AUTHORED' \
-                    AND COALESCE(properties->>$7 = ANY($6), false)) \
+           AND NOT COALESCE(properties->>$7 = ANY($6), false) \
            AND NOT (source_type = 'claim' AND source_id = $1) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
@@ -1316,7 +1342,8 @@ async fn migrate_superseded_edges(
     let resourced: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE edges SET source_id = $1 \
          WHERE source_id = $2 AND source_type = 'claim' \
-           AND relationship != 'supersedes' \
+           AND valid_to IS NULL \
+           AND lower(relationship) <> 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
            AND NOT (target_type = 'claim' AND target_id = $1) \
@@ -6434,12 +6461,20 @@ impl ClaimRepository {
     /// `step_follows` / `phase_follows` in either direction (they link the
     /// frozen steps `executes` names, which is the id set
     /// `workflow_steps::ordered_steps` walks), `revises` in either direction
-    /// (the lineage's branch history, like `supersedes`) and agents'
-    /// `asserts` / `AUTHORED` (the successor is written by the evolve_step
-    /// caller, not by the agents that asserted the old content) on the retired
-    /// step. A supersession made here writes no `step_lineage_id`, so the
-    /// lineage rule does not apply to it. The rule is read from the rows,
-    /// because the deferred replay knows nothing of the original caller.
+    /// (the lineage's branch history, like `supersedes`) on the retired step.
+    /// A supersession made here writes no `step_lineage_id`, so the lineage
+    /// rule does not apply to it. The rule is read from the rows, because the
+    /// deferred replay knows nothing of the original caller.
+    ///
+    /// ## Agent authorship stays (ruling R-133)
+    ///
+    /// Every supersession, lineage or not, leaves agents' `asserts` /
+    /// `AUTHORED` edges ([`STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS`]) and
+    /// any incoming edge carrying the act marker ([`SUPERSEDE_ACT_PROPERTY`])
+    /// on the retired claim: they record who stated or wrote THAT content, and the
+    /// successor (an evolve_step successor is written by its caller) is
+    /// content they never saw. The dedup and merge cascades apply the same
+    /// rule.
     ///
     /// ## Non-public steps keep their `executes` (OD-32)
     ///
@@ -6465,7 +6500,7 @@ impl ClaimRepository {
     ///
     /// * `supersede` MINTS `new_uuid` in this transaction, so no pre-existing
     ///   edge can already name it (the only one that does is the `supersedes`
-    ///   edge inserted above, excluded by `relationship != 'supersedes'`).
+    ///   edge inserted above, excluded by `lower(relationship) <> 'supersedes'`).
     ///   Contrast `mark_duplicate`, whose canonical claim pre-exists and
     ///   routinely already has edges — there the guards are load-bearing.
     /// * The remaining shape — a pre-existing `old -rel-> old` self-edge that
@@ -8209,7 +8244,8 @@ impl ClaimRepository {
     ///   current.
     /// - `DbError::WriteRefused` for `supersedes` when the retire of a parent
     ///   the locked read returned changed no row (for example a trigger
-    ///   skipped it). Defensive: the claims tenancy policy refuses a readable
+    ///   skipped it), and for either edge type when the lineage back-fill of
+    ///   a parent with no lineage yet changed no row (backlog 41646a94). Defensive: the claims tenancy policy refuses a readable
     ///   parent the session may not write by raising at its WITH CHECK
     ///   (`QueryFailed`, SQLSTATE 42501, the transaction aborted), not by
     ///   matching zero rows.
@@ -8324,12 +8360,26 @@ impl ClaimRepository {
         let lineage_id = match existing_lineage {
             Some(l) => l,
             None => {
+                // The back-fill must land on the parent, or the successor
+                // below carries a lineage id its parent does not, which
+                // splits the lineage silently (backlog 41646a94). An UPDATE
+                // that changes no row reports success, so the count is the
+                // only signal; refused as the zero-row retire above is.
                 let new_lineage = Uuid::new_v4();
-                sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
-                    .bind(new_lineage)
-                    .bind(parent_uuid)
-                    .execute(&mut *tx)
-                    .await?;
+                let backfilled =
+                    sqlx::query("UPDATE claims SET step_lineage_id = $1 WHERE id = $2")
+                        .bind(new_lineage)
+                        .bind(parent_uuid)
+                        .execute(&mut *tx)
+                        .await?
+                        .rows_affected();
+                if backfilled != 1 {
+                    return Err(DbError::WriteRefused {
+                        entity: "Claim".to_string(),
+                        id: parent_uuid,
+                        action: "evolve_step lineage back-fill".to_string(),
+                    });
+                }
                 new_lineage
             }
         };
@@ -11060,8 +11110,11 @@ impl ClaimRepository {
     ///   duplicate rows that feed the same Dempster-Shafer mass twice through
     ///   `auto_create_factor_from_edge`. Belief corruption, not an error.
     ///
-    /// `AUTHORED` is excluded from deduplication (migration 017 explicitly
-    /// allows it to accumulate) and `supersedes` from migration entirely.
+    /// An agent's `asserts` / `AUTHORED` edge, and an edge carrying the act
+    /// marker ([`SUPERSEDE_ACT_PROPERTY`]), stay on their source (ruling
+    /// R-133). Any other `AUTHORED` is excluded from deduplication (migration
+    /// 017 explicitly allows it to accumulate), and `supersedes` from
+    /// migration entirely.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` on a bad source set (wrong count,
@@ -11595,7 +11648,9 @@ async fn migrate_consolidated_edges(
     source_ids: &[Uuid],
 ) -> Result<ConsolidateEdgeMigration, DbError> {
     let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
-    // Collect every LIVE non-supersedes edge touching a source, dropping those
+    // Collect every LIVE non-supersedes edge (either spelling: a legacy
+    // upper-case `SUPERSEDES` is lineage too, SPEC §5.1) touching a source,
+    // dropping those
     // interior to the merge (both endpoints inside the source set) — those
     // would collapse to merged→merged self-loops. A retracted edge stays where
     // it is: it is history, and leaving it makes a second run a no-op.
@@ -11610,7 +11665,21 @@ async fn migrate_consolidated_edges(
     // A dedup identity edge (`same_as` carrying `properties.dedup`) is not a
     // candidate either: it names the claim its duplicate supersedes, so it is
     // neither moved nor retracted (see `migrate_superseded_edges`).
+    //
+    // An agent's authorship of a source (`source_type = 'agent'`
+    // `asserts` / `AUTHORED`) and an edge carrying the act marker are not
+    // candidates either: they record who stated or wrote THAT source, and the
+    // merged claim is content they never saw (ruling R-133, as in
+    // `migrate_superseded_edges`). They stay on the retired source.
     let frozen: Vec<String> = NON_PUBLIC_FROZEN_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
         .iter()
         .map(|s| (*s).to_string())
         .collect();
@@ -11618,11 +11687,13 @@ async fn migrate_consolidated_edges(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
         SELECT e.id, e.source_id, e.target_id, e.source_type, e.target_type, e.relationship
         FROM edges e
-        WHERE e.relationship != 'supersedes'
+        WHERE lower(e.relationship) <> 'supersedes'
           AND e.valid_to IS NULL
           AND ( (e.source_id = ANY($1) AND e.source_type = 'claim')
              OR (e.target_id = ANY($1) AND e.target_type = 'claim') )
           AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+          AND NOT (e.source_type = 'agent' AND e.relationship = ANY($3))
+          AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
           AND NOT ( e.relationship = ANY($2) AND (
                   (e.source_id = ANY($1) AND e.source_type = 'claim'
                    AND NOT EXISTS (SELECT 1 FROM claims c
@@ -11634,6 +11705,9 @@ async fn migrate_consolidated_edges(
     )
     .bind(source_ids)
     .bind(&frozen)
+    .bind(&agent_authorship)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -11651,7 +11725,10 @@ async fn migrate_consolidated_edges(
             to_delete.push(*id);
             continue;
         }
-        // AUTHORED is allowed to accumulate (migration 017) — migrate, never dedupe.
+        // An agent's AUTHORED never reaches here: it stays on its source
+        // (ruling R-133, the candidate select above). A non-agent AUTHORED
+        // (a workflow's, a claim's) still migrates and is never deduped,
+        // because migration 017 lets AUTHORED accumulate.
         if relationship == "AUTHORED" {
             survivors.push(*id);
             continue;
@@ -12299,7 +12376,10 @@ async fn repair_marked_duplicate(
     //      accumulate (migration 017 explicitly allows multiple AUTHORED
     //      edges per triple).
     //
-    // The 'supersedes' edges (dedup/lineage trail) are preserved throughout.
+    // The 'supersedes' edges (dedup/lineage trail) are preserved throughout,
+    // in either spelling: a legacy upper-case `SUPERSEDES` edge is lineage
+    // too, so neither the collision guards nor the re-points touch it
+    // (supersede SPEC §5.1, K2).
     //
     // A NON-PUBLIC duplicate also keeps its `executes` edges
     // (`NON_PUBLIC_FROZEN_RELATIONSHIPS`, OD-32): they name the steps of a
@@ -12310,6 +12390,18 @@ async fn repair_marked_duplicate(
     // today; the outgoing clauses and the claim-sourced incoming collision
     // guard cover a claim-sourced `executes`, which the edges table accepts.
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
+    // Agents' authorship of the duplicate and act-marked edges stay on it
+    // (ruling R-133, as in `migrate_superseded_edges`). Both point AT the
+    // claim they record, so the incoming re-point tests them; the collision
+    // guards never meet an agent-sourced edge (they act on claim-sourced ones).
+    let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
 
     // The act's identity edge, which keys this repair's revert record (a
     // mark made before identity edges existed has none).
@@ -12344,7 +12436,7 @@ async fn repair_marked_duplicate(
         r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
          UPDATE edges AS e SET valid_to = now()
          WHERE e.target_id = $2 AND e.target_type = 'claim'
-         AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+         AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
          AND NOT (e.relationship = ANY($3))
          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
          AND e.source_type = 'claim' AND e.source_id != $1
@@ -12374,7 +12466,7 @@ async fn repair_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
              UPDATE edges AS e SET valid_to = now()
              WHERE e.source_id = $2 AND e.source_type = 'claim'
-             AND e.relationship != 'supersedes' AND e.relationship != 'AUTHORED'
+             AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
              AND NOT (e.relationship = ANY($3))
              AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
              AND e.target_type = 'claim' AND e.target_id != $1
@@ -12452,13 +12544,17 @@ async fn repair_marked_duplicate(
     // statement (migration 117).
     let deleted_edge_ids: Vec<Uuid> = deleted_edges.iter().map(|(id, _)| *id).collect();
     // The rows are about to be deleted, so the revert record keeps them whole.
+    // Only LIVE rows: `delete_edge_bbas` keeps a retracted one (migration 184,
+    // rulings R-79 / R-103) keyed on its retracted edge, so the record must
+    // not name it as deleted.
     let mut deleted_rows: Vec<serde_json::Value> = if deleted_edge_ids.is_empty() {
         Vec::new()
     } else {
         sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              SELECT to_jsonb(mf) FROM mass_functions mf
-              WHERE mf.perspective_id = ANY($1) ORDER BY mf.id"#,
+              WHERE mf.perspective_id = ANY($1) AND mf.retracted_at IS NULL
+              ORDER BY mf.id"#,
         )
         .bind(&deleted_edge_ids)
         .fetch_all(&mut *conn)
@@ -12488,7 +12584,8 @@ async fn repair_marked_duplicate(
 
     let retargeted: Vec<(Uuid,)> = sqlx::query_as(
         "UPDATE edges SET target_id = $1 \
-         WHERE target_id = $2 AND target_type = 'claim' AND relationship != 'supersedes' \
+         WHERE target_id = $2 AND target_type = 'claim' \
+           AND lower(relationship) <> 'supersedes' \
            AND valid_to IS NULL \
            -- Retracted edges do NOT migrate. A withdrawn assertion was made
            -- ABOUT the duplicate; re-pointing it at the canonical claim would
@@ -12499,11 +12596,19 @@ async fn repair_marked_duplicate(
            -- A dedup identity edge names the claim its duplicate SUPERSEDES;
            -- it stays with it when that claim is itself marked a duplicate.
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
+           -- An agent's authorship of the duplicate, and an edge carrying
+           -- the act marker, record who stated or wrote THAT content; the
+           -- canonical is content they never saw (ruling R-133).
+           AND NOT (source_type = 'agent' AND relationship = ANY($4)) \
+           AND NOT COALESCE(properties->>$6 = ANY($5), false) \
          RETURNING id",
     )
     .bind(canon_uuid)
     .bind(dup_uuid)
     .bind(&frozen)
+    .bind(&agent_authorship)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -12515,6 +12620,7 @@ async fn repair_marked_duplicate(
     let mut moved_bbas = 0_u64;
     let mut dropped_duplicate_copies = 0_u64;
     let mut skipped_false_bindings = 0_u64;
+    let mut kept_on_duplicate_by_retracted_holder: Vec<Uuid> = Vec::new();
     let mut copied_frames: Vec<Uuid> = Vec::new();
     let mut canonical_frame_inputs: Vec<Uuid> = Vec::new();
     let mut moved_rows: Vec<MovedBba> = Vec::new();
@@ -12613,22 +12719,35 @@ async fn repair_marked_duplicate(
 
         // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
         // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
-        // 034): when `canonical` already holds a row for an incoming
-        // perspective, the DUPLICATE's copy is dropped and the canonical keeps
-        // its own. Both carry the same edge, frame and source agent; only the
-        // moment their masses were frozen differs, and the canonical's row may
-        // be another writer's contribution, which a dedup does not destroy
-        // (migration 115 section 4's rule, now the only one).
+        // 034): when `canonical` already holds a LIVE row for an incoming
+        // perspective, the duplicate's LIVE copy is dropped and the canonical
+        // keeps its own. Both carry the same edge, frame and source agent; only
+        // the moment their masses were frozen differs, and the canonical's row
+        // may be another writer's contribution, which a dedup does not destroy
+        // (migration 115 section 4's rule).
+        //
+        // A RETRACTED row on either side (migration 184) changes that (rulings
+        // R-79 / R-103: kept for audit, and it holds its key):
+        // * a retracted duplicate copy is never dropped; it stays where it is;
+        // * a live duplicate copy whose canonical holder is retracted is not
+        //   dropped either (the holder counts for nothing, so dropping the copy
+        //   would leave the evidence folded nowhere and recoverable only by an
+        //   un-mark) and cannot move onto the held key: it is KEPT on the
+        //   duplicate, as part 3 keeps a non-edge row, and reported.
+        // The move below skips every row the canonical holds the key of, so
+        // neither kind is moved.
         let dropped: Vec<serde_json::Value> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions d
               WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+                AND d.retracted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM mass_functions c
                      WHERE c.claim_id = $1
                        AND c.perspective_id = d.perspective_id
                        AND c.frame_id = d.frame_id
-                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id)
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
+                       AND c.retracted_at IS NULL)
              RETURNING to_jsonb(d)"#,
         )
         .bind(canon_uuid)
@@ -12638,19 +12757,48 @@ async fn repair_marked_duplicate(
         .await?;
         dropped_duplicate_copies = dropped.len() as u64;
         deleted_rows.extend(dropped);
+        kept_on_duplicate_by_retracted_holder = sqlx::query_scalar(
+            r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+             SELECT d.id FROM mass_functions d
+              WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+                AND d.retracted_at IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM mass_functions c
+                     WHERE c.claim_id = $1
+                       AND c.perspective_id = d.perspective_id
+                       AND c.frame_id = d.frame_id
+                       AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
+                       AND c.retracted_at IS NOT NULL)
+              ORDER BY d.id"#,
+        )
+        .bind(canon_uuid)
+        .bind(dup_uuid)
+        .bind(&retargeted_ids)
+        .fetch_all(&mut *conn)
+        .await?;
 
         // The move keeps "a writer's contribution is the writer's" (migration
         // 114). Onto a PUBLIC canonical, a row keeps its owner and comes out
         // writer-owned whenever that owner is not the canonical's (so a later
         // insert on the canonical does not re-stamp it to the canonical's
         // owner); onto a group-private canonical it becomes the claim's own
-        // row, as every derived row of a private claim is.
+        // row, as every derived row of a private claim is. A row whose key the
+        // canonical holds (only the kept rows above remain so) is not moved:
+        // the move would collide with the holder on migration 034's unique key.
+        // A retracted row the canonical does not hold moves with its edge, its
+        // retraction intact (184's guards admit a move).
         let moved: Vec<MovedBba> = sqlx::query_as(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              WITH before AS (
                  SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
                    FROM mass_functions b
-                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3))
+                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM mass_functions c
+                         WHERE c.claim_id = $1
+                           AND c.perspective_id = b.perspective_id
+                           AND c.frame_id = b.frame_id
+                           AND c.source_agent_id IS NOT DISTINCT FROM b.source_agent_id))
              {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
         ))
         .bind(canon_uuid)
@@ -12723,7 +12871,8 @@ async fn repair_marked_duplicate(
     // `DedupRepair::resourced_edges`).
     let resourced_rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
         "UPDATE edges SET source_id = $1 \
-         WHERE source_id = $2 AND source_type = 'claim' AND relationship != 'supersedes' \
+         WHERE source_id = $2 AND source_type = 'claim' \
+           AND lower(relationship) <> 'supersedes' \
            AND valid_to IS NULL \
            -- Retracted edges do NOT migrate. A withdrawn assertion was made
            -- ABOUT the duplicate; re-pointing it at the canonical claim would
@@ -12840,6 +12989,7 @@ async fn repair_marked_duplicate(
         skipped_false_bindings,
         pooled_bbas,
         kept_on_duplicate,
+        kept_on_duplicate_by_retracted_holder,
         canonical_is_compound,
         revert: DedupRevert {
             identity_edge,
@@ -13054,7 +13204,9 @@ async fn reverse_marked_duplicate(
     // returning input's slot on the duplicate may since hold the duplicate's
     // re-derived CACHED combination (the cascade recomputed it); that row is
     // derived and is cleared so the input can return. Any other occupant of
-    // the slot is a later write: the row stays where it is (drifted).
+    // the slot is a later write: the row stays where it is (drifted). So is a
+    // RETRACTED cached row (migration 184): it is kept for audit and holds its
+    // key (rulings R-79, R-103), so the input it blocks is reported drifted.
     let moved_ids: Vec<Uuid> = record.moved_bbas.iter().map(|m| m.id).collect();
     let moved_json =
         serde_json::to_value(&record.moved_bbas).map_err(|e| DbError::InvalidData {
@@ -13065,7 +13217,7 @@ async fn reverse_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions k
               USING mass_functions m
-              WHERE k.claim_id = $2 AND {}
+              WHERE k.claim_id = $2 AND {} AND k.retracted_at IS NULL
                 AND m.id = ANY($3) AND m.claim_id = ANY($1)
                 AND m.frame_id = k.frame_id
                 AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
@@ -13111,7 +13263,9 @@ async fn reverse_marked_duplicate(
     // only beside an edge that is in force again: every one of them is keyed
     // to an edge, and a BBA on a retracted edge is exactly the orphan the
     // repair exists to prevent. One whose id or key is taken again is a later
-    // write's and is skipped.
+    // write's and is skipped (`ON CONFLICT DO NOTHING`, no conflict target, so
+    // a key a RETRACTED row holds is skipped too and its row reported
+    // drifted; the retracted row is not touched).
     if !record.deleted_bbas.is_empty() {
         let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
         let asked: Vec<Uuid> = record

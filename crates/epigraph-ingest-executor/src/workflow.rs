@@ -461,6 +461,42 @@ pub async fn execute_workflow_ingest_plan_in_group(
     execute_plan(conn, plan, extraction, Some(caller), declared_group).await
 }
 
+/// The group a NEW generation inherits (ruling R-98 Q6(a)): when no row
+/// `(canonical_name, generation)` exists yet, the group of the lineage's head
+/// if it is a group row, else of the row the ingest links as its parent
+/// (`WorkflowRepository::ingest_anchors`, the anchors the callers' authority
+/// check reads, in the same order). `None` for a re-ingest, a brand-new
+/// lineage, or a public predecessor. Read on the plan walk's
+/// system-agent-stamped transaction.
+async fn inherited_generation_group(
+    conn: &mut sqlx::PgConnection,
+    extraction: &WorkflowExtraction,
+) -> Result<Option<Uuid>, IngestExecutorError> {
+    let anchors = WorkflowRepository::ingest_anchors(
+        &mut *conn,
+        &extraction.source.canonical_name,
+        extraction.source.generation as i32,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await?;
+    if anchors.existing.is_some() {
+        return Ok(None);
+    }
+    for anchor in [anchors.lineage_head, anchors.linked_parent]
+        .into_iter()
+        .flatten()
+    {
+        if let Some((visibility, group)) =
+            WorkflowRepository::tenancy_of(&mut *conn, anchor).await?
+        {
+            if visibility == "group" {
+                return Ok(Some(group));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The walk both entry points share. `caller` is `None` only for
 /// [`execute_workflow_ingest_plan`], which never declares a group.
 #[allow(clippy::too_many_lines)]
@@ -471,6 +507,30 @@ async fn execute_plan(
     caller: Option<&epigraph_db::visibility::Viewer>,
     declared_group: Option<Uuid>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
+    // A NEW generation of a group lineage inherits its predecessor's group
+    // when it declares none (ruling R-98 Q6(a), backlog 630af617; 074's
+    // successor rule). Before, `improve_workflow_hierarchy` or an undeclared
+    // next-generation ingest made a PUBLIC row with public claims under a
+    // private lineage. The caller must write the inherited group itself, as
+    // for a declared one.
+    let declared_group = match declared_group {
+        Some(group) => Some(group),
+        None => {
+            let inherited = inherited_generation_group(&mut *conn, extraction).await?;
+            if let Some(group) = inherited {
+                let principal = caller.and_then(|c| c.principal());
+                let writes = caller
+                    .is_some_and(|c| principal.is_some() && c.writable_groups().contains(&group));
+                if !writes {
+                    return Err(IngestExecutorError::InheritedGroupNotWritable {
+                        caller: principal.unwrap_or_else(Uuid::nil),
+                        group,
+                    });
+                }
+            }
+            inherited
+        }
+    };
     // A declared group always comes with the caller it is declared for.
     let declared = match (declared_group, caller) {
         (Some(group), Some(caller)) => Some((group, caller)),

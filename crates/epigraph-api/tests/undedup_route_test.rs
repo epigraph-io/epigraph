@@ -152,6 +152,12 @@ async fn undedup_without_an_admin_connection_is_refused_and_writes_nothing() {
     .await;
     assert_eq!(status, 409, "{b}");
     assert!(b.to_string().contains("administrative"), "{b}");
+    // And says where an un-mark does run (backlog e8113079).
+    assert!(
+        b.to_string()
+            .contains("the `unmark_duplicate` CLI on the maintenance DSN"),
+        "{b}"
+    );
     assert_eq!(
         dup_state(&pool, dup).await,
         (Some(canonical), false),

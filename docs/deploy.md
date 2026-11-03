@@ -749,13 +749,19 @@ a 2-connection maintenance pool). The timers add, while they run:
 `replay_deferred_cascades` up to 11 (the `MaintenancePool` cap, see below) and
 `drain_jobs` up to 4 plus the one connection that holds its advisory lock.
 
-**The timers refuse the fallback.** `replay_deferred_cascades`, `drain_jobs` and
-the `sweep_semantic_duplicates` CLI require `MAINTENANCE_DATABASE_URL` to be SET:
+**The timers refuse the fallback.** `replay_deferred_cascades`, `drain_jobs`,
+the `sweep_semantic_duplicates` CLI and the `unmark_duplicate` CLI (the only
+process that completes an un-mark: an un-mark has no deferred form, so MCP
+`unmark_duplicate`, HTTP `POST /api/v1/claims/:id/undedup` and
+`revert_label_dedup` with marks refuse on a request server) require
+`MAINTENANCE_DATABASE_URL` to be SET:
 the documented fallback to `DATABASE_URL` is refused, so the application DSN
 never runs maintenance work. `drain_jobs` also refuses a connection that does
 not satisfy `epigraph_bypass()`, whether or not row security is active yet.
-Each takes its own session advisory lock, so a hand-run beside the timer does
-nothing (`{"locked": true}`, exit 0). `replay_deferred_cascades --report-only`
+Each timer and the sweep take their own session advisory lock, so a hand-run
+beside the timer does nothing (`{"locked": true}`, exit 0); `unmark_duplicate`
+takes the replay's lock instead and, while a replay holds it, exits 1 with
+nothing written. `replay_deferred_cascades --report-only`
 prints `{"pending","stuck","oldest_age_s"}` in a read-only transaction and
 takes no lock (the staleness check).
 
@@ -914,7 +920,7 @@ rolsuper, rolbypassrls FROM pg_roles`:
 | role | login | superuser | bypassrls | what it is for |
 |---|---|---|---|---|
 | `epigraph` | yes | **yes** | yes | The migration/dev/CI superuser. Every `#[sqlx::test]` and `ci.yml` connect as this, which is why `epigraph_bypass()` is unconditionally true in the test suite and why PR-15's refusal rule is unit-tested on a pure function rather than asserted against a live connection. |
-| `epigraph_app` | **no** | no | no | The request-path role RLS is written against. **Still NOLOGIN after PR-17.** Migration 077 grants it schema `USAGE`, table DML and sequence access — the migration-shaped half — but `ALTER ROLE epigraph_app LOGIN PASSWORD …` is an out-of-band operator step in the 11d runbook, because this repository is public and a credential must never land in it. That `ALTER ROLE` is what arms every PR-17 posture refusal: they are staged on `current_user`, so they are inert until it runs. `current_user <> 'epigraph_app'` remains a WARN and not a refusal — see `epigraph_api::state::rls_verdict`. |
+| `epigraph_app` | **no** on a fresh migrate; **yes** once armed | no | no | The request-path role RLS is written against. **The migrations never give it a login:** 060 creates it `NOLOGIN` and no later migration changes that (`schema_contract.rs::no_migration_grants_a_role_login` fails on any migration that grants a role LOGIN). Migration 077 grants it schema `USAGE`, table DML and sequence access — the migration-shaped half — but `ALTER ROLE epigraph_app LOGIN PASSWORD …` is an out-of-band operator step in the 11d runbook, because this repository is public and a credential must never land in it. That `ALTER ROLE` is what arms every PR-17 posture refusal: they are staged on `current_user`, so they are inert until it runs. `current_user <> 'epigraph_app'` remains a WARN and not a refusal — see `epigraph_api::state::rls_verdict`. So on an armed cluster this role logs in by design; `schema_contract.rs::tenancy_roles_are_nologin` allows that and asserts instead that it is never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB, while `epigraph_maintenance` and `epigraph_seed` must stay NOLOGIN. |
 | `epigraph_maintenance` | **no** | no | no | The bypass role. `epigraph_bypass()` (migration 067) is membership of this. NOLOGIN, so it is a *membership grant target*, not a connect-as identity. |
 | `epigraph_seed` | **no** | no | no | Migration 074 arm 4's fixture escape hatch (PR-16). |
 | `epigraph_ro` | yes | no | no | Read-only. Used by `scripts/subcluster_outliers.py` and `run_assessment_worker.py`'s read side, both of which PR-15 deliberately left alone. |
@@ -1698,6 +1704,10 @@ model, the audit trail and the round-4 binding fixes are in `docs/tenancy.md`
    same transaction. A claim the world group does not own is refused unless
    `--allow-owned` is given, and the act records whether it was (operator
    ruling OQ-8 (a)).
+   The same transaction records a `supersede` cascade deferral naming the
+   custodian: the edge migration and the belief cascade run from it in the
+   next `replay_deferred_cascades` run (the replay timer), as for any deferred
+   supersede.
    The successor has no embedding until the next embedding backfill.
 
 **Rollback.** First roll back every binary that calls a 123 function:
@@ -2057,9 +2067,11 @@ it unarmed.
    closed). The elevate grant is unaffected either way (read scopes plus
    `platform:admin`). A token without an admin-only scope never reads it.
    The paths that hand scopes OUT follow the same switch: client approval
-   (`POST /api/v1/admin/clients/:id/approve`) approves an admin-only scope
-   only while unarmed (with a warning in the log) and refuses it (403) while
-   armed or when the switch cannot be read; it never grants `platform:admin`.
+   (`POST /api/v1/admin/clients/:id/approve`) refuses an admin-only scope
+   (403) while armed or when the switch cannot be read, and never grants
+   `platform:admin`; since migration 188 it approves nothing on a request
+   unit (501 MOVED: the approval definer is maintenance-only, so a
+   maintenance session calls `epigraph_oauth_client_approve` directly).
    Registration (`POST /oauth/register`), which grants a fixed set whatever it
    is asked, refuses (400) a request naming an admin-only scope while armed.
 

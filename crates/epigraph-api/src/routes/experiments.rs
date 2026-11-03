@@ -644,6 +644,19 @@ pub async fn design_experiment(
     State(state): State<AppState>,
     Json(request): Json<DesignExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The response names the hypothesis, so it is read through the caller's
+    // viewer first, as every R-51 route reads it (backlog d817613e): a
+    // hypothesis the caller cannot read is the same 404 as a missing one.
+    // Read access only: a design writes nothing.
+    crate::routes::experiment_loop::require_hypothesis(
+        &state,
+        &viewer,
+        request.hypothesis_id,
+        crate::routes::experiment_loop::HypothesisAccess::Read,
+        "design an experiment on this hypothesis",
+    )
+    .await?;
+
     // Load methods
     let mut protocol = Vec::new();
     let mut _all_equipment: Vec<String> = Vec::new();

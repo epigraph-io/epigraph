@@ -809,8 +809,11 @@ fn approve_path(client: Uuid) -> String {
     format!("/api/v1/admin/clients/{client}/approve")
 }
 
-/// Client approval hands out an admin-only scope only while the switch is
-/// UNARMED, and never `platform:admin`. ARMED, since the check chokepoint
+/// Client approval is a maintenance act (migration 188, backlog ca3968f6): the
+/// application role may not EXECUTE `epigraph_oauth_client_approve`, so the
+/// route, which holds no maintenance connection (operator decision D9), answers
+/// 501 MOVED once its own checks pass and grants nothing. Its refusals still
+/// come first: never `platform:admin`. ARMED, since the check chokepoint
 /// (plan EL-10) a STANDING `clients:admin` token no longer holds the scope the
 /// route needs: every approval through it is refused (403 naming
 /// `clients:admin`) and nothing is granted, so the route's own armed refusal
@@ -819,31 +822,42 @@ fn approve_path(client: Uuid) -> String {
 /// approval is maintenance-CLI-only once armed (plan EQ-5). An unreadable
 /// switch is armed for the request (fail closed).
 ///
-/// Catches: the unarmed approval refused (the chokepoint treating unarmed as
-/// armed); the `platform:admin` refusal removed (approved unarmed); the
+/// Catches: the route approving on the application role again (a 200 and an
+/// `active` client, the pre-188 shape); the unarmed approval refused (the
+/// chokepoint treating unarmed as armed: 403, not 501); the `platform:admin`
+/// refusal removed (501 instead of 403); the
 /// chokepoint not applied to the route's scope check (the armed approvals
 /// succeed); an unreadable switch read as unarmed (fail open).
 #[sqlx::test(migrations = "../../migrations")]
-async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
+async fn approval_refuses_admin_scopes_and_otherwise_answers_moved(pool: PgPool) {
     let st = state(&pool).await;
     let jwt = st.jwt_config.clone();
     let app = create_router(st);
     let bearer = client_admin_bearer(&pool, &jwt).await;
 
-    // Unarmed: as before.
-    let unarmed = pending_client(&pool).await;
-    let (status, body) = post_bearer(
-        app.clone(),
-        &approve_path(unarmed),
-        &bearer,
-        json!({ "granted_scopes": HELD }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "unarmed approval: {body}");
-    assert_eq!(
-        status_and_granted(&pool, unarmed).await,
-        ("active".to_string(), v(HELD))
-    );
+    // Unarmed: the checks pass and the route answers MOVED; nothing is
+    // approved or granted, admin-only or ordinary scopes alike.
+    for granted in [json!(HELD), json!(["claims:read"])] {
+        let unarmed = pending_client(&pool).await;
+        let (status, body) = post_bearer(
+            app.clone(),
+            &approve_path(unarmed),
+            &bearer,
+            json!({ "granted_scopes": granted }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_IMPLEMENTED,
+            "unarmed approval: {body}"
+        );
+        assert_eq!(body["error"], "maintenance_surface_not_served", "{body}");
+        assert_eq!(body["surface"], "approve_client", "{body}");
+        assert_eq!(
+            status_and_granted(&pool, unarmed).await,
+            ("pending".to_string(), vec![])
+        );
+    }
 
     // platform:admin: never.
     let never = pending_client(&pool).await;
@@ -902,6 +916,64 @@ async fn approval_hands_out_admin_scopes_only_while_unarmed(pool: PgPool) {
         status_and_granted(&pool, unreadable).await,
         ("pending".to_string(), vec![])
     );
+}
+
+/// Migration 188's route half: the approve route approves nothing on ANY
+/// application DSN, a privileged one included (the superuser test pool, which
+/// may still EXECUTE the definer), because it no longer calls the definer. It
+/// answers 501 MOVED naming the maintenance-only definer.
+///
+/// Catches: the route still approving on its own pool (a privileged DSN would
+/// activate the client: 200, `active`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_approve_route_approves_nothing_even_on_a_privileged_dsn(pool: PgPool) {
+    let st = AppState::with_db(pool.clone(), config())
+        .with_admin_scope_arming_ttl(std::time::Duration::ZERO);
+    let jwt = st.jwt_config.clone();
+    let app = create_router(st);
+    let bearer = client_admin_bearer(&pool, &jwt).await;
+    let privileged: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(current_user, \
+            'public.epigraph_oauth_client_approve(uuid, text[], uuid)'::regprocedure, 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("probe");
+    assert!(
+        privileged,
+        "CALIBRATION: this DSN may EXECUTE the definer, so a 501 is the route's"
+    );
+
+    let client = pending_client(&pool).await;
+    let (status, body) = post_bearer(
+        app,
+        &approve_path(client),
+        &bearer,
+        json!({ "granted_scopes": ["claims:read"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"], "maintenance_surface_not_served", "{body}");
+    assert_eq!(body["runs_on"]["kind"], "none", "{body}");
+    assert!(
+        body["runs_on"]["name"]
+            .as_str()
+            .is_some_and(|n| n.contains("epigraph_oauth_client_approve")),
+        "{body}"
+    );
+    assert_eq!(
+        status_and_granted(&pool, client).await,
+        ("pending".to_string(), vec![])
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'oauth.client_approved' \
+            AND details->>'oauth_client_id' = $1::text",
+    )
+    .bind(client)
+    .fetch_one(&pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audited, 0, "a 501 leaves no approval audit row");
 }
 
 fn registration(name: &str, scope: Option<&str>) -> Value {

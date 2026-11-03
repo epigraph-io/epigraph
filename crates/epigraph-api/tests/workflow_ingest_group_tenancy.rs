@@ -1891,6 +1891,238 @@ async fn a_public_step_reused_by_a_private_generation_does_not_admit_a_non_membe
     assert_eq!(outcome_written(&pool, w1).await, (Some(1), 0));
 }
 
+/// R-98 Q8(a) (backlog 630af617 (4)): privatizing a plan's level 0..2 claims
+/// (`restrict_claims_conn`, the privatization apply step, on a privileged
+/// session) re-tenants its PUBLIC `workflows` row into the target group, so
+/// the plan is private as a unit: a non-member's outcome report is the
+/// unknown-id answer and writes nothing, while a member of the group still
+/// reports. Before, the row stayed public, and the report gate decided on the
+/// row (R-74) and admitted the non-member over a plan whose every claim was
+/// private.
+#[sqlx::test(migrations = "../../migrations")]
+async fn restricting_a_plans_claims_re_tenants_its_workflows_row(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-restrict-plan";
+    let out = w
+        .api
+        .ingest_ok(&h, &extraction(name, 0, &[&["acme restrict op"]]))
+        .await;
+    let wf = uuid_of(&out["workflow_id"]);
+    let row = || async {
+        sqlx::query_as::<_, (String, Uuid)>(
+            "SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1",
+        )
+        .bind(wf)
+        .fetch_one(&pool)
+        .await
+        .expect("the row")
+    };
+    assert_eq!(row().await.0, "public", "fixture: a public plan");
+    let structural: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT e.target_id FROM edges e JOIN claims c ON c.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND (c.properties->>'level')::int <= 2",
+    )
+    .bind(wf)
+    .fetch_all(&pool)
+    .await
+    .expect("the plan's structural claims");
+    assert!(!structural.is_empty());
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let moved = PrivatizationRepository::restrict_claims_conn(&mut conn, &structural, w.og)
+        .await
+        .expect("restrict the plan's claims");
+    assert_eq!(moved.len(), structural.len(), "every claim moved");
+    // The plan half, as the apply batch runs it (the unit rule and the
+    // audited round trip are tests/privatization_workflow_rows.rs).
+    let rows = PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, w.og)
+        .await
+        .expect("restrict the plan's row");
+    drop(conn);
+    assert_eq!(rows.len(), 1, "the plan's one row moves: {rows:?}");
+    assert_eq!(
+        row().await,
+        ("group".to_string(), w.og),
+        "the privatized plan's row is re-tenanted with it"
+    );
+
+    let uri = format!("/api/v1/workflows/hierarchical/{wf}/outcome");
+    let (status, out) = w
+        .api
+        .call(
+            Method::POST,
+            &uri,
+            &token(w.h2, WRITE_SCOPES),
+            Some(&outcome_body()),
+        )
+        .await;
+    assert_eq!(
+        (status, outcome_written(&pool, wf).await),
+        (StatusCode::NOT_FOUND, (None, 0)),
+        "a non-member's report is the unknown-id answer and writes nothing: {out}"
+    );
+    let (status, out) = w
+        .api
+        .call(Method::POST, &uri, &h, Some(&outcome_body()))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the group's member reports: {out}");
+}
+
+/// MCP `add_step` as `viewer` (with `auth` over HTTP, `None` on stdio).
+async fn mcp_add_step(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    name: &str,
+    text: &str,
+) -> Result<(), String> {
+    epigraph_mcp::tools::step_ops::add_step(
+        server,
+        viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: name.to_string(),
+            step_text: text.to_string(),
+            position: None,
+        },
+        auth,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.message.to_string())
+}
+
+/// Set `agent`'s live membership of `group` to `role` (harness).
+async fn set_role(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    let n = sqlx::query(
+        "UPDATE group_memberships SET role = $3 \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("set the role")
+    .rows_affected();
+    assert_eq!(n, 1, "one live membership of {agent} in {group}");
+}
+
+/// R-98 Q5(a) review addendum (backlog 630af617 (1)): the step a GROUP plan
+/// gains lands in the plan's group on the system agent's stamp, which writes
+/// that group whoever called, so the CALLER itself must write the group. A
+/// caller with workflow authority (the recorded submitter) that holds only a
+/// READER membership, or none, is refused with nothing written, over REST,
+/// MCP over HTTP and MCP over stdio. A writer is admitted (calibration) and
+/// its step lands in the group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_writer_cannot_add_a_step_to_a_group_plan(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-add-step-non-writer";
+    let out = w
+        .api
+        .ingest_ok(
+            &h,
+            &declared(extraction(name, 0, &[&["acme non-writer op"]]), w.g, None),
+        )
+        .await;
+    let wf = uuid_of(&out["workflow_id"]);
+    let rest_add = |tok: String, text: &'static str| {
+        let api = &w.api;
+        async move {
+            api.call(
+                Method::POST,
+                "/api/v1/workflows/steps",
+                &tok,
+                Some(&json!({"canonical_name": name, "step_text": text})),
+            )
+            .await
+        }
+    };
+    let before = executes_count(&pool, wf).await;
+
+    // The submitter, now a READER of the plan's group.
+    set_role(&pool, w.g, w.h, "reader").await;
+    let (s, b) = rest_add(h.clone(), "acme reader rest step").await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST: a reader is refused: {b}");
+    let h_viewer = epigraph_db::Viewer::resolve(&pool, w.h)
+        .await
+        .expect("viewer");
+    let err = mcp_add_step(
+        &w.c_server,
+        &h_viewer,
+        Some(&http_auth(w.h)),
+        name,
+        "acme reader http step",
+    )
+    .await
+    .expect_err("MCP over HTTP: a reader is refused");
+    assert!(err.contains("does not write"), "{err}");
+
+    // A NON-member recorded as the submitter.
+    set_role(&pool, w.g, w.h, "admin").await;
+    set_submitter(&pool, wf, w.h2).await;
+    let (s, b) = rest_add(token(w.h2, WRITE_SCOPES), "acme stranger rest step").await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "REST: a non-member is refused: {b}"
+    );
+    assert_eq!(
+        executes_count(&pool, wf).await,
+        before,
+        "nothing was written by any refused call"
+    );
+    assert_eq!(claims_with_content(&pool, "acme reader rest step").await, 0);
+    assert_eq!(claims_with_content(&pool, "acme reader http step").await, 0);
+    assert_eq!(
+        claims_with_content(&pool, "acme stranger rest step").await,
+        0
+    );
+
+    // stdio: the curator's own plan, the curator a reader, then a writer.
+    let stdio_name = "acme-add-step-non-writer-stdio";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction(stdio_name, 0, &[&["acme stdio non-writer op"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator declares the plan into the team group");
+    set_role(&pool, w.g, w.c, "reader").await;
+    let c_viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let refused = mcp_add_step(
+        &w.c_server,
+        &c_viewer,
+        None,
+        stdio_name,
+        "acme reader stdio step",
+    )
+    .await;
+    assert!(refused.is_err(), "stdio: a reader is refused: {refused:?}");
+    assert_eq!(
+        claims_with_content(&pool, "acme reader stdio step").await,
+        0
+    );
+
+    // CALIBRATION: the submitter as a writer again, over REST.
+    set_submitter(&pool, wf, w.h).await;
+    let (s, b) = rest_add(h.clone(), "acme writer rest step").await;
+    assert_eq!(s, StatusCode::OK, "REST: the writing submitter adds: {b}");
+    let step = uuid_of(&b["step_claim_id"]);
+    assert_eq!(
+        claim_tenancy(&pool, step).await,
+        ("group".to_string(), w.g),
+        "the writer's step lands in the plan's group"
+    );
+}
+
 /// Both MCP entry points (`report_hierarchical_outcome` and
 /// `report_workflow_outcome`'s hierarchical branch), as `agent`, on
 /// `workflow_id`. Each call's result as `Ok(())` or `Err(message)`.
@@ -2154,9 +2386,18 @@ async fn over_mcp_a_declared_generation_is_found_only_by_its_group(pool: PgPool)
 /// succeeds; the new generation is NOT declared into the group, so its row is
 /// public, as before migration 183. Whether a new generation should inherit
 /// its head's group (as a superseding claim does) is the open question.
+/// R-98 Q6(a) (backlog 630af617 (2)): a new generation of a group lineage
+/// inherits its head's group (074's successor rule: a successor takes its
+/// predecessor's tenancy unless it declares its own). It used to become a
+/// PUBLIC workflows row with public new claims, while 183's backfill makes the
+/// same shape a group row. Over stdio (`improve_workflow_hierarchy`, which
+/// declares nothing) and over REST (an undeclared next-generation ingest):
+/// the new row AND every claim the new generation creates are the head's
+/// group, and a non-member reads none of them.
 #[sqlx::test(migrations = "../../migrations")]
-async fn characterization_improving_a_group_lineage_numbers_past_its_head(pool: PgPool) {
+async fn a_new_generation_of_a_group_lineage_inherits_the_heads_group(pool: PgPool) {
     let w = world(&pool).await;
+    // stdio: the curator improves its team-group lineage.
     let name = "acme-improve-group-head";
     stdio_ingest(
         &w.c_server,
@@ -2183,8 +2424,8 @@ async fn characterization_improving_a_group_lineage_numbers_past_its_head(pool: 
     .unwrap_or_else(|e| panic!("the improvement is accepted: {}", e.message));
     let body = tool_json(&out);
     assert_eq!(body["new_generation"], json!(1), "{body}");
-    let tenancy: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT generation, visibility::text FROM workflows \
+    let rows: Vec<(i32, String, Uuid)> = sqlx::query_as(
+        "SELECT generation, visibility::text, owner_group_id FROM workflows \
           WHERE canonical_name = $1 ORDER BY generation",
     )
     .bind(name)
@@ -2192,10 +2433,208 @@ async fn characterization_improving_a_group_lineage_numbers_past_its_head(pool: 
     .await
     .expect("lineage rows");
     assert_eq!(
-        tenancy,
-        vec![(0, "group".to_string()), (1, "public".to_string())],
-        "CHARACTERIZATION: the new generation is public (operator question)"
+        rows,
+        vec![(0, "group".to_string(), w.g), (1, "group".to_string(), w.g)],
+        "the new generation's row inherits the head's group"
     );
+    let gen1 = workflow_id_named(&pool, name, 1).await.expect("gen 1");
+    let created: Vec<Uuid> = body_created(&pool, gen1).await;
+    assert!(!created.is_empty(), "the improvement created claims");
+    for id in &created {
+        assert_eq!(
+            claim_tenancy(&pool, *id).await,
+            ("group".to_string(), w.g),
+            "claim {id} the new generation created inherits the head's group"
+        );
+    }
+
+    // REST: the human's undeclared generation 1 of its operator-group lineage.
+    let h = token(w.h, WRITE_SCOPES);
+    let rest_name = "acme-rest-next-generation";
+    w.api
+        .ingest_ok(
+            &h,
+            &declared(
+                extraction(rest_name, 0, &[&["acme rest gen op"]]),
+                w.og,
+                None,
+            ),
+        )
+        .await;
+    let mut gen1_body = extraction(
+        rest_name,
+        1,
+        &[&["acme rest gen op"], &["acme rest new op"]],
+    );
+    gen1_body["source"]["parent_canonical_name"] = json!(rest_name);
+    let out = w.api.ingest_ok(&h, &gen1_body).await;
+    let rest_gen1 = uuid_of(&out["workflow_id"]);
+    let row: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(rest_gen1)
+            .fetch_one(&pool)
+            .await
+            .expect("the REST generation's row");
+    assert_eq!(row, ("group".to_string(), w.og), "REST: the row inherits");
+    let created = body_created(&pool, rest_gen1).await;
+    assert!(!created.is_empty(), "the REST generation created claims");
+    let stranger = token(w.h2, READ_SCOPES);
+    for id in &created {
+        assert_eq!(
+            claim_tenancy(&pool, *id).await,
+            ("group".to_string(), w.og),
+            "REST: claim {id} inherits the head's group"
+        );
+        let (s, b) = w.api.get(&format!("/api/v1/claims/{id}"), &stranger).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "a non-member reads no claim: {b}");
+    }
+}
+
+/// The level 0..2 claims `workflow` executes that no OTHER workflow executes
+/// (the claims its own ingest created, as opposed to reused ones).
+async fn body_created(pool: &PgPool, workflow: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT e.target_id FROM edges e \
+          WHERE e.source_id = $1 AND e.relationship = 'executes' \
+            AND NOT EXISTS (SELECT 1 FROM edges o WHERE o.target_id = e.target_id \
+                              AND o.relationship = 'executes' AND o.source_id <> $1) \
+          ORDER BY e.target_id",
+    )
+    .bind(workflow)
+    .fetch_all(pool)
+    .await
+    .expect("created claims")
+}
+
+async fn claim_tenancy(pool: &PgPool, claim: Uuid) -> (String, Uuid) {
+    sqlx::query_as("SELECT visibility::text, owner_group_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim tenancy")
+}
+
+/// The `(visibility, owner group)` of every `relationship` edge `source ->
+/// target`.
+async fn edge_tenancy(
+    pool: &PgPool,
+    source: Uuid,
+    target: Uuid,
+    relationship: &str,
+) -> Vec<(String, Uuid)> {
+    sqlx::query_as(
+        "SELECT visibility::text, owner_group_id FROM edges \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = $3",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .fetch_all(pool)
+    .await
+    .expect("edge tenancy")
+}
+
+/// R-98 Q5(a) (backlog 630af617 (1)): a step added to a GROUP plan inherits
+/// the plan row's `(visibility, owner_group_id)`, and so does its `executes`
+/// edge. It used to be declared from the system agent (a public step with a
+/// public `executes` edge in a private plan). Over REST
+/// (`POST /api/v1/workflows/steps`, the submitting human) and over stdio MCP
+/// (`add_step`, the submitting curator); a non-member reads neither.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_step_added_to_a_group_plan_inherits_the_plan_rows_tenancy(pool: PgPool) {
+    let w = world(&pool).await;
+    let stranger = token(w.h2, READ_SCOPES);
+
+    // REST.
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-add-step-group-rest";
+    let out = w
+        .api
+        .ingest_ok(
+            &h,
+            &declared(extraction(name, 0, &[&["acme add-step op"]]), w.og, None),
+        )
+        .await;
+    let wf = uuid_of(&out["workflow_id"]);
+    let (s, b) = w
+        .api
+        .call(
+            Method::POST,
+            "/api/v1/workflows/steps",
+            &h,
+            Some(&json!({"canonical_name": name, "step_text": "acme rest added step"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let step = uuid_of(&b["step_claim_id"]);
+    assert_eq!(
+        claim_tenancy(&pool, step).await,
+        ("group".to_string(), w.og),
+        "REST: the added step is the plan's group"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, wf, step, "executes").await,
+        vec![("group".to_string(), w.og)],
+        "REST: and so is its executes edge"
+    );
+    let (s, b) = w
+        .api
+        .get(&format!("/api/v1/claims/{step}"), &stranger)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a non-member reads no step: {b}");
+    let (s, b) = w
+        .api
+        .get(
+            &format!("/api/v1/edges?source_id={wf}&relationship=executes"),
+            &stranger,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b.as_array().map(Vec::len), Some(0), "nor any edge: {b}");
+
+    // stdio MCP.
+    let name = "acme-add-step-group-stdio";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction(name, 0, &[&["acme add-step stdio op"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator declares the plan into the team group");
+    let wf = workflow_id_named(&pool, name, 0).await.expect("the row");
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let out = epigraph_mcp::tools::step_ops::add_step(
+        &w.c_server,
+        &viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: name.to_string(),
+            step_text: "acme stdio added step".to_string(),
+            position: None,
+        },
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("the curator adds a step: {}", e.message));
+    let step = uuid_of(&tool_json(&out)["step_claim_id"]);
+    assert_eq!(
+        claim_tenancy(&pool, step).await,
+        ("group".to_string(), w.g),
+        "stdio: the added step is the plan's group"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, wf, step, "executes").await,
+        vec![("group".to_string(), w.g)],
+        "stdio: and so is its executes edge"
+    );
+    let (s, b) = w
+        .api
+        .get(&format!("/api/v1/claims/{step}"), &stranger)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "a non-member reads no step: {b}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2547,11 +2986,13 @@ async fn over_mcp_recall_includes_a_declared_generation_only_for_its_group(pool:
 
 /// MCP `verify_claim` on a workflow step whose stored digest is scoped by its
 /// workflow's `canonical_name` recovers that name from the executing
-/// `workflows` row, read as the caller. The step here is PUBLIC (add_step
-/// writes a public step into a group plan, an R-74 residual) and executed only
-/// by the group row W2: the member's check matches; a non-member, who cannot
-/// read W2, gets `hash_matches: null` (not applicable), never a verdict
-/// computed from a row it cannot read.
+/// `workflows` row, read as the caller. The step here is PUBLIC and executed
+/// only by the group row W2: the member's check matches; a non-member, who
+/// cannot read W2, gets `hash_matches: null` (not applicable), never a verdict
+/// computed from a row it cannot read. Since ruling R-98 (backlog 630af617)
+/// `add_step` gives a step appended to a group plan the plan's group, so the
+/// harness re-tenants the appended step to public: the shape every step
+/// appended to a group plan before R-98 has.
 #[sqlx::test(migrations = "../../migrations")]
 async fn verify_claim_seeds_a_step_digest_only_from_rows_the_caller_reads(pool: PgPool) {
     let w = world(&pool).await;
@@ -2596,9 +3037,29 @@ async fn verify_claim_seeds_a_step_digest_only_from_rows_the_caller_reads(pool: 
             .await
             .expect("step visibility");
     assert_eq!(
-        visibility, "public",
-        "fixture shape: the appended step is public"
+        visibility, "group",
+        "R-98: the step appended to a group plan takes the plan's group"
     );
+    // The pre-R-98 shape: the same step, public (harness declassification).
+    {
+        let mut tx = pool.begin().await.expect("begin");
+        sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
+            .execute(&mut *tx)
+            .await
+            .expect("arm the declassification");
+        sqlx::query(
+            "UPDATE claims SET visibility = 'public', \
+                    owner_group_id = (SELECT owner_group_id FROM claims c \
+                                       WHERE c.id <> $1 AND c.visibility = 'public' \
+                                         AND c.content LIKE 'acme-hidden-verify step%' LIMIT 1) \
+              WHERE id = $1",
+        )
+        .bind(step)
+        .execute(&mut *tx)
+        .await
+        .expect("re-tenant the step to public");
+        tx.commit().await.expect("commit");
+    }
 
     let verify = |agent: Uuid| {
         let pool = pool.clone();
@@ -2691,8 +3152,10 @@ async fn over_mcp_the_hierarchical_embedding_path_finds_a_declared_generation_on
 /// join to `workflows` (whose row security would drop a row the caller cannot
 /// read). A caller who holds workflow authority over the public W1, and writes
 /// the shared step's owning group, but does not read W2's group is refused
-/// evolving the step W1 and W2 both execute, and nothing is written. A member
-/// who holds authority over both evolves it.
+/// evolving the step W1 and W2 both execute, and nothing is written. The
+/// refusal is the missing-parent 404 and does not name W2 (backlog c831df4a:
+/// it used to be a 403 naming the hidden row). A member who holds authority
+/// over both evolves it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(pool: PgPool) {
     let w = world(&pool).await;
@@ -2725,10 +3188,14 @@ async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(po
     let (status, out) = evolve(w.h2, refused).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "the hidden W2 stays in the authority set: {out}"
+        StatusCode::NOT_FOUND,
+        "the hidden W2 stays in the authority set, answered as a missing parent: {out}"
     );
-    assert!(out.to_string().contains("Nothing was written"), "{out}");
+    assert_eq!(out["details"]["id"], json!(step.to_string()), "{out}");
+    assert!(
+        !out.to_string().contains(&w2.to_string()),
+        "the refusal does not name the hidden W2: {out}"
+    );
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(claims_with_content(&pool, refused).await, 0);
     assert!(
@@ -2792,7 +3259,9 @@ async fn over_mcp_evolving_a_step_a_hidden_generation_executes_needs_authority_o
     let err = evolve(w.h2, refused)
         .await
         .expect_err("the hidden W2 stays in the authority set");
-    assert!(err.contains("Nothing was written"), "{err}");
+    // Answered as a missing parent, naming nothing hidden (backlog c831df4a).
+    assert_eq!(err, format!("parent step {step} not found"), "{err}");
+    assert!(!err.contains(&w2.to_string()), "{err}");
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(claims_with_content(&pool, refused).await, 0);
     assert!(
@@ -2948,21 +3417,20 @@ async fn over_mcp_deprecating_a_declared_generation_is_its_groups_alone(pool: Pg
     assert_eq!(workflow_truth(&pool, w1).await, t1, "W1 is untouched");
 }
 
-/// CHARACTERIZATION (operator question, R-74 residual): a cascading
-/// deprecation walks the lineage on the ingest system agent's stamp, which
-/// reads every group the system agent serves, not on the caller's.
+/// A cascading deprecation walks the lineage on the ingest system agent's
+/// stamp, which reads every group the system agent serves, not on the
+/// caller's (R-74 residual; the walk itself is backlog 4c6e8a17).
 ///
 /// Over the authenticated transport only a caller of the system agent's own
 /// operator reaches the walk (any other is refused OPL02 first, writing
 /// nothing), and each descendant then needs the caller's workflow authority.
-/// On the stdio transport, which checks no workflow authority (the process
-/// holds the DSN; not a trust boundary), a fleet agent of that operator that
-/// does NOT read W2's group cascades W1's deprecation into W2: W2 is
-/// deprecated and its id is reported to the agent.
+/// Since backlog 222289f3 the stdio transport checks workflow authority too,
+/// against every target of the cascade: a fleet agent of that operator is
+/// refused on W1 (its human submitted W1, and a bound agent is not admitted),
+/// and even as W1's recorded submitter it is refused on W2, a descendant it
+/// cannot read, without W2 being named. All-or-nothing: neither row moves.
 #[sqlx::test(migrations = "../../migrations")]
-async fn characterization_a_stdio_cascade_deprecates_a_descendant_the_agent_cannot_read(
-    pool: PgPool,
-) {
+async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool: PgPool) {
     let w = world(&pool).await;
     let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-cascade", w.g).await;
     let reads_g: bool = sqlx::query_scalar(
@@ -2977,25 +3445,44 @@ async fn characterization_a_stdio_cascade_deprecates_a_descendant_the_agent_cann
         !reads_g,
         "premise: the fleet agent is not a member of W2's group"
     );
+    let (t1, t2) = (
+        workflow_truth(&pool, w1).await,
+        workflow_truth(&pool, w2).await,
+    );
 
     let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.f_server, None)
         .await
         .expect("the stdio viewer");
-    let params: epigraph_mcp::types::DeprecateWorkflowParams = serde_json::from_value(json!({
-        "workflow_id": w1.to_string(), "reason": "probe", "cascade": true
-    }))
-    .expect("the tool's parameters");
-    let out =
-        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params, None)
+    let params = || -> epigraph_mcp::types::DeprecateWorkflowParams {
+        serde_json::from_value(json!({
+            "workflow_id": w1.to_string(), "reason": "probe", "cascade": true
+        }))
+        .expect("the tool's parameters")
+    };
+    let err =
+        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params(), None)
             .await
-            .unwrap_or_else(|e| panic!("the stdio cascade runs: {}", e.message));
-    let body = tool_json(&out);
-    assert_eq!(
-        body["deprecated_ids"],
-        json!([w1.to_string(), w2.to_string()]),
-        "CHARACTERIZATION: the cascade deprecates (and names) W2: {body}"
+            .expect_err("the fleet agent did not submit W1");
+    assert!(
+        err.message.contains("submitted by agent"),
+        "{}",
+        err.message
     );
-    assert!((workflow_truth(&pool, w2).await - 0.05).abs() < 1e-9);
+    assert!(!err.message.contains(&w2.to_string()), "{}", err.message);
+
+    // Even as W1's recorded submitter, the hidden descendant refuses the cascade.
+    set_submitter(&pool, w1, w.f).await;
+    let err =
+        epigraph_mcp::tools::workflows::deprecate_workflow(&w.f_server, &viewer, params(), None)
+            .await
+            .expect_err("W2 is a descendant the fleet agent cannot read");
+    assert!(
+        !err.message.contains(&w2.to_string()),
+        "the refusal must not name the hidden descendant: {}",
+        err.message
+    );
+    assert_eq!(workflow_truth(&pool, w1).await, t1, "W1 is untouched");
+    assert_eq!(workflow_truth(&pool, w2).await, t2, "W2 is untouched");
 }
 
 /// CHARACTERIZATION: `DELETE /api/v1/workflows/:id` deprecates FLAT workflow
@@ -3036,4 +3523,161 @@ async fn characterization_rest_deprecation_serves_no_hierarchical_row(pool: PgPo
         );
     }
     assert_eq!(workflow_truth(&pool, w2).await, t2, "W2 is unchanged");
+}
+
+/// R-98 Q6(a) review (backlog 630af617 (2)): a NEW generation inherits its
+/// lineage's group, and lands in it on the system agent's stamp, so the
+/// CALLER must write that group. A caller with authority over the lineage
+/// (its submitter) that is only a READER of the group is refused with the
+/// coded `InheritedGroupNotWritable` text, nothing written: over REST (an
+/// undeclared next generation, and a variant inheriting through its linked
+/// parent) and over MCP on the authenticated transport
+/// (`improve_workflow_hierarchy`). On stdio the authority gate refuses the
+/// same reader before the executor runs (its group-write check).
+/// CALIBRATIONS: an explicit declaration into another group the caller writes
+/// still wins; as a writer again the variant is admitted and lands in the
+/// inherited group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_that_does_not_write_the_inherited_group_cannot_add_a_generation(pool: PgPool) {
+    let w = world(&pool).await;
+    let h = token(w.h, WRITE_SCOPES);
+    let name = "acme-inherit-refused";
+    w.api
+        .ingest_ok(
+            &h,
+            &declared(extraction(name, 0, &[&["acme inherit op"]]), w.g, None),
+        )
+        .await;
+    let coded = |text: &str| {
+        text.contains(&format!("inherits group {}", w.g))
+            && text.contains("holds no live writer or admin membership")
+    };
+    set_role(&pool, w.g, w.h, "reader").await;
+    let before = row_counts(&pool).await;
+
+    // REST: the undeclared next generation.
+    let mut gen1 = extraction(name, 1, &[&["acme inherit op"], &["acme inherit new op"]]);
+    gen1["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &gen1).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST next generation: {b}");
+    assert!(coded(&b.to_string()), "REST: the coded refusal: {b}");
+
+    // REST: a variant (another canonical name) linked to the group parent.
+    // Generation 1, so it links `(name, 0)` (`resolve_ingest_parent` looks
+    // one generation down; a generation-0 variant links nothing).
+    let variant = "acme-inherit-variant";
+    let mut child = extraction(variant, 1, &[&["acme inherit variant op"]]);
+    child["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &child).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "REST linked variant: {b}");
+    assert!(
+        coded(&b.to_string()),
+        "REST variant: the coded refusal: {b}"
+    );
+
+    // MCP over HTTP: improve_workflow_hierarchy with the submitter's token.
+    let h_viewer = epigraph_db::Viewer::resolve(&pool, w.h)
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::types::ImproveWorkflowHierarchyParams =
+        serde_json::from_value(json!({
+            "parent_canonical_name": name,
+            "extraction": extraction(name, 0, &[&["acme inherit op"], &["acme inherit http op"]]),
+        }))
+        .expect("the tool's parameters");
+    let err = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy(
+        &w.c_server,
+        &h_viewer,
+        params,
+        Some(&http_auth(w.h)),
+    )
+    .await
+    .expect_err("MCP over HTTP: a reader cannot add a generation");
+    assert!(
+        coded(&err.message),
+        "MCP-HTTP: the coded refusal: {}",
+        err.message
+    );
+    assert_eq!(row_counts(&pool).await, before, "nothing was written");
+    assert_eq!(workflows_named(&pool, name).await, 1);
+    assert_eq!(workflows_named(&pool, variant).await, 0);
+
+    // stdio: the curator's own lineage, the curator a reader. (Its operator
+    // `h` must write the group for the curator's declared ingest: OPL02.)
+    set_role(&pool, w.g, w.h, "admin").await;
+    let stdio_name = "acme-inherit-refused-stdio";
+    stdio_ingest(
+        &w.c_server,
+        mcp_params(
+            extraction(stdio_name, 0, &[&["acme inherit stdio op"]]),
+            Some(w.g),
+        ),
+    )
+    .await
+    .expect("the curator declares generation 0 into the team group");
+    set_role(&pool, w.g, w.c, "reader").await;
+    let before = row_counts(&pool).await;
+    let c_viewer = epigraph_mcp::tools::viewer::request_viewer(&w.c_server, None)
+        .await
+        .expect("the stdio viewer");
+    let params: epigraph_mcp::types::ImproveWorkflowHierarchyParams =
+        serde_json::from_value(json!({
+            "parent_canonical_name": stdio_name,
+            "extraction": extraction(
+                stdio_name, 0, &[&["acme inherit stdio op"], &["acme inherit stdio new op"]]),
+        }))
+        .expect("the tool's parameters");
+    let err = epigraph_mcp::tools::workflow_ingest::improve_workflow_hierarchy(
+        &w.c_server,
+        &c_viewer,
+        params,
+        None,
+    )
+    .await
+    .expect_err("stdio: a reader cannot add a generation");
+    assert!(
+        err.message.contains("does not write"),
+        "stdio: the gate's group-write refusal: {}",
+        err.message
+    );
+    assert_eq!(row_counts(&pool).await, before, "stdio wrote nothing");
+    assert_eq!(workflows_named(&pool, stdio_name).await, 1);
+
+    // CALIBRATION: a writer, the variant is admitted and inherits.
+    let b = w.api.ingest_ok(&h, &child).await;
+    let row: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(uuid_of(&b["workflow_id"]))
+            .fetch_one(&pool)
+            .await
+            .expect("the variant's row");
+    assert_eq!(
+        row,
+        ("group".to_string(), w.g),
+        "a variant inherits its linked parent's group"
+    );
+
+    // CALIBRATION: an explicit declaration into the caller's own operator
+    // group still wins over the inherited one, for a reader of the inherited
+    // group too.
+    // Fresh texts (no claim of the group's generation 0 is reused: linking
+    // one would be refused on its own, as private to a group h does not
+    // write).
+    set_role(&pool, w.g, w.h, "reader").await;
+    let mut own = extraction("acme-inherit-own-texts", 1, &[&["acme inherit own op"]]);
+    own["source"]["canonical_name"] = json!(name);
+    own["source"]["parent_canonical_name"] = json!(name);
+    let (s, b) = w.api.ingest(&h, &declared(own, w.og, None)).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the declared generation is admitted: {b}"
+    );
+    let row: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+            .bind(uuid_of(&b["workflow_id"]))
+            .fetch_one(&pool)
+            .await
+            .expect("the declared generation's row");
+    assert_eq!(row, ("group".to_string(), w.og), "the declaration wins");
 }

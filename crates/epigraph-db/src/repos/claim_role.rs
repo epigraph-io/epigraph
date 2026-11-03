@@ -26,6 +26,13 @@
 //! `'procedural'`. [`roles_batch`] is their Rust twin and reads
 //! [`CLAIM_ROLE_SQL`] itself.
 //!
+//! The one copy: migration 193's definer `public.epigraph_claim_is_compound`
+//! states [`IS_COMPOUND_SQL`] in SQL, schema-qualified (rendered over `c`;
+//! every relation `public.`, `now()` as `pg_catalog.now()`), for the
+//! cached-belief owner lookup. `tests/claim_is_compound_definer.rs` pins its
+//! catalog body to this template, so a change here needs a migration that
+//! re-states it.
+//!
 //! # Role is structure; the leaf closure is spliced
 //!
 //! * **Deciding a role carries no viewer splice.** A compound's fan-out is a
@@ -36,9 +43,12 @@
 //!   bulk writers run). `edges` and `claims` are FORCE ROW LEVEL SECURITY, so
 //!   on an application connection the server still filters these reads, and
 //!   a session that can see none of a compound's in-force decomposition
-//!   edges finds no compound. Closing that gap would take a definer-rights
-//!   function (a migration), which this module deliberately does not add:
-//!   the role predicate is code only.
+//!   edges finds no compound. The cached-belief owner lookup
+//!   (`MassFunctionRepository::cache_owner_frame_for_claim`) closes that gap
+//!   with migration 193's definer-rights `epigraph_claim_is_compound`, which
+//!   decides [`IS_COMPOUND_SQL`] on the whole graph (backlog 0dc20fad). The
+//!   templates here, and [`roles_batch`], still read on the caller's
+//!   connection.
 //! * **The leaf closure is spliced** on both `edges` (`EDGE_VISIBILITY`) and
 //!   `claims` (`VISIBILITY`), because a compound's derived value served to a
 //!   viewer may use only the leaves that viewer can read (§8 T1). A leaf is

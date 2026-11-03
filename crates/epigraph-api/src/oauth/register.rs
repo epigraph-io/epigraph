@@ -238,8 +238,9 @@ pub async fn register_endpoint(
                 // claims:write and ingest:write — i.e. an unauthenticated POST
                 // to this endpoint yielded a usable write credential. It now
                 // registers PENDING with an EMPTY granted set: `allowed_scopes`
-                // records what an admin MAY approve
-                // (POST /api/v1/admin/clients/:id/approve), `granted_scopes` is
+                // records what an admin MAY approve (a maintenance session,
+                // through `epigraph_oauth_client_approve`, migration 188; the
+                // REST approve route answers 501 MOVED), `granted_scopes` is
                 // what the client actually holds, and the client_credentials
                 // grant refuses it entirely until then because
                 // `OAuthClientRepository::get_by_client_id` filters

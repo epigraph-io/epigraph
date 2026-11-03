@@ -54,6 +54,16 @@ async fn create_claim_embeds_inline(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
+    // Provision the agent's personal group BEFORE the request, as the token
+    // mint does in production (PR-02). The claim is owned by that group, and
+    // the post-commit embed is stored on the caller's viewer, whose writable
+    // set is resolved when the request arrives. An agent whose group was first
+    // minted INSIDE the claim's transaction would have an empty writable set at
+    // that moment: on a stamped server its INSERT is refused by row security,
+    // so this fixture shape does not occur there.
+    epigraph_db::ClaimRepository::personal_group_of_pool(&pool, agent_id)
+        .await
+        .expect("provision the agent's personal group");
 
     let body = json!({
         "agent_id": agent_id,

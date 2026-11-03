@@ -40,7 +40,8 @@
 //!
 //! * the raw pool: `state.db_pool`, or a local bound to it;
 //! * a connection: `&mut *x` (a `ScopedRead`, `ScopedTx` or `Transaction`
-//!   deref), or `&mut x` where `x` is a `let mut` bound from a connection
+//!   deref), or `&mut x` where `x` is a `let mut` (or an `if let` / `while
+//!   let` `Ok(mut x)` / `Some(mut x)` / `Err(mut x)`) bound from a connection
 //!   constructor (`read_as`, `write_as`, `begin_claim_write`, `begin_as`,
 //!   `maintenance`, `Connection::begin`, `.begin()`, `.acquire()`), from
 //!   `state`, or from another connection;
@@ -377,10 +378,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["derivation_scope::retain_for_cache"],
     ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The REFUTES edge write runs on a transaction bound by
-    // `if let Ok(mut tx) = state.write_as(..)` and passed as `&mut tx`, a
-    // binding this scanner does not recognise as a connection, so it is not
-    // measured here.
+    // The signed REFUTES edge write runs on a transaction stamped with the
+    // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,
+    // passed as `&mut tx`): the edge trigger and WITH CHECK decide the write,
+    // as for create_edge.
     (
         "conventions.rs",
         "forget_convention",
@@ -388,6 +389,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
             "ClaimRepository::update_truth_value",
+            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
@@ -1015,18 +1017,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // write: embeddings and propagation for the claim this request just
-    // persisted through the viewer (`persist_packet`); `validate_packet` runs
-    // no tenancy read.
+    // write: propagation for the claim this request just persisted through
+    // the viewer (`persist_packet`); `validate_packet` runs no tenancy read.
+    // The two post-commit embedding UPDATEs (claim, figure evidence) now
+    // receive the viewer (`AppState::store_claim_embedding_as` /
+    // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
     (
         "submit.rs",
         "submit_packet",
-        &[
-            "propagate_from",
-            "sqlx::query(UPDATE).execute",
-            "sqlx::query(UPDATE).execute",
-            "validate_packet",
-        ],
+        &["propagate_from", "validate_packet"],
     ),
     // gated (`write_target_of`) then write.
     (
@@ -1047,8 +1046,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimRepository::supersede_act_conn",
             "ClaimVersionRepository::create",
-            "admin_session_or_deferral",
             "sqlx::query_as(SELECT).fetch_all",
+            "supersede_session_or_deferral",
         ],
     ),
     (
@@ -1066,6 +1065,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::set_truth_value",
         ],
     ),
+    // the existence check is the caller's viewed read (backlog 08061583);
+    // the insert stays on the pool because `behavioral_executions` has no row
+    // security (the workflow was already read through the caller's view).
+    (
+        "workflows.rs",
+        "record_behavioral_execution",
+        &["BehavioralExecutionRepository::create"],
+    ),
     // write on a transaction stamped with the caller's viewer, after the
     // database's lineage-authority check for the caller.
     (
@@ -1074,7 +1081,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimRepository::evolve_step_conn",
             "record_api_lineage_writes",
-            "require_api_lineage_authority",
             "versioning::admin_session_or_deferral",
         ],
     ),
@@ -1165,10 +1171,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // authenticated id, never the body), then that group's current key epoch,
     // read only after the membership check passed; the author's agent row.
     // write: everything else runs on the claim-write transaction stamped with
-    // this viewer, except the best-effort post-commit embedding, AUTHORED /
-    // HAS_TRACE / DERIVED_FROM edges and provenance row, which are raw-pool
-    // writes for a row this call created (`was_created`; ROUTE_LAYER_WRITES in
-    // viewer_route_table_lint.rs).
+    // this viewer, except the AUTHORED / HAS_TRACE / DERIVED_FROM edges and
+    // provenance row, which are raw-pool writes for a row this call created
+    // (`was_created`; ROUTE_LAYER_WRITES in viewer_route_table_lint.rs). The
+    // best-effort post-commit embedding now receives the viewer
+    // (`AppState::store_claim_embedding_as`, backlog 1e2315a9), so one
+    // `sqlx::query(UPDATE).execute` left this list.
     (
         "claims.rs",
         "create_claim_core",
@@ -1184,7 +1192,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
             "provenance::record_provenance",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
         ],
@@ -1314,7 +1321,61 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "workflows.rs",
         "workflow_ingest_submitter",
-        &["WorkflowRepository::ingest_anchors", "workflow_authority"],
+        &["WorkflowRepository::ingest_anchors"],
+    ),
+    // backlog c831df4a: the step routes and the lineage gate hand the caller's
+    // viewer to `workflow_authority`, which reads the target row through it
+    // (`WorkflowRepository::tenancy_as_viewer`, viewed) before any answer names
+    // the row. Unviewed, by design:
+    // * the step routes' system-ingest transaction and the executor's step
+    //   write on it (the rows are the system agent's; the caller's authority
+    //   is the gate), the AUTHORED edges and the per-write provenance / admin
+    //   audit rows;
+    // * the head / lineage resolution, which must see every workflow the
+    //   write would touch so each is authority-checked (an unreadable one is
+    //   then refused by the viewed read);
+    // * the gate's own arms, which run only on a row the caller reads: the
+    //   recorded submitter, the submitter's operator and the admin grant.
+    (
+        "workflows.rs",
+        "add_step",
+        &[
+            "audit_api_admin_workflow_write",
+            "begin_system_ingest_stamped_tx",
+            "epigraph_ingest_executor::add_step",
+            "record_api_authorship",
+            "record_api_caller_workflow_write",
+        ],
+    ),
+    (
+        "workflows.rs",
+        "delete_step",
+        &[
+            "audit_api_admin_workflow_write",
+            "begin_system_ingest_stamped_tx",
+            "epigraph_ingest_executor::delete_step",
+            "record_api_caller_workflow_write",
+        ],
+    ),
+    (
+        "workflows.rs",
+        "require_api_lineage_authority",
+        &["WorkflowRepository::workflows_executing_step_lineage"],
+    ),
+    (
+        "workflows.rs",
+        "require_api_workflow_authority",
+        &["WorkflowRepository::head_by_canonical"],
+    ),
+    (
+        "workflows.rs",
+        "workflow_authority",
+        &[
+            "AgentRepository::operator_of_author",
+            "WorkflowRepository::submitter_of",
+            "api_admin_arm",
+            "api_admin_arm",
+        ],
     ),
 ];
 
@@ -1678,11 +1739,16 @@ fn handlers(code: &str, sql: &str) -> Vec<Handler> {
 }
 
 /// `let [mut] <name> [: T] = <rhs>;` bindings in `[a, b)`, as
-/// `(name, is_mut, let_offset, rhs_start, rhs_end)`.
+/// `(name, is_mut, let_offset, rhs_start, rhs_end)`, plus the refutable
+/// `if let` / `while let` form [`if_let_binding`] reads.
 fn lets(code: &str, a: usize, b: usize) -> Vec<(String, bool, usize, usize, usize)> {
     let s = code.as_bytes();
     let mut out = Vec::new();
     for at in words(code, "let", a, b) {
+        if let Some(binding) = if_let_binding(code, at, b) {
+            out.push(binding);
+            continue;
+        }
         let mut j = skip_ws(s, at + 3);
         let mut is_mut = false;
         if s[j..].starts_with(b"mut") && !is_ident(s[j + 3]) {
@@ -1729,6 +1795,71 @@ fn lets(code: &str, a: usize, b: usize) -> Vec<(String, bool, usize, usize, usiz
         out.push((name, is_mut, at, rhs_start, k));
     }
     out
+}
+
+/// The `let` at `at` as `if let <Ctor>([mut] <name>) = <rhs> {` (or `while
+/// let`), `<Ctor>` one of `Ok` / `Some` / `Err`: the binding a connection
+/// constructor's result is unwrapped into (`if let Ok(mut tx) =
+/// state.write_as(..)`). The right-hand side is the scrutinee, which ends at the
+/// `{` that opens the body at bracket depth 0 (a scrutinee cannot be a bare
+/// struct literal, so that `{` is the body's). Any other shape is `None`.
+fn if_let_binding(code: &str, at: usize, b: usize) -> Option<(String, bool, usize, usize, usize)> {
+    let s = code.as_bytes();
+    let mut k = at;
+    while k > 0 && s[k - 1].is_ascii_whitespace() {
+        k -= 1;
+    }
+    let mut w = k;
+    while w > 0 && is_ident(s[w - 1]) {
+        w -= 1;
+    }
+    if !matches!(&code[w..k], "if" | "while") {
+        return None;
+    }
+    let mut j = skip_ws(s, at + 3);
+    let ctor = ident_at(s, j);
+    if !matches!(ctor, "Ok" | "Some" | "Err") {
+        return None;
+    }
+    j = skip_ws(s, j + ctor.len());
+    if j >= b || s[j] != b'(' {
+        return None;
+    }
+    j = skip_ws(s, j + 1);
+    let mut is_mut = false;
+    if s[j..].starts_with(b"mut") && !is_ident(s[j + 3]) {
+        is_mut = true;
+        j = skip_ws(s, j + 3);
+    }
+    let name = ident_at(s, j).to_string();
+    if name.is_empty() {
+        return None;
+    }
+    j = skip_ws(s, j + name.len());
+    if j >= b || s[j] != b')' {
+        return None;
+    }
+    j = skip_ws(s, j + 1);
+    if j >= b || s[j] != b'=' || matches!(s[j + 1], b'=' | b'>') {
+        return None;
+    }
+    let rhs_start = j + 1;
+    let (mut depth, mut k) = (0i32, rhs_start);
+    while k < b {
+        match s[k] {
+            b'{' if depth == 0 => break,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    Some((name, is_mut, at, rhs_start, k))
 }
 
 const CONNECTION_CTORS: &[&str] = &[
@@ -2590,5 +2721,68 @@ pub async fn stamped(
         vec!["Repo::get", "sqlx::query_scalar(SELECT).fetch_optional"],
         "reads on a connection stamped with the viewer are measured unviewed unless \
          the viewer reaches the statement; stamping is row security only"
+    );
+}
+
+/// A connection bound by a refutable pattern, `if let Ok(mut tx) = <ctor>` /
+/// `while let Some(mut c) = <ctor>`, is a connection like a `let mut` one:
+/// a call handed `&mut tx` is measured (backlog 109ead0f). Its right-hand side
+/// is the scrutinee only, which ends at the `{` that opens the body, so a
+/// pool read inside the body does not make the binding a connection.
+#[test]
+fn the_scanner_sees_a_connection_bound_by_if_let() {
+    let src = r##"
+pub async fn if_let_write(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(mut tx) = state.write_as(&viewer, "if_let_write").await {
+        if Repo::write(&mut tx, id).await.is_ok() {
+            let _ = tx.commit().await;
+        }
+    }
+    if let Ok(mut tx) = state.write_as(&viewer, "viewed").await {
+        let _ = Repo::write_as(&mut tx, &viewer, id).await;
+    }
+    while let Some(mut conn) = state.db_pool.try_acquire() {
+        Repo::drain(&mut conn).await;
+    }
+    Ok(())
+}
+
+pub async fn if_let_decoys(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    // Not a connection: the scrutinee names neither state nor a connection.
+    if let Ok(mut guard) = lock.write() {
+        touch(&mut guard);
+    }
+    // The scrutinee ends at the body's `{`: the pool read inside the body
+    // does not make `n` a connection.
+    if let Some(mut n) = counter.next() {
+        let _ = Repo::get(&state.db_pool, id).await;
+        bump(&mut n);
+    }
+    let mut tx = state.write_as(&viewer, "plain").await?;
+    Repo::write(&mut tx, id).await?;
+    Ok(())
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "if_let_write"),
+        vec!["Repo::drain", "Repo::write", "db_pool.try_acquire"],
+        "a call handed `&mut tx` where `tx` is bound by `if let Ok(mut tx) = <ctor>` \
+         (or `while let Some(mut ..)`) is a database call; one that also passes the \
+         viewer is viewed"
+    );
+    assert_eq!(
+        labels(&m, "if_let_decoys"),
+        vec!["Repo::get", "Repo::write"],
+        "an if-let binding from a non-connection scrutinee is not a connection, the \
+         scrutinee stops at the body's `{{`, and the `let mut` form is unchanged"
     );
 }

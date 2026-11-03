@@ -91,7 +91,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("edges_staging", OPERATIONAL),
     ("entities", REGISTRY),
     ("entity_types", REGISTRY),
-    ("events", OPERATIONAL),
     ("experiment_results", OPERATIONAL),
     ("experiments", OPERATIONAL),
     ("factors", DERIVED_BP),
@@ -120,6 +119,10 @@ const CLOSED: &[&str] = &[
     // Migration 165: an authority table (which role confers which group),
     // written only by maintenance definers or a guarded maintenance statement.
     "group_role_bindings",
+    // Migration 194 (H10): the retracted-BBA purge grants, written and cleared
+    // only by `epigraph_purge_mass_functions`; the application role holds no
+    // privilege on it.
+    "mass_function_purge_grants",
     "oauth_authorization_codes",
     "oauth_authorize_sessions",
     "oauth_clients",
@@ -158,6 +161,9 @@ const NO_WRITE: &[&str] = &[
     "harvester_audit_reports",
     "harvester_enriched_concepts",
     "harvester_sources",
+    // Migration 194: written only by the maintenance purge definer; the
+    // application role holds no privilege at all, SELECT included.
+    "mass_function_purge_grants",
     "source_artifacts",
 ];
 
@@ -1371,15 +1377,19 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
             .unwrap();
     assert_eq!(linked, Some(a1));
 
+    // Migration 188: the approval is a maintenance act (the application role
+    // may not EXECUTE the definer; see
+    // `the_app_role_cannot_approve_an_oauth_client`).
     let approver = seed_client(&pool, "active").await;
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
     OAuthClientRepository::approve(
-        &app,
+        &maint,
         client,
         &["claims:read".into(), "claims:write".into()],
         approver,
     )
     .await
-    .expect("approve on the application role");
+    .expect("approve on the maintenance role");
     let (status, scopes): (String, Vec<String>) =
         sqlx::query_as("SELECT status, granted_scopes FROM oauth_clients WHERE id = $1")
             .bind(client)
@@ -1398,6 +1408,106 @@ async fn oauth_client_link_is_write_once_and_approval_is_audited(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(audited, 1, "an approval leaves an audit row");
+}
+
+/// Migration 188 (backlog ca3968f6): the application role may not EXECUTE
+/// `epigraph_oauth_client_approve`, so an application session cannot activate
+/// a pending client with a scope set of its choosing (here `claims:admin`, an
+/// admin-only scope the definer itself never filters). The client stays
+/// `pending` with nothing granted and no `oauth.client_approved` row is
+/// written. The maintenance role (the definer's owner) still approves, audited.
+///
+/// Fails on 187 and earlier: 118's GRANT EXECUTE lets the application session
+/// activate the client with `claims:admin`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_approve_an_oauth_client(pool: PgPool) {
+    let state_of = |client: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Vec<String>, i64)>(
+                "SELECT c.status, c.granted_scopes, \
+                        (SELECT count(*) FROM security_events e \
+                          WHERE e.event_type = 'oauth.client_approved' \
+                            AND e.details->>'oauth_client_id' = c.id::text) \
+                   FROM oauth_clients c WHERE c.id = $1",
+            )
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("client row")
+        }
+    };
+
+    let pending = seed_client(&pool, "pending").await;
+    let app = app_pool(&pool, 2).await;
+    let r = sqlx::query_scalar::<_, bool>(
+        "SELECT public.epigraph_oauth_client_approve($1, ARRAY['claims:admin'], NULL)",
+    )
+    .bind(pending)
+    .fetch_one(&app)
+    .await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "the application role approved a client"
+    );
+    let e = OAuthClientRepository::approve(&app, pending, &["claims:admin".into()], pending)
+        .await
+        .expect_err("the repository approval on the application role");
+    assert_eq!(db_err_code(&e).as_deref(), Some("42501"));
+    assert_eq!(
+        state_of(pending).await,
+        ("pending".to_string(), vec!["claims:read".to_string()], 0),
+        "a refused approval leaves the client pending, its grant unchanged and unaudited"
+    );
+
+    // Catalog: 188 took EXECUTE on the approve definer from the application
+    // role, and ONLY that one: 118's other application-executable OAuth and
+    // agent-key definers (the mint, refresh, consent and key-status paths)
+    // stay EXECUTE-able.
+    let app_exec: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('epigraph_app', \
+            'public.epigraph_oauth_client_approve(uuid, text[], uuid)'::regprocedure, 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert!(
+        !app_exec,
+        "epigraph_app must not EXECUTE epigraph_oauth_client_approve"
+    );
+    for kept in [
+        "public.epigraph_refresh_token_check(bytea)",
+        "public.epigraph_refresh_token_rotate(bytea, bytea, timestamptz)",
+        "public.epigraph_refresh_token_revoke(uuid, text)",
+        "public.epigraph_refresh_token_revoke_by_hash(bytea)",
+        "public.epigraph_refresh_token_revoke_client(uuid)",
+        "public.epigraph_oauth_code_consume(bytea)",
+        "public.epigraph_oauth_session_to_consent(text, text, uuid, text[])",
+        "public.epigraph_oauth_session_take(text)",
+        "public.epigraph_oauth_client_lock_for_link(uuid)",
+        "public.epigraph_oauth_client_link_agent(uuid, uuid)",
+        "public.epigraph_agent_key_set_status(uuid, text, text, uuid)",
+    ] {
+        let may: bool = sqlx::query_scalar(
+            "SELECT has_function_privilege('epigraph_app', $1::text::regprocedure, 'EXECUTE')",
+        )
+        .bind(kept)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("catalog {kept}: {e}"));
+        assert!(may, "epigraph_app lost EXECUTE on {kept}");
+    }
+
+    // Control: the maintenance role approves, and the approval is audited.
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    OAuthClientRepository::approve(&maint, pending, &["claims:write".into()], pending)
+        .await
+        .expect("approve on the maintenance role");
+    assert_eq!(
+        state_of(pending).await,
+        ("active".to_string(), vec!["claims:write".to_string()], 1)
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1766,6 +1876,144 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
     .await
     .unwrap();
     assert_eq!(left, 0, "the cascade cleared the children");
+}
+
+/// Migration 189 (backlog 796c55aa): `events` is append-only for the
+/// application role. It keeps INSERT (the event bus and every best-effort
+/// publish) and SELECT, but an application session can neither delete a
+/// provenance event (`claim.created` here), nor rewrite one, nor truncate the
+/// table. A refused delete also leaves the edge that names the event: the
+/// INVOKER trigger `events_cascade_edges` never runs.
+///
+/// Fails on 188 and earlier: the application role holds DELETE and UPDATE on
+/// `events` (077; `("events", OPERATIONAL)` was allowlisted), so the delete
+/// removes the event and its edge. The TRUNCATE refusal is a regression pin
+/// only: 077 never granted the application role TRUNCATE, so it passes on the
+/// base too. The maintenance half (186's DELETE still works) is
+/// `the_maintenance_role_still_deletes_events_the_app_role_cannot`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
+    let app = app_pool(&pool, 2).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "b03-events").await;
+
+    // Control: the request path still appends (and reads) events.
+    let payload = serde_json::json!({ "claim_id": Uuid::new_v4() });
+    let event = epigraph_db::EventRepository::insert(&app, "claim.created", Some(agent), &payload)
+        .await
+        .expect("an event INSERT on the application role");
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE id = $1")
+        .bind(event)
+        .fetch_one(&app)
+        .await
+        .expect("an event SELECT on the application role");
+    assert_eq!(seen, 1);
+
+    // An edge that names the event (seeded on the superuser pool).
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'event', $2, 'agent', 'TEST_EDGE')",
+    )
+    .bind(event)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("an edge naming the event");
+
+    let r = sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(event)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "DELETE events");
+    let r = sqlx::query("UPDATE events SET payload = '{}'::jsonb WHERE id = $1")
+        .bind(event)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE events");
+    let r = sqlx::query("TRUNCATE events").execute(&app).await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "TRUNCATE events");
+
+    let (events_left, edges_left, kept): (i64, i64, serde_json::Value) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM events WHERE id = $1), \
+                (SELECT count(*) FROM edges WHERE source_id = $1), \
+                (SELECT payload FROM events WHERE id = $1)",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(events_left, 1, "the provenance event survives");
+    assert_eq!(edges_left, 1, "the edge naming it survives");
+    assert_eq!(kept, payload, "its payload is unchanged");
+}
+
+/// Migrations 186 and 189 together: the maintenance role (the retention job's
+/// `MaintenancePool`) still deletes an `events` row, and 024's INVOKER
+/// trigger `events_cascade_edges` still removes the edge naming it in the same
+/// statement, while the application role holds neither DELETE nor UPDATE.
+/// So 189 closed `events` to the application role only and left 186's
+/// maintenance DELETE intact.
+///
+/// `role_pool` uses SET SESSION AUTHORIZATION, so `session_user` and
+/// `current_user` are both `epigraph_maintenance` (the superuser fixture does
+/// not mask the grant check, and `epigraph_bypass()` admits the cascade's
+/// `DELETE FROM edges` through `edges_delete_owner`).
+///
+/// Fails if 189 (or any later file) also takes DELETE from the maintenance
+/// role: the delete is refused with 42501 and the event and its edge stay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_maintenance_role_still_deletes_events_the_app_role_cannot(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "b03-events-maint").await;
+    let payload = serde_json::json!({ "claim_id": Uuid::new_v4() });
+    let event = epigraph_db::EventRepository::insert(&pool, "claim.created", Some(agent), &payload)
+        .await
+        .expect("seed an event");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'event', $2, 'agent', 'TEST_EDGE')",
+    )
+    .bind(event)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("an edge naming the event");
+
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    let deleted = sqlx::query("DELETE FROM events WHERE id = $1")
+        .bind(event)
+        .execute(&maint)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.into_owned()))
+                .unwrap_or_else(|| e.to_string())
+        });
+    maint.close().await;
+
+    let (events_left, edges_left): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM events WHERE id = $1), \
+                (SELECT count(*) FROM edges WHERE source_id = $1)",
+    )
+    .bind(event)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    let grants: (bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('epigraph_maintenance', 'public.events', 'DELETE'), \
+                has_table_privilege('epigraph_app', 'public.events', 'DELETE'), \
+                has_table_privilege('epigraph_app', 'public.events', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+
+    assert_eq!(
+        (deleted, events_left, edges_left, grants),
+        (Ok(1), 0, 0, (true, false, false)),
+        "(maintenance DELETE, events left, edges left, (maintenance DELETE grant, app DELETE \
+         grant, app UPDATE grant)): the maintenance role deletes the event and the cascade \
+         removes its edge; the application role holds neither DELETE nor UPDATE"
+    );
 }
 
 /// Migration 118 section 7: an application session cannot write an `oauth.`

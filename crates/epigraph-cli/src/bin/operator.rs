@@ -24,6 +24,8 @@
 //! least one listed frame (nothing is written then, even under `--apply`).
 //! `group-member remove` exits 1 when the agent is not a live member
 //! (NOT-A-MEMBER: nothing to revoke, usually a mistyped id).
+//! `retire-link` exits 1 when the agent has no operator link (NO-LINK: nothing
+//! to retire, usually a mistyped id); a link already retired exits 0.
 //!
 //! Usage:
 //!     epigraph-operator link-retired --agents-file retired.txt --operator <uuid> \
@@ -44,6 +46,7 @@
 //!     epigraph-operator revoke-human-operator --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
+//!     epigraph-operator retire-link --agent <uuid> --reason TEXT [--revoke-membership] [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
@@ -90,12 +93,14 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
+//!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, bind, binding_client, client_scope, confirmations, custodian,
-    dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey, reown,
-    reown_linked, restrict, reverse, system_agent, team_group,
+    self, admin_scopes, arm, bind, binding_client, client_scope, client_status, confirmations,
+    custodian, dcr_sweep, delete_frames, elevation, group_role, hide, human, legacy, link, passkey,
+    reown, reown_linked, restrict, retire_link, reverse, system_agent, team_group,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -169,8 +174,10 @@ enum Command {
         apply: bool,
     },
     /// Revise a platform-corpus claim as the custodian: the supersede act,
-    /// the edge migration and a `platform.custodial_act` audit row naming the
-    /// assignment, in ONE transaction on the maintenance DSN (migration 123).
+    /// its cascade deferral (the edge migration and the belief cascade run
+    /// from it in replay_deferred_cascades) and a `platform.custodial_act`
+    /// audit row naming the assignment, in ONE transaction on the maintenance
+    /// DSN (migration 123).
     /// World-owned claims only unless --allow-owned. Exit 2: the act did not
     /// leave what it must, rolled back.
     CustodialSupersede {
@@ -474,6 +481,37 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Retire ONE existing LIVE operator link (migration 191): the agent stops
+    /// acting for its operator, which keeps ownership of its claims. Audited
+    /// (`operator.link_retired`) and idempotent (an already-retired link is
+    /// reported and nothing is written). Refused while the agent still holds a
+    /// live writer/admin row in the operator's group, unless
+    /// `--revoke-membership`. Exits 1 when the agent has no link.
+    RetireLink {
+        /// The linked agent's id.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded in the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Revoke the agent's live writer/admin rows in the operator's group
+        /// in the same act (a retired identity may hold no write authority).
+        #[arg(long)]
+        revoke_membership: bool,
+        /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Suspend ONE OAuth client (`oauth_clients.id`): status `suspended`, every
+    /// live refresh chain revoked, one `oauth.client_suspended` audit row, in
+    /// one transaction. Already-minted access tokens stay valid until they
+    /// expire (printed). Idempotent; a revoked client is refused.
+    SuspendClient(ClientStatusArgs),
+    /// Revoke ONE OAuth client (`oauth_clients.id`), final: status `revoked`,
+    /// every live refresh chain revoked, one `oauth.client_revoked` audit row,
+    /// in one transaction. Already-minted access tokens stay valid until they
+    /// expire (printed). Idempotent.
+    RevokeClient(ClientStatusArgs),
     /// Allow ONE service or agent OAuth client's agent to write as a bound
     /// agent of a registered human operator (migration 149's author-binding
     /// allowlist), without linking it: the client keeps its HTTP token. The
@@ -887,6 +925,20 @@ enum GroupMemberAction {
     },
 }
 
+/// The arguments `suspend-client` and `revoke-client` share.
+#[derive(clap::Args)]
+struct ClientStatusArgs {
+    /// The client's `oauth_clients.id` (not its `client_id` string).
+    #[arg(long)]
+    client: Uuid,
+    /// Recorded in the audit row. Required, not blank.
+    #[arg(long)]
+    reason: String,
+    /// Commit. Without it, the change and its audit row roll back.
+    #[arg(long)]
+    apply: bool,
+}
+
 /// The arguments every `group-member` verb shares.
 #[derive(clap::Args)]
 struct MemberTarget {
@@ -1187,26 +1239,31 @@ async fn main_inner() -> anyhow::Result<i32> {
             match custodian::custodial_supersede(&mut conn, &req).await? {
                 custodian::SupersedeOutcome::Done(r) => {
                     println!(
-                        "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\tedges_moved={}\t\
-                         custodial_act={}\tassignment={assignment}\tactor={actor}{}",
+                        "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\t\
+                         cascade_deferral={}\tcustodial_act={}\tassignment={assignment}\t\
+                         actor={actor}{}",
                         if r.applied { "" } else { "WOULD BE " },
                         r.old,
                         r.new,
                         r.author,
                         r.owner,
-                        r.edges_moved,
+                        r.cascade_deferral,
                         r.act_event,
                         r.admin_act
                             .map_or_else(String::new, |a| format!("\tact={a}"))
                     );
                     if r.applied {
                         println!(
+                            "NOTE: the edge migration and the belief cascade run from the \
+                             cascade deferral, in the next replay_deferred_cascades run."
+                        );
+                        println!(
                             "NOTE: the successor has no embedding until the next embedding \
                              backfill; it is a live_missing row until then."
                         );
                     } else {
                         println!(
-                            "DRY RUN: the supersede, its edge migration and its audit row were \
+                            "DRY RUN: the supersede, its cascade deferral and its audit row were \
                              rolled back."
                         );
                     }
@@ -1653,6 +1710,34 @@ async fn main_inner() -> anyhow::Result<i32> {
             );
             if !apply {
                 println!("DRY RUN: the revocation and its audit row were rolled back.");
+            }
+            Ok(0)
+        }
+        Command::RetireLink {
+            agent,
+            reason,
+            revoke_membership,
+            apply,
+        } => {
+            let outcome =
+                retire_link::run(&mut conn, agent, &reason, revoke_membership, apply).await?;
+            println!("{}", retire_link::describe(agent, &outcome, apply));
+            if !apply && outcome.exit_code() == 0 {
+                println!("DRY RUN: the retire and its audit row were rolled back.");
+            }
+            Ok(outcome.exit_code())
+        }
+        cmd @ (Command::SuspendClient(_) | Command::RevokeClient(_)) => {
+            let (act, a) = match cmd {
+                Command::SuspendClient(a) => (client_status::StatusAct::Suspend, a),
+                Command::RevokeClient(a) => (client_status::StatusAct::Revoke, a),
+                _ => unreachable!("matched above"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome =
+                client_status::run(&mut conn, act, a.client, &a.reason, a.apply, &who).await?;
+            for line in client_status::describe(&outcome) {
+                println!("{line}");
             }
             Ok(0)
         }

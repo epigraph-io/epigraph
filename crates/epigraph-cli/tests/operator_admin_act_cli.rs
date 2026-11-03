@@ -420,18 +420,35 @@ async fn is_current(pool: &PgPool, claim: Uuid) -> bool {
         .expect("claim")
 }
 
+/// Every `cascade.deferred` row as `(id, agent_id, cause, trigger subject)`.
+async fn cascade_deferrals(
+    pool: &PgPool,
+) -> Vec<(Uuid, Option<Uuid>, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT id, agent_id, details->>'cause', details->'trigger'->>'subject_id' \
+           FROM security_events WHERE event_type = 'cascade.deferred' ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("cascade deferrals")
+}
+
 /// `custodial-supersede` by a custodian holding a passkey: with no act the
 /// database refuses the record (ELV10) and the whole supersede rolls back;
 /// on an act confirmed for truth 0.7, flags saying 0.8 are refused before any
 /// write; with the act's exact args (the content hashed by the DATABASE in
 /// this test, so the verb's own hash is checked against it) the claim is
 /// revised, the act spent, and the `platform.custodial_act` row names the
-/// act with `confirmation = 'passkey'`.
+/// act with `confirmation = 'passkey'`. The confirmed-act arm owes the same
+/// cascade as the assignment arm (SPEC section 3.1): the refused runs leave no
+/// `supersede` cascade deferral, the confirmed run leaves exactly one, naming
+/// the custodian and the predecessor, and the act record links it.
 ///
 /// Verified to fail: the verb recording without the act (the six-parameter
 /// recorder) -> the confirmed run is refused ELV10; the verb hashing the
 /// content trimmed -> the confirmed run is refused (the flags are not the
-/// act's).
+/// act's); the cascade deferral recorded in the assignment arm only -> the
+/// confirmed run leaves no deferral.
 #[sqlx::test(migrations = "../../migrations")]
 async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
     let (c, a) = custodian_with_passkey(&pool, "custodian", 1).await;
@@ -474,6 +491,11 @@ async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
     assert_eq!(bare.code, 1, "{}", bare.show());
     assert!(bare.stderr.contains("ELV10"), "{}", bare.show());
     assert!(is_current(&pool, claim).await, "the supersede rolled back");
+    assert_eq!(
+        cascade_deferrals(&pool).await,
+        vec![],
+        "the refused act rolled its cascade deferral back with it"
+    );
 
     let hash: String = sqlx::query_scalar("SELECT encode(sha256(convert_to($1, 'UTF8')), 'hex')")
         .bind(content)
@@ -495,6 +517,11 @@ async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
     assert_eq!(off.code, 1, "{}", off.show());
     assert!(off.stderr.contains("REFUSED"), "{}", off.show());
     assert!(is_current(&pool, claim).await, "nothing was changed");
+    assert_eq!(
+        cascade_deferrals(&pool).await,
+        vec![],
+        "a refusal before the write records no deferral"
+    );
 
     let done = run(args_for("0.7", Some(&act_s))).await;
     assert_eq!(done.code, 0, "{}", done.show());
@@ -521,6 +548,26 @@ async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
             .await
             .expect("the act");
     assert!(spent, "the act is spent");
+
+    let rows = cascade_deferrals(&pool).await;
+    assert_eq!(rows.len(), 1, "one deferral for the one act: {rows:?}");
+    let (deferral, agent, cause, subject) = &rows[0];
+    assert_eq!(*agent, Some(c), "the deferral names the custodian");
+    assert_eq!(cause.as_deref(), Some("supersede"));
+    assert_eq!(subject.as_deref(), Some(claims.as_str()));
+    let link: Option<String> = sqlx::query_scalar(
+        "SELECT details->'details'->>'cascade_deferral_event_id' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1",
+    )
+    .bind(claims.as_str())
+    .fetch_one(&pool)
+    .await
+    .expect("the custodial act record");
+    assert_eq!(
+        link,
+        Some(deferral.to_string()),
+        "the act record names the cascade it owes"
+    );
 }
 
 /// A LATER passkey: `passkey-enroll` for a person who already holds a live

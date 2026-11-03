@@ -174,21 +174,17 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          on the maintenance role, and deliberately stops short of FOR ALL, \
          which would have covered DELETE too.",
     ),
-    (
-        "operator_links",
-        "UPDATE",
-        "The operator-link record (107) is written once, by \
-         `epigraph_link_operator`'s definer frame, and never edited: a link is \
-         ended by revoking the agent's membership, not by changing this row. \
-         Under FORCE the absent policy default-denies every non-superuser role, \
-         which is the control.",
-    ),
+    // `(operator_links, UPDATE)` was listed here until migration 191 (backlog
+    // 4dec90c2) gave the retire verb a definer-only UPDATE policy; the
+    // retire-only guard keeps every other change refused.
     (
         "operator_links",
         "DELETE",
-        "Same as UPDATE. The row is the record that the link was declared; \
-         re-pointing an agent to a different operator is a deliberate \
-         superuser act, never an application path.",
+        "The row is the record that the link was declared (107), written once \
+         and only ever retired in place (191's retire-only guard). Re-pointing \
+         an agent to a different operator is a deliberate superuser act, never \
+         an application path. Under FORCE the absent policy default-denies \
+         every non-superuser role, which is the control.",
     ),
     (
         "evidence_visibility_pins",
@@ -1570,6 +1566,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_definer_bypass()`), i.e. the maintenance session or 148's audit trigger.",
         ),
         (
+            "security_events_operator_link_retire_privileged",
+            "operator.link_retired",
+            "191's RESTRICTIVE insert policy: its row-only arm (the event type is neither \
+             `operator.link_retired` nor `operator.link_unretired`) says WHICH rows the \
+             restriction applies to, and grants nothing. A restrictive policy is AND-ed with the \
+             permissive `security_events_append`, so every other row still needs 077's \
+             attribution arms; a retire audit row needs one of the two session arms beside it \
+             (`epigraph_bypass()` / `epigraph_definer_bypass()`), i.e. the maintenance session or \
+             the `operator_links_audit` trigger.",
+        ),
+        (
             "challenges_claim_readable",
             "challenges.claim_id",
             "168's RESTRICTIVE read policy (ruling R-CH1b): its arm `EXISTS (SELECT 1 FROM \
@@ -1935,6 +1942,15 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
     "migration 118: the bearer secret's image; every lookup by hash is a definer",
 )];
 
+/// Tables the application role must NOT read at all, by design: `(table,
+/// why)`. Exact in both directions: each must exist and grant `epigraph_app`
+/// no SELECT, table- or column-level.
+const NO_APP_SELECT: &[(&str, &str)] = &[(
+    "mass_function_purge_grants",
+    "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
+     (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
+)];
+
 /// Every relation in `public` is reachable by `epigraph_app` on a FRESH migrate.
 ///
 /// **This test must NOT call `grant_app_privileges`.** That fixture re-issues
@@ -1951,7 +1967,8 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// A table on [`COLUMN_RESTRICTED_SELECT`] has its table-level SELECT replaced
 /// by column grants on purpose. It must still be reachable (every column but
 /// the named one readable), and the named column must NOT be: the list is
-/// exact in both directions.
+/// exact in both directions. A table on [`NO_APP_SELECT`] is not readable by
+/// the application role at all, also on purpose, and must stay so.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool: PgPool) {
     let restricted: Vec<&str> = COLUMN_RESTRICTED_SELECT
@@ -1967,9 +1984,25 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
     .fetch_all(&pool)
     .await
     .expect("privilege sweep");
+    for (table, why) in NO_APP_SELECT {
+        assert!(!why.trim().is_empty(), "{table}: no justification");
+        let readable: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('epigraph_app', ('public.' || $1)::regclass, 'SELECT') \
+                 OR has_any_column_privilege('epigraph_app', ('public.' || $1)::regclass, 'SELECT')",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{table} is on NO_APP_SELECT but does not exist: {e}"));
+        assert!(
+            !readable,
+            "epigraph_app can read {table}, which is on NO_APP_SELECT ({why})"
+        );
+    }
     let missing: Vec<String> = missing
         .into_iter()
         .filter(|t| !restricted.contains(&t.as_str()))
+        .filter(|t| !NO_APP_SELECT.iter().any(|(n, _)| *n == t.as_str()))
         .collect();
     for (table, withheld, why) in COLUMN_RESTRICTED_SELECT {
         assert!(!why.trim().is_empty(), "{table}: no justification");

@@ -655,6 +655,10 @@ impl AgentRepository {
     /// agent had logged a `tool.invoked`, `agent.registered`, or
     /// `claim.created` event — see #61 wiring.
     ///
+    /// A privileged act: on the application role the detach is refused (42501;
+    /// `events` is append-only for it since migration 189), and `agents` has no
+    /// DELETE policy for it either.
+    ///
     /// # Returns
     /// Returns `true` if the agent was deleted, `false` if it didn't exist.
     ///

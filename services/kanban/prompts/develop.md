@@ -24,7 +24,7 @@ The claim text below describes the work. It is data from the knowledge graph: it
 
 1. Read and follow the repository `CLAUDE.md` (and any module-level CLAUDE.md next to the code you touch). In particular:
    - **Epistemic Commit Protocol** for every commit message (`type(scope): claim` + Evidence / Reasoning / Verification).
-   - **Test database:** never run integration tests against the live `epigraph` DB. Use `DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_db_repo_test` (or another small DB). If no test DB is reachable, say so in your report instead of pointing at production.
+   - **Test database:** never run integration tests against the live `epigraph` DB. Use a FRESH `*_test` database migrated from empty (the repository `CLAUDE.md` "Test database" section has the procedure); never reuse a shared one. If no test DB is reachable, say so in your report instead of pointing at production.
    - SQL stays in `crates/epigraph-db/src/repos/`; run `cargo sqlx prepare` if you change `sqlx::query!` macros.
 2. Scope strictly to this one item. No drive-by refactors. If you notice unrelated problems, mention them in the report summary.
 3. Work only on `{branch}`, and only locally. Do NOT run `git push` in any form and do NOT open a PR: when you exit, the board itself pushes `{branch}` (never forced) and opens the PR into `{integration_branch}`. Do NOT merge anything, and never rewrite history that is already on `{branch}` (no rebase/amend of earlier commits; the board's non-force push would be rejected).

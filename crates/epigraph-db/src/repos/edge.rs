@@ -1839,10 +1839,10 @@ impl EdgeRepository {
     ///   the claims of every OTHER writer's BBA keyed on the edge, which it
     ///   removes. Recorded even when only the caller's own BBAs existed, so
     ///   their claims are re-derived.
-    /// * (a) it then deletes the caller's OWN edge-keyed BBAs, scoped
+    /// * (a) it then deletes the caller's OWN live edge-keyed BBAs, scoped
     ///   explicitly to the session's writable set (the same set the definer
     ///   read), so a privileged stamped session is held to the same owner
-    ///   scope as the application role.
+    ///   scope as the application role. A retracted one is kept for audit.
     ///
     /// [`EdgeWithdrawal::BeingDeleted`] first closes the row's window
     /// (`valid_to = now()`, the transaction's start, so `valid_to <= now()`
@@ -1917,11 +1917,14 @@ impl EdgeRepository {
             reason,
         )
         .await?;
-        // (a) The caller's own rows.
+        // (a) The caller's own LIVE rows. A retracted one (migration 184) is
+        // kept for audit and stays keyed on the withdrawn edge, where nothing
+        // folds it (rulings R-79, R-103).
         let deleted = sqlx::query(
             "DELETE FROM mass_functions \
               WHERE perspective_id = $1 \
-                AND owner_group_id = ANY (public.epigraph_writable_groups())",
+                AND owner_group_id = ANY (public.epigraph_writable_groups()) \
+                AND retracted_at IS NULL",
         )
         .bind(edge_id)
         .execute(&mut *conn)
@@ -1934,9 +1937,10 @@ impl EdgeRepository {
     }
 
     /// The administrative half of an `edge_retract` cascade, on the
-    /// MAINTENANCE connection: remove every BBA keyed on the edge (keyed on
+    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge (keyed on
     /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
-    /// touched) and return the claims they lived on.
+    /// touched) and return the claims they lived on. A RETRACTED row
+    /// (migration 184) is kept for audit (rulings R-79, R-103).
     ///
     /// STATE-DERIVED: it acts only while the edge row is absent or out of force
     /// (`valid_to <= now()`). An edge in force at the time of the call (its
@@ -1974,6 +1978,7 @@ impl EdgeRepository {
                   WHERE p.id = mf.perspective_id \
                     AND p.id = $1 \
                     AND p.perspective_type = 'edge' \
+                    AND mf.retracted_at IS NULL \
                  RETURNING mf.claim_id) \
              SELECT claim_id FROM gone",
         )
@@ -1992,8 +1997,10 @@ impl EdgeRepository {
     }
 
     /// The edges whose BBAs outlived them: an edge-factor perspective
-    /// (`perspective_type = 'edge'`) with BBAs keyed on it whose edge is absent
-    /// or out of force. The one-shot legacy sweep
+    /// (`perspective_type = 'edge'`) with LIVE BBAs keyed on it whose edge is
+    /// absent or out of force. An edge holding only retracted rows is not
+    /// listed: the removal keeps those (migration 184), so listing it would
+    /// spend the sweep's `limit` on an edge it can do nothing for. The one-shot legacy sweep
     /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
     /// BBAs through the same administrative path as an `edge_retract` replay.
     /// Maintenance connection only.
@@ -2009,7 +2016,8 @@ impl EdgeRepository {
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
              SELECT p.id FROM perspectives p \
               WHERE p.perspective_type = 'edge' \
-                AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.perspective_id = p.id) \
+                AND EXISTS (SELECT 1 FROM mass_functions mf \
+                             WHERE mf.perspective_id = p.id AND mf.retracted_at IS NULL) \
                 AND NOT EXISTS (SELECT 1 FROM edges e \
                                  WHERE e.id = p.id \
                                    AND (e.valid_to IS NULL OR e.valid_to > now())) \

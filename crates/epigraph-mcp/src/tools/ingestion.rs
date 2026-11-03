@@ -181,6 +181,7 @@ pub async fn ingest_document(
     // the caller was told `queued` and after `ensure_paper_node` wrote the
     // `papers` row. The core re-derives (and re-checks) the same set.
     ingest_claim_labels(&extraction, &doi)?;
+    refuse_lineage_relationships(&extraction)?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
     // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
@@ -314,6 +315,7 @@ pub async fn ingest_document_inline(
     let title = extraction.source.title.clone();
     // Before any write, for the reason given in `ingest_document` above.
     ingest_claim_labels(&extraction, &doi)?;
+    refuse_lineage_relationships(&extraction)?;
 
     // Same detached-task ownership requirement, the same refusals (an elevated
     // request first, before the detach downgrades it) and the same
@@ -388,6 +390,14 @@ async fn ingest_in_request(
             )),
             data: e.data,
         })
+}
+
+/// Refuse a document whose `relationships` name `supersedes` in any spelling
+/// (supersede SPEC K12a): the lineage edge is the supersession act's alone.
+/// A caller payload error, before any write, on every document entry point.
+fn refuse_lineage_relationships(extraction: &DocumentExtraction) -> Result<(), McpError> {
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(invalid_params)
 }
 
 /// Create (or fetch) the document's `papers` row **synchronously**, before the
@@ -965,6 +975,7 @@ pub async fn do_ingest_document(
     // belief about TRUE for a claim the caller placed on a labeled hypothesis.
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+    refuse_lineage_relationships(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -1767,11 +1778,22 @@ pub(crate) async fn find_paper_by_document_key(
 
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
-/// Priority: real DOI → arXiv id parsed from `uri` → `uri` → synthesized key.
+/// Priority: real DOI → arXiv id parsed from `uri` → a DOI spelled as `uri` →
+/// `external_id` (synthesized key) → plain `uri` → metadata-synthesized key.
 /// A DOI given as a resolver URL or `doi:` (in `doi` or in `uri`) is keyed on
 /// the bare DOI ([`canonical_document_key`]).
-/// Placeholder DOIs/URIs (`"unknown"`, `"n/a"`, empty, …) are treated as absent
-/// so they fall through to synthesis instead of becoming a shared bucket.
+/// Placeholder DOIs/URIs/external ids (`"unknown"`, `"n/a"`, empty, …) are
+/// treated as absent so they fall through instead of becoming a shared bucket.
+///
+/// `external_id` outranks a plain `uri` (backlog b69dfb91): a uri is where a
+/// document lives, and several works can live at one (an ELN notebook page, a
+/// repository landing page), while `external_id` is the caller's identity for
+/// the record. Keyed on the uri, two works sharing one merged under one paper
+/// node. A uri that IS an identifier (arXiv, DOI) still wins, as `doi` does.
+/// Consequence: a document ingested before this change with both a plain uri
+/// and an external_id was keyed on the uri, and re-ingesting it now keys a new
+/// node. No lookup falls back to the old uri key, because that key may be the
+/// merged node this rule exists to stop reusing.
 fn resolve_doi(extraction: &DocumentExtraction) -> String {
     if let Some(d) = &extraction.source.doi {
         if !is_placeholder_id(d) {
@@ -1783,13 +1805,26 @@ fn resolve_doi(extraction: &DocumentExtraction) -> String {
             "ingest: placeholder DOI treated as absent; synthesizing a stable document key (issue #356). Pass source.external_id to control this key."
         );
     }
+    let has_external_id = extraction
+        .source
+        .external_id
+        .as_deref()
+        .is_some_and(|ext| !is_placeholder_id(ext));
     if let Some(uri) = &extraction.source.uri {
         if !is_placeholder_id(uri) {
-            // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}
-            if let Some(arxiv) = find_arxiv_id(uri) {
+            // Hand-rolled arXiv pattern: \d{4}\.\d{4,5}. It matches any digit
+            // run, so against an external_id it counts only when the uri
+            // names arXiv (host or `arXiv:` scheme); a date-shaped path
+            // segment must not fabricate a shared arXiv key. Without an
+            // external_id the legacy behaviour is kept so existing keys hold.
+            let names_arxiv = !has_external_id || uri.to_ascii_lowercase().contains("arxiv");
+            if let Some(arxiv) = find_arxiv_id(uri).filter(|_| names_arxiv) {
                 return format!("10.48550/arXiv.{arxiv}");
             }
-            return canonical_document_key(uri);
+            let key = canonical_document_key(uri);
+            if !has_external_id || epigraph_db::repos::paper::is_bare_doi(&key) {
+                return key;
+            }
         }
     }
     synthetic_document_key(&extraction.source)
@@ -1974,6 +2009,7 @@ pub async fn do_ingest_document_spine(
     // belief about TRUE for a claim the caller placed on a labeled hypothesis.
     epigraph_ingest::document::axis::validate_axes(extraction)
         .map_err(|e| invalid_params(format!("axis declaration invalid: {e}")))?;
+    refuse_lineage_relationships(extraction)?;
 
     let plan = build_ingest_plan(extraction);
     let pool = &server.pool;
@@ -2754,6 +2790,118 @@ mod tests {
             resolve_doi(&extraction_of(b)),
             "two sweep variants with the same title shared one node"
         );
+    }
+
+    /// Backlog b69dfb91: with `doi` null, a plain `uri` keyed the document and
+    /// `external_id` was never read, so two different works sharing one uri
+    /// (an ELN host page, a repository landing page) merged under one paper
+    /// node. `external_id` is the documented identity for a DOI-less record,
+    /// so it must keep them apart.
+    #[test]
+    fn shared_uri_with_distinct_external_ids_does_not_merge() {
+        let uri = "https://example.org/eln/notebook";
+        let mut a = src("Sweep variant");
+        a.uri = Some(uri.to_string());
+        a.external_id = Some("eln-run-v2".to_string());
+        let mut b = src("Sweep variant");
+        b.uri = Some(uri.to_string());
+        b.external_id = Some("eln-run-v3".to_string());
+        let (ka, kb) = (
+            resolve_doi(&extraction_of(a)),
+            resolve_doi(&extraction_of(b)),
+        );
+        assert_ne!(
+            ka, kb,
+            "two works sharing source.uri but carrying different external_id \
+             were keyed onto one paper node"
+        );
+        assert!(
+            is_synthetic_key(&ka) && is_synthetic_key(&kb),
+            "the external_id identity, not the shared uri, keys them: {ka} / {kb}"
+        );
+    }
+
+    /// The same record (same uri, same external_id) still converges, and it
+    /// converges with the uri-less spelling of that record: identity is the
+    /// external id alone, so adding or correcting the uri does not fork it.
+    #[test]
+    fn same_external_id_converges_with_or_without_the_uri() {
+        let mk = |uri: Option<&str>| {
+            let mut s = src("ELN entry: variant V2");
+            s.uri = uri.map(str::to_string);
+            s.external_id = Some("eln-run-2026-07-23-v2".to_string());
+            resolve_doi(&extraction_of(s))
+        };
+        let with_uri = mk(Some("https://example.org/eln/notebook"));
+        assert_eq!(with_uri, mk(Some("https://example.org/eln/notebook")));
+        assert_eq!(with_uri, mk(None));
+        assert_eq!(with_uri, mk(Some("https://example.org/eln/moved-notebook")));
+    }
+
+    /// A uri with no usable external_id keeps the verbatim key it always had,
+    /// so rows ingested that way are still found on re-ingest.
+    #[test]
+    fn uri_without_external_id_keeps_its_verbatim_key() {
+        let uri = "https://example.org/eln/entry-42";
+        assert_eq!(key_for_uri(uri), uri);
+        for placeholder in ["unknown", " n/a ", ""] {
+            let mut s = src("A paper");
+            s.uri = Some(uri.to_string());
+            s.external_id = Some(placeholder.to_string());
+            assert_eq!(
+                resolve_doi(&extraction_of(s)),
+                uri,
+                "placeholder external_id {placeholder:?} must not displace the uri key"
+            );
+        }
+    }
+
+    /// A uri that names a real identifier (a DOI resolver link, an arXiv
+    /// page) outranks external_id, exactly as a real `doi` does.
+    #[test]
+    fn identifier_shaped_uri_outranks_external_id() {
+        let mut d = src("A paper");
+        d.uri = Some("https://doi.org/10.1021/acsnano.9b05650".to_string());
+        d.external_id = Some("lab-copy-1".to_string());
+        assert_eq!(resolve_doi(&extraction_of(d)), "10.1021/acsnano.9b05650");
+
+        let mut x = src("A preprint");
+        x.uri = Some("https://arxiv.org/abs/2606.04990".to_string());
+        x.external_id = Some("lab-copy-1".to_string());
+        assert_eq!(resolve_doi(&extraction_of(x)), "10.48550/arXiv.2606.04990");
+
+        let mut p = src("A paper");
+        p.uri = Some("doi:10.1021/acsnano.9b05650".to_string());
+        p.external_id = Some("lab-copy-1".to_string());
+        assert_eq!(resolve_doi(&extraction_of(p)), "10.1021/acsnano.9b05650");
+    }
+
+    /// A shared uri whose path merely contains an arXiv-shaped digit run
+    /// (`2026.1102`, `20261102.14301`) does not name arXiv, so it must not
+    /// outrank external_id: keyed on a fabricated `10.48550/arXiv.*` DOI, two
+    /// different works at that uri merged exactly as b69dfb91 describes.
+    #[test]
+    fn digit_run_in_a_shared_uri_is_not_an_arxiv_identifier() {
+        for uri in [
+            "https://lab.example/eln/2026.1102/notebook",
+            "https://lab.example/eln/entry/20261102.14301",
+        ] {
+            let mut a = src("Sweep variant");
+            a.uri = Some(uri.to_string());
+            a.external_id = Some("run-a".to_string());
+            let mut b = src("Sweep variant");
+            b.uri = Some(uri.to_string());
+            b.external_id = Some("run-b".to_string());
+            let (ka, kb) = (
+                resolve_doi(&extraction_of(a)),
+                resolve_doi(&extraction_of(b)),
+            );
+            assert_ne!(ka, kb, "two works at {uri} merged under one key {ka}");
+            assert!(
+                is_synthetic_key(&ka) && is_synthetic_key(&kb),
+                "external_id, not a digit run in {uri}, keys them: {ka} / {kb}"
+            );
+        }
     }
 
     #[test]

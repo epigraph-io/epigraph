@@ -1628,6 +1628,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // maintenance-role frame, so every un-retraction errors with nothing
     // written (loud).
     ("epigraph_unretract_mass_function", 184),
+    // 193 (backlog 0dc20fad), the definer-rights compound test of the
+    // cached-belief owner lookup. Fails OPEN under a non-member owner: its
+    // reads of the FORCEd `claims` and `edges` are then row-security filtered
+    // exactly as the caller's would be, so a compound whose decomposition the
+    // caller cannot see reads as "not a compound" and the per-request refresh
+    // refolds or vacates its cache, which is the defect the function closes.
+    // The stake that makes the owner a control here.
+    ("epigraph_claim_is_compound", 193),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -1637,8 +1645,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // so an owner deleting its own claim silently leaves world-owned edges
     // pointing at the deleted row. That is the stake this entry reports.
     ("epigraph_session_writes_node", 115),
+    // Re-bodied by 117 (owner arm only) and 194 (retracted rows kept); the
+    // stake above is unchanged by either.
     ("epigraph_cascade_delete_edge_bbas", 115),
     ("epigraph_cascade_delete_node_edges", 115),
+    // 194 (H10), the purge-grant helper the retracted-row delete guard calls.
+    // Fails CLOSED under a non-member owner: such an owner holds no privilege
+    // on `mass_function_purge_grants` (only `epigraph_maintenance` does), so
+    // its read is refused and every delete of a retracted row, the purge
+    // definer's included, errors with nothing deleted (loud).
+    ("epigraph_mf_purge_granted", 194),
+    // 194 (H10), the audited purge of retracted mass functions. Fails CLOSED
+    // under a non-member owner: its grant INSERT is refused (no privilege on
+    // the grant table) and its `security_events` audit INSERT by the tenancy
+    // policies, so every purge errors with nothing deleted (loud), and a
+    // claim or frame delete that needs one stays refused SR09.
+    ("epigraph_purge_mass_functions", 194),
     // 116, the attested retire of a former shared HTTP signer (batch HTTP-id).
     // Deferred for 107's reason, and fails CLOSED the same way under a
     // non-member owner: the tenancy policies refuse its link and audit writes.
@@ -2071,6 +2093,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // member removal is refused whole, the pre-181 behaviour); its GRA02 arm
     // refuses a filtered UPDATE rather than dropping the mark silently.
     ("epigraph_mark_group_reseal_required", 181),
+    // 191 (backlog 4dec90c2), the audited retire of a live operator link. It
+    // runs only for a maintenance session, whose `epigraph_bypass()` admits
+    // its read of the FORCEd `operator_links`; its UPDATE is admitted only by
+    // `operator_links_definer_retire` (`epigraph_definer_bypass()`, the
+    // owner) and needs the owner's column grant, so under a non-member owner
+    // every retire is refused (42501, loud) and nothing is written: fail
+    // CLOSED.
+    ("epigraph_retire_operator_link", 191),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2829,6 +2859,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_mark_group_reseal_required",
             "public.epigraph_mark_group_reseal_required(uuid)",
             true,
+        ),
+        // 191: retiring a live link is a maintenance act; an app grant would
+        // let the request DSN end an agent's authority (and revoke its
+        // membership) for any agent.
+        (
+            "epigraph_retire_operator_link",
+            "public.epigraph_retire_operator_link(uuid, text, boolean)",
+            false,
         ),
     ];
 

@@ -7,13 +7,13 @@
 //!
 //! See docs/superpowers/specs/2026-05-05-cross-component-bridge-sweep-design.md.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use epigraph_cli::bridge::candidates::{build_candidate_table, drop_candidate_table};
+use epigraph_cli::bridge::candidates::{build_candidate_table, CandidateTableLifetime};
 use epigraph_cli::bridge::components::{compute_components, ComponentSummary};
 use epigraph_cli::bridge::spine::{compute_spine_destination, SpineUmbrella};
-use epigraph_cli::rerank::{rerank_candidates_table, RerankConfig};
+use epigraph_cli::rerank::{find_candidates_from_table, rerank_candidates, RerankConfig};
 
 const USAGE: &str = r#"
 bridge-sweep — bridge multiple disconnected components into the giant CC
@@ -33,7 +33,11 @@ OPTIONS:
   --model <NAME>             Model override
   --dry-run                  Default.
   --apply                    Commit edges (overrides --dry-run).
-  --keep-tables              Don't drop temp candidate tables on exit.
+  --keep-tables              Build regular (persistent) candidate tables and keep
+                             them. Needs CREATE on the schema, which the
+                             maintenance login does not hold; without this flag
+                             the tables are TEMP and vanish with their
+                             transaction.
   --report-out <PATH>        JSON report path (else stdout).
   --limit <N>                Per-component LLM evaluation cap.
   -h, --help
@@ -501,10 +505,49 @@ async fn process_component(
         }
     };
 
+    let fail =
+        |candidates_count: usize, spine: Vec<SpineUmbrella>, error: String| ComponentReport {
+            component_id: component.component_id,
+            size: component.size,
+            candidates_table: table_name.to_string(),
+            candidates_count,
+            spine_top_umbrellas: spine,
+            rerank: None,
+            error: Some(error),
+            duration_ms: started.elapsed().as_millis(),
+        };
+    let config = RerankConfig {
+        min_similarity: args.min_similarity,
+        batch_size: args.batch_size,
+        provider: args.provider.clone(),
+        model: args.model.clone(),
+        dry_run: !args.apply,
+        limit: args.limit,
+        verbose: false,
+    };
+
+    // Steps 2–4a run in ONE transaction, because the candidate table is a TEMP
+    // table (no role this runs as holds CREATE on a schema) and a TEMP table is
+    // visible only in the session that created it. A transaction, not a bare
+    // connection, so the session holds behind a transaction-mode pooler too.
+    // Committing drops the TEMP table (`ON COMMIT DROP`), and any early return
+    // drops `tx`, which rolls back and drops it as well. `--keep-tables` builds
+    // a regular table instead, which the commit keeps.
+    let lifetime = if args.keep_tables {
+        CandidateTableLifetime::Persistent
+    } else {
+        CandidateTableLifetime::Transaction
+    };
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return fail(0, Vec::new(), format!("begin: {e}")),
+    };
+
     // Step 2: build candidate table.
     let candidates_count = match build_candidate_table(
-        pool,
+        &mut tx,
         table_name,
+        lifetime,
         &source_atoms,
         &target_atoms,
         args.min_similarity,
@@ -513,22 +556,11 @@ async fn process_component(
     .await
     {
         Ok(n) => n,
-        Err(e) => {
-            return ComponentReport {
-                component_id: component.component_id,
-                size: component.size,
-                candidates_table: table_name.to_string(),
-                candidates_count: 0,
-                spine_top_umbrellas: Vec::new(),
-                rerank: None,
-                error: Some(format!("build_candidate_table: {e}")),
-                duration_ms: started.elapsed().as_millis(),
-            }
-        }
+        Err(e) => return fail(0, Vec::new(), format!("build_candidate_table: {e}")),
     };
 
     // Step 3: spine BEFORE the LLM step (graph-health diagnostic).
-    let spine = match compute_spine_destination(pool, table_name, 5).await {
+    let spine = match spine_in_savepoint(&mut tx, table_name).await {
         Ok(v) => v,
         Err(e) => {
             // Record the error but continue to the rerank step — spine is a
@@ -541,48 +573,35 @@ async fn process_component(
         }
     };
 
-    // Step 4: rerank if there are candidates.
-    let rerank = if candidates_count > 0 {
-        let config = RerankConfig {
-            min_similarity: args.min_similarity,
-            batch_size: args.batch_size,
-            provider: args.provider.clone(),
-            model: args.model.clone(),
-            dry_run: !args.apply,
-            limit: args.limit,
-            verbose: false,
-        };
-        match rerank_candidates_table(pool, table_name, &config).await {
+    // Step 4a: read the candidates back in the same transaction.
+    let candidates = if candidates_count > 0 {
+        match find_candidates_from_table(&mut tx, table_name, &config).await {
+            Ok(c) => Some(c),
+            Err(e) => return fail(candidates_count, spine, format!("rerank: {e}")),
+        }
+    } else {
+        None
+    };
+
+    // Step 5: end the transaction BEFORE the LLM calls, so it is never held
+    // open across them.
+    if let Err(e) = tx.commit().await {
+        return fail(candidates_count, spine, format!("commit: {e}"));
+    }
+
+    // Step 4b: rerank the materialized candidates on the pool.
+    let rerank = match candidates {
+        Some(c) => match rerank_candidates(pool, c, &config).await {
             Ok(s) => Some(RerankReport {
                 candidates_evaluated: s.candidates_evaluated,
                 llm_accepted: s.llm_accepted,
                 edges_created: s.edges_created,
                 duration_ms: s.duration_ms,
             }),
-            Err(e) => {
-                if !args.keep_tables {
-                    let _ = drop_candidate_table(pool, table_name).await;
-                }
-                return ComponentReport {
-                    component_id: component.component_id,
-                    size: component.size,
-                    candidates_table: table_name.to_string(),
-                    candidates_count,
-                    spine_top_umbrellas: spine,
-                    rerank: None,
-                    error: Some(format!("rerank: {e}")),
-                    duration_ms: started.elapsed().as_millis(),
-                };
-            }
-        }
-    } else {
-        None
+            Err(e) => return fail(candidates_count, spine, format!("rerank: {e}")),
+        },
+        None => None,
     };
-
-    // Step 5: drop temp table unless --keep-tables.
-    if !args.keep_tables {
-        let _ = drop_candidate_table(pool, table_name).await; // best-effort
-    }
 
     ComponentReport {
         component_id: component.component_id,
@@ -594,4 +613,21 @@ async fn process_component(
         error: None,
         duration_ms: started.elapsed().as_millis(),
     }
+}
+
+/// [`compute_spine_destination`] under a savepoint. The spine is a
+/// diagnostic, so its failure must not take the candidate read down with it;
+/// a failed statement aborts the enclosing transaction, and rolling back to
+/// the savepoint is what keeps `tx` usable afterwards.
+async fn spine_in_savepoint(
+    tx: &mut Transaction<'_, Postgres>,
+    table_name: &str,
+) -> Result<Vec<SpineUmbrella>, sqlx::Error> {
+    use sqlx::Connection as _;
+    // A nested `begin` on a connection already in a transaction issues
+    // `SAVEPOINT`; dropping it on the error path queues the rollback to it.
+    let mut savepoint = (**tx).begin().await?;
+    let spine = compute_spine_destination(&mut savepoint, table_name, 5).await?;
+    savepoint.commit().await?;
+    Ok(spine)
 }

@@ -24,7 +24,11 @@ jobs:
     # 2026-10-25: 150. With the static checks moved to the `lint` job, `test`
     # alone took 1h55m on a main-sized tree (#691) and ~111 min of test steps on
     # a staging-sized one (#690): 120 cut real suites off. 150 still bounds a hang.
-    timeout-minutes: 150
+    # 2026-11-02: 210. main's own push run now takes ~147 of the 150 minutes,
+    # and a 15-PR staging tree (#750) was cut off at 150 inside the epigraph-mcp
+    # step with nothing failed, ~10 minutes short of finishing (~160 projected).
+    # 210 leaves headroom for run-to-run variance and still bounds a hang.
+    timeout-minutes: 210
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -446,6 +450,18 @@ jobs:
         run: |
           cargo clippy -p epigraph-api --features genai --all-targets --locked -- -D warnings
           cargo clippy -p epigraph-cli --features genai --all-targets --locked -- -D warnings
+      - name: TLS feature clippy
+        # `tls` (axum-server + rustls: src/tls.rs's PEM loader and its explicit
+        # crypto-provider choice) is off by default and no other step enables
+        # it, so that code and its two tests had no compile or lint signal
+        # (backlog ed3fff02). The workspace Clippy step above passes with a
+        # clippy-only defect in the tls-gated impl; this one refuses it.
+        run: cargo clippy -p epigraph-api --features tls --all-targets --locked -- -D warnings
+      - name: TLS feature tests
+        # tests/tls_pem_loading.rs and tests/tls_provider_choice.rs declare
+        # required-features = ["tls"], so every other test step skips them.
+        # No database: they handshake against the loaded config in-process.
+        run: cargo test -p epigraph-api --features tls --locked --test tls_pem_loading --test tls_provider_choice
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`

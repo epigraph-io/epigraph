@@ -435,9 +435,8 @@ impl FramedBeliefContext {
     }
 
     /// The global (no-lens) context over the served profile
-    /// ([`BeliefProfile::served`]: the workspace calibration, falling back to
-    /// the built-in calibration when `calibration.toml` cannot be loaded,
-    /// exactly as the cache recompute does).
+    /// ([`BeliefProfile::served`]: `CALIBRATION_PATH`, else the calibration
+    /// compiled into the binary, exactly as the cache recompute does).
     #[must_use]
     pub fn global() -> Self {
         Self::from_profile(BeliefProfile::served().clone())

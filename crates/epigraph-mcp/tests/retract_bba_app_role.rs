@@ -728,3 +728,165 @@ async fn unretracting_a_claims_only_bba_over_mcp_restores_its_cache(pool: PgPool
     assert_eq!(first_text(&again)["status"], "not_retracted");
     assert_eq!(unretract_audits().await.len(), 1);
 }
+
+/// Backlog 0dc20fad over MCP, on the application role: a compound (owned by
+/// the caller's group) whose only child, and the edge to it, are private to a
+/// group the caller is not in. Its cache is a query over its leaves, never a
+/// fold of the BBAs on it, so retracting its only BBA must not VACATE it
+/// (ruling R-80's vacate is for a claim that lost its last cache-owning
+/// input, and a compound has no owner), and un-retracting it must not refold
+/// it. Before migration 193 the caller's row security hid the decomposition
+/// from the owner lookup, which then read the compound as a standalone claim.
+/// CALIBRATION: a standalone twin holding the same BBA, under the same
+/// sentinel, IS vacated by the same tool.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retract_and_unretract_leave_a_compound_whose_decomposition_is_hidden_unchanged(
+    pool: PgPool,
+) {
+    let server = app_role_server(&pool).await;
+    let (owner, owner_auth, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let (other, _, _) = seed_caller(&pool, &["claims:write"]).await;
+    let group = personal_group_of(&pool, owner).await;
+    let other_group = personal_group_of(&pool, other).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("0dc20fad-mcp-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let compound = owned_public_claim(&pool, owner, group, "compound").await;
+    let child: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2, true, 'group', $3) RETURNING id",
+    )
+    .bind(format!("0dc20fad private child {}", Uuid::new_v4()))
+    .bind(other)
+    .bind(other_group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed the private child");
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, \
+                            valid_from) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'decomposes_to', \
+                 now() - interval '1 day') RETURNING id",
+    )
+    .bind(compound)
+    .bind(child)
+    .fetch_one(&pool)
+    .await
+    .expect("seed decomposes_to");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(other_group)
+    .execute(&pool)
+    .await
+    .expect("make the edge private");
+    let twin = owned_public_claim(&pool, owner, group, "standalone twin").await;
+    let masses = serde_json::json!({"0": 0.8, "0,1": 0.2});
+    let only = seed_bba(&pool, owner, compound, frame, masses.clone()).await;
+    let twin_only = seed_bba(&pool, owner, twin, frame, masses).await;
+    let sentinel = (0.613, 0.887, 0.741);
+    for c in [compound, twin] {
+        sqlx::query(
+            "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
+                    belief_frame_id = $5 WHERE id = $1",
+        )
+        .bind(c)
+        .bind(sentinel.0)
+        .bind(sentinel.1)
+        .bind(sentinel.2)
+        .bind(frame)
+        .execute(&pool)
+        .await
+        .expect("set the sentinel cache");
+    }
+
+    let res = retract_bba(
+        &server,
+        &owner_viewer,
+        params(twin_only, "twin"),
+        Some(&owner_auth),
+    )
+    .await
+    .expect("retract the twin's only BBA");
+    assert_eq!(
+        first_text(&res)["belief_vacated"],
+        true,
+        "calibration: the standalone twin is vacated"
+    );
+    assert!(close(cached(&pool, twin).await, (0.0, 1.0, 0.5)));
+    // CALIBRATION of the un-retract leg: on the standalone twin the same tool
+    // DOES refold (so `belief_recomputed:false` below is the guard, not an
+    // un-retract that never refreshes).
+    let res = unretract_bba(
+        &server,
+        &owner_viewer,
+        UnretractBbaParams {
+            mass_function_id: twin_only.to_string(),
+            reason: "twin restored".to_string(),
+        },
+        Some(&owner_auth),
+    )
+    .await
+    .expect("un-retract the twin's only BBA");
+    assert_eq!(
+        first_text(&res)["belief_recomputed"],
+        true,
+        "calibration: un-retracting on the standalone twin refolds it"
+    );
+    let twin_after = cached(&pool, twin).await;
+    assert!(
+        !close(twin_after, (0.0, 1.0, 0.5)),
+        "calibration: the twin's cache moved off the vacuous value: {twin_after:?}"
+    );
+
+    let res = retract_bba(
+        &server,
+        &owner_viewer,
+        params(only, "withdrawn"),
+        Some(&owner_auth),
+    )
+    .await
+    .expect("the owner retracts the compound's only BBA");
+    let body = first_text(&res);
+    assert_eq!(body["status"], "retracted", "{body}");
+    assert_eq!(body["belief_recomputed"], false, "{body}");
+    assert_eq!(
+        body["belief_vacated"], false,
+        "0dc20fad: a compound is never vacated: {body}"
+    );
+    let after = cached(&pool, compound).await;
+    assert!(
+        close(after, sentinel),
+        "0dc20fad: the retraction rewrote the compound's cache: {after:?}"
+    );
+
+    let res = unretract_bba(
+        &server,
+        &owner_viewer,
+        UnretractBbaParams {
+            mass_function_id: only.to_string(),
+            reason: "withdrawn in error".to_string(),
+        },
+        Some(&owner_auth),
+    )
+    .await
+    .expect("the owner un-retracts the compound's BBA");
+    let body = first_text(&res);
+    assert_eq!(body["status"], "unretracted", "{body}");
+    assert_eq!(
+        body["belief_recomputed"], false,
+        "0dc20fad: a compound is never refolded: {body}"
+    );
+    let after = cached(&pool, compound).await;
+    assert!(
+        close(after, sentinel),
+        "0dc20fad: the un-retraction refolded the compound's own BBA: {after:?}"
+    );
+}
