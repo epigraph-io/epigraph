@@ -626,8 +626,7 @@ where
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
         adjust(stored),
-        // STUB (red): the base is not threaded through yet.
-        BeliefProfile::served(),
+        base,
     )
     .await
 }
