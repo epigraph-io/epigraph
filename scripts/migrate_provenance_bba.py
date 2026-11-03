@@ -461,14 +461,28 @@ def rollback(cur, args, manifest_path: str) -> int:
     print(f"manifest lists {len(ids)} inserted BBAs and "
           f"{len(assignments)} claim_frames rows this migration created")
 
+    # A RETRACTED row (migration 184) is kept for audit, and migration 194
+    # refuses any delete of one outside its audited purge definer: deleting it
+    # here would fail the whole rollback (SR09). Skip it and say which.
+    cur.execute(
+        "SELECT id::text AS id FROM mass_functions "
+        "WHERE id = ANY(%s::uuid[]) AND retracted_at IS NOT NULL ORDER BY id",
+        (ids,),
+    )
+    retracted = [r["id"] for r in cur.fetchall()]
+
     if not args.execute:
         cur.execute(
             "SELECT COUNT(*) AS n FROM mass_functions "
-            "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s",
+            "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s "
+            "AND retracted_at IS NULL",
             (ids, SEED_METHOD, LOCALITY_TAG),
         )
         print(f"would delete {cur.fetchone()['n']} BBAs "
               f"and {len(assignments)} assignments (dry-run)")
+        if retracted:
+            print(f"would skip {len(retracted)} retracted BBAs (kept for audit; only "
+                  f"epigraph_purge_mass_functions deletes them): {', '.join(retracted)}")
         return 0
 
     # The tag + locality predicate is belt-and-braces: even a corrupted manifest
@@ -476,14 +490,19 @@ def rollback(cur, args, manifest_path: str) -> int:
     # locality 'unknown', evidence BBAs a different combination_method).
     cur.execute(
         "DELETE FROM mass_functions "
-        "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s",
+        "WHERE id = ANY(%s::uuid[]) AND combination_method = %s AND locality_tag = %s "
+        "AND retracted_at IS NULL",
         (ids, SEED_METHOD, LOCALITY_TAG),
     )
     deleted = cur.rowcount
     print(f"deleted {deleted} BBAs")
-    if deleted != len(ids):
+    if retracted:
+        print(f"  skipped {len(retracted)} retracted BBAs (kept for audit; only "
+              f"epigraph_purge_mass_functions deletes them): {', '.join(retracted)}")
+    if deleted != len(ids) - len(retracted):
         print(
-            f"  NOTE: {len(ids) - deleted} manifest rows were already absent — expected if a\n"
+            f"  NOTE: {len(ids) - len(retracted) - deleted} manifest rows were already absent — "
+            "expected if a\n"
             "  previous rollback ran, or if the insert was rolled back before commit."
         )
 

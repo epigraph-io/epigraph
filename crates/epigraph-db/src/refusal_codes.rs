@@ -11,6 +11,11 @@
 //!
 //! `tests/caller_refusal_codes_restatement.rs` pins that this list is exactly
 //! the set of codes 176 introduces.
+//!
+//! The supersede architecture's refusal codes (`SR01`..`SR13`, SPEC section
+//! 7.2) follow 176's pattern but are not 176's, so they live in a second
+//! reviewed list, [`SUPERSEDE_REFUSAL_CODES`], each code added by the
+//! migration that first raises it. [`caller_refusal_code`] consults both.
 
 /// Every refusal code migration 176 introduced.
 #[rustfmt::skip]
@@ -30,12 +35,34 @@ pub const CALLER_REFUSAL_CODES: &[&str] = &[
     "AGK01",
 ];
 
-/// The [`CALLER_REFUSAL_CODES`] entry `message` opens with (`"GRM05: ..."`
-/// gives `Some("GRM05")`), or `None`.
+/// The supersede architecture's caller-reachable refusal codes (SPEC section
+/// 7.2), each reviewed for what its message discloses (row ids go in DETAIL).
+/// The SQLSTATE of each is the class its HTTP answer follows: `42501` -> 403,
+/// `55000` -> 409.
+#[rustfmt::skip]
+pub const SUPERSEDE_REFUSAL_CODES: &[&str] = &[
+    // Migration 194 (H10): delete a retracted BBA outside the purge definer.
+    "SR09",
+];
+
+/// The code `message` opens with, `"CODE: ..."`, when `list` names it.
+fn listed_code(message: &str, list: &'static [&'static str]) -> Option<&'static str> {
+    let (code, _) = message.split_once(": ")?;
+    list.iter().copied().find(|c| *c == code)
+}
+
+/// The [`CALLER_REFUSAL_CODES`] or [`SUPERSEDE_REFUSAL_CODES`] entry `message`
+/// opens with (`"GRM05: ..."` gives `Some("GRM05")`), or `None`.
 #[must_use]
 pub fn caller_refusal_code(message: &str) -> Option<&'static str> {
-    let (code, _) = message.split_once(": ")?;
-    CALLER_REFUSAL_CODES.iter().copied().find(|c| *c == code)
+    listed_code(message, CALLER_REFUSAL_CODES)
+        .or_else(|| listed_code(message, SUPERSEDE_REFUSAL_CODES))
+}
+
+/// The [`SUPERSEDE_REFUSAL_CODES`] entry `message` opens with, or `None`.
+#[must_use]
+pub fn supersede_refusal_code(message: &str) -> Option<&'static str> {
+    listed_code(message, SUPERSEDE_REFUSAL_CODES)
 }
 
 #[cfg(test)]
@@ -58,6 +85,25 @@ mod tests {
             "",
         ] {
             assert_eq!(caller_refusal_code(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_supersede_code_is_recognised_by_both_and_kept_out_of_176s_list() {
+        assert_eq!(caller_refusal_code("SR09: a retracted x"), Some("SR09"));
+        assert_eq!(supersede_refusal_code("SR09: a retracted x"), Some("SR09"));
+        assert!(!CALLER_REFUSAL_CODES.contains(&"SR09"));
+        // A 176 code is a caller code but not a supersede code.
+        assert_eq!(supersede_refusal_code("GRM05: the roster"), None);
+        for other in [
+            "SR99: unlisted",
+            "SR10: not yet raised",
+            "x SR09: y",
+            "SR09 y",
+            "sr09: y",
+        ] {
+            assert_eq!(caller_refusal_code(other), None, "{other:?}");
+            assert_eq!(supersede_refusal_code(other), None, "{other:?}");
         }
     }
 }
