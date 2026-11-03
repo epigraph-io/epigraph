@@ -38,6 +38,15 @@
 //! delta. The sheaf half of K12(b) changes no served value either: the
 //! sheaf readers (`SheafRepository`) select an explicit relationship list
 //! that never included `supersedes`.
+//!
+//! # The calibration delta (`r173`)
+//!
+//! [`r173`] measures, in the same kind of transaction (or one per chunk), what
+//! re-folding each claim's owner frame under the shipped calibration would
+//! change on caches written under the empty calibration vocabulary (ruling
+//! R-173). See that module.
+
+pub mod r173;
 
 use uuid::Uuid;
 
@@ -268,10 +277,12 @@ pub struct DeltaItems {
     pub k10_retro: bool,
     /// K12(b): BBAs keyed on `supersedes` edges (DS), and the sheaf half.
     pub k12b: bool,
+    /// R-173: the calibration delta of the owner-frame caches ([`r173`]).
+    pub r173: bool,
 }
 
 impl DeltaItems {
-    /// Parse a comma-separated list of `r131`, `k10-retro`, `k12b`.
+    /// Parse a comma-separated list of `r131`, `k10-retro`, `k12b`, `r173`.
     ///
     /// # Errors
     /// An unknown item, or an empty list.
@@ -282,26 +293,32 @@ impl DeltaItems {
                 "r131" => items.r131 = true,
                 "k10-retro" => items.k10_retro = true,
                 "k12b" => items.k12b = true,
+                "r173" => items.r173 = true,
                 other => {
                     return Err(format!(
-                        "unknown item `{other}` (expected r131, k10-retro, k12b)"
+                        "unknown item `{other}` (expected r131, k10-retro, k12b, r173)"
                     ))
                 }
             }
         }
         if items == Self::default() {
-            return Err("no item selected (expected r131, k10-retro, k12b)".to_string());
+            return Err("no item selected (expected r131, k10-retro, k12b, r173)".to_string());
         }
         Ok(items)
     }
 }
 
 /// Options for [`run_read_only`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DeltaOptions {
     pub items: DeltaItems,
     /// How many top movers each block lists.
     pub top: usize,
+    /// `SET LOCAL statement_timeout` (milliseconds) in every transaction the
+    /// run opens; `None` keeps the session's.
+    pub statement_timeout_ms: Option<u64>,
+    /// The `r173` item's options.
+    pub r173: r173::R173Options,
 }
 
 /// A claim's cached DS scalars.
@@ -442,6 +459,8 @@ pub struct DeltaReport {
     pub k12b: Option<K12bReport>,
     /// The union of the K10(3) and K12(b) DS removals, when both are selected.
     pub combined: Option<DeltaBlock>,
+    /// The R-173 calibration delta.
+    pub r173: Option<r173::R173Report>,
 }
 
 /// Begin the delta's transaction: `REPEATABLE READ READ ONLY`, through
@@ -461,26 +480,192 @@ pub async fn begin_read_only(
     .await
 }
 
+/// `SET LOCAL statement_timeout` inside the current transaction (allowed in
+/// a READ ONLY one), when `ms` is given.
+async fn set_statement_timeout(
+    conn: &mut sqlx::PgConnection,
+    ms: Option<u64>,
+) -> Result<(), String> {
+    if let Some(ms) = ms {
+        sqlx::query(&format!("SET LOCAL statement_timeout = {ms}"))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("set the statement timeout: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Run the delta in one read-only transaction on `conn`, which must be a
 /// privileged (maintenance) connection with its bypass `viewer`: the
 /// selections read every group's rows. The transaction is rolled back.
 ///
+/// With `r173` and `opts.r173.chunk`, the r173 item instead runs after it in
+/// one read-only transaction for the candidate list and one per chunk of
+/// claims, each rolled back and each snapshot recorded
+/// ([`r173::R173Report::snapshots`]); chunks see different snapshots.
+///
 /// # Errors
-/// Any read's error, or a write attempted inside the transaction (which is
-/// a bug: SQLSTATE 25006).
+/// Any read's error, a write attempted inside the transaction (which is a
+/// bug: SQLSTATE 25006), or, with `r173`, a served calibration that has a
+/// startup problem ([`r173::calibration_guard`]).
 pub async fn run_read_only(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     opts: &DeltaOptions,
 ) -> Result<DeltaReport, String> {
+    let identity = if opts.items.r173 {
+        Some(r173::calibration_identity()?)
+    } else {
+        None
+    };
     let mut tx = begin_read_only(conn)
         .await
         .map_err(|e| format!("begin the read-only transaction: {e}"))?;
-    let report = measure(&mut tx, viewer, opts).await;
+    let report = async {
+        set_statement_timeout(&mut tx, opts.statement_timeout_ms).await?;
+        let mut report = measure(&mut tx, viewer, opts).await?;
+        if let (Some(identity), None) = (&identity, opts.r173.chunk) {
+            report.r173 = Some(r173_in_one(&mut tx, viewer, opts, identity.clone()).await?);
+        }
+        Ok::<_, String>(report)
+    }
+    .await;
     tx.rollback()
         .await
         .map_err(|e| format!("end the read-only transaction: {e}"))?;
-    report
+    let mut report = report?;
+    if let (Some(identity), Some(chunk)) = (identity, opts.r173.chunk) {
+        report.r173 = Some(r173_chunked(conn, viewer, opts, identity, chunk).await?);
+    }
+    Ok(report)
+}
+
+/// The r173 item inside the current (read-only) transaction.
+async fn r173_in_one(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    opts: &DeltaOptions,
+    identity: r173::CalibrationIdentity,
+) -> Result<r173::R173Report, String> {
+    let o = &opts.r173;
+    let ids = r173::candidates(&mut *conn, o.only.as_deref())
+        .await
+        .map_err(|e| format!("r173 candidates: {e}"))?;
+    let snap = r173::snapshot(&mut *conn, None, &ids).await?;
+    let mut run = r173::Run::new();
+    let measured = r173::measure_ids(&mut *conn, viewer, &mut run, &ids).await?;
+    let canary = match o.canary {
+        Some(id) => Some(r173_canary(&mut *conn, viewer, &mut run, &measured, id).await?),
+        None => None,
+    };
+    Ok(r173::report(
+        identity,
+        o,
+        opts.top,
+        vec![snap],
+        ids.len(),
+        measured,
+        canary,
+    ))
+}
+
+/// The r173 item in one read-only transaction per chunk of claims.
+async fn r173_chunked(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    opts: &DeltaOptions,
+    identity: r173::CalibrationIdentity,
+    chunk: usize,
+) -> Result<r173::R173Report, String> {
+    let o = &opts.r173;
+    let timeout = opts.statement_timeout_ms;
+    let mut snapshots = Vec::new();
+
+    let mut tx = begin_read_only(&mut *conn)
+        .await
+        .map_err(|e| format!("begin a read-only transaction: {e}"))?;
+    let listed = async {
+        set_statement_timeout(&mut tx, timeout).await?;
+        let ids = r173::candidates(&mut tx, o.only.as_deref())
+            .await
+            .map_err(|e| format!("r173 candidates: {e}"))?;
+        let snap = r173::snapshot(&mut tx, None, &ids).await?;
+        Ok::<_, String>((ids, snap))
+    }
+    .await;
+    tx.rollback()
+        .await
+        .map_err(|e| format!("end a read-only transaction: {e}"))?;
+    let (ids, snap) = listed?;
+    snapshots.push(snap);
+
+    let mut run = r173::Run::new();
+    let mut measured = Vec::with_capacity(ids.len());
+    for (n, part) in ids.chunks(chunk.max(1)).enumerate() {
+        let mut tx = begin_read_only(&mut *conn)
+            .await
+            .map_err(|e| format!("begin a read-only transaction: {e}"))?;
+        let got = async {
+            set_statement_timeout(&mut tx, timeout).await?;
+            let snap = r173::snapshot(&mut tx, Some(n), part).await?;
+            let got = r173::measure_ids(&mut tx, viewer, &mut run, part).await?;
+            Ok::<_, String>((got, snap))
+        }
+        .await;
+        tx.rollback()
+            .await
+            .map_err(|e| format!("end a read-only transaction: {e}"))?;
+        let (got, snap) = got?;
+        snapshots.push(snap);
+        measured.extend(got);
+    }
+
+    let canary = match o.canary {
+        Some(id) => {
+            let mut tx = begin_read_only(&mut *conn)
+                .await
+                .map_err(|e| format!("begin a read-only transaction: {e}"))?;
+            let got = async {
+                set_statement_timeout(&mut tx, timeout).await?;
+                r173_canary(&mut tx, viewer, &mut run, &measured, id).await
+            }
+            .await;
+            tx.rollback()
+                .await
+                .map_err(|e| format!("end a read-only transaction: {e}"))?;
+            Some(got?)
+        }
+        None => None,
+    };
+    Ok(r173::report(
+        identity,
+        o,
+        opts.top,
+        snapshots,
+        ids.len(),
+        measured,
+        canary,
+    ))
+}
+
+/// The canary's record: the measured one, or measured now when it was not a
+/// candidate.
+async fn r173_canary(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    run: &mut r173::Run,
+    measured: &[r173::R173Claim],
+    id: Uuid,
+) -> Result<r173::Canary, String> {
+    let claim = match measured.iter().find(|c| c.id == id) {
+        Some(c) => Some(c.clone()),
+        None => r173::measure_ids(&mut *conn, viewer, run, &[id])
+            .await?
+            .into_iter()
+            .next()
+            .filter(|c| c.outcome != r173::R173Outcome::SkippedNoInput || c.stored.betp.is_some()),
+    };
+    Ok(r173::canary_of(id, claim))
 }
 
 async fn measure(

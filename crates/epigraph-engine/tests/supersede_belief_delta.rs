@@ -27,6 +27,7 @@ mod fixture;
 use epigraph_db::visibility::{SystemReason, Viewer};
 use epigraph_db::{ClaimRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
 use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
+use epigraph_engine::supersede_delta::r173::R173Options;
 use epigraph_engine::supersede_delta::{
     begin_read_only, run_read_only, ClaimDelta, DeltaItems, DeltaOptions, DeltaOutcome,
 };
@@ -37,8 +38,17 @@ const ALL: DeltaOptions = DeltaOptions {
         r131: true,
         k10_retro: true,
         k12b: true,
+        // The calibration item has its own suite (`r173_calibration_delta.rs`).
+        r173: false,
     },
     top: 50,
+    statement_timeout_ms: None,
+    r173: R173Options {
+        thresholds: Vec::new(),
+        chunk: None,
+        canary: None,
+        only: None,
+    },
 };
 
 struct World {
@@ -730,6 +740,7 @@ fn the_delta_calls_no_write_path() {
     ];
     for rel in [
         "src/supersede_delta.rs",
+        "src/supersede_delta/r173.rs",
         "../epigraph-cli/src/bin/supersede_belief_delta.rs",
     ] {
         let path = root.join(rel);

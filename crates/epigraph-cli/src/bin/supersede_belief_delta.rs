@@ -63,6 +63,8 @@ async fn run(cli: Cli) -> Result<(), String> {
     let opts = DeltaOptions {
         items,
         top: cli.top,
+        statement_timeout_ms: None,
+        r173: epigraph_engine::supersede_delta::r173::R173Options::default(),
     };
     // Refuse an existing file before connecting: a report is never overwritten.
     let mut out = std::fs::OpenOptions::new()
