@@ -718,9 +718,10 @@ pub async fn candidates(
             AND EXISTS (SELECT 1 FROM mass_functions mf
                          WHERE mf.claim_id = c.id
                            AND mf.evidence_type IS NOT NULL
-                           AND mf.retracted_at IS NULL
+                           AND {not_retracted}
                            AND NOT {cached})
           ORDER BY c.id",
+        not_retracted = epigraph_db::repos::mass_function::not_retracted_predicate("mf."),
         cached = epigraph_db::repos::mass_function::cached_combination_predicate("mf.")
     );
     sqlx::query_scalar(&sql)
