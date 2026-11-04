@@ -30,6 +30,8 @@ pub mod rerank;
 pub mod retarget;
 #[cfg(feature = "db")]
 pub mod shadow_report;
+#[cfg(feature = "db")]
+pub mod truth_mirror;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;
