@@ -52,9 +52,12 @@ use std::collections::BTreeMap;
 const REGISTER: &[(&str, &str, usize, &str)] = &[
     // --- epigraph-cli -------------------------------------------------------
     ("crates/epigraph-cli/src/backfill_factors.rs", "const EDGE_QUERY", 1, "existence gate: edges whose target holds NO mass function row; a retracted row still counts as present, so the backfill never re-derives a BBA that was retracted"),
+    ("crates/epigraph-cli/src/backfill_factors.rs", "edge_shape", 1, "targeted rewire's held-bucket probe (R-177 OD-E5): it MUST see retracted rows on the edge (retracted_on_edge), and counts live rows with retracted_at IS NULL; no fold"),
+    ("crates/epigraph-cli/src/backfill_factors.rs", "read_edge_row", 1, "one row by id, bit-exact, for the targeted rewire's pre/post snapshot of the live row it locked; no fold"),
     ("crates/epigraph-cli/src/belief_cache.rs", "downstream_edges", 1, "restore planner: finds edges whose BBA was WRITTEN after a wave cutoff (a write timestamp, not a fold)"),
     ("crates/epigraph-cli/src/bin/backfill_factors.rs", "const EVIDENCE_QUERY", 1, "existence gate: claims holding NO mass function row; a retracted row still counts as present, so the backfill never re-derives a BBA that was retracted"),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 4, "legacy DEKG migration tool: mass-sum validation, missing-row gate and CONTRIBUTES_TO edge derivation over every stored row; no belief fold"),
+    ("crates/epigraph-cli/src/edge_rewire.rs", "restore_edge_rows", 1, "edge-row CAS restore's outcome probe: reports a row retracted since the rewire (retracted_since_rewire) instead of writing it; the UPDATE itself matches only retracted_at IS NULL; no fold"),
     ("crates/epigraph-cli/src/operator/delete_frames.rs", "plan", 1, "the frame delete's purge list: selects exactly the RETRACTED rows on the frames (retracted_at IS NOT NULL), which migration 194 lets only the purge definer delete; no fold"),
     ("crates/epigraph-cli/src/operator/hide.rs", "print_surfaces", 1, "operator hide report: counts every stored row naming a hidden evidence row, retracted or not (the rows the hide leaves in place)"),
     ("crates/epigraph-cli/src/recompute_betp.rs", "select_wave_cohort", 1, "recompute cohort enumerator: a claim whose every BBA is retracted still enters, so the single atom-cache writer sees its (empty) fold"),

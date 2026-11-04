@@ -9,6 +9,8 @@ pub mod bootstrap;
 pub mod bridge;
 pub mod decompose;
 #[cfg(feature = "db")]
+pub mod edge_rewire;
+#[cfg(feature = "db")]
 pub mod embed_backfill;
 pub mod enrichment;
 #[cfg(feature = "db")]
