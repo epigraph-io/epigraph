@@ -354,10 +354,24 @@ sections (the legacy-author tie, the backfill, the re-own) find nothing to do.
 
 ## 3. Configuration reference
 
-Variables are read once at startup unless a row says otherwise. Boolean flags
-of the `1`/`true`/`yes` kind are case-insensitive; `EPIGRAPH_MIGRATE_ON_BOOT`
-and `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` also ignore surrounding whitespace.
-Anything else is off.
+Variables are read once at startup unless a row says otherwise. On/off
+switches do not share one parser:
+
+- `EPIGRAPH_MIGRATE_ON_BOOT` and `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD`: `1`,
+  `true` or `yes`, case-insensitive, surrounding whitespace ignored.
+- `EPIGRAPH_ALLOW_INSECURE_SECRET` and `EPIGRAPH_REQUIRE_SIGNATURES`: `1`,
+  `true` or `yes`, case-insensitive, whitespace **not** ignored.
+- `EPIGRAPH_ALLOW_ALL_IDENTITIES`: exactly `true`.
+- `EPIGRAPH_RUN_TOKENS`, `EPIGRAPH_BP_APPLY` and
+  `EPIGRAPH_MCP_CONNECTOR_ELEVATION`: `on`, case-insensitive, whitespace
+  ignored.
+- `EPIGRAPH_MCP_LOG_PAYLOADS`: `1` or `true` (case-insensitive), whitespace
+  ignored.
+- `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION`: `1`/`true`/`yes` or
+  `0`/`false`/`no`, case-insensitive, whitespace ignored. When passkeys are
+  configured, any other value stops the server at boot.
+
+For the others, anything else is off.
 
 ### `server` (the HTTP API)
 
@@ -3689,7 +3703,7 @@ reached `main` through a merge, the PR is given as "landed via #N".
     - the five operator verbs that need a superuser DSN, including
       `hide-evidence --apply`;
     - that `epigraph-migrate`'s fallback WARN shows only when `RUST_LOG`
-      enables `warn`, which boolean flags trim whitespace, and the readers of
+      enables `warn`, the values each on/off switch accepts, and the readers of
       `EPIGRAPH_API`, `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`.
   - **Corrected:**
     - the anonymous surface is 25 paths, not 13;
