@@ -38,7 +38,7 @@ use epigraph_cli::belief_cache::{
 };
 use epigraph_cli::truth_mirror::{
     apply, cas_refresh, dry_run, plan_candidates, read_truth_records, restore, write_truth_record,
-    Bucket, MirrorReport, RefreshOptions, TruthRecord,
+    Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
 };
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::{ClaimRepository, Viewer};
@@ -1002,4 +1002,94 @@ async fn the_binary_dry_runs_applies_and_restores_through_files(pool: PgPool) {
         "the two restores' default reports: {reports:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── (13) a record that cannot be written stops the run, its batch rolled back ─
+
+/// `apply` with an `on_record` that fails on its `fail_on`-th call (1-based)
+/// and keeps every record it accepted before that.
+async fn apply_failing_on(
+    pool: &PgPool,
+    viewer: &Viewer,
+    candidates: &[Candidate],
+    batch_size: usize,
+    fail_on: usize,
+) -> (anyhow::Result<MirrorReport>, Vec<TruthRecord>) {
+    let mut delivered = Vec::new();
+    let mut calls = 0;
+    let result = apply(
+        pool,
+        viewer,
+        candidates,
+        &RefreshOptions {
+            batch_size,
+            include_round: false,
+        },
+        |r| {
+            calls += 1;
+            if calls == fail_on {
+                anyhow::bail!("disk full (test record writer)");
+            }
+            delivered.push(r.clone());
+            Ok(())
+        },
+    )
+    .await;
+    (result, delivered)
+}
+
+/// The restore guarantee: no committed write lacks a record. A record writer
+/// that fails rolls its whole batch back and stops the run; batches that
+/// committed before it keep their writes, and their records were delivered.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_rolls_back_a_batch_whose_record_fails(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let b = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[a, b], "L1").await;
+    // The run's order is the planner's.
+    let cands = plan_candidates(&records);
+    let (first, second) = (cands[0].claim_id, cands[1].claim_id);
+    let t1 = truth_of(&pool, first).await;
+    let v1 = row_version(&pool, first).await;
+    let t2 = truth_of(&pool, second).await;
+    let v2 = row_version(&pool, second).await;
+
+    // (i) The first record fails: nothing is written.
+    let (result, delivered) = apply_failing_on(&pool, &viewer, &cands, 1, 1).await;
+    let err = result.expect_err("a failed record writer must stop the run");
+    assert!(
+        format!("{err:#}").contains("disk full"),
+        "the run stopped for another reason: {err:#}"
+    );
+    assert!(delivered.is_empty());
+    assert_untouched(&pool, first, t1, v1, "1st record failed: 1st claim").await;
+    assert_untouched(&pool, second, t2, v2, "1st record failed: 2nd claim").await;
+
+    // (ii) One batch of two, the second record fails: the first record WAS
+    // delivered, and its write still rolls back with the batch.
+    let (result, delivered) = apply_failing_on(&pool, &viewer, &cands, 2, 2).await;
+    assert!(result.is_err(), "a failed record writer must stop the run");
+    assert_eq!(
+        delivered.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![first]
+    );
+    assert_untouched(&pool, first, t1, v1, "batch of two rolled back: 1st claim").await;
+    assert_untouched(&pool, second, t2, v2, "batch of two rolled back: 2nd claim").await;
+
+    // (iii) Batches of one, the second record fails: the first batch
+    // committed with its record delivered; the second rolled back.
+    let (result, delivered) = apply_failing_on(&pool, &viewer, &cands, 1, 2).await;
+    assert!(result.is_err(), "a failed record writer must stop the run");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].claim_id, first);
+    let new_first = cache_of(&pool, first).await.pignistic_prob.unwrap();
+    assert_eq!(
+        truth_of(&pool, first).await.to_bits(),
+        new_first.to_bits(),
+        "the committed first batch was not refreshed"
+    );
+    assert_eq!(delivered[0].truth_written.to_bits(), new_first.to_bits());
+    assert_untouched(&pool, second, t2, v2, "second batch rolled back").await;
 }
