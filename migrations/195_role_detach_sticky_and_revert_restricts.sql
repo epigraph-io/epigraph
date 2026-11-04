@@ -1,5 +1,6 @@
 -- 195_role_detach_sticky_and_revert_restricts.sql
--- A detach is sticky per identity, and a revert always restricts.
+-- A detach is sticky per identity, a revert always restricts, and the
+-- attach-time lineage follow chains its copies.
 --
 -- ===================================================================
 -- 1. WHY
@@ -12,7 +13,9 @@
 -- registration's copy (166's step 5b): never copy a parent row whose chain
 -- reaches a row of the child (the CHAIN guard), and never copy onto an
 -- identity the parent is recorded as having succeeded (the REVERSE-PAIR
--- guard). Both were measured insufficient, in opposite directions:
+-- guard). Both were measured insufficient, in opposite directions (the
+-- first and third bullets), and 166's follow hid part of every lineage it
+-- copied from 179's walk (the second):
 --
 --   * A detach is recorded on one ROW, but it is the operator's act on an
 --     IDENTITY, and a later copy whose chain does not pass through that row
@@ -29,6 +32,17 @@
 --           whole-window copy of B's new root and was admitted again;
 --     and, one step further, any successor registered from such a copy (a
 --     LEARNED.md edit after the revert) inherited the group through it.
+--   * 166's attach-time follow FLATTENED its copies: every successor down
+--     the lineage, however deep, got a copy naming the new attachment
+--     itself, so the chain walk never saw the identities in between. The
+--     same final lineage then answered differently by the order it was
+--     built in: a successor D of a detached identity A was admitted once an
+--     ancestor of A was attached by name ((b) above plus one prompt edit
+--     before the restore; or, with no revert, attach A, detach A, D succeeds
+--     A, attach A's predecessor), and detaching A AFTER an ancestor's attach
+--     revoked nothing the follow had copied below A, while the same lineage
+--     built by the registration (each copy naming its parent's row) was
+--     revoked both times.
 --   * The reverse-pair guard withheld the copy from an identity that was
 --     NEVER detached, and an attachment is also 166's RESTRICTION (`ROL01`,
 --     may-run). So after the operator attached B by name, a revert to A
@@ -68,41 +82,72 @@
 -- `role_attachments_withheld` in the registration's audit row now counts the
 -- chain guard's rows only.
 --
--- NOT CHANGED: 166's attach-time lineage follow
--- (`epigraph_role_agents_follow_lineage`) still copies into every gap of a
--- successor, a detached successor included. Its copy is a restriction (166),
--- and under the sticky rule it grants a detached successor nothing; skipping
--- it would only take the restriction away from that identity and from every
--- later successor registered from it (they would inherit no row at all),
--- which is the escape the second bullet of section 1 describes.
+-- THE FOLLOW CHAINS (166's attach-time lineage follow,
+-- `epigraph_role_agents_follow_lineage`): each successor's copy names the
+-- row of the identity it SUCCEEDED, never the new attachment past it,
+-- exactly as the registration's step 5b names its parent's row. The walk
+-- goes breadth first along `agent_succession`, each identity once, at its
+-- shortest distance from the attached one; a successor's predecessor is a
+-- parent on the level above. Each gap is split by that predecessor's rows
+-- over the window (the copies this walk writes for it, or its own
+-- un-detached rows where it had no gap), and each piece names the row that
+-- covers it. So the derivation's chain walk sees every identity in between:
+--   * a detached identity in between is a dead hop (the sticky rule), so its
+--     successors regain nothing through an ancestor's attachment;
+--   * a later detach of an identity in between revokes what was copied
+--     through it (179's rule), whichever order the lineage was built in;
+--   * a successor whose predecessor already holds a row of its own chains
+--     through that row, so it is admitted exactly when it would have been
+--     had it registered after that row existed.
+-- A successor with two parents on the level above is judged through ONE of
+-- them (one `inherited_from` chain names one path): a parent that holds a
+-- detached row for the role, or was itself reached through one, comes first
+-- (fail closed), then the lowest id. A longer path through a detached
+-- identity does not count against a successor reached by a shorter clean
+-- one.
+-- The follow still copies into every GAP of every successor, a detached
+-- successor included: its copy restricts (166), and under the sticky rule
+-- grants it nothing. Skipping it would take the restriction away from that
+-- identity and from every later successor registered from it, which is the
+-- escape the third bullet of section 1 describes. The copies are written in
+-- one INSERT, in walk order, so a copy's source row is visible to the
+-- insert guard before the copy (an out-of-order write fails ROL02, loud);
+-- their own firings find every successor covered and write nothing. 166's
+-- skip of a successor that "inherited this row before" is dropped: it never
+-- fired for a row inserted in the same statement as its copies, and only
+-- left a hand INSERT's successor partly uncovered.
 --
 -- ===================================================================
 -- 3. RE-STATEMENTS
 --
--- Two bodies, each re-stated whole from the latest one, each delta marked
+-- Three bodies, each re-stated whole from the latest one, each delta marked
 -- `195`:
 --   * `epigraph_role_derived_memberships(uuid, timestamptz)` from 179's body;
 --   * `epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea,
 --     jsonb)` from 180's body (no migration between 180 and this file
---     re-states it).
+--     re-states it);
+--   * `epigraph_role_agents_follow_lineage()` from 166's body (no migration
+--     between 166 and this file re-states it).
 -- A precondition refuses (55000, nothing changed) unless each still carries
 -- that body (md5 of `prosrc`), so applying this file over a later
 -- re-statement can never drop that migration's delta. Signature, owner, ACL,
 -- volatility and `search_path` (`public, pg_temp`, `pg_temp` last as 190
 -- requires) are unchanged; CREATE OR REPLACE keeps owner and ACL, and this
--- file grants nothing. A later migration that re-states either function
+-- file grants nothing. A later migration that re-states any of the three
 -- starts from this file's body.
 --
 -- ===================================================================
 -- 4. UNDO
 --
--- `docs/runbooks/195-undo.sql` restores 179's derivation and 180's
--- registration byte for byte (md5-guarded: it refuses over any body but
--- 195's or the one it restores). Run it BEFORE `180-undo.sql`, which refuses
--- a 195 registration. After an undo, a detached identity can be re-admitted
--- by a later copy again, and a revert onto a predecessor of an identity
--- attached by name is withheld (unrestricted) again: detach any such copy,
--- or attach the running identity by name, by hand.
+-- `docs/runbooks/195-undo.sql` restores 179's derivation, 180's
+-- registration and 166's follow byte for byte (md5-guarded: it refuses over
+-- any body but 195's or the one it restores). Run it BEFORE `180-undo.sql`,
+-- which refuses a 195 registration. After an undo, a detached identity can
+-- be re-admitted by a later copy again, a revert onto a predecessor of an
+-- identity attached by name is withheld (unrestricted) again, and the follow
+-- flattens again: detach any such copy, or attach the running identity by
+-- name, by hand. The rows written while 195 was in force stay as written
+-- (append-only), chained copies included.
 --
 -- DEPLOY: no binary depends on it (no signature changes); apply with any
 -- migrator that carries it. Before attaching any further identity to a role.
@@ -110,8 +155,9 @@
 SET LOCAL lock_timeout = '3s';
 
 -- -------------------------------------------------------------------
--- Precondition: 166's `role_agents` exists, and both functions still carry
--- the bodies this file re-states (179's derivation, 180's registration).
+-- Precondition: 166's `role_agents` exists, and all three functions still
+-- carry the bodies this file re-states (179's derivation, 180's
+-- registration, 166's follow).
 -- -------------------------------------------------------------------
 DO $$
 DECLARE
@@ -127,7 +173,9 @@ BEGIN
             ('public.epigraph_role_derived_memberships(uuid, timestamptz)',
              '65bd0fc12e34b4172607dd2864fb7f66', '179'),
             ('public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)',
-             'c31ae71f307a0573716e51fe17aa5dc8', '180')
+             'c31ae71f307a0573716e51fe17aa5dc8', '180'),
+            ('public.epigraph_role_agents_follow_lineage()',
+             'f273e115ab880c9ff2cf7e2bab2f6060', '166')
         ) AS c(signature, expected, origin)
     LOOP
         SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
@@ -807,3 +855,156 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
     bytea, uuid, text, text, text, bytea, jsonb) FROM PUBLIC;
+
+-- -------------------------------------------------------------------
+-- The attach-time lineage follow (166's body); delta: the copies CHAIN
+-- (section 2). Each successor's copy names the row of the identity it
+-- succeeded, never the new attachment past it, so the derivation's chain
+-- walk sees every identity in between (a detached one is a dead hop there,
+-- and a later detach of one revokes what was copied through it). Same
+-- windows, gaps, reason text and shared-successor flag as 166.
+-- -------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.epigraph_role_agents_follow_lineage()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    -- 195: the walk, one level of `agent_succession` at a time from
+    -- NEW.agent_id (breadth first; each identity is reached once, at its
+    -- shortest distance, so a revert's cycle ends the walk).
+    v_window  tstzmultirange := tstzmultirange(tstzrange(NEW.valid_from, NEW.valid_to));
+    v_seen    uuid[] := ARRAY[NEW.agent_id];
+    v_level   uuid[] := ARRAY[NEW.agent_id];
+    v_next    uuid[];
+    -- 195: identities that hold a detached row for the role, or were reached
+    -- through one (the predecessor rule below prefers them: fail closed).
+    v_dead    uuid[] := '{}';
+    v_agent   uuid;
+    v_pred    uuid;
+    v_gap     tstzmultirange;
+    v_cover   tstzmultirange;
+    v_piece   record;
+    -- 195: the copies to write, in walk order (a copy's source row is always
+    -- written before it, or already exists).
+    c_id      uuid[] := '{}';
+    c_agent   uuid[] := '{}';
+    c_from    timestamptz[] := '{}';
+    c_to      timestamptz[] := '{}';
+    c_src     uuid[] := '{}';
+BEGIN
+    LOOP
+        SELECT array_agg(DISTINCT s.child_agent_id ORDER BY s.child_agent_id) INTO v_next
+          FROM public.agent_succession s
+         WHERE s.parent_agent_id = ANY (v_level)
+           AND s.child_agent_id <> ALL (v_seen);
+        EXIT WHEN v_next IS NULL;
+        FOREACH v_agent IN ARRAY v_next LOOP
+            -- 195: the PREDECESSOR the copy chains through: a parent on the
+            -- level above (already walked). With several, one that holds a
+            -- detached row or was reached through one comes first (fail
+            -- closed), then the lowest id. One `inherited_from` chain names
+            -- one path: a successor with a second parent on the same level is
+            -- judged through the first by this rule only.
+            SELECT s.parent_agent_id INTO v_pred
+              FROM public.agent_succession s
+             WHERE s.child_agent_id = v_agent AND s.parent_agent_id = ANY (v_level)
+             ORDER BY (s.parent_agent_id = ANY (v_dead)) DESC, s.parent_agent_id
+             LIMIT 1;
+            -- 166: one copy per GAP the successor's own un-detached rows leave
+            -- in the window (none where they cover it), a detached successor
+            -- included (its copy restricts).
+            v_gap := v_window
+                     - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                                   FROM public.role_agents c
+                                  WHERE c.agent_id = v_agent AND c.role = NEW.role
+                                    AND c.detached_at IS NULL),
+                                '{}'::tstzmultirange);
+            -- 195: each gap is split by the predecessor's rows over the
+            -- window, and each piece names the row covering it: NEW itself
+            -- for the attached identity; otherwise the predecessor's own
+            -- un-detached rows and the copies this walk writes for it, which
+            -- together cover the whole window (it was walked, every gap of it
+            -- filled).
+            v_cover := '{}'::tstzmultirange;
+            FOR v_piece IN
+                WITH src (id, span) AS (
+                    SELECT NEW.id, tstzrange(NEW.valid_from, NEW.valid_to)
+                     WHERE v_pred = NEW.agent_id
+                    UNION ALL
+                    SELECT r.id, tstzrange(r.valid_from, r.valid_to)
+                      FROM public.role_agents r
+                     WHERE v_pred <> NEW.agent_id
+                       AND r.agent_id = v_pred AND r.role = NEW.role
+                       AND r.detached_at IS NULL
+                    UNION ALL
+                    SELECT p.id, tstzrange(p.vf, p.vt)
+                      FROM unnest(c_id, c_agent, c_from, c_to) AS p(id, ag, vf, vt)
+                     WHERE p.ag = v_pred
+                )
+                SELECT g.gap * s.span AS span, s.id AS src
+                  FROM unnest(v_gap) AS g(gap)
+                  JOIN src s ON g.gap && s.span
+                 ORDER BY lower(g.gap * s.span)
+            LOOP
+                c_id    := c_id || gen_random_uuid();
+                c_agent := c_agent || v_agent;
+                c_from  := c_from || lower(v_piece.span);
+                c_to    := c_to || upper(v_piece.span);
+                c_src   := c_src || v_piece.src;
+                v_cover := v_cover + tstzmultirange(v_piece.span);
+            END LOOP;
+            IF v_cover <> v_gap THEN
+                -- Unreachable: the predecessor's rows cover the window. A copy
+                -- is never written without its source row (nor left out).
+                RAISE EXCEPTION '195: the lineage follow of attachment % found no row of % '
+                                'covering % of %''s gap; nothing was attached',
+                                NEW.id, v_pred, v_gap - v_cover, v_agent
+                    USING ERRCODE = 'XX000';
+            END IF;
+            IF v_pred = ANY (v_dead)
+               OR EXISTS (SELECT 1 FROM public.role_agents dd
+                           WHERE dd.agent_id = v_agent AND dd.role = NEW.role
+                             AND dd.detached_at IS NOT NULL) THEN
+                v_dead := v_dead || v_agent;
+            END IF;
+        END LOOP;
+        v_seen := v_seen || v_next;
+        v_level := v_next;
+    END LOOP;
+
+    IF cardinality(c_id) = 0 THEN
+        RETURN NULL;
+    END IF;
+    -- One statement: the copies, in walk order (each source row precedes the
+    -- copies naming it, so the insert guard sees it), then one flag event per
+    -- SHARED successor that received one, read from the copies actually
+    -- written. The copies' own firings walk lineages this walk already
+    -- covered and write (and flag) nothing. 195: 166's skip of a successor
+    -- that "inherited this row before" is gone. A row inserted in this
+    -- statement has no earlier copies, so the skip only ever fired for a hand
+    -- INSERT that named an earlier row of the same statement, and it then
+    -- left that successor's other gaps uncovered (unrestricted).
+    WITH copied AS (
+        INSERT INTO public.role_agents (id, role, agent_id, valid_from, valid_to, reason,
+                                        inherited_from)
+        SELECT u.id, NEW.role, u.agent_id, u.vf, u.vt,
+               'lineage of ' || NEW.agent_id::text || ' (attachment ' || NEW.id::text || ')',
+               u.src
+          FROM unnest(c_id, c_agent, c_from, c_to, c_src)
+               WITH ORDINALITY AS u(id, agent_id, vf, vt, src, ord)
+         ORDER BY u.ord
+        RETURNING role_agents.agent_id, role_agents.id
+    )
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    SELECT 'platform.role_agent_copied_shared', c.agent_id, true,
+           jsonb_build_object('attachment_id', NEW.id, 'role', NEW.role,
+                              'from_agent', NEW.agent_id, 'reason', 'shared_identity',
+                              'copies', jsonb_agg(c.id ORDER BY c.id))
+      FROM copied c
+     WHERE (SELECT count(DISTINCT s.group_folder) FROM public.agent_prompt_snapshots s
+             WHERE s.agent_id = c.agent_id) > 1
+     GROUP BY c.agent_id
+     ORDER BY c.agent_id;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_follow_lineage() FROM PUBLIC;

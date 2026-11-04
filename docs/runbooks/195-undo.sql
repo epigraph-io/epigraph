@@ -9,6 +9,10 @@
 --     detached row (a multi-hop revert after a restore, or 166's attach-time
 --     follow onto a reverted identity), and admits any successor registered
 --     from such a copy;
+--   * 166's attach-time follow flattens again: a successor's copy names the
+--     new attachment past every identity in between, so a detached identity
+--     in between is no dead hop for it, and a later detach of an identity in
+--     between revokes nothing the follow copied below it;
 --   * a revert onto the recorded predecessor of an identity is withheld again
 --     (180's reverse-pair guard), so the reverted identity is not held by
 --     166's restriction (`ROL01`, may-run) while its parent is.
@@ -17,16 +21,18 @@
 -- each reverted job by name if the restriction must hold.
 --
 -- WHAT IT DOES
---   * Restores migration 179's body of `epigraph_role_derived_memberships`
---     and migration 180's body of `epigraph_register_agent_identity`, byte for
---     byte (CREATE OR REPLACE keeps owner and ACL).
+--   * Restores migration 179's body of `epigraph_role_derived_memberships`,
+--     migration 180's body of `epigraph_register_agent_identity` and
+--     migration 166's body of `epigraph_role_agents_follow_lineage`, byte for
+--     byte (CREATE OR REPLACE keeps owner, ACL and `search_path`).
 --
 -- ORDER: newest first. Run this BEFORE `180-undo.sql` (which refuses a 195
 -- registration body) and before any undo of 179.
 --
 -- WHAT IT LEAVES: 195's `_sqlx_migrations` row, and every `role_agents` row
 -- written while 195 was in force (the table is append-only; the copies 195's
--- registration wrote are ordinary copies and stay attached).
+-- registration and follow wrote are ordinary copies and stay attached, each
+-- still naming the row it was chained to).
 -- Re-introducing the rules is a NEW migration, never a re-run of 195.
 -- Idempotent.
 -- ===================================================================
@@ -49,7 +55,10 @@ BEGIN
              '65bd0fc12e34b4172607dd2864fb7f66'),   -- 179's
             ('public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)',
              'a792b630dd34b1ab8c36218b5cb698d1',    -- 195's
-             'c31ae71f307a0573716e51fe17aa5dc8')    -- 180's
+             'c31ae71f307a0573716e51fe17aa5dc8'),   -- 180's
+            ('public.epigraph_role_agents_follow_lineage()',
+             'f60c55756be189b751565de942d63a0a',    -- 195's
+             'f273e115ab880c9ff2cf7e2bab2f6060')    -- 166's
         ) AS c(signature, body_195, body_before)
     LOOP
         SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
@@ -688,5 +697,58 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_register_agent_identity(
     bytea, uuid, text, text, text, bytea, jsonb) FROM PUBLIC;
+
+-- Migration 166's attach-time lineage follow, verbatim (it flattens: every
+-- successor's copy names the new attachment).
+CREATE OR REPLACE FUNCTION public.epigraph_role_agents_follow_lineage()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    -- One statement: the copies, then one flag event per SHARED successor
+    -- that received one, read from the copies actually written (so a copy's
+    -- own firing, which writes nothing, flags nothing: one event per
+    -- successor however deep it sits).
+    WITH RECURSIVE lineage(agent_id) AS (
+        SELECT s.child_agent_id FROM public.agent_succession s
+         WHERE s.parent_agent_id = NEW.agent_id
+        UNION
+        SELECT s.child_agent_id FROM public.agent_succession s
+          JOIN lineage l ON s.parent_agent_id = l.agent_id
+    ),
+    copied AS (
+        INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,
+                                        inherited_from)
+        SELECT NEW.role, l.agent_id, lower(g.gap), upper(g.gap),
+               'lineage of ' || NEW.agent_id::text || ' (attachment ' || NEW.id::text || ')',
+               NEW.id
+          FROM lineage l
+         CROSS JOIN LATERAL unnest(
+                   tstzmultirange(tstzrange(NEW.valid_from, NEW.valid_to))
+                   - COALESCE((SELECT range_agg(tstzrange(c.valid_from, c.valid_to))
+                                 FROM public.role_agents c
+                                WHERE c.agent_id = l.agent_id AND c.role = NEW.role
+                                  AND c.detached_at IS NULL),
+                              '{}'::tstzmultirange)) AS g(gap)
+         WHERE l.agent_id <> NEW.agent_id
+           AND NOT EXISTS (
+                   SELECT 1 FROM public.role_agents c
+                    WHERE c.agent_id = l.agent_id AND c.inherited_from = NEW.id)
+         ORDER BY l.agent_id, lower(g.gap)
+        RETURNING role_agents.agent_id, role_agents.id
+    )
+    INSERT INTO public.security_events (event_type, agent_id, success, details)
+    SELECT 'platform.role_agent_copied_shared', c.agent_id, true,
+           jsonb_build_object('attachment_id', NEW.id, 'role', NEW.role,
+                              'from_agent', NEW.agent_id, 'reason', 'shared_identity',
+                              'copies', jsonb_agg(c.id ORDER BY c.id))
+      FROM copied c
+     WHERE (SELECT count(DISTINCT s.group_folder) FROM public.agent_prompt_snapshots s
+             WHERE s.agent_id = c.agent_id) > 1
+     GROUP BY c.agent_id
+     ORDER BY c.agent_id;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_role_agents_follow_lineage() FROM PUBLIC;
 
 COMMIT;

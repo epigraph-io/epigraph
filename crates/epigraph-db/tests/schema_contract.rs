@@ -3945,6 +3945,52 @@ async fn migration_195_registration_restricts_a_revert_at_head(pool: PgPool) {
     }
 }
 
+/// Migration 195: the attach-time lineage follow CHAINS its copies AT HEAD.
+/// Each successor's copy names the row of the identity it succeeded (the
+/// predecessor's copy from the same walk, or its own covering row), never the
+/// new attachment past it: 166's flattened copy hid every identity in between
+/// from the derivation's chain walk, so a detached one there was no dead hop
+/// and a later detach of one revoked nothing below it. A later re-statement
+/// of the follow must keep the chained source and the restriction copy for
+/// every gap.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_195_follow_chains_its_copies_at_head(pool: PgPool) {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p \
+          WHERE p.oid = to_regprocedure('public.epigraph_role_agents_follow_lineage()')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let body = body.expect("the lineage follow must exist");
+    for fragment in [
+        // The predecessor on the level above, a dead one first.
+        "WHERE s.child_agent_id = v_agent AND s.parent_agent_id = ANY (v_level)",
+        "ORDER BY (s.parent_agent_id = ANY (v_dead)) DESC, s.parent_agent_id",
+        // Each piece of a gap names the predecessor's row covering it.
+        "SELECT g.gap * s.span AS span, s.id AS src",
+        "c_src   := c_src || v_piece.src;",
+        // 166's restriction copy into every gap, a detached successor's included.
+        "AND c.detached_at IS NULL),",
+        // One INSERT, in walk order.
+        "WITH ORDINALITY AS u(id, agent_id, vf, vt, src, ord)",
+        "ORDER BY u.ord",
+        "'platform.role_agent_copied_shared'",
+    ] {
+        assert!(
+            body.contains(fragment),
+            "epigraph_role_agents_follow_lineage at head lost {fragment:?} (re-state it from \
+             the head body, keeping every delta)"
+        );
+    }
+    assert!(
+        !body.contains("WITH RECURSIVE lineage(agent_id)"),
+        "epigraph_role_agents_follow_lineage at head flattens again (166's body): every \
+         successor's copy would name the new attachment past the identities in between \
+         (migration 195)"
+    );
+}
+
 /// Migration 191 (backlog 4dec90c2, the audited retire of a live operator
 /// link): the verb is a SECURITY DEFINER owned by `epigraph_maintenance` on
 /// 172's `pg_catalog, pg_temp` path with an explicit ACL that neither PUBLIC
