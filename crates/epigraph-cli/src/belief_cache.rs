@@ -53,7 +53,7 @@ use uuid::Uuid;
 /// correctly rounded. A non-finite value has no JSON number and serde_json
 /// would write it as `null`, which a restore would then write back as NULL, so
 /// it is refused instead.
-mod exact_f64 {
+pub(crate) mod exact_f64 {
     use serde::de::Error as _;
     use serde::ser::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};

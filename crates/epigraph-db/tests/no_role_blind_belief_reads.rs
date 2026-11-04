@@ -216,6 +216,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     // --- epigraph-engine ----------------------------------------------------
     ("crates/epigraph-engine/src/belief_query.rs", "get_belief", Tag::Todo { pr: "PR-R1a", why: "the get_belief choke point serves the cache columns; SPEC §7.2 dispatches on role" }),
     ("crates/epigraph-engine/src/edge_factor.rs", "auto_wire_ds_for_edge", Tag::Todo { pr: "PR-F2", why: "builds an edge BBA from the source's cached Bel/Pl, compound sources included; SPEC §4.1 W8" }),
+    ("crates/epigraph-engine/src/supersede_delta.rs", "delta_block", Tag::Todo { pr: "unassigned", why: "the supersede dry-run delta (supersede SPEC §11 K0) reads the raw cache that the supersede cascade's repair recomputes, compounds included, to report old beside new; role-aware when that repair is" }),
     // --- epigraph-jobs ------------------------------------------------------
     ("crates/epigraph-jobs/src/cluster_graph/neighborhood.rs", "run_one_theme", Tag::Todo { pr: "unassigned", why: "theme neighbourhood BetP; SPEC §7.2 calls it atoms-only, but the predicate is not the IS_COMPOUND_SQL spelling" }),
     ("crates/epigraph-jobs/src/cluster_graph/runner.rs", "run_clustering", Tag::Todo { pr: "PR-M2", why: "cluster mean_betp over claims, compounds included; SPEC §7.2" }),

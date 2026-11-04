@@ -27,6 +27,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // --- epigraph-cli -------------------------------------------------------
     ("crates/epigraph-cli/src/backfill_factors.rs", "delete_edge_rows", 1, "SPEC §10.1 H3: rewire deletes an edge's BBAs; PR-F2 maps compound outcomes to keep, never to delete"),
     ("crates/epigraph-cli/src/backfill_factors.rs", "rewire_one", 1, "SPEC §4.1 W8: rewire restamps an edge BBA's tenancy columns; masses untouched"),
+    ("crates/epigraph-cli/src/edge_rewire.rs", "restore_edge_rows", 1, "R-176(2) class E rollback: compare-and-swap of a targeted rewire's rows back to their recorded pre-image (masses, typing, created_at), only where the row is live and still holds what the rewire wrote; the rewire wrote no compound-ended edge, so neither does this"),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 1, "SPEC §4.1 W13: raw INSERT of bootstrap BBAs; PR-W4"),
     ("crates/epigraph-cli/src/bin/experiment.rs", "analyze", 1, "SPEC §4.1 W13: CLI experiment outcome BBA; PR-W4"),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", 1, "SPEC §4.1 W13: CLI hypothesis prior BBA; PR-W4"),
