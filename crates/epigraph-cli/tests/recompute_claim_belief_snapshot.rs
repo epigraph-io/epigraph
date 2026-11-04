@@ -219,6 +219,16 @@ async fn seeded(pool: &PgPool, n: usize) -> (Vec<Uuid>, Vec<CacheColumns>) {
     (ids, sentinels)
 }
 
+/// The wave file's raw bytes split into lines, each with its `\n`; a cut
+/// line (no `\n`) is the last element.
+fn raw_lines(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read the wave file");
+    bytes
+        .split_inclusive(|b| *b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
 // ── tests ──────────────────────────────────────────────────────────────────
 
 /// The round trip the R-176 apply's rollback rests on: each claim the run
@@ -465,6 +475,136 @@ async fn a_record_that_cannot_be_written_leaves_the_claim_unwritten_and_stops_th
         r.stderr.contains("wave file"),
         "failed for the wrong reason: {}",
         r.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The volume fills up PART-WAY through a record (a short write, then
+/// `EFBIG`): the cut line is taken back off the wave file, so the file still
+/// parses and `restore_belief_cache --from` (the restore the STOP message
+/// points at) undoes the one write that committed. A cut line left in place
+/// would make the restore refuse the whole file.
+///
+/// The fill is a file-size limit (`ulimit -f`, 512-byte blocks, `SIGXFSZ`
+/// ignored so the write fails instead of killing the run) placed inside the
+/// second record. Where it falls is measured, not guessed: a first run of
+/// identically shaped claims gives the record length, and the `--wave` name
+/// pads each record so the limit lands a third of the way into record 2.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_record_cut_short_by_a_full_volume_leaves_a_wave_file_the_restore_reads(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    const WAVE: &str = "cal2-straddle";
+
+    // Calibration: the same values on other claims, into a throwaway file.
+    let (cal_ids, _) = seeded(&pool, 3).await;
+    let cal_wave = dir.join("calibration.jsonl");
+    let cal_list = write_ids(&dir, &cal_ids);
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &[
+            "--input",
+            s(&cal_list),
+            "--snapshot",
+            s(&cal_wave),
+            "--wave",
+            WAVE,
+            "--concurrency",
+            "1",
+        ],
+    )
+    .ok("calibration run");
+    let cal = raw_lines(&cal_wave);
+    assert_eq!(cal.len(), 3, "calibration: one record per claim");
+    let first = cal[0].len();
+    let longest = cal.iter().map(Vec::len).max().expect("a record");
+    // The smallest block count whose two-thirds point lies past every
+    // record; pad record 1 to end exactly there.
+    let blocks = (1..)
+        .find(|k| 1024 * k / 3 >= longest)
+        .expect("a block count");
+    let limit = 512 * blocks;
+    let pad = 1024 * blocks / 3 - first;
+    let wave_name = format!("{WAVE}{}", "x".repeat(pad));
+    let line_len = |i: usize| cal[i].len() + pad;
+    assert!(
+        line_len(0) < limit && limit < line_len(0) + line_len(1),
+        "the limit ({limit} bytes) does not fall inside record 2 ({} .. {})",
+        line_len(0),
+        line_len(0) + line_len(1)
+    );
+
+    let (ids, sentinels) = seeded(&pool, 3).await;
+    let wave = dir.join("wave.jsonl");
+    let list = write_ids(&dir, &ids);
+    let blocks_arg = blocks.to_string();
+    let r = run(
+        "/bin/sh",
+        &dir,
+        &db,
+        &[
+            "-c",
+            r#"trap "" XFSZ; ulimit -f "$1" || exit 99; shift; exec "$@""#,
+            "sh",
+            &blocks_arg,
+            RECOMPUTE,
+            "--input",
+            s(&list),
+            "--snapshot",
+            s(&wave),
+            "--wave",
+            &wave_name,
+            "--concurrency",
+            "1",
+        ],
+    );
+    assert_eq!(
+        r.code,
+        Some(3),
+        "the run must STOP on the cut record (exit 3)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert_eq!(r.count("recorded"), 1, "claim 1 recorded, claim 2 not");
+    assert!(
+        r.stderr.contains("1 claims were not attempted"),
+        "claim 3 was attempted: {}",
+        r.stderr
+    );
+    let written_1 = cache(&pool, ids[0]).await;
+    assert_ne!(written_1, sentinels[0], "claim 1 was not written");
+    for i in 1..3 {
+        assert_eq!(
+            cache(&pool, ids[i]).await,
+            sentinels[i],
+            "claim {} was written without a record",
+            i + 1
+        );
+    }
+
+    let lines = raw_lines(&wave);
+    let tail = lines
+        .last()
+        .filter(|l| !l.ends_with(b"\n"))
+        .map_or(0, Vec::len);
+    let r = run(RESTORE, &dir, &db, &["--from", s(&wave)]);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "the restore refused the wave file a full volume left ({tail} bytes of a cut record \
+         after the last whole line)\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert_eq!(tail, 0, "a cut record was left in the wave file");
+    assert_eq!(lines.len(), 1, "the wave file holds one whole record");
+    assert_eq!(r.count("restored"), 1);
+    assert_eq!(
+        cache(&pool, ids[0]).await,
+        sentinels[0],
+        "the restore did not put back claim 1's exact prior cache"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
