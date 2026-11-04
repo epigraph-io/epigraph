@@ -16,7 +16,13 @@
 //! - `"CALIBRATION_PATH"`: reading the override variable outside the resolver;
 //! - `CalibrationConfig::load(`: a path-based read of the calibration;
 //! - a string literal ending in `calibration.toml"`: naming the file as a path
-//!   (cwd-relative `"calibration.toml"`, or an `include_str!` copy).
+//!   (cwd-relative `"calibration.toml"`, or an `include_str!` copy);
+//! - `CalibrationConfig::embedded(`: the compiled-in copy alone, which ignores
+//!   a `CALIBRATION_PATH` override (`cached()` serves it as the fallback);
+//! - `default_for_phase2_fallback(`: a calibration with EMPTY weight and alias
+//!   maps, so every evidence type falls to the unknown-type default;
+//! - `from_str::<CalibrationConfig`: deserializing a calibration from text
+//!   read somewhere other than the resolver.
 //!
 //! The exemption is the resolver's file by its FULL path (a file-name match
 //! would also exempt `matching/calibration.rs`). Any other exception is an
@@ -55,6 +61,9 @@ const NEEDLES: &[&str] = &[
     "\"CALIBRATION_PATH\"",
     "CalibrationConfig::load(",
     "calibration.toml\"",
+    "CalibrationConfig::embedded(",
+    "default_for_phase2_fallback(",
+    "from_str::<CalibrationConfig",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,12 +365,16 @@ fn load_evidence_type_weight(evidence_type: &str) -> f64 {
         .unwrap_or(0.7)
 }
 const COPY: &str = include_str!("../../../calibration.toml");
+fn compiled_in_only() -> f64 { CalibrationConfig::embedded().get_evidence_type_weight("empirical") }
+fn empty_maps() -> CalibrationConfig { CalibrationConfig::default_for_phase2_fallback() }
+fn parsed(p: &Path) -> CalibrationConfig { toml::from_str::<CalibrationConfig>(&std::fs::read_to_string(p).unwrap()).unwrap() }
 "#;
     let hits = scan("x.rs", removed);
     assert_eq!(
         hits.iter().map(|h| h.line).collect::<Vec<_>>(),
-        vec![3, 4, 9],
-        "env + cwd literal (line 3), path load (line 4), embedded copy (line 9): {hits:?}"
+        vec![3, 4, 9, 10, 11, 12],
+        "env + cwd literal (line 3), path load (line 4), embedded copy (line 9), \
+         compiled-in only (line 10), empty maps (line 11), text parse (line 12): {hits:?}"
     );
 
     let quiet = r#"
