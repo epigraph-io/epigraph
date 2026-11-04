@@ -36,7 +36,7 @@ mod fixture;
 
 use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
 use epigraph_db::repos::mass_function::COMBINATION_METHOD_LABELS;
-use epigraph_db::visibility::Viewer;
+use epigraph_db::visibility::{SystemReason, Viewer};
 use epigraph_db::{MassFunctionRepository, PgPool};
 use epigraph_engine::belief_profile::BeliefProfile;
 use epigraph_engine::edge_factor::{ensure_binary_frame, recompute_claim_cached_belief};
@@ -1106,4 +1106,68 @@ async fn only_restricts_the_population_and_cannot_admit_a_non_candidate(pool: Pg
     .await;
     let c = unknown.checks.c2_canary.as_ref().expect("canary");
     assert_eq!((c.id, c.claim.is_none(), c.e_equals_s), (ghost, true, None));
+}
+
+/// The run on the login the binary connects as (`epigraph_maintenance`:
+/// NOSUPERUSER, no BYPASSRLS) measures exactly what the superuser measures,
+/// a GROUP-private candidate in a group the session has no part in included:
+/// a smaller population there would corrupt check C1 and every figure.
+#[sqlx::test(migrations = "../../migrations")]
+async fn r173_reads_every_row_on_the_maintenance_login(pool: PgPool) {
+    let w = world(&pool).await;
+    let (pagent, pgroup) = fixture::seed_agent_with_group(&pool, "r173-private").await;
+    let binary = ensure_binary_frame(
+        &mut pool.acquire().await.expect("acquire"),
+        &fixture::public_viewer(&pool).await,
+    )
+    .await
+    .expect("binary frame");
+    let private = fixture::seed_group_claim(&pool, pagent, pgroup, "r173 private").await;
+    bba(
+        &pool,
+        private,
+        binary,
+        pagent,
+        serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        Some("auto_wire"),
+        None,
+        Some("empirical"),
+    )
+    .await;
+    plant(&pool, private, 0.3, 1.0, one(0.5, 0.6, 0.4)).await;
+
+    let as_superuser = r173(&pool, &w.viewer, &opts(None, None, None)).await;
+    let p = find(&as_superuser, private);
+    assert_eq!(
+        (p.outcome, p.list),
+        (R173Outcome::Recomputed, Some(ApplyList::L1)),
+        "PREMISE: the superuser run measures the private candidate: {p:?}"
+    );
+
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let scoped = fixture::scoped_pool(&pool)
+        .await
+        .with_maintenance_pool(maint);
+    let mut session = scoped
+        .maintenance_session(SystemReason::BeliefRecomputation)
+        .await
+        .expect("maintenance session");
+    let (conn, viewer) = session.split();
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("current_user");
+    assert_eq!(role, "epigraph_maintenance", "PREMISE: the run's login");
+    let as_maintenance = run_read_only(conn, viewer, &opts(None, None, None))
+        .await
+        .expect("maintenance run")
+        .r173
+        .expect("the r173 block");
+
+    assert!(ids_of(&as_maintenance).contains(&private));
+    assert_eq!(
+        serde_json::to_value(without_snapshots(as_maintenance)).expect("json"),
+        serde_json::to_value(without_snapshots(as_superuser)).expect("json"),
+        "the maintenance login measures exactly what the superuser measures"
+    );
 }
