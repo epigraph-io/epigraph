@@ -296,8 +296,8 @@ export TOKEN=<the access_token value>
 curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/claims
 ```
 
-The response is HTTP 200 with a JSON list, empty on a fresh database. The
-first token a client gets also gives that client an agent identity, which is
+The response is HTTP 200 with a JSON object holding `claims` (empty on a
+fresh database), `total`, `limit` and `offset`. The first token a client gets also gives that client an agent identity, which is
 what the API uses as the token's principal.
 
 ## Step 6 — Install the MCP server and register it with Claude Code
@@ -399,7 +399,7 @@ Without an OpenAI key the claim is stored without an embedding. The write
 does not fail, and the write-side novelty check, which needs an embedding,
 is skipped.
 
-Ask `recall` for "installed" and the claim comes back.
+Ask `recall` for "installed": the claim should come back.
 
 **With an OpenAI key** you can also use `recall_with_context`:
 

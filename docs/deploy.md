@@ -60,13 +60,21 @@ The four logins:
 
 | Login | Who creates it | Privileges |
 |---|---|---|
-| **migration login** | you, before the first migrate | Owns the schema or is a superuser. DDL on every table; creates roles and extensions. Used only by `epigraph-migrate` and the undo runbooks. |
+| **migration login** | you, before the first migrate | Owns the schema or is a superuser. DDL on every table; creates roles and extensions. Used by `epigraph-migrate` and the undo runbooks. |
 | **`epigraph_app`** | migration 060 creates the role `NOLOGIN`; **you** give it `LOGIN` and a password | The request path's DML, which row security is written against. Never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB. |
 | **maintenance login** | you: a login role that is a member of `epigraph_maintenance` | `epigraph_bypass()` is true on it, so it can do cross-tenant maintenance. It must be a NON-superuser with no CREATE on schema `public`. |
 | **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | EXECUTE on agent-identity registration only. Needed only if a host registers agent identities (section 9). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
 hatch of migration 074. Nothing connects as it in production.
+
+Four `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
+switches the session to the application role: `reown-claims`,
+`reown-linked`, `reown-reverse` and `restrict-claims`. For those runs only,
+point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at a superuser login (the migration
+login, if it is one). The standing maintenance login, the one in
+`MAINTENANCE_DATABASE_URL` and in every other operator run, stays a
+non-superuser.
 
 No migration grants a role LOGIN or carries a password.
 `crates/epigraph-db/tests/schema_contract.rs::no_migration_grants_a_role_login`
@@ -179,9 +187,15 @@ MAINTENANCE_DATABASE_URL='<maintenance DSN>' DATABASE_URL='<application DSN>' \
   ./target/release/epigraph-tenancy-backfill verify
 ```
 
-It exits 0 on a correctly provisioned fresh database. It checks the owner and
-grants of the maintenance-owned definer functions, the CREATE-on-`public`
-rule above, and that no row lacks a tenancy declaration.
+It checks the owner and grants of the maintenance-owned definer functions,
+the CREATE-on-`public` rule above, and that no row lacks a tenancy
+declaration. It must report no ownership, grant or CREATE fault. Exit 0 is
+the expected result on a correctly provisioned fresh database, but this
+runbook has not measured it. Without `--legacy-owner`, `verify` is the
+strict check, which also fails on any world-owned row in the tables it
+walks. If it reports only world-owned rows, re-run it with
+`--legacy-owner platform`. That form treats world-owned rows of unlinked
+authors as the platform corpus and reports them instead of failing on them.
 
 ### Step 6 — Create the first OAuth clients
 

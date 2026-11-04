@@ -82,6 +82,7 @@ MIGRATION_DATABASE_URL="$DATABASE_URL" ./target/release/epigraph-migrate
 : > providers.toml
 export EPIGRAPH_JWT_SECRET="$(openssl rand -hex 32)"
 ./target/release/server &
+#    Wait for the log line "Server listening on 0.0.0.0:8080", then:
 curl -s http://127.0.0.1:8080/health      # {"status":"healthy",...}
 
 # 5. Register the MCP server with Claude Code. A fixed agent key gives every
