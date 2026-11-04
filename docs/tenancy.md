@@ -1458,6 +1458,21 @@ that attachment, and so do the identities registered from it afterwards.
 To take the group from a job altogether, detach the identity you attached
 by name too; every copy chained from it stops counting.
 
+The cut-off follows the recorded successions, not only the identity that
+runs now. Detaching ANY identity, an old one included, takes the group
+from every identity registered below it through identities with no live
+attachment made by name, and a revert records an edge too. For example:
+you attach Q by name; the job runs P, then A, reverts to P (A is recorded
+as P's parent), and goes on to B and C; detaching the old A months later
+takes the group from P, B and C, the identity that runs now included.
+Before any detach, list the identities reachable DOWN `agent_succession`
+from the one you detach (revert edges included), up to the first one
+holding a live attachment made by name, and confirm the running identity
+is meant to be among them. The walk ignores when a succession was recorded
+and when a detach was made, so the answer for a past instant also changes
+after a later revert or detach (the same "at any time" reading as the
+sticky detach itself).
+
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
 whose old copy still covers the window (166's lineage follow copies only

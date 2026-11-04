@@ -2411,12 +2411,17 @@ restart.
   either direction of a revert and however many registrations later, up
   to the first identity on the way that the operator attached by name; the
   answer depends on the final lineage only, not on the order it was built
-  in or on which parent a copy chains through. A DIRECT attachment counts
+  in or on which parent a copy chains through. That includes the identity
+  that runs now when the operator detaches an OLD identity it descends from
+  (a revert records a succession too), and the walk ignores when a
+  succession or a detach was recorded, so an answer for a past instant can
+  change after a later revert or detach. A DIRECT attachment counts
   as before wherever it sits (so attaching an identity by name re-admits
   it, a revert to an identity attached by name keeps the group through
   that row, and the documented restore still restores the running
   identity and its later successors). A copy written by hand for an agent
-  with no recorded succession is judged by its chain alone. Re-states `epigraph_register_agent_identity` from 180's body:
+  with no recorded succession is judged by its chain alone. Re-states
+  `epigraph_register_agent_identity` from 180's body:
   step 5b keeps 180's chain guard and drops the reverse-pair guard, so a
   revert onto a predecessor is copied and restricts like any succession
   (`role_attachments_withheld` now counts chain-guard rows only).
