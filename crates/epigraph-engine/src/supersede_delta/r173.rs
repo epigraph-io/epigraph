@@ -58,6 +58,9 @@ pub const REGIME_EPS: f64 = 1e-6;
 pub const MOVE_EPS: f64 = 1e-9;
 /// The single-input closed form must equal the fold within this (check C3).
 pub const C3_TOLERANCE: f64 = 1e-9;
+/// A raw fold value further than this outside `[0, 1]` is a C5 violation;
+/// closer is the float noise the write's clamp absorbs.
+pub const C5_TOLERANCE: f64 = 1e-9;
 
 /// The r173 options.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -210,17 +213,48 @@ pub struct Stored {
     pub frame_id: Option<Uuid>,
 }
 
-/// A fold, clamped as the cache write clamps it.
+/// A fold, clamped as the cache write clamps it, with what the clamp hid.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Folded {
     pub belief: f64,
     pub plausibility: f64,
     pub betp: f64,
     pub classification: Option<String>,
+    /// A raw value of the fold (Bel, Pl, BetP, conflict, missing mass) was
+    /// not finite before the clamp (which writes it as 0 or 1).
+    pub raw_non_finite: bool,
+    /// How far the raw values lay outside `[0, 1]` before the clamp, at most
+    /// (0 inside; finite values only). Check C5 reads it against
+    /// [`C5_TOLERANCE`].
+    pub raw_excursion: f64,
+}
+
+/// How far a finite `v` lies outside `[0, 1]`.
+fn excursion(v: f64) -> f64 {
+    if v < 0.0 {
+        -v
+    } else if v > 1.0 {
+        v - 1.0
+    } else {
+        0.0
+    }
 }
 
 impl Folded {
     fn of(p: CombinedBeliefPreview) -> Self {
+        let raw = [
+            p.belief,
+            p.plausibility,
+            p.pignistic_prob,
+            p.conflict_k,
+            p.missing_mass,
+        ];
+        let raw_non_finite = raw.iter().any(|v| !v.is_finite());
+        let raw_excursion = raw
+            .iter()
+            .filter(|v| v.is_finite())
+            .map(|&v| excursion(v))
+            .fold(0.0, f64::max);
         // The write clamps exactly so (`update_claim_belief`).
         let (belief, plausibility, betp, _, _) = epigraph_ds::measures::clamp_claim_belief_measures(
             p.belief,
@@ -234,6 +268,8 @@ impl Folded {
             plausibility,
             betp: betp.unwrap_or(p.pignistic_prob),
             classification: p.classification,
+            raw_non_finite,
+            raw_excursion,
         }
     }
 
@@ -533,8 +569,13 @@ pub struct R173Checks {
     pub c3_max_abs_diff: f64,
     pub c3_violations: Vec<Uuid>,
     pub c4: &'static str,
-    /// A value that is not finite or lies outside `[0, 1]`.
+    /// A value that is not finite or lies outside `[0, 1]`: a stored one, a
+    /// component, or a fold BEFORE the write's clamp (beyond
+    /// [`C5_TOLERANCE`]; the clamped values are always in range).
     pub c5_violations: Vec<Uuid>,
+    /// The largest raw excursion of any fold outside `[0, 1]` (violating or
+    /// not), so near-misses under the tolerance are visible.
+    pub c5_max_raw_excursion: f64,
     pub c6: &'static str,
     /// Unchanged claims whose E and F were both folded and compared.
     pub c7_checked: usize,
@@ -968,14 +1009,20 @@ fn in_unit(v: f64) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
+fn folds(c: &R173Claim) -> impl Iterator<Item = &Folded> {
+    [&c.empty, &c.full, &c.apply]
+        .into_iter()
+        .filter_map(Option::as_ref)
+}
+
 fn out_of_range(c: &R173Claim) -> bool {
     let stored = [c.stored.belief, c.stored.plausibility, c.stored.betp];
-    let folded = [&c.empty, &c.full, &c.apply];
     stored.iter().flatten().any(|v| !in_unit(*v))
-        || folded
-            .iter()
-            .filter_map(|f| f.as_ref())
-            .any(|f| !(in_unit(f.belief) && in_unit(f.plausibility) && in_unit(f.betp)))
+        || folds(c).any(|f| {
+            f.raw_non_finite
+                || f.raw_excursion > C5_TOLERANCE
+                || !(in_unit(f.belief) && in_unit(f.plausibility) && in_unit(f.betp))
+        })
         || [c.d_other, c.d_cal, c.d_apply]
             .iter()
             .flatten()
@@ -1010,6 +1057,9 @@ pub(super) fn report(
     for c in measured {
         if out_of_range(&c) {
             checks.c5_violations.push(c.id);
+        }
+        for f in folds(&c) {
+            checks.c5_max_raw_excursion = checks.c5_max_raw_excursion.max(f.raw_excursion);
         }
         if let (Some(si), Some(e), Some(f)) = (&c.single_input, &c.empty, &c.full) {
             checks.c3_checked += 1;
@@ -1202,6 +1252,11 @@ mod tests {
             "a non-finite or out-of-range RAW fold is a C5 violation: {:?}",
             r.checks
         );
+        assert!(
+            (r.checks.c5_max_raw_excursion - 0.3).abs() < 1e-12,
+            "the largest raw excursion (Pl 1.3) is reported: {}",
+            r.checks.c5_max_raw_excursion
+        );
     }
 
     #[test]
@@ -1220,6 +1275,8 @@ mod tests {
             plausibility: 1.0,
             betp,
             classification: None,
+            raw_non_finite: false,
+            raw_excursion: 0.0,
         };
         c.apply = Some(at(0.75));
         c.empty = Some(at(0.75));

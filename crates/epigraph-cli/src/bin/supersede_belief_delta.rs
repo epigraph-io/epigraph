@@ -223,12 +223,13 @@ async fn measure_into(
         );
         let c = &r.checks;
         println!(
-            "r173 checks: C3 {} checked, {} violations (max {:.3e}); C5 {}; C7 {} checked, \
-             {} violations; A=F violations {}",
+            "r173 checks: C3 {} checked, {} violations (max {:.3e}); C5 {} (max raw fold \
+             excursion {:.3e}); C7 {} checked, {} violations; A=F violations {}",
             c.c3_checked,
             c.c3_violations.len(),
             c.c3_max_abs_diff,
             c.c5_violations.len(),
+            c.c5_max_raw_excursion,
             c.c7_checked,
             c.c7_violations.len(),
             c.a_matches_f_violations.len()
