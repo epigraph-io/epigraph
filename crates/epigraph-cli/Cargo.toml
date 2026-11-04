@@ -177,6 +177,12 @@ name = "belief_cache_bins"
 path = "tests/belief_cache_bins.rs"
 required-features = ["db"]
 
+# Drives the supersede_belief_delta binary (a db-feature bin) without a database.
+[[test]]
+name = "supersede_belief_delta_guard"
+path = "tests/supersede_belief_delta_guard.rs"
+required-features = ["db"]
+
 # Cohort-v2 waves of `recompute_betp` as real processes (`db`-gated bins).
 [[test]]
 name = "recompute_betp_wave"
