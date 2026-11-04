@@ -50,6 +50,14 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "a provenance label for the profile overlay, not a path",
     ),
     (
+        "crates/epigraph-engine/src/supersede_delta/r173.rs",
+        "BeliefProfile::from_calibration(&CalibrationConfig::default_for_phase2_fallback())",
+        "`empty_vocabulary_profile`: the R-173 dry run's counterfactual E, the profile a process \
+         served when it could NOT load a calibration (the empty vocabulary the measured caches \
+         were written under); read-only, never a served or written weight (F and A use \
+         BeliefProfile::served)",
+    ),
+    (
         "crates/epigraph-engine/src/matching/calibration.rs",
         "Self::load_from(Path::new(\"calibration.toml\"))",
         "MatcherConfig ([matcher] section, cross-source matcher), a separate loader that \
