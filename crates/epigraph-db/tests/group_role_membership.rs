@@ -3591,3 +3591,77 @@ async fn a_revert_onto_a_never_detached_predecessor_restricts_it_like_its_parent
         "A, never detached, is a member through its copy once the role is held"
     );
 }
+
+/// EVERY HOP'S WINDOW, TWO HOPS UP (the chain walk's recursive step). The
+/// root's window closes while the copy below it and the copy of that copy
+/// stay open (hand repairs that meet 166's guards: 166's own copy paths never
+/// widen a window). Before the root closes the last copy is a member
+/// (positive control); after, it is not, although its own row and its
+/// parent's are live: the hop that closed is the chain's SECOND, which only
+/// the recursive step reads (the first hop, the middle copy, is still open).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_counts_only_inside_its_roots_window_two_hops_up(pool: PgPool) {
+    let (h, _) = human(&pool, "hop-window-2-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Hop Window Two Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    let mid = register_in(&pool, &identity_key(), None, "g-job").await;
+    let last = register_in(&pool, &identity_key(), None, "g-job").await;
+    for who in [root, mid, last] {
+        link_to(&pool, who, h).await;
+    }
+    attach_until(&pool, ROLE, root, 5).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let root_row = live_attachment(&pool, root).await;
+    let hand_copy = |agent: Uuid, source: Uuid| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO role_agents (role, agent_id, valid_from, valid_to, reason, \
+                                              inherited_from) \
+                     VALUES ($1, $2, now(), NULL, 'hand repair: an open copy', $3) \
+                     RETURNING id",
+                )
+                .bind(ROLE)
+                .bind(agent)
+                .bind(source)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("a maintenance INSERT that meets 166's guards");
+                (conn, id)
+            })
+            .await
+        }
+    };
+    let mid_row = hand_copy(mid, root_row).await;
+    hand_copy(last, mid_row).await;
+    assert_eq!(attachment_rows(&pool, last).await, (1, 1), "PREMISE");
+    assert_eq!(
+        resolves(&pool, last, group).await,
+        (true, true),
+        "POSITIVE CONTROL: inside every hop's window"
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (false, false),
+        "PREMISE: the root's window closed"
+    );
+    assert_eq!(
+        attachment_rows(&pool, mid).await,
+        (1, 1),
+        "PREMISE: the middle copy (the first hop) is open"
+    );
+    assert_eq!(
+        attachment_rows(&pool, last).await,
+        (1, 1),
+        "PREMISE: the last copy is open"
+    );
+    assert_eq!(
+        resolves(&pool, last, group).await,
+        (false, false),
+        "a copy whose root, two hops up, is outside its window admits nothing"
+    );
+    assert_eq!(derived_rows(&pool, last).await, 0, "nothing derived");
+}
