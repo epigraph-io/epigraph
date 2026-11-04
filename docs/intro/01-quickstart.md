@@ -133,9 +133,11 @@ MIGRATION_DATABASE_URL="$DATABASE_URL" ./target/release/epigraph-migrate
 ```
 
 `epigraph-migrate` reads `MIGRATION_DATABASE_URL`. If that is unset, it falls
-back to `DATABASE_URL` and logs a warning, because migrating needs DDL
-privilege that a production serving login must not have. Here both are the
-same superuser, so setting it only silences the warning.
+back to `DATABASE_URL` and emits a WARN, because migrating needs DDL
+privilege that a production serving login must not have. That WARN is shown
+only when `RUST_LOG` includes `warn` (for example `RUST_LOG=info`); the
+default filter shows errors only. Here both are the same superuser; setting
+`MIGRATION_DATABASE_URL` explicitly is the supported form.
 
 The migrations are embedded in the binary at build time from `migrations/`.
 At the revision this page was checked against, that directory holds 158
@@ -210,9 +212,9 @@ request-serving process refuses to start when it is set (see
 **Check the log.** The server checks its configuration in this order and
 stops at the first failure: the maintenance DSN, the JWT secret, the passkey
 settings, the resource-metadata URL, the database connection, the
-session-settings probe, the operator-binding posture, the API signing key,
-the entity-type cache, the tenancy triggers, row-security posture, and
-finally `providers.toml`. A healthy start contains these lines:
+session-settings probe, the test-only software-attestation flag, the
+operator-binding posture, the API signing key, the entity-type cache, the
+tenancy triggers, row-security posture, and finally `providers.toml`. A healthy start contains these lines:
 
 ```
 Session-GUC probe passed
@@ -222,12 +224,21 @@ Internal metrics listener started — update the Prometheus scrape target: /metr
 Server listening on 0.0.0.0:8080
 ```
 
-On a superuser trial, these warnings are expected and harmless:
+On a superuser trial these lines are expected and harmless.
+
+WARN:
 
 - `connecting as a role other than epigraph_app ...` (production connects
   as `epigraph_app`);
+- `this connection can take migration 074's epigraph_seed escape hatch ...`
+  (a superuser is a member of every role, including `epigraph_seed`);
 - `operator binding is NOT ARMED on this database: ...` (arming is a
   production step, described in `docs/deploy.md`);
+- `EPIGRAPH_API_SIGNING_KEY_FILE is not set: HTTP edge writers insert their edges UNSIGNED ...`
+  (production provisions the API's own signing key).
+
+INFO:
+
 - `Embedding service: Mock (development only)` (only when no
   `OPENAI_API_KEY` is set);
 - `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503`.
@@ -502,12 +513,19 @@ commit reached `main` through a merge, the PR is given as "via #N".
     real messages. Replaced the startup checksum-mismatch row with what
     `epigraph-migrate` prints.
   - Moved the reconcile pointer for legacy databases to `docs/deploy.md`.
+  - The `epigraph-migrate` fallback WARN is documented as shown only when
+    `RUST_LOG` enables `warn`. The boot-order list includes the
+    software-attestation check. The expected boot lines are split into WARN
+    (adding the `epigraph_seed` and unsigned-edges warnings) and INFO.
   - Evidence: `Cargo.toml` `[workspace.package]` comment; `ci.yml`;
     `crates/epigraph-api/src/bin/server.rs`; `.../bin/epigraph-migrate.rs`;
     `.../src/migrate.rs`; `crates/epigraph-mcp/src/main.rs` and
     `src/embed.rs`; `crates/epigraph-mcp/src/tools/memory.rs`;
     `crates/epigraph-cli/src/bin/bootstrap_clients.rs`;
-    `crates/epigraph-api/tests/public_router_allowlist.rs`.
+    `crates/epigraph-api/tests/public_router_allowlist.rs`;
+    `crates/epigraph-api/src/state.rs::warn_on_privileged_connection`;
+    `crates/epigraph-api/src/edge_signer.rs::UNSIGNED_AT_BOOT`;
+    `crates/epigraph-api/src/passkey_boot.rs`.
 - 2026-10-15 2c7271eb9 (via #622): described the `recall_with_context`
   `section` key as a serialized null.
 - 2026-10-15 0c550b9df (via #622): corrected the quickstart for whole-corpus
