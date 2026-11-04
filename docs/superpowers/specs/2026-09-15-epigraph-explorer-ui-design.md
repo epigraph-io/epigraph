@@ -227,6 +227,10 @@ BFF endpoint is enumerated and read-only in v1.
 
 ## 7. The Notion surface
 
+> **Superseded (2026-11-04)** by `2026-11-04-epigraph-explorer-atlas-design.md` §8:
+> embeds fetch with the signed-in user's token, pasted-link cards are guest reads
+> of public claims only, tours live in Notion, and there is no Notion ingest.
+
 Notion gets two things, both cheap, neither involving copying claims:
 
 1. **One `/embed` block** pointing at the explorer, on an "EpiGraph" page.
@@ -380,6 +384,9 @@ BFF with OAuth. No graph canvas. This is the smallest thing that delivers the
 
 **Phase 3 — documents and Notion.** `/document/:key`, the Notion embed, the
 auto-ingest reconciler. Depends on `check_already_ingested` having a route.
+*Superseded (2026-11-04):* Phase 3 is now the Atlas, phases P3a-P3e of
+`2026-11-04-epigraph-explorer-atlas-design.md` §10. The auto-ingest reconciler is
+dropped (owner ruling A3).
 
 **Phase 4 — writes.** Challenge, label, supersede from the UI. Only after
 tenancy, because a write surface without ownership enforcement is the one thing
