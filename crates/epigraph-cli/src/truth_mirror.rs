@@ -886,4 +886,81 @@ mod tests {
         assert_eq!(back[0].truth_before.to_bits(), rec.truth_before.to_bits());
         assert_eq!(back[0].truth_written.to_bits(), rec.truth_written.to_bits());
     }
+
+    #[test]
+    fn records_round_trip_bit_for_bit_over_a_sweep_of_bit_patterns() {
+        // Every non-negative finite f64 below 1.0, drawn by a fixed LCG, so
+        // subnormals and long mantissas are covered, not only short decimals.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let v = f64::from_bits(x % 0x3FF0_0000_0000_0000);
+            let rec = TruthRecord {
+                claim_id: Uuid::nil(),
+                truth_before: v,
+                truth_written: v,
+                cache_old: v,
+                cache_new: v,
+                waves: vec![],
+                at: Utc::now(),
+            };
+            let mut buf = Vec::new();
+            write_truth_record(&mut buf, &rec).unwrap();
+            let back = read_truth_records(buf.as_slice()).unwrap();
+            assert_eq!(back[0].truth_before.to_bits(), v.to_bits(), "{v:e}");
+        }
+    }
+
+    #[test]
+    fn an_unchanged_or_missing_new_value_is_not_written() {
+        let c = cand(0.612_3, 0.612_3);
+        assert_eq!(classify(&c, Some(&state(0.612_3, &c)), false), Bucket::Noop);
+        for new in [None, Some(1.5), Some(-0.2)] {
+            let mut c = cand(0.612_3, 0.701_2);
+            c.new = new;
+            c.written.pignistic_prob = new;
+            assert_eq!(
+                classify(&c, Some(&state(0.612_3, &c)), false),
+                Bucket::NoNewValue,
+                "new = {new:?}"
+            );
+        }
+    }
+
+    fn outcome_of(bucket: Bucket, old: f64, new: f64) -> Outcome {
+        Outcome {
+            claim_id: Uuid::new_v4(),
+            bucket,
+            truth_before: Some(old),
+            old: Some(old),
+            new: Some(new),
+        }
+    }
+
+    #[test]
+    fn the_report_counts_crossings_and_delta_bins_over_the_refresh_set_only() {
+        let report = MirrorReport {
+            outcomes: vec![
+                outcome_of(Bucket::Refresh, 0.29, 0.31),
+                outcome_of(Bucket::Refresh, 0.76, 0.74),
+                outcome_of(Bucket::Refresh, 0.52, 0.48),
+                // A delta of exactly +0.01 (exact in f64): the bin it opens.
+                outcome_of(Bucket::Refresh, 0.0, 0.01),
+                // Not refreshed: crosses everything upward, counted nowhere.
+                outcome_of(Bucket::NotAMirror, 0.1, 0.9),
+            ],
+        };
+        let j = report.to_json(true, false, 5);
+        let cross = |t: &str, dir: &str| j["crossings"][t][dir].as_u64().unwrap();
+        assert_eq!((cross("0.30", "up"), cross("0.30", "down")), (1, 0));
+        assert_eq!((cross("0.50", "up"), cross("0.50", "down")), (0, 1));
+        assert_eq!((cross("0.75", "up"), cross("0.75", "down")), (0, 1));
+        let bins = j["delta_bins"].as_object().unwrap();
+        assert_eq!(bins["[+0.01, +0.05)"], 2, "{bins:?}");
+        assert_eq!(bins["[-0.05, -0.01)"], 2, "{bins:?}");
+        assert_eq!(bins.values().map(|v| v.as_u64().unwrap()).sum::<u64>(), 4);
+        assert_eq!(j["refresh"].as_array().unwrap().len(), 4);
+    }
 }
