@@ -3304,3 +3304,364 @@ async fn a_copy_counts_only_inside_every_hops_window(pool: PgPool) {
     );
     assert_eq!(derived_rows(&pool, copy).await, 0, "nothing derived");
 }
+
+// =====================================================================
+// A DETACH IS STICKY PER IDENTITY (migration 195). A detach is recorded on
+// one ROW, but it is the operator's act on an IDENTITY: an identity holding a
+// detached attachment to the role is admitted again only by a DIRECT
+// attachment the operator makes for it by name. A succession COPY admits
+// nothing to such an identity, wherever the copy came from (the
+// registration's step 5b, 166's attach-time lineage follow, a hand repair),
+// and nothing to any identity whose copy runs THROUGH a copy held by such an
+// identity. The copies are still written and still restrict (166's ROL01):
+// a revert always restricts. A direct attachment (`inherited_from` NULL) is
+// exempt wherever it sits, so the documented restore (detach the running
+// identity's stale copy, attach it by name) restores it and its later
+// successors.
+// =====================================================================
+
+/// 166's may-run answer for `agent`, on the attestor's session (as the host
+/// asks it before starting a container).
+async fn may_run(pool: &PgPool, agent: Uuid) -> bool {
+    fixture::as_role(pool, "epigraph_identity_attestor", |mut conn| async move {
+        let r: bool =
+            sqlx::query_scalar("SELECT may_run FROM public.epigraph_role_agent_may_run($1)")
+                .bind(agent)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("may_run");
+        (conn, r)
+    })
+    .await
+}
+
+/// The documented restore after a root detach, then a MULTI-HOP revert. Attach
+/// A; B and C succeed it (copies); the operator detaches A (all three are
+/// out); the operator restores the running C as documented (detach C's stale
+/// copy, attach C by name). Later the job reverts to A's prompt and model, and
+/// the host names C as A's parent. C's new row is a root and the pair "C
+/// succeeded A" is not on record, so the registration copies it onto A. That
+/// copy restricts A (166) but admits A nowhere: A is the identity the
+/// operator detached. CONTROL: C, attached by name, stays a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_hop_revert_after_the_documented_restore_regains_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "sticky-p1-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Sticky P1 Team", "writer").await;
+    let assignment = grant(&pool, ROLE, h, 0, None).await;
+    let a_key = identity_key();
+    let a = register_in(&pool, &a_key, None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    let b = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    let c = register_in(&pool, &identity_key(), Some(b), "g-job").await;
+    assert_eq!(resolves(&pool, c, group).await, (true, true), "PREMISE: C");
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    assert_eq!(
+        resolves(&pool, c, group).await,
+        (false, false),
+        "PREMISE: C out"
+    );
+    assert!(
+        detach_from_role(&pool, ROLE, c).await >= 1,
+        "C's stale copy detached"
+    );
+    attach_to_role(&pool, ROLE, c).await;
+    assert_eq!(
+        resolves(&pool, c, group).await,
+        (true, true),
+        "PREMISE: C restored by name"
+    );
+
+    assert_eq!(
+        register_in(&pool, &a_key, Some(c), "g-job").await,
+        a,
+        "PREMISE: the revert re-derives A's key"
+    );
+    assert_eq!(
+        attachment_rows(&pool, a).await,
+        (1, 1),
+        "the revert copies C's row onto A: a copy back always restricts"
+    );
+    assert_eq!(derived_rows(&pool, a).await, 0, "A is admitted nowhere");
+    assert_eq!(resolves(&pool, a, group).await, (false, false), "A");
+    assert_eq!(
+        resolves(&pool, c, group).await,
+        (true, true),
+        "CONTROL: C, attached by name, stays a member"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "the detached, reverted A, forged stamp (armed)",
+    );
+    write_honest(&pool, c, group)
+        .await
+        .expect("CONTROL: C writes on an application session");
+
+    assert!(end_role(&pool, assignment).await, "the role's holder ends");
+    assert!(
+        !may_run(&pool, a).await,
+        "A's copy still restricts it: with the role unheld it may not run"
+    );
+}
+
+/// 166's attach-time lineage follow onto a detached, reverted identity.
+/// Attach A; B succeeds it; the operator detaches A; the job reverts (A is
+/// registered with B as its parent: the chain guard withholds the copy back
+/// onto A's own row); the operator then detaches B's stale copy and attaches
+/// B by name. The follow walks B's successors, which include A through "A
+/// succeeded B", and A holds no un-detached row, so A gets a whole-window
+/// copy of B's new root row. The copy restricts A and admits it nowhere.
+/// CONTROL: B is a member.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_attach_time_follow_onto_a_detached_identity_restricts_and_admits_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "sticky-p2-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Sticky P2 Team", "writer").await;
+    let assignment = grant(&pool, ROLE, h, 0, None).await;
+    let a_key = identity_key();
+    let a = register_in(&pool, &a_key, None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    let b = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    assert_eq!(
+        register_in(&pool, &a_key, Some(b), "g-job").await,
+        a,
+        "PREMISE: the revert re-derives A's key"
+    );
+    assert_eq!(
+        attachment_rows(&pool, a).await,
+        (0, 0),
+        "PREMISE: the chain guard withheld the copy back onto A's own row"
+    );
+    assert!(
+        detach_from_role(&pool, ROLE, b).await >= 1,
+        "B's stale copy detached"
+    );
+    attach_to_role(&pool, ROLE, b).await;
+    assert_eq!(
+        attachment_rows(&pool, a).await,
+        (1, 1),
+        "PREMISE: the follow copied B's new row onto A"
+    );
+
+    assert_eq!(derived_rows(&pool, a).await, 0, "A is admitted nowhere");
+    assert_eq!(resolves(&pool, a, group).await, (false, false), "A");
+    assert_eq!(
+        resolves(&pool, b, group).await,
+        (true, true),
+        "CONTROL: B, attached by name"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, a, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "A after B's attach-time follow, forged stamp (armed)",
+    );
+
+    assert!(end_role(&pool, assignment).await, "the role's holder ends");
+    assert!(
+        !may_run(&pool, a).await,
+        "the follow's copy restricts A: with the role unheld it may not run"
+    );
+}
+
+/// The stickiness follows the lineage forward. After P1's revert, the job's
+/// next prompt change makes D (parent A) and then E (parent D). D's copy runs
+/// through A's copy, and E's through D's: neither admits anything, because a
+/// copy held by the detached A is a dead hop for everything copied through
+/// it. (Without this, one LEARNED.md edit after a revert would hand the
+/// detached job the group under a new key.) Both copies are written and
+/// restrict. CONTROL: F, a later successor of the restored C, is a member: a
+/// direct attachment is never a dead hop, although C holds a detached row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_copied_through_a_detached_identitys_copy_regains_nothing(pool: PgPool) {
+    let (h, _) = human(&pool, "sticky-chain-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Sticky Chain Team", "writer").await;
+    let assignment = grant(&pool, ROLE, h, 0, None).await;
+    let a_key = identity_key();
+    let a = register_in(&pool, &a_key, None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    let b = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    let c = register_in(&pool, &identity_key(), Some(b), "g-job").await;
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    assert!(
+        detach_from_role(&pool, ROLE, c).await >= 1,
+        "C's stale copy detached"
+    );
+    attach_to_role(&pool, ROLE, c).await;
+    assert_eq!(
+        register_in(&pool, &a_key, Some(c), "g-job").await,
+        a,
+        "PREMISE: the revert is A"
+    );
+    assert_eq!(attachment_rows(&pool, a).await, (1, 1), "PREMISE: A's copy");
+
+    let d = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    let e = register_in(&pool, &identity_key(), Some(d), "g-job").await;
+    assert_eq!(attachment_rows(&pool, d).await, (1, 1), "PREMISE: D's copy");
+    assert_eq!(attachment_rows(&pool, e).await, (1, 1), "PREMISE: E's copy");
+    assert_eq!(
+        derived_rows(&pool, d).await,
+        0,
+        "D, copied through the detached A's copy (the chain's first hop)"
+    );
+    assert_eq!(
+        derived_rows(&pool, e).await,
+        0,
+        "E, two hops below the detached A's copy (the chain's recursive step)"
+    );
+    assert_eq!(resolves(&pool, d, group).await, (false, false), "D");
+    assert_eq!(resolves(&pool, e, group).await, (false, false), "E");
+
+    let f = register_in(&pool, &identity_key(), Some(c), "g-job").await;
+    assert_eq!(
+        resolves(&pool, f, group).await,
+        (true, true),
+        "CONTROL: a successor of the identity attached by name keeps the group"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, e, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "E, forged stamp (armed)",
+    );
+
+    assert!(end_role(&pool, assignment).await, "the role's holder ends");
+    assert!(!may_run(&pool, d).await, "D's copy restricts it");
+    assert!(!may_run(&pool, e).await, "E's copy restricts it");
+}
+
+/// A REVERT ALWAYS RESTRICTS. A precedes B and was never attached; the
+/// operator attaches B by name (the documented recovery shape) while the role
+/// has no holder, so B is refused ROL01. The job reverts to A (the host names
+/// B as A's parent). The registration copies B's row onto A, so A is held by
+/// the role exactly as B is: refused ROL01, may not run. Once the role is
+/// held, A, an identity the operator never detached, is a member like B.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_onto_a_never_detached_predecessor_restricts_it_like_its_parent(pool: PgPool) {
+    let (h, personal) = human(&pool, "sticky-p3-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Sticky P3 Team", "writer").await;
+    let a_key = identity_key();
+    let a = register_in(&pool, &a_key, None, "g-job").await;
+    link_to(&pool, a, h).await;
+    let b = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    attach_to_role(&pool, ROLE, b).await;
+    arm(&pool).await;
+    assert!(!may_run(&pool, b).await, "PREMISE: B is held (role unheld)");
+    let wb = write_honest(&pool, b, personal).await;
+    assert_eq!(
+        code_of(&wb).as_deref(),
+        Some("ROL01"),
+        "PREMISE: B is refused ROL01: {wb:?}"
+    );
+
+    assert_eq!(
+        register_in(&pool, &a_key, Some(b), "g-job").await,
+        a,
+        "PREMISE: the revert re-derives A's key"
+    );
+    assert_eq!(
+        attachment_rows(&pool, a).await,
+        (1, 1),
+        "the revert copies B's row onto A"
+    );
+    assert!(!may_run(&pool, a).await, "the reverted A may not run");
+    let wa = write_honest(&pool, a, personal).await;
+    assert_eq!(
+        code_of(&wa).as_deref(),
+        Some("ROL01"),
+        "the reverted job is still held by the role: {wa:?}"
+    );
+
+    grant(&pool, ROLE, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, b, group).await,
+        (true, true),
+        "CONTROL: B once the role is held"
+    );
+    assert_eq!(
+        resolves(&pool, a, group).await,
+        (true, true),
+        "A, never detached, is a member through its copy once the role is held"
+    );
+}
+
+/// EVERY HOP'S WINDOW, TWO HOPS UP (the chain walk's recursive step). The
+/// root's window closes while the copy below it and the copy of that copy
+/// stay open (hand repairs that meet 166's guards: 166's own copy paths never
+/// widen a window). Before the root closes the last copy is a member
+/// (positive control); after, it is not, although its own row and its
+/// parent's are live: the hop that closed is the chain's SECOND, which only
+/// the recursive step reads (the first hop, the middle copy, is still open).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_counts_only_inside_its_roots_window_two_hops_up(pool: PgPool) {
+    let (h, _) = human(&pool, "hop-window-2-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Hop Window Two Team", "writer").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    let mid = register_in(&pool, &identity_key(), None, "g-job").await;
+    let last = register_in(&pool, &identity_key(), None, "g-job").await;
+    for who in [root, mid, last] {
+        link_to(&pool, who, h).await;
+    }
+    attach_until(&pool, ROLE, root, 5).await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let root_row = live_attachment(&pool, root).await;
+    let hand_copy = |agent: Uuid, source: Uuid| {
+        let pool = pool.clone();
+        async move {
+            fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+                let id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO role_agents (role, agent_id, valid_from, valid_to, reason, \
+                                              inherited_from) \
+                     VALUES ($1, $2, now(), NULL, 'hand repair: an open copy', $3) \
+                     RETURNING id",
+                )
+                .bind(ROLE)
+                .bind(agent)
+                .bind(source)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("a maintenance INSERT that meets 166's guards");
+                (conn, id)
+            })
+            .await
+        }
+    };
+    let mid_row = hand_copy(mid, root_row).await;
+    hand_copy(last, mid_row).await;
+    assert_eq!(attachment_rows(&pool, last).await, (1, 1), "PREMISE");
+    assert_eq!(
+        resolves(&pool, last, group).await,
+        (true, true),
+        "POSITIVE CONTROL: inside every hop's window"
+    );
+
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    assert_eq!(
+        resolves(&pool, root, group).await,
+        (false, false),
+        "PREMISE: the root's window closed"
+    );
+    assert_eq!(
+        attachment_rows(&pool, mid).await,
+        (1, 1),
+        "PREMISE: the middle copy (the first hop) is open"
+    );
+    assert_eq!(
+        attachment_rows(&pool, last).await,
+        (1, 1),
+        "PREMISE: the last copy is open"
+    );
+    assert_eq!(
+        resolves(&pool, last, group).await,
+        (false, false),
+        "a copy whose root, two hops up, is outside its window admits nothing"
+    );
+    assert_eq!(derived_rows(&pool, last).await, 0, "nothing derived");
+}

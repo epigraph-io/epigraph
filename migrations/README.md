@@ -1664,7 +1664,8 @@ restart.
   row (`role_attachments_withheld`). The cost: the reverted identity then
   holds no attachment, so 166's restriction (ROL01, may-run) no longer
   applies to it; attach the running identity by name after a revert if it
-  must hold. Adds
+  must hold. (Amended by **195**: the reverse-pair guard is dropped, the
+  chain guard kept, so a revert onto a predecessor restricts again.) Adds
   `epigraph_record_legacy_succession(child, parent, group_folder, reason)`,
   maintenance-session only and audited (`agent.identity_succession_recorded`):
   for a child the host registered parentless in that folder, with no
@@ -2041,6 +2042,9 @@ restart.
   RAISEs `55000` (changing nothing) over any other body; a LATER re-statement
   of the derivation must start from 179's body (the head pin fails
   otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
+  Amended by **195** (a detach is sticky per identity: no copy admits an
+  identity holding a detached row for the role, nor anything copied through
+  a copy it holds).
   **Deploy order:** after 165 and 166; before any operator CLI call with
   `--agent-mode attached_agents` (the other modes work without it).
 - **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
@@ -2367,6 +2371,50 @@ restart.
   **Predeploy check:** `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid
   = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
   text)')` must print 117's md5 and one of the two paths.
+  **Applied to throwaway databases only, NOT to any deployed database.**
+
+- **195**: public `role_detach_sticky_and_revert_restricts`. Two measured
+  gaps in 179/180's handling of role attachments, one in each direction.
+  (1) A detach was per ROW, so an identity the operator detached was
+  admitted again in 179's attached mode by a later copy whose chain did not
+  pass through its detached row: a multi-hop revert after the documented
+  restore (attach A; B, C succeed it; detach A; restore C by name; the job
+  reverts to A, parent C), 166's attach-time follow onto a reverted identity
+  (attach A; B succeeds it; detach A; revert to A; restore B by name), and
+  any successor registered from such a copy. (2) 180's reverse-pair guard
+  withheld the registration's copy from an identity that was never
+  detached, so after the operator attached B by name a revert to A left A
+  outside 166's restriction (ROL01, may-run) while B was held. Re-states
+  `epigraph_role_derived_memberships` from 179's body: a succession copy
+  (`inherited_from` set) admits nothing to an agent holding ANY detached
+  `role_agents` row for the role, and the chain walk treats a COPY held by
+  such an agent as a dead hop; a DIRECT attachment counts as before
+  wherever it sits (so attaching an identity by name re-admits it, and the
+  documented restore still restores the running identity and its later
+  successors). Re-states `epigraph_register_agent_identity` from 180's body:
+  step 5b keeps 180's chain guard and drops the reverse-pair guard, so a
+  revert onto a predecessor is copied and restricts like any succession
+  (`role_attachments_withheld` now counts chain-guard rows only). 166's
+  attach-time follow is NOT changed: its copy onto a detached successor
+  restricts and, under the sticky rule, grants nothing; skipping it would
+  leave that identity and its later successors unrestricted. Signatures,
+  owners, ACLs and `search_path` unchanged; no grant. A precondition checks
+  the md5 of 179's derivation (`65bd0fc12e34b4172607dd2864fb7f66`) and 180's
+  registration (`c31ae71f307a0573716e51fe17aa5dc8`) and RAISEs `55000`
+  (changing nothing) over any other body; a later re-statement of either
+  starts from 195's (derivation `e63dc71ab1c75c87a3cb23b0506dc665`,
+  registration `a792b630dd34b1ab8c36218b5cb698d1`). Pinned by
+  `epigraph-db/tests/group_role_membership.rs` (the 195 section),
+  `legacy_fleet_parent.rs` (`a_copy_onto_the_parents_own_predecessor_restricts`,
+  the precondition and the undo) and
+  `schema_contract.rs::migration_179_attached_arm_survives_at_head` /
+  `::migration_195_registration_restricts_a_revert_at_head`. Undo:
+  `docs/runbooks/195-undo.sql` (tested: it returns the `public` catalog to
+  below 195 and refuses `55000` over any body but 195's or the one it
+  restores); run it BEFORE `180-undo.sql`, which refuses a 195 registration.
+  Checked before claiming: no migration on main, open PR, origin branch or
+  local worktree carries a `195`. **Deploy order:** after 179 and 180; no
+  binary depends on it; before attaching any further identity to a role.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
