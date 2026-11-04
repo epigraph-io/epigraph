@@ -30,8 +30,14 @@
 //! the guards in `epigraph_cli::backfill_factors` (a held edge is never
 //! deleted or rewritten). With `--dry-run` it PREDICTS (one READ ONLY
 //! transaction; `--predict-json` writes the per-edge and per-target report).
-//! A real targeted run needs the accepted list (`--edges-from`) and both
-//! snapshot files (`--snapshot`, `--edge-rows`); undo it with
+//! The predict records its options (`epsilon`, `max_passes`, `only_changed`,
+//! the accepted list's size, the wave files): the apply must reuse exactly
+//! them. A real targeted run needs the accepted list (`--edges-from`) and both
+//! snapshot files (`--snapshot`, `--edge-rows`). The fixed-point verify after
+//! an apply is a predict over the L1 wave files AND the apply's `--snapshot`
+//! file (an L1 claim the rewire refolded holds neither L1 value; the E
+//! records chain onto the L1 ones), and must report nothing to rewrite. Undo
+//! an apply with
 //! `restore_edge_factors --edge-rows` and then `restore_belief_cache --from
 //! <the --snapshot file>`.
 
@@ -321,7 +327,12 @@ async fn run_targeted(
             .map_or_else(|| "none".to_string(), |e| e.len().to_string())
     );
     if cli.dry_run {
-        let report = predict_targeted_rewire(pool, viewer, &seed, &opts).await?;
+        let mut report = predict_targeted_rewire(pool, viewer, &seed, &opts).await?;
+        report.run.wave_files = cli
+            .sources_from_waves
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         println!(
             "PREDICT ({}): would_rewrite={} unchanged={} held={:?} would_remove={} \
              would_vacate={} cycle_unconverged={} converged={} passes={}",

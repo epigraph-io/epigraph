@@ -568,12 +568,30 @@ pub struct PredictTotals {
     pub crossings: BTreeMap<String, usize>,
 }
 
+/// The options and inputs a predict ran with. Predict-equals-apply holds only
+/// for an apply with the SAME options (an `epsilon` decides which targets
+/// count as moved), so acceptance compares the apply's flags with these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictRun {
+    pub epsilon: f64,
+    pub max_passes: usize,
+    pub only_changed: bool,
+    /// Size of the accepted edge list, when one was given.
+    pub accepted_edges: Option<usize>,
+    /// Wave claims in the seed, and how many of them moved (pass 1's sources).
+    pub wave_claims: usize,
+    pub moved_sources: usize,
+    /// The wave files the seed came from (filled in by the binary).
+    pub wave_files: Vec<String>,
+}
+
 /// What a predict writes to `--predict-json`. Deterministic: no timestamp,
 /// ordered maps, edges in visit order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredictReport {
     pub calibration_source: String,
     pub profile_hash: String,
+    pub run: PredictRun,
     /// `db` (the database holds the wave's written values) or `seeded` (some
     /// wave claims still hold their `before`: the overlay was seeded with
     /// the wave's `written`, a restored pre-wave copy).
@@ -656,6 +674,13 @@ fn d_edge_bin(d: f64) -> &'static str {
 ///
 /// Refuses when a wave claim's cache equals neither its wave `before` nor
 /// its `written` (`l1_state_unknown`: someone wrote it since the wave).
+///
+/// The fixed-point VERIFY after an apply (design §1.5 (b)) must be handed the
+/// L1 wave files AND the apply's `--snapshot` file: an L1 claim the rewire
+/// refolded as a target now holds the rewire's value, which is neither its L1
+/// `before` nor its L1 `written`, and the E records chain onto the L1 ones
+/// (each E `before` is the previous `written`), so together they read as the
+/// current state.
 ///
 /// # Errors
 /// A read fails, the binary frame is missing, or the state check refuses.
@@ -920,6 +945,15 @@ pub async fn predict_targeted_rewire(
         calibration_source: epigraph_engine::calibration::CalibrationConfig::cached_source()
             .to_string(),
         profile_hash: epigraph_engine::belief_profile::BeliefProfile::served().profile_hash(),
+        run: PredictRun {
+            epsilon: opts.epsilon,
+            max_passes: opts.max_passes,
+            only_changed: opts.only_changed,
+            accepted_edges: opts.edges.as_ref().map(BTreeSet::len),
+            wave_claims: seed.written.len(),
+            moved_sources: seed.moved.len(),
+            wave_files: Vec::new(),
+        },
         seed_mode: seed_mode.to_string(),
         passes,
         converged,

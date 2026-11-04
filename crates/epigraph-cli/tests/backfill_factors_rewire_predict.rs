@@ -281,3 +281,61 @@ async fn predict_seeds_from_the_wave_and_refuses_an_unknown_state(pool: PgPool) 
     assert!(err.to_string().contains("l1_state_unknown"), "{err}");
     let _ = (ch.bc, ch.c);
 }
+
+/// The fixed-point verify after an apply (§1.5 (b)) when an L1 claim was
+/// also a rewire TARGET: `a → b` with both `a` and `b` moved by L1. After the
+/// apply, `b` holds the rewire's value, neither its L1 `before` nor its L1
+/// `written`, so a predict over the L1 waves alone refuses
+/// (`l1_state_unknown`). Handed the L1 waves AND the apply's snapshot (wave
+/// records chain: each E `before` is the previous `written`), it reads the
+/// database as current and reports nothing to rewrite.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_verify_predict_reads_l1_and_e_waves_together(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let author = seed_agent(&pool, "verify").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    let a = fresh_claim(&pool, &viewer, author, frame, "verify a", EVIDENCE_A).await;
+    let b = fresh_claim(&pool, &viewer, author, frame, "verify b", TARGET_EVIDENCE).await;
+    let ab = wired_edge(&pool, &viewer, author, a, b, "supports").await;
+    let mut l1 = vec![move_claim(&pool, &viewer, a, EVIDENCE_B).await];
+    l1.push(move_claim(&pool, &viewer, b, EVIDENCE_C).await);
+
+    let o = opts();
+    let predicted = predict(&pool, &viewer, &l1).await;
+    assert_eq!(predicted.would_rewrite(), vec![ab], "{:?}", predicted.edges);
+    assert_eq!(predicted.run.moved_sources, 2);
+    assert_eq!(predicted.run.wave_claims, 2);
+    assert_eq!(predicted.run.epsilon, o.epsilon);
+    assert_eq!(predicted.run.only_changed, o.only_changed);
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&l1, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    assert_eq!(applied.rewired(), 1, "{applied:?}");
+    let e_wave = epigraph_cli::belief_cache::read_wave(w.as_slice()).expect("E wave file");
+    assert_eq!(
+        e_wave.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![b]
+    );
+
+    let err = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&l1, o.epsilon), &o)
+        .await
+        .expect_err("the L1 waves alone no longer describe b");
+    assert!(err.to_string().contains("l1_state_unknown"), "{err}");
+
+    let mut both = l1.clone();
+    both.extend(e_wave);
+    let verify = predict(&pool, &viewer, &both).await;
+    assert_eq!(verify.seed_mode, "db");
+    assert!(verify.would_rewrite().is_empty(), "{:?}", verify.edges);
+    assert!(verify.totals.held.is_empty(), "{:?}", verify.totals);
+    assert!(verify.totals.unchanged >= 1, "{:?}", verify.totals);
+}
