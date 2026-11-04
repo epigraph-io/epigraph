@@ -144,7 +144,7 @@ Design:
 Newest first. Each line gives the commit that changed this file. Where a
 commit reached `main` through a merge, the PR is given as "via #N".
 
-- 2026-11-04 (this revision): rewrote the file for a reader new to the
+- 2026-11-04 (this revision, PR #764): rewrote the file for a reader new to the
   project, checked against `main` at 5fcd75087.
   - Added a table of the binaries.
   - The quickstart now migrates as a PostgreSQL superuser, the layout CI
