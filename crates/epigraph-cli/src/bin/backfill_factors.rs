@@ -244,7 +244,10 @@ async fn run_evidence_phase(
     }
 
     for (evidence_id, claim_id, signer_id, evidence_type, _extr) in eligible {
-        let weight = load_evidence_type_weight(&evidence_type);
+        // The served calibration (`CALIBRATION_PATH`, else the compiled-in
+        // copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
+        let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+            .get_evidence_type_weight(&evidence_type);
         // An operator backfill on the DSN the operator supplies — in practice a
         // superuser, where a tenancy stamp is inert. The acquire is mechanical: it
         // moves each row's wiring onto ONE connection instead of a checkout per
@@ -347,12 +350,4 @@ async fn run_edge_phase(
         }
     }
     Ok(summary)
-}
-
-fn load_evidence_type_weight(evidence_type: &str) -> f64 {
-    let path = std::env::var("CALIBRATION_PATH").unwrap_or_else(|_| "calibration.toml".to_string());
-    epigraph_engine::calibration::CalibrationConfig::load(std::path::Path::new(&path))
-        .ok()
-        .map(|c| c.get_evidence_type_weight(evidence_type))
-        .unwrap_or(0.7)
 }
