@@ -575,6 +575,22 @@ pub struct PlanWorkItem {
     pub before_owner_group_id: Uuid,
 }
 
+/// A `workflows` row an apply batch moved into the target group with its
+/// plan, and the tenancy it had before
+/// ([`PrivatizationRepository::restrict_plan_workflows_conn`]). The pre-image
+/// is what [`PrivatizationRepository::record_workflow_moves_conn`] writes to
+/// the plan's audit trail and what
+/// [`PrivatizationRepository::restore_plan_workflows_conn`] puts back.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct WorkflowMove {
+    /// The `workflows` row.
+    pub workflow_id: Uuid,
+    /// Its `visibility` before the move (always `public` today).
+    pub before_visibility: String,
+    /// Its `owner_group_id` before the move.
+    pub before_owner_group_id: Uuid,
+}
+
 /// A state transition [`PrivatizationRepository::transition_plan_conn`] performs.
 ///
 /// An enum rather than four functions, so the guard conditions that make each
@@ -831,13 +847,72 @@ const SEAL_VERSION_SENTINEL: &str = "'[sealed:x' || replace(v.claim_id::text, '-
 /// The sentinel `evidence.raw_content` carries once its claim is sealed.
 ///
 /// Not id-suffixed, and it does not need to be: `evidence` has no generated
-/// tsvector and its `content_hash` is left as the ORIGINAL body's digest (it is
-/// not recomputed from the sentinel), so the reasons the claim sentinel carries
-/// an id do not apply. One fixed token is the smaller side channel.
+/// tsvector, and its `content_hash` is replaced by the per-row
+/// [`SEAL_EVIDENCE_DIGEST_SENTINEL`], so nothing keyed on the body needs the
+/// sentinel to differ between rows. One fixed token is the smaller side
+/// channel.
 ///
 /// `pub(crate)` for `EvidenceRepository::update_raw_content`, which refuses to
 /// rewrite a row holding it.
 pub(crate) const SEAL_EVIDENCE_SENTINEL: &str = "[sealed]";
+
+/// The `evidence.content_hash` a sealed row carries: SHA-256 of an id-derived
+/// token, computed per row by the seal UPDATE (backlog 12b68201).
+///
+/// The original digest is BLAKE3 of the plaintext body (or a caller-supplied
+/// digest of an external artefact), so leaving it on a sealed row lets anyone
+/// who can read the row confirm a guessed body against it. The sentinel is a
+/// function of the row id alone, so it says nothing about the body; it is 32
+/// bytes (`evidence_content_hash_length`); and it differs per row, so two
+/// sealed rows never look like duplicates of each other, nor of a later row
+/// with the same body, to the evidence de-duplication
+/// (`EvidenceRepository`, migration 171). The original digest travels in the
+/// ciphertext under [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] and unseal puts it
+/// back.
+///
+/// A SQL fragment over the alias `e`, like [`SEAL_CONTENT_SENTINEL`]: the seal
+/// UPDATE is set-based. Migration 171's backfill of rows sealed before the
+/// sentinel writes the same expression.
+const SEAL_EVIDENCE_DIGEST_SENTINEL: &str =
+    "sha256(convert_to('[sealed:x' || replace(e.id::text, '-', '') || ']', 'UTF8'))";
+
+/// Which of a sealed claim's evidence rows the seal covers: those owned by the
+/// claim's OWNER (operator ruling R-78). A SQL predicate over the aliases `e`
+/// (evidence) and `c` (its claim).
+///
+/// An evidence row names one claim, but what it records can bear on others,
+/// and a row another group holds on the claim is that group's: the seal leaves
+/// it as it is (no ciphertext row, body and digest untouched), rather than
+/// blanking it under the claim group's key.
+///
+/// Reach (operator ruling R-101): evidence rows are per claim, so a claim's
+/// rows are its own copies. A restrict runs before the seal, and migration
+/// 168's narrowing (`epigraph_propagate_tenancy`) moves the narrowing claim's
+/// inherited rows and its writers' own (writer-owned) rows onto the claim's
+/// group, so at seal time the rows this keeps out are the ones another group
+/// holds through a visibility pin (operator `hide`, migration 110). The same
+/// body on ANOTHER public claim is that claim's own row: neither the narrowing
+/// nor the seal touches it, so public evidence supporting a public claim stays
+/// public. Backlog c2fffbc9 (ruling R-102) later replaces the per-claim row
+/// with a de-duplicated evidence node linked through the generic edges table.
+///
+/// The manifest ([`PrivatizationRepository::seal_manifest_page_conn`]), the
+/// commit's TCB shape ([`PrivatizationRepository::seal_tcb_shape_conn`]) and the
+/// mutation ([`PrivatizationRepository::seal_claims_conn`]) all apply it, so the
+/// set served, the set the commit must cover and the set sealed are one set.
+const SEAL_EVIDENCE_OWNER_PREDICATE: &str = "e.owner_group_id = c.owner_group_id";
+
+/// The key under which a seal manifest carries an evidence row's
+/// `evidence.content_hash` (lowercase hex) inside that row's `properties`.
+///
+/// The seal replaces the column with [`SEAL_EVIDENCE_DIGEST_SENTINEL`], and a
+/// body-less (external) row's digest was supplied by its writer, so the
+/// server could not rebuild it on unseal: like
+/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`], it rides in the properties the client
+/// encrypts, and unseal splits it back out into the column of a row restored
+/// without a body. A row restored WITH a body gets BLAKE3 of that body
+/// instead, whatever the carrier says.
+pub const SEALED_EVIDENCE_CONTENT_HASH_KEY: &str = "$sealed_content_hash";
 
 /// The key under which a seal manifest carries an evidence row's
 /// `evidence.source_url` inside that row's `properties`.
@@ -857,40 +932,72 @@ pub const SEALED_EVIDENCE_SOURCE_URL_KEY: &str = "$sealed_source_url";
 
 /// `properties` as the seal manifest serves it for one evidence row: the row's
 /// own properties, plus its `source_url` under
-/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`] when the column holds one.
+/// [`SEALED_EVIDENCE_SOURCE_URL_KEY`] when the column holds one, and its
+/// `content_hash` (hex) under [`SEALED_EVIDENCE_CONTENT_HASH_KEY`].
 ///
 /// A non-object `properties` (the schema does not forbid one) is served
-/// unchanged and the URL is not folded, because there is no key to put it
-/// under; the seal still NULLs the column. Every writer in this codebase
-/// stores an object.
+/// unchanged and neither column is folded, because there is no key to put them
+/// under; the seal still NULLs the URL and replaces the digest, and unseal
+/// then recomputes the digest from the restored body (a body-less row keeps
+/// the sentinel). Every writer in this codebase stores an object.
 #[must_use]
 pub fn seal_manifest_evidence_properties(
     properties: &serde_json::Value,
     source_url: Option<&str>,
+    content_hash: &[u8],
 ) -> serde_json::Value {
     let mut out = properties.clone();
-    if let (Some(url), Some(map)) = (source_url, out.as_object_mut()) {
+    if let Some(map) = out.as_object_mut() {
+        if let Some(url) = source_url {
+            map.insert(
+                SEALED_EVIDENCE_SOURCE_URL_KEY.to_string(),
+                serde_json::Value::String(url.to_string()),
+            );
+        }
         map.insert(
-            SEALED_EVIDENCE_SOURCE_URL_KEY.to_string(),
-            serde_json::Value::String(url.to_string()),
+            SEALED_EVIDENCE_CONTENT_HASH_KEY.to_string(),
+            serde_json::Value::String(hex::encode(content_hash)),
         );
     }
     out
 }
 
+/// One evidence row's restored `properties`, split by
+/// [`split_unsealed_evidence_properties`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsealedEvidenceProperties {
+    /// The properties with both carrier keys removed.
+    pub properties: serde_json::Value,
+    /// The URL [`SEALED_EVIDENCE_SOURCE_URL_KEY`] carried, if any.
+    pub source_url: Option<String>,
+    /// The digest [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] carried, if it was
+    /// 64 hex characters. Anything else is dropped, as if absent.
+    pub content_hash: Option<Vec<u8>>,
+}
+
 /// The inverse of [`seal_manifest_evidence_properties`]: the restored
-/// properties with [`SEALED_EVIDENCE_SOURCE_URL_KEY`] removed, and the URL it
-/// carried, if any.
+/// properties with [`SEALED_EVIDENCE_SOURCE_URL_KEY`] and
+/// [`SEALED_EVIDENCE_CONTENT_HASH_KEY`] removed, and what they carried.
 #[must_use]
 pub fn split_unsealed_evidence_properties(
     properties: &serde_json::Value,
-) -> (serde_json::Value, Option<String>) {
+) -> UnsealedEvidenceProperties {
     let mut out = properties.clone();
-    let url = out
-        .as_object_mut()
-        .and_then(|map| map.remove(SEALED_EVIDENCE_SOURCE_URL_KEY))
-        .and_then(|v| v.as_str().map(str::to_string));
-    (out, url)
+    let (source_url, content_hash) = match out.as_object_mut() {
+        Some(map) => (
+            map.remove(SEALED_EVIDENCE_SOURCE_URL_KEY)
+                .and_then(|v| v.as_str().map(str::to_string)),
+            map.remove(SEALED_EVIDENCE_CONTENT_HASH_KEY)
+                .and_then(|v| v.as_str().and_then(|h| hex::decode(h).ok()))
+                .filter(|bytes| bytes.len() == 32),
+        ),
+        None => (None, None),
+    };
+    UnsealedEvidenceProperties {
+        properties: out,
+        source_url,
+        content_hash,
+    }
 }
 
 /// `privacy_tier` on every encryption row.
@@ -955,7 +1062,8 @@ pub struct SealManifestItem {
     pub properties: serde_json::Value,
     /// Every `claim_versions` row for this claim.
     pub versions: Vec<SealManifestVersion>,
-    /// Every `evidence` row for this claim.
+    /// Every `evidence` row for this claim that the claim's owner holds
+    /// ([`SEAL_EVIDENCE_OWNER_PREDICATE`]).
     pub evidence: Vec<SealManifestEvidence>,
 }
 
@@ -1038,7 +1146,8 @@ pub struct SealTcbShape {
     pub claim_id: Uuid,
     /// Every live `claim_versions.id` for it.
     pub version_ids: Vec<Uuid>,
-    /// Every live `evidence.id` for it.
+    /// Every live `evidence.id` for it that the claim's owner holds
+    /// ([`SEAL_EVIDENCE_OWNER_PREDICATE`]).
     pub evidence_ids: Vec<Uuid>,
 }
 
@@ -2653,6 +2762,216 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })
     }
 
+    /// `restrict`, the plan half: move into the target group every PUBLIC
+    /// `workflows` row whose plan this batch completed, and return each moved
+    /// row with its pre-image (ruling R-98 Q8(a), backlog 630af617 (4)).
+    ///
+    /// # A row moves only with its WHOLE plan
+    ///
+    /// A row is moved when (a) it executes, at levels 0..2, one of
+    /// `moved_claim_ids` (claims THIS batch moved, from
+    /// [`Self::restrict_claims_conn`]), and (b) EVERY level 0..2 claim it
+    /// executes is now `('group', target_group_id)`. Level 3 operation atoms
+    /// are content-addressed across documents and say nothing about the plan
+    /// (migration 183's rule), so they neither anchor nor block a move. Every
+    /// `executes` edge counts, retracted or not, as the plan readers and 183's
+    /// backfill count them.
+    ///
+    /// So a row with one structural claim still public, or private to ANOTHER
+    /// group, is not part of this privatization as a unit and stays where it
+    /// is: moving it would hide a public plan from every reader outside the
+    /// target group, or take a plan away from the other group's members. A
+    /// row already in some group is left alone too (it is private either way).
+    ///
+    /// # Evaluated on the batch's own state, under its lock
+    ///
+    /// It runs in the apply batch's transaction, after the claims UPDATE and
+    /// behind [`Self::begin_batch_conn`]'s global lock, and locks the rows it
+    /// moves (`FOR UPDATE`). So the decision is the handler's re-validation of
+    /// these rows: it is made on the state at apply, never on a set frozen at
+    /// plan time, and a row that gained a public step or was re-tenanted since
+    /// the plan was frozen is not moved. Because the anchor is the claims this
+    /// batch moved and the predicate reads the post-UPDATE state, a row moves
+    /// in the batch that moves its LAST structural claim.
+    ///
+    /// The caller records the returned pre-images in the plan's audit trail
+    /// ([`Self::record_workflow_moves_conn`]) on the same transaction; that
+    /// record is what [`Self::restore_plan_workflows_conn`] reverses. (It is
+    /// an audit row, not a plan item: plan items are the frozen, digested set
+    /// the handler re-hashes before every run, and a row decided at apply is
+    /// not part of it.)
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restrict_plan_workflows_conn(
+        conn: &mut PgConnection,
+        moved_claim_ids: &[Uuid],
+        target_group_id: Uuid,
+    ) -> Result<Vec<WorkflowMove>, DbError> {
+        if moved_claim_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, WorkflowMove>(
+            r#"
+            WITH completed AS (
+                SELECT w.id,
+                       w.visibility::text AS before_visibility,
+                       w.owner_group_id AS before_owner_group_id
+                  FROM public.workflows w
+                 WHERE w.visibility = 'public'
+                   AND EXISTS (
+                       SELECT 1
+                         FROM public.edges e
+                         JOIN public.claims c ON c.id = e.target_id
+                        WHERE e.source_id = w.id
+                          AND e.source_type = 'workflow' AND e.target_type = 'claim'
+                          AND e.relationship = 'executes'
+                          AND e.target_id = ANY($1)
+                          AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$')
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM public.edges e
+                         JOIN public.claims c ON c.id = e.target_id
+                        WHERE e.source_id = w.id
+                          AND e.source_type = 'workflow' AND e.target_type = 'claim'
+                          AND e.relationship = 'executes'
+                          AND btrim(c.properties->>'level') ~ '^[+]?0*[0-2]$'
+                          AND NOT (c.visibility = 'group' AND c.owner_group_id = $2))
+                 ORDER BY w.id
+                   FOR UPDATE OF w
+            )
+            UPDATE public.workflows w
+               SET visibility = 'group', owner_group_id = $2
+              FROM completed k
+             WHERE w.id = k.id
+            RETURNING w.id AS workflow_id, k.before_visibility, k.before_owner_group_id
+            "#,
+        )
+        .bind(moved_claim_ids)
+        .bind(target_group_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Record the `workflows` rows an apply batch moved
+    /// ([`Self::restrict_plan_workflows_conn`]) in the plan's audit trail: one
+    /// `privatization_audit` row each, `kind = 'workflow'`,
+    /// `action = 'item.apply'`, with the row's pre-image as the `before_*`
+    /// pair and `('group', target_group_id)` as the `after_*` pair. Written on
+    /// the batch's transaction, so a move and its record commit together.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_workflow_moves_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        moves: &[WorkflowMove],
+        target_group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        if moves.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
+        let visibilities: Vec<String> = moves.iter().map(|m| m.before_visibility.clone()).collect();
+        let owners: Vec<Uuid> = moves.iter().map(|m| m.before_owner_group_id).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, before_owner_group_id,
+                    after_visibility, after_owner_group_id, correlation_id)
+            SELECT $1, $2, 'item.apply', 'workflow', m.id, m.v, m.o, 'group', $6, $7
+              FROM unnest($3::uuid[], $4::text[], $5::uuid[]) AS m(id, v, o)
+            "#,
+        )
+        .bind(plan_id)
+        .bind(actor_agent_id)
+        .bind(&ids)
+        .bind(&visibilities)
+        .bind(&owners)
+        .bind(target_group_id)
+        .bind(correlation_id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
+    /// Revert, the plan half: put every `workflows` row this plan moved back
+    /// to the pre-image its `item.apply` audit row recorded, and record each
+    /// restore (`kind = 'workflow'`, `action = 'item.revert'`). Returns how
+    /// many rows it restored.
+    ///
+    /// The pre-image is the plan's FIRST `item.apply` record for the row (a
+    /// row moves once per apply; a re-dispatched apply finds it no longer
+    /// public). As [`Self::restore_claims_conn`] does for claims, only a row
+    /// that still carries this plan's stamp, `('group', target_group_id)`, is
+    /// restored; a row some later decision re-tenanted is left alone.
+    ///
+    /// The revert handler calls this once its claims are all back (the batch
+    /// that finds no `applied` item left), so an interrupted or aborted revert
+    /// leaves the row private, never public over private claims.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn restore_plan_workflows_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        target_group_id: Uuid,
+    ) -> Result<u64, DbError> {
+        sqlx::query(
+            r#"
+            WITH recorded AS (
+                SELECT DISTINCT ON (a.entity_id)
+                       a.entity_id, a.before_visibility, a.before_owner_group_id
+                  FROM public.privatization_audit a
+                 WHERE a.plan_id = $1 AND a.kind = 'workflow' AND a.action = 'item.apply'
+                   AND a.entity_id IS NOT NULL
+                   AND a.before_visibility IS NOT NULL
+                   AND a.before_owner_group_id IS NOT NULL
+                 ORDER BY a.entity_id, a.id
+            ), stamped AS (
+                SELECT w.id, r.before_visibility, r.before_owner_group_id
+                  FROM public.workflows w
+                  JOIN recorded r ON r.entity_id = w.id
+                 WHERE w.visibility = 'group' AND w.owner_group_id = $2
+                 ORDER BY w.id
+                   FOR UPDATE OF w
+            ), restored AS (
+                UPDATE public.workflows w
+                   SET visibility = k.before_visibility,
+                       owner_group_id = k.before_owner_group_id
+                  FROM stamped k
+                 WHERE w.id = k.id
+                RETURNING w.id, k.before_visibility, k.before_owner_group_id
+            )
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, before_owner_group_id,
+                    after_visibility, after_owner_group_id, correlation_id)
+            SELECT $1, $3, 'item.revert', 'workflow', r.id, 'group', $2,
+                   r.before_visibility, r.before_owner_group_id, $4
+              FROM restored r
+            "#,
+        )
+        .bind(plan_id)
+        .bind(target_group_id)
+        .bind(actor_agent_id)
+        .bind(correlation_id)
+        .execute(&mut *conn)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
     /// Restore a batch of claims to the tenancy the freeze recorded.
     ///
     /// The `before_visibility` / `before_owner_group_id` columns were read from
@@ -2689,6 +3008,12 @@ impl PrivatizationRepository {
     /// scope `SET` would leave it armed on a pooled connection for whatever ran
     /// next — the hazard [`Self::select`] documents for `statement_timeout`,
     /// with a far worse payload.
+    ///
+    /// # Claims only
+    ///
+    /// The `workflows` rows the apply moved with their plans (ruling R-98)
+    /// are restored by [`Self::restore_plan_workflows_conn`], once every claim
+    /// is back.
     ///
     /// **The sealed arm of that guard is NOT reachable from here and must not
     /// be.** It has no GUC override by design (sec F11), so a revert of a plan
@@ -3084,15 +3409,19 @@ impl PrivatizationRepository {
                 Option<String>,
                 serde_json::Value,
                 Option<String>,
+                Vec<u8>,
             ),
-        >(
+        >(&format!(
             r"
-            SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url
-              FROM public.evidence e
-             WHERE e.claim_id = ANY($1)
-             ORDER BY e.claim_id, e.id
-            ",
-        )
+                SELECT e.claim_id, e.id, e.raw_content, e.properties, e.source_url,
+                       e.content_hash
+                  FROM public.evidence e
+                  JOIN public.claims c ON c.id = e.claim_id
+                 WHERE e.claim_id = ANY($1)
+                   AND {SEAL_EVIDENCE_OWNER_PREDICATE}
+                 ORDER BY e.claim_id, e.id
+                "
+        ))
         .bind(&claim_ids)
         .fetch_all(&mut *conn)
         .await
@@ -3117,15 +3446,19 @@ impl PrivatizationRepository {
                     .iter()
                     .filter(|(cid, ..)| *cid == claim_id)
                     .map(
-                        |(_, id, raw_content, properties, source_url)| SealManifestEvidence {
-                            id: *id,
-                            raw_content: raw_content.clone(),
-                            // The column is plaintext the seal NULLs, so it
-                            // travels inside the encrypted properties.
-                            properties: seal_manifest_evidence_properties(
-                                properties,
-                                source_url.as_deref(),
-                            ),
+                        |(_, id, raw_content, properties, source_url, content_hash)| {
+                            SealManifestEvidence {
+                                id: *id,
+                                raw_content: raw_content.clone(),
+                                // The URL is plaintext the seal NULLs and the
+                                // digest one it replaces, so both travel inside
+                                // the encrypted properties.
+                                properties: seal_manifest_evidence_properties(
+                                    properties,
+                                    source_url.as_deref(),
+                                    content_hash,
+                                ),
+                            }
                         },
                     )
                     .collect(),
@@ -3152,19 +3485,21 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(
+        let rows = sqlx::query_as::<_, (Uuid, Vec<Uuid>, Vec<Uuid>)>(&format!(
             r"
             SELECT ids.claim_id,
                    COALESCE(ARRAY(SELECT v.id FROM public.claim_versions v
                                    WHERE v.claim_id = ids.claim_id
                                    ORDER BY v.id), ARRAY[]::uuid[]) AS version_ids,
                    COALESCE(ARRAY(SELECT e.id FROM public.evidence e
+                                   JOIN public.claims c ON c.id = e.claim_id
                                    WHERE e.claim_id = ids.claim_id
+                                     AND {SEAL_EVIDENCE_OWNER_PREDICATE}
                                    ORDER BY e.id), ARRAY[]::uuid[]) AS evidence_ids
               FROM unnest($1::uuid[]) AS ids(claim_id)
              ORDER BY ids.claim_id
-            ",
-        )
+            "
+        ))
         .bind(claim_ids)
         .fetch_all(&mut *conn)
         .await
@@ -3217,7 +3552,9 @@ impl PrivatizationRepository {
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
     ///    `embedding_3072` again, and `privacy_tier`, which the plan's DDL for
-    ///    this table omits and the applied schema requires.
+    ///    this table omits and the applied schema requires. Only the rows the
+    ///    claim's owner holds ([`SEAL_EVIDENCE_OWNER_PREDICATE`], ruling R-78),
+    ///    selected by one read first, whatever evidence the commit names.
     /// 7. The derived-extraction DELETEs, over
     ///    [`SEAL_DELETE_TABLES`], keeping the writer-owned rows of
     ///    [`SEAL_KEEPS_WRITER_OWNED`] (an outsider's challenge, ruling R-5).
@@ -3342,12 +3679,41 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
         }
 
-        // 5/6. Evidence.
+        // 5/6. Evidence: only the rows the claim's owner holds (ruling R-78,
+        //      [`SEAL_EVIDENCE_OWNER_PREDICATE`]), whatever the commit names.
+        //      Read once, so the ciphertext INSERT and the blanking UPDATE
+        //      cover the same set.
+        let named: Vec<Uuid> = items
+            .iter()
+            .filter(|i| sealed.contains(&i.claim_id))
+            .flat_map(|i| i.evidence.iter().map(|e| e.id))
+            .collect();
+        let owners: std::collections::HashSet<Uuid> = if named.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            sqlx::query_scalar::<_, Uuid>(&format!(
+                r"
+                SELECT e.id
+                  FROM public.evidence e
+                  JOIN public.claims c ON c.id = e.claim_id
+                 WHERE e.id = ANY($1)
+                   AND e.claim_id = ANY($2)
+                   AND {SEAL_EVIDENCE_OWNER_PREDICATE}
+                "
+            ))
+            .bind(&named)
+            .bind(&sealed)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?
+            .into_iter()
+            .collect()
+        };
         let mut evidence_ids: Vec<Uuid> = Vec::new();
         let mut evidence_cts: Vec<Vec<u8>> = Vec::new();
         let mut evidence_prop_cts: Vec<Vec<u8>> = Vec::new();
         for item in items.iter().filter(|i| sealed.contains(&i.claim_id)) {
-            for e in &item.evidence {
+            for e in item.evidence.iter().filter(|e| owners.contains(&e.id)) {
                 evidence_ids.push(e.id);
                 evidence_cts.push(e.content_ct.clone());
                 evidence_prop_cts.push(e.properties_ct.clone());
@@ -3375,17 +3741,18 @@ impl PrivatizationRepository {
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
 
-            sqlx::query(
+            sqlx::query(&format!(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = $2,
+                       content_hash = {SEAL_EVIDENCE_DIGEST_SENTINEL},
                        embedding = NULL,
                        embedding_3072 = NULL,
-                       properties = '{}'::jsonb,
+                       properties = '{{}}'::jsonb,
                        source_url = NULL
                  WHERE e.id = ANY($1)
-                ",
-            )
+                "
+            ))
             .bind(&evidence_ids)
             .bind(SEAL_EVIDENCE_SENTINEL)
             .execute(&mut *conn)
@@ -3747,29 +4114,61 @@ impl PrivatizationRepository {
         let mut evidence_contents: Vec<Option<String>> = Vec::new();
         let mut evidence_props: Vec<serde_json::Value> = Vec::new();
         let mut evidence_urls: Vec<Option<String>> = Vec::new();
+        let mut evidence_hashes: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut evidence_body_hashes: Vec<Option<Vec<u8>>> = Vec::new();
         for item in items.iter().filter(|i| restored.contains(&i.claim_id)) {
             for e in &item.evidence {
                 evidence_ids.push(e.id);
                 evidence_parents.push(item.claim_id);
                 evidence_contents.push(e.raw_content.clone());
-                // The seal folded `evidence.source_url` into the encrypted
-                // properties; split it back out into the column. COALESCE keeps
-                // the column of a row sealed before the fold existed.
-                let (properties, source_url) = split_unsealed_evidence_properties(&e.properties);
-                evidence_props.push(properties);
-                evidence_urls.push(source_url);
+                // The seal folded `evidence.source_url` and `content_hash`
+                // into the encrypted properties; split them back out into the
+                // columns.
+                let split = split_unsealed_evidence_properties(&e.properties);
+                evidence_props.push(split.properties);
+                evidence_urls.push(split.source_url);
+                evidence_hashes.push(split.content_hash);
+                evidence_body_hashes.push(
+                    e.raw_content
+                        .as_ref()
+                        .map(|body| blake3::hash(body.as_bytes()).as_bytes().to_vec()),
+                );
             }
         }
         if !evidence_ids.is_empty() {
+            // The digest, in order: for a row whose body is restored, BLAKE3 of
+            // that body, always, so `content_hash` = BLAKE3(`raw_content`)
+            // holds whatever the unsealing client carried; else (a body-less,
+            // external row) the digest the seal folded into the ciphertext,
+            // the only copy of its writer-supplied value; else the column as
+            // it is. A body-less row sealed without the fold therefore keeps
+            // the sentinel: its digest is not recoverable.
+            //
+            // Only rows that hold a ciphertext row are restored. After ruling
+            // R-78 a sealed claim can also carry another group's row the seal
+            // never covered, still in plaintext; an item naming it must not
+            // rewrite it. The route's exact-cover check refuses such a commit
+            // first; this keeps the mutation correct on its own, as
+            // `seal_claims_conn` re-filters by owner.
+            //
+            // A restored digest may equal a row the same owner wrote on the
+            // claim while it was sealed. Evidence has no unique key (migration
+            // 171), so both rows stay, as any stored duplicate does; the unseal
+            // is not refused.
             sqlx::query(
                 r"
                 UPDATE public.evidence e
                    SET raw_content = t.raw_content,
                        properties = t.properties,
-                       source_url = COALESCE(t.source_url, e.source_url)
-                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[])
-                    AS t(evidence_id, claim_id, raw_content, properties, source_url)
+                       source_url = COALESCE(t.source_url, e.source_url),
+                       content_hash = COALESCE(t.body_hash, t.content_hash, e.content_hash)
+                  FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::jsonb[], $5::text[],
+                              $6::bytea[], $7::bytea[])
+                    AS t(evidence_id, claim_id, raw_content, properties, source_url,
+                         content_hash, body_hash)
                  WHERE e.id = t.evidence_id AND e.claim_id = t.claim_id
+                   AND EXISTS (SELECT 1 FROM public.evidence_encryption ee
+                                WHERE ee.evidence_id = e.id)
                 ",
             )
             .bind(&evidence_ids)
@@ -3777,6 +4176,8 @@ impl PrivatizationRepository {
             .bind(&evidence_contents)
             .bind(&evidence_props)
             .bind(&evidence_urls)
+            .bind(&evidence_hashes)
+            .bind(&evidence_body_hashes)
             .execute(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;

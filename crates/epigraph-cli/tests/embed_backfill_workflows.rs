@@ -62,9 +62,18 @@ async fn run_bin(pool: &PgPool, args: &[&str]) -> Run {
 async fn seed_unembedded_workflow(pool: &PgPool, goal: &str) -> Uuid {
     let id = Uuid::new_v4();
     let name = format!("u031-probe-{}", id.simple());
-    WorkflowRepository::insert_root(pool, id, &name, 0, goal, None, serde_json::json!({}))
-        .await
-        .expect("insert workflow root");
+    WorkflowRepository::insert_root(
+        pool,
+        id,
+        &name,
+        0,
+        goal,
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
     id
 }
 

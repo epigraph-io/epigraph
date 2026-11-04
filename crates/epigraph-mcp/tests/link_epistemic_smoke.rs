@@ -1452,3 +1452,58 @@ async fn belief_wired_false_names_its_reason(pool: PgPool) {
             .expect("count edge BBA");
     assert_eq!(bba_rows, 0, "the failed wiring stored no BBA: {failed}");
 }
+
+// ── case-folded relationships in any case — backlog 3ce5e00c ────────────────
+
+/// `link_epistemic` is the MCP twin of `POST /api/v1/edges`, which accepts the
+/// case-folded relationships (`supports`, `contradicts`, `corroborates`,
+/// `refutes`) in any ASCII case and stores them lower case. Before, the MCP
+/// allow-list was byte-exact, so `CONTRADICTS` (the spelling the HTTP route
+/// used to store) was refused here. Now it is accepted and stored, reported and
+/// deduped as `contradicts`; a non-folded relationship in the wrong case is
+/// still refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upper_case_folded_relationship_is_stored_lower_case(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let source = seed_claim_with_belief(&pool, 0.9, 0.9, Some(0.9)).await;
+    let target = seed_claim(&pool, "upper-case contradicted", 0.5).await;
+
+    let link = |rel: &str| LinkEpistemicParams {
+        source_claim_id: source.to_string(),
+        target_claim_id: target.to_string(),
+        relationship: rel.to_string(),
+        properties: None,
+    };
+    let first = parse_response(
+        &do_link_epistemic(&server, &viewer, link("CONTRADICTS"), None)
+            .await
+            .expect("CONTRADICTS is accepted"),
+    );
+    assert!(first.was_created);
+    assert_eq!(first.relationship, "contradicts");
+    assert_eq!(edge_count(&pool, source, target, "contradicts").await, 1);
+    assert_eq!(edge_count(&pool, source, target, "CONTRADICTS").await, 0);
+
+    // The lower-case spelling is the same edge.
+    let second = parse_response(
+        &do_link_epistemic(&server, &viewer, link("contradicts"), None)
+            .await
+            .expect("contradicts is accepted"),
+    );
+    assert!(
+        !second.was_created,
+        "same relationship, other spelling: a dedup hit"
+    );
+    assert_eq!(second.edge_id, first.edge_id);
+
+    // Not folded: `ELABORATES` stays an unknown relationship.
+    let err = do_link_epistemic(&server, &viewer, link("ELABORATES"), None)
+        .await
+        .expect_err("a non-folded relationship is matched exactly");
+    assert!(
+        err.message.contains("invalid relationship"),
+        "{}",
+        err.message
+    );
+}

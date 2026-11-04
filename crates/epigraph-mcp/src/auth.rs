@@ -275,7 +275,7 @@ pub fn unauthorized(resource_metadata_url: Option<&str>, error: &str) -> Respons
 /// AUTHOR-STAMPED writes only, `EpiGraphMcpFull::write_identity` refuses a
 /// principal-less context without a write scope as a second layer. Write and
 /// admin tools that never resolve an author (`stage_claims`, `create_frame`,
-/// `report_hierarchical_outcome`, `theme_cluster`, and the `claims:admin`
+/// `report_hierarchical_outcome`, and the `claims:admin`
 /// maintenance tools) have the scope gate as their ONLY refusal, so a
 /// `SCOPE_MAP` entry that put one of them on a `:read` scope would open it
 /// here. Reads are unchanged. A caller

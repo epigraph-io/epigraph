@@ -677,4 +677,42 @@ mod tests {
         .expect_err("mismatch");
         assert!(reason.contains("does not hash to its key"), "{reason}");
     }
+
+    /// A frame written by the PREVIOUS zstd binding (0.13.3 / zstd-safe 7.3.0,
+    /// level 19, captured verbatim) is what deployed databases already hold in
+    /// `agent_prompt_blobs`. The reader must still decompress it and
+    /// hash-verify it after a binding bump. The literal is fixed, so this pins
+    /// cross-version decoding rather than a same-binding round trip.
+    #[test]
+    fn a_frame_written_by_the_previous_zstd_binding_still_verifies() {
+        const RAW: &[u8] = b"# Learned\n\
+- prefer the repository API over raw SQL\n\
+- prefer the repository API over raw SQL for graph writes\n\
+- re-measure a finding before fixing it\n\
+- re-measure a finding before fixing it at the current base\n";
+        const FRAME_0_13_3: &str = "28b52ffd20d14d030072071616903b07403749a0a52022060d0ec858\
+6747934a5e3e25c9308fc6e6bf4162363288adfa6ef9a8d258d2d86ad66f609a517e55828eec4f97975\
+77ab73a14469f7c6fc755208246779141f7fc7a89bd97ffaa52e2f6f45020040007238c4b159e982b14\
+0c5250";
+        let frame = hex::decode(FRAME_0_13_3).expect("hex literal");
+        // CALIBRATION: the literal is a real compressed frame (zstd magic, and
+        // smaller than its input), so the entropy decoder is exercised, not a
+        // stored raw block.
+        assert_eq!(&frame[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        assert!(frame.len() < RAW.len(), "{} >= {}", frame.len(), RAW.len());
+        let key = blake3::hash(RAW).as_bytes().to_vec();
+
+        let blob = verified_blob("learned_md", Some(key.clone()), Some(frame.clone()))
+            .expect("an old frame still verifies")
+            .expect("present");
+        assert_eq!(blob.bytes, RAW);
+        assert_eq!(&blob.blob_hash[..], &key[..]);
+
+        // CALIBRATION: one flipped byte in the compressed payload is withheld,
+        // so the pass above is not vacuous.
+        let mut corrupt = frame;
+        let at = corrupt.len() / 2;
+        corrupt[at] ^= 0x01;
+        verified_blob("learned_md", Some(key), Some(corrupt)).expect_err("corrupted frame");
+    }
 }

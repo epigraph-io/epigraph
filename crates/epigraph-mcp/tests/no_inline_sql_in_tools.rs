@@ -116,7 +116,11 @@ const EXPECTED_INLINE_SQL: &[(&str, usize, usize)] = &[
     // read from the error message no longer reaches the caller. Fixture SQL.
     ("workflow_hierarchical.rs", 2, 14),
     ("workflow_ingest.rs", 0, 10),
-    ("workflows.rs", 2, 0),
+    // 2 -> 1 (ruling R-74, migration 183): `report_workflow_outcome`'s
+    // routing probe moved to the repo layer
+    // (`WorkflowRepository::viewer_reads_row`, viewer-spliced, on the caller's
+    // stamped read), now that `workflows` carries tenancy.
+    ("workflows.rs", 1, 0),
 ];
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,

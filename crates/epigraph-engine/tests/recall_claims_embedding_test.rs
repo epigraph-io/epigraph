@@ -40,6 +40,7 @@ async fn seed_agent(pool: &PgPool) -> Uuid {
 #[sqlx::test(migrations = "../../migrations")]
 async fn recall_semantic_path_reads_claims_embedding(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
     // Deterministic mock: embedding a fixed query text always yields the same
     // 1536-d vector, so seeding a claim with that exact vector guarantees an
     // exact-match (cosine ~1.0) semantic hit.
@@ -72,7 +73,7 @@ async fn recall_semantic_path_reads_claims_embedding(pool: PgPool) {
     .await
     .expect("seed claim with claims.embedding vector");
 
-    let results = recall(&pool, &viewer, &mock, query, 10, 0.5)
+    let results = recall(&pool, &scoped, &viewer, &mock, query, 10, 0.5)
         .await
         .expect("recall must not error");
 

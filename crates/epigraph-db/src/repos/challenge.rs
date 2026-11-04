@@ -226,6 +226,13 @@ impl ChallengeRepository {
     }
 
     /// Update challenge state (e.g. pending -> accepted/rejected).
+    ///
+    /// A plain UPDATE of all four resolution columns with a caller-supplied
+    /// `resolved_by`, so since migration 170 (ruling R-13) it lands only on a
+    /// PRIVILEGED connection (maintenance, superuser, BYPASSRLS): an
+    /// application session is refused `CR07` (42501) unless the change is a
+    /// withdrawal. A request path sets a resolution through
+    /// [`Self::resolve_as_claim_owner`].
     pub async fn update_state(
         pool: &PgPool,
         challenge_id: Uuid,

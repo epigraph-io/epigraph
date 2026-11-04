@@ -15,6 +15,11 @@
 //!   and dedup at `claims:write` since batch OA1).
 //! - **read-only** (`ro`): every read scope, no writes, no admin.
 
+/// The `claims:admin` scope, named once so a caller asking the check chokepoint
+/// (`epigraph_auth::AuthContext::has_scope`) about it does not spell it again
+/// (`epigraph-api/tests/admin_scope_literals.rs`).
+pub const CLAIMS_ADMIN: &str = "claims:admin";
+
 /// Scopes that gate admin-only operations. These are EXCLUDED from `wo` and
 /// `ro`; included in `admin`.
 ///
@@ -51,10 +56,12 @@
 /// [`PUBLIC_CLIENT_READ_SCOPES`], the agent arm grants nothing), and
 /// `routes/agents.rs` grants [`AGENT_PROVISION_SCOPES`]. It reaches a token
 /// only through `bootstrap_clients` minting `epigraph-admin`, or an operator
-/// UPDATE. **Known third path:** `POST /api/v1/admin/clients/:id/approve`
-/// (`routes/admin.rs`) writes `granted_scopes` verbatim with no validation
-/// against `allowed_scopes`, so a `clients:admin` holder can grant it. That is
-/// pre-existing and is not closed here.
+/// UPDATE. **Known third path:** the approval definer
+/// `epigraph_oauth_client_approve` writes `granted_scopes` verbatim with no
+/// validation against `allowed_scopes`. Since migration 188 only a maintenance
+/// session may call it (`POST /api/v1/admin/clients/:id/approve` answers 501
+/// MOVED), so a request-path `clients:admin` holder no longer can; a
+/// maintenance session still can, which is not closed here.
 ///
 /// # An operator may grant these to a HUMAN's own client (batch OA1)
 ///

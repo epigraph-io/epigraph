@@ -155,8 +155,9 @@ pub async fn create_span(
     // create an attributed_to edge: agent → span
     if req.parent_span_id.is_none() {
         if let Some(agent_id) = req.agent_id {
-            let _ = epigraph_db::repos::EdgeRepository::create(
+            let _ = epigraph_db::repos::EdgeRepository::create_signed(
                 &state.db_pool,
+                state.edge_signing_key(),
                 agent_id,
                 "agent",
                 row.id,
@@ -206,8 +207,9 @@ pub async fn close_span(
 
     // Auto-create edges for generated_ids: span --generated--> claim
     for claim_id in &row.generated_ids {
-        let _ = epigraph_db::repos::EdgeRepository::create(
+        let _ = epigraph_db::repos::EdgeRepository::create_signed(
             &state.db_pool,
+            state.edge_signing_key(),
             row.id,
             "span",
             *claim_id,
@@ -222,8 +224,9 @@ pub async fn close_span(
 
     // Auto-create edges for consumed_ids: span --uses_evidence--> claim
     for claim_id in &row.consumed_ids {
-        let _ = epigraph_db::repos::EdgeRepository::create(
+        let _ = epigraph_db::repos::EdgeRepository::create_signed(
             &state.db_pool,
+            state.edge_signing_key(),
             row.id,
             "span",
             *claim_id,

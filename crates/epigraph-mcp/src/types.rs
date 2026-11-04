@@ -139,7 +139,7 @@ pub struct SubmitClaimParams {
     pub labels: Vec<String>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -502,7 +502,7 @@ pub struct MemorizeParams {
     pub tags: Option<Vec<String>>,
 
     #[schemars(
-        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies."
+        description = "Semantic novelty gate threshold on ANN cosine distance to the nearest existing (is_current) claim, checked only on genuinely new content (after content-hash dedup). Default 0.05: a nearer match returns the EXISTING claim id instead of inserting, writes nothing from this call, and marks the response deduplicated.by='novelty_gate'. A match in [threshold, 0.15) still inserts but is labeled 'near-duplicate'. Set to 0.0 to always insert (escape hatch) — the 0.15 near-duplicate label still applies. Not needed for recurring status reports: a claim labelled telemetry, gen-status, generator-summary, review-status, revise-status, research-scan, norcal-rfp-gen-status, norcal-rfp-review-status, norcal-rfp-revise-status, norcal-rfp-dedup-status, grant-gen-status, grant-run-status or grant-dedup-status is never suppressed (as if 0.0 were passed), so successive runs that differ only in numbers and dates each persist as their own claim."
     )]
     #[serde(default)]
     pub novelty_threshold: Option<f64>,
@@ -827,7 +827,7 @@ pub struct EvaluateWorkflowPromotionParams {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct StepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order; a step add_step left without a plan_index comes after every indexed step."
+        description = "Zero-based index of the step in the workflow's plan order: its step_follows chain, so a step add_step inserted at slot i is step i (when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last)."
     )]
     pub step_index: usize,
 
@@ -909,7 +909,7 @@ pub struct IngestWorkflowParams {
     pub extraction: epigraph_ingest::workflow::WorkflowExtraction,
 
     #[schemars(
-        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public."
+        description = "Optional declared tenancy for the claims this ingest creates: {\"visibility\": \"group\", \"owner_group_id\": <uuid>} (\"group\" is the only accepted visibility). The calling agent ITSELF must hold a live writer or admin membership of the group (its operator's membership does not count), and so must the workflow-ingest system agent; otherwise the call is refused and nothing is written. New claims and their executes edges are then readable only by members of the group. Claims the plan reuses (an unchanged step of an earlier generation, a shared operation atom, a whole re-ingest) keep their tenancy and are listed in the response's reused_items; a reused claim private to a group the calling agent does not write refuses the ingest. The workflows row (canonical_name, goal, metadata, and the goal embedding unless embed is false) stays instance-readable, so keep those neutral. Omit for the default: public, except that a new generation of a group-private lineage (a later generation of its canonical_name, or a variant of a group-private parent) inherits that lineage's group, and the calling agent itself must then write that group."
     )]
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
@@ -959,7 +959,7 @@ pub struct FindWorkflowHierarchicalParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HierarchicalStepExecution {
     #[schemars(
-        description = "Zero-based index of the step in the workflow's plan order (matches `executes`-edge ordering at level=2); a step add_step left without a plan_index comes after every indexed step. An out-of-range index is stored with a null step_claim_id."
+        description = "Zero-based index of the step in the workflow's plan order (the level-2 steps in step_follows chain order, as find_workflow lists them; a step add_step inserted at slot i is step i, except when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last). An out-of-range index is stored with a null step_claim_id."
     )]
     pub step_index: usize,
 
@@ -1469,11 +1469,11 @@ pub struct VerifyResponse {
     ///
     /// What `true` does NOT prove:
     /// * that the author asserted THIS claim. The signature covers
-    ///   `blake3(content)` only: no author, no `created_at`, and no claim /
-    ///   evidence distinction (evidence rows are signed the same way). Someone
-    ///   who can write the database directly can copy the author's signature
-    ///   from any claim or evidence row with the same bytes onto a row naming
-    ///   that author, and it reports bound.
+    ///   `blake3(content)` only: no author and no `created_at`, and under
+    ///   [`Self::signature_scheme`] `legacy` no claim / evidence distinction
+    ///   either. Someone who can write the database directly can copy the
+    ///   author's signature from any claim (or, legacy, evidence) row with the
+    ///   same bytes onto a row naming that author, and it reports bound.
     /// * the date. `created_at` is set by the writer and is not signed, so the
     ///   window test trusts it: a backdated row passes it.
     /// * anything, under an `identity-legacy` key: its private half is
@@ -1487,6 +1487,13 @@ pub struct VerifyResponse {
     /// `"unattested"` (only the signer's `agents.public_key` verifies it, and
     /// no attested row carries that key). `null` when no key verifies.
     pub key_kind: Option<&'static str>,
+    /// Which message the verifying signature was made over (ruling R-34):
+    /// `"v1"` (`epigraph-sig-v1:claim:` || digest, bound to the claim type) or
+    /// `"legacy"` (the bare digest, written before v1: it binds no entity
+    /// type, so an evidence row with the same bytes carries an equally valid
+    /// one). `null` when nothing verifies. A v1 signature tagged for evidence
+    /// or an edge never verifies a claim.
+    pub signature_scheme: Option<epigraph_crypto::SignatureScheme>,
     /// The authoritative integrity verdict. See [`HashCheck`] — in particular,
     /// only [`HashCheck::Mismatch`] is evidence of tampering.
     pub hash_check: HashCheck,
@@ -2397,7 +2404,9 @@ pub struct PaperResponse {
 
 #[derive(Debug, Serialize)]
 pub struct StoreWorkflowResponse {
-    /// `workflows.id` (deterministic from canonical_name + generation).
+    /// `workflows.id` (deterministic from canonical_name + generation). Left
+    /// out for a re-ingest of a row the caller cannot read (backlog c831df4a).
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub canonical_name: String,
     pub goal: String,
@@ -2831,6 +2840,25 @@ pub struct ChallengeclaimParams {
 pub struct ListChallengesParams {
     #[schemars(description = "UUID of the claim to list challenges for")]
     pub claim_id: String,
+}
+
+/// `resolve_challenge`'s parameters. There is no resolver field, and an
+/// unknown field is refused: the resolver is always the calling principal
+/// (operator ruling R-13).
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveChallengeParams {
+    #[schemars(description = "UUID of the challenge to resolve")]
+    pub challenge_id: String,
+
+    #[schemars(
+        description = "Resolution status to set: under_review, accepted or rejected. A pending challenge may be accepted or rejected directly, and a settled one re-resolved."
+    )]
+    pub state: String,
+
+    #[schemars(description = "Optional JSON object recording the resolution (e.g. the reason)")]
+    #[serde(default)]
+    pub resolution_details: Option<serde_json::Value>,
 }
 
 // ── Events ──
@@ -3429,7 +3457,7 @@ pub struct DecideMatchCandidateParams {
     #[schemars(description = "Match-candidate UUID to decide on")]
     pub candidate_id: String,
     #[schemars(
-        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — CORROBORATES for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
+        description = "Decision: 'promote' (records the edge the row's verifier_verdict calls for — corroborates for same/paraphrase/overlapping, contradicts for contradicts; refused for distinct) or 'reject'. To undo a promotion use the separate `retire_match_candidate` tool — it requires claims:admin because it withdraws another principal's assertion."
     )]
     pub verdict: String,
 }

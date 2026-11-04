@@ -927,6 +927,10 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
                         &format!("revision of {old}"),
                         epigraph_core::TruthValue::new(0.6).expect("truth"),
                         "operator binding probe",
+                        epigraph_db::SupersedeActor::new(
+                            writer,
+                            epigraph_db::SupersedeTool::SupersedeClaim,
+                        ),
                     )
                     .await;
                     if r.is_ok() {
@@ -1152,6 +1156,7 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
                 "a revision of l1",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
                 "operator binding probe",
+                epigraph_db::SupersedeActor::new(x, epigraph_db::SupersedeTool::SupersedeClaim),
             )
             .await;
             if r.is_ok() {
@@ -1387,12 +1392,25 @@ async fn supersede_on(
     old: Uuid,
 ) -> Result<(Uuid, Uuid), epigraph_db::DbError> {
     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_optional(&mut *tx)
+            .await
+            .expect("read the superseded claim's author")
+            .unwrap_or_else(uuid::Uuid::nil);
     let r = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut tx,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("custodial revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),
         "operator binding probe",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await;
     if r.is_ok() {
@@ -2254,19 +2272,33 @@ async fn the_registry_keys_on_its_client_and_holds_for_direct_writes(pool: PgPoo
     );
 }
 
-/// Delta review round 3 SEC-R3-1: the application role cannot take an OAuth
-/// client back out of `suspended` or `revoked` through 118's approval definer
-/// (the REST admin approval, which it may EXECUTE). So a human whose recorded
-/// client a maintenance session suspended stays un-registered, and that human's
-/// live agent stays refused. A revoked client stays revoked too. Promoting a
-/// `pending` client on the application role and re-activating on a privileged
-/// session both still work.
+/// Delta review round 3 SEC-R3-1: a non-privileged session cannot take an
+/// OAuth client back out of `suspended` or `revoked` through 118's approval
+/// definer. So a human whose recorded client a maintenance session suspended
+/// stays un-registered, and that human's live agent stays refused. A revoked
+/// client stays revoked too. Promoting a `pending` client on a non-privileged
+/// session and re-activating on a privileged session both still work.
+///
+/// Since migration 188 the application role may not EXECUTE the definer at all
+/// (`app_role_table_lockdown.rs::the_app_role_cannot_approve_an_oauth_client`),
+/// which would make every 42501 below the missing grant's rather than the
+/// guard's. The guard stays as a second layer for any other non-privileged
+/// route to the table, so this test re-grants EXECUTE to `epigraph_app` in its
+/// own throwaway database and keeps measuring the guard.
 ///
 /// Verified to fail: the `oauth_clients_reactivation_guard` trigger dropped ->
 /// the application role's approval re-activates B's suspended client, and Y is
 /// `live_link` again ("re-activated a suspended client").
 #[sqlx::test(migrations = "../../migrations")]
 async fn only_a_privileged_session_reactivates_a_suspended_or_revoked_client(pool: PgPool) {
+    // See the doc comment: isolate the guard from 188's REVOKE.
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION public.epigraph_oauth_client_approve(uuid, text[], uuid) \
+         TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-grant the definer to the application role, for this test only");
     let (b, b_group) = fixture::seed_human_operator(&pool, "human-b").await;
     let (y, _) = fixture::seed_agent_with_group(&pool, "b-agent-y").await;
     link_live(&pool, y, b).await;

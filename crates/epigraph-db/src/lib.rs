@@ -55,6 +55,7 @@ pub mod errors;
 pub mod label_validation;
 pub mod operator_binding;
 pub mod pool;
+pub mod refusal_codes;
 pub mod repos;
 pub mod visibility;
 
@@ -67,7 +68,7 @@ pub mod visibility;
 // keep that module path resolving. The constant is unaffected and is exported
 // below from where PR-08 actually put it.
 pub use errors::{
-    DbError, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
+    DbError, RefusalKind, OPERATOR_LINK_FIX, OPERATOR_LINK_REQUIRED, OPERATOR_SCOPE_REFUSED,
     PERSONAL_GROUP_NOT_OWNED, PERSONAL_MEMBERSHIP_REVOKED, ROLE_HOLDER_REQUIRED,
 };
 pub use label_validation::reject_unexpanded_labels;
@@ -80,6 +81,9 @@ pub use pool::{
     ScopedPool, ScopedPoolOptions, ScopedRead, ScopedTx, SessionGucMode, ACCESS_RECORDER_GUC,
     MAINTENANCE_DATABASE_URL, MAINTENANCE_SURFACE_NOT_SERVED, REQUEST_UNIT_HOLDS_MAINTENANCE_DSN,
 };
+pub use refusal_codes::{
+    caller_refusal_code, supersede_refusal_code, CALLER_REFUSAL_CODES, SUPERSEDE_REFUSAL_CODES,
+};
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
@@ -89,9 +93,10 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
-    carries_dedup_identity_key, ActivityRepository, AdminClaimAction, AdminClaimWrite, AdminToken,
-    AgentKeyRepository, AgentKeyRow, AgentPublicProfile, AgentRepository, AlternativePairRow,
-    AlternativeSetRepository, AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
+    carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
+    AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
+    AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,
+    AnalysisRecord, AnalysisRepository, AttestedKeyRow, AuthorOperator,
     BehavioralExecutionRepository, BehavioralExecutionRow, BeliefBoundedClaimHit,
     BeliefIntervalRow, BeliefSort, ChallengeRepository, ChallengeRow, ClaimBeliefColumns,
     ClaimDispute, ClaimEmbeddingHit, ClaimEncryptionRepository, ClaimEncryptionRow,
@@ -125,13 +130,15 @@ pub use repos::{
     RefreshTokenRow, ResolvedStep, RetiredLinkOutcome, RevokeOutcome, RevokedAccessTokenRepository,
     RoleAgentRunGate, RotateOutcome, ScopedBeliefRepository, ScoredHierarchicalWorkflowRow,
     SecurityEventRepository, SecurityEventRow, SheafRepository, SortDirection,
-    StructuralRepository, SupersedeEdgeMigration, SweepCandidate, TaskRepository, TaskRow,
-    TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow, TraceProvenanceStep, TripleRepository,
-    TripleRow, UnmarkedDuplicate, WebhookSubscriptionRepository, WebhookSubscriptionRow,
-    WorkflowExecutionRepository, WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED,
-    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
-    PRUNABLE_EVENT_TYPES,
+    StructuralRepository, SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate,
+    TaskRepository, TaskRow, TenancyPrecondition, ThemeMemberRow, ThemeSummaryRow,
+    TraceProvenanceStep, TripleRepository, TripleRow, UnmarkedDuplicate,
+    WebhookSubscriptionRepository, WebhookSubscriptionRow, WorkflowExecutionRepository,
+    WorkflowExecutionRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, PRUNABLE_EVENT_TYPES,
+    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
+    SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
@@ -171,8 +178,9 @@ pub use repos::edge::{
 pub use repos::factor::{BpMessageRow, FactorRow};
 pub use repos::frame::{ClaimFrameRow, FrameRow};
 pub use repos::graph_view::{
-    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
-    SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GqlColumn, GqlCondition,
+    GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, SubgraphClaimRow,
+    SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use repos::mass_function::{
     cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,

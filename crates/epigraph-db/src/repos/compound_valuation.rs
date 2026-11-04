@@ -25,7 +25,9 @@ use uuid::Uuid;
 use super::atom_axiom::AtomInputRow;
 use super::claim_role::is_compound_sql;
 use super::edge::EDGE_IN_FORCE;
-use super::mass_function::{cached_combination_predicate, ingest_template_predicate};
+use super::mass_function::{
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+};
 use crate::errors::DbError;
 use crate::visibility::Viewer;
 
@@ -158,6 +160,7 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
                           WHERE ar.combination_method = 'attributed_v1'
                             AND ar.perspective_id IN (mf.id, mf.perspective_id, mf.evidence_id)
                             AND COALESCE((ar.masses->>'1')::float8, 0) > 0
+                            AND ar.retracted_at IS NULL
                             /* {{VISIBILITY:ar}} */) AS refuting_citers
             FROM mass_functions mf
             JOIN frames f ON f.id = mf.frame_id
@@ -169,11 +172,13 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
               AND (array_length(f.hypotheses, 1) = 2 OR f.id = $2)
               AND NOT {cached}
               AND NOT {template}
+              AND {not_retracted}
               /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */ /* {{VISIBILITY:c}} */
             ORDER BY mf.claim_id, mf.created_at, mf.id
             "#,
             cached = cached_combination_predicate("mf."),
             template = ingest_template_predicate("mf.", "f."),
+            not_retracted = not_retracted_predicate("mf."),
         ),
         3,
     );

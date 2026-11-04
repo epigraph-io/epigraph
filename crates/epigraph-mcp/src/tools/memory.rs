@@ -62,7 +62,11 @@ pub async fn memorize(
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
-    claim.signature = Some(server.signer.sign(&claim.content_hash));
+    claim.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Claim, &claim.content_hash),
+    );
 
     // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4) — same
     // shape as `submit_claim`'s wiring, see `crate::tools::novelty_gate`
@@ -86,6 +90,9 @@ pub async fn memorize(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            // memorize's `tags` ARE its labels (persisted below), so a
+            // status-tagged memory gets the same bypass as submit_claim.
+            &tags,
         )
         .await
         {
@@ -156,6 +163,7 @@ pub async fn memorize(
         &claim,
         Some(signer_typed.as_uuid()),
         "memorize",
+        Some(server.edge_signing_key().await?),
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();
@@ -213,7 +221,11 @@ pub async fn memorize(
             Some(evidence_text),
             claim.id,
         );
-        evidence.signature = Some(server.signer.sign(&evidence_hash));
+        evidence.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
 
         let trace = ReasoningTrace::new(
             agent_id_typed,
@@ -612,16 +624,26 @@ async fn recall_post_embed(
     // its dense+lexical fusion (`crate::embed::HYBRID_RRF_K`), just applied in
     // Rust across two disjoint (claim vs workflow) ranked lists instead of two
     // legs of one list.
+    //
+    // Read as the CALLER: a `workflows` row carries its plan's tenancy since
+    // migration 183 (ruling R-74), so a member finds its group's workflows and
+    // nobody else does.
     let workflow_hits: Vec<epigraph_db::WorkflowGoalEmbeddingHit> = if params.include_workflows {
         match pgvec_opt.as_deref() {
-            Some(pgvec) => WorkflowRepository::search_by_goal_embedding_since(
-                &server.pool,
-                pgvec,
-                HYBRID_CANDIDATE_POOL,
-                params.since,
-            )
-            .await
-            .map_err(internal_error)?,
+            Some(pgvec) => {
+                let mut read = super::workflows::CallerRead::open(server, viewer).await?;
+                let hits = WorkflowRepository::search_by_goal_embedding_since(
+                    read.conn(),
+                    viewer,
+                    pgvec,
+                    HYBRID_CANDIDATE_POOL,
+                    params.since,
+                )
+                .await
+                .map_err(internal_error)?;
+                read.close().await?;
+                hits
+            }
             None => Vec::new(),
         }
     } else {
@@ -800,8 +822,9 @@ async fn recall_post_embed(
             .iter()
             .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
             .collect();
-        match epigraph_engine::belief_query::get_perspective_belief_batch(
+        match epigraph_engine::belief_query::get_perspective_belief_batch_scoped(
             &server.pool,
+            server.scoped.as_ref(),
             viewer,
             &claim_ids,
             frame_id,

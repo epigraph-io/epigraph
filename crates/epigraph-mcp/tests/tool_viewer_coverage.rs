@@ -96,16 +96,11 @@ use std::path::{Path, PathBuf};
 ///     removal rather than by filtering — the resolution its own
 ///     `suggested_fix` named. Recorded in `docs/tenancy/progress.json` under
 ///     `closed_findings`.
-///   - `theme_cluster` — the corpus-wide `FROM claims` is in
-///     `epigraph-engine/src/theme_kmeans.rs::run_theme_kmeans`, not in the MCP
-///     tool, and that function has a second caller: the HTTP twin
-///     `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`. Threading a
-///     `Viewer` through it changes an `epigraph-engine` public signature and
-///     must land with both callers, or MCP hardens while HTTP keeps clustering
-///     corpus-wide — a parity violation of exactly the kind §8.4 #16 exists to
-///     catch. Deferred as a unit, deliberately. Note this leaves plan §2.4's
-///     `claim_themes` `tenancy_exempt` residual **without its stated control**;
-///     that is the single largest thing PR-09 does not deliver.
+///   - `theme_cluster` is now a REFUSAL: it wrapped the k-means prototype
+///     (`epigraph_engine::theme_kmeans`), which is retired with its HTTP twin
+///     `build_themes_from_corpus` and the scheduled rebuild job (backlog
+///     a0ed0180, ruling R-29). Its corpus-wide clustering read no longer exists
+///     on any transport; the name stays registered only to answer "retired".
 const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // Batch H-b removed `challenge_claim`, `create_perspective`,
     // `ingest_document_spine` and `retire_match_candidate`: each now authors or
@@ -132,6 +127,7 @@ const EXPECTED_TOOLS_WITHOUT_A_VIEWER: &[&str] = &[
     // reads not converted by PR-09 — see the module doc for the owner of each.
     // `get_ownership` was here until PR-14 deleted the tool.
     "get_workflow_executions",
+    // RETIRED (backlog a0ed0180): a refusal that reads and writes nothing.
     "theme_cluster",
 ];
 

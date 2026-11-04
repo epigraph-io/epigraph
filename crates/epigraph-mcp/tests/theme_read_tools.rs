@@ -17,10 +17,10 @@
 //!
 //!  1. Each test mints a run-unique `label_prefix`, asserts only on its OWN
 //!     rows, and never on a corpus-wide total or "the first theme".
-//!  2. Themes are deleted on the way out. `theme_cluster_test`'s skip path and
-//!     `recall_temporal`'s `no_leak_s6_diverse_themes` both depend on the
-//!     corpus having few or no themes, so leaked theme rows would break
-//!     siblings rather than this file.
+//!  2. Themes are deleted on the way out. `recall_temporal`'s
+//!     `no_leak_s6_diverse_themes` depends on the corpus having few or no
+//!     themes, so leaked theme rows would break a sibling rather than this
+//!     file.
 
 #[macro_use]
 mod common;
@@ -282,8 +282,8 @@ async fn get_theme_rejects_ambiguous_and_unresolvable_selectors() {
     let viewer = fixture::public_viewer(&pool).await;
     let prefix = unique_prefix("ambig");
 
-    // TWO themes with the SAME label. `claim_themes` has no UNIQUE(label) and
-    // `theme_cluster(wipe_first=false)` produces exactly this. An
+    // TWO themes with the SAME label. `claim_themes` has no UNIQUE(label), and
+    // the retired k-means tool's additive runs left exactly this. An
     // implementation that resolved a label to "the first match" would silently
     // scope to one of two distinct themes.
     let dup_label = format!("{prefix}-dup");

@@ -11,7 +11,8 @@
 //! required parameter with no legal argument does not compile.
 //!
 //! What PR-09 still owns: moving the eight inline-SQL tools to the repo layer,
-//! `no_inline_sql_in_tools.rs`, `theme_cluster`'s within-viewer clustering, and
+//! `no_inline_sql_in_tools.rs`, `theme_cluster`'s within-viewer clustering (moot:
+//! the tool is retired with the k-means prototype, backlog a0ed0180), and
 //! the `auth.rs::unauthenticated_context()` change. This file is the acquisition
 //! half only.
 //!

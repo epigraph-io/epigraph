@@ -61,9 +61,10 @@
 //!   a G-private claim and its `executes` edge: the GUCs are session
 //!   settings, not credentials, so a session on the application role reads
 //!   whichever group it names.
-//! * (h) The same role can `UPDATE workflows` (truth and the submitter key):
-//!   `workflows` has no row security. A rewritten submitter is then honoured by
-//!   the workflow authority gate.
+//! * (h) The same role can `UPDATE workflows` (truth and the submitter key) of
+//!   a row it reads: migration 183's row security admits an UPDATE of any
+//!   readable row (a public one here) and guards only the tenancy columns. A
+//!   rewritten submitter is then honoured by the workflow authority gate.
 //! * Outcome report (as changed by #632, then by the visibility gate): `POST
 //!   /api/v1/workflows/hierarchical/:id/outcome` needs `claims:write`; on a
 //!   group-private plan a member's report resolves the steps, and a
@@ -447,6 +448,16 @@ async fn restrict_plan(pool: &PgPool, workflow_id: Uuid, g: Uuid) -> Vec<Uuid> {
         .await
         .expect("restrict the plan's claims");
     assert_eq!(moved.len(), claims.len(), "every plan claim moved");
+    // The plan half of `restrict` (R-98 Q8(a)), as the apply batch runs it:
+    // the whole plan is private now, so its row goes with it.
+    let rows = PrivatizationRepository::restrict_plan_workflows_conn(&mut conn, &moved, g)
+        .await
+        .expect("restrict the plan's row");
+    assert_eq!(
+        rows.iter().map(|r| r.workflow_id).collect::<Vec<_>>(),
+        vec![workflow_id],
+        "the fully restricted plan's row moves with it"
+    );
     let edge_tenancy: Vec<(String, Uuid)> = sqlx::query_as(
         "SELECT visibility::text, owner_group_id FROM edges \
           WHERE source_id = $1 AND relationship = 'executes'",
@@ -557,8 +568,11 @@ async fn a_reader_of_the_group_reads_every_executes_edge_and_claim(pool: PgPool)
 
 /// (a2) A non-member reads none of it: zero `executes` edges (not even a
 /// count) and a 404 on every claim. Calibrated by the same claims answering
-/// the reader. The `workflows` ROW is a different matter: it has no row
-/// security, so the non-member reads its goal, name and submitter.
+/// the reader. The `workflows` ROW too, since ruling R-98 Q8(a) (backlog
+/// 630af617): restricting the plan's claims re-tenants the public row into the
+/// group, so a non-member's read of it is the unknown-id 404 (it used to read
+/// the goal, name and submitter of the privatized plan), while the reader
+/// still reads it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_reads_no_executes_edge_and_gets_404_per_claim(pool: PgPool) {
     let w = private_workflow(&pool, fixture_extraction(None)).await;
@@ -587,22 +601,29 @@ async fn a_non_member_reads_no_executes_edge_and_gets_404_per_claim(pool: PgPool
         );
     }
 
-    // The residual: the workflow row itself is world-readable.
-    let (status, body) = w
-        .api
-        .get(&format!("/api/v1/workflows/{}", w.workflow_id), &stranger)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["canonical_name"], json!(w.canonical_name));
+    // The row went private with its claims (R-98 Q8(a)).
+    let uri = format!("/api/v1/workflows/{}", w.workflow_id);
+    let (status, body) = w.api.get(&uri, &stranger).await;
     assert_eq!(
-        body["goal"],
-        vectors()["extraction"]["source"]["goal"],
-        "the goal is readable by a non-member"
+        status,
+        StatusCode::NOT_FOUND,
+        "a non-member reads no row: {body}"
     );
+    assert!(
+        !body.to_string().contains(&w.canonical_name),
+        "nor its name: {body}"
+    );
+    let (status, body) = w.api.get(&uri, &reader).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: the reader reads the row: {body}"
+    );
+    assert_eq!(body["canonical_name"], json!(w.canonical_name));
     assert_eq!(
         body["properties"]["epigraph_submitted_by"],
         json!(w.curator.to_string()),
-        "the submitter is readable by a non-member"
+        "the reader reads the row's submitter"
     );
 }
 
@@ -1273,8 +1294,9 @@ async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool
     );
 }
 
-/// (h) CHARACTERIZATION. `workflows` has no row security: the application
-/// role rewrites a workflow's truth and its recorded submitter, and the
+/// (h) CHARACTERIZATION. `workflows`' row security (migration 183) admits an
+/// UPDATE of any row the session reads: the application role rewrites a
+/// public workflow's truth and its recorded submitter, and the
 /// workflow authority gate then honours the rewritten submitter (it reads the
 /// row) and refuses the original one.
 #[sqlx::test(migrations = "../../migrations")]

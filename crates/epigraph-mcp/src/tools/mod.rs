@@ -1,6 +1,7 @@
 pub mod admin_write;
 pub mod alternative_sets;
 pub mod batch;
+pub mod bba_retract;
 pub mod cdst_maintenance;
 pub mod challenges;
 pub mod claims;

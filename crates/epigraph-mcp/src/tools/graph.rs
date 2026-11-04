@@ -35,8 +35,12 @@ pub async fn get_neighborhood(
         .map_err(internal_error)?;
 
     let mut edges = Vec::new();
+    // A filter on a case-folded relationship (`supports`, `contradicts`,
+    // `corroborates`, `refutes`) matches every stored spelling of it: legacy
+    // upper-case rows and canonical lower-case ones (backlog 3ce5e00c). Any
+    // other relationship is still matched exactly (`REFINES` != `refines`).
     let keep = |rel: &str| match params.relationship.as_deref() {
-        Some(filter) => filter == rel,
+        Some(filter) => same_relationship(filter, rel),
         None => true,
     };
 
@@ -76,6 +80,15 @@ pub async fn get_neighborhood(
         edge_count: edges.len(),
         edges,
     })
+}
+
+/// Whether a stored `relationship` answers a caller's relationship `filter`:
+/// equal once both are in their canonical spelling, so every spelling of a
+/// case-folded relationship matches and every other relationship must match
+/// byte for byte (`epigraph_core::edge::relationships::canonical_relationship`).
+fn same_relationship(filter: &str, relationship: &str) -> bool {
+    use epigraph_core::edge::relationships::canonical_relationship;
+    canonical_relationship(filter) == canonical_relationship(relationship)
 }
 
 fn neighborhood_edge(e: epigraph_db::EdgeRow) -> NeighborhoodEdge {
@@ -225,7 +238,7 @@ pub async fn traverse(
 
                 for e in outgoing {
                     if let Some(ref rel_filter) = params.relationship {
-                        if e.relationship != *rel_filter {
+                        if !same_relationship(rel_filter, &e.relationship) {
                             continue;
                         }
                     }

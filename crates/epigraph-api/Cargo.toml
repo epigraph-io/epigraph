@@ -11,15 +11,19 @@ db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-ingest-executor", "dep:epigra
 jina = ["epigraph-embeddings/jina"]
 genai = ["db", "dep:epigraph-cli"]  # LLM-dependent workflows; requires ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN)
 integration = []
-tls = ["axum-server"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
+tls = ["axum-server", "dep:rustls"]  # TLS/HTTPS via axum-server + rustls (Caddy terminates TLS in production)
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 # Episcience features: structural isomorphism detection.
 # Enable only when epigraph-isomorphism is added as a dep (epigraph-io/episcience repo).
 episcience = []
 
+# Operator ruling R-39: the `not(feature = "db")` build is CHECK-ONLY (CI runs
+# `cargo check -p epigraph-api --no-default-features --locked`). The server is
+# never built without `db`, so no-db route stubs can never answer a request.
 [[bin]]
 name = "server"
 path = "src/bin/server.rs"
+required-features = ["db"]
 
 [[bin]]
 name = "epigraph-migrate"
@@ -41,8 +45,6 @@ epigraph-interfaces = { workspace = true }  # Extension point traits (PolicyGate
 epigraph-authz = { workspace = true }  # Fail-closed write gate installed in AppState (no SQL, no pool — nameable under --no-default-features)
 epigraph-ingest = { workspace = true, features = ["openapi"] }  # Workflow/document extraction schemas and ingest planners
 epigraph-ingest-executor = { workspace = true, optional = true }  # Persistence executor for workflow ingest (db feature)
-# k-means for /api/v1/themes/build-from-corpus lives in epigraph-engine
-# (theme_kmeans::run_theme_kmeans) — no direct linfa/ndarray dep needed here.
 epigraph-jobs = { workspace = true }  # Background job runner + ClusterGraph handler
 epigraph-core = { workspace = true }
 epigraph-crypto = { workspace = true }
@@ -67,7 +69,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"], optional = true }
 
 axum = { workspace = true }  # Web framework
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }  # TLS support (feature-gated)
+rustls = { version = "0.23.46", optional = true }  # `tls`: ServerConfig on an explicit provider (src/tls.rs); floor = RUSTSEC-2026-0346..0349 fix
 tokio = { workspace = true }  # Async runtime
 tower = { version = "0.5", features = ["util", "timeout"] }  # Service abstraction
 tower-http = { version = "0.5", features = ["trace", "cors"] }  # HTTP middleware
@@ -153,6 +156,12 @@ ciborium = "0.2"
 # with `epigraph-mcp`'s axum under a renamed dev-dependency.
 rmcp = { workspace = true }
 axum08 = { package = "axum", version = "0.8" }
+# `tests/tls_pem_loading.rs` only (`tls` feature): a TLS client that handshakes
+# against the config the PEM loader built. Already in the graph (axum-server's
+# `tls-rustls`, reqwest): no new package. `default-features = false` so the
+# dev graph enables no rustls crypto provider of its own: aws-lc-rs stays a
+# `tls`-only build (the tests get rustls itself through the optional normal dep).
+tokio-rustls = { version = "0.26", default-features = false }
 
 [[test]]
 name = "boot_secret_gate_test"
@@ -263,3 +272,17 @@ path = "tests/integration/idempotency_2p5_tests.rs"
 name = "belief_modes_surfaces_agree"
 path = "tests/belief_modes_surfaces_agree.rs"
 required-features = ["db"]
+
+# The PEM loader behind EPIGRAPH_TLS_CERT / EPIGRAPH_TLS_KEY exists only under
+# the `tls` feature: `cargo test -p epigraph-api --features tls --test tls_pem_loading`.
+[[test]]
+name = "tls_pem_loading"
+path = "tests/tls_pem_loading.rs"
+required-features = ["tls"]
+
+# Installs a process-level rustls provider, so it cannot share a binary with
+# tls_pem_loading (which must run with none installed).
+[[test]]
+name = "tls_provider_choice"
+path = "tests/tls_provider_choice.rs"
+required-features = ["tls"]

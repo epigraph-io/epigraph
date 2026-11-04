@@ -635,7 +635,17 @@ pub fn narrowed(prior: &Tenancy, ends_meet: Option<Tenancy>) -> Tenancy {
 /// `claims` is every claim of `ev_claim` the edge touches through an evidence
 /// endpoint, plus any claim endpoint in `in_set`; `neighbours` is any claim
 /// endpoint outside `in_set`.
-async fn fetch_evidence_edges(
+///
+/// Each row's `writer` is its SOURCE claim's author
+/// ([`super::tables::EDGE_WRITER_SQL`], ruling R-49), so an evidence-sourced
+/// edge is unattributed (`None`). Nothing in `restrict-claims` decides on that
+/// writer (it narrows an edge by its endpoints' meet, [`narrowed`]; only
+/// `reown-claims --derived keep-writer` reads `Attached::writer`); public for
+/// the R-49 reader test (`tests/edge_author_not_signer.rs`).
+///
+/// # Errors
+/// When the read fails.
+pub async fn fetch_evidence_edges(
     conn: &mut PgConnection,
     ev_claim: &BTreeMap<Uuid, Uuid>,
     in_set: &BTreeSet<Uuid>,
@@ -646,17 +656,22 @@ async fn fetch_evidence_edges(
         return Ok(out);
     }
     let ev: Vec<Uuid> = ev_claim.keys().copied().collect();
-    let rows = sqlx::query(
+    // The writer is the source claim's author (`tables::EDGE_WRITER_SQL`,
+    // ruling R-49), never the attesting `signer_id`.
+    let sql = format!(
         "SELECT e.id, e.source_id, e.source_type::text, e.target_id, e.target_type::text, \
-                e.owner_group_id, e.visibility::text, e.co_owner_group_id, e.signer_id \
+                e.owner_group_id, e.visibility::text, e.co_owner_group_id, \
+                {} \
            FROM edges e \
           WHERE (e.source_type = 'evidence' AND e.source_id = ANY($1)) \
              OR (e.target_type = 'evidence' AND e.target_id = ANY($1))",
-    )
-    .bind(&ev)
-    .fetch_all(&mut *conn)
-    .await
-    .context("reading edges with an evidence endpoint")?;
+        super::tables::EDGE_WRITER_SQL
+    );
+    let rows = sqlx::query(&sql)
+        .bind(&ev)
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading edges with an evidence endpoint")?;
     for r in &rows {
         let id: Uuid = r.get(0);
         let key = ("edges".to_string(), id.to_string());

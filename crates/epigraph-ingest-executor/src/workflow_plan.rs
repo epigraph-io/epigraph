@@ -71,6 +71,7 @@ pub async fn frozen_plan(
         truth_value: row.truth_value,
         submitter,
         edges: read.edges.into_iter().map(executes_edge).collect(),
+        chain_order: read.chain_order,
     })))
 }
 

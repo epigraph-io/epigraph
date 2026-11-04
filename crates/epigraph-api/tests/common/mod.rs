@@ -8,6 +8,7 @@ use uuid::Uuid;
     reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
 )]
 pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    assert_test_db_at_head(database_url).await;
     let app = epigraph_api::build_app_for_tests(database_url)
         .await
         .expect("app builds for tests");
@@ -34,6 +35,7 @@ pub async fn spawn_app(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) 
     reason = "shared integration-test fixture: only the cascade binaries use it"
 )]
 pub async fn spawn_app_with_admin_cascade(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    assert_test_db_at_head(database_url).await;
     let app = epigraph_api::build_app_for_tests_with_admin_cascade(database_url)
         .await
         .expect("app builds for tests");
@@ -59,6 +61,7 @@ pub async fn spawn_app_with_admin_cascade(database_url: &str) -> (SocketAddr, on
     reason = "shared integration-test fixture: only the BP apply binaries use it"
 )]
 pub async fn spawn_app_with_bp_apply(database_url: &str) -> (SocketAddr, oneshot::Sender<()>) {
+    assert_test_db_at_head(database_url).await;
     let app = epigraph_api::build_app_for_tests_with_bp_apply(database_url)
         .await
         .expect("app builds for tests");
@@ -87,6 +90,7 @@ pub async fn spawn_app_with_webhook_egress(
     database_url: &str,
     webhook_egress: epigraph_jobs::egress::EgressGuard,
 ) -> (SocketAddr, oneshot::Sender<()>) {
+    assert_test_db_at_head(database_url).await;
     let app = epigraph_api::build_app_for_tests_with_webhook_egress(database_url, webhook_egress)
         .await
         .expect("app builds for tests");
@@ -139,6 +143,7 @@ pub async fn spawn_app_with_webhook_egress(
 pub async fn spawn_app_with_mock_embedding(
     database_url: &str,
 ) -> (SocketAddr, oneshot::Sender<()>) {
+    assert_test_db_at_head(database_url).await;
     use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
     use std::sync::Arc;
 
@@ -170,6 +175,99 @@ pub async fn spawn_app_with_mock_embedding(
             .unwrap();
     });
     (addr, tx)
+}
+
+/// Refuse a test database that is not at this tree's migration head, before an
+/// app is built on it (backlog acffb2c4). The ~90 binaries here that read the
+/// ambient `DATABASE_URL` do not migrate it, so a shared database left at a
+/// pre-tenancy version used to surface as hundreds of unrelated-looking
+/// failures (a missing `visibility` column, a refused role switch) that read
+/// exactly like a code regression. This turns that shape into one message
+/// with the procedure. A `#[sqlx::test]` database is migrated to head, so it
+/// passes.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn assert_test_db_at_head(database_url: &str) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .expect("connect to the test database");
+    let stale = stale_test_db_reason(&pool).await;
+    pool.close().await;
+    if let Some(why) = stale {
+        panic!("{why}");
+    }
+}
+
+/// Why `pool`'s database is not a test database at this tree's head (its
+/// highest applied migration is below the tree's, or `claims` lacks the
+/// tenancy columns), with the procedure; `None` when it is at head.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub async fn stale_test_db_reason(pool: &PgPool) -> Option<String> {
+    let head = tree_migration_head();
+    let applied: Option<i64> =
+        sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(None);
+    let tenancy_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'claims' \
+            AND column_name IN ('visibility', 'owner_group_id')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if applied.is_some_and(|v| v >= head) && tenancy_columns == 2 {
+        return None;
+    }
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|_| "?".to_string());
+    Some(format!(
+        "test database {db:?} is not at this tree's migration head: highest applied \
+         migration {applied:?}, tree head {head}, claims tenancy columns {tenancy_columns}/2 \
+         (visibility, owner_group_id). {STALE_TEST_DB_HELP}"
+    ))
+}
+
+/// The procedure for a test database that is not at this tree's head.
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: `tests/common/mod.rs` is compiled into every `epigraph-api` integration-test binary, and each binary uses only the subset of helpers it needs, so `dead_code` fires in the others"
+)]
+pub const STALE_TEST_DB_HELP: &str = "A database that was not migrated 001 -> head from \
+     empty (one left at a pre-tenancy version, or provisioned outside the public migration \
+     series) cannot run these suites and cannot be repaired in place: migrating it fails \
+     closed at 060. Do what CI does: create a FRESH database whose name ends in `_test`, \
+     migrate it from empty (`createdb <name>_test`, then `MIGRATION_DATABASE_URL=<its DSN> \
+     cargo run -p epigraph-api --bin epigraph-migrate`), and point DATABASE_URL at it. Never \
+     reuse a shared one. #[sqlx::test] suites are unaffected: each test gets a private \
+     database.";
+
+/// The highest migration version in this tree's `migrations/` (`NNN_name.sql`).
+#[allow(
+    dead_code,
+    reason = "shared integration-test fixture: used through `stale_test_db_reason`, which only some binaries call"
+)]
+fn tree_migration_head() -> i64 {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+    std::fs::read_dir(dir)
+        .expect("read the migrations directory")
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let (version, _) = name.strip_suffix(".sql")?.split_once('_')?;
+            version.parse::<i64>().ok()
+        })
+        .max()
+        .expect("at least one migration")
 }
 
 /// Returns a real signed JWT that the production bearer_auth_middleware will accept.

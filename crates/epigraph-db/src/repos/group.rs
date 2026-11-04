@@ -68,7 +68,48 @@ impl GroupRepository {
         creator_agent_id: Uuid,
     ) -> Result<Uuid, DbError> {
         let mut tx = pool.begin().await?;
+        let id = Self::create_with_admin_conn(
+            &mut tx,
+            id,
+            display_name,
+            did_key,
+            public_key,
+            pre_public_key,
+            creator_agent_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
 
+    /// [`Self::create_with_admin`] over a borrowed connection: the three
+    /// INSERTs, and no `BEGIN` / `COMMIT` of its own.
+    ///
+    /// `POST /api/v1/groups` calls this on the caller's
+    /// `ScopedPool::begin_as` transaction (backlog 323773fe). On the
+    /// application role the three tables carry FORCEd row security, and only a
+    /// connection stamped with the creator as `epigraph_principal_id()` passes
+    /// it: `groups_tenancy`'s `WITH CHECK` admits `created_by_agent_id =
+    /// epigraph_principal_id()`, and the epoch-0 and admin-membership rows are
+    /// admitted by `epigraph_is_group_creator`'s empty-roster arm (migrations
+    /// 077 and 092). On the unstamped pool the first INSERT is refused.
+    ///
+    /// The caller owns the transaction, so the three rows still commit or roll
+    /// back together.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if any statement fails.
+    #[instrument(skip(conn, public_key, pre_public_key))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_with_admin_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        display_name: Option<&str>,
+        did_key: &str,
+        public_key: &[u8],
+        pre_public_key: Option<&[u8]>,
+        creator_agent_id: Uuid,
+    ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO groups
@@ -83,7 +124,7 @@ impl GroupRepository {
         .bind(public_key)
         .bind(pre_public_key)
         .bind(creator_agent_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut *conn)
         .await?;
 
         // Via the repo helper, not an inlined INSERT: the inlined copy left
@@ -91,7 +132,7 @@ impl GroupRepository {
         // statements free to drift (migration 060's ROTATION CONTRACT names
         // that pair).
         crate::repos::group_key_epoch::GroupKeyEpochRepository::create_epoch_conn(
-            &mut tx, row.0, 0, None, "active",
+            &mut *conn, row.0, 0, None, "active",
         )
         .await?;
 
@@ -103,10 +144,8 @@ impl GroupRepository {
         )
         .bind(row.0)
         .bind(creator_agent_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-
-        tx.commit().await?;
 
         Ok(row.0)
     }
@@ -117,6 +156,24 @@ impl GroupRepository {
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool))]
     pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<GroupRow>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_by_id_conn(&mut conn, id).await
+    }
+
+    /// [`Self::get_by_id`] over a borrowed connection.
+    ///
+    /// For the group routes that run on the caller's stamped connection
+    /// (backlog 323773fe). On the application role `groups_tenancy` shows a
+    /// stamped session the groups it is a live member of (and, while the
+    /// roster is empty, the ones it created); an unstamped one sees none.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_by_id_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+    ) -> Result<Option<GroupRow>, DbError> {
         let row: Option<GroupRow> = sqlx::query_as(
             r#"
             SELECT id, display_name, did_key, public_key, pre_public_key, created_at, updated_at,
@@ -126,7 +183,7 @@ impl GroupRepository {
             "#,
         )
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         Ok(row)

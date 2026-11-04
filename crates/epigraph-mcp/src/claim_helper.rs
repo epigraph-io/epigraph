@@ -3,6 +3,7 @@
 //! docs/superpowers/specs/2026-04-26-s3a-epigraph-mcp-writer-migration-design.md.
 
 use epigraph_core::Claim;
+use epigraph_db::repos::EdgeSigningKey;
 use epigraph_db::{ClaimRepository, EdgeRepository};
 use serde_json::json;
 use sqlx::{Acquire, PgConnection};
@@ -690,6 +691,12 @@ pub(crate) async fn store_embedding_author_stamped(
 /// A savepoint keeps both properties: the edge either lands or is rolled back
 /// alone, and the outer transaction is still usable either way.
 ///
+/// `key` attests the edge AT INSERT (rulings R-49, R-50): the server's
+/// signer ([`EpiGraphMcpFull::edge_signing_key`]). These verb-edges have an
+/// `agent` or `evidence` / `trace` endpoint, and an agent-sourced edge is
+/// world-owned, which no application session may UPDATE afterwards, so the
+/// INSERT is the only point it can be signed. `None` writes it unsigned.
+///
 /// # Errors
 ///
 /// Returns an error only if the SAVEPOINT itself could not be taken or released
@@ -706,10 +713,12 @@ pub async fn emit_verb_edge_best_effort(
     relationship: &str,
     properties: Option<serde_json::Value>,
     tool_name: &'static str,
+    key: Option<EdgeSigningKey<'_>>,
 ) -> Result<(), McpError> {
     let mut sp = conn.begin().await.map_err(internal_error)?;
-    match EdgeRepository::create(
-        &mut *sp,
+    match EdgeRepository::create_signed_conn(
+        &mut sp,
+        key,
         source_id,
         source_type,
         target_id,
@@ -784,6 +793,7 @@ pub async fn create_claim_idempotent(
     claim: &Claim,
     signer_agent_id: Option<uuid::Uuid>,
     tool_name: &'static str,
+    edge_key: Option<EdgeSigningKey<'_>>,
 ) -> Result<(Claim, bool), McpError> {
     // Tenancy declaration (PR-16). Every MCP writer that reaches this helper
     // (`submit_claim`, `memorize`, `batch_submit_claims`) posts a claim
@@ -817,6 +827,7 @@ pub async fn create_claim_idempotent(
         "AUTHORED",
         Some(json!({"tool": tool_name, "was_created": was_created})),
         tool_name,
+        edge_key,
     )
     .await?;
 

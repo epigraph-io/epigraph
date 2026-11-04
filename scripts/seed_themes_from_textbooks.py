@@ -26,9 +26,9 @@ BACKLOG — raw SQL used here because the API surface is incomplete:
     crates/epigraph-api/src/routes/crud.rs::CreateThemeWithCentroidRequest
     + `ClaimThemeRepository::set_centroid_3072` + a properties merge).
   * The drop-auto path (DELETE FROM claim_themes WHERE label LIKE 'auto-%')
-    has no API equivalent. POST /api/v1/themes/build-from-corpus has a
-    `wipe_first` parameter, but it drops EVERY theme (whatever its prefix;
-    admitted only with label_prefix "auto") and also re-runs k-means; we
+    has no API equivalent. The retired POST /api/v1/themes/build-from-corpus had
+    a `wipe_first` parameter, but it dropped EVERY theme (whatever its prefix;
+    admitted only with label_prefix "auto") and also re-ran k-means; we
     just want the prefix-scoped delete. Need
     DELETE /api/v1/themes/by-label-prefix or similar.
   * Bulk theme_id assignment (UPDATE claims SET theme_id = ...) goes

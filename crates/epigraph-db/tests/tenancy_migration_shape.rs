@@ -75,6 +75,13 @@ const TIER_A: &[&str] = &[
     "recall_events",
 ];
 
+/// The two harvester neighbours of `harvester_fragments` that migration 173
+/// (ruling R-66) brings under tenancy. NOT part of 062's array and not seeded
+/// into `tenancy_backfill_progress`: 173 derives their owners itself (from
+/// their fragments) and refuses when it cannot, so the backfill has nothing to
+/// do for them.
+const HARVESTER_173: &[&str] = &["harvester_audit_reports", "harvester_sources"];
+
 const WORLD_GROUP: &str = "00000000-0000-0000-0000-000000000000";
 const SEED_GROUP: &str = "00000000-0000-0000-0000-00000000dead";
 
@@ -887,8 +894,9 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         assert_eq!(seeded, 1, "tenancy_backfill_progress is missing {table}");
     }
 
-    // Exactly 25 tables, no more: a table that gained the columns without being
-    // registered in the tier-A array is a table nothing backfills.
+    // Exactly 25 tables, no more, plus 173's two: a table that gained the
+    // columns without being registered in the tier-A array (or derived by the
+    // migration that gave them, as 173 does) is a table nothing backfills.
     let widened: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.columns \
           WHERE table_schema = 'public' AND column_name = 'owner_group_id' \
@@ -899,7 +907,15 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
     .expect("owner_group_id census");
 
     let observed: BTreeSet<&str> = widened.iter().map(String::as_str).collect();
-    let expected: BTreeSet<&str> = TIER_A.iter().copied().collect();
+    // Plus migration 183's `workflows` (ruling R-74): it carries the columns
+    // in 062's shape (`workflows_tenancy.rs::workflow_rows_carry_the_tier_a_shape`) and is
+    // backfilled by that migration itself, so it has no ledger row.
+    let expected: BTreeSet<&str> = TIER_A
+        .iter()
+        .chain(HARVESTER_173)
+        .copied()
+        .chain(std::iter::once("workflows"))
+        .collect();
     assert_eq!(
         observed, expected,
         "the set of tables carrying owner_group_id has drifted from the tier-A \

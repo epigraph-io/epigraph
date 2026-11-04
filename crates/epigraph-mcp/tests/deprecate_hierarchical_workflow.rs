@@ -682,10 +682,13 @@ async fn a_legacy_workflow_is_deprecated_only_through_the_audited_admin_arm(pool
     assert_eq!(submitter_kind.as_deref(), Some("null"));
 }
 
-/// stdio is unchanged (the batch H-b bar): an unauthenticated stdio caller is
-/// not checked, and its deprecation retires the claims like any other.
+/// stdio is checked (backlog 222289f3, reversing the batch H-b bar): a stdio
+/// caller that is not the workflow's submitter (nor its operator) is refused
+/// with nothing written, as an HTTP stranger is; the stdio agent's OWN
+/// workflow (a stdio ingest records it as the submitter) is deprecated like
+/// any other, and the write is recorded with `transport = "stdio"`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn stdio_deprecates_without_an_authority_check(pool: PgPool) {
+async fn stdio_deprecation_needs_the_submitter(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let wf = ingest(
@@ -698,13 +701,41 @@ async fn stdio_deprecates_without_an_authority_check(pool: PgPool) {
     .await;
     let owned = executed(&pool, wf, &["0", "1", "2"]).await;
     let public = fixture::public_viewer(&pool).await;
-    tools::workflows::deprecate_workflow(&server, &public, params(wf, false), None)
+    let err = tools::workflows::deprecate_workflow(&server, &public, params(wf, false), None)
         .await
-        .expect("stdio is not checked");
-    assert!((truth(&pool, wf).await - 0.05).abs() < 1e-12);
+        .expect_err("a stdio caller that did not submit the workflow is refused");
+    assert!(
+        err.message.contains("submitted by agent"),
+        "{}",
+        err.message
+    );
+    assert!(
+        (truth(&pool, wf).await - 0.05).abs() > 1e-6,
+        "row untouched"
+    );
     for c in &owned {
+        assert!(is_current(&pool, *c).await, "claim {c} kept");
+    }
+
+    // CALIBRATION: the stdio agent's own workflow.
+    let mine = ingest(&pool, &server, &public, None, "u017-stdio-own").await;
+    let mine_claims = executed(&pool, mine, &["0", "1", "2"]).await;
+    tools::workflows::deprecate_workflow(&server, &public, params(mine, false), None)
+        .await
+        .expect("the stdio submitter deprecates its own workflow");
+    assert!((truth(&pool, mine).await - 0.05).abs() < 1e-12);
+    for c in &mine_claims {
         assert!(!is_current(&pool, *c).await, "claim {c} retired over stdio");
     }
+    let transport: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'transport' FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'workflow_id' = $1",
+    )
+    .bind(mine.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the stdio provenance row");
+    assert_eq!(transport.as_deref(), Some("stdio"));
 }
 
 /// The authority rule runs over EVERY target of a cascade, not only the root,

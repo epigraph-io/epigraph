@@ -106,6 +106,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         Some(env!("CARGO_BIN_EXE_sweep_semantic_duplicates")),
         "src/bin/sweep_semantic_duplicates.rs",
     ),
+    (
+        "unmark_duplicate",
+        Some(env!("CARGO_BIN_EXE_unmark_duplicate")),
+        "src/bin/unmark_duplicate.rs",
+    ),
 ];
 
 const SENTINEL_TAG: &str = "HELPLEAK";

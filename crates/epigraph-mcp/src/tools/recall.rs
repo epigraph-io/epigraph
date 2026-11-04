@@ -9,8 +9,20 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::errors::{internal_error, invalid_params, McpError};
+use crate::errors::{internal_error, internal_error_logged, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
+
+/// A `recall_with_context` step failed on the server: the caller reads which
+/// step (designed text), and the error itself goes to the server log
+/// (`internal_error_logged`). Replaces `internal_error(format!("step: {e}"))`,
+/// which sent the caller only the fixed redacted message and so discarded the
+/// step too (backlog e0f0cb68 (2), tests/internal_error_format_ratchet.rs).
+fn recall_fault(step: &str, cause: impl std::fmt::Display) -> McpError {
+    internal_error_logged(
+        format!("recall_with_context: {step}; the detail is in the server log"),
+        cause,
+    )
+}
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -58,11 +70,130 @@ pub async fn embedded_3072_population(
 }
 
 async fn detect_centroid_dim(
+    cache: &CentroidPopulationCache,
     pool: &sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<u32, sqlx::Error> {
-    let frac = embedded_3072_population(pool, viewer).await?;
+    let frac = cache.fraction(pool, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
+}
+
+/// [`embedded_3072_population`] behind a short per-scope cache (backlog
+/// be28f3d2).
+///
+/// The fraction is two full-table aggregates over `claims`, and
+/// `recall_with_context` used to run it on EVERY call that omitted
+/// `centroid_dim` (or asked for 3072): about 1.25 s per recall, logged as a slow
+/// statement. It moves only when a re-embed run moves it, so a read stands for
+/// [`Self::ttl`] and a recall pays for it once per interval per scope.
+///
+/// # The key is the query's binds, not the principal
+///
+/// The answer is a function of `(pool, bypass_bind, group_bind)` and nothing
+/// else, so that pair is the key: two viewers that bind the same values read
+/// the same corpus by construction, and a membership change produces a
+/// different key rather than a stale hit. One cache per server process (shared
+/// by every session the factory clones), never a `static`: two servers on two
+/// databases must not answer for each other.
+///
+/// Errors are not cached; the next call reads again.
+#[derive(Debug)]
+pub struct CentroidPopulationCache {
+    ttl: std::time::Duration,
+    slots: std::sync::Mutex<std::collections::HashMap<PopulationKey, (std::time::Instant, f64)>>,
+}
+
+/// `(bypass_bind, sorted group_bind)` — the two values
+/// [`embedded_3072_population`] binds.
+type PopulationKey = (bool, Vec<Uuid>);
+
+impl Default for CentroidPopulationCache {
+    fn default() -> Self {
+        Self::with_ttl(Self::DEFAULT_TTL)
+    }
+}
+
+impl CentroidPopulationCache {
+    /// How long a read stands. Auto-detect therefore follows a re-embed run
+    /// across the 0.5 threshold within five minutes.
+    pub const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Distinct scopes held at once; past this, expired entries are evicted
+    /// and, if none were, the map is cleared. Bounds memory against an
+    /// unbounded variety of group sets.
+    const MAX_SCOPES: usize = 1024;
+
+    /// A cache whose reads stand for `ttl` (`Duration::ZERO`: every call reads).
+    #[must_use]
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            slots: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// How long a read stands.
+    #[must_use]
+    pub const fn ttl(&self) -> std::time::Duration {
+        self.ttl
+    }
+
+    fn key(viewer: &epigraph_db::visibility::Viewer) -> PopulationKey {
+        // `group_bind` is already sorted and deduplicated (`Viewer::resolve`).
+        (
+            viewer.bypass_bind(),
+            viewer.group_bind().unwrap_or(&[]).to_vec(),
+        )
+    }
+
+    /// The standing read for `viewer`'s scope, if one is younger than the TTL.
+    #[must_use]
+    pub fn cached(&self, viewer: &epigraph_db::visibility::Viewer) -> Option<f64> {
+        let key = Self::key(viewer);
+        let slots = self.slots.lock().ok()?;
+        slots
+            .get(&key)
+            .filter(|(at, _)| at.elapsed() < self.ttl)
+            .map(|(_, frac)| *frac)
+    }
+
+    /// The fraction for `viewer`'s scope: the standing read, else a fresh one.
+    ///
+    /// # Errors
+    /// The population query failed (not cached).
+    pub async fn fraction(
+        &self,
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<f64, sqlx::Error> {
+        if let Some(frac) = self.cached(viewer) {
+            return Ok(frac);
+        }
+        self.refresh(pool, viewer).await
+    }
+
+    /// A fresh read for `viewer`'s scope, which then stands for the TTL.
+    ///
+    /// # Errors
+    /// The population query failed (not cached).
+    pub async fn refresh(
+        &self,
+        pool: &sqlx::PgPool,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Result<f64, sqlx::Error> {
+        let frac = embedded_3072_population(pool, viewer).await?;
+        if let Ok(mut slots) = self.slots.lock() {
+            if slots.len() >= Self::MAX_SCOPES {
+                let ttl = self.ttl;
+                slots.retain(|_, (at, _)| at.elapsed() < ttl);
+                if slots.len() >= Self::MAX_SCOPES {
+                    slots.clear();
+                }
+            }
+            slots.insert(Self::key(viewer), (std::time::Instant::now(), frac));
+        }
+        Ok(frac)
+    }
 }
 
 /// Corpus cardinality reported alongside every `recall_with_context` response.
@@ -775,17 +906,24 @@ pub async fn recall_with_context(
                 "centroid_dim must be 1536 or 3072 (got {d})"
             )));
         }
-        None => detect_centroid_dim(&server.pool, viewer)
+        None => detect_centroid_dim(&server.centroid_population, &server.pool, viewer)
             .await
-            .map_err(|e| internal_error(format!("auto-detect centroid_dim: {e}")))?,
+            .map_err(|e| recall_fault("could not detect the centroid dimension", e))?,
     };
 
     // Spec §3.4: explicit 3072 against an unpopulated column must error
     // (otherwise the empty kNN result is indistinguishable from "no relevant paragraphs").
+    //
+    // A standing positive read is trusted; a zero is re-measured before it
+    // refuses, so a caller who has just re-embedded is never turned away on a
+    // stale cache (backlog be28f3d2).
     if matches!(params.centroid_dim, Some(3072)) {
-        let frac = embedded_3072_population(&server.pool, viewer)
-            .await
-            .map_err(|e| internal_error(format!("3072 population check: {e}")))?;
+        let cache = &server.centroid_population;
+        let frac = match cache.cached(viewer) {
+            Some(frac) if frac > 0.0 => Ok(frac),
+            _ => cache.refresh(&server.pool, viewer).await,
+        }
+        .map_err(|e| recall_fault("could not check the 3072-dim embedding population", e))?;
         if frac == 0.0 {
             return Err(invalid_params(
                 "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
@@ -799,7 +937,7 @@ pub async fn recall_with_context(
         .embedder
         .generate_at_dim(&params.query, centroid_dim)
         .await
-        .map_err(|e| internal_error(format!("embed query: {e}")))?;
+        .map_err(|e| recall_fault("could not embed the query", e))?;
     let pgvec = crate::embed::format_pgvector(&query_embedding);
 
     // Resolve + existence-check the optional (frame, perspective) lens ONCE,
@@ -893,7 +1031,7 @@ async fn apply_graph_expansion(
         pool, viewer, &seed_ids, depth, since,
     )
     .await
-    .map_err(|e| internal_error(format!("graph expansion traverse: {e}")))?;
+    .map_err(|e| recall_fault("graph expansion could not traverse from the seed claims", e))?;
 
     // No level filter on the emitted rows. Backlog 4e856a99 added one
     // (`ClaimRepository::paragraph_level_ids`, removed with it) so that
@@ -942,7 +1080,7 @@ async fn apply_graph_expansion(
     let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
     let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, viewer, &all_ids)
         .await
-        .map_err(|e| internal_error(format!("in_epistemic_degree_batch: {e}")))?;
+        .map_err(|e| recall_fault("could not read the candidates' epistemic degree", e))?;
 
     combined.sort_by(|a, b| {
         let score = |h: &epigraph_db::ClaimEmbeddingHit| {
@@ -1059,7 +1197,7 @@ async fn recall_with_context_post_embed(
             config,
         )
         .await
-        .map_err(|e| internal_error(format!("diverse retrieval: {e}")))?;
+        .map_err(|e| recall_fault("diverse retrieval failed", e))?;
 
         if selected.is_empty() {
             // No themes, themes that do not cover this query's neighbourhood,
@@ -1077,7 +1215,7 @@ async fn recall_with_context_post_embed(
                 epigraph_db::EmbeddingSeedScope::AllClaims,
             )
             .await
-            .map_err(|e| internal_error(format!("kNN fallback: {e}")))?
+            .map_err(|e| recall_fault("the kNN fallback search failed", e))?
         } else {
             selected
                 .into_iter()
@@ -1103,14 +1241,14 @@ async fn recall_with_context_post_embed(
             epigraph_db::EmbeddingSeedScope::AllClaims,
         )
         .await
-        .map_err(|e| internal_error(format!("kNN: {e}")))?
+        .map_err(|e| recall_fault("the kNN search failed", e))?
     };
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
         let corpus_scope = compute_corpus_scope(&server.pool, viewer)
             .await
-            .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+            .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
         let event_id = Uuid::new_v4();
         spawn_recall_audit(
             server,
@@ -1174,7 +1312,7 @@ async fn recall_with_context_post_embed(
         let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
         let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, viewer, &ids)
             .await
-            .map_err(|e| internal_error(format!("rerank content fetch: {e}")))?;
+            .map_err(|e| recall_fault("could not fetch claim content for reranking", e))?;
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
             .iter()
             .filter_map(|h| {
@@ -1269,7 +1407,7 @@ async fn recall_with_context_post_embed(
         epistemic_limit,
     )
     .await
-    .map_err(|e| internal_error(format!("batch fetch: {e}")))?;
+    .map_err(|e| recall_fault("could not fetch the context batch", e))?;
 
     // Backlog 14b98adc: the min_truth gate below reads the DS pignistic
     // probability, not `claims.truth_value` — which no DS write path refreshes,
@@ -1621,7 +1759,7 @@ async fn recall_with_context_post_embed(
 
     let corpus_scope = compute_corpus_scope(&server.pool, viewer)
         .await
-        .map_err(|e| internal_error(format!("corpus_scope: {e}")))?;
+        .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
 
     // Recall audit log (backlog 8cbffa0e) — same fire-and-forget contract as
     // `tools::memory::recall`: spawned after the response is assembled so an
@@ -2568,7 +2706,20 @@ pub mod __test_only {
         pool: &sqlx::PgPool,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<u32, sqlx::Error> {
-        super::detect_centroid_dim(pool, viewer).await
+        // A fresh cache: this pins the DECISION, not the caching.
+        let cache = super::CentroidPopulationCache::with_ttl(std::time::Duration::ZERO);
+        super::detect_centroid_dim(&cache, pool, viewer).await
+    }
+
+    /// The fraction `server`'s population cache currently holds for
+    /// `viewer`'s scope — `None` when no read stands. Lets a test observe that
+    /// `recall_with_context`'s auto-detect went through the SERVER's cache.
+    #[must_use]
+    pub fn cached_centroid_population(
+        server: &EpiGraphMcpFull,
+        viewer: &epigraph_db::visibility::Viewer,
+    ) -> Option<f64> {
+        server.centroid_population.cached(viewer)
     }
 
     /// Integration-test entry point that skips the OpenAI embedder.
@@ -2816,6 +2967,33 @@ mod tests {
                 .await
                 .unwrap(),
             "the revocation must stand"
+        );
+    }
+
+    /// A failed recall step tells the caller WHICH step failed and keeps the
+    /// error itself server-side (backlog e0f0cb68 (2)). Before, these sites
+    /// were `internal_error(format!("step: {e}"))`, whose reply was the fixed
+    /// redacted message alone, so the step was lost along with the error.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_failed_recall_step_names_the_step_and_logs_the_cause() {
+        let e = super::recall_fault(
+            "the kNN search failed",
+            "relation \"claims_ann_9d2f\" does not exist at db-host-9d2f",
+        );
+        assert_eq!(e.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            e.message,
+            "recall_with_context: the kNN search failed; the detail is in the server log"
+        );
+        assert!(
+            !e.message.contains("db-host-9d2f"),
+            "the cause reached the caller: {}",
+            e.message
+        );
+        assert!(
+            logs_contain("db-host-9d2f"),
+            "the withheld cause must reach the server log"
         );
     }
 }

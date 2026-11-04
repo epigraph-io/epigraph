@@ -8,6 +8,7 @@ license.workspace = true
 openapi = ["dep:utoipa"]
 
 [dependencies]
+epigraph-core = { workspace = true }  # The lineage-relationship predicate every ingest refuses on (supersede K12a)
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }

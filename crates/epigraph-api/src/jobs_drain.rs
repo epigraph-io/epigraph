@@ -31,7 +31,6 @@ use epigraph_jobs::{
     privatization::{
         PrivatizationApplyHandler, PrivatizationResealHandler, PrivatizationRevertHandler,
     },
-    theme_cluster_rebuild::ThemeClusterRebuildHandler,
     ConfigurableEmbeddingHandler, JobError, JobQueue, JobRunner, JobState, PostgresJobQueue,
 };
 use serde::Serialize;
@@ -66,8 +65,8 @@ pub const DEFAULT_MAX_RUNTIME: Duration = Duration::from_secs(50 * 60);
 ///
 /// `handler_scoped` must be the drain's maintenance `ScopedPool` (the
 /// privatization handlers need `unscoped_for_maintenance`, the only mint of the
-/// lease `Viewer::system` requires); `queue` is the queue the theme rebuild
-/// enqueues its follow-up on; `embedder` and `provider` come from
+/// lease `Viewer::system` requires); `queue` is the queue the runner claims
+/// from; `embedder` and `provider` come from
 /// [`crate::embedding_restore::embedding_service_from_env`].
 ///
 /// # The embedding handler is registered CONDITIONALLY
@@ -103,10 +102,6 @@ pub fn build_job_runner(
     runner.register_handler(Arc::new(ClusterGraphHandler::new(Arc::clone(
         &handler_pool,
     ))));
-    runner.register_handler(Arc::new(ThemeClusterRebuildHandler::with_followup_queue(
-        Arc::clone(&handler_pool),
-        queue,
-    )));
     runner.register_handler(Arc::new(PrivatizationApplyHandler::new(Arc::clone(
         &handler_scoped,
     ))));

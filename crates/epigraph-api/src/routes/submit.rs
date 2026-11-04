@@ -1313,7 +1313,8 @@ async fn persist_packet(
     }
 
     // Short-circuit all dependent writes on a duplicate. On a duplicate the
-    // evidence INSERT would hit `evidence_content_hash_claim_unique` → 500;
+    // raw evidence INSERT below (no `EvidenceRepository` de-duplication) would
+    // add a second copy of the canonical claim's evidence;
     // the `trace_id` UPDATE would mutate another run's canonical noun-claim
     // (forbidden, see claim.rs noun-claim invariant); and post-018 the edges
     // have no triple-unique, so re-inserting would silently duplicate the
@@ -1381,53 +1382,74 @@ async fn persist_packet(
         })?;
 
         // 5b. Materialize structural edges: agent --AUTHORED--> claim, claim --HAS_TRACE--> trace
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(agent_uuid)
-    .bind(claim_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create AUTHORED edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            agent_uuid,
+            "agent",
+            claim_uuid,
+            "claim",
+            "AUTHORED",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create AUTHORED edge: {}", e),
+                ),
+            )
+        })?;
 
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'claim', $2, 'trace', 'HAS_TRACE', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(claim_uuid)
-    .bind(trace_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create HAS_TRACE edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            claim_uuid,
+            "claim",
+            trace_uuid,
+            "trace",
+            "HAS_TRACE",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create HAS_TRACE edge: {}", e),
+                ),
+            )
+        })?;
 
-        sqlx::query_scalar::<_, i32>(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-         VALUES ($1, 'trace', $2, 'claim', 'TRACES', '{}'::jsonb) \
-         RETURNING 1"
-    )
-    .bind(trace_uuid)
-    .bind(claim_uuid)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorResponse::new("DatabaseError", format!("Failed to create TRACES edge: {}", e)),
+        epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
+            trace_uuid,
+            "trace",
+            claim_uuid,
+            "claim",
+            "TRACES",
+            None,
+            None,
+            None,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new(
+                    "DatabaseError",
+                    format!("Failed to create TRACES edge: {}", e),
+                ),
+            )
+        })?;
 
         // 6. Insert evidence records
         for (i, evidence_submission) in packet.evidence.iter().enumerate() {
@@ -1506,39 +1528,54 @@ async fn persist_packet(
             )
         })?;
 
-            // Materialize graph edges: evidence --SUPPORTS--> claim
-            sqlx::query_scalar::<_, i32>(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'evidence', $2, 'claim', 'SUPPORTS', '{}'::jsonb) \
-             RETURNING 1"
-        )
-        .bind(evidence_uuid)
-        .bind(claim_uuid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to create SUPPORTS edge: {}", e)),
+            // Materialize graph edges: evidence --supports--> claim (the canonical
+            // spelling, `epigraph_core::edge::relationships::canonical_relationship`)
+            epigraph_db::EdgeRepository::create_signed_conn(
+                &mut tx,
+                state.edge_signing_key(),
+                evidence_uuid,
+                "evidence",
+                claim_uuid,
+                "claim",
+                "supports",
+                None,
+                None,
+                None,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to create SUPPORTS edge: {}", e),
+                    ),
+                )
+            })?;
 
             // Materialize graph edges: trace --USES_EVIDENCE--> evidence
-            sqlx::query_scalar::<_, i32>(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, 'trace', $2, 'evidence', 'USES_EVIDENCE', '{}'::jsonb) \
-             RETURNING 1"
-        )
-        .bind(trace_uuid)
-        .bind(evidence_uuid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorResponse::new("DatabaseError", format!("Failed to create USES_EVIDENCE edge: {}", e)),
+            epigraph_db::EdgeRepository::create_signed_conn(
+                &mut tx,
+                state.edge_signing_key(),
+                trace_uuid,
+                "trace",
+                evidence_uuid,
+                "evidence",
+                "USES_EVIDENCE",
+                None,
+                None,
+                None,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorResponse::new(
+                        "DatabaseError",
+                        format!("Failed to create USES_EVIDENCE edge: {}", e),
+                    ),
+                )
+            })?;
         }
     } // end `if was_created`
 
@@ -1900,7 +1937,7 @@ pub async fn submit_packet(
             } else {
                 match embedding_service.generate(&packet.claim.content).await {
                     Ok(embedding) => {
-                        // Store directly via SQL (provider-agnostic — works with Jina, OpenAI, etc.)
+                        // Provider-agnostic pgvector literal (Jina, OpenAI, ...).
                         let pgvector_str = format!(
                             "[{}]",
                             embedding
@@ -1909,24 +1946,34 @@ pub async fn submit_packet(
                                 .collect::<Vec<_>>()
                                 .join(",")
                         );
-                        if let Err(e) =
-                            sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2")
-                                .bind(&pgvector_str)
-                                .bind(claim_id)
-                                .execute(&state.db_pool)
-                                .await
+                        // Stored on the authority that wrote the claim: a
+                        // transaction stamped with the caller's viewer. On the
+                        // unstamped `db_pool` row security refused this UPDATE
+                        // for every writer (`AppState::store_claim_embedding_as`).
+                        match state
+                            .store_claim_embedding_as(
+                                &viewer,
+                                claim_id,
+                                &pgvector_str,
+                                "submit_packet.embed",
+                            )
+                            .await
                         {
-                            tracing::warn!(
-                                claim_id = %claim_id,
-                                error = %e,
-                                "Failed to store claim embedding"
-                            );
-                        } else {
-                            tracing::debug!(
+                            Ok(true) => tracing::debug!(
                                 claim_id = %claim_id,
                                 embedding_dim = embedding.len(),
                                 "Generated and stored embedding for claim"
-                            );
+                            ),
+                            Ok(false) => tracing::warn!(
+                                claim_id = %claim_id,
+                                "Claim embedding matched no row (claim missing, sealed, \
+                                 superseded, or not writable by the caller); no vector stored"
+                            ),
+                            Err(e) => tracing::warn!(
+                                claim_id = %claim_id,
+                                error = %e,
+                                "Failed to store claim embedding"
+                            ),
                         }
                     }
                     Err(e) => {
@@ -2011,31 +2058,39 @@ pub async fn submit_packet(
                                     .collect::<Vec<_>>()
                                     .join(",")
                             );
-                            if let Err(e) = sqlx::query(
-                                "UPDATE evidence SET embedding = $1::vector WHERE id = $2",
-                            )
-                            .bind(&pgvector_str)
-                            .bind(evidence_id)
-                            .execute(&state.db_pool)
-                            .await
+                            // Same authority as the packet's insert, for the
+                            // same reason as the claim's vector above.
+                            match state
+                                .store_evidence_embedding_as(
+                                    &viewer,
+                                    evidence_id,
+                                    &pgvector_str,
+                                    "submit_packet.embed_figure",
+                                )
+                                .await
                             {
-                                tracing::warn!(
+                                Ok(true) => {
+                                    let mode = if embedding_service.as_multimodal().is_some() {
+                                        "image"
+                                    } else {
+                                        "caption"
+                                    };
+                                    tracing::debug!(
+                                        evidence_id = %evidence_id,
+                                        embedding_dim = embedding.len(),
+                                        mode,
+                                        "Generated and stored figure evidence embedding"
+                                    );
+                                }
+                                Ok(false) => tracing::warn!(
+                                    evidence_id = %evidence_id,
+                                    "Figure evidence embedding matched no row; no vector stored"
+                                ),
+                                Err(e) => tracing::warn!(
                                     evidence_id = %evidence_id,
                                     error = %e,
                                     "Failed to store figure evidence embedding"
-                                );
-                            } else {
-                                let mode = if embedding_service.as_multimodal().is_some() {
-                                    "image"
-                                } else {
-                                    "caption"
-                                };
-                                tracing::debug!(
-                                    evidence_id = %evidence_id,
-                                    embedding_dim = embedding.len(),
-                                    mode,
-                                    "Generated and stored figure evidence embedding"
-                                );
+                                ),
                             }
                         }
                         Err(e) => {

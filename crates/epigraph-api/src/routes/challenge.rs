@@ -2,6 +2,8 @@
 //!
 //! POST /api/v1/claims/:id/challenge - Submit a challenge (protected)
 //! GET  /api/v1/claims/:id/challenges - List challenges for a claim
+//! POST /api/v1/challenges/:id/resolve - Set a challenge's resolution status
+//!      (the challenged claim's owner; protected)
 //!
 //! Challenges allow agents to dispute existing claims with counter-evidence.
 //! This is a core epistemic mechanism: truth must be contestable to be trustworthy.
@@ -482,6 +484,173 @@ pub async fn list_challenges(
     Ok(Json(ListChallengesResponse {
         challenges: challenge_responses,
         total,
+    }))
+}
+
+// =============================================================================
+// RESOLUTION (operator rulings R-3, R-13, R-14, R-CH1b)
+// =============================================================================
+
+/// The resolution statuses a writer of the challenged claim's group sets.
+/// `withdrawn` is the challenger's own act and `pending` is no resolution, so
+/// neither is accepted here; migration 168's definer refuses them as well.
+pub const RESOLUTION_STATES: &[&str] = &["under_review", "accepted", "rejected"];
+
+/// Request body for `POST /api/v1/challenges/:id/resolve`.
+///
+/// There is no resolver field, and an unknown field is refused: the resolver
+/// is always the authenticated caller (ruling R-13).
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveChallengeRequest {
+    /// `under_review`, `accepted` or `rejected`.
+    pub state: String,
+    /// Optional JSON recording the resolution (e.g. the reason).
+    #[serde(default)]
+    pub resolution_details: Option<serde_json::Value>,
+}
+
+/// Response for a resolved challenge.
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ChallengeResolutionResponse {
+    pub challenge_id: Uuid,
+    pub claim_id: Uuid,
+    pub state: String,
+    pub resolved_by: Option<Uuid>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution_details: Option<serde_json::Value>,
+}
+
+/// The SQLSTATE of a database error.
+#[cfg(feature = "db")]
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// Set the resolution status of a challenge
+///
+/// POST /api/v1/challenges/:id/resolve
+///
+/// The HTTP twin of the MCP `resolve_challenge` tool. Requires `claims:write`.
+/// One transaction stamped with the caller's viewer calls migration 168's
+/// `epigraph_resolve_challenge`, which:
+///
+/// * admits only a writer of the CHALLENGED CLAIM's owning group (ruling R-3):
+///   the challenger itself (an outsider owns its row, R-CH1), a stranger and a
+///   reader member are refused; the challenger's text and ownership are never
+///   touched;
+/// * records the caller as `resolved_by` (the session principal; the body has
+///   no resolver field and refuses unknown ones, ruling R-13) and appends one
+///   `security_events` row naming it;
+/// * resolves `pending` -> `accepted` / `rejected` directly and re-resolves a
+///   settled challenge (ruling R-14), each change audited;
+/// * refuses a challenge its challenger withdrew;
+/// * answers a challenge on a claim the caller cannot read exactly as a
+///   nonexistent id (ruling R-CH1b): the same 404 and body.
+///
+/// # Errors
+///
+/// - 400: `state` is not `under_review`, `accepted` or `rejected` (checked
+///   before any lookup, so it says nothing about the id)
+/// - 401: missing or invalid bearer token (middleware)
+/// - 403: no `claims:write`, an elevated (read-only) request, or a caller that
+///   does not write the challenged claim's owning group
+/// - 404: the challenge does not exist or the caller cannot read its claim
+/// - 409: the challenger withdrew the challenge
+/// - 422: a body field other than `state` / `resolution_details`
+#[cfg(feature = "db")]
+pub async fn resolve_challenge(
+    ViewerExtractor(viewer): ViewerExtractor,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    State(state): State<AppState>,
+    Path(challenge_id): Path<Uuid>,
+    Json(request): Json<ResolveChallengeRequest>,
+) -> Result<Json<ChallengeResolutionResponse>, ApiError> {
+    // Nothing before the definer call depends on the challenge, so none of it
+    // distinguishes a hidden challenge from a missing one.
+    let auth = auth_ctx
+        .ok_or(ApiError::Unauthorized {
+            reason: "resolving a challenge requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+    if viewer.principal().is_none() {
+        return Err(ApiError::Forbidden {
+            reason: "resolving a challenge needs an authenticated resolver".to_string(),
+        });
+    }
+    if !RESOLUTION_STATES.contains(&request.state.as_str()) {
+        let hint = if request.state == "withdrawn" {
+            " (withdrawal is the challenger's own act, not a resolution)"
+        } else {
+            ""
+        };
+        return Err(ApiError::ValidationError {
+            field: "state".to_string(),
+            reason: format!(
+                "'{}' is not a resolution status; valid: {}{hint}",
+                request.state,
+                RESOLUTION_STATES.join(", ")
+            ),
+        });
+    }
+
+    let not_found = || ApiError::NotFound {
+        entity: "Challenge".to_string(),
+        id: challenge_id.to_string(),
+    };
+    let mut tx = state.write_as(&viewer, "resolve_challenge").await?;
+    epigraph_db::ChallengeRepository::resolve_as_claim_owner(
+        &mut *tx,
+        challenge_id,
+        &request.state,
+        request.resolution_details.as_ref(),
+    )
+    .await
+    .map_err(|e| match sqlstate(&e).as_deref() {
+        // CR02: missing OR unreadable, one answer (R-CH1b).
+        Some("P0002") => not_found(),
+        // CR03 (not a writer of the claim's group); CR01 / CR05 cannot reach
+        // here past the principal check and `write_as`'s elevation refusal.
+        Some("42501") => ApiError::Forbidden {
+            reason: "only a writer of the challenged claim's owning group sets a challenge's \
+                     resolution status (the challenger may only withdraw its own challenge); \
+                     nothing was written"
+                .to_string(),
+        },
+        Some("55000") => ApiError::Conflict {
+            reason: "the challenger withdrew this challenge; a withdrawn challenge takes no \
+                     resolution status; nothing was written"
+                .to_string(),
+        },
+        Some("22023") => ApiError::ValidationError {
+            field: "state".to_string(),
+            reason: format!("'{}' is not a resolution status", request.state),
+        },
+        _ => ApiError::InternalError {
+            message: format!("Failed to resolve the challenge: {e}"),
+        },
+    })?;
+    // The caller wrote the row, so it reads it: it can read the claim (CR02
+    // passed) and the row-security read follows the claim (168 section 6).
+    let row = epigraph_db::ChallengeRepository::get(&mut *tx, &viewer, challenge_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to read the resolved challenge: {e}"),
+        })?
+        .ok_or_else(not_found)?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the resolution: {e}"),
+    })?;
+    Ok(Json(ChallengeResolutionResponse {
+        challenge_id: row.id,
+        claim_id: row.claim_id,
+        state: row.state,
+        resolved_by: row.resolved_by,
+        resolved_at: row.resolved_at,
+        resolution_details: row.resolution_details,
     }))
 }
 

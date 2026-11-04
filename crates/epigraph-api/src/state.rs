@@ -320,6 +320,12 @@ pub struct AppState {
     /// `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKENS` at boot.
     #[cfg(feature = "db")]
     pub run_tokens: epigraph_db::RunTokens,
+    /// The LLM models the run-token grant may mint for
+    /// (`crate::oauth::run_token`). EMPTY in every constructor, which refuses
+    /// every mint; `bin/server.rs` sets it from `EPIGRAPH_RUN_TOKEN_MODELS` at
+    /// boot.
+    #[cfg(feature = "db")]
+    pub run_token_models: crate::oauth::run_token::RunTokenModels,
     /// Whether `POST /api/v1/bp/propagate` may WRITE its results
     /// (`apply_updates: true`). OFF in every constructor; `bin/server.rs` sets
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
@@ -463,6 +469,11 @@ pub struct AppState {
     /// (fail closed; dev and CI run this way).
     #[cfg(feature = "db")]
     pub passkeys: Option<Arc<epigraph_passkey::Passkeys>>,
+    /// The API's OWN entity signing key for the edges HTTP writers insert
+    /// (ruling R-50; [`crate::edge_signer`]). `None` = edges are written
+    /// unsigned (no key configured).
+    #[cfg(feature = "db")]
+    pub edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
 }
 
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
@@ -703,6 +714,14 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Role-attached agents (166), FORCEd by the migration that creates it, on
     // the same precedent.
     "role_agents",
+    // The two harvester neighbours of `harvester_fragments` (173, ruling
+    // R-66), brought under tenancy and FORCEd by that migration, on the same
+    // precedent. Apply 173 before or with a binary carrying these two names.
+    "harvester_sources",
+    "harvester_audit_reports",
+    // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
+    // that migration, on the same precedent.
+    "workflows",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1110,6 +1129,43 @@ const TENANCY_TRIGGERS_089: &[(&str, &str)] = &[(
 #[cfg(feature = "db")]
 const MIGRATION_089_MARKER: &str = "epigraph_inherit_fragment_tenancy_stmt";
 
+/// The tenancy triggers **migration 173** adds, as `(relation, trigger)`.
+///
+/// Transcribed from `migrations/173_harvester_tables_tenancy_posture.sql`'s
+/// section 4: the root trigger that makes a `harvester_sources` writer declare
+/// its tenancy, the stamp that gives an audit report its fragment's pair at
+/// INSERT, and the trigger on `harvester_fragments` that re-stamps a
+/// fragment's audit reports when the fragment's pair changes. A dropped follow
+/// trigger is the silent case: the audit of a narrowed or re-owned fragment
+/// stays readable to its old readers, and nothing errors.
+///
+/// Required by [`AppState::assert_tenancy_triggers_armed`] **only when one of
+/// [`MIGRATION_173_MARKERS`] exists**, for the reasons
+/// [`TENANCY_TRIGGERS_089`] gives: an unconditional entry would refuse every
+/// database that has not reached 173.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_173: &[(&str, &str)] = &[
+    ("harvester_sources", "harvester_sources_require_tenancy"),
+    (
+        "harvester_audit_reports",
+        "harvester_audit_reports_inherit_tenancy",
+    ),
+    (
+        "harvester_fragments",
+        "harvester_fragments_audit_reports_inherit_tenancy",
+    ),
+];
+
+/// The markers that migration 173 has run: the two functions it installs
+/// beside its triggers. EITHER one present means 173 ran, so dropping one
+/// trigger together with its own function still leaves the tier required by
+/// the other. 173's documented undo drops both, and then nothing is required.
+#[cfg(feature = "db")]
+const MIGRATION_173_MARKERS: &[&str] = &[
+    "epigraph_audit_report_inherit_tenancy",
+    "epigraph_fragment_audit_reports_follow",
+];
+
 impl AppState {
     /// Create new application state with the given configuration (no database)
     #[cfg(not(feature = "db"))]
@@ -1165,6 +1221,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1187,6 +1245,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -1246,6 +1305,18 @@ impl AppState {
     #[must_use]
     pub fn with_run_tokens(mut self, run_tokens: epigraph_db::RunTokens) -> Self {
         self.run_tokens = run_tokens;
+        self
+    }
+
+    /// Set the models the run-token grant may mint for; see
+    /// [`Self::run_token_models`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_run_token_models(
+        mut self,
+        models: crate::oauth::run_token::RunTokenModels,
+    ) -> Self {
+        self.run_token_models = models;
         self
     }
 
@@ -1532,6 +1603,107 @@ impl AppState {
         Ok(ClaimWriteTx::Unscoped(tx))
     }
 
+    /// Store a claim's embedding after the claim's own write committed, on the
+    /// SAME authority that wrote it: a [`Self::begin_claim_write`] transaction
+    /// stamped with the request's `viewer`.
+    ///
+    /// # Why not `db_pool`
+    ///
+    /// An `UPDATE claims SET embedding` on the unstamped pool carries no
+    /// writable set. Migration 077's `claims_tenancy` lets that session SEE a
+    /// public row (`USING … visibility = 'public'`) and then refuses the new
+    /// row (`WITH CHECK owner_group_id = ANY(epigraph_writable_groups())`, an
+    /// empty set): "new row violates row-level security policy for table
+    /// \"claims\"". The claim-write routes swallowed that refusal by design (a
+    /// failed embed must not unwind a committed claim), so they answered 2xx
+    /// and left the claim with no vector, invisible to dense recall. The
+    /// viewer that just passed the INSERT's `WITH CHECK` passes the UPDATE's.
+    ///
+    /// # Why `store_embedding_if_unsealed`
+    ///
+    /// The provider round trip sits between the commit and this store, and a
+    /// claim can be sealed or superseded inside that window. The repository
+    /// call takes the row lock first, re-checks `claim_encryption` and
+    /// `is_current`, and splices the viewer's `{WRITABLE:c}` predicate so the
+    /// statement's qual agrees with the stamp. The caller generates the vector
+    /// BEFORE calling this, so no transaction is held across the provider call.
+    ///
+    /// # The unscoped fallback fails closed
+    ///
+    /// `begin_claim_write` falls back to a plain `db_pool` transaction only for
+    /// a test-built state with no `ScopedPool`. A production process without
+    /// one would run this UPDATE unstamped, which `claims_tenancy` refuses:
+    /// the vector is not stored and the caller logs why. Nothing is admitted.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` when the vector landed. `Ok(false)` when the statement ran and
+    /// matched no row (claim missing, sealed, superseded, or not writable by
+    /// `viewer`). `Err` names a failed begin/stamp, statement, or commit.
+    #[cfg(feature = "db")]
+    pub async fn store_claim_embedding_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+        embedding_pgvector: &str,
+        handler: &'static str,
+    ) -> Result<bool, String> {
+        let mut tx = self
+            .begin_claim_write(viewer, handler)
+            .await
+            .map_err(|e| format!("could not begin a viewer-stamped transaction: {e:?}"))?;
+        let stored = epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+            &mut tx,
+            viewer,
+            claim_id,
+            embedding_pgvector,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("the embedding UPDATE ran but could not commit: {e}"))?;
+        Ok(stored)
+    }
+
+    /// Store an evidence row's embedding after the packet that inserted it
+    /// committed, on a [`Self::begin_claim_write`] transaction stamped with the
+    /// same `viewer`. The evidence twin of [`Self::store_claim_embedding_as`],
+    /// for the same reason: `evidence` carries the same generic tenancy policy
+    /// as `claims`, so the unstamped UPDATE is refused by its `WITH CHECK`.
+    /// Stored through `EvidenceRepository::store_embedding_as`, which splices
+    /// the viewer's `{WRITABLE:e}` predicate and skips a sealed row.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` when a row was updated, `Ok(false)` when none matched, `Err`
+    /// on a failed begin/stamp, statement, or commit.
+    #[cfg(feature = "db")]
+    pub async fn store_evidence_embedding_as(
+        &self,
+        viewer: &epigraph_db::visibility::Viewer,
+        evidence_id: Uuid,
+        embedding_pgvector: &str,
+        handler: &'static str,
+    ) -> Result<bool, String> {
+        let mut tx = self
+            .begin_claim_write(viewer, handler)
+            .await
+            .map_err(|e| format!("could not begin a viewer-stamped transaction: {e:?}"))?;
+        let stored = epigraph_db::EvidenceRepository::store_embedding_as(
+            &mut tx,
+            viewer,
+            epigraph_core::EvidenceId::from_uuid(evidence_id),
+            embedding_pgvector,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        tx.commit()
+            .await
+            .map_err(|e| format!("the embedding UPDATE ran but could not commit: {e}"))?;
+        Ok(stored)
+    }
+
     /// Create new application state with database pool and custom signature verification state
     #[cfg(feature = "db")]
     pub fn with_db_and_signature_state(
@@ -1546,6 +1718,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1568,6 +1742,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -1617,6 +1792,8 @@ impl AppState {
             admin_cascade: false,
             #[cfg(feature = "db")]
             run_tokens: epigraph_db::RunTokens::Off,
+            #[cfg(feature = "db")]
+            run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
@@ -1639,6 +1816,7 @@ impl AppState {
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
+            edge_signer: None,
         }
     }
 
@@ -1768,6 +1946,9 @@ impl AppState {
     ///     [`MIGRATION_089_MARKER`] — 089's own function — is present. The
     ///     marker is deliberately NOT the trigger: a gate keyed on the thing it
     ///     checks for is vacuous.
+    ///   * [`TENANCY_TRIGGERS_173`] is required only once either of
+    ///     [`MIGRATION_173_MARKERS`] — 173's own functions — is present, on the
+    ///     same reasoning.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -1816,6 +1997,7 @@ impl AppState {
                 .iter()
                 .chain(TENANCY_TRIGGERS_074.iter())
                 .chain(TENANCY_TRIGGERS_089.iter())
+                .chain(TENANCY_TRIGGERS_173.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -1830,14 +2012,25 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        let migration_089_applied: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_proc p \
-                              JOIN pg_namespace n ON n.oid = p.pronamespace \
-                             WHERE n.nspname = 'public' AND p.proname = $1)",
+        // One read for every marker-gated tier (089's and 173's), so the boot
+        // check keeps a single catalog probe.
+        let markers: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT p.proname::text FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' AND p.proname = ANY($1)",
         )
-        .bind(MIGRATION_089_MARKER)
-        .fetch_one(&self.db_pool)
+        .bind(
+            std::iter::once(MIGRATION_089_MARKER)
+                .chain(MIGRATION_173_MARKERS.iter().copied())
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        )
+        .fetch_all(&self.db_pool)
         .await?;
+        let migration_089_applied = markers.iter().any(|m| m == MIGRATION_089_MARKER);
+        let migration_173_applied = markers
+            .iter()
+            .any(|m| MIGRATION_173_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -1850,6 +2043,9 @@ impl AppState {
         }
         if migration_089_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_089);
+        }
+        if migration_173_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_173);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -1905,6 +2101,7 @@ impl AppState {
             triggers = rows.len(),
             migration_074_applied,
             migration_089_applied,
+            migration_173_applied,
             "tenancy triggers armed"
         );
         Ok(())
@@ -2224,6 +2421,27 @@ impl AppState {
     pub fn with_passkeys(mut self, passkeys: Option<Arc<epigraph_passkey::Passkeys>>) -> Self {
         self.passkeys = passkeys;
         self
+    }
+
+    /// Attach the API's edge signing key; see [`Self::edge_signer`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_edge_signer(
+        mut self,
+        edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
+    ) -> Self {
+        self.edge_signer = edge_signer;
+        self
+    }
+
+    /// The key an HTTP edge writer passes to the `EdgeRepository::*_signed_conn`
+    /// primitives: the API's own (ruling R-50), or `None` (unsigned).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn edge_signing_key(&self) -> Option<epigraph_db::repos::EdgeSigningKey<'_>> {
+        self.edge_signer
+            .as_deref()
+            .map(crate::edge_signer::ApiEdgeSigner::key)
     }
 }
 

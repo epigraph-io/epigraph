@@ -93,7 +93,9 @@ async fn run(
     let claims = ClaimRepository::find_claims_needing_embeddings(pool, viewer, cli.limit)
         .await
         .context("find claims needing embeddings")?;
-    // `workflows` has no row security, so this leg needs no viewer.
+    // The maintenance connection reads every `workflows` row (its row
+    // security, migration 183, admits the maintenance role), so this leg
+    // needs no viewer.
     let workflows = WorkflowRepository::find_needing_goal_embedding(pool, cli.limit)
         .await
         .context("find workflows needing goal embeddings")?;

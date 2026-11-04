@@ -32,7 +32,8 @@ pub struct ClaimThemeRow {
 /// It is **not maintained** by the assignment writers: `assign_claim`,
 /// `bulk_assign` and `unassign_claim` all write `claims.theme_id` and never
 /// touch it; only [`ClaimThemeRepository::update_count`] does, and only the
-/// k-means path calls that. `member_count` is the live
+/// `create-with-centroid` route calls that (the retired k-means prototype was
+/// the other caller). `member_count` is the live
 /// `COUNT(*) FROM claims WHERE theme_id = t.id AND is_current` and is the
 /// authoritative figure. The two are both reported so a caller (or an
 /// operator auditing drift) can see the divergence instead of silently
@@ -156,8 +157,8 @@ pub struct ClaimThemeRepository;
 impl ClaimThemeRepository {
     /// Create a new theme (centroid stored separately via raw SQL for vector type)
     ///
-    /// Executor-generic, like the other writes `run_theme_kmeans` and the HTTP
-    /// `create-with-centroid` route make, so a caller can put the theme row, its
+    /// Executor-generic, like the other writes the HTTP `create-with-centroid`
+    /// route makes, so a caller can put the theme row, its
     /// centroid and its claim assignment in ONE transaction. Written separately
     /// on a pool, a refused assignment left the theme row behind (batch H-a
     /// review: `claim_themes +1` with the call reported as failed).
@@ -426,9 +427,8 @@ impl ClaimThemeRepository {
     /// Every theme carrying EXACTLY this label, oldest first.
     ///
     /// Returns a `Vec`, not an `Option`, on purpose: `claim_themes` has no
-    /// `UNIQUE(label)` constraint and `theme_cluster(wipe_first=false)`
-    /// actively produces duplicate `auto-00` rows (see this module's
-    /// docstring). A resolver that returned "the first match" would silently
+    /// `UNIQUE(label)` constraint, and the retired k-means tool's additive runs
+    /// (`theme_cluster(wipe_first=false)`) left duplicate `auto-00` rows. A resolver that returned "the first match" would silently
     /// pick one of several distinct themes; callers must see the ambiguity and
     /// refuse rather than guess.
     pub async fn find_by_label(pool: &PgPool, label: &str) -> Result<Vec<Uuid>, DbError> {

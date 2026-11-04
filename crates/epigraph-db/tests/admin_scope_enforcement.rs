@@ -922,3 +922,163 @@ async fn the_arming_cache_reads_a_database_without_the_switch_as_unarmed(pool: P
     let cache = epigraph_db::AdminScopeArmingCache::with_ttl(std::time::Duration::ZERO);
     assert!(!cache.armed(&pool).await, "no switch: unarmed");
 }
+
+// =====================================================================
+// Migration 169 over legacy cascade rows, and its rollback
+// (docs/runbooks/169-undo.sql)
+// =====================================================================
+
+fn undo_169() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/169-undo.sql"),
+    )
+    .expect("169-undo.sql")
+}
+
+/// `security_events_read`'s command and qualifier as the catalog prints them.
+async fn security_events_read_body(pool: &PgPool) -> (String, String) {
+    sqlx::query_as(
+        "SELECT pol.polcmd::text, pg_get_expr(pol.polqual, pol.polrelid) \
+           FROM pg_policy pol \
+          WHERE pol.polname = 'security_events_read' \
+            AND pol.polrelid = 'public.security_events'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("security_events_read")
+}
+
+/// How many of `ids` `principal` reads as `epigraph_app`, stamped with that
+/// principal and nothing else.
+async fn events_read_by(pool: &PgPool, principal: Uuid, ids: &[Uuid]) -> i64 {
+    let ids = ids.to_vec();
+    fixture::as_role(pool, "epigraph_app", |mut c| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(principal.to_string())
+            .execute(&mut *c)
+            .await
+            .expect("stamp");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM security_events WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_one(&mut *c)
+            .await
+            .expect("read as the principal");
+        sqlx::query("SELECT set_config('epigraph.principal_id', '', false)")
+            .execute(&mut *c)
+            .await
+            .expect("unstamp");
+        (c, n)
+    })
+    .await
+}
+
+/// The ruling's "keep the legacy rows intact" on a database that already
+/// holds them: `cascade.admin_applied` / `cascade.belief_rederived` rows
+/// carrying other writers' ids, written BEFORE 169, come out of 169 byte for
+/// byte, and the agent they name, which read both before (the in-test
+/// red), reads neither after. `docs/runbooks/169-undo.sql` then returns
+/// `security_events_read` exactly to its pre-169 body and the catalog to its
+/// pre-169 state, twice over, and the agent reads both rows again. Cut at
+/// 169, not head: a later migration is undone first.
+///
+/// Verified to fail: with 169's file removed (B still reads both rows after
+/// the upgrade); with the undo recreating 169's narrowed body (the qualifier
+/// differs from 168's).
+#[sqlx::test(migrations = false)]
+async fn the_169_upgrade_keeps_legacy_cascade_rows_and_its_undo_restores_the_read(pool: PgPool) {
+    migrate(&pool, &up_to(168)).await;
+    let body_168 = security_events_read_body(&pool).await;
+    let catalog_168 = catalog(&pool).await;
+    fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "legacy-cascade-b").await;
+    let (other_edge, other_claim) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut ids = Vec::new();
+    for (event_type, details) in [
+        (
+            "cascade.admin_applied",
+            serde_json::json!({"cause": "dedup",
+                               "touched": {"edges_retargeted": [other_edge]}}),
+        ),
+        (
+            "cascade.belief_rederived",
+            serde_json::json!({"cause": "dedup",
+                               "belief": {"recomputed": [other_claim]}}),
+        ),
+    ] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, $2, true, $3) RETURNING id",
+        )
+        .bind(event_type)
+        .bind(b)
+        .bind(details)
+        .fetch_one(&pool)
+        .await
+        .expect("a legacy cascade row naming B");
+        ids.push(id);
+    }
+    let rows = |pool: PgPool, ids: Vec<Uuid>| async move {
+        let r: Vec<(Uuid, String, Option<Uuid>, String)> = sqlx::query_as(
+            "SELECT id, event_type::text, agent_id, details::text FROM security_events \
+              WHERE id = ANY($1) ORDER BY event_type",
+        )
+        .bind(&ids)
+        .fetch_all(&pool)
+        .await
+        .expect("the legacy rows");
+        r
+    };
+    let before = rows(pool.clone(), ids.clone()).await;
+    assert!(
+        before.len() == 2
+            && before[0].3.contains(&other_edge.to_string())
+            && before[1].3.contains(&other_claim.to_string()),
+        "CALIBRATION: the legacy rows carry other writers' ids: {before:?}"
+    );
+    assert_eq!(
+        events_read_by(&pool, b, &ids).await,
+        2,
+        "CALIBRATION: before 169 the agent reads both legacy rows naming it"
+    );
+
+    migrate(&pool, &up_to(169)).await;
+    assert_eq!(
+        rows(pool.clone(), ids.clone()).await,
+        before,
+        "169 changes no row: the legacy rows and their id lists are kept"
+    );
+    assert_eq!(
+        events_read_by(&pool, b, &ids).await,
+        0,
+        "after 169 the agent reads neither legacy row naming it"
+    );
+    let body_169 = security_events_read_body(&pool).await;
+    assert_ne!(body_169, body_168, "169 narrows security_events_read");
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo_169())
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the 169 undo applies (run {run}): {e}"));
+    }
+    assert_eq!(
+        security_events_read_body(&pool).await,
+        body_168,
+        "after 169-undo security_events_read reads exactly as before 169"
+    );
+    assert_eq!(
+        catalog(&pool).await,
+        catalog_168,
+        "after 169-undo the catalog is the pre-169 one"
+    );
+    assert_eq!(
+        events_read_by(&pool, b, &ids).await,
+        2,
+        "after 169-undo the agent reads both rows again"
+    );
+    assert_eq!(
+        rows(pool.clone(), ids.clone()).await,
+        before,
+        "169-undo changes no row either"
+    );
+}

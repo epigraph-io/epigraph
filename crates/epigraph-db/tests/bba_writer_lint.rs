@@ -27,6 +27,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // --- epigraph-cli -------------------------------------------------------
     ("crates/epigraph-cli/src/backfill_factors.rs", "delete_edge_rows", 1, "SPEC §10.1 H3: rewire deletes an edge's BBAs; PR-F2 maps compound outcomes to keep, never to delete"),
     ("crates/epigraph-cli/src/backfill_factors.rs", "rewire_one", 1, "SPEC §4.1 W8: rewire restamps an edge BBA's tenancy columns; masses untouched"),
+    ("crates/epigraph-cli/src/edge_rewire.rs", "restore_edge_rows", 1, "R-176(2) class E rollback: compare-and-swap of a targeted rewire's rows back to their recorded pre-image (masses, typing, created_at), only where the row is live and still holds what the rewire wrote; the rewire wrote no compound-ended edge, so neither does this"),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", 1, "SPEC §4.1 W13: raw INSERT of bootstrap BBAs; PR-W4"),
     ("crates/epigraph-cli/src/bin/experiment.rs", "analyze", 1, "SPEC §4.1 W13: CLI experiment outcome BBA; PR-W4"),
     ("crates/epigraph-cli/src/bin/hypothesis.rs", "create", 1, "SPEC §4.1 W13: CLI hypothesis prior BBA; PR-W4"),
@@ -49,7 +50,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // --- epigraph-mcp -------------------------------------------------------
     ("crates/epigraph-mcp/src/tools/ds.rs", "submit_ds_evidence", 1, "SPEC §4.1 W3: MCP submit_ds_evidence; warn-then-refuse on compounds is PR-W1a"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_for_claim", 1, "SPEC §4.1 W2: the first BBA of a newly created claim"),
-    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
+    ("crates/epigraph-mcp/src/tools/ds_auto.rs", "auto_wire_ds_update_filed_on", 2, "SPEC §4.1 W1 and W4: the evidence BBA and the truth_value seed; PR-W1e puts the compound guard inside"),
     ("crates/epigraph-mcp/src/tools/ds_auto.rs", "wire_single_batch_entry", 1, "SPEC §4.1 W5: ingest atom BBA; PR-W3 keys it to the atom's evidence row"),
     // --- scripts ------------------------------------------------------------
     ("scripts/backfill_intra_source_evidence_discount.py", "execute_backfill", 1, "SPEC §4.1 W13 script: rewrites source_strength; frozen, not edited"),
@@ -62,7 +63,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("scripts/migrate_provenance_bba.py", "rollback", 1, "SPEC §4.1 W13 script: deletes the seed BBAs it inserted"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "<module>", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
     ("scripts/phase2_locality_tag_vocab_migration.py", "main", 1, "rewrites the evidence_type vocabulary only; masses untouched"),
-    ("scripts/tests/test_migrate_provenance_bba.py", "execute", 1, "a test double that matches the statement text of migrate_provenance_bba.py; writes nothing"),
+    ("scripts/tests/test_migrate_provenance_bba.py", "execute", 2, "two test doubles (seed and rollback) that match the statement text of migrate_provenance_bba.py; write nothing"),
+    ("scripts/tests/test_migrate_provenance_bba.py", "test_the_delete_skips_retracted_rows_and_reports_them", 1, "selects the rollback's recorded DELETE text from a test double to assert its retracted_at predicate; writes nothing"),
+    ("scripts/tests/test_migrate_provenance_bba_db.py", "_seed_bba", 1, "the K4b DB arm's fixture: one seed BBA exactly as migrate() writes it, in the CI-provisioned _test database only"),
 ];
 
 /// Is the text before `at` the `fn` keyword (a declaration, not a call)?

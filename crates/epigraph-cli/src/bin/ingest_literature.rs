@@ -40,7 +40,7 @@
 //! }
 //! ```
 
-use epigraph_crypto::{AgentSigner, ContentHasher};
+use epigraph_crypto::{AgentSigner, ContentHasher, SignedEntity};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -444,7 +444,8 @@ fn build_packets(
             let content_hash = ContentHasher::hash(raw_content.as_bytes());
             let content_hash_hex = hex::encode(content_hash);
 
-            let evidence_signature = hex::encode(signer.sign(raw_content.as_bytes()));
+            let evidence_signature =
+                hex::encode(signer.sign_entity(SignedEntity::Evidence, &content_hash));
 
             let text_evidence = EvidenceSubmission {
                 content_hash: content_hash_hex,
@@ -476,7 +477,9 @@ fn build_packets(
                             if let Some(ref image_data) = fig.image_base64 {
                                 let fig_hash = ContentHasher::hash(image_data.as_bytes());
                                 let fig_hash_hex = hex::encode(fig_hash);
-                                let fig_signature = hex::encode(signer.sign(image_data.as_bytes()));
+                                let fig_signature = hex::encode(
+                                    signer.sign_entity(SignedEntity::Evidence, &fig_hash),
+                                );
 
                                 evidence_items.push(EvidenceSubmission {
                                     content_hash: fig_hash_hex,
@@ -1213,6 +1216,26 @@ mod tests {
         let sig_hex = packets[0].evidence[0].signature.as_ref().unwrap();
         let sig_bytes = hex::decode(sig_hex).expect("Signature should be valid hex");
         assert_eq!(sig_bytes.len(), 64, "Ed25519 signature should be 64 bytes");
+
+        // Ruling R-34: a v1 EVIDENCE signature over the evidence's content
+        // hash, which is no claim signature over that hash.
+        let sig: [u8; 64] = sig_bytes.try_into().unwrap();
+        let mut hash = [0u8; 32];
+        hex::decode_to_slice(&packets[0].evidence[0].content_hash, &mut hash).unwrap();
+        let check = |kind| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &signer.public_key(),
+                kind,
+                &hash,
+                &sig,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            check(SignedEntity::Evidence),
+            Some(epigraph_crypto::SignatureScheme::V1)
+        );
+        assert_eq!(check(SignedEntity::Claim), None);
     }
 
     #[test]
@@ -1410,6 +1433,32 @@ mod tests {
 
         // Trace inputs should reference all evidence
         assert_eq!(packets[0].reasoning_trace.inputs.len(), 2);
+
+        // Ruling R-34: the FIGURE evidence (its own sign site) carries a v1
+        // EVIDENCE signature over its content hash, which is no claim
+        // signature over that hash.
+        let fig = &packets[0].evidence[1];
+        let sig: [u8; 64] = hex::decode(fig.signature.as_ref().expect("figure is signed"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut hash = [0u8; 32];
+        hex::decode_to_slice(&fig.content_hash, &mut hash).unwrap();
+        let check = |kind| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &signer.public_key(),
+                kind,
+                &hash,
+                &sig,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            check(SignedEntity::Evidence),
+            Some(epigraph_crypto::SignatureScheme::V1),
+            "the figure evidence is not signed as v1 evidence"
+        );
+        assert_eq!(check(SignedEntity::Claim), None);
     }
 
     #[test]

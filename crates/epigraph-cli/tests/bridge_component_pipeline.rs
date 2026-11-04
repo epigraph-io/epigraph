@@ -7,13 +7,13 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 // Imitate what bridge_component does: detect components, build candidate
-// table, call rerank_candidates_table — all in-process.
+// table and read it back in one transaction, rerank — all in-process.
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn pipeline_dry_run_with_isolated_components(pool: PgPool) {
-    use epigraph_cli::bridge::candidates::{build_candidate_table, drop_candidate_table};
+    use epigraph_cli::bridge::candidates::{build_candidate_table, CandidateTableLifetime};
     use epigraph_cli::bridge::components::compute_components;
-    use epigraph_cli::rerank::{rerank_candidates_table, RerankConfig};
+    use epigraph_cli::rerank::{find_candidates_from_table, rerank_candidates, RerankConfig};
 
     // Seed: agent + 2 disconnected components, each with one level=3 atom
     // that has a 1536d embedding.
@@ -64,9 +64,18 @@ async fn pipeline_dry_run_with_isolated_components(pool: PgPool) {
     );
 
     let table = format!("test_pipeline_{}", Uuid::new_v4().simple());
-    let count = build_candidate_table(&pool, &table, &[small_atom], &[target_atom], 0.5, 10)
-        .await
-        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let count = build_candidate_table(
+        &mut tx,
+        &table,
+        CandidateTableLifetime::Transaction,
+        &[small_atom],
+        &[target_atom],
+        0.5,
+        10,
+    )
+    .await
+    .unwrap();
     assert_eq!(count, 1, "expected 1 candidate pair");
 
     let config = RerankConfig {
@@ -78,11 +87,11 @@ async fn pipeline_dry_run_with_isolated_components(pool: PgPool) {
         limit: None,
         verbose: false,
     };
-    let summary = rerank_candidates_table(&pool, &table, &config)
+    let candidates = find_candidates_from_table(&mut tx, &table, &config)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
+    let summary = rerank_candidates(&pool, candidates, &config).await.unwrap();
     assert_eq!(summary.candidates_evaluated, 1);
     assert_eq!(summary.edges_created, 0, "dry-run must not create edges");
-
-    drop_candidate_table(&pool, &table).await.unwrap();
 }

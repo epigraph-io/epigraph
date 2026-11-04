@@ -42,7 +42,7 @@ pub async fn embedding_neighborhood_density(
         .embedder
         .generate(&params.query)
         .await
-        .map_err(|e| internal_error(format!("embed failed: {e}")))?;
+        .map_err(|e| crate::errors::internal_error_logged("embed failed", e))?;
     let embedding_dim = embedding.len() as u32;
     let embedding_str = crate::embed::format_pgvector(&embedding);
 

@@ -1,8 +1,5 @@
 [workspace]
 resolver = "2"
-exclude = [
-    "crates/epigraph-harvester",
-]
 members = [
     "crates/epigraph-interfaces",
     "crates/epigraph-authz",
@@ -73,7 +70,9 @@ bs58 = "0.5"
 hex = "0.4"
 # zstd: the agent prompt-history blobs (migration 161) are stored zstd-compressed;
 # epigraph-db compresses them on registration and decompresses them on read.
-zstd = { version = "0.13", default-features = false }
+# Floor 0.14.3 (zstd-safe 8.2): RUSTSEC-2026-0391/0398/0403 have no 0.13 fix;
+# pinned by crates/epigraph-db/tests/zstd_advisory_floor.rs.
+zstd = { version = "0.14.3", default-features = false }
 hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"

@@ -430,7 +430,7 @@ async fn decide_by_service_client_records_a_non_null_decider(pool: PgPool) {
     // identity in its properties — it must not be null either.
     let edge_decided_by: Option<serde_json::Value> = sqlx::query_scalar(
         "SELECT properties -> 'decided_by' FROM edges
-         WHERE relationship = 'CORROBORATES' AND properties ->> 'candidate_id' = $1",
+         WHERE relationship = 'corroborates' AND properties ->> 'candidate_id' = $1",
     )
     .bind(candidate.to_string())
     .fetch_one(&pool)
@@ -614,7 +614,8 @@ async fn retire_undoes_a_promotion_including_its_derived_factors(pool: PgPool) {
         serde_json::json!(candidate),
         "the snapshot must preserve the edge properties, not just its id"
     );
-    assert_eq!(dumped[0]["relationship"], "CORROBORATES");
+    // Stored in the canonical lower-case spelling (backlog 3ce5e00c).
+    assert_eq!(dumped[0]["relationship"], "corroborates");
 
     // THE POINT OF RETRACTION. Under the old DELETE these three assertions were
     // impossible: the row was gone, so `decided_by` — who made the original

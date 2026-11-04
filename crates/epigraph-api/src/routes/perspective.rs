@@ -157,8 +157,9 @@ pub async fn create_perspective(
 
     // Materialize PERSPECTIVE_OF edge (agent → perspective) if owner specified
     if let Some(agent_id) = request.owner_agent_id {
-        let _ = epigraph_db::EdgeRepository::create(
+        let _ = epigraph_db::EdgeRepository::create_signed(
             pool,
+            state.edge_signing_key(),
             row.id,
             "perspective",
             agent_id,

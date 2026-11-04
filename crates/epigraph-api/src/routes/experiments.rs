@@ -305,11 +305,23 @@ pub async fn hypothesize(
 }
 
 /// POST /api/v1/methods - Add a characterization/synthesis method.
+///
+/// Writes the shared method catalog (a method row and its capability links),
+/// so it takes `claims:write` like the experiment writes (operator ruling
+/// R-52a), checked before the embedder is called or anything is written.
 #[cfg(feature = "db")]
 pub async fn add_method(
     State(state): State<AppState>,
+    auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<AddMethodRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = auth_ctx
+        .ok_or_else(|| ApiError::Unauthorized {
+            reason: "POST /api/v1/methods requires authentication".into(),
+        })?
+        .0;
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
+
     let canonical_name = request.name.to_lowercase().replace(' ', "_");
 
     // Generate embedding for the method
@@ -632,6 +644,19 @@ pub async fn design_experiment(
     State(state): State<AppState>,
     Json(request): Json<DesignExperimentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The response names the hypothesis, so it is read through the caller's
+    // viewer first, as every R-51 route reads it (backlog d817613e): a
+    // hypothesis the caller cannot read is the same 404 as a missing one.
+    // Read access only: a design writes nothing.
+    crate::routes::experiment_loop::require_hypothesis(
+        &state,
+        &viewer,
+        request.hypothesis_id,
+        crate::routes::experiment_loop::HypothesisAccess::Read,
+        "design an experiment on this hypothesis",
+    )
+    .await?;
+
     // Load methods
     let mut protocol = Vec::new();
     let mut _all_equipment: Vec<String> = Vec::new();

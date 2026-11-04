@@ -9,6 +9,8 @@ pub mod bootstrap;
 pub mod bridge;
 pub mod decompose;
 #[cfg(feature = "db")]
+pub mod edge_rewire;
+#[cfg(feature = "db")]
 pub mod embed_backfill;
 pub mod enrichment;
 #[cfg(feature = "db")]
@@ -20,12 +22,16 @@ pub mod operator;
 #[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]
+pub mod recompute_claim_belief;
+#[cfg(feature = "db")]
 pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;
 pub mod retarget;
 #[cfg(feature = "db")]
 pub mod shadow_report;
+#[cfg(feature = "db")]
+pub mod truth_mirror;
 
 #[cfg(feature = "db")]
 use sqlx::PgPool;

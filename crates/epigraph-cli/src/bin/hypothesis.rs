@@ -403,6 +403,20 @@ async fn promote(
     viewer: &epigraph_db::visibility::Viewer,
     id: Uuid,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Promoted once, as the HTTP route refuses it (409, backlog 03b1508f): the
+    // gate below reads `hypothesis_assessment` only, so a BBA filed there
+    // after the promotion could pass it, and a second promotion would move
+    // that BBA onto `research_validity` beside the first one's.
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    if status.as_deref() == Some(epigraph_engine::promotion::PROMOTED_STATUS) {
+        return Err(format!("hypothesis {id} is already promoted; nothing was written").into());
+    }
+
     // Re-check gate (inline the logic from status)
     let completed_with_analysis =
         epigraph_db::ExperimentRepository::count_completed_with_analysis(pool, viewer, id)
@@ -475,6 +489,28 @@ async fn promote(
 
     let mut tx = pool.begin().await?;
 
+    // The status write comes FIRST and is conditional, so the gate is atomic
+    // (backlog 03b1508f): the gate above ran before this transaction, so two
+    // concurrent promotions could both pass it. This UPDATE takes the claim
+    // row's lock; a promotion that waited on another one that has since
+    // committed re-checks the row, changes nothing and is refused before
+    // anything else is written (the transaction rolls back on drop).
+    let flipped = sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+          WHERE id = $1 AND properties->>'hypothesis_status' IS DISTINCT FROM 'promoted'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if flipped != 1 {
+        return Err(format!(
+            "hypothesis {id} is already promoted (a concurrent promotion committed first), \
+             or its status could not be written; nothing was written"
+        )
+        .into());
+    }
+
     // Copy mass function
     // `copy_to_frame` keeps evidence_type, source_strength, locality_tag and
     // evidence_id, which the raw INSERT this replaced dropped (bc06ec6f).
@@ -513,10 +549,6 @@ async fn promote(
         .bind(rv_frame.0)
         .execute(&mut *tx)
         .await?;
-
-    // Update status
-    sqlx::query("UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' WHERE id = $1")
-        .bind(id).execute(&mut *tx).await?;
 
     tx.commit().await?;
 

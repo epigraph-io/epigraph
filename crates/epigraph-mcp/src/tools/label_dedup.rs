@@ -1806,7 +1806,9 @@ pub async fn revert_label_dedup(
                     format!(
                         "this revert un-marks {} duplicate(s), and an un-mark needs this \
                          server's administrative (maintenance) connection ({reason}); nothing \
-                         was written",
+                         was written. An operator un-marks them with the `unmark_duplicate` \
+                         CLI (`--applied-marks`) on the maintenance DSN, then reverts the \
+                         labels here with `applied_units` only",
                         unmarks.len()
                     ),
                 )

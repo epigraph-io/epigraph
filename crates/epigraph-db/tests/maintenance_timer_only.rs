@@ -28,12 +28,14 @@ use uuid::Uuid;
 /// application session.
 const JOB_TYPES: &[&str] = &[
     "cluster_graph",
-    "theme_cluster_rebuild",
+    "embedding_generation",
     "privatization_apply",
     "no_such_job_type",
 ];
 
-/// The tables a job handler names in a DELETE, which 119 grants.
+/// The tables a job handler names in a DELETE, which 119 grants. (`claim_themes`
+/// was the retired `theme_cluster_rebuild` job's; the grant is migration 119's
+/// and stays.)
 const HANDLER_DELETE_TABLES: &[&str] = &[
     "jobs",
     "graph_cluster_runs",

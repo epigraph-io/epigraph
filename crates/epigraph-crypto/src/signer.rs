@@ -67,6 +67,18 @@ impl AgentSigner {
         self.signing_key.sign(message).to_bytes()
     }
 
+    /// Sign an entity's digest under the version-1 scheme: the signed message
+    /// is [`crate::signing_message`]`(kind, digest)`, never the bare digest
+    /// (backlog `1a79c4d9`). Every claim, evidence and edge signer uses this.
+    #[must_use]
+    pub fn sign_entity(
+        &self,
+        kind: crate::SignedEntity,
+        digest: &[u8; crate::HASH_SIZE],
+    ) -> [u8; SIGNATURE_SIZE] {
+        self.sign(&crate::signing_message(kind, digest))
+    }
+
     /// Sign a canonically serializable value
     ///
     /// The value is first serialized to canonical JSON, then signed.

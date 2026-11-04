@@ -604,14 +604,39 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// it is decided over the edges the caller can see, not structurally; see
 /// `compound_ids_among_sql` for the residual that leaves.
 ///
-/// Returns `(written, skipped_not_visible, skipped_compounds)`.
+/// # A claim BP could have informed from a LESS READABLE one is SKIPPED
+///
+/// Ruling R-22 (generalised by the security review): a claim's cached belief
+/// is derived only from sources at least as widely readable as the claim.
+/// BP messages travel along factors, so a claim's result can carry the belief
+/// of any claim in its connected component of the run's factor graph
+/// (`factor_variables`). A claim whose component holds a claim less readable
+/// than itself (for a public claim, any non-public one; for a group claim,
+/// another group's; and any id that is no claim the caller can read) is
+/// skipped and counted in `skipped_less_readable_inputs`.
+///
+/// Returns `(written, skipped_not_visible, skipped_compounds,
+/// skipped_less_readable_inputs)`.
 #[cfg(feature = "db")]
 async fn apply_bp_updates(
     state: &AppState,
     viewer: &epigraph_db::visibility::Viewer,
     updates: &[BpUpdate],
-) -> Result<(usize, usize, usize), ApiError> {
+    factor_variables: &[&[Uuid]],
+) -> Result<(usize, usize, usize, usize), ApiError> {
     let mut tx = state.write_as(viewer, "propagate_beliefs").await?;
+    let all_variables: Vec<Uuid> = factor_variables
+        .iter()
+        .flat_map(|v| v.iter().copied())
+        .collect();
+    let tenancy =
+        epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_tenancy_among(
+            &mut *tx,
+            viewer,
+            &all_variables,
+        )
+        .await?;
+    let informed_by_narrower = claims_informed_by_less_readable(factor_variables, &tenancy);
     let ids: Vec<Uuid> = updates.iter().map(|(id, _, _)| *id).collect();
     let visible: std::collections::HashSet<Uuid> =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM claims WHERE id = ANY($1)")
@@ -636,6 +661,7 @@ async fn apply_bp_updates(
     let mut written = 0_usize;
     let mut skipped = 0_usize;
     let mut skipped_compounds = 0_usize;
+    let mut skipped_less_readable = 0_usize;
     for (claim_id, betp, interval) in updates {
         if !visible.contains(claim_id) {
             skipped += 1;
@@ -643,6 +669,10 @@ async fn apply_bp_updates(
         }
         if compounds.contains(claim_id) {
             skipped_compounds += 1;
+            continue;
+        }
+        if informed_by_narrower.contains(claim_id) {
+            skipped_less_readable += 1;
             continue;
         }
         let result = match interval {
@@ -695,7 +725,125 @@ async fn apply_bp_updates(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the belief updates: {e}"),
     })?;
-    Ok((written, skipped, skipped_compounds))
+    Ok((written, skipped, skipped_compounds, skipped_less_readable))
+}
+
+/// The stored BBAs that seed a CDST BP run, with each row's source (writing
+/// agent, its owner, its same-source key), read on one viewer-stamped
+/// connection.
+///
+/// Ruling R-22: a run that writes caches (`apply`) seeds each claim with the
+/// BBAs its own recompute may fold (every source at least as widely readable
+/// as the claim); a read-only run SERVES its values to the caller, so it seeds
+/// with the BBAs whose every source the caller can read
+/// (`derivation_scope::retain_for_viewer`). A row on a public claim is public
+/// whatever it was derived from, so without either filter a stranger's BP
+/// value moved with evidence narrowed to a group.
+#[cfg(feature = "db")]
+async fn bp_seed_rows(
+    state: &AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+    apply: bool,
+) -> Result<
+    Vec<(
+        epigraph_db::MassFunctionRow,
+        epigraph_engine::source_dependence::BbaSource,
+    )>,
+    ApiError,
+> {
+    let rows =
+        epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, viewer, claim_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load mass functions: {e}"),
+            })?;
+    let mut read = state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "propagate_beliefs",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
+    let rows = if apply {
+        epigraph_engine::derivation_scope::retain_for_cache(&mut read, rows).await?
+    } else {
+        epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, rows).await?
+    };
+    let sources =
+        epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows).await?;
+    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+    Ok(rows.into_iter().zip(sources).collect())
+}
+
+/// The claims of a BP run whose connected component in the factor graph
+/// (`factor_variables`, one variable list per factor) holds a variable less
+/// readable than the claim: one absent from `tenancy` (no claim the caller can
+/// read), or a non-public one that is not the claim's own group's (for a
+/// public claim, every non-public one). `tenancy` maps a claim to (`is
+/// public`, owner group).
+#[cfg(feature = "db")]
+fn claims_informed_by_less_readable(
+    factor_variables: &[&[Uuid]],
+    tenancy: &std::collections::HashMap<Uuid, (bool, Uuid)>,
+) -> std::collections::HashSet<Uuid> {
+    use std::collections::{HashMap, HashSet};
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut cur = x;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    let mut index: HashMap<Uuid, usize> = HashMap::new();
+    let mut parent: Vec<usize> = Vec::new();
+    for vars in factor_variables {
+        let mut first: Option<usize> = None;
+        for v in vars.iter() {
+            let i = *index.entry(*v).or_insert_with(|| {
+                parent.push(parent.len());
+                parent.len() - 1
+            });
+            match first {
+                None => first = Some(i),
+                Some(f) => {
+                    let (a, b) = (find(&mut parent, f), find(&mut parent, i));
+                    parent[a] = b;
+                }
+            }
+        }
+    }
+    let mut components: HashMap<usize, Vec<Uuid>> = HashMap::new();
+    let vars: Vec<(Uuid, usize)> = index.iter().map(|(v, i)| (*v, *i)).collect();
+    for (v, i) in vars {
+        components.entry(find(&mut parent, i)).or_default().push(v);
+    }
+    let mut out: HashSet<Uuid> = HashSet::new();
+    for members in components.values() {
+        for target in members {
+            let Some(&(t_public, t_owner)) = tenancy.get(target) else {
+                continue;
+            };
+            let narrower = members.iter().any(|v| match tenancy.get(v) {
+                None => true,
+                Some(&(public, owner)) => !public && (t_public || owner != t_owner),
+            });
+            if narrower {
+                out.insert(*target);
+            }
+        }
+    }
+    out
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
@@ -819,55 +967,81 @@ pub async fn propagate_beliefs(
         })
         .collect();
 
+    // The run's factor graph, for apply's R-22 guard (`apply_bp_updates`).
+    let factor_variables: Vec<&[Uuid]> =
+        factors.iter().map(|f| f.variable_ids.as_slice()).collect();
+
     // -- CDST branch: decide mode, load mass functions if needed ---------------
     let mode = request.mode.as_deref().unwrap_or("auto");
 
-    // Only load mass functions when CDST might be used (skip for explicit scalar/interval)
-    let use_cdst = match mode {
-        "cdst" => true,
-        "scalar" | "interval" => false,
+    // Only load mass functions when CDST might be used (skip for explicit
+    // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
+    // (rulings R-22 and R-36), for the coverage check too, so a BBA the
+    // caller may not see a fold of cannot flip the mode either.
+    let (use_cdst, seed_rows) = match mode {
+        "cdst" => (
+            true,
+            bp_seed_rows(&state, &viewer, &all_var_ids, apply).await?,
+        ),
+        "scalar" | "interval" => (false, Vec::new()),
         _ => {
-            // Auto: load mass functions and check coverage
-            let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-                &state.db_pool,
-                &viewer,
-                &all_var_ids,
-            )
-            .await
-            .unwrap_or_default();
+            // Auto: load mass functions and check coverage (a failed load
+            // reads as no coverage, as before).
+            let rows = bp_seed_rows(&state, &viewer, &all_var_ids, apply)
+                .await
+                .unwrap_or_default();
             let claims_with_mf: std::collections::HashSet<Uuid> =
-                mf_rows.iter().map(|r| r.claim_id).collect();
-            !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len()
+                rows.iter().map(|(r, _)| r.claim_id).collect();
+            let use_cdst = !all_var_ids.is_empty() && claims_with_mf.len() * 2 > all_var_ids.len();
+            (use_cdst, rows)
         }
     };
 
     if use_cdst {
-        let mf_rows = epigraph_db::MassFunctionRepository::get_for_claims(
-            &state.db_pool,
-            &viewer,
-            &all_var_ids,
-        )
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to load mass functions: {e}"),
-        })?;
-
         // Combine multiple mass functions per claim via adaptive combination
-        // (a claim may have evidence from multiple sources/agents)
-        let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
-        for row in &mf_rows {
+        // (a claim may have evidence from multiple sources/agents). Ruling
+        // R-36: agreeing BBAs of sibling agents of one human never multiply,
+        // so each claim's sibling groups are first reduced by the cautious
+        // rule (`reduce_same_owner_siblings`); a claim with no siblings
+        // combines exactly as before.
+        let mut per_claim: HashMap<
+            Uuid,
+            Vec<(
+                epigraph_engine::source_dependence::BbaSource,
+                epigraph_ds::MassFunction,
+            )>,
+        > = HashMap::new();
+        for (row, source) in seed_rows {
             if let Ok(mf) = epigraph_engine::cdst_bp::parse_mass_function_row(&row.masses) {
-                evidence
+                per_claim
                     .entry(row.claim_id)
-                    .and_modify(|existing| {
-                        if let Ok((combined, _)) =
-                            epigraph_ds::combination::adaptive_combine(existing, &mf, 0.3)
-                        {
-                            *existing = combined;
-                        }
-                    })
-                    .or_insert(mf);
+                    .or_default()
+                    .push((source, mf));
             }
+        }
+        let mut evidence: HashMap<Uuid, epigraph_ds::MassFunction> = HashMap::new();
+        for (claim_id, items) in per_claim {
+            let fallback: Vec<epigraph_ds::MassFunction> =
+                items.iter().map(|(_, m)| m.clone()).collect();
+            let inputs = epigraph_engine::source_dependence::reduce_same_owner_siblings(items, 0.3)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        %claim_id,
+                        error = %e,
+                        "BP seed: same-human reduction failed; combining as independent"
+                    );
+                    fallback
+                });
+            let mut inputs = inputs.into_iter();
+            let Some(first) = inputs.next() else {
+                continue;
+            };
+            let seed = inputs.fold(first, |existing, mf| {
+                epigraph_ds::combination::adaptive_combine(&existing, &mf, 0.3)
+                    .map(|(combined, _)| combined)
+                    .unwrap_or(existing)
+            });
+            evidence.insert(claim_id, seed);
         }
 
         // Build initial beliefs: evidence where available, vacuous otherwise
@@ -920,7 +1094,8 @@ pub async fn propagate_beliefs(
         // its existing readers and is now always 0: a failed apply is an error
         // with nothing written, not a count beside a 200.
         let apply_failures = 0_usize;
-        let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
+        let (mut written, mut skipped, mut skipped_compounds, mut skipped_less_readable) =
+            (0_usize, 0_usize, 0_usize, 0_usize);
         if apply {
             let updates: Vec<BpUpdate> = result
                 .updated_betps
@@ -935,8 +1110,8 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
-            (written, skipped, skipped_compounds) =
-                apply_bp_updates(&state, &viewer, &updates).await?;
+            (written, skipped, skipped_compounds, skipped_less_readable) =
+                apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
         }
 
         return Ok(Json(serde_json::json!({
@@ -952,6 +1127,7 @@ pub async fn propagate_beliefs(
             "applied_count": written,
             "skipped_not_visible": skipped,
             "skipped_compounds": skipped_compounds,
+            "skipped_less_readable_inputs": skipped_less_readable,
             "apply_failures": apply_failures,
             "updated_beliefs": result.updated_betps.iter()
                 .map(|(id, betp)| serde_json::json!({"claim_id": id, "betp": betp}))
@@ -962,14 +1138,16 @@ pub async fn propagate_beliefs(
     // -- Scalar BP fallback ---------------------------------------------------
     let result = epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config);
 
-    let (mut written, mut skipped, mut skipped_compounds) = (0_usize, 0_usize, 0_usize);
+    let (mut written, mut skipped, mut skipped_compounds, mut skipped_less_readable) =
+        (0_usize, 0_usize, 0_usize, 0_usize);
     if apply && !result.updated_beliefs.is_empty() {
         let updates: Vec<BpUpdate> = result
             .updated_beliefs
             .iter()
             .map(|(claim_id, new_betp)| (*claim_id, *new_betp, None))
             .collect();
-        (written, skipped, skipped_compounds) = apply_bp_updates(&state, &viewer, &updates).await?;
+        (written, skipped, skipped_compounds, skipped_less_readable) =
+            apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
     }
 
     let updated: Vec<serde_json::Value> = result
@@ -990,6 +1168,7 @@ pub async fn propagate_beliefs(
         "applied_count": written,
         "skipped_not_visible": skipped,
         "skipped_compounds": skipped_compounds,
+        "skipped_less_readable_inputs": skipped_less_readable,
         "updated_beliefs": updated,
     })))
 }
@@ -1226,4 +1405,61 @@ async fn extract_neighborhood(
     })?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+#[cfg(all(test, feature = "db"))]
+mod less_readable_tests {
+    use super::claims_informed_by_less_readable;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_variable_that_is_no_readable_claim_counts_as_narrower() {
+        // Factor (1, 2) and factor (2, 3); 3 is absent from the tenancy map
+        // (a stale factor id, or a claim the caller cannot read), so every
+        // claim in that component is informed by something less readable.
+        let (a, b, c) = (id(1), id(2), id(3));
+        let world = id(100);
+        let tenancy: HashMap<Uuid, (bool, Uuid)> = [(a, (true, world)), (b, (true, world))]
+            .into_iter()
+            .collect();
+        let f1 = [a, b];
+        let f2 = [b, c];
+        let out = claims_informed_by_less_readable(&[&f1, &f2], &tenancy);
+        assert!(out.contains(&a) && out.contains(&b), "{out:?}");
+        assert!(
+            !out.contains(&c),
+            "an unreadable id is not itself a claim to skip"
+        );
+        // Without the unreadable variable, the all-public component is clean.
+        let out = claims_informed_by_less_readable(&[&f1], &tenancy);
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn a_narrower_claim_may_be_informed_by_a_more_readable_one() {
+        let (public_claim, group_claim, other_group_claim) = (id(1), id(2), id(3));
+        let (g, h, world) = (id(200), id(201), id(100));
+        let tenancy: HashMap<Uuid, (bool, Uuid)> = [
+            (public_claim, (true, world)),
+            (group_claim, (false, g)),
+            (other_group_claim, (false, h)),
+        ]
+        .into_iter()
+        .collect();
+        let pair = [public_claim, group_claim];
+        let out = claims_informed_by_less_readable(&[&pair], &tenancy);
+        assert!(out.contains(&public_claim), "{out:?}");
+        assert!(!out.contains(&group_claim), "{out:?}");
+        let groups = [group_claim, other_group_claim];
+        let out = claims_informed_by_less_readable(&[&groups], &tenancy);
+        assert!(
+            out.contains(&group_claim) && out.contains(&other_group_claim),
+            "{out:?}"
+        );
+    }
 }

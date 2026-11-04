@@ -84,6 +84,62 @@ async fn generated_signer_permits_cross_agent_supersede_without_auth(pool: PgPoo
     );
 }
 
+/// Backlog 73085534 (ruling R-23) on the no-`AuthContext` (stdio) arm: the
+/// act runs as this server's write identity, so that agent is recorded as the
+/// successor's `AUTHORED` edge (exactly one, with the #600 properties), while
+/// the successor keeps the retired claim's author.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stdio_supersede_records_the_servers_write_identity_as_the_actor(pool: PgPool) {
+    let server =
+        build_scoped_test_server_generated_signer(pool.clone(), fixture::scoped_pool(&pool).await);
+    let server_agent = server.server_agent_id().await.expect("server agent");
+    let foreign_agent = seed_agent_row(&pool).await;
+    let foreign_claim = seed_claim(&pool, foreign_agent).await;
+
+    let r = supersede_claim(
+        &server,
+        &fixture::public_viewer(&pool).await,
+        SupersedeClaimParams {
+            claim_id: foreign_claim.as_uuid().to_string(),
+            content: "a replacement written over stdio".to_string(),
+            truth_value: 0.7,
+            reason: "stdio actor record".to_string(),
+        },
+        None,
+    )
+    .await
+    .expect("the stdio supersede lands");
+    let new = common::parse_uuid_field(&common::first_text(&r), "new_claim_id");
+    assert_ne!(server_agent, foreign_agent, "CALIBRATION: distinct agents");
+
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(&pool)
+        .await
+        .expect("the successor");
+    assert_eq!(
+        author, foreign_agent,
+        "the successor inherits the predecessor's author"
+    );
+    let authored: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT source_id, source_type, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND target_type = 'claim'",
+    )
+    .bind(new)
+    .fetch_all(&pool)
+    .await
+    .expect("read AUTHORED edges");
+    assert_eq!(
+        authored,
+        vec![(
+            server_agent,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "the server's write identity performed the act and is recorded"
+    );
+}
+
 /// `mark_duplicate` shares the gate, so it must move in lockstep. Asserted
 /// separately because the two tools call `require_owner_or_admin` from
 /// different call sites and a fix applied to only one would leave cross-agent

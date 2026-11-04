@@ -172,6 +172,23 @@ impl GroupKeyEpochRepository {
         pool: &PgPool,
         group_id: Uuid,
     ) -> Result<Option<KeyEpochRow>, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::get_current_epoch_conn(&mut conn, group_id).await
+    }
+
+    /// [`Self::get_current_epoch`] over a borrowed connection, for the group
+    /// routes that run on the caller's stamped connection (backlog 323773fe).
+    /// `group_key_epochs_tenancy` shows a stamped session the epochs of the
+    /// groups it is a live member of; an unstamped one sees none, which the
+    /// member route used to report as "no current epoch".
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn))]
+    pub async fn get_current_epoch_conn(
+        conn: &mut sqlx::PgConnection,
+        group_id: Uuid,
+    ) -> Result<Option<KeyEpochRow>, DbError> {
         let row: Option<KeyEpochRow> = sqlx::query_as(
             r#"
             SELECT id, group_id, epoch, wrapped_key, status, created_at, retired_at
@@ -182,7 +199,7 @@ impl GroupKeyEpochRepository {
             "#,
         )
         .bind(group_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         Ok(row)

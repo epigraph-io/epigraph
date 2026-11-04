@@ -208,12 +208,13 @@ pub struct VersionHistoryResponse {
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: Validation failures or claim already superseded
+/// - 400 Bad Request: Validation failures
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the claim but does not write its
 ///   owning group (authorship alone is not enough) and lacks `claims:admin`
 /// - 404 Not Found: Claim does not exist, or the caller cannot read it (the two
 ///   are indistinguishable)
+/// - 409 Conflict: the claim is already superseded (operator ruling R-55)
 /// - 201 Created: New claim created successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -227,6 +228,7 @@ pub struct VersionHistoryResponse {
         (status = 401),
         (status = 403),
         (status = 404),
+        (status = 409),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -376,6 +378,16 @@ pub async fn supersede_claim(
     //    Stamped, the owner's supersede commits, and a caller whose writable set
     //    lacks the claim's owner group gets 403 with nothing written.
     let old_claim_id = ClaimId::from_uuid(claim_id);
+    // The ACTING agent, recorded as the replacement's `AUTHORED` edge (backlog
+    // 73085534, ruling R-23): the replacement keeps the retired claim's author,
+    // so this edge is the only record in the graph of who restated it.
+    // `ViewerExtractor` already refuses an agentless token, so a principal-less
+    // viewer does not reach here; it is refused rather than recorded as nobody.
+    let Some(acting_agent) = viewer.principal() else {
+        return Err(ApiError::Unauthorized {
+            reason: "supersede requires an authenticated principal".into(),
+        });
+    };
     let mut tx = state.write_as(&viewer, "supersede_claim").await?;
     //
     //    Migration 117: this is the supersession's ACT only (retire, insert the
@@ -388,47 +400,10 @@ pub async fn supersede_claim(
         &request.content,
         truth_value,
         &request.reason,
+        epigraph_db::SupersedeActor::new(acting_agent, epigraph_db::SupersedeTool::SupersedeClaim),
     )
     .await
-    .map_err(|e| {
-        if crate::errors::db_is_insufficient_privilege(&e) {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                handler = "supersede_claim",
-                claim = %claim_id,
-                error = %e,
-                "the database refused the supersession"
-            );
-            return crate::errors::write_refused("claim");
-        }
-        // The session reads the claim as current but its retirement matched
-        // no row (an UPDATE policy that hides it): a denial, and the act wrote
-        // nothing. `From<DbError>` answers it 403.
-        if matches!(e, epigraph_db::DbError::WriteRefused { .. }) {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                handler = "supersede_claim",
-                claim = %claim_id,
-                error = %e,
-                "the database refused to retire the claim"
-            );
-            return ApiError::from(e);
-        }
-        // Map DB errors to appropriate API errors
-        let msg = e.to_string();
-        if msg.contains("not found") {
-            ApiError::NotFound {
-                entity: "Claim".to_string(),
-                id: claim_id.to_string(),
-            }
-        } else if msg.contains("already been superseded") {
-            ApiError::BadRequest { message: msg }
-        } else {
-            ApiError::InternalError {
-                message: format!("Supersession failed: {msg}"),
-            }
-        }
-    })?;
+    .map_err(|e| supersede_refusal(claim_id, e))?;
 
     let now = Utc::now();
     let new_claim_id = ClaimId::from_uuid(new_uuid);
@@ -458,13 +433,16 @@ pub async fn supersede_claim(
         .await
         {
             Ok(latest) => {
+                // The version was created by the agent that performed the
+                // act, not by the author the replacement inherits (backlog
+                // 1a54283d, ruling R-85).
                 let version_row = ClaimVersionRow {
                     id: uuid::Uuid::new_v4(),
                     claim_id: new_uuid,
                     version_number: latest + 1,
                     content: request.content.clone(),
                     truth_value: request.truth_value,
-                    created_by: Some(agent_uuid),
+                    created_by: Some(acting_agent),
                     created_at: now,
                 };
                 ClaimVersionRepository::create(&mut *sp, &version_row).await
@@ -498,7 +476,7 @@ pub async fn supersede_claim(
         Some(new_uuid),
     );
     #[cfg(feature = "db")]
-    let (mut session, deferred) = admin_session_or_deferral(&state, &mut tx, &trigger).await?;
+    let (mut session, deferred) = supersede_session_or_deferral(&state, &mut tx, &trigger).await?;
 
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the supersession: {e}"),
@@ -512,6 +490,21 @@ pub async fn supersede_claim(
             agent_id: AgentId::from_uuid(agent_uuid),
             initial_truth: truth_value,
         })
+        .await;
+
+    // 9a. The staleness event a supersession emits (supersede SPEC K12d,
+    // SF-26), after the commit, to the same store and with the same payload
+    // keys `POST /api/v1/edges` used for a `supersedes` edge before K12a made
+    // that relationship the act's alone. Attributed to the acting agent.
+    super::events::global_event_store()
+        .push(
+            "claim.superseded".to_string(),
+            Some(acting_agent),
+            serde_json::json!({
+                "superseded_claim_id": claim_id,
+                "superseded_by_claim_id": new_uuid,
+            }),
+        )
         .await;
 
     // 9b. The administrative cascade (backlog 20e9ed83; migration 117): migrate
@@ -606,6 +599,153 @@ pub(crate) fn oauth_principal(
     }
 }
 
+/// The answer `supersede_claim` gives when the database refuses its act on
+/// `claim_id` (`supersede_act_conn`) (supersede SPEC K5). Its first arm, CX03,
+/// is also the answer to a refused cascade deferral
+/// ([`supersede_deferral_refusal`]), so CX03 reads the same whichever
+/// statement raised it. A denial is 403 with its code in the reason, and
+/// nothing was written (the act and its deferral share one transaction):
+///
+/// 1. migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`), recognised
+///    by its message code BEFORE the generic `42501` arm, which would drop the
+///    code: the session does not write the claim's group
+///    ([`epigraph_auth::claim_act::supersede_not_recorded_message`]);
+/// 2. a reviewed caller-refusal code (`epigraph_db::caller_refusal_code`),
+///    through `From<DbError>`, keeping its code;
+/// 3. row security's `42501`: the group-write refusal;
+/// 4. `WriteRefused`, a repo `Refused`, "not found";
+/// 5. everything else through `From<DbError> for ApiError`, which answers
+///    OPL01 / OPL02 / ROL01 as 403 with their codes and a fault as a 500.
+#[cfg(feature = "db")]
+pub fn supersede_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    if let Some(denial) = cx03_denial(claim_id, &e) {
+        return denial;
+    }
+    // A reviewed caller-refusal code (`epigraph_db::caller_refusal_code`) keeps
+    // its code: `From<DbError>` answers it 403 with the database's reviewed
+    // text, as the MCP twin's `db_caller_error` path keeps it. Before the
+    // generic 42501 arm, which would drop the code. An UNLISTED coded 42501
+    // still takes that arm (its text is unreviewed, and `From` would redact it
+    // to a 500).
+    if let epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::Database(d),
+    } = &e
+    {
+        if epigraph_db::caller_refusal_code(d.message()).is_some() {
+            return ApiError::from(e);
+        }
+    }
+    if crate::errors::db_is_insufficient_privilege(&e) {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "supersede_claim",
+            claim = %claim_id,
+            error = %e,
+            "the database refused the supersession"
+        );
+        return crate::errors::write_refused("claim");
+    }
+    // The session reads the claim as current but its retirement matched
+    // no row (an UPDATE policy that hides it): a denial, and the act wrote
+    // nothing. `From<DbError>` answers it 403.
+    if matches!(e, epigraph_db::DbError::WriteRefused { .. }) {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "supersede_claim",
+            claim = %claim_id,
+            error = %e,
+            "the database refused to retire the claim"
+        );
+        return ApiError::from(e);
+    }
+    // A repo-authored refusal (e.g. the claim is already superseded) is
+    // answered by its kind (operator ruling R-55), not by its text.
+    if matches!(e, epigraph_db::DbError::Refused { .. }) {
+        return ApiError::from(e);
+    }
+    if e.to_string().contains("not found") {
+        return ApiError::NotFound {
+            entity: "Claim".to_string(),
+            id: claim_id.to_string(),
+        };
+    }
+    // The operator binding's OPL01 / OPL02 and 166's ROL01 are 403 with their
+    // codes there; a fault stays a redacted 500.
+    ApiError::from(e)
+}
+
+/// Migration 120's CX03 (SQLSTATE `42501`, message `CX03: ...`) as the
+/// caller's 403, or `None` for any other error.
+///
+/// The definer raises CX03 when the deferral names no committed act of the
+/// session's own: either the act did not land, or the session does not write
+/// both claims' group. On the supersede path the act runs first in the same
+/// transaction, so only the authority arm is reachable there, and that is what
+/// [`epigraph_auth::claim_act::supersede_not_recorded_message`] says.
+#[cfg(feature = "db")]
+fn cx03_denial(claim_id: Uuid, e: &epigraph_db::DbError) -> Option<ApiError> {
+    let epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::Database(d),
+    } = e
+    else {
+        return None;
+    };
+    let cx03 = format!(
+        "{}:",
+        epigraph_auth::claim_act::CASCADE_DEFERRAL_REFUSAL_CODE
+    );
+    if d.code().as_deref() != Some("42501") || !d.message().starts_with(&cx03) {
+        return None;
+    }
+    tracing::warn!(
+        target: "tenancy.scoped_write",
+        handler = "supersede_claim",
+        claim = %claim_id,
+        detail = %d.message(),
+        "the cascade deferral refused the supersession"
+    );
+    Some(ApiError::Forbidden {
+        reason: epigraph_auth::claim_act::supersede_not_recorded_message(claim_id),
+    })
+}
+
+/// The answer to a failed supersede DEFERRAL: CX03 is the caller's 403
+/// ([`supersede_refusal`]'s first arm, the same text); anything else is the
+/// server's fault, the 500 [`admin_session_or_deferral`] gives the other claim
+/// acts. Not the act mapper: an uncoded `42501` here is a deploy fault (a
+/// missing EXECUTE grant on the definer), not row security refusing the
+/// caller, so it must not read as the group-write 403.
+#[cfg(feature = "db")]
+pub fn supersede_deferral_refusal(claim_id: Uuid, e: epigraph_db::DbError) -> ApiError {
+    cx03_denial(claim_id, &e).unwrap_or_else(|| deferral_failed(e))
+}
+
+/// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
+/// refusal is answered by [`supersede_deferral_refusal`] for the trigger's
+/// subject (the retired claim): CX03 as the caller's 403, anything else as a
+/// fault. The other claim acts keep [`admin_session_or_deferral`].
+///
+/// # Errors
+/// The deferral INSERT's error, mapped: nothing commits.
+#[cfg(feature = "db")]
+pub async fn supersede_session_or_deferral<'s>(
+    state: &'s AppState,
+    tx: &mut sqlx::PgConnection,
+    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
+) -> Result<
+    (
+        Option<epigraph_db::MaintenanceSession<'s>>,
+        epigraph_engine::admin_cascade::CascadeStatus,
+    ),
+    ApiError,
+> {
+    let claim_id = trigger.subject_id;
+    session_or_deferral(state, tx, trigger, |e| {
+        supersede_deferral_refusal(claim_id, e)
+    })
+    .await
+}
+
 /// Acquire the administrative (maintenance) session BEFORE the caller's act
 /// commits. When there is none -- not configured, or not usable -- record the
 /// deferral inside the act's own transaction `tx` (stamped with the caller's
@@ -626,15 +766,39 @@ pub(crate) async fn admin_session_or_deferral<'s>(
     ),
     ApiError,
 > {
+    session_or_deferral(state, tx, trigger, deferral_failed).await
+}
+
+/// The generic answer to a failed deferral INSERT: a database error.
+#[cfg(feature = "db")]
+fn deferral_failed(e: epigraph_db::DbError) -> ApiError {
+    ApiError::DatabaseError {
+        message: format!("Failed to record the deferred cascade: {e}"),
+    }
+}
+
+/// [`admin_session_or_deferral`] with the deferral's error answered by
+/// `refusal`.
+#[cfg(feature = "db")]
+async fn session_or_deferral<'s>(
+    state: &'s AppState,
+    tx: &mut sqlx::PgConnection,
+    trigger: &epigraph_engine::admin_cascade::CascadeTrigger,
+    refusal: impl FnOnce(epigraph_db::DbError) -> ApiError,
+) -> Result<
+    (
+        Option<epigraph_db::MaintenanceSession<'s>>,
+        epigraph_engine::admin_cascade::CascadeStatus,
+    ),
+    ApiError,
+> {
     match state.admin_cascade_session().await {
         Ok(session) => Ok((Some(session), Default::default())),
         Err(reason) => {
             let status =
                 epigraph_engine::admin_cascade::record_deferral(&mut *tx, trigger, &reason)
                     .await
-                    .map_err(|e| ApiError::DatabaseError {
-                        message: format!("Failed to record the deferred cascade: {e}"),
-                    })?;
+                    .map_err(refusal)?;
             Ok((None, status))
         }
     }
@@ -662,14 +826,17 @@ pub async fn supersede_claim(
 ///
 /// # Errors
 ///
-/// - 400 Bad Request: duplicate_id == canonical_id, or claim already superseded
+/// - 400 Bad Request: duplicate_id == canonical_id
 /// - 401 Unauthorized: no bearer token
 /// - 403 Forbidden: the token lacks `claims:write`; or `not_owner` (rule
 ///   `not_claim_writer`): the caller can read the duplicate (or the canonical)
 ///   but does not write its owning group (authorship alone is not enough) and
-///   lacks `claims:admin`; `claim_id` names the claim refused
+///   lacks `claims:admin`; `claim_id` names the claim refused; or the act's
+///   own authority refusal (FA04/FA07), with its reason
 /// - 404 Not Found: the claim or the canonical does not exist, or the caller
 ///   cannot read it (the two are indistinguishable)
+/// - 409 Conflict: the duplicate is already superseded, or the canonical is
+///   not current (operator ruling R-55: a state refusal, with its reason)
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -824,6 +991,9 @@ pub async fn mark_duplicate(
             entity: "Claim".into(),
             id: id.to_string(),
         },
+        // The act's own refusals by kind (operator ruling R-55): FA04/FA07
+        // are 403, a retired canonical or an already-superseded duplicate 409.
+        e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
         epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
             reason: "claim already superseded or invalid input".into(),
         },
@@ -1045,7 +1215,8 @@ pub async fn unmark_duplicate(
         .map_err(|reason| ApiError::Conflict {
             reason: format!(
                 "an un-mark needs this server's administrative (maintenance) connection and \
-                 cannot be deferred; nothing was written ({reason})"
+                 cannot be deferred; nothing was written ({reason}). An operator runs it as \
+                 the `unmark_duplicate` CLI on the maintenance DSN"
             ),
         })?;
 
@@ -1404,8 +1575,10 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        // Not compiled (this module is `not(feature = "db")`); kept in step
+        // with the db route, which answers a STATE refusal 409 (ruling R-55).
         #[tokio::test]
-        async fn test_supersede_already_superseded_claim_returns_400() {
+        async fn test_supersede_already_superseded_claim_returns_409() {
             let claim_id = Uuid::new_v4();
             let (state, _) = state_with_claim(claim_id).await;
 
@@ -1443,7 +1616,7 @@ mod tests {
                 .unwrap();
 
             let response2 = router.oneshot(request2).await.unwrap();
-            assert_eq!(response2.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response2.status(), StatusCode::CONFLICT);
         }
 
         #[tokio::test]

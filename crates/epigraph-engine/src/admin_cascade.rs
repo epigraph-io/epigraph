@@ -447,6 +447,7 @@ pub async fn report_for_caller(
             );
             return CascadeReport {
                 invalidated_bbas: report.invalidated_bbas,
+                retracted_key_kept: report.retracted_key_kept,
                 errors: vec![
                     "the cascade report could not be filtered to the caller's view; the \
                      details are in the audit row"
@@ -480,6 +481,7 @@ pub async fn report_for_caller(
                 }
             })
             .collect(),
+        retracted_key_kept: report.retracted_key_kept,
     }
 }
 
@@ -609,8 +611,8 @@ macro_rules! repair_with_audit {
             let touched: serde_json::Value = $touched;
             let mut details = $trigger.audit_details();
             details["outcome"] = serde_json::json!("applied");
-            // The applied row names the triggering principal, who can read it
-            // (`security_events_read`): it carries COUNTS. The ids the repair
+            // The applied row names the triggering principal (who could read
+            // it before migration 169): it carries COUNTS. The ids the repair
             // moved -- other writers' edges among them -- go to an agent-less
             // companion row in the same transaction, when there are any.
             let counts = counts_only(&touched);
@@ -652,8 +654,8 @@ type BeliefAudit = (Option<Uuid>, Option<String>);
 
 /// Write the belief re-derivation's row after the applied repair (best-effort).
 ///
-/// The row names the triggering principal, who can read it
-/// (`security_events_read`), so it carries [`belief_counts`]; the claim ids
+/// The row names the triggering principal (who could read it before migration
+/// 169's `security_events_read`), so it carries [`belief_counts`]; the claim ids
 /// and error texts go to an agent-less [`EVENT_BELIEF_IDS`] row, committed
 /// with it in one transaction.
 async fn record_belief(
@@ -667,6 +669,7 @@ async fn record_belief(
     details["belief"] = belief_counts(report);
     let full = serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
@@ -720,6 +723,7 @@ async fn record_belief(
 fn belief_counts(report: &CascadeReport) -> serde_json::Value {
     serde_json::json!({
         "invalidated_bbas": report.invalidated_bbas,
+        "retracted_key_kept": report.retracted_key_kept,
         "targets": report.targets.len(),
         "recomputed": report.recomputed.len(),
         "unbacked": report.unbacked.len(),
@@ -752,8 +756,9 @@ fn applied(
 }
 
 /// The supersede cascade: migrate the retired claim's edges onto the
-/// replacement (with its audit row, atomically), then invalidate and re-derive
-/// the BBAs frozen from its interval ([`cascade_after_supersede`]).
+/// replacement and mint the moved edges' BP factors (with its audit row,
+/// atomically), then invalidate and re-derive the BBAs frozen from its
+/// interval ([`cascade_after_supersede`]).
 ///
 /// `admin` must be the maintenance connection and `admin_viewer` its bypass
 /// viewer (`MaintenanceSession::split`): the cascade walks downstream claims of
@@ -768,13 +773,25 @@ pub async fn apply_after_supersede(
     old_id: Uuid,
     new_id: Uuid,
 ) -> (CascadeStatus, CascadeReport) {
+    // The migration and the BP factors of the edges it moved (SPEC §11 K3)
+    // commit together with the applied row: the retirement deleted the
+    // predecessor's factors, and the INSERT-only factor trigger never sees the
+    // migration's re-points.
     let repaired = repair_with_audit!(
         admin,
         trigger,
-        |tx| ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new_id),
+        |tx| async {
+            let m = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new_id).await?;
+            let moved: Vec<Uuid> = m.retargeted.iter().chain(&m.resourced).copied().collect();
+            let slots =
+                ClaimRepository::regenerate_superseded_edge_factors_conn(&mut tx, new_id, &moved)
+                    .await?;
+            Ok::<_, DbError>((m, slots))
+        },
         |m| serde_json::json!({
-            "edges_retargeted": m.retargeted,
-            "edges_resourced": m.resourced,
+            "edges_retargeted": m.0.retargeted,
+            "edges_resourced": m.0.resourced,
+            "factors_minted": m.1,
         })
     );
     let (_, applied_id, touched) = match repaired {
@@ -786,7 +803,7 @@ pub async fn apply_after_supersede(
             )
         }
     };
-    let report = cascade_after_supersede(&mut *admin, admin_viewer, new_id).await;
+    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, new_id).await;
     let belief = record_belief(admin, trigger, applied_id, &report).await;
     let status = applied(applied_id, &touched, Some((&report, belief)));
     (status, report_for_caller(admin, caller, &report).await)
@@ -823,6 +840,7 @@ pub async fn apply_after_dedup(
             "false_bindings_not_copied": r.skipped_false_bindings,
             "bbas_pooled": r.pooled_bbas.len(),
             "bbas_kept_on_duplicate": r.kept_on_duplicate.len(),
+            "bbas_kept_on_duplicate_by_retracted_holder": r.kept_on_duplicate_by_retracted_holder.len(),
         }),
         record: serde_json::to_value(&r.revert).ok()
     );
@@ -897,7 +915,10 @@ impl std::fmt::Display for UnmarkRefusal {
 /// whose reversal failed would leave a current claim with its edges and BBAs
 /// still on the canonical. The request paths therefore establish the caller's
 /// write authority FIRST, by running the same act on the caller's stamped
-/// transaction and rolling it back.
+/// transaction and rolling it back. Under operator decision D9 no request
+/// path holds that connection, so in production the un-mark runs from the
+/// `unmark_duplicate` operator CLI (epigraph-cli), which calls this with the
+/// maintenance session's viewer as both admin and caller.
 ///
 /// A canonical superseded or consolidated since the mark is followed to the
 /// current one, and the duplicate is restored against it (operator ruling
@@ -1057,6 +1078,12 @@ pub async fn apply_unmark_authorized(
     details["outcome"] = serde_json::json!("applied");
     if legacy_mark {
         details["legacy_mark"] = serde_json::json!(true);
+    }
+    if let Some(stripped) = &unmarked.legacy_stripped {
+        // What the act stripped from the restored legacy claim (operator
+        // ruling R-18): the duplicate's own label and properties, which the
+        // caller's authority over the duplicate already covers.
+        details["legacy_stripped"] = stripped.clone();
     }
     if current_canonical_id != canonical_id {
         // Restored against the canonical's current replacement (R-11).
@@ -1221,8 +1248,9 @@ pub async fn apply_match_retire(
 /// The applied row names `trigger.agent_id`: the edge's owner whose act
 /// deferred it (or, for the one-shot legacy sweep, the acting operator).
 /// `touched` carries COUNTS only, never another writer's BBA ids or source
-/// agents, because the row's `agent_id` can read it. `sweep_reason` is the
-/// operator's text for the one-shot sweep, recorded in `touched`.
+/// agents, because the row names its `agent_id` (who could read it before
+/// migration 169). `sweep_reason` is the operator's text for the one-shot
+/// sweep, recorded in `touched`.
 pub async fn apply_after_edge_retract(
     admin: &mut sqlx::PgConnection,
     admin_viewer: &Viewer,

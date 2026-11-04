@@ -79,6 +79,7 @@ async fn set_ds_cache(pool: &PgPool, claim: Uuid, belief: f64, plausibility: f64
 #[sqlx::test(migrations = "../../migrations")]
 async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
     let mock = MockProvider::new(EmbeddingConfig::openai(1536));
     let query = "brelltide sorption isotherm";
     let qvec = mock.generate_query(query).await.expect("mock embed");
@@ -112,7 +113,7 @@ async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
 
     // Control: with the gate wide open both claims are reachable, so an absence
     // below is the gate deciding, not the fixture being unretrievable.
-    let open = recall(&pool, &viewer, &mock, query, 10, 0.0)
+    let open = recall(&pool, &scoped, &viewer, &mock, query, 10, 0.0)
         .await
         .expect("recall");
     let open_ids: Vec<&str> = open.iter().map(|r| r.claim_id.as_str()).collect();
@@ -122,7 +123,7 @@ async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
         "control: both claims must be retrievable at min_truth 0.0, got {open_ids:?}"
     );
 
-    let gated = recall(&pool, &viewer, &mock, query, 10, 0.5)
+    let gated = recall(&pool, &scoped, &viewer, &mock, query, 10, 0.5)
         .await
         .expect("recall");
     assert!(
@@ -148,6 +149,7 @@ async fn engine_recall_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn engine_recall_fallback_leg_gates_on_the_gated_score_not_truth_value(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
+    let scoped = fixture::scoped_pool(&pool).await;
     // failure_rate 1.0: every generate_query errs, so `recall` takes the
     // text-search fallback on every call below.
     let failing = MockProvider::new(EmbeddingConfig::openai(1536)).with_failures(1.0);
@@ -173,7 +175,7 @@ async fn engine_recall_fallback_leg_gates_on_the_gated_score_not_truth_value(poo
 
     // Control: with the gate wide open the fallback leg returns both claims, so
     // an absence below is the gate deciding.
-    let open = recall(&pool, &viewer, &failing, query, 10, 0.0)
+    let open = recall(&pool, &scoped, &viewer, &failing, query, 10, 0.0)
         .await
         .expect("recall");
     let open_ids: Vec<&str> = open.iter().map(|r| r.claim_id.as_str()).collect();
@@ -184,7 +186,7 @@ async fn engine_recall_fallback_leg_gates_on_the_gated_score_not_truth_value(poo
          got {open_ids:?}"
     );
 
-    let gated = recall(&pool, &viewer, &failing, query, 10, 0.5)
+    let gated = recall(&pool, &scoped, &viewer, &failing, query, 10, 0.5)
         .await
         .expect("recall");
     assert!(

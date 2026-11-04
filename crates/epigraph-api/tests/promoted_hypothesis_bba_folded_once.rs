@@ -286,11 +286,31 @@ async fn a_promoter_who_cannot_retire_the_source_writes_nothing(
         .connect_with(conn_opts.clone())
         .await
         .expect("seeding pool");
-    // A public (world-owned) claim: readable by the promoter, so the gate
-    // passes, but outside its writable set.
+    // A claim owned by the ANALYST's group, which the promoter reads as a
+    // `reader` member: readable by the promoter, so the gate passes, but
+    // outside its writable set. The analyst files the evidence, because the
+    // analyze route writes only onto a hypothesis its caller may write
+    // (operator ruling R-51); the promoter could not have filed it.
+    let (analyst, analyst_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "846b808e-analyst").await;
     let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-outsider").await;
-    let claim = viewer_fixture::seed_public_claim(&pool, agent, "846b808e public hypothesis").await;
-    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(analyst_group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("promoter reads the analyst's group");
+    let claim = viewer_fixture::seed_group_claim(
+        &pool,
+        analyst,
+        analyst_group,
+        "846b808e hypothesis the promoter only reads",
+    )
+    .await;
+    let r = make_promotable(&pool, &conn_opts, analyst, claim).await;
     let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
 
     // CALIBRATION: the premise of this arm is that the source BBA lies
@@ -471,7 +491,10 @@ async fn a_promoted_hypothesis_is_not_promoted_again(
         reqwest::StatusCode::CONFLICT,
         "a second promotion is refused: {status} {body}"
     );
-    assert!(body.contains("already promoted"), "{body}");
+    assert!(
+        body.contains("already promoted; nothing was written") && !body.contains("concurrent"),
+        "the gate's status check refuses a sequential re-promotion, not the race path: {body}"
+    );
     let after: Vec<(Uuid, serde_json::Value)> = rows(&pool, r.claim, r.rv_frame)
         .await
         .into_iter()
@@ -561,5 +584,260 @@ async fn evidence_analyzed_after_promotion_lands_on_research_validity(
     assert!(
         on_rv.iter().any(|row| row.id == promoted[0].id),
         "beside the promoted evidence, not over it"
+    );
+}
+
+/// Bring a hypothesis no ordinary agent may write to a promotable state the
+/// way legacy evidence got there, by writing exactly the rows the `analyze`
+/// route writes (`routes/experiment_loop.rs::analyze_result`) directly on the
+/// seeding pool. Since R-51 the route refuses an agent outside the owning
+/// group's writable set, so it cannot file this evidence itself. The rows: a
+/// completed experiment and result, an analysis with an explicit scope, its
+/// `analyzes` and `provides_evidence` edges, and the untyped, evidence-less
+/// `error_derived` BBA on `hypothesis_assessment`.
+async fn make_promotable_by_legacy_rows(
+    pool: &PgPool,
+    conn_opts: &PgConnectOptions,
+    analyst: Uuid,
+    claim: Uuid,
+) -> Ready {
+    let hyp_frame = ensure_frame(pool, "hypothesis_assessment").await;
+    let rv_frame = ensure_frame(pool, "research_validity").await;
+    let experiment: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiments (hypothesis_id, created_by, status) \
+         VALUES ($1, $2, 'complete') RETURNING id",
+    )
+    .bind(claim)
+    .bind(analyst)
+    .fetch_one(pool)
+    .await
+    .expect("seed experiment");
+    let result: Uuid = sqlx::query_scalar(
+        "INSERT INTO experiment_results (experiment_id, data_source, raw_measurements, measurement_count) \
+         VALUES ($1, 'instrument', $2, 2) RETURNING id",
+    )
+    .bind(experiment)
+    .bind(serde_json::json!([
+        {"value": 1.2, "random_error": 0.05, "systematic_error": 0.02},
+        {"value": 1.1, "random_error": 0.05, "systematic_error": 0.02}
+    ]))
+    .fetch_one(pool)
+    .await
+    .expect("seed result");
+    let analysis: Uuid = sqlx::query_scalar(
+        "INSERT INTO analyses (analysis_type, method_description, inference_path, agent_id, properties) \
+         VALUES ('automated', 'Error-derived mass function from experimental measurements', \
+                 'novel', $1, $2) RETURNING id",
+    )
+    .bind(analyst)
+    .bind(serde_json::json!({
+        "scope_limitations": [{"type": "small_sample_size"}],
+        "supports_hypothesis": true,
+    }))
+    .fetch_one(pool)
+    .await
+    .expect("seed analysis");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, 'analysis', $2, 'experiment_result', 'analyzes', '{}')",
+    )
+    .bind(analysis)
+    .bind(result)
+    .execute(pool)
+    .await
+    .expect("seed analyzes edge");
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, 'analysis', $2, 'claim', 'provides_evidence', $3)",
+    )
+    .bind(analysis)
+    .bind(claim)
+    .bind(serde_json::json!({"direction": "supports"}))
+    .execute(pool)
+    .await
+    .expect("seed provides_evidence edge");
+    epigraph_db::MassFunctionRepository::store(
+        pool,
+        claim,
+        hyp_frame,
+        Some(analyst),
+        &serde_json::json!({"0": 0.8, "0,1": 0.2}),
+        None,
+        Some("error_derived"),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed the error_derived BBA");
+    let (addr, shutdown) = spawn_app(conn_opts).await;
+    Ready {
+        addr,
+        _shutdown: shutdown,
+        claim,
+        hyp_frame,
+        rv_frame,
+    }
+}
+
+/// The prod-dominant shape of the refusal above: an ordinary agent promotes a
+/// PUBLIC (legacy) hypothesis whose `hypothesis_assessment` BBA is owned by
+/// the memberless world group. It cannot retire that BBA, so the promotion is
+/// refused and nothing is written: no `research_validity` copy, and the
+/// source stays in place.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promoter_who_cannot_retire_a_world_owned_source_writes_nothing(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-legacy-author").await;
+    let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "846b808e-legacy-promoter").await;
+    let claim =
+        viewer_fixture::seed_public_claim(&pool, author, "846b808e public legacy hypothesis").await;
+    let r = make_promotable_by_legacy_rows(&pool, &conn_opts, author, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await;
+    assert_eq!(source.len(), 1, "CALIBRATION: one source BBA: {source:?}");
+    let source = source.into_iter().next().expect("one source BBA");
+    assert_eq!(
+        (
+            source.combination_method.as_deref(),
+            source.evidence_type.as_deref(),
+            source.evidence_id
+        ),
+        (Some("error_derived"), None, None),
+        "CALIBRATION: the source is the untyped, evidence-less row analyze writes"
+    );
+
+    // CALIBRATION: the source BBA is world-owned, so it lies outside every
+    // ordinary agent's writable set; and the hypothesis is promotable for the
+    // promoter, so a refusal below is the retire and not the readiness gate.
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
+            .bind(source.id)
+            .fetch_one(&pool)
+            .await
+            .expect("source owner");
+    assert_eq!(
+        owner,
+        Some(viewer_fixture::world_group(&pool).await),
+        "CALIBRATION: the source BBA on a public hypothesis is world-owned"
+    );
+    let ready = status_of(r.addr, agent, r.claim).await;
+    assert_eq!(
+        ready["promotion"]["ready"], true,
+        "CALIBRATION: the promoter sees a promotable hypothesis: {ready}"
+    );
+
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a promotion that cannot retire a world-owned source must be refused: {status} {body}"
+    );
+    assert!(
+        body.contains("cannot retire that BBA"),
+        "the refusal names the retire, not some other failure: {body}"
+    );
+    assert!(
+        rows(&pool, r.claim, r.rv_frame).await.is_empty(),
+        "a refused promotion writes no research_validity copy"
+    );
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame)
+            .await
+            .iter()
+            .any(|row| row.id == source.id),
+        "a refused promotion leaves the source in place"
+    );
+}
+
+/// Backlog 03b1508f (2): the promote gate is atomic. The gate reads the
+/// hypothesis's status before the promotion's transaction, so two concurrent
+/// promotions could both pass it. Here the other promotion holds the claim
+/// row with its status write uncommitted; this promotion passes the gate (it
+/// reads the committed, unpromoted status), waits on the claim row, and the
+/// other commits. At origin/main its status write then simply ran: 200, and
+/// the hypothesis_assessment BBA was moved by a promotion of an already
+/// promoted hypothesis. Now the status flip is the transaction's first,
+/// conditional write, and the late promotion is refused with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_promotion_racing_a_committed_promotion_is_refused(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "03b1508f-race").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "03b1508f racing promotion").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("database name");
+
+    let mut other = pool
+        .begin()
+        .await
+        .expect("the other promotion's transaction");
+    sqlx::query(
+        "UPDATE claims SET properties = properties || '{\"hypothesis_status\": \"promoted\"}' \
+         WHERE id = $1",
+    )
+    .bind(r.claim)
+    .execute(&mut *other)
+    .await
+    .expect("the other promotion's status write");
+
+    let racing = tokio::spawn(promote(r.addr, agent, r.claim));
+    let mut blocked = false;
+    for _ in 0..1200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = $1 AND wait_event_type = 'Lock'",
+        )
+        .bind(&db)
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        blocked,
+        "CALIBRATION: the promotion reached the claim row the other promotion holds"
+    );
+    other.commit().await.expect("the other promotion commits");
+
+    let (status, body) = racing.await.expect("join the racing promotion");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CONFLICT,
+        "a promotion that lost the race is refused: {status} {body}"
+    );
+    assert!(
+        body.contains("concurrent promotion"),
+        "the conditional status write refuses it (its 0-row path), not the gate: {body}"
+    );
+    assert!(
+        rows(&pool, r.claim, r.rv_frame).await.is_empty(),
+        "the refused promotion writes no research_validity copy"
+    );
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame)
+            .await
+            .iter()
+            .any(|row| row.id == source.id),
+        "the refused promotion leaves the source in place"
     );
 }

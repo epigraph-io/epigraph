@@ -90,6 +90,32 @@ fn assert_refused<T: std::fmt::Debug>(
     }
 }
 
+/// Migration 148's registered-key refusal as migration 176 states it: the
+/// message carries the code AGK01 and names no system identity, and the role
+/// it refuses for is in DETAIL (the server log's, not the caller's).
+fn assert_registered_key_refusal(e: &sqlx::Error, what: &str) {
+    let db = e
+        .as_database_error()
+        .unwrap_or_else(|| panic!("{what}: not a database error: {e}"));
+    assert!(
+        db.message()
+            .starts_with("AGK01: agents: this public key was registered for a system agent"),
+        "{what}: {e}"
+    );
+    assert!(
+        !db.message().contains("workflow-ingest"),
+        "{what}: the message names no system identity: {e}"
+    );
+    let detail = db
+        .try_downcast_ref::<sqlx::postgres::PgDatabaseError>()
+        .and_then(sqlx::postgres::PgDatabaseError::detail);
+    assert_eq!(
+        detail,
+        Some("system agent role: workflow-ingest"),
+        "{what}: the role is kept in DETAIL"
+    );
+}
+
 async fn seed_agent(pool: &PgPool, label: &str) -> Uuid {
     fixture::seed_agent_with_group(pool, label).await.0
 }
@@ -794,12 +820,7 @@ async fn a_registered_key_cannot_be_taken_by_another_agent(pool: PgPool) {
             other => panic!("{what}: expected a QueryFailed(55000), got {other:?}"),
         };
         assert_eq!(sqlstate(source).as_deref(), Some("55000"), "{what}: {e}");
-        assert!(
-            source
-                .to_string()
-                .contains("registered for the workflow-ingest system agent"),
-            "{what}: {source}"
-        );
+        assert_registered_key_refusal(source, what);
     };
 
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
@@ -830,8 +851,12 @@ async fn a_registered_key_cannot_be_taken_by_another_agent(pool: PgPool) {
     assert_refused(
         &r,
         "55000",
-        "registered for the workflow-ingest system agent",
+        "AGK01: agents: this public key was registered for a system agent",
         &[],
+        "(3) superuser re-key of another agent to K",
+    );
+    assert_registered_key_refusal(
+        r.as_ref().unwrap_err(),
         "(3) superuser re-key of another agent to K",
     );
     assert_eq!(holders().await, 0);

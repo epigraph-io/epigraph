@@ -1,5 +1,7 @@
-//! Coordination primitives that keep the heavy nightly jobs (`cluster_graph`,
-//! `theme_cluster_rebuild`) from stacking and grinding the database.
+//! Coordination primitives that keep the heavy nightly job (`cluster_graph`)
+//! from stacking and grinding the database. (`theme_cluster_rebuild`, the
+//! other one, ran the retired k-means theme prototype and is gone: backlog
+//! a0ed0180.)
 //!
 //! Background: the cron fires ~60 s after *every* `epigraph-api` boot, the
 //! queue had no dedup, and the runner has multiple workers — so each restart
@@ -22,11 +24,10 @@ use std::time::Duration;
 /// DB-wide advisory-lock key serializing concurrent `cluster_graph` runs.
 ///
 /// Advisory-lock keys must be globally unique within the database. Keep this
-/// distinct from [`THEME_REBUILD_LOCK_KEY`] and any future key.
+/// distinct from any future key, and do not reuse `770_011`: it was the
+/// retired `theme_cluster_rebuild` job's, and a process still running an old
+/// build would take it.
 pub const CLUSTER_GRAPH_LOCK_KEY: i64 = 770_010;
-
-/// DB-wide advisory-lock key serializing concurrent `theme_cluster_rebuild` runs.
-pub const THEME_REBUILD_LOCK_KEY: i64 = 770_011;
 
 /// Run `body` while holding the DB-wide advisory lock `lock_key`.
 ///

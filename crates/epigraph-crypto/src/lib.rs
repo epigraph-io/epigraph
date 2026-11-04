@@ -15,6 +15,7 @@
 
 pub mod canonical;
 pub mod did_key;
+pub mod domain;
 pub mod encryption;
 pub mod epoch;
 pub mod errors;
@@ -28,6 +29,7 @@ pub use did_key::{
     did_key_for_llm_agent, keypair_from_llm_agent, keypair_from_llm_agent_keyed,
     keypair_from_llm_agent_prehashed, DidKey,
 };
+pub use domain::{signing_message, SignatureScheme, SignedEntity, SIGNING_DOMAIN_V1};
 pub use encryption::{decrypt, encrypt, EncryptedPayload};
 pub use epoch::derive_epoch_key;
 pub use errors::CryptoError;

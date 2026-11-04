@@ -96,18 +96,22 @@ async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
 }
 
 /// Count edges incident on either of two claims for a given relationship,
-/// in EITHER direction. The matcher treats CORROBORATES as symmetric, so this
-/// is the metric that proves bidirectional dedup.
+/// in EITHER direction and in any stored spelling of it (writers store the
+/// lower-case canonical spelling, backlog 3ce5e00c). The matcher treats
+/// CORROBORATES as symmetric, so this is the metric that proves bidirectional
+/// dedup.
 async fn incident_edge_count(pool: &PgPool, a: uuid::Uuid, b: uuid::Uuid, rel: &str) -> i64 {
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*)::bigint FROM edges
-         WHERE relationship = $3
+         WHERE relationship = ANY($3)
            AND ((source_id = $1 AND target_id = $2)
              OR (source_id = $2 AND target_id = $1))",
     )
     .bind(a)
     .bind(b)
-    .bind(rel)
+    .bind(epigraph_core::edge::relationships::relationship_spellings(
+        rel,
+    ))
     .fetch_one(pool)
     .await
     .expect("count edges");

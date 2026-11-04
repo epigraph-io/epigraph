@@ -41,10 +41,9 @@ const ATOM_0: &str = "Gravity bends light.";
 const ATOM_1: &str = "Time dilates near mass.";
 const SOURCE: &str = "Clocks near massive bodies tick at exactly the same rate as distant clocks.";
 
-/// The conflict relationship the world is seeded with. `refutes`, because
-/// `contradicts` retargets are HELD (`retarget::HELD_RELATIONSHIPS`): a
-/// regression test built on a held relationship would pass on the hold alone,
-/// whatever the guard it claims to test does.
+/// The conflict relationship the world is seeded with. `refutes`, chosen while
+/// `contradicts` retargets were HELD (`retarget::HELD_RELATIONSHIPS`, empty
+/// since backlog 3ce5e00c); `contradicts` has its own apply test.
 const REL: &str = "refutes";
 
 struct World {
@@ -355,47 +354,57 @@ fn the_hold_tracks_the_edges_route_whitelist() {
     }
 }
 
-/// A `contradicts` parent edge is HELD on apply: the LLM plan is still made
-/// (the dry run shows it), but nothing crosses the socket, no row is written,
-/// the parent stays unmarked, and the entry says why.
+/// A `contradicts` parent edge is APPLIED (the hold lifted with backlog
+/// 3ce5e00c), from either stored spelling of the parent: the atom edge is
+/// created through `POST /api/v1/edges`, stored as `contradicts` (the spelling
+/// the API now stores and `dispute_batch` matches), and the atom reads as
+/// disputed. Before, the route refused lower-case `contradicts`, so the
+/// retarget was held and wrote nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn contradicts_retargets_are_held_and_write_nothing(pool: PgPool) {
-    let viewer = viewer_fixture::public_viewer(&pool).await;
-    let w = seed_world_with(&pool, "contradicts").await;
-    let (api, hits, server) = serve_api(&pool, w.agent).await;
-    let llm = fixture(serde_json::json!({"atoms": [1]}));
-    let before = snapshot(&pool, &w).await;
-    let manifest = manifest_path();
+async fn contradicts_retargets_are_applied_in_the_lower_case_spelling(pool: PgPool) {
+    for parent_spelling in ["contradicts", "CONTRADICTS"] {
+        let viewer = viewer_fixture::public_viewer(&pool).await;
+        let w = seed_world_with(&pool, parent_spelling).await;
+        let (api, hits, server) = serve_api(&pool, w.agent).await;
+        let llm = fixture(serde_json::json!({"atoms": [1]}));
+        let manifest = manifest_path();
 
-    let run = run_retarget(&pool, &viewer, &llm, Some(&api), &manifest, opts(true))
-        .await
-        .unwrap();
+        let run = run_retarget(&pool, &viewer, &llm, Some(&api), &manifest, opts(true))
+            .await
+            .unwrap();
 
-    assert_eq!(
-        hits.load(Ordering::SeqCst),
-        0,
-        "a held retarget sends no request"
-    );
-    assert_eq!(
-        snapshot(&pool, &w).await,
-        before,
-        "a held retarget writes nothing"
-    );
-    assert_eq!(
-        run.plan[0].verdict,
-        verdict::ATOMS,
-        "the plan is still made"
-    );
-    let applied = &run.applied[0];
-    assert!(applied.held, "{applied:?}");
-    assert!(!applied.parent_marked);
-    assert!(
-        applied.errors.iter().any(|e| e.starts_with("HELD")),
-        "{:?}",
-        applied.errors
-    );
-    std::fs::remove_file(&manifest).ok();
-    server.stop().await;
+        let applied = &run.applied[0];
+        assert!(!applied.held, "{parent_spelling}: {applied:?}");
+        assert!(
+            applied.errors.is_empty(),
+            "{parent_spelling}: {:?}",
+            applied.errors
+        );
+        assert_eq!(
+            applied.created_edge_ids.len(),
+            1,
+            "{parent_spelling}: {applied:?}"
+        );
+        let new_edge = applied.created_edge_ids[0];
+        let stored: String = sqlx::query_scalar("SELECT relationship FROM edges WHERE id = $1")
+            .bind(new_edge)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "contradicts", "{parent_spelling}");
+        let disputes = epigraph_db::ClaimRepository::dispute_batch(&pool, &viewer, &[w.atoms[1]])
+            .await
+            .unwrap();
+        assert_eq!(
+            disputes.get(&w.atoms[1]).map(|d| d.dispute_count),
+            Some(1),
+            "{parent_spelling}: dispute_batch must report the retargeted atom as disputed"
+        );
+        assert!(applied.parent_marked, "{parent_spelling}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one POST + one PATCH");
+        std::fs::remove_file(&manifest).ok();
+        server.stop().await;
+    }
 }
 
 /// THE CORE CLAIM. `--retarget --apply` with the fixture choosing atom 1

@@ -1,0 +1,11 @@
+# Python test dependencies for the `python` job in .github/workflows/ci.yml,
+# pinned to versions the suites pass on (Python 3.12). Install into a venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r tests/requirements-ci.txt
+pytest==9.0.2
+psycopg2-binary==2.9.11
+httpx==0.28.1
+# tests/theme (scripts/theme_lib.py, refine_clusters.py, split_theme.py)
+numpy==1.26.4
+scikit-learn==1.8.0
+umap-learn==0.5.11
+numba==0.64.0

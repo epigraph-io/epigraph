@@ -136,12 +136,27 @@ async fn the_new_mode_signs_with_the_signing_key_and_attributes_to_the_identity(
         .try_into()
         .expect("64-byte signature");
     let digest = ContentHasher::hash(content.as_bytes());
-    assert!(
-        SignatureVerifier::verify(&signing.public_key(), &digest, &signature).unwrap_or(false),
-        "the stored signature is the signing key's"
+    // Ruling R-34: the server signs the claim-tagged v1 message.
+    assert_eq!(
+        SignatureVerifier::verify_entity(
+            &signing.public_key(),
+            epigraph_crypto::SignedEntity::Claim,
+            &digest,
+            &signature
+        )
+        .unwrap(),
+        Some(epigraph_crypto::SignatureScheme::V1),
+        "the stored signature is the signing key's, over the v1 claim message"
     );
-    assert!(
-        !SignatureVerifier::verify(&identity, &digest, &signature).unwrap_or(false),
+    assert_eq!(
+        SignatureVerifier::verify_entity(
+            &identity,
+            epigraph_crypto::SignedEntity::Claim,
+            &digest,
+            &signature
+        )
+        .unwrap(),
+        None,
         "and not an identity-key signature"
     );
     assert_eq!(
@@ -163,6 +178,30 @@ async fn the_new_mode_signs_with_the_signing_key_and_attributes_to_the_identity(
     assert_eq!(resp["signature_valid"], Value::Bool(true), "{resp}");
     assert_eq!(resp["key_bound"], Value::Bool(true), "{resp}");
     assert_eq!(resp["key_kind"], Value::from("signing"), "{resp}");
+
+    // Rulings R-49/R-50: the claim's AUTHORED edge is attested at INSERT by
+    // the same signing key, recorded against the identity agent, and the edge
+    // verifier admits it through the agent's `signing` row (its
+    // `agents.public_key` is the identity key, which signs nothing).
+    let authored: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE target_id = $1 AND relationship = 'AUTHORED'",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("the AUTHORED edge");
+    let (_bypass_pool, bypass) = fixture::bypass(&pool).await;
+    let mut conn = pool.acquire().await.expect("conn");
+    let check =
+        epigraph_db::repos::EdgeSignatureRepository::verify_conn(&mut conn, &bypass, authored)
+            .await
+            .expect("verify the edge")
+            .expect("readable");
+    drop(conn);
+    assert!(check.signature_valid, "{check:?}");
+    assert_eq!(check.key_kind, Some("signing"), "{check:?}");
+    assert_eq!(check.signer_id, Some(agent), "{check:?}");
+    assert_eq!(check.content_matches, Some(true), "{check:?}");
 
     // Contrast: no identity declared -> the agent is keyed by the signer.
     let legacy = server_signing_with(&pool, scoped, signer(0x82));

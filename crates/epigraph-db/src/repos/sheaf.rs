@@ -62,6 +62,10 @@ impl SheafRepository {
     /// Case-insensitive because most prod edges carry UPPER-case spellings
     /// (4,409 match the lowercase list exactly; 21,717 case-insensitively).
     /// Two spellings of one relationship between the same pair are two rows.
+    ///
+    /// Both the claim and its neighbour must be current (`is_current`): a
+    /// retired claim gets no section and constrains no neighbour (DD-20,
+    /// backlog 174ffd23).
     pub async fn get_claim_neighbor_betp_pairs<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -98,6 +102,10 @@ impl SheafRepository {
             AND (e.valid_to IS NULL OR e.valid_to > now())
             AND c.pignistic_prob IS NOT NULL
             AND n.pignistic_prob IS NOT NULL
+            -- A retired claim (superseded, marked duplicate, deprecated) takes
+            -- no part in the factor graph (DD-20), on either side of the edge.
+            AND c.is_current
+            AND n.is_current
             /* {VISIBILITY:c} */ /* {VISIBILITY:n} */ /* {EDGE_VISIBILITY:e} */
             ORDER BY c.id
             "#,
@@ -122,6 +130,10 @@ impl SheafRepository {
     /// match skipped every upper-case edge. The relationship is returned as
     /// stored, and two spellings of one relationship between the same pair
     /// are two rows.
+    ///
+    /// Both endpoints must be current (`is_current`), as in
+    /// [`Self::get_claim_neighbor_betp_pairs`]: an edge to or from a retired
+    /// claim is no obstruction (DD-20, backlog 174ffd23).
     pub async fn get_epistemic_edge_pairs<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -153,6 +165,12 @@ impl SheafRepository {
             AND (e.valid_to IS NULL OR e.valid_to > now())
             AND src.pignistic_prob IS NOT NULL
             AND tgt.pignistic_prob IS NOT NULL
+            -- Neither may an edge to or from a retired claim (DD-20). Supersession
+            -- leaves `contradicts` / `refutes` on the retired claim by design
+            -- (issue #398), so without this the conflict a supersession resolved
+            -- stays an obstruction (backlog 174ffd23).
+            AND src.is_current
+            AND tgt.is_current
             /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:src} */ /* {VISIBILITY:tgt} */
             "#,
             1,

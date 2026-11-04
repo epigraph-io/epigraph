@@ -1,27 +1,16 @@
-//! Theme k-means MCP tool. Wraps
-//! [`epigraph_engine::theme_kmeans::run_theme_kmeans`] so MCP clients (e.g.
-//! EpiClaw) can trigger server-side theme clustering instead of falling back
-//! to manual sampling. Mirrors the HTTP route
-//! `POST /api/v1/themes/build-from-corpus` (`build_themes_from_corpus` in
-//! `epigraph-api/src/routes/crud.rs`) with the same defaults.
+//! Theme READ tools: `list_themes` and `get_theme` (and the theme selector
+//! `memory.rs`'s theme-scoped recall shares).
 //!
-//! ## Safety
-//! - `limit` is capped at 500 (per `feedback_memory_limits.md`: VM OOMs at
-//!   ~2000 embeddings).
-//! - `wipe_first` defaults to `false`, as on the HTTP route. A wipe is not
-//!   scoped to `label_prefix`: `ClaimThemeRepository::delete_all` deletes EVERY
-//!   theme and clears every `claims.theme_id`, so the run's output becomes the
-//!   whole live theme set. It used to default to `true` (to stop duplicate
-//!   `auto-NN` rows accumulating, `claim_themes` having no `UNIQUE(label)`), and
-//!   on 2026-09-23 a sweep probe's bare call with `label_prefix="sweep-probe"`
-//!   replaced the production set with probe output (backlog 5abe23de).
-//! - A wipe therefore needs `claims:admin` over HTTP (the scope the HTTP route
-//!   demands for any run; stdio is the local operator and is not gated, as for
-//!   every other tool), and the engine admits it only for the canonical
-//!   `"auto"` family (`epigraph_engine::theme_kmeans::validate_config`).
-//! - An additive run (`wipe_first=false`) that creates themes carries a
-//!   `warning` in the response: repeated additive runs under one prefix
-//!   accumulate duplicate labels.
+//! The theme layer is maintained by the UMAP theme pipeline
+//! (`scripts/cluster_claims.py`, `scripts/maintain_themes.py` and the REST
+//! routes they call). The `theme_cluster` tool this module used to implement
+//! wrapped the k-means prototype (`epigraph_engine::theme_kmeans`), which is
+//! retired (backlog a0ed0180, operator ruling R-29): no MCP tool rebuilds or
+//! wipes themes. The tool NAME stays registered as a refusal
+//! ([`theme_cluster_retired`]) because a scheduled agent prompt can still reach
+//! it (the `theme-maintenance` task falls back to a bare `theme_cluster` call,
+//! `docs/ops/theme-v2-promotion-runbook.md`); the ruling says such a caller
+//! gets a clear "retired" answer, not an unknown-tool error.
 
 #![allow(clippy::wildcard_imports)]
 
@@ -35,118 +24,47 @@ use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 
 use epigraph_db::{ClaimThemeRepository, ThemeSummaryRow};
-use epigraph_engine::theme_kmeans::{
-    run_theme_kmeans, RunThemeKmeansConfig, ThemeKmeansError, CANONICAL_LABEL_PREFIX,
-};
 
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ThemeClusterParams {
-    /// Explicit k. When omitted, runs elbow-penalised search over `k_min..=k_max`.
-    pub k: Option<u32>,
-    /// Lower bound for k search (inclusive). Default 4.
-    pub k_min: Option<u32>,
-    /// Upper bound for k search (inclusive). Default 16.
-    pub k_max: Option<u32>,
-    /// Drop clusters with fewer than this many claims. Default 5.
-    pub min_claims_per_theme: Option<u32>,
-    /// Cap on number of `claims` rows pulled. Default 500; capped at 500
-    /// regardless of input to defend against VM OOM at ~2000 embeddings.
-    pub limit: Option<u32>,
-    /// Theme label prefix. Default `"auto"` (produces `auto-00`, `auto-01`, …).
-    pub label_prefix: Option<String>,
-    /// Embedding dimensionality. Must be 1536 or 3072. Default 1536.
-    pub centroid_dim: Option<u32>,
-    /// Whether to delete EVERY existing theme (whatever its prefix) and clear
-    /// every `claims.theme_id` before clustering. **Default `false`.** `true`
-    /// needs `claims:admin` over HTTP and the canonical `label_prefix` `"auto"`;
-    /// it is refused otherwise, with nothing written. See the module docstring.
-    pub wipe_first: Option<bool>,
-}
+/// Parameters of the RETIRED `theme_cluster` tool. Empty, and unknown fields
+/// are ignored, so a call carrying the old tool's arguments (`k`, `wipe_first`,
+/// `label_prefix`, ...) reaches the retirement answer rather than a parameter
+/// error.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct RetiredThemeClusterParams {}
 
-const MCP_LIMIT_CAP: u32 = 500;
+/// What a `theme_cluster` call is told. Names the replacement so an agent
+/// following a stale workflow can recover without operator help.
+pub const THEME_CLUSTER_RETIRED: &str = "theme_cluster is retired: the k-means theme prototype it \
+     ran was removed (backlog a0ed0180). Use the UMAP theme pipeline instead: \
+     scripts/maintain_themes.py for incremental maintenance (assign-unthemed, reassign, \
+     split-candidates, recompute-centroids over /api/v1/themes/*), and theme_pipeline.py grow \
+     on the host for a periodic full rebuild. Read themes with list_themes / get_theme. \
+     Nothing was written; do not retry.";
 
-pub async fn theme_cluster(
-    server: &EpiGraphMcpFull,
-    params: ThemeClusterParams,
-    auth: Option<&epigraph_auth::AuthContext>,
-) -> Result<CallToolResult, McpError> {
-    let wipe_first = params.wipe_first.unwrap_or(false);
-    // A wipe replaces the whole live theme set: admin power, the scope the HTTP
-    // route (`build_themes_from_corpus`) demands for any run. `has_scope` applies the
-    // current admin posture, so an armed token's `claims:admin` counts only as
-    // the dispatch gate would count it. `None` is stdio: the local operator.
-    if wipe_first && auth.is_some_and(|a| !a.has_scope(crate::scope_map::CLAIMS_ADMIN)) {
-        return Err(McpError::invalid_request(
-            "theme_cluster wipe_first=true deletes every theme and replaces the live set, so it \
-             requires claims:admin; nothing was written. Omit wipe_first (default false) for an \
-             additive run"
-                .to_string(),
-            None,
-        ));
-    }
-
-    let config = RunThemeKmeansConfig {
-        k: params.k,
-        k_min: params.k_min.unwrap_or(4),
-        k_max: params.k_max.unwrap_or(16),
-        min_claims_per_theme: params.min_claims_per_theme.unwrap_or(5),
-        limit: params.limit.unwrap_or(500).clamp(1, MCP_LIMIT_CAP),
-        label_prefix: params
-            .label_prefix
-            .unwrap_or_else(|| CANONICAL_LABEL_PREFIX.to_string()),
-        wipe_first,
-        centroid_dim: params.centroid_dim.unwrap_or(1536),
-    };
-
-    let summary = run_theme_kmeans(&server.pool, &config)
-        .await
-        .map_err(|e| match e {
-            ThemeKmeansError::BadRequest(msg) => crate::errors::invalid_params(msg),
-            ThemeKmeansError::Centroid3072Empty => crate::errors::invalid_params(e.to_string()),
-            other => internal_error(other),
-        })?;
-
-    // Mirror the HTTP handler's JSON shape so EpiClaw and the route share a
-    // single observable contract.
-    let mut body = if let Some(k_used) = summary.k_used {
-        serde_json::json!({
-            "themes_created": summary.themes_created,
-            "claims_assigned": summary.claims_assigned,
-            "k_used": k_used,
-            "claims_with_embeddings": summary.claims_with_embeddings,
-            "centroid_dim": summary.centroid_dim,
-        })
-    } else {
-        serde_json::json!({
-            "themes_created": summary.themes_created,
-            "claims_assigned": summary.claims_assigned,
-            "k_used": serde_json::Value::Null,
-            "claims_with_embeddings": summary.claims_with_embeddings,
-            "centroid_dim": summary.centroid_dim,
-            "skipped_reason": summary.skipped_reason.unwrap_or_default(),
-        })
-    };
-
-    // An additive run (the default) that created themes: with no DB-level
-    // UNIQUE constraint on `claim_themes.label`, repeated calls with the same
-    // `label_prefix` proliferate duplicate rows.
-    if !wipe_first && summary.themes_created > 0 {
-        body["warning"] = serde_json::json!(
-            "wipe_first=false (the default): created themes were added alongside the existing set. Repeated calls with the same label_prefix will produce duplicate rows; use a unique label_prefix, or a claims:admin rebuild of the \"auto\" family with wipe_first=true. See claim_themes UNIQUE constraint backlog."
-        );
-    }
-
-    Ok(CallToolResult::success(vec![ContentBlock::text(
-        serde_json::to_string_pretty(&body).map_err(internal_error)?,
-    )]))
+/// The refusal every `theme_cluster` call gets: JSON-RPC `INVALID_REQUEST`
+/// (the caller-error class, so it is not retried as an internal error), with a
+/// machine-readable `data` like the D9 MOVED refusal's. Writes nothing and
+/// reads nothing.
+#[must_use]
+pub fn theme_cluster_retired() -> McpError {
+    McpError::invalid_request(
+        THEME_CLUSTER_RETIRED.to_string(),
+        Some(serde_json::json!({
+            "status": "retired",
+            "surface": "theme_cluster",
+            "replacement": "scripts/maintain_themes.py (UMAP theme pipeline)",
+            "retryable": false,
+            "backlog": "a0ed0180",
+        })),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // READ SIDE — `list_themes` / `get_theme`
 //
-// Backlog c40689c9 / ac4d02b9: before these, `theme_cluster` above was the
-// ONLY theme tool, so the only way to learn what the current themes contain
-// was to rebuild (and by default wipe) them. Both tools here are pure reads:
+// Backlog c40689c9 / ac4d02b9: before these, `theme_cluster` (the retired
+// k-means wrapper) was the ONLY theme tool, so the only way to learn what the
+// current themes contain was to rebuild (and by default wipe) them. Both tools here are pure reads:
 // they never call `reject_if_read_only`, take `claims:read`, and issue no
 // statement that is not a SELECT.
 //
@@ -160,10 +78,8 @@ pub async fn theme_cluster(
 // CLAUDE.md rule that routes and MCP tools both call `epigraph-db/src/repos/`.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Default / maximum page sizes for the theme reader. The cap exists for the
-/// same reason `MCP_LIMIT_CAP` above does — bounding what one tool call can
-/// pull into a response body — but is unrelated to the OOM-at-~2000-embeddings
-/// concern, since no vectors are returned here.
+/// Default / maximum page sizes for the theme reader. The cap bounds what one
+/// tool call can pull into a response body; no vectors are returned here.
 const THEME_PAGE_DEFAULT: u32 = 50;
 const THEME_PAGE_MAX: u32 = 500;
 const MEMBER_PAGE_DEFAULT: u32 = 50;
@@ -231,10 +147,10 @@ pub struct ResolvedTheme {
 /// - a `theme_label` matching nothing is rejected, not treated as "no filter"
 ///   (that is the difference between an empty answer and the whole corpus);
 /// - a `theme_label` matching MORE THAN ONE theme is rejected with all the
-///   candidate ids. `claim_themes` has no `UNIQUE(label)` constraint and
-///   `theme_cluster(wipe_first=false)` actively produces duplicate `auto-00`
-///   rows, so picking the first match would silently scope to one of several
-///   distinct themes.
+///   candidate ids. `claim_themes` has no `UNIQUE(label)` constraint, and the
+///   retired k-means tool's additive runs left duplicate `auto-00` rows, so
+///   picking the first match would silently scope to one of several distinct
+///   themes.
 pub async fn resolve_theme_selector(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,

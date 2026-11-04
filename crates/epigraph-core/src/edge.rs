@@ -160,6 +160,28 @@ pub mod relationships {
         }
     }
 
+    /// The spelling a writer STORES `relationship` with.
+    ///
+    /// A member of [`CASE_FOLDED_RELATIONSHIPS`], in any ASCII case, is
+    /// returned in its lower-case canonical spelling (the one the MCP tools,
+    /// this module's constants and [`SYMMETRIC_CLAIM_RELATIONSHIPS`] use); any
+    /// other relationship is returned unchanged, so `REFINES` stays `REFINES`
+    /// and `DERIVED_FROM` stays distinct from `derived_from`.
+    ///
+    /// Every edge writer calls this before it inserts, so new rows carry one
+    /// spelling; readers still match [`relationship_spellings`] because rows
+    /// written before the canonical spelling keep the upper-case form until
+    /// the operator case-fold (`docs/runbooks/edge-relationship-casefold.sql`)
+    /// rewrites them.
+    #[must_use]
+    pub fn canonical_relationship(relationship: &str) -> &str {
+        CASE_FOLDED_RELATIONSHIPS
+            .iter()
+            .find(|r| r.eq_ignore_ascii_case(relationship))
+            .copied()
+            .unwrap_or(relationship)
+    }
+
     /// Claim A supports Claim B (evidence relationship)
     pub const SUPPORTS: &str = "supports";
 
@@ -189,6 +211,22 @@ pub mod relationships {
 
     /// Claim supersedes an older version
     pub const SUPERSEDES: &str = "supersedes";
+
+    /// The refusal every generic edge writer answers a [`SUPERSEDES`] edge
+    /// with, in any spelling (supersede SPEC K12a, ruling R-132): the lineage
+    /// edge is written only by the supersession act, in the same write as the
+    /// retirement it records, so a generic writer never creates one.
+    pub const SUPERSEDES_ACT_ONLY: &str =
+        "relationship 'supersedes' (in any spelling) is written only by the supersession act \
+         (POST /api/v1/claims/{id}/supersede, MCP supersede_claim), which retires the claim it \
+         replaces in the same write; a generic edge write cannot create it; nothing was written";
+
+    /// Whether `relationship` is the lineage relationship [`SUPERSEDES`], in
+    /// any ASCII case. The one predicate every generic writer refuses on.
+    #[must_use]
+    pub fn is_lineage_relationship(relationship: &str) -> bool {
+        relationship.eq_ignore_ascii_case(SUPERSEDES)
+    }
 
     /// Two claims describe the same entity from different sources
     pub const EQUIVALENT_TO: &str = "equivalent_to";
@@ -244,10 +282,10 @@ pub mod relationships {
     ///
     /// Listed in the lower-case canonical spelling; use
     /// [`is_symmetric_claim_relationship`] to test membership, which ignores
-    /// ASCII case so the upper-case `CONTRADICTS` / `CORROBORATES` the HTTP
-    /// allow-list admits are recognised too. Recognising a spelling does not
-    /// unify spellings: the writers' dedup probe still compares
-    /// `relationship` byte-exactly.
+    /// ASCII case so a legacy upper-case `CONTRADICTS` / `CORROBORATES` is
+    /// recognised too. The writers store [`canonical_relationship`] and their
+    /// dedup probes match every [`relationship_spellings`] entry, so a legacy
+    /// upper-case row and a new lower-case one over the same pair are one edge.
     ///
     /// The other epistemic relations (`supports`, `refutes`, `elaborates`,
     /// `generalizes`, `specializes`) are directional and MUST NOT be added:
@@ -341,6 +379,36 @@ mod tests {
                 .and_then(super::super::properties::PropertyValue::as_float),
             Some(0.85)
         );
+    }
+
+    #[test]
+    fn canonical_relationship_lowers_only_the_case_folded_relationships() {
+        use relationships::canonical_relationship as canon;
+        // Every case of a folded relationship stores as its lower-case spelling.
+        for (asked, stored) in [
+            ("SUPPORTS", "supports"),
+            ("supports", "supports"),
+            ("Contradicts", "contradicts"),
+            ("CONTRADICTS", "contradicts"),
+            ("CORROBORATES", "corroborates"),
+            ("REFUTES", "refutes"),
+        ] {
+            assert_eq!(canon(asked), stored, "{asked}");
+        }
+        // Distinct relationships that differ only in case are left alone, and
+        // so is everything outside the folded list.
+        for rel in [
+            "REFINES",
+            "refines",
+            "DERIVED_FROM",
+            "derived_from",
+            "SUPERSEDES",
+            "supersedes",
+            "WITHIN_FRAME",
+            "supporting",
+        ] {
+            assert_eq!(canon(rel), rel, "{rel} must not change");
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //! refusal at the rewire left a step claim linked into a broken chain. Handed
 //! `&mut *tx` the whole rewire is one unit.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use uuid::Uuid;
 
@@ -108,6 +108,20 @@ pub enum StepOpError {
          its claim, so it was not soft-deleted"
     )]
     StepNotWritable { step_claim_id: Uuid, lineage: Uuid },
+    /// `add_step` into a GROUP plan by a caller that does not itself hold a
+    /// live writer/admin membership of the plan's group (ruling R-98: the new
+    /// step takes the plan's group, and the system agent's stamp writes it;
+    /// inheriting the plan's tenancy must not let a non-writer write into the
+    /// group). The group is not named. Nothing is written.
+    #[error(
+        "workflow {canonical_name:?} belongs to a group the calling agent {caller} does not \
+         write (it holds no live writer or admin membership of it), so it may not add a step \
+         to it; nothing was written"
+    )]
+    GroupNotWritable {
+        canonical_name: String,
+        caller: Uuid,
+    },
     #[error("db error: {0}")]
     Db(#[from] sqlx::Error),
     #[error("repo error: {0}")]
@@ -173,13 +187,17 @@ pub async fn find_phase(
     row.ok_or(StepOpError::PhaseMissing)
 }
 
-/// Level-2 step claims under a workflow, ordered by walking `step_follows`
-/// from the head. Unreachable orphans (broken chain or no edges) are
-/// appended in plan order ([`PLAN_ORDER`]), and when several steps could be
-/// the head the earliest in plan order wins.
+/// Level-2 step claims under a workflow, in the `step_follows` order every
+/// plan-order reader returns: the [`PLAN_ORDER`] list reordered by
+/// `epigraph_db::WorkflowRepository::order_by_step_follows`, the ONE
+/// definition of the walk (operator ruling R-38). So slot `i` here, where
+/// [`add_step`] inserts, is slot `i` in `find_workflow`,
+/// `find_workflow_hierarchical` and the outcome reports' `step_index`.
 ///
-/// Both of those used to be `c.created_at`, which ties for every step of a plan
-/// written in one transaction.
+/// The pairs are read on this connection with no viewer predicate (the caller
+/// stamped it, so row security is the filter), retracted rows included, as
+/// the readers count them: a surviving retracted pair beside a live one is a
+/// fork, and a fork (or a cycle) falls back to [`PLAN_ORDER`].
 pub async fn ordered_steps(
     conn: &mut sqlx::PgConnection,
     workflow_id: Uuid,
@@ -199,52 +217,17 @@ pub async fn ordered_steps(
     if all.is_empty() {
         return Ok(vec![]);
     }
-    let id_set: Vec<Uuid> = all.clone();
-
-    let head_candidates: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT ws.id FROM unnest($1::uuid[]) AS ws(id) \
-         WHERE NOT EXISTS ( \
-           SELECT 1 FROM edges sf \
-           WHERE sf.target_id = ws.id AND sf.relationship = 'step_follows' \
-             AND sf.source_id = ANY($1::uuid[]) \
-         )",
+    let follows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT source_id, target_id FROM edges \
+         WHERE relationship = 'step_follows' \
+           AND source_id = ANY($1::uuid[]) AND target_id = ANY($1::uuid[])",
     )
-    .bind(&id_set)
+    .bind(&all)
     .fetch_all(&mut *conn)
     .await?;
-
-    // Pick the head that comes earliest in plan order among the candidates.
-    let head = all.iter().copied().find(|id| head_candidates.contains(id));
-
-    let mut chain: Vec<Uuid> = Vec::with_capacity(all.len());
-    let mut visited: HashSet<Uuid> = HashSet::new();
-    if let Some(h) = head {
-        let mut cur = h;
-        loop {
-            chain.push(cur);
-            visited.insert(cur);
-            let next: Option<Uuid> = sqlx::query_scalar(
-                "SELECT target_id FROM edges \
-                 WHERE source_id = $1 AND relationship = 'step_follows' \
-                   AND target_id = ANY($2::uuid[]) \
-                 LIMIT 1",
-            )
-            .bind(cur)
-            .bind(&id_set)
-            .fetch_optional(&mut *conn)
-            .await?;
-            match next {
-                Some(n) if !visited.contains(&n) => cur = n,
-                _ => break,
-            }
-        }
-    }
-    for id in &all {
-        if !visited.contains(id) {
-            chain.push(*id);
-        }
-    }
-    Ok(chain)
+    Ok(epigraph_db::WorkflowRepository::order_by_step_follows(
+        &all, &follows,
+    ))
 }
 
 // ── plan_index for an added step ────────────────────────────────────────────
@@ -310,8 +293,9 @@ async fn plan_edges(
 ///   index. So an insert is never indexed.
 ///
 /// An unindexed edge is what every `add_step` wrote before this: the frozen
-/// plan read counts it in `unindexed_edges`, and plan order lists it after
-/// every indexed item.
+/// plan read counts it in `unindexed_edges`. Plan order does NOT depend on it:
+/// every plan-order reader walks the `step_follows` chain (ruling R-38), where
+/// the step sits at the slot it was added at.
 fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
     if !append || !plan.all_public {
         return None;
@@ -333,8 +317,10 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 /// Every other add (an insert, an append to a plan with a non-public
 /// `executes` edge or with no integer `plan_index`) writes the edge WITHOUT
 /// `plan_index`, and [`AddStepResult::plan_index`] is `None`: the frozen plan
-/// read counts it in `unindexed_edges` and plan order lists it after every
-/// indexed item. `plan_placement` says why.
+/// read counts it in `unindexed_edges` (it reports STORED order). Every
+/// plan-order reader walks the `step_follows` chain, so the step is at slot
+/// `position` for them all (ruling R-38: position does not change
+/// `plan_index`). `plan_placement` says why the index is withheld.
 ///
 /// The placement sees only the edges this session can read. On a plan with
 /// an item the workflow-ingest stamp cannot read, `max + 1` can repeat that
@@ -345,6 +331,7 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 /// workflow cannot both take the same index.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
+    caller: Option<Uuid>,
     canonical_name: &str,
     step_text: &str,
     position: Option<u32>,
@@ -356,6 +343,34 @@ pub async fn add_step(
     // Before the plan is read: a concurrent add_step on this workflow waits
     // here, so the two cannot both take the same next `plan_index`.
     epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *conn, workflow_id).await?;
+    // A GROUP plan's new step lands in the plan's group (below), on the
+    // system agent's stamp, which writes that group whoever called. So the
+    // CALLER itself must write the group, decided here before anything is
+    // read or written, on every transport (REST and MCP pass their acting
+    // agent; `None` names no agent and is refused). Not left to row security:
+    // the stamp is not the caller's.
+    let plan_group =
+        match epigraph_db::WorkflowRepository::tenancy_of(&mut *conn, workflow_id).await? {
+            Some((visibility, group)) if visibility == "group" => Some(group),
+            _ => None,
+        };
+    if let Some(group) = plan_group {
+        let writes = match caller {
+            Some(agent) => {
+                epigraph_db::GroupMembershipRepository::agent_writes_group_conn(
+                    &mut *conn, agent, group,
+                )
+                .await?
+            }
+            None => false,
+        };
+        if !writes {
+            return Err(StepOpError::GroupNotWritable {
+                canonical_name: canonical_name.to_string(),
+                caller: caller.unwrap_or_else(Uuid::nil),
+            });
+        }
+    }
     let phase_id = find_phase(&mut *conn, workflow_id).await?;
     let chain = ordered_steps(&mut *conn, workflow_id).await?;
     let plan = plan_edges(&mut *conn, workflow_id).await?;
@@ -398,9 +413,9 @@ pub async fn add_step(
     let rewire = if !chain.is_empty() && position > 0 && position < chain.len() {
         let (prev, next) = (chain[position - 1], chain[position]);
         // Every prev -> next row the session can see, RETRACTED ones included:
-        // `ordered_steps` follows a retracted `step_follows` too (`LIMIT 1`, no
-        // `valid_to` filter), so a surviving retracted row would still fork the
-        // order.
+        // `ordered_steps` (and every plan-order reader) counts a retracted
+        // `step_follows` too (no `valid_to` filter), so a surviving retracted
+        // row would still fork the chain and send the order back to plan_index.
         let existing_ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM edges \
              WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
@@ -467,7 +482,17 @@ pub async fn add_step(
     // every workflow private to whoever last edited it. A parameter here would
     // therefore only widen the ways to get it wrong, so the declaration is
     // derived from the author the row already names.
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?;
+    //
+    // A GROUP plan is the exception (ruling R-98 Q5(a), backlog 630af617):
+    // its new step takes the `workflows` row's tenancy, read under the row
+    // lock taken above, so the step, its `executes` edge and its chain edges
+    // (the endpoint meet) are the plan's group and not public. The system
+    // agent's stamp writes that group (a declared ingest required it); if it
+    // no longer does, the INSERT is refused and nothing is written.
+    let decl = match plan_group {
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        None => epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?,
+    };
 
     let claim_created = sqlx::query(
         "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, labels, properties, step_lineage_id, \

@@ -56,6 +56,15 @@
 //! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
+//! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
+//! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | no |
+//! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | no |
+//! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | no |
+//!
+//! The four `experiment_loop.rs` rows are not new writes: they were that file's
+//! raw `INSERT INTO edges` statements (the second register), moved onto
+//! `EdgeRepository::create_signed` so the API key attests them (ruling R-50),
+//! on the same raw pool as before. Stamping them is still to do.
 //!
 //!
 //! # The second register: raw `INSERT INTO edges` in a route file
@@ -64,17 +73,13 @@
 //! is registered too ([`RAW_INSERTS`]), stamped or not. Measured when this table
 //! was written, every one of them ran unstamped; `persist_packet`'s have since
 //! moved onto the stamped claim-write transaction (operator-binding delta
-//! review), and the rest still run unstamped:
+//! review), and since ruling R-50 `persist_packet`'s five and
+//! `experiment_loop.rs`'s four write through `EdgeRepository`'s signed
+//! primitive (the latter now counted in [`UNSTAMPED`]). What remains:
 //!
 //! | file | handler | endpoints -> relationship | executor | in D8 scope |
 //! |---|---|---|---|---|
 //! | crud.rs | promote_staged_edges (claims:admin) | any staged pair (x2 statements) | `state.db_pool` | when the staged pair is claim/evidence at both ends |
-//! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | `state.db_pool` | no |
-//! | experiment_loop.rs | submit_results | experiment_result -> experiment result_of | `state.db_pool` | no |
-//! | experiment_loop.rs | analyze_result | analysis -> experiment_result analyzes | `state.db_pool` | no |
-//! | experiment_loop.rs | analyze_result | analysis -> claim provides_evidence | `state.db_pool` | no |
-//! | submit.rs | persist_packet | agent -> claim AUTHORED, claim -> trace HAS_TRACE, trace -> claim TRACES, trace -> evidence USES_EVIDENCE | `AppState::begin_claim_write` (stamped with the caller's viewer on a server) | no |
-//! | submit.rs | persist_packet | evidence -> claim SUPPORTS | `AppState::begin_claim_write` (stamped with the caller's viewer on a server) | yes |
 //!
 //! # What this file does NOT see
 //!
@@ -133,23 +138,28 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
     ("crud.rs", 2),
+    // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
+    // `EdgeRepository::create_signed` on the same raw pool); not new writes.
+    ("experiment_loop.rs", 4),
     ("perspective.rs", 1),
     ("provenance.rs", 4),
     ("spans.rs", 3),
 ];
 
 /// The total the register may never exceed. 28 before U012 (`cross_source.rs`
-/// left the register; see its note in [`UNSTAMPED`]).
-const HIGH_WATER: usize = 27;
+/// left the register; see its note in [`UNSTAMPED`]); 27 -> 31 under R-50 only
+/// because `experiment_loop.rs`'s four writes moved here from
+/// [`RAW_INSERTS`] (whose high water fell 11 -> 2): no write was added.
+const HIGH_WATER: usize = 31;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo
 /// layer on a stamped transaction; delete it at zero. Never raise one.
-const RAW_INSERTS: &[(&str, usize)] =
-    &[("crud.rs", 2), ("experiment_loop.rs", 4), ("submit.rs", 5)];
+const RAW_INSERTS: &[(&str, usize)] = &[("crud.rs", 2)];
 
-/// The total [`RAW_INSERTS`] may never exceed.
-const RAW_HIGH_WATER: usize = 11;
+/// The total [`RAW_INSERTS`] may never exceed. 11 before R-50 moved
+/// `submit.rs`'s five and `experiment_loop.rs`'s four onto the signed primitive.
+const RAW_HIGH_WATER: usize = 2;
 
 /// Whether `line` (trimmed) opens with a test-gating `cfg` attribute.
 fn is_cfg_test(line: &str) -> bool {

@@ -7,11 +7,10 @@
 //! original needs a shared test-support crate, an `include!` across a crate
 //! boundary, or a copy. This workspace has no test-support crate and no
 //! cross-crate `include!` today, so the first two both mean inventing a
-//! mechanism. (The workspace's one `include!`,
+//! mechanism. (The workspace's only `include!` was
 //! `epigraph-harvester/src/proto/mod.rs` pulling in its own generated protobuf,
-//! is within a single crate and establishes no precedent for the pattern being
-//! declined here. An earlier revision of this paragraph said there was no
-//! `include!` at all, which a one-line grep refutes.)
+//! within a single crate, so it set no precedent for the pattern declined here;
+//! that crate has since been deleted, backlog 3caeb71f.)
 //!
 //! **`F-PR28-viewer-fixture-duplication` is that same decision and is assigned
 //! to a different batch.** Inventing an answer here would either be undone or

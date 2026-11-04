@@ -763,29 +763,35 @@ pub async fn get_belief_in_mode(
         .await?;
     }
 
-    let interval =
-        epigraph_engine::belief_query::get_belief(&server.pool, viewer, claim_id, frame_id)
-            .await
-            .map_err(|e| match e {
-                epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
-                    invalid_params(format!("frame {id} not found"))
-                }
-                epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
-                    invalid_params(format!("claim {id} not found"))
-                }
-                epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
-                    invalid_params(format!("invalid mass function: {msg}"))
-                }
-                other => internal_error(other),
-            })?;
+    let interval = epigraph_engine::belief_query::get_belief_scoped(
+        &server.pool,
+        server.scoped.as_ref(),
+        viewer,
+        claim_id,
+        frame_id,
+    )
+    .await
+    .map_err(|e| match e {
+        epigraph_engine::BeliefQueryError::FrameNotFound(id) => {
+            invalid_params(format!("frame {id} not found"))
+        }
+        epigraph_engine::BeliefQueryError::ClaimNotFound(id) => {
+            invalid_params(format!("claim {id} not found"))
+        }
+        epigraph_engine::BeliefQueryError::ParseMasses(msg) => {
+            invalid_params(format!("invalid mass function: {msg}"))
+        }
+        other => internal_error(other),
+    })?;
 
     // Additive lensed interval, computed under the chosen (frame, perspective).
     // The top-level belief/plausibility/etc above stay the global (unlensed)
     // values. Existence already validated → a compute failure is internal.
     let lensed_belief = match lens {
         Some((lens_frame, lens_perspective)) => {
-            let lensed = epigraph_engine::belief_query::get_perspective_belief(
+            let lensed = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 claim_id,
                 lens_frame,
@@ -877,15 +883,65 @@ pub async fn compare_methods(
         MassFunctionRepository::get_for_claim_frame(&server.pool, viewer, claim_id, frame_id)
             .await
             .map_err(internal_error)?;
+    // Ruling R-22: only the BBAs whose sources this viewer can read; a
+    // reader outside a group never sees a fold of BBAs derived from it.
+    // On the viewer-stamped read when the server has one, so a group member's
+    // own group's sources are visible to the session as well as the viewer.
+    // Each row's source (writing agent and the live human it acts for) is
+    // read on the same connection, for the same-human rule below.
+    let (all_bbas, sources) = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let mut read = scoped.read_as(viewer).await.map_err(internal_error)?;
+            let rows =
+                epigraph_engine::derivation_scope::retain_for_viewer(&mut *read, viewer, all_bbas)
+                    .await
+                    .map_err(internal_error)?;
+            let sources =
+                epigraph_engine::source_dependence::bba_sources_for_rows(&mut read, viewer, &rows)
+                    .await
+                    .map_err(internal_error)?;
+            (rows, sources)
+        }
+        None => {
+            let rows = epigraph_engine::derivation_scope::retain_for_viewer(
+                &server.pool,
+                viewer,
+                all_bbas,
+            )
+            .await
+            .map_err(internal_error)?;
+            let sources = epigraph_engine::source_dependence::bba_sources_for_rows_on_pool(
+                &server.pool,
+                viewer,
+                &rows,
+            )
+            .await
+            .map_err(internal_error)?;
+            (rows, sources)
+        }
+    };
 
     if all_bbas.is_empty() {
         return Err(invalid_params("no BBAs stored for this claim/frame"));
     }
 
-    let mut mass_fns = Vec::new();
-    for row in &all_bbas {
-        mass_fns.push(parse_masses_json(&frame, &row.masses)?);
+    // Ruling R-36 (backlog fe3ec493): agents of one human replace or contest,
+    // never aggregate. Each same-human sibling group (per agent: same-source
+    // rule, then Dempster) is reduced to one BBA by the cautious rule before
+    // any method combines, so every method compares one owner's evidence as
+    // ONE input; rows of distinct owners are passed through unchanged and in
+    // order, so a claim with no sibling agents compares exactly as before.
+    let mut items = Vec::with_capacity(all_bbas.len());
+    for (row, source) in all_bbas.iter().zip(sources) {
+        items.push((source, parse_masses_json(&frame, &row.masses)?));
     }
+    let mass_fns = epigraph_engine::source_dependence::reduce_same_owner_siblings(
+        items,
+        epigraph_engine::belief_profile::BeliefProfile::served()
+            .combination
+            .conflict_threshold,
+    )
+    .map_err(internal_error)?;
 
     let hypothesis_index = params.hypothesis_index as usize;
     let target = FocalElement::positive(BTreeSet::from([hypothesis_index]));
@@ -980,8 +1036,9 @@ pub async fn scoped_belief(
     if scope_type == "perspective" {
         if let Some(frame_id_str) = params.frame_id.as_deref() {
             let frame_id = parse_uuid(frame_id_str)?;
-            let interval = epigraph_engine::belief_query::get_perspective_belief(
+            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 claim_id,
                 frame_id,

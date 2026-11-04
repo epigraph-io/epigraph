@@ -25,12 +25,20 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod viewer_fixture;
+
 // =============================================================================
 // FIXTURES
 // =============================================================================
 
-fn app(pool: PgPool) -> axum::Router {
-    create_router(AppState::with_db(pool, ApiConfig::default()))
+/// Built from a `ScopedPool` over the test database: every group route runs
+/// on the caller's stamped connection (backlog 323773fe), which
+/// `AppState::with_db` cannot supply and the routes refuse to fall back from.
+async fn app(pool: PgPool) -> axum::Router {
+    create_router(AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    ))
 }
 
 /// Insert a real `agents` row. `group_memberships.agent_id` and
@@ -114,7 +122,7 @@ fn wrapped_share(seed: &str) -> String {
 
 async fn create_group(pool: &PgPool, tok: &str, name: &str, key_seed: &str) -> (StatusCode, Value) {
     send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         "/api/v1/groups",
         Some(tok),
@@ -176,7 +184,7 @@ async fn create_group_then_add_member_then_get_member_role_round_trips(pool: PgP
     // membership row for the creator and returns 403.
     let admin = token(&["groups:admin"], creator);
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -253,7 +261,7 @@ async fn did_key_is_parseable_by_the_kernel_parser(pool: PgPool) {
     let key_hex = group_key("grp-did");
 
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         "/api/v1/groups",
         Some(&tok),
@@ -282,7 +290,7 @@ async fn create_group_accepts_the_legacy_creator_public_key_field_name(pool: PgP
     let creator = seed_agent(&pool, "legacy-creator").await;
     let tok = token(&["groups:write"], creator);
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         "/api/v1/groups",
         Some(&tok),
@@ -315,7 +323,7 @@ async fn role_omitted_defaults_to_reader_and_does_not_500(pool: PgPool) {
     let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
 
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&token(&["groups:admin"], creator)),
@@ -346,7 +354,7 @@ async fn role_member_is_rejected_with_400(pool: PgPool) {
     let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
 
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&token(&["groups:admin"], creator)),
@@ -467,7 +475,7 @@ async fn last_admin_cannot_be_removed(pool: PgPool) {
     // group permanently unadministrable — require_group_admin is the only way
     // in and there is no break-glass path.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::DELETE,
         &format!("/api/v1/groups/{group_id}/members/{creator}"),
         Some(&token(&["groups:admin"], creator)),
@@ -495,7 +503,7 @@ async fn an_admin_can_be_removed_once_a_second_admin_exists(pool: PgPool) {
 
     let admin = token(&["groups:admin"], creator);
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -509,7 +517,7 @@ async fn an_admin_can_be_removed_once_a_second_admin_exists(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::DELETE,
         &format!("/api/v1/groups/{group_id}/members/{creator}"),
         Some(&admin),
@@ -528,7 +536,7 @@ async fn removing_a_non_member_is_404(pool: PgPool) {
 
     // Previously a silent 204: remove_member discarded rows_affected().
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::DELETE,
         &format!("/api/v1/groups/{group_id}/members/{stranger}"),
         Some(&token(&["groups:admin"], creator)),
@@ -551,12 +559,12 @@ async fn get_group_is_401_anonymously_and_403_for_a_non_member(pool: PgPool) {
     let uri = format!("/api/v1/groups/{group_id}");
 
     // Anonymous: the route left the public router in PR-02.
-    let (status, _) = send(app(pool.clone()), Method::GET, &uri, None, None).await;
+    let (status, _) = send(app(pool.clone()).await, Method::GET, &uri, None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Authenticated non-member: membership is the tenancy boundary.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::GET,
         &uri,
         Some(&token(&["groups:read"], stranger)),
@@ -567,7 +575,7 @@ async fn get_group_is_401_anonymously_and_403_for_a_non_member(pool: PgPool) {
 
     // Authenticated member without groups:read.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::GET,
         &uri,
         Some(&token(&["claims:read"], creator)),
@@ -578,7 +586,7 @@ async fn get_group_is_401_anonymously_and_403_for_a_non_member(pool: PgPool) {
 
     // The member, correctly scoped.
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::GET,
         &uri,
         Some(&token(&["groups:read"], creator)),
@@ -601,7 +609,7 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
     // create_group without groups:write — 403, and (issue #128) NOT a 422 from
     // Json parsing, because the scope extractor runs first.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         "/api/v1/groups",
         Some(&token(&["claims:read"], creator)),
@@ -622,7 +630,7 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
     // add_member with groups:write but not groups:admin — scope AND membership.
     let other = seed_agent(&pool, "scope-other").await;
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&token(&["groups:write"], creator)),
@@ -636,7 +644,7 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
 
     // groups:admin but NOT a member of this group — the membership half.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&token(&["groups:admin"], other)),
@@ -651,6 +659,75 @@ async fn group_writes_require_their_scopes(pool: PgPool) {
         StatusCode::FORBIDDEN,
         "groups:admin alone must not be enough — membership is also required"
     );
+}
+
+/// A token that carries every group scope but NO agent principal is refused
+/// 401 by the group write routes, before the scope check and before the body
+/// is read. Since backlog 323773fe these routes take the caller's
+/// `ViewerExtractor` first (they run on the caller's stamped transaction), so
+/// the "re-authenticate to obtain an agent" answer is the viewer's 401; it used
+/// to be a 403 from the handlers' own agent checks. Pinned so the
+/// status is a deliberate contract, the same one `rotate_key` and the claim
+/// writers already give.
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_writes_by_a_token_without_an_agent_are_401(pool: PgPool) {
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET")
+        .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
+    let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
+    let (agentless, _jti) = cfg
+        .issue_access_token(
+            Uuid::new_v4(),
+            vec!["groups:write".to_string(), "groups:admin".to_string()],
+            "agent",
+            None,
+            None,
+            chrono::Duration::minutes(60),
+            epigraph_auth::AccessTokenBinding::NONE,
+        )
+        .expect("test JWT issued");
+
+    let creator = seed_agent(&pool, "agentless-creator").await;
+    let (_, body) = create_group(
+        &pool,
+        &token(&["groups:write"], creator),
+        "Agentless",
+        "grp-agentless",
+    )
+    .await;
+    let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
+    let other = seed_agent(&pool, "agentless-other").await;
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            "/api/v1/groups".to_string(),
+            Some(json!({ "name": "Nope", "group_public_key": group_key("agentless-nope") })),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/groups/{group_id}/members"),
+            Some(json!({ "agent_id": other, "wrapped_key_share": wrapped_share("agentless") })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/groups/{group_id}/members/{creator}"),
+            None,
+        ),
+    ] {
+        let (status, resp) = send(
+            app(pool.clone()).await,
+            method.clone(),
+            &uri,
+            Some(&agentless),
+            body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} with an agent-less token: {resp}"
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -678,7 +755,7 @@ async fn add_member_rejects_a_wrapped_share_that_is_not_60_bytes(pool: PgPool) {
         ("empty", String::new()),
     ] {
         let (status, _) = send(
-            app(pool.clone()),
+            app(pool.clone()).await,
             Method::POST,
             &uri,
             Some(&admin),
@@ -690,7 +767,7 @@ async fn add_member_rejects_a_wrapped_share_that_is_not_60_bytes(pool: PgPool) {
 
     // Non-hex is also a 400, not a 500.
     let (status, _) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &uri,
         Some(&admin),
@@ -726,7 +803,7 @@ async fn adding_an_existing_member_twice_is_409_not_500(pool: PgPool) {
     });
 
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -736,7 +813,7 @@ async fn adding_an_existing_member_twice_is_409_not_500(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -755,7 +832,7 @@ async fn adding_an_unknown_agent_is_404_not_500(pool: PgPool) {
     let group_id: Uuid = body["group_id"].as_str().unwrap().parse().unwrap();
 
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&token(&["groups:admin"], creator)),
@@ -775,7 +852,7 @@ async fn adding_an_unknown_agent_is_404_not_500(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn creating_a_group_with_an_unknown_agent_principal_is_403_not_500(pool: PgPool) {
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         "/api/v1/groups",
         Some(&token(&["groups:write"], Uuid::new_v4())),
@@ -824,7 +901,7 @@ async fn two_concurrent_admin_removals_cannot_strand_a_group(pool: PgPool) {
 
     let admin = token(&["groups:admin"], a);
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -959,7 +1036,7 @@ async fn the_guard_waits_for_the_admin_rows_its_decision_reads(pool: PgPool) {
 
     let admin = token(&["groups:admin"], a);
     let (status, body) = send(
-        app(pool.clone()),
+        app(pool.clone()).await,
         Method::POST,
         &format!("/api/v1/groups/{group_id}/members"),
         Some(&admin),
@@ -1056,7 +1133,7 @@ async fn the_lock_set_covers_every_live_member_not_only_the_admins(pool: PgPool)
         (reader_c, "reader", "s-roster-c"),
     ] {
         let (status, body) = send(
-            app(pool.clone()),
+            app(pool.clone()).await,
             Method::POST,
             &format!("/api/v1/groups/{group_id}/members"),
             Some(&admin),
@@ -1152,7 +1229,7 @@ async fn two_concurrent_removals_of_different_members_both_succeed(pool: PgPool)
         (reader_d, "reader", "s-pair-d"),
     ] {
         let (status, body) = send(
-            app(pool.clone()),
+            app(pool.clone()).await,
             Method::POST,
             &format!("/api/v1/groups/{group_id}/members"),
             Some(&admin),
@@ -1213,7 +1290,7 @@ async fn count_live_admins_excluding_ignores_the_excluded_and_the_revoked(pool: 
     let admin = token(&["groups:admin"], a);
     for (agent, role, seed) in [(b, "admin", "s-b"), (c, "reader", "s-c")] {
         let (status, body) = send(
-            app(pool.clone()),
+            app(pool.clone()).await,
             Method::POST,
             &format!("/api/v1/groups/{group_id}/members"),
             Some(&admin),

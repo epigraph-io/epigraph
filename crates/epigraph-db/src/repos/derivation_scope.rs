@@ -1,0 +1,286 @@
+//! Which stored BBAs a belief may be computed from, by where the BBAs CAME
+//! FROM (operator ruling R-22, backlog fef24216).
+//!
+//! A `mass_functions` row inherits its CLAIM's tenancy (migration 070 arm (c),
+//! or migration 114's public writer-owned row), so every row on a public claim
+//! is itself public. Visibility of the row therefore says nothing about the
+//! evidence it was derived from:
+//!
+//! * an edge-factor row (`combination_method = 'edge_factor'`, keyed by the
+//!   edge id in `perspective_id`) carries the belief of the edge's SOURCE
+//!   claim, which may be group-private, through an edge that may be
+//!   group-private;
+//! * an evidence-derived row (`evidence_id`) may cite an evidence row narrowed
+//!   to a private group (`epigraph-operator hide-evidence`, migration 110).
+//!
+//! A Bel/Pl folded from such a row leaks the existence, direction and weight
+//! of the restricted evidence even when nothing restricted is displayed. The
+//! same holds one level down: a GROUP claim's cache is read by every member of
+//! its group, so a BBA derived from ANOTHER group's private source leaks that
+//! source to them (the security review's generalisation of R-22: a BBA enters
+//! a claim's cached belief only if every source is at least as widely readable
+//! as the claim). The reads here decide ADMISSIBILITY by derivation, and they
+//! are written as
+//! "include iff the source is visible" (an `EXISTS` over the visible source),
+//! never "exclude iff a private source exists": row security hides private
+//! rows from some sessions, so only the inclusive form gives the same answer
+//! on a maintenance connection and on an application session.
+//!
+//! A consequence, recorded: an edge-factor row whose edge (or source claim) no
+//! longer exists is not admissible either, since nothing visible vouches for
+//! it.
+
+use std::collections::{HashMap, HashSet};
+
+use uuid::Uuid;
+
+use crate::errors::DbError;
+use crate::repos::claim_role::is_compound_sql;
+use crate::repos::mass_function::{
+    cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+};
+use crate::visibility::Viewer;
+
+/// A source `x` is at least as widely readable as the claim `c` when it is
+/// public, or when the claim is not public and the source belongs to the
+/// claim's own owner group (an edge only as a single-owner edge: a co-owned
+/// edge is readable by the members of BOTH groups, fewer than the claim's).
+const CACHE_ADMISSIBLE_SQL: &str = "SELECT mf.id FROM mass_functions mf \
+       JOIN claims c ON c.id = mf.claim_id \
+     WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL \
+       AND (mf.visibility = 'public' \
+            OR (c.visibility <> 'public' AND mf.owner_group_id = c.owner_group_id)) \
+       AND (mf.evidence_id IS NULL \
+            OR EXISTS (SELECT 1 FROM evidence e \
+                        WHERE e.id = mf.evidence_id \
+                          AND (e.visibility = 'public' \
+                               OR (c.visibility <> 'public' \
+                                   AND e.owner_group_id = c.owner_group_id)))) \
+       AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
+            OR mf.perspective_id IS NULL \
+            OR EXISTS (SELECT 1 FROM edges ed \
+                        WHERE ed.id = mf.perspective_id \
+                          AND (ed.visibility = 'public' \
+                               OR (c.visibility <> 'public' \
+                                   AND ed.owner_group_id = c.owner_group_id \
+                                   AND ed.co_owner_group_id IS NULL)) \
+                          AND EXISTS (SELECT 1 FROM claims s \
+                                       WHERE s.id = ed.source_id \
+                                         AND (s.visibility = 'public' \
+                                              OR (c.visibility <> 'public' \
+                                                  AND s.owner_group_id = c.owner_group_id)))))";
+
+/// The derivation half of [`DerivationScopeRepository::viewer_derived`], over
+/// a `mass_functions mf` already in scope: every source the row was derived
+/// from (the evidence it cites; for an edge-factor row, the edge and the
+/// edge's source claim) is visible to the viewer. Placeholders are
+/// `Viewer::splice`'s.
+const VIEWER_DERIVED_PREDICATE: &str = "(mf.evidence_id IS NULL \
+            OR EXISTS (SELECT 1 FROM evidence e \
+                        WHERE e.id = mf.evidence_id /* {VISIBILITY:e} */)) \
+       AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
+            OR mf.perspective_id IS NULL \
+            OR EXISTS (SELECT 1 FROM edges ed \
+                        WHERE ed.id = mf.perspective_id /* {EDGE_VISIBILITY:ed} */ \
+                          AND EXISTS (SELECT 1 FROM claims s \
+                                       WHERE s.id = ed.source_id \
+                                         /* {VISIBILITY:s} */)))";
+
+/// Repository for derivation-scoped belief reads.
+pub struct DerivationScopeRepository;
+
+impl DerivationScopeRepository {
+    /// Of the `mass_functions` rows `row_ids`, those that may enter THEIR
+    /// claim's cached belief (and anything stored from the same fold): every
+    /// derivation source (the row itself, the evidence it cites and, for an
+    /// edge-factor row, the edge and the edge's source claim) is at least as
+    /// widely readable as the claim. For a public claim that is "public"; for
+    /// a group claim, "public, or owned by the claim's own group".
+    ///
+    /// A row whose claim this session cannot see is not admitted (no session
+    /// that cannot see a claim folds its rows).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn cache_admissible<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        row_ids: &[Uuid],
+    ) -> Result<HashSet<Uuid>, DbError> {
+        if row_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<Uuid> = sqlx::query_scalar(CACHE_ADMISSIBLE_SQL)
+            .bind(row_ids)
+            .fetch_all(executor)
+            .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// The tenancy (`is public`, owner group) of each claim among `ids` that
+    /// `viewer` can read; an id that is no claim, or one the viewer cannot
+    /// read, is absent.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn claim_tenancy_among<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, (bool, Uuid)>, DbError> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id, c.visibility = 'public', c.owner_group_id FROM claims c \
+             WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, bool, Uuid)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(|(id, public, owner)| (id, (public, owner)))
+            .collect())
+    }
+
+    /// Of the `mass_functions` rows `row_ids`, those whose every derivation
+    /// source `viewer` can read (the same sources as [`Self::cache_admissible`],
+    /// under the viewer's predicates; `edges` under the co-ownership
+    /// intersection). A group member gets the rows derived from its group's
+    /// private sources; a reader outside the group does not. A bypass viewer
+    /// admits every row it is given.
+    ///
+    /// The session's own row security applies on top of the predicate, so
+    /// on an UNSTAMPED application session a private source is invisible and
+    /// its rows are not admitted for anyone, which is what that session can
+    /// show.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn viewer_derived<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        row_ids: &[Uuid],
+    ) -> Result<HashSet<Uuid>, DbError> {
+        if row_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let sql = viewer.splice(
+            &format!(
+                "SELECT mf.id FROM mass_functions mf \
+                 WHERE mf.id = ANY($1) AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
+                   AND {VIEWER_DERIVED_PREDICATE}"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(row_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let ids: Vec<Uuid> = q.fetch_all(executor).await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// How many of `claim_id`'s `mass_functions` rows `viewer` may see a
+    /// belief folded from: rows it can see whose every derivation source it
+    /// can read (the [`Self::viewer_derived`] rule). This is the count a
+    /// reader is told (`GET /api/v1/claims/:id/belief`'s
+    /// `mass_function_count`): a row on a public claim is public whatever it
+    /// was derived from, so a plain visible-row count rose when a private
+    /// edge was wired, an existence oracle over the private source.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn count_viewer_derived_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT COUNT(*) FROM mass_functions mf \
+                 WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL /* {{VISIBILITY:mf}} */ \
+                   AND {VIEWER_DERIVED_PREDICATE}"
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+
+    /// The ids of `claim_id`'s combine inputs on every frame, as the cache
+    /// owner rule counts them (`MassFunctionRepository::cache_owner_frame_for_claim`):
+    /// rows `viewer` can see, on a frame it can see, that are neither a cached
+    /// combination, nor retracted (migration 184), nor an ingest template.
+    /// Pass them to
+    /// [`Self::cache_admissible`] to learn whether ANY of the claim's BBAs may
+    /// enter its cache (ruling R-80).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn combine_input_ids_for_claim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT mf.id FROM mass_functions mf \
+                   JOIN frames f ON f.id = mf.frame_id \
+                 WHERE mf.claim_id = $1 \
+                   AND NOT {cached} \
+                   AND {not_retracted} \
+                   AND NOT {template} \
+                   /* {{VISIBILITY:mf}} */ /* {{VISIBILITY:f}} */",
+                cached = cached_combination_predicate("mf."),
+                not_retracted = not_retracted_predicate("mf."),
+                template = ingest_template_predicate("mf.", "f."),
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Whether `claim_id`, as `viewer` reads it, is a NON-compound claim with
+    /// a cached belief (any of `belief`, `plausibility`, `pignistic_prob`
+    /// set): a cache that is a fold of the claim's own BBAs. A compound's
+    /// cache is not (its belief is a query over its leaves, and the cache
+    /// owner rule never refolds it), so it is never a fold cache here. A claim
+    /// the viewer cannot read has none.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn claim_has_fold_cache<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM claims c \
+                     WHERE c.id = $1 \
+                       AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
+                            OR c.pignistic_prob IS NOT NULL) \
+                       AND NOT {compound} \
+                       /* {{VISIBILITY:c}} */)",
+                compound = is_compound_sql("c"),
+            ),
+            2,
+        );
+        let mut q = sqlx::query_scalar(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(executor).await?)
+    }
+}

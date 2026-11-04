@@ -52,6 +52,7 @@ async fn insert_workflow(pool: &PgPool, canonical_name: &str, truth_value: f64) 
         "Deploy a service with zero downtime",
         None,
         serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
     )
     .await
     .expect("insert workflows row");

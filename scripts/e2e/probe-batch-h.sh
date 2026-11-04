@@ -23,9 +23,9 @@
 #                 also when the APPLICATION DSN is itself bypass-capable
 #   supersede     supersede_claim on own-public / own-private / foreign-private /
 #                 foreign-public claims (fresh rows, so no other arm sees them)
-#   theme         theme_cluster (wipe_first=true) over public claims the server
-#                 agent owns, with a pre-existing theme in place: the run must
-#                 commit whole or leave the previous themes exactly as they were
+#   theme         theme_cluster is RETIRED (backlog a0ed0180): a call with the
+#                 old k-means arguments must be refused (status=retired) and
+#                 leave the existing themes exactly as they were
 #   maint_auth    the same tools over AUTHENTICATED HTTP (--jwt-secret, a
 #                 random per-run secret that is never written to disk): a
 #                 claims:write-only bearer with no membership must be refused
@@ -361,27 +361,14 @@ if want supersede; then
   done
 fi
 
-# ── theme_cluster ──────────────────────────────────────────────────────────
+# ── theme_cluster (RETIRED) ────────────────────────────────────────────────
 if want theme; then
   echo
-  echo "=== theme_cluster: all or nothing, the previous themes survive a failed run ==="
-  q "UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL; DELETE FROM claim_themes" >/dev/null
+  echo "=== theme_cluster: retired with the k-means prototype (backlog a0ed0180), refuses and writes nothing ==="
   PRIOR=$(q "INSERT INTO claim_themes (label, description) VALUES ('bh-prior-$LABEL', 'a theme from an earlier run') RETURNING id" | head -1)
-  # Two well-separated directions, three public claims each, all owned by the
-  # server agent's group: the population a stamp-free clusterer can reach.
-  for i in 1 2 3; do
-    for d in 0 1; do
-      if [ "$d" = 0 ]; then V="('[0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1535]),',')||']')::vector"
-      else V="('[0.01,0.9,'||array_to_string(array_fill(0.01::float8, ARRAY[1534]),',')||']')::vector"; fi
-      q "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, labels, visibility, owner_group_id, embedding)
-         VALUES (gen_random_uuid(), 'Batch H theme $d/$i $LABEL', decode(md5(random()::text)||md5(random()::text),'hex'), 0.6,
-                 '$MA', ARRAY['bh-theme']::text[], 'public', '$OG', $V)" >/dev/null
-    done
-  done
-  # label_prefix "auto": a wipe under any other prefix is refused before the run
-  # (backlog 5abe23de, theme_kmeans::validate_config); this stack is throwaway.
+  BEFORE=$(q "SELECT count(*) FROM claim_themes")
   R=$(tool theme_cluster '{"k":2,"min_claims_per_theme":1,"wipe_first":true,"label_prefix":"auto"}')
-  echo "   theme_cluster: $(verdict "$R") themes_created=$(field "$R" themes_created) claims_assigned=$(field "$R" claims_assigned) | themes=$(q "SELECT count(*) FROM claim_themes") prior_survives=$(q "SELECT count(*) FROM claim_themes WHERE id='$PRIOR'") themed_claims=$(q "SELECT count(*) FROM claims WHERE theme_id IS NOT NULL")"
+  echo "   theme_cluster: $(verdict "$R") status=$(printf '%s' "$R" | jq -r '.error.data.status // "-"' 2>/dev/null) | themes_before=$BEFORE themes_after=$(q "SELECT count(*) FROM claim_themes") prior_survives=$(q "SELECT count(*) FROM claim_themes WHERE id='$PRIOR'")"
 fi
 
 # ── maintenance tools ──────────────────────────────────────────────────────

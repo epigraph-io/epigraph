@@ -31,9 +31,11 @@ pub mod context;
 pub mod corpus_stats;
 pub mod counterfactual;
 pub mod decomposition_priority;
+pub mod derivation_scope;
 pub mod divergence;
 pub mod edge;
 pub mod edge_encryption;
+pub mod edge_signature;
 pub mod ego;
 pub mod elevated_access;
 pub mod elevation_ceremony;
@@ -109,17 +111,19 @@ pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
-    carries_dedup_identity_key, AdminClaimAction, AdminClaimWrite, AdminToken,
-    BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute, ClaimEmbeddingHit,
-    ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository, ClaimSortField,
-    ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult, DedupRepair,
-    DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
+    carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
+    AdminToken, BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute,
+    ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
+    ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
+    DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
     EvolveStepResult, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor, HybridHit,
     LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
     MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
-    SupersedeEdgeMigration, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
-    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
-    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
+    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
+    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
+    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
+    SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -155,8 +159,9 @@ pub use factor::FactorRepository;
 pub use frame::FrameRepository;
 pub use gap::{GapAnalysisResult, GapRecord, GapRepository};
 pub use graph_view::{
-    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GraphNodeRow,
-    GraphViewRepository, SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
+    AtomicNodeRow, CompoundGroupRow, CompoundNeighborRow, CompoundNodeRow, GqlColumn, GqlCondition,
+    GqlDirection, GqlNodeTable, GqlOp, GqlValue, GqlWalk, GraphNodeRow, GraphViewRepository,
+    SubgraphClaimRow, SubgraphEdgeRow, SubgraphEvidenceRow, SubgraphTraceRow,
 };
 pub use learning_event::{LearningEventRepository, LearningEventRow};
 pub use lineage::LineageRepository;
@@ -199,6 +204,10 @@ pub use workflow::{
 pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
+pub use edge_signature::{
+    edge_attestation_canonical_json, edge_attestation_digest, EdgeAttestation, EdgeSignOutcome,
+    EdgeSignatureCheck, EdgeSignatureRepository, EdgeSigningCoverage, EdgeSigningKey,
+};
 pub use evidence_encryption::{EvidenceEncryptionRepository, EvidenceEncryptionRow};
 pub use group::{GroupRepository, GroupRow};
 pub use group_key_epoch::{GroupKeyEpochRepository, KeyEpochRow, RotateOutcome};

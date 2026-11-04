@@ -40,6 +40,30 @@ impl SignatureVerifier {
         Ok(verifying_key.verify(message, &sig).is_ok())
     }
 
+    /// Verify an entity signature over `digest`, versioned (ruling R-34).
+    ///
+    /// Tries the version-1 message for `kind` ([`crate::signing_message`])
+    /// first, then the legacy bare digest, and returns the scheme that
+    /// verified; `Ok(None)` when neither does. A v1 signature made for another
+    /// kind verifies under neither rung.
+    ///
+    /// # Errors
+    /// Returns error if the public key bytes are not a valid Ed25519 key.
+    pub fn verify_entity(
+        public_key: &[u8; PUBLIC_KEY_SIZE],
+        kind: crate::SignedEntity,
+        digest: &[u8; crate::HASH_SIZE],
+        signature: &[u8; SIGNATURE_SIZE],
+    ) -> Result<Option<crate::SignatureScheme>, CryptoError> {
+        if Self::verify(public_key, &crate::signing_message(kind, digest), signature)? {
+            return Ok(Some(crate::SignatureScheme::V1));
+        }
+        if Self::verify(public_key, digest, signature)? {
+            return Ok(Some(crate::SignatureScheme::Legacy));
+        }
+        Ok(None)
+    }
+
     /// Verify a signature over a canonically serialized value
     ///
     /// # Errors

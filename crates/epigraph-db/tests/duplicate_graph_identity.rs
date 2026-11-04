@@ -1064,12 +1064,24 @@ async fn superseding_a_canonical_leaves_its_duplicates_identity_edge(pool: PgPoo
     .expect("mark");
     let identity = r.revert.identity_edge.expect("the act's identity edge");
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(canonical)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
         ClaimId::from_uuid(canonical),
         "canonical, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -1170,12 +1182,24 @@ async fn superseding_an_unmarked_duplicate_leaves_its_retracted_identity_edge(po
         "calibration: the un-mark retracted the identity edge and left it in place"
     );
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
         ClaimId::from_uuid(claim),
         "a duplicate, revised",
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");
@@ -1249,12 +1273,24 @@ async fn consolidating_a_canonical_leaves_its_duplicates_identity_edge(pool: PgP
 /// on); returns the replacement.
 async fn supersede_canonical(pool: &PgPool, old: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("acquire");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(old)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         &mut conn,
         ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede act");

@@ -274,3 +274,141 @@ pub async fn list_challenges(
         .to_string(),
     )]))
 }
+
+/// The resolution statuses a writer of the challenged claim's group sets.
+/// `withdrawn` is the challenger's own act and `pending` is no resolution;
+/// migration 168's definer refuses both as well.
+const RESOLUTION_STATES: &[&str] = &["under_review", "accepted", "rejected"];
+
+/// The `data.rule` of [`challenge_not_claim_owner`].
+pub const CHALLENGE_RESOLUTION_RULE: &str = "challenge_resolution_requires_claim_group_writer";
+
+/// The named refusal for a resolver that does not write the CHALLENGED
+/// CLAIM's owning group (ruling R-3; R-13: the challenger, which owns an
+/// outsider's row, may only withdraw it). `INVALID_REQUEST`: a denial of
+/// authority. Names neither group.
+fn challenge_not_claim_owner(challenge_id: uuid::Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot set the resolution status of challenge {challenge_id}: only a writer of the \
+             challenged claim's owning group sets it (the challenger may only withdraw its own \
+             challenge); nothing was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_claim_owner",
+            "rule": CHALLENGE_RESOLUTION_RULE,
+            "challenge_id": challenge_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// A challenge its challenger withdrew takes no resolution status (168's CR06).
+fn challenge_withdrawn(challenge_id: uuid::Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "challenge {challenge_id} was withdrawn by its challenger; a withdrawn challenge \
+             takes no resolution status; nothing was written"
+        )),
+        data: Some(serde_json::json!({
+            "error": "challenge_withdrawn",
+            "challenge_id": challenge_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// Set a challenge's resolution status as a writer of the challenged claim's
+/// owning group (operator rulings R-3, R-13, R-14, R-CH1b). The MCP twin of
+/// `POST /api/v1/challenges/:id/resolve`.
+///
+/// One transaction stamped as the request's principal (the caller over HTTP,
+/// this server's agent on stdio) calls `ChallengeRepository::
+/// resolve_as_claim_owner`, i.e. migration 168's `epigraph_resolve_challenge`:
+///
+/// * only a writer of the challenged claim's owning group passes; the
+///   challenger itself (an outsider owns its own row, R-CH1), a stranger and a
+///   reader member get [`challenge_not_claim_owner`], and the challenger's
+///   text and ownership are never reachable from here;
+/// * `resolved_by` is the session principal: [`ResolveChallengeParams`] has
+///   no resolver field and refuses unknown ones (R-13), and migration 170
+///   refuses every plain-SQL change of the resolution columns;
+/// * `pending` -> `accepted` / `rejected` directly, and re-resolving a settled
+///   challenge, are allowed (R-14); every change appends one
+///   `security_events` row naming the resolver;
+/// * a withdrawn challenge is refused ([`challenge_withdrawn`]);
+/// * a challenge whose claim the caller cannot read is "not found", in exactly
+///   the text a random id gets (R-CH1b): the definer answers both with CR02.
+///
+/// The state is validated before any lookup, so a bad state says nothing
+/// about the id either.
+pub async fn resolve_challenge(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: ResolveChallengeParams,
+    auth: Option<&epigraph_auth::AuthContext>,
+) -> Result<CallToolResult, McpError> {
+    let challenge_id = parse_uuid(&params.challenge_id)?;
+    if !RESOLUTION_STATES.contains(&params.state.as_str()) {
+        let hint = if params.state == "withdrawn" {
+            " (withdrawal is the challenger's own act, not a resolution)"
+        } else {
+            ""
+        };
+        return Err(invalid_params(format!(
+            "'{}' is not a resolution status; valid: {}{hint}",
+            params.state,
+            RESOLUTION_STATES.join(", ")
+        )));
+    }
+
+    let resolver = server.write_identity(auth, viewer).await?;
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, resolver, "resolve_challenge").await?;
+
+    let not_found = || invalid_params(format!("challenge {challenge_id} not found"));
+    ChallengeRepository::resolve_as_claim_owner(
+        &mut *tx,
+        challenge_id,
+        &params.state,
+        params.resolution_details.as_ref(),
+    )
+    .await
+    .map_err(|e| {
+        match e
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref()
+        {
+            // CR02: missing OR unreadable, one answer (R-CH1b).
+            Some("P0002") => not_found(),
+            Some("42501") => challenge_not_claim_owner(challenge_id),
+            Some("55000") => challenge_withdrawn(challenge_id),
+            Some("22023") => {
+                invalid_params(format!("'{}' is not a resolution status", params.state))
+            }
+            _ => internal_error(e),
+        }
+    })?;
+    // The caller just wrote the row, so it can read it (its claim passed
+    // CR02, and 168's read policy follows the claim).
+    let row = ChallengeRepository::get(&mut *tx, viewer, challenge_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(not_found)?;
+    tx.commit().await.map_err(internal_error)?;
+
+    Ok(CallToolResult::success(vec![ContentBlock::text(
+        serde_json::json!({
+            "challenge_id": row.id,
+            "claim_id": row.claim_id,
+            "state": row.state,
+            "resolved_by": row.resolved_by,
+            "resolved_at": row.resolved_at.map(|t| t.to_rfc3339()),
+            "resolution_details": row.resolution_details,
+        })
+        .to_string(),
+    )]))
+}

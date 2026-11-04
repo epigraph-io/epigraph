@@ -676,6 +676,180 @@ async fn an_elevated_claim_owner_sets_no_challenge_status(pool: PgPool) {
     assert_eq!((state.as_str(), by), ("accepted", Some(p.person)));
 }
 
+/// Migration 181 (ruling R-56): the re-key mark definer
+/// `epigraph_mark_group_reseal_required` is owned by the maintenance role, so
+/// 126's `groups_elevated_no_update` (a policy on `epigraph_app`) is not
+/// applied inside its frame, and before 181 that policy is what refused an
+/// elevated session's direct `UPDATE groups SET reseal_required_at`. The
+/// definer therefore refuses an ELEVATED session itself (`GRA03`, 42501),
+/// as 168's challenge definer does (CR05): an elevated session writes no
+/// re-key obligation by this path either. The same principal unelevated, an
+/// admin of the group, marks it (the calibration: the refusal is the
+/// elevation, not a malformed call).
+///
+/// Verified to fail with the definer's `epigraph_is_elevated()` refusal
+/// removed (the elevated call lands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_group_admin_marks_no_rekey_obligation(pool: PgPool) {
+    let p = holder(&pool, "arms-reseal-p", 15).await;
+    let group = Uuid::new_v4();
+    let key: Vec<u8> = group.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, 'P team', 'did:key:arms-reseal-' || $1::text, $2, 'team', $3)",
+    )
+    .bind(group)
+    .bind(&key)
+    .bind(p.person)
+    .execute(&pool)
+    .await
+    .expect("P's team group");
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'admin')",
+    )
+    .bind(group)
+    .bind(p.person)
+    .execute(&pool)
+    .await
+    .expect("P administers it");
+    let row = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT to_jsonb(g) FROM groups g WHERE g.id = $1",
+        )
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .expect("group row")
+    };
+    let before = row(pool.clone()).await;
+    assert!(before["reseal_required_at"].is_null(), "fixture: unmarked");
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+    const MARK: &str = "SELECT public.epigraph_mark_group_reseal_required($1)";
+
+    let mut conn = app_conn(&s, &elevated).await;
+    let refused = sqlx::query(MARK).bind(group).execute(&mut *conn).await;
+    release(conn).await;
+    let e = refused.expect_err("an elevated session marks no re-key obligation");
+    let db = e.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("42501"), "{db}");
+    assert!(db.message().starts_with("GRA03:"), "{}", db.message());
+    assert_eq!(
+        row(pool.clone()).await,
+        before,
+        "nothing was written elevated"
+    );
+
+    let mut conn = app_conn(&s, &plain).await;
+    let landed = sqlx::query(MARK).bind(group).execute(&mut *conn).await;
+    release(conn).await;
+    landed.expect("CALIBRATION: P unelevated, a live admin, marks the group");
+    assert!(row(pool.clone()).await["reseal_required_at"].is_string());
+}
+
+/// Migration 191's retire of a live operator link is maintenance-only, so an
+/// ELEVATED session (always an application-role session: 125 answers "not
+/// live" to a maintenance or superuser login) cannot reach it. On today's
+/// grants the EXECUTE ACL refuses it first. So that the definer's OWN arms are
+/// pinned too, the test then grants EXECUTE to the application role (the
+/// "later grant" 191's header guards against): the ELEVATED call is refused
+/// by the elevation arm (`OLR02:`, 42501, the GRA03 pattern) and the SAME
+/// principal unelevated by the maintenance-only arm (`OLR01:`); after each
+/// the link stays live with its writer row. The same call on a maintenance
+/// session retires it (the calibration: the refusal is the session, not a
+/// malformed call).
+///
+/// Verified to fail: 191's `epigraph_is_elevated()` refusal removed -> the
+/// elevated call is refused with `OLR01:` instead of `OLR02:`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_elevated_session_retires_no_operator_link(pool: PgPool) {
+    let p = holder(&pool, "arms-retire-p", 16).await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "arms-retire-agent").await;
+    let mut raw = pool.acquire().await.expect("acquire");
+    let link = epigraph_db::AgentRepository::link_operator(&mut raw, agent, p.person)
+        .await
+        .expect("a live link to P");
+    drop(raw);
+    let state = |pool: PgPool| async move {
+        sqlx::query_as::<_, (bool, i64)>(
+            "SELECT (SELECT retired FROM operator_links WHERE agent_id = $1), \
+                    (SELECT count(*) FROM group_memberships \
+                      WHERE agent_id = $1 AND group_id = $2 AND revoked_at IS NULL)",
+        )
+        .bind(agent)
+        .bind(link.operator_group_id)
+        .fetch_one(&pool)
+        .await
+        .expect("link state")
+    };
+    assert_eq!(
+        state(pool.clone()).await,
+        (false, 1),
+        "PREMISE: live, with its row"
+    );
+    const RETIRE: &str =
+        "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'elevated', true)";
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+    async fn call(s: &ScopedPool, v: &Viewer, agent: Uuid) -> (Option<String>, String) {
+        let mut conn = app_conn(s, v).await;
+        let r = sqlx::query_scalar::<_, String>(RETIRE)
+            .bind(agent)
+            .fetch_one(&mut *conn)
+            .await;
+        release(conn).await;
+        let e = r.expect_err("an application-role session retires no link");
+        let db = e.as_database_error().expect("a database error");
+        (db.code().map(|c| c.to_string()), db.message().to_string())
+    }
+
+    // Today's grants: the ACL refuses before the body runs.
+    let (code, msg) = call(&s, &elevated, agent).await;
+    assert_eq!(code.as_deref(), Some("42501"), "{msg}");
+    assert!(msg.contains("permission denied for function"), "{msg}");
+    assert_eq!(state(pool.clone()).await, (false, 1), "nothing was written");
+
+    // A later grant to the application role still meets the definer's arms.
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION \
+         public.epigraph_retire_operator_link(uuid, text, boolean) TO epigraph_app",
+    )
+    .execute(&pool)
+    .await
+    .expect("grant EXECUTE to the application role");
+    let (code, msg) = call(&s, &elevated, agent).await;
+    assert_eq!(code.as_deref(), Some("42501"), "{msg}");
+    assert!(
+        msg.starts_with("OLR02:"),
+        "the elevation arm refused: {msg}"
+    );
+    assert_eq!(state(pool.clone()).await, (false, 1), "nothing was written");
+    let (code, msg) = call(&s, &plain, agent).await;
+    assert_eq!(code.as_deref(), Some("42501"), "{msg}");
+    assert!(
+        msg.starts_with("OLR01:"),
+        "the maintenance arm refused: {msg}"
+    );
+    assert_eq!(state(pool.clone()).await, (false, 1), "nothing was written");
+
+    let outcome = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let o = sqlx::query_scalar::<_, String>(RETIRE)
+            .bind(agent)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("CALIBRATION: a maintenance session retires it");
+        (conn, o)
+    })
+    .await;
+    assert_eq!(outcome, "retired");
+    assert_eq!(state(pool.clone()).await, (true, 0));
+}
+
 // =====================================================================
 // The standing admin read arms follow the admin-scope switch (migration 129)
 // =====================================================================
@@ -868,6 +1042,128 @@ async fn arming_turns_the_standing_admin_read_arms_into_elevated_ones(pool: PgPo
     assert_eq!(
         disarmed_plain, unarmed_plain,
         "disarmed, the standing arms answer as before"
+    );
+}
+
+// =====================================================================
+// Applied-cascade audit rows are read by custodians only (migration 169)
+// =====================================================================
+
+/// What `conn` reads of `ids`: `count(*)` per id, in order.
+async fn read_events(conn: &mut sqlx::PgConnection, ids: &[Uuid]) -> Vec<i64> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        out.push(count_row(conn, "security_events", "id", *id).await);
+    }
+    out
+}
+
+/// Migration 169 (backlog 9d6f21c5 part 2): a `cascade.admin_applied` or
+/// `cascade.belief_rederived` row is no longer read by the agent it names.
+/// Rows written before the agent-less `*_ids` companion rows existed carry
+/// the edge and claim ids the cascade touched (most of them other writers')
+/// on the row itself, and they stay as written. So B, the triggering agent,
+/// reads neither, while it still reads its own deferral and its own
+/// non-cascade event (the calibration that its stamp works). A custodian
+/// reads all four through the standing arm, ids intact, unarmed; armed, the
+/// same custodian reads none of them unelevated and all of them elevated.
+///
+/// Verified to fail on the base (129's `security_events_read`): B reads its
+/// applied and belief rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn applied_cascade_rows_are_read_by_custodians_not_by_their_trigger(pool: PgPool) {
+    let p = holder(&pool, "cascade-read-p", 22).await;
+    let (b, _) = fixture::seed_agent_with_group(&pool, "cascade-read-b").await;
+    let (other_edge, other_claim) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut ids = Vec::new();
+    for (event_type, details) in [
+        (
+            "cascade.admin_applied",
+            serde_json::json!({"cause": "supersede",
+                               "touched": {"edges_retargeted": [other_edge]}}),
+        ),
+        (
+            "cascade.belief_rederived",
+            serde_json::json!({"cause": "supersede",
+                               "belief": {"recomputed": [other_claim]}}),
+        ),
+        (
+            "cascade.deferred",
+            serde_json::json!({"cause": "supersede"}),
+        ),
+        ("test.cascade_read", serde_json::json!({})),
+    ] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, $2, true, $3) RETURNING id",
+        )
+        .bind(event_type)
+        .bind(b)
+        .bind(details)
+        .fetch_one(&pool)
+        .await
+        .expect("B's event");
+        ids.push(id);
+    }
+
+    let b_reads = as_app(&pool, Some(b), |mut conn| {
+        let ids = ids.clone();
+        async move {
+            let r = read_events(&mut conn, &ids).await;
+            (conn, r)
+        }
+    })
+    .await;
+    assert_eq!(
+        b_reads,
+        [0, 0, 1, 1],
+        "B reads its deferral and its own event (calibration), and neither its \
+         `cascade.admin_applied` nor its `cascade.belief_rederived` row"
+    );
+
+    let s = scoped(&pool).await;
+    let live = session(&pool, &p).await;
+    let (elevated, plain) = viewers(&pool, &p, live).await;
+
+    let mut conn = app_conn(&s, &plain).await;
+    let unarmed = read_events(&mut conn, &ids).await;
+    let kept: Vec<String> = sqlx::query_scalar(
+        "SELECT details::text FROM public.security_events WHERE id = ANY($1) \
+          ORDER BY event_type",
+    )
+    .bind(&ids[..2])
+    .fetch_all(&mut *conn)
+    .await
+    .expect("the custodian reads the rows");
+    release(conn).await;
+    assert_eq!(
+        unarmed,
+        [1, 1, 1, 1],
+        "unarmed, custodian P reads all four through the standing arm"
+    );
+    assert!(
+        kept.len() == 2
+            && kept[0].contains(&other_edge.to_string())
+            && kept[1].contains(&other_claim.to_string()),
+        "the legacy rows keep their id lists (no redaction): {kept:?}"
+    );
+
+    set_switch(&pool, true).await;
+    let mut conn = app_conn(&s, &plain).await;
+    let armed_plain = read_events(&mut conn, &ids).await;
+    release(conn).await;
+    assert_eq!(
+        armed_plain,
+        [0, 0, 0, 0],
+        "armed, P unelevated reads none of B's rows"
+    );
+    let mut conn = app_conn(&s, &elevated).await;
+    let armed_elevated = read_events(&mut conn, &ids).await;
+    release(conn).await;
+    assert_eq!(
+        armed_elevated,
+        [1, 1, 1, 1],
+        "armed, P elevated reads all four"
     );
 }
 

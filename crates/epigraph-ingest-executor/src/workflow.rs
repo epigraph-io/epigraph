@@ -461,6 +461,42 @@ pub async fn execute_workflow_ingest_plan_in_group(
     execute_plan(conn, plan, extraction, Some(caller), declared_group).await
 }
 
+/// The group a NEW generation inherits (ruling R-98 Q6(a)): when no row
+/// `(canonical_name, generation)` exists yet, the group of the lineage's head
+/// if it is a group row, else of the row the ingest links as its parent
+/// (`WorkflowRepository::ingest_anchors`, the anchors the callers' authority
+/// check reads, in the same order). `None` for a re-ingest, a brand-new
+/// lineage, or a public predecessor. Read on the plan walk's
+/// system-agent-stamped transaction.
+async fn inherited_generation_group(
+    conn: &mut sqlx::PgConnection,
+    extraction: &WorkflowExtraction,
+) -> Result<Option<Uuid>, IngestExecutorError> {
+    let anchors = WorkflowRepository::ingest_anchors(
+        &mut *conn,
+        &extraction.source.canonical_name,
+        extraction.source.generation as i32,
+        extraction.source.parent_canonical_name.as_deref(),
+    )
+    .await?;
+    if anchors.existing.is_some() {
+        return Ok(None);
+    }
+    for anchor in [anchors.lineage_head, anchors.linked_parent]
+        .into_iter()
+        .flatten()
+    {
+        if let Some((visibility, group)) =
+            WorkflowRepository::tenancy_of(&mut *conn, anchor).await?
+        {
+            if visibility == "group" {
+                return Ok(Some(group));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The walk both entry points share. `caller` is `None` only for
 /// [`execute_workflow_ingest_plan`], which never declares a group.
 #[allow(clippy::too_many_lines)]
@@ -471,6 +507,30 @@ async fn execute_plan(
     caller: Option<&epigraph_db::visibility::Viewer>,
     declared_group: Option<Uuid>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
+    // A NEW generation of a group lineage inherits its predecessor's group
+    // when it declares none (ruling R-98 Q6(a), backlog 630af617; 074's
+    // successor rule). Before, `improve_workflow_hierarchy` or an undeclared
+    // next-generation ingest made a PUBLIC row with public claims under a
+    // private lineage. The caller must write the inherited group itself, as
+    // for a declared one.
+    let declared_group = match declared_group {
+        Some(group) => Some(group),
+        None => {
+            let inherited = inherited_generation_group(&mut *conn, extraction).await?;
+            if let Some(group) = inherited {
+                let principal = caller.and_then(|c| c.principal());
+                let writes = caller
+                    .is_some_and(|c| principal.is_some() && c.writable_groups().contains(&group));
+                if !writes {
+                    return Err(IngestExecutorError::InheritedGroupNotWritable {
+                        caller: principal.unwrap_or_else(Uuid::nil),
+                        group,
+                    });
+                }
+            }
+            inherited
+        }
+    };
     // A declared group always comes with the caller it is declared for.
     let declared = match (declared_group, caller) {
         (Some(group), Some(caller)) => Some((group, caller)),
@@ -617,6 +677,24 @@ async fn execute_plan(
     // ── 2. Ensure system agent ───────────────────────────────────────────
     let system_agent_id = get_or_create_system_agent(&mut *conn).await?;
 
+    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
+    // in a workflow ingest is authored by the same system agent, and resolving
+    // it per claim would be N identical round trips. The executor is pure-DB
+    // and its callers do not choose a group -- `store_workflow`,
+    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
+    // instance-wide workflow content -- so the system agent's own group is the
+    // declaration, publicly visible.
+    //
+    // A DECLARED group (`execute_workflow_ingest_plan_in_group`) replaces that
+    // default for the claims this walk creates; step 0c proved the stamp writes
+    // it. The `workflows` row takes the same declaration (ruling R-74,
+    // migration 183): the row is the plan's, and its tenancy is what every
+    // reader of the plan and the outcome report decide on.
+    let decl = match declared_group {
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        None => ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?,
+    };
+
     // ── 3. Insert workflow row (idempotent) ──────────────────────────────
     // The parent is resolved in ONE place, shared with the authority check
     // (`WorkflowRepository::ingest_anchors`): the named parent at
@@ -638,9 +716,22 @@ async fn execute_plan(
         goal,
         parent_id,
         workflow_row_metadata(&extraction.source.metadata, &extraction.source.tags),
+        decl,
     )
     .await
     .map_err(|e| IngestExecutorError::WorkflowInsert(e.to_string()))?;
+    // `ON CONFLICT DO NOTHING` also skips a row this stamp cannot read (step 1
+    // did not find it): writing this plan's claims and edges under it would
+    // extend a plan the stamp has no view of. Refuse, so nothing is written.
+    if WorkflowRepository::find_root_by_canonical(&mut *conn, canonical_name, generation)
+        .await?
+        .is_none()
+    {
+        return Err(IngestExecutorError::WorkflowOutsideView {
+            canonical_name: canonical_name.to_string(),
+            generation,
+        });
+    }
 
     // ── 3a. variant_of edge for hierarchical workflows (issue #51) ──────
     // When a parent was resolved above (the named parent, or this lineage's
@@ -730,21 +821,8 @@ async fn execute_plan(
     let mut inserted: Vec<(Uuid, String)> = Vec::new();
     let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
 
-    // Tenancy declaration (PR-16). One lookup for the whole plan: every claim
-    // in a workflow ingest is authored by the same system agent, and resolving
-    // it per claim would be N identical round trips. The executor is pure-DB
-    // and its callers do not choose a group -- `store_workflow`,
-    // `ingest_workflow` and `POST /api/v1/workflows/ingest` all post
-    // instance-wide workflow content -- so the system agent's own group is the
-    // declaration, publicly visible.
-    //
-    // A DECLARED group (`execute_workflow_ingest_plan_in_group`) replaces that
-    // default for the claims this walk creates; step 0c proved the stamp writes
-    // it.
-    let decl = match declared_group {
-        Some(group) => epigraph_core::TenancyDecl::group(group),
-        None => ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?,
-    };
+    // The tenancy declaration `decl` (step 2) covers every claim this walk
+    // creates, as it covered the `workflows` row.
     let mut reused_ids: Vec<Uuid> = Vec::new();
 
     for planned in &plan.claims {

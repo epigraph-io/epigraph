@@ -84,6 +84,7 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
               FROM mass_functions mf
               JOIN frames f ON f.id = mf.frame_id
              WHERE array_length(f.hypotheses, 1) = 2
+               AND mf.retracted_at IS NULL
              GROUP BY mf.claim_id, mf.frame_id
             HAVING COUNT(*) > 1
 
@@ -105,6 +106,7 @@ pub async fn select_cohort(pool: &PgPool) -> Result<Vec<Uuid>, sqlx::Error> {
               FROM mass_functions mf
               JOIN frames f ON f.id = mf.frame_id
              WHERE array_length(f.hypotheses, 1) = 2
+               AND mf.retracted_at IS NULL
                AND (COALESCE(CASE WHEN jsonb_typeof(mf.masses->'1') = 'number'
                                   THEN (mf.masses->>'1')::float8 END, 0) > 0
                     OR COALESCE(CASE WHEN jsonb_typeof(mf.masses->'~') = 'number'
@@ -129,7 +131,7 @@ async fn claim_frames(pool: &PgPool, claim_id: Uuid) -> Result<Vec<Uuid>, String
         "SELECT DISTINCT mf.frame_id, f.name \
            FROM mass_functions mf \
            JOIN frames f ON f.id = mf.frame_id \
-          WHERE mf.claim_id = $1 \
+          WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL \
           ORDER BY f.name",
     )
     .bind(claim_id)
@@ -470,11 +472,20 @@ fn parse_df_available_kib(out: &str) -> Option<u64> {
 /// (claim caches, [`WaveRecord`]) and its scoped sidecar
 /// ([`ScopedWaveRecord`]), both appended and flushed BEFORE the write they
 /// record commits, so every committed write has a record.
+///
+/// A record that cannot be written in full is cut back off the file (so the
+/// file only ever holds whole lines, which is what `restore_belief_cache
+/// --from` parses), and the log is then FAILED for the rest of the run: every
+/// later record, in either file, is refused without writing, so its claim
+/// rolls back too. Without that, a sibling whose append succeeded once space
+/// came back could commit after a gap, or onto the cut, and the "every
+/// committed write has a record" guarantee would hang on luck.
 pub struct WaveLog {
     wave: String,
     at: DateTime<Utc>,
     claims: std::sync::Mutex<std::fs::File>,
     scoped: std::sync::Mutex<std::fs::File>,
+    failed: std::sync::atomic::AtomicBool,
 }
 
 impl WaveLog {
@@ -514,6 +525,7 @@ impl WaveLog {
             at,
             claims: std::sync::Mutex::new(open(wave_file)?),
             scoped: std::sync::Mutex::new(open(&scoped_sidecar_path(wave_file))?),
+            failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -521,6 +533,18 @@ impl WaveLog {
     #[must_use]
     pub const fn at(&self) -> DateTime<Utc> {
         self.at
+    }
+
+    /// Record one claim-cache write under this run's own wave name (the
+    /// `recompute_claim_belief --snapshot` writer). Appended, flushed and
+    /// synced before it returns.
+    pub(crate) fn record_claim(
+        &self,
+        claim_id: Uuid,
+        before: CacheColumns,
+        written: CacheColumns,
+    ) -> Result<(), String> {
+        self.record(&self.wave, claim_id, before, written)
     }
 
     fn record(
@@ -546,9 +570,7 @@ impl WaveLog {
             },
         )
         .map_err(|e| format!("wave record: {e}"))?;
-        f.write_all(&line)
-            .and_then(|()| f.flush())
-            .and_then(|()| f.sync_data())
+        self.append(&mut f, &line)
             .map_err(|e| format!("wave file write: {e}"))
     }
 
@@ -559,10 +581,39 @@ impl WaveLog {
             .map_err(|_| "scoped file lock poisoned".to_string())?;
         let mut line = Vec::new();
         write_scoped_record(&mut line, rec).map_err(|e| format!("scoped record: {e}"))?;
-        f.write_all(&line)
-            .and_then(|()| f.flush())
-            .and_then(|()| f.sync_data())
+        self.append(&mut f, &line)
             .map_err(|e| format!("scoped file write: {e}"))
+    }
+
+    /// Append `line` to `f` (held under its mutex) and sync it, or leave `f`
+    /// as it was and fail the log. Called with the file's lock held, so the
+    /// FAILED check and the write cannot interleave with another record of
+    /// the same file.
+    fn append(&self, f: &mut std::fs::File, line: &[u8]) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.failed.load(Ordering::SeqCst) {
+            return Err("an earlier record of this run could not be written; \
+                        no further record is written"
+                .to_string());
+        }
+        // The length before the write, so a short write (the volume filled up
+        // part-way through the line) can be cut back off. A file whose length
+        // cannot be read (a character device) has nothing to cut.
+        let prev_len = f.metadata().map(|m| m.len()).ok();
+        let res = f
+            .write_all(line)
+            .and_then(|()| f.flush())
+            .and_then(|()| f.sync_data());
+        if let Err(e) = res {
+            self.failed.store(true, Ordering::SeqCst);
+            // Best effort: if the cut itself fails there is nothing better to
+            // do than report the original error, and the log is failed anyway.
+            if let Some(len) = prev_len {
+                let _ = f.set_len(len).and_then(|()| f.sync_data());
+            }
+            return Err(e.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -583,7 +634,9 @@ pub struct WaveClaimOutcome {
     pub scoped_kept: usize,
 }
 
-async fn lock_cache(
+/// Lock `claim_id`'s row (`FOR UPDATE`) and read its cache columns, in the
+/// caller's transaction; `None` when the row is absent or not visible.
+pub(crate) async fn lock_cache(
     tx: &mut sqlx::PgConnection,
     claim_id: Uuid,
 ) -> Result<Option<CacheColumns>, String> {
@@ -1193,4 +1246,89 @@ pub async fn drift_decomposition(
         final_value,
         total: final_value - start,
     })
+}
+
+#[cfg(test)]
+mod wave_log_tests {
+    use super::*;
+
+    fn cols(belief: f64) -> CacheColumns {
+        CacheColumns {
+            belief: Some(belief),
+            plausibility: None,
+            pignistic_prob: None,
+            mass_on_empty: None,
+            mass_on_missing: None,
+            belief_frame_id: None,
+            classification: None,
+        }
+    }
+
+    /// A record that fails leaves the log FAILED: once the volume has room
+    /// again, a later record is still refused and nothing reaches the file,
+    /// so no claim commits after a record its wave file is missing.
+    #[test]
+    fn a_failed_record_fails_every_later_record_without_writing() {
+        let dir = std::env::temp_dir().join(format!("wave-log-sticky-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let wave = dir.join("wave.jsonl");
+        let log = WaveLog::open(&wave, "sticky-test", Utc::now()).expect("open the wave log");
+
+        // The volume is full: swap the claims file for /dev/full.
+        let full = std::fs::OpenOptions::new()
+            .append(true)
+            .open("/dev/full")
+            .expect("open /dev/full");
+        let real = std::mem::replace(&mut *log.claims.lock().unwrap(), full);
+        assert!(
+            log.record_claim(Uuid::new_v4(), cols(0.1), cols(0.2))
+                .is_err(),
+            "a write to a full device must fail"
+        );
+
+        // Space came back: the real file is writable again.
+        *log.claims.lock().unwrap() = real;
+        let later = log.record_claim(Uuid::new_v4(), cols(0.3), cols(0.4));
+        assert!(
+            later.is_err(),
+            "a record after a failed one was accepted: {later:?}"
+        );
+        let scoped = ScopedColumns {
+            belief: Some(0.5),
+            plausibility: None,
+            mass_on_empty: None,
+            mass_on_missing: None,
+            conflict_k: None,
+            strategy_used: None,
+            pignistic_prob: None,
+        };
+        assert!(
+            log.record_scoped(&ScopedWaveRecord {
+                row_id: Uuid::new_v4(),
+                claim_id: Uuid::new_v4(),
+                frame_id: Uuid::new_v4(),
+                scope_type: "perspective".to_string(),
+                scope_id: None,
+                before: scoped.clone(),
+                written: scoped,
+                wave: "sticky-test".to_string(),
+                at: log.at(),
+            })
+            .is_err(),
+            "a scoped record after a failed claim record was accepted"
+        );
+        assert_eq!(
+            std::fs::metadata(&wave).expect("wave file").len(),
+            0,
+            "a record reached the wave file after the log failed"
+        );
+        assert_eq!(
+            std::fs::metadata(scoped_sidecar_path(&wave))
+                .expect("scoped sidecar")
+                .len(),
+            0,
+            "a record reached the scoped sidecar after the log failed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -81,11 +81,12 @@ pub struct NewRecallEvent {
     /// surfaces resolve through `tools::recall::recall_audit_owner_group`,
     /// which returns `Result<Uuid, AuditOwnerUnresolved>` — no variant of that
     /// error means "write it instance-wide", so an unresolvable identity drops
-    /// the row. The remaining `None` producer is the library path in
-    /// `epigraph-engine`, which has no principal at all and whose `agent_id` is
-    /// `None` for the same reason (`recall_events.agent_id` is nullable for
-    /// that caller on purpose). See [`RecallEventRepository::log`] for why that
-    /// one caller cannot be given a group instead.
+    /// the row. The library path in `epigraph-engine` resolves its owner the
+    /// same way from the caller's viewer (backlog 41841f7b); its one remaining
+    /// `None` is a `Bypass` viewer, which has no principal, so its `agent_id`
+    /// is `None` too (`recall_events.agent_id` is nullable for that caller on
+    /// purpose). Such a row is admitted only on a bypass connection; see
+    /// [`RecallEventRepository::log`].
     pub owner_group_id: Option<Uuid>,
 }
 
@@ -134,20 +135,23 @@ impl RecallEventRepository {
         // group>)`, so the owner alone was already right and the predicate was
         // still vacuous.
         //
-        // THE AGENT-LESS CASE IS A MEASURED RESIDUAL, NOT A CHOICE. The library
-        // path in `epigraph-engine` has no principal at all -- its `agent_id`
-        // is `None` -- so there is no personal group to name, and the two
-        // memberless sentinel groups cannot stand in for one: migration 062's
+        // THE AGENT-LESS CASE IS A BYPASS-ONLY ROW. `owner_group_id = None`
+        // selects the instance-wide declaration, and the two memberless
+        // sentinel groups cannot stand in for a personal one: migration 062's
         // `recall_events_group_needs_real_group` CHECK forbids pairing `'group'`
         // with either the world or the seed group, because a group-visible row
         // owned by a memberless group is a black hole nobody, including its
-        // author, can read back. Refusing the write instead is also wrong: this
-        // function is best-effort by contract (see the module header) and
-        // `recall_event_test.rs::agentless_event_is_accepted` pins that an
-        // agent-less retrieval is still audited. So that ONE caller keeps the
-        // instance-wide declaration, and it is the whole of what remains open:
-        // `D-PR16-recall-events-are-instance-wide` in
-        // `docs/tenancy/progress.json` records it, narrowed.
+        // author, can read back. But an agent-less row is admitted ONLY on a
+        // bypass connection: `recall_events_tenancy`'s WITH CHECK (migration
+        // 077) requires `agent_id = epigraph_principal_id()` of `epigraph_app`,
+        // so there it is refused, not published. The library path in
+        // `epigraph-engine` used to send exactly that row from the episcience
+        // worker and lost every audit row to the refusal (backlog 41841f7b);
+        // it now threads the caller's principal and writes on a stamped
+        // transaction, and only a `Bypass` viewer still produces `None`.
+        // `recall_event_test.rs::agentless_event_is_accepted` pins the bypass
+        // write; `D-PR16-recall-events-are-instance-wide` in
+        // `docs/tenancy/progress.json` records the correction.
         let decl = match event.owner_group_id {
             Some(group) => epigraph_core::TenancyDecl::group(group),
             None => epigraph_core::TenancyDecl::instance_wide(),

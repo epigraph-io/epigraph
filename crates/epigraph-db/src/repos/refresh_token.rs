@@ -20,16 +20,32 @@ pub struct RefreshTokenRow {
 
 pub struct RefreshTokenRepository;
 
+/// One row of [`RefreshTokenRepository::check`]'s read: the check definer's
+/// `(outcome, token_id, client_id)` and the live row's `scopes` and
+/// `issued_to_client_id`, joined in by id.
+type CheckRow = (
+    String,
+    Option<Uuid>,
+    Option<Uuid>,
+    Option<Vec<String>>,
+    Option<Uuid>,
+);
+
 /// What [`RefreshTokenRepository::check`] found for a presented token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshCheck {
     /// Live and unexpired. `scopes` are the scopes the token was minted with
     /// (the consent, or its rotation's narrowing): the ceiling of anything the
     /// refresh grant may issue from it (RFC 6749 section 6).
+    ///
+    /// `issued_to_client_id` is the connector app that obtained the chain
+    /// (migration 174; `None` for a grant with no separate app, and for a
+    /// chain minted before 174).
     Valid {
         id: Uuid,
         client_id: Uuid,
         scopes: Vec<String>,
+        issued_to_client_id: Option<Uuid>,
     },
     /// Spent by its own rotation less than 30 seconds ago: a benign
     /// concurrent refresh. Refused like [`Self::Invalid`], and the family
@@ -79,6 +95,8 @@ impl RefreshRevokeReason {
 }
 
 impl RefreshTokenRepository {
+    /// Open a chain bound to no connector app (`client_credentials`, the
+    /// external-provider grants). See [`Self::create_issued_to`].
     #[instrument(skip(pool, token_hash))]
     pub async fn create(
         pool: &PgPool,
@@ -87,14 +105,31 @@ impl RefreshTokenRepository {
         scopes: &[String],
         expires_at: DateTime<Utc>,
     ) -> Result<Uuid, DbError> {
+        Self::create_issued_to(pool, token_hash, client_id, scopes, expires_at, None).await
+    }
+
+    /// Open a chain for `client_id`, bound to the connector app
+    /// `issued_to_client_id` that obtained it (migration 174; the
+    /// authorization-code exchange). Every rotation carries the binding, and
+    /// the refresh grant refuses the chain once that app is not active.
+    #[instrument(skip(pool, token_hash))]
+    pub async fn create_issued_to(
+        pool: &PgPool,
+        token_hash: &[u8],
+        client_id: Uuid,
+        scopes: &[String],
+        expires_at: DateTime<Utc>,
+        issued_to_client_id: Option<Uuid>,
+    ) -> Result<Uuid, DbError> {
         let row: (Uuid,) = sqlx::query_as(
-            r#"INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at)
-            VALUES ($1, $2, $3, $4) RETURNING id"#,
+            r#"INSERT INTO refresh_tokens (token_hash, client_id, scopes, expires_at, issued_to_client_id)
+            VALUES ($1, $2, $3, $4, $5) RETURNING id"#,
         )
         .bind(token_hash)
         .bind(client_id)
         .bind(scopes)
         .bind(expires_at)
+        .bind(issued_to_client_id)
         .fetch_one(pool)
         .await
         .map_err(|e| DbError::QueryFailed { source: e })?;
@@ -147,7 +182,8 @@ impl RefreshTokenRepository {
     /// Anything else (unknown, expired, revoked for another reason) is
     /// [`RefreshCheck::Invalid`].
     ///
-    /// A `valid` token's stored `scopes` are joined in by id rather than
+    /// A `valid` token's stored `scopes` (and, since migration 174, its
+    /// `issued_to_client_id`) are joined in by id rather than
     /// returned by the definer, so the definer's `RETURNS TABLE` (and its
     /// grants) is unchanged. The application role reads `scopes` and `id`
     /// (118's column grant withholds only `token_hash`), `refresh_tokens` has
@@ -157,13 +193,8 @@ impl RefreshTokenRepository {
     /// read as "no ceiling".
     #[instrument(skip(pool, token_hash))]
     pub async fn check(pool: &PgPool, token_hash: &[u8]) -> Result<RefreshCheck, DbError> {
-        let (outcome, id, client_id, scopes): (
-            String,
-            Option<Uuid>,
-            Option<Uuid>,
-            Option<Vec<String>>,
-        ) = sqlx::query_as(
-            "SELECT c.outcome, c.token_id, c.client_id, t.scopes \
+        let (outcome, id, client_id, scopes, issued_to_client_id): CheckRow = sqlx::query_as(
+            "SELECT c.outcome, c.token_id, c.client_id, t.scopes, t.issued_to_client_id \
                FROM public.epigraph_refresh_token_check($1) c \
                LEFT JOIN public.refresh_tokens t ON t.id = c.token_id",
         )
@@ -176,6 +207,7 @@ impl RefreshTokenRepository {
                 id,
                 client_id,
                 scopes,
+                issued_to_client_id,
             },
             ("grace", ..) => RefreshCheck::Grace,
             ("reuse", ..) => RefreshCheck::Reuse,

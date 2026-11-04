@@ -582,7 +582,18 @@ async fn an_agent_token_carries_no_family_from_either_grant(pool: PgPool) {
     assert_eq!(claims.client_type, "agent");
     assert_eq!(claims.fam, None, "an agent token carries no family");
 
-    let (status, body) = post_json(app, "/oauth/token", refresh_grant(&refresh)).await;
+    let (status, body) = post_json(
+        app,
+        "/oauth/token",
+        json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+            "client_assertion_type": "urn:epigraph:ed25519",
+            "client_assertion": assertion(&key),
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "agent refresh: {body}");
     let claims = claims_of(&jwt, &body);
     assert_eq!(

@@ -82,12 +82,24 @@ async fn refutes_edge_filed_against_the_original_stays_on_the_original(pool: PgP
     let original = seed_claim(&pool, agent, "geometric confound invalidates the series").await;
     let edge = seed_edge(&pool, refuter, original, "refutes").await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(original)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(original),
         "corrected series; the geometric objection is withdrawn",
         TruthValue::clamped(0.9),
         "correcting the confound inference",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -113,12 +125,24 @@ async fn contradicts_edge_asserted_by_the_original_stays_on_the_original(pool: P
     let original = seed_claim(&pool, agent, "the measurement is confounded").await;
     let edge = seed_edge(&pool, original, objected_to, "contradicts").await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(original)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(original),
         "withdrawing the confound objection; the measurement is sound",
         TruthValue::clamped(0.9),
         "retracting the objection",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();
@@ -145,12 +169,24 @@ async fn strengthening_edges_still_migrate_in_both_directions(pool: PgPool) {
     let incoming = seed_edge(&pool, supporter, original, "supports").await;
     let outgoing = seed_edge(&pool, original, downstream, "generalizes").await;
 
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(original)
+            .fetch_one(&pool)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede(
         &pool,
         ClaimId::from_uuid(original),
         "the original finding, restated with tighter bounds",
         TruthValue::clamped(0.9),
         "tightening bounds",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .unwrap();

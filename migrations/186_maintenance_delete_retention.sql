@@ -1,0 +1,82 @@
+-- Migration 186: let the maintenance role DELETE from `recall_events` and
+-- `events`, so the retention job `prune_recall_events` can prune on a
+-- NOSUPERUSER maintenance login.
+--
+-- WHY A GRANT. `prune_recall_events` connects through
+-- `epigraph_cli::MaintenancePool`, which refuses any session that does not
+-- satisfy `epigraph_bypass()`. That refusal is correct: `recall_events` is
+-- FORCE row security (079) and `recall_events_tenancy` (077) admits an
+-- application session only to its own principal's rows, so an application-role
+-- `DELETE FROM recall_events` matches zero rows, exits 0, and the retention
+-- window silently stops being enforced. But 070 grants `epigraph_maintenance`
+-- SELECT / INSERT / UPDATE on every table and deliberately no DELETE, and no
+-- later migration granted DELETE on these two tables. So on a maintenance login
+-- the job's dry run (two counts) succeeds and its real run stops at its first
+-- statement with "permission denied for table recall_events" (measured,
+-- `epigraph-cli/tests/prune_recall_events_maintenance.rs::
+-- a_maintenance_login_prunes_expired_recall_and_telemetry_rows`). 115
+-- (`mass_functions`, `edges`), 117 (`factors`, `bp_messages`), 118
+-- (`oauth_authorize_sessions`), 119 (`jobs` and the timer tables), 158
+-- (`frames`) and 184 (`ds_combined_beliefs`) each added the DELETE a reviewed
+-- maintenance path needed; this is the next such path.
+--
+-- WHY THESE TWO TABLES. They are exactly the tables the job names in a DELETE:
+-- `RecallEventRepository::prune_older_than` (`recall_events`, by age) and
+-- `RecallEventRepository::prune_telemetry_events` (`events`, by age AND
+-- `event_type = ANY(PRUNABLE_EVENT_TYPES)`, today only `tool.invoked`;
+-- provenance events such as `claim.created` are never selected). Neither table
+-- is referenced by a foreign key. Each `events` row deleted fires
+-- `events_cascade_edges` (024), 001's SECURITY INVOKER `cascade_delete_edges`,
+-- which issues `DELETE FROM edges` as the deleting session; the role already
+-- holds DELETE on `edges` (115) and passes `edges_delete_owner` through
+-- `epigraph_bypass()`, so no further grant is needed.
+--
+-- WHAT THE ROLE COULD ALREADY DO ON THESE TABLES (unchanged here):
+--   * `recall_events`: SELECT, INSERT, UPDATE (070). Row security: FORCE (079);
+--     `recall_events_tenancy` (077) admits it through `epigraph_bypass()`;
+--     126's `recall_events_elevated_*` policies are `TO epigraph_app` only.
+--     Triggers: `recall_events_require_tenancy` (INSERT) and 166's statement
+--     trigger `role_agent_write_check`.
+--   * `events`: SELECT, INSERT, UPDATE (070). No row security. Triggers:
+--     `events_cascade_edges` (above) and 166's `role_agent_write_check`.
+--   So the role could already rewrite any row of either table; DELETE adds
+--   removal, nothing it could not already alter.
+--
+-- EFFECTIVE REACH. The grant is on the role, not on the job. Any session acting
+-- as `epigraph_maintenance` (timers, scripts, operator logins on the
+-- maintenance DSN) can now delete any `recall_events` row and any `events` row,
+-- not only expired telemetry; the type and age filters are the job's, in Rust.
+-- A narrower SECURITY DEFINER for the telemetry delete was considered and not
+-- taken here: on `events` it would protect nothing while the application role
+-- keeps its own table-wide DELETE there with no row security (an allowlisted
+-- posture, `app_role_table_lockdown.rs`, `OPERATIONAL`), and the maintenance
+-- role keeps UPDATE. If `events` is later closed to application writes, a
+-- type-restricted prune definer should replace this grant on `events` in the
+-- same change.
+--
+-- ROW SECURITY is unchanged. No application role gains anything; an
+-- application session still deletes no `recall_events` row it does not own
+-- (pinned by the same test file,
+-- `the_application_role_prunes_no_recall_row`).
+--
+-- A GRANT takes no table lock beyond a brief catalog update; `lock_timeout`
+-- is set like 158 all the same. Idempotent: re-granting a held privilege is a
+-- no-op, and the role guard makes the file a no-op on a database without the
+-- maintenance role.
+--
+-- DEPLOY ORDER: none against other migrations or the binaries (a grant; every
+-- shipped `prune_recall_events` already issues these two statements).
+--
+-- UNDO:
+--   REVOKE DELETE ON public.recall_events, public.events FROM epigraph_maintenance;
+--   (the retention job then fails again on a maintenance login.)
+-- Checked before claiming: no `origin/main` migration, open PR, origin branch
+-- or local worktree carries a `186`.
+
+SET LOCAL lock_timeout = '3s';
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'GRANT DELETE ON public.recall_events, public.events TO epigraph_maintenance';
+    END IF;
+END $$;

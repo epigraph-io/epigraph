@@ -30,7 +30,23 @@ import uuid
 
 import pytest
 
-psycopg2 = pytest.importorskip("psycopg2")
+# CI (.github/workflows/ci.yml, job `python`) provisions a migrated `_test`
+# database and sets this, so a database-backed arm that cannot reach it FAILS
+# there instead of skipping: a job whose arms all skip would pass while running
+# none of them (backlog d5781a48). Unset, they skip as before.
+REQUIRE_DB = os.environ.get("EPIGRAPH_PYTEST_REQUIRE_DB") == "1"
+
+
+def _unavailable(reason: str, **kw):
+    if REQUIRE_DB:
+        pytest.fail(f"EPIGRAPH_PYTEST_REQUIRE_DB=1 but {reason}", pytrace=False)
+    pytest.skip(reason, **kw)
+
+
+try:
+    import psycopg2
+except ImportError:
+    _unavailable("psycopg2 is not installed", allow_module_level=True)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "fuzzy_dedup_claims.py"
@@ -43,7 +59,7 @@ TEST_DSN = os.environ.get(
 # Same guard epigraph-db's `db_is_disposable` applies: this fixture INSERTs and
 # DELETEs claims, so it must never be pointed at a real corpus.
 if not (TEST_DSN.rstrip("/").endswith("_test") or "/_sqlx_test" in TEST_DSN):
-    pytest.skip(
+    _unavailable(
         f"refusing to run destructive dedup fixtures against {TEST_DSN!r}: "
         "the database name must end in `_test`",
         allow_module_level=True,
@@ -59,7 +75,7 @@ def db():
     try:
         conn = psycopg2.connect(TEST_DSN)
     except Exception as e:  # noqa: BLE001
-        pytest.skip(f"test DB unavailable ({TEST_DSN}): {e}")
+        _unavailable(f"test DB unavailable ({TEST_DSN}): {e}")
     yield conn
     conn.close()
 
@@ -79,7 +95,7 @@ def seeded(db):
         cur.execute("SELECT id FROM groups LIMIT 1")
         row = cur.fetchone()
         if row is None:
-            pytest.skip("no rows in `groups` — run the tenancy migrations on the test DB")
+            _unavailable("no rows in `groups` — run the tenancy migrations on the test DB")
         group_id = row[0]
 
         # `agents_public_key_length` requires a real 32-byte ed25519 key.

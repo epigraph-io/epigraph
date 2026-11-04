@@ -111,6 +111,16 @@ async fn main() {
     for flag in epigraph_engine::belief_modes::unrecognised() {
         tracing::warn!("belief-mode flag ignored: {flag}");
     }
+    // Calibration (backlog 7cb71243): resolved and journalled at boot, like the
+    // belief modes, so a CALIBRATION_PATH that does not load or an empty
+    // evidence-type vocabulary is reported at startup. Reported, not fatal.
+    tracing::info!(
+        calibration = %epigraph_engine::calibration::CalibrationConfig::cached_source(),
+        "calibration loaded at startup"
+    );
+    for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
+        tracing::error!("calibration: {problem}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,
@@ -422,12 +432,17 @@ async fn main() {
             "epigraph-api",
             epigraph_api::passkey_boot::running_stop(allows_software),
         );
+        // The API's own edge signing key (ruling R-50): unset = unsigned edges,
+        // logged once; set but unusable = refuse to start.
+        let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
+            .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_bp_apply(bp_apply_from_env())
-            .with_passkeys(passkeys);
+            .with_passkeys(passkeys)
+            .with_edge_signer(edge_signer);
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the

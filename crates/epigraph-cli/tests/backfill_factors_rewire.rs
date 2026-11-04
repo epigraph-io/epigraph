@@ -868,3 +868,124 @@ async fn rewire_runs_on_a_maintenance_login_without_bypassrls(pool: PgPool) {
         "vacuous row removed"
     );
 }
+
+/// The rewire selection's retained `e.signer_id` fallback (kept on purpose,
+/// unlike `EDGE_QUERY`, ruling R-49): a stored edge-factor row with NO
+/// `source_agent_id` is re-keyed under the edge's `signer_id`, the agent the
+/// legacy `COALESCE(e.signer_id, src.agent_id)` wiring used, and the rewrite
+/// leaves ONE BBA for the edge, never a second one keyed on the source's
+/// author. Pins the fallback so a later sweep of `signer_id` readers cannot
+/// drop it silently.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_rekeys_an_agentless_row_under_the_edge_signer_without_a_second_bba(pool: PgPool) {
+    let w = seed_world(&pool, "agentless").await;
+    let signer = seed_agent(&pool, "rewire-signer-agentless").await;
+    sqlx::query(
+        "UPDATE edges SET signer_id = $2, signature = decode(repeat('cd', 64), 'hex') \
+          WHERE id = $1",
+    )
+    .bind(w.edge)
+    .bind(signer)
+    .execute(&pool)
+    .await
+    .expect("sign the edge as a third agent");
+    sqlx::query(
+        "UPDATE mass_functions SET source_agent_id = NULL \
+          WHERE perspective_id = $1 AND combination_method = 'edge_factor'",
+    )
+    .bind(w.edge)
+    .execute(&pool)
+    .await
+    .expect("an agentless stored row");
+
+    let selected = select_rewire_edges(&pool, &RewireOptions::default())
+        .await
+        .expect("select");
+    let row = selected
+        .iter()
+        .find(|r| r.edge_id == w.edge)
+        .unwrap_or_else(|| panic!("calibration: the edge is selected: {selected:?}"));
+    assert_eq!(
+        row.agent_id, signer,
+        "an agentless row is re-keyed under the edge's signer (the legacy wiring key)"
+    );
+
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!((summary.rewired, summary.failed), (1, 0), "{summary:?}");
+    let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
+        "SELECT source_agent_id FROM mass_functions \
+          WHERE perspective_id = $1 AND combination_method = 'edge_factor'",
+    )
+    .bind(w.edge)
+    .fetch_all(&pool)
+    .await
+    .expect("edge rows");
+    assert_eq!(rows.len(), 1, "one BBA for the edge: {rows:?}");
+}
+
+/// Operator ruling R-103 on the rewire backfill: the edge's live row sits off
+/// the wire key (another frame), and the row AT the wire key `(target,
+/// binary_truth, agent, edge)` was retracted. Re-wiring would re-write the
+/// retracted row's key, which is refused (RT07): the edge counts as failed and
+/// rolls back, so the retracted row keeps its retraction and masses and the
+/// live row is not deleted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_refuses_to_rewrite_a_retracted_edge_factor_and_changes_nothing(pool: PgPool) {
+    let w = seed_world(&pool, "r103").await;
+    let held: Uuid = sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
+        .bind(w.edge)
+        .fetch_one(&pool)
+        .await
+        .expect("the wire-key row");
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("r103-rewire-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed a second frame");
+    seed_stale_edge_factor(&pool, w.edge, w.target, other_frame, w.stale_agent).await;
+    sqlx::query(
+        "UPDATE mass_functions \
+            SET retracted_at = now(), retracted_by = $2, retract_reason = 'r103 fixture' \
+          WHERE id = $1",
+    )
+    .bind(held)
+    .bind(w.stale_agent)
+    .execute(&pool)
+    .await
+    .expect("retract the wire-key row");
+    let before: (serde_json::Value, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT masses, created_at FROM mass_functions WHERE id = $1")
+            .bind(held)
+            .fetch_one(&pool)
+            .await
+            .expect("read the retracted row");
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!(
+        (summary.eligible, summary.rewired, summary.failed),
+        (1, 0, 1),
+        "the edge is selected by its live row and fails on the retracted key: {summary:?}"
+    );
+    let after: (serde_json::Value, chrono::DateTime<chrono::Utc>, bool) = sqlx::query_as(
+        "SELECT masses, created_at, retracted_at IS NOT NULL FROM mass_functions WHERE id = $1",
+    )
+    .bind(held)
+    .fetch_one(&pool)
+    .await
+    .expect("read the retracted row again");
+    assert_eq!((after.0, after.1), before, "the retracted row is untouched");
+    assert!(after.2, "and still retracted");
+    assert_eq!(
+        edge_rows(&pool, w.edge).await.len(),
+        2,
+        "the live off-key row was not deleted"
+    );
+}

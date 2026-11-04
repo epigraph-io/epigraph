@@ -1,6 +1,10 @@
 //! Edge repository for LPG-style relationships
 
 use crate::errors::DbError;
+use crate::repos::edge_signature::{
+    insert_attested_conn, new_attestation, EdgeSigningKey, SymmetricGuard,
+};
+use epigraph_core::edge::relationships::{canonical_relationship, relationship_spellings};
 use sqlx::types::Json;
 use sqlx::PgPool;
 use tracing::instrument;
@@ -203,6 +207,33 @@ pub struct SymmetricEdgeUpsert {
     pub was_created: bool,
 }
 
+/// The columns the symmetric row-returning INSERT and its dedup probe read.
+type SymmetricRow = (
+    Uuid,
+    Uuid,
+    String,
+    Uuid,
+    String,
+    String,
+    serde_json::Value,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+fn symmetric_edge_row(r: SymmetricRow) -> EdgeRow {
+    EdgeRow {
+        id: r.0,
+        source_id: r.1,
+        source_type: r.2,
+        target_id: r.3,
+        target_type: r.4,
+        relationship: r.5,
+        properties: r.6,
+        valid_from: r.7,
+        valid_to: r.8,
+    }
+}
+
 /// Repository for Edge operations
 pub struct EdgeRepository;
 
@@ -252,6 +283,7 @@ impl EdgeRepository {
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Uuid, DbError> {
         let properties = properties.unwrap_or(serde_json::json!({}));
+        let relationship = canonical_relationship(relationship);
 
         let row = sqlx::query!(
             r#"
@@ -272,6 +304,95 @@ impl EdgeRepository {
         .await?;
 
         Ok(row.id)
+    }
+
+    /// [`Self::create_signed_conn`] on a connection of `pool`, for a writer
+    /// that writes on the pool itself (as [`Self::create`] on a pool does).
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`], and `DbError::QueryFailed` if no
+    /// connection can be acquired.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_signed(
+        pool: &PgPool,
+        key: Option<EdgeSigningKey<'_>>,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Uuid, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_signed_conn(
+            &mut conn,
+            key,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create`] ATTESTED AT INSERT when `key` is given (ruling R-50):
+    /// the row carries its attestation digest, the v1 edge signature over it
+    /// and `signer_id = key.signer_id` (see
+    /// `edge_signature::insert_attested_conn`). With `key = None` it is
+    /// exactly [`Self::create`]. On a connection, because the attested INSERT
+    /// runs in a savepoint.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails, and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Uuid, DbError> {
+        let Some(key) = key else {
+            return Self::create(
+                &mut *conn,
+                source_id,
+                source_type,
+                target_id,
+                target_type,
+                relationship,
+                properties,
+                valid_from,
+                valid_to,
+            )
+            .await;
+        };
+        let a = new_attestation(
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties.unwrap_or(serde_json::json!({})),
+            valid_from,
+        );
+        insert_attested_conn(conn, key, a, valid_to, SymmetricGuard::None, false)
+            .await?
+            .map(|row| row.id)
+            .ok_or_else(|| DbError::InvalidData {
+                reason: "an unconditional attested edge INSERT returned no row".to_string(),
+            })
     }
 
     /// Like [`create`], but if an edge with the same
@@ -376,8 +497,43 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_not_exists_signed_conn(
+            conn,
+            None,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_not_exists_conn`], with the edge it INSERTS attested
+    /// at INSERT by `key` (ruling R-50; see [`Self::create_signed_conn`]). A
+    /// dedup hit returns the existing row and writes nothing onto it.
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_not_exists_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
         Self::create_if_absent_conn(
             conn,
+            key,
             DedupProbe::InForce,
             source_id,
             source_type,
@@ -448,8 +604,44 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
+        Self::create_if_absent_including_retracted_signed_conn(
+            conn,
+            None,
+            source_id,
+            source_type,
+            target_id,
+            target_type,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_if_absent_including_retracted_conn`], with the edge it
+    /// INSERTS attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]). A dedup hit returns the existing row and
+    /// writes nothing onto it.
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_absent_including_retracted_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        source_id: Uuid,
+        source_type: &str,
+        target_id: Uuid,
+        target_type: &str,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
         Self::create_if_absent_conn(
             conn,
+            key,
             DedupProbe::AnyState,
             source_id,
             source_type,
@@ -520,6 +712,7 @@ impl EdgeRepository {
     #[allow(clippy::too_many_arguments)]
     async fn create_if_absent_conn(
         conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
         probe: DedupProbe,
         source_id: Uuid,
         source_type: &str,
@@ -545,7 +738,7 @@ impl EdgeRepository {
                  SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
                         e.relationship, e.properties, e.valid_from, e.valid_to \
                    FROM edges e \
-                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
                     AND {EDGE_IN_FORCE} \
                   LIMIT 1"
             ),
@@ -554,7 +747,7 @@ impl EdgeRepository {
                  SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type, \
                         e.relationship, e.properties, e.valid_from, e.valid_to \
                    FROM edges e \
-                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = $3 \
+                  WHERE e.source_id = $1 AND e.target_id = $2 AND e.relationship = ANY($3) \
                   LIMIT 1"
                 .to_string(),
         };
@@ -572,7 +765,7 @@ impl EdgeRepository {
         )> = sqlx::query_as(&sql)
             .bind(source_id)
             .bind(target_id)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -595,6 +788,25 @@ impl EdgeRepository {
         }
 
         let properties = properties.unwrap_or(serde_json::json!({}));
+        let relationship = canonical_relationship(relationship);
+        if let Some(key) = key {
+            let a = new_attestation(
+                source_id,
+                source_type,
+                target_id,
+                target_type,
+                relationship,
+                properties,
+                valid_from,
+            );
+            let row = insert_attested_conn(&mut tx, key, a, valid_to, SymmetricGuard::None, false)
+                .await?
+                .ok_or_else(|| DbError::InvalidData {
+                    reason: "an unconditional attested edge INSERT returned no row".to_string(),
+                })?;
+            tx.commit().await?;
+            return Ok((row, true));
+        }
         let row = sqlx::query!(
             r#"
             INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to)
@@ -659,6 +871,27 @@ impl EdgeRepository {
         pipeline: &str,
         tool: &str,
     ) -> Result<bool, DbError> {
+        Self::create_processed_by_stamp_if_absent_signed_conn(
+            conn, None, paper_id, agent_id, pipeline, tool,
+        )
+        .await
+    }
+
+    /// [`Self::create_processed_by_stamp_if_absent_conn`], with the stamp it
+    /// INSERTS attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]).
+    ///
+    /// # Errors
+    /// As [`Self::create_signed_conn`].
+    #[instrument(skip(conn, key))]
+    pub async fn create_processed_by_stamp_if_absent_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        paper_id: Uuid,
+        agent_id: Uuid,
+        pipeline: &str,
+        tool: &str,
+    ) -> Result<bool, DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
 
@@ -683,8 +916,9 @@ impl EdgeRepository {
             return Ok(false);
         }
 
-        Self::create(
-            &mut *tx,
+        Self::create_signed_conn(
+            &mut tx,
+            key,
             paper_id,
             "paper",
             agent_id,
@@ -735,11 +969,23 @@ impl EdgeRepository {
     /// `(LEAST(source,target), GREATEST(source,target), relationship)`, keyed on
     /// the same `(pair + properties->>'source' = 'cross_source_matcher')`
     /// identity `MatchCandidateRepo::retire` already uses and restricted to
-    /// in-force claim-claim rows. Its predicate is a strict SUBSET of what this
-    /// guard blocks, so it can only ever reject a row the guard would have
-    /// rejected too if it had seen it — and an operator-authored edge over the
-    /// same pair is untouched, which is what keeps this a dedup repair rather
-    /// than a change to what `POST /edges` may write.
+    /// in-force claim-claim rows. Migration 175 re-keys it on
+    /// `lower(relationship)`, so a legacy `CORROBORATES` and a canonical
+    /// `corroborates` matcher row over one pair are one key.
+    ///
+    /// For rows stored in the lower-case or UPPER-case spelling (the two
+    /// [`relationship_spellings`] returns, which this guard matches) the index
+    /// predicate is a strict SUBSET of what this guard blocks, so it can only
+    /// ever reject a row the guard would have rejected too if it had seen it —
+    /// and an operator-authored edge over the same pair is untouched, which is
+    /// what keeps this a dedup repair rather than a change to what
+    /// `POST /edges` may write. A MIXED-case in-force matcher row (e.g.
+    /// `Corroborates`; no matcher writer ever produced one) is the exception:
+    /// the guard misses it and the index swallows the insert, so this form
+    /// reports a dedup hit and the `_returning` / `_oriented` / `_full` forms'
+    /// post-conflict probe finds no row and errors. The operator case-fold
+    /// (`docs/runbooks/edge-relationship-casefold.sql`) rewrites mixed-case rows
+    /// to lower case, which closes that window.
     ///
     /// The second case it covers is why this is a FORCE precondition
     /// (`D-PR17-read-guards-widen-under-rls`): 072 arm (d)'s no-widening rule
@@ -802,14 +1048,15 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
              )
              ON CONFLICT DO NOTHING",
         )
         .bind(a)
         .bind(b)
-        .bind(relationship)
+        .bind(canonical_relationship(relationship))
         .bind(Json(properties))
+        .bind(relationship_spellings(relationship))
         .execute(&mut *conn)
         .await?;
 
@@ -883,6 +1130,42 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<(Uuid, bool), DbError> {
+        Self::create_symmetric_if_absent_returning_signed_conn(
+            conn,
+            None,
+            a,
+            b,
+            relationship,
+            properties,
+        )
+        .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_returning_conn`], with the edge it
+    /// INSERTS attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]). A dedup hit writes nothing.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_returning`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_returning_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<(Uuid, bool), DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            if let Some(row) =
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::InForce, true).await?
+            {
+                return Ok((row.id, true));
+            }
+            return Self::symmetric_in_force_id(conn, a, b, relationship).await;
+        }
         // In force only (migration 120): a retracted link asserted again is a
         // new edge, never a silent `false` onto the retracted row. 091's
         // `edges_alternative_of_symmetric_uniq` covers `valid_to IS NULL` rows
@@ -895,7 +1178,7 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              ON CONFLICT DO NOTHING
@@ -904,15 +1187,26 @@ impl EdgeRepository {
         let inserted: Option<Uuid> = sqlx::query_scalar(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties))
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
         if let Some(id) = inserted {
             return Ok((id, true));
         }
+        Self::symmetric_in_force_id(conn, a, b, relationship).await
+    }
 
+    /// The dedup-hit half of [`Self::create_symmetric_if_absent_returning_signed_conn`]:
+    /// the id of the existing symmetric edge in force.
+    async fn symmetric_in_force_id(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+    ) -> Result<(Uuid, bool), DbError> {
         // Dedup hit — surface the id of the existing symmetric edge in force.
         let probe = format!(
             "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
@@ -920,14 +1214,14 @@ impl EdgeRepository {
              SELECT id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
-               AND relationship = $3
+               AND relationship = ANY($3)
                AND {EDGE_IN_FORCE_UNALIASED}
              LIMIT 1"
         );
         let existing: Uuid = sqlx::query_scalar(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
@@ -985,6 +1279,47 @@ impl EdgeRepository {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<SymmetricEdgeUpsert, DbError> {
+        Self::create_symmetric_if_absent_oriented_signed_conn(
+            conn,
+            None,
+            a,
+            b,
+            relationship,
+            properties,
+        )
+        .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_oriented_conn`], with the edge it
+    /// INSERTS attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]). A dedup hit writes nothing.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_oriented`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_oriented_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<SymmetricEdgeUpsert, DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(a, "claim", b, "claim", relationship, properties, None);
+            if let Some(row) =
+                insert_attested_conn(conn, key, att, None, SymmetricGuard::InForce, false).await?
+            {
+                return Ok(SymmetricEdgeUpsert {
+                    edge_id: row.id,
+                    source_id: row.source_id,
+                    target_id: row.target_id,
+                    was_created: true,
+                });
+            }
+            return Self::symmetric_in_force_oriented(conn, a, b, relationship).await;
+        }
         // In force only (migration 120), as `create_symmetric_if_absent_returning_conn`:
         // a retracted link asserted again is a new edge (and the belief wiring
         // keyed on it attaches to a row in force), never a silent
@@ -999,7 +1334,7 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($5)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              RETURNING id, source_id, target_id"
@@ -1007,8 +1342,9 @@ impl EdgeRepository {
         let inserted: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties))
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
@@ -1020,21 +1356,31 @@ impl EdgeRepository {
                 was_created: true,
             });
         }
+        Self::symmetric_in_force_oriented(conn, a, b, relationship).await
+    }
 
+    /// The dedup-hit half of
+    /// [`Self::create_symmetric_if_absent_oriented_signed_conn`].
+    async fn symmetric_in_force_oriented(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+    ) -> Result<SymmetricEdgeUpsert, DbError> {
         // Dedup hit — surface the existing row in force AS STORED, which may be
         // the reverse of the caller's (a, b).
         let probe = format!(
             "SELECT id, source_id, target_id FROM edges
              WHERE ((source_id = $1 AND target_id = $2)
                  OR (source_id = $2 AND target_id = $1))
-               AND relationship = $3
+               AND relationship = ANY($3)
                AND {EDGE_IN_FORCE_UNALIASED}
              LIMIT 1"
         );
         let (edge_id, source_id, target_id): (Uuid, Uuid, Uuid) = sqlx::query_as(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
@@ -1089,29 +1435,55 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<(EdgeRow, bool), DbError> {
-        type Row = (
-            Uuid,
-            Uuid,
-            String,
-            Uuid,
-            String,
-            String,
-            serde_json::Value,
-            Option<chrono::DateTime<chrono::Utc>>,
-            Option<chrono::DateTime<chrono::Utc>>,
-        );
-        fn edge_row(r: Row) -> EdgeRow {
-            EdgeRow {
-                id: r.0,
-                source_id: r.1,
-                source_type: r.2,
-                target_id: r.3,
-                target_type: r.4,
-                relationship: r.5,
-                properties: r.6,
-                valid_from: r.7,
-                valid_to: r.8,
+        Self::create_symmetric_if_absent_row_signed_conn(
+            conn,
+            None,
+            a,
+            b,
+            relationship,
+            properties,
+            valid_from,
+            valid_to,
+        )
+        .await
+    }
+
+    /// [`Self::create_symmetric_if_absent_row_conn`], with the edge it INSERTS
+    /// attested at INSERT by `key` (ruling R-50; see
+    /// [`Self::create_signed_conn`]). A dedup hit writes nothing.
+    ///
+    /// # Errors
+    /// As [`Self::create_symmetric_if_absent_row_conn`], and
+    /// `DbError::InvalidData` if the stored row cannot be attested.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(conn, key, properties))]
+    pub async fn create_symmetric_if_absent_row_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+        properties: Option<serde_json::Value>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(EdgeRow, bool), DbError> {
+        if let Some(key) = key {
+            let att = new_attestation(
+                a,
+                "claim",
+                b,
+                "claim",
+                relationship,
+                properties.unwrap_or(serde_json::json!({})),
+                valid_from,
+            );
+            if let Some(row) =
+                insert_attested_conn(conn, key, att, valid_to, SymmetricGuard::InForce, false)
+                    .await?
+            {
+                return Ok((row, true));
             }
+            return Self::symmetric_in_force_row(conn, a, b, relationship).await;
         }
 
         // In force only (migration 120), as the other link-tool forms: a
@@ -1124,28 +1496,38 @@ impl EdgeRepository {
                  SELECT 1 FROM edges
                  WHERE ((source_id = $1 AND target_id = $2)
                      OR (source_id = $2 AND target_id = $1))
-                   AND relationship = $3
+                   AND relationship = ANY($7)
                    AND {EDGE_IN_FORCE_UNALIASED}
              )
              RETURNING id, source_id, source_type, target_id, target_type,
                        relationship, properties, valid_from, valid_to"
         );
-        let inserted: Option<Row> = sqlx::query_as(&insert)
+        let inserted: Option<SymmetricRow> = sqlx::query_as(&insert)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(canonical_relationship(relationship))
             .bind(Json(properties.unwrap_or(serde_json::json!({}))))
             .bind(valid_from)
             .bind(valid_to)
+            .bind(relationship_spellings(relationship))
             .fetch_optional(&mut *conn)
             .await?;
 
         if let Some(row) = inserted {
-            return Ok((edge_row(row), true));
+            return Ok((symmetric_edge_row(row), true));
         }
+        Self::symmetric_in_force_row(conn, a, b, relationship).await
+    }
 
-        // Dedup hit — the existing row in force AS STORED, which may be the
-        // reverse of the caller's (a, b).
+    /// The dedup-hit half of
+    /// [`Self::create_symmetric_if_absent_row_signed_conn`]: the existing row
+    /// in force AS STORED, which may be the reverse of the caller's (a, b).
+    async fn symmetric_in_force_row(
+        conn: &mut sqlx::PgConnection,
+        a: Uuid,
+        b: Uuid,
+        relationship: &str,
+    ) -> Result<(EdgeRow, bool), DbError> {
         let probe = format!(
             "-- VISIBILITY-EXEMPT: symmetric-dedup probe inside a WRITE path;
              -- same reasoning as `create_or_get`'s.
@@ -1154,18 +1536,18 @@ impl EdgeRepository {
                FROM edges
               WHERE ((source_id = $1 AND target_id = $2)
                   OR (source_id = $2 AND target_id = $1))
-                AND relationship = $3
+                AND relationship = ANY($3)
                 AND {EDGE_IN_FORCE_UNALIASED}
               LIMIT 1"
         );
-        let existing: Row = sqlx::query_as(&probe)
+        let existing: SymmetricRow = sqlx::query_as(&probe)
             .bind(a)
             .bind(b)
-            .bind(relationship)
+            .bind(relationship_spellings(relationship))
             .fetch_one(&mut *conn)
             .await?;
 
-        Ok((edge_row(existing), false))
+        Ok((symmetric_edge_row(existing), false))
     }
 
     /// Get edges by source entity
@@ -1457,10 +1839,10 @@ impl EdgeRepository {
     ///   the claims of every OTHER writer's BBA keyed on the edge, which it
     ///   removes. Recorded even when only the caller's own BBAs existed, so
     ///   their claims are re-derived.
-    /// * (a) it then deletes the caller's OWN edge-keyed BBAs, scoped
+    /// * (a) it then deletes the caller's OWN live edge-keyed BBAs, scoped
     ///   explicitly to the session's writable set (the same set the definer
     ///   read), so a privileged stamped session is held to the same owner
-    ///   scope as the application role.
+    ///   scope as the application role. A retracted one is kept for audit.
     ///
     /// [`EdgeWithdrawal::BeingDeleted`] first closes the row's window
     /// (`valid_to = now()`, the transaction's start, so `valid_to <= now()`
@@ -1535,11 +1917,14 @@ impl EdgeRepository {
             reason,
         )
         .await?;
-        // (a) The caller's own rows.
+        // (a) The caller's own LIVE rows. A retracted one (migration 184) is
+        // kept for audit and stays keyed on the withdrawn edge, where nothing
+        // folds it (rulings R-79, R-103).
         let deleted = sqlx::query(
             "DELETE FROM mass_functions \
               WHERE perspective_id = $1 \
-                AND owner_group_id = ANY (public.epigraph_writable_groups())",
+                AND owner_group_id = ANY (public.epigraph_writable_groups()) \
+                AND retracted_at IS NULL",
         )
         .bind(edge_id)
         .execute(&mut *conn)
@@ -1552,9 +1937,10 @@ impl EdgeRepository {
     }
 
     /// The administrative half of an `edge_retract` cascade, on the
-    /// MAINTENANCE connection: remove every BBA keyed on the edge (keyed on
+    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge (keyed on
     /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
-    /// touched) and return the claims they lived on.
+    /// touched) and return the claims they lived on. A RETRACTED row
+    /// (migration 184) is kept for audit (rulings R-79, R-103).
     ///
     /// STATE-DERIVED: it acts only while the edge row is absent or out of force
     /// (`valid_to <= now()`). An edge in force at the time of the call (its
@@ -1592,6 +1978,7 @@ impl EdgeRepository {
                   WHERE p.id = mf.perspective_id \
                     AND p.id = $1 \
                     AND p.perspective_type = 'edge' \
+                    AND mf.retracted_at IS NULL \
                  RETURNING mf.claim_id) \
              SELECT claim_id FROM gone",
         )
@@ -1610,8 +1997,10 @@ impl EdgeRepository {
     }
 
     /// The edges whose BBAs outlived them: an edge-factor perspective
-    /// (`perspective_type = 'edge'`) with BBAs keyed on it whose edge is absent
-    /// or out of force. The one-shot legacy sweep
+    /// (`perspective_type = 'edge'`) with LIVE BBAs keyed on it whose edge is
+    /// absent or out of force. An edge holding only retracted rows is not
+    /// listed: the removal keeps those (migration 184), so listing it would
+    /// spend the sweep's `limit` on an edge it can do nothing for. The one-shot legacy sweep
     /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
     /// BBAs through the same administrative path as an `edge_retract` replay.
     /// Maintenance connection only.
@@ -1627,7 +2016,8 @@ impl EdgeRepository {
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
              SELECT p.id FROM perspectives p \
               WHERE p.perspective_type = 'edge' \
-                AND EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.perspective_id = p.id) \
+                AND EXISTS (SELECT 1 FROM mass_functions mf \
+                             WHERE mf.perspective_id = p.id AND mf.retracted_at IS NULL) \
                 AND NOT EXISTS (SELECT 1 FROM edges e \
                                  WHERE e.id = p.id \
                                    AND (e.valid_to IS NULL OR e.valid_to > now())) \
@@ -1802,7 +2192,8 @@ impl EdgeRepository {
             .collect())
     }
 
-    /// Get edges by relationship type
+    /// Get edges by relationship type, in every stored spelling of a
+    /// case-folded relationship (`relationship_spellings`).
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -1824,14 +2215,14 @@ impl EdgeRepository {
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
-            WHERE relationship = $1
+            WHERE relationship = ANY($1::text[])
               AND ($2::bool OR visibility = 'public'
                    OR (owner_group_id = ANY($3::uuid[])
                        AND (co_owner_group_id IS NULL
                             OR co_owner_group_id = ANY($3::uuid[]))))
             ORDER BY created_at DESC
             "#,
-            relationship,
+            &relationship_spellings(relationship)[..],
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
@@ -1945,13 +2336,19 @@ impl EdgeRepository {
         // implementer converting the marked sites by grep would have converted
         // six of the eleven `edges` reads in this file and left five reading on
         // `owner_group_id` alone.
+        //
+        // A relationship filter matches every stored spelling of a case-folded
+        // relationship (`relationship_spellings`), so `?relationship=SUPPORTS`
+        // and `?relationship=supports` return the same rows, legacy upper-case
+        // ones included.
+        let spellings = relationship.map(relationship_spellings);
         let rows = sqlx::query!(
             r#"
             SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
             FROM edges
             WHERE ($1::uuid IS NULL OR source_id = $1)
               AND ($2::uuid IS NULL OR target_id = $2)
-              AND ($3::text IS NULL OR relationship = $3)
+              AND ($3::text[] IS NULL OR relationship = ANY($3::text[]))
               AND ($4::text IS NULL OR source_type = $4)
               AND ($5::text IS NULL OR target_type = $5)
               AND ($7::bool OR visibility = 'public'
@@ -1963,7 +2360,7 @@ impl EdgeRepository {
             "#,
             source_id,
             target_id,
-            relationship,
+            spellings.as_deref(),
             source_type,
             target_type,
             limit,

@@ -440,8 +440,9 @@ pub async fn add_member(
     })?;
 
     // Materialize MEMBER_OF edge (perspective → community)
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         pool,
+        state.edge_signing_key(),
         request.perspective_id,
         "perspective",
         community_id,

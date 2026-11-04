@@ -29,6 +29,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 
 #[derive(Debug, serde::Serialize)]
 pub struct IngestWorkflowResponse {
+    /// Empty, and then not serialized, for a re-ingest of a row the caller
+    /// cannot read (backlog c831df4a): the answer must not hand over the id
+    /// of a workflow the caller cannot see.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub canonical_name: String,
     pub generation: i32,
@@ -118,6 +122,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     auth: Option<&epigraph_auth::AuthContext>,
     declared_group: Option<uuid::Uuid>,
 ) -> Result<(IngestWorkflowResponse, Vec<(uuid::Uuid, String)>), McpError> {
+    // Supersede SPEC K12a: a `supersedes` relationship is the act's alone.
+    epigraph_ingest::common::schema::refuse_lineage_relationships(&extraction.relationships)
+        .map_err(invalid_params)?;
     // H3 (batch H-b): the submitter is recorded by THIS entry point, never
     // taken from the caller's metadata; see `tools::workflow_authority`.
     let caller = server.write_identity(auth, viewer).await?;
@@ -158,6 +165,15 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // recorded with the write (`record_caller_workflow_write`).
     let mut grants: Vec<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)> =
         Vec::with_capacity(2);
+    // An anchor the caller cannot read (a lineage head or linked parent in a
+    // group it is not in) is refused without naming it (backlog c831df4a).
+    let not_found = || {
+        invalid_params(format!(
+            "workflow_ingest: canonical_name '{}' (generation {}) extends a workflow lineage \
+             this caller cannot read. Nothing was written.",
+            extraction.source.canonical_name, extraction.source.generation
+        ))
+    };
     if creating {
         let mut checked: Vec<uuid::Uuid> = Vec::with_capacity(2);
         for anchor in [anchors.lineage_head, anchors.linked_parent]
@@ -175,6 +191,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 caller,
                 anchor,
                 "workflow_ingest",
+                &not_found,
             )
             .await?;
             admin_write |= grant.is_admin();
@@ -207,7 +224,9 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         "workflow_ingest",
     )
     .await
-    .map_err(|e| internal_error(format!("workflow ingest: could not record authorship: {e}")))?;
+    .map_err(|e| {
+        crate::errors::internal_error_logged("workflow ingest: could not record authorship", e)
+    })?;
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));
@@ -264,9 +283,23 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
         )
         .await?;
     }
-    tx.commit()
-        .await
-        .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+    // A re-ingest reports the EXISTING row, which the system agent's stamp
+    // found and the caller may not read (a group plan outside its groups).
+    // Its id is then left out of the answer (backlog c831df4a, ruling R-100),
+    // and so not handed to the post-commit goal embedding either.
+    let caller_reads_row = !result.already_ingested
+        || epigraph_db::WorkflowRepository::tenancy_as_viewer(&mut tx, viewer, result.workflow_id)
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    "workflow ingest: could not read the workflow as the caller",
+                    e,
+                )
+            })?
+            .is_some();
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged("workflow ingest: could not commit", e)
+    })?;
 
     // The DS wiring runs in its OWN system-agent-stamped transaction, after the
     // ingest commit. `claim_frames` / `mass_functions` / the cached-belief
@@ -305,7 +338,11 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
 
     let inserted = result.inserted.clone();
     let response = IngestWorkflowResponse {
-        workflow_id: result.workflow_id.to_string(),
+        workflow_id: if caller_reads_row {
+            result.workflow_id.to_string()
+        } else {
+            String::new()
+        },
         canonical_name: result.canonical_name,
         generation: result.generation,
         claims_ingested: result.claims_ingested,
@@ -443,10 +480,9 @@ pub async fn do_ingest_workflow_via_pool(
         // Named `unstamped_tx`, not `tx`: `residual_unstamped_writes.rs`'s
         // executor-call register counts calls spelled `&mut tx` as STAMPED, and
         // this one is not.
-        let mut unstamped_tx = pool
-            .begin()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not begin: {e}")))?;
+        let mut unstamped_tx = pool.begin().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not begin", e)
+        })?;
         let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
             &mut unstamped_tx,
             &plan,
@@ -454,17 +490,15 @@ pub async fn do_ingest_workflow_via_pool(
         )
         .await
         .map_err(|e| crate::errors::executor_caller_error("workflow ingest", e))?;
-        unstamped_tx
-            .commit()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not commit: {e}")))?;
+        unstamped_tx.commit().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not commit", e)
+        })?;
         result
     };
     {
-        let mut ds_conn = pool
-            .acquire()
-            .await
-            .map_err(|e| internal_error(format!("workflow ingest: could not acquire: {e}")))?;
+        let mut ds_conn = pool.acquire().await.map_err(|e| {
+            crate::errors::internal_error_logged("workflow ingest: could not acquire", e)
+        })?;
         wire_ds_after_ingest(&mut ds_conn, viewer, &plan, &result).await;
     }
     Ok(IngestWorkflowResponse {
@@ -531,6 +565,66 @@ pub async fn store_ingest_embedding(
     }
 }
 
+/// Store a workflow's goal embedding on a transaction stamped from the
+/// workflow-ingest system agent, the identity that wrote the row. Since
+/// migration 183 a `workflows` row carries its plan's tenancy, so the plain
+/// pool cannot see (and so cannot update) a row declared into a group.
+/// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a superuser development
+/// server) the plain pool is used, as before. Best-effort: a failure is logged
+/// and the row stays findable by text.
+pub(crate) async fn store_workflow_goal_embedding(
+    server: &EpiGraphMcpFull,
+    workflow_id: uuid::Uuid,
+    embedding: &[f32],
+) {
+    let stored = match server.scoped.as_ref() {
+        Some(scoped) => {
+            let authority = match epigraph_ingest_executor::system_agent_write_authority(scoped)
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(workflow_id = %workflow_id, error = %e, "goal embedding not stored: no system-agent write authority");
+                    return;
+                }
+            };
+            let mut tx = match scoped.begin_as(&authority.viewer).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::warn!(workflow_id = %workflow_id, error = %e, "goal embedding not stored: could not begin a stamped transaction");
+                    return;
+                }
+            };
+            let r = epigraph_db::WorkflowRepository::set_goal_embedding(
+                &mut *tx,
+                workflow_id,
+                embedding,
+            )
+            .await;
+            match r {
+                Ok(n) => tx.commit().await.map(|()| n).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        None => epigraph_db::WorkflowRepository::set_goal_embedding(
+            &server.pool,
+            workflow_id,
+            embedding,
+        )
+        .await
+        .map_err(|e| e.to_string()),
+    };
+    match stored {
+        Ok(1) => {}
+        Ok(n) => {
+            tracing::warn!(workflow_id = %workflow_id, rows = n, "goal embedding matched no readable workflow row");
+        }
+        Err(e) => {
+            tracing::warn!(workflow_id = %workflow_id, error = %e, "set_goal_embedding failed")
+        }
+    }
+}
+
 /// MCP tool: ingest a `WorkflowExtraction` JSON.
 ///
 /// `tenancy`: see [`execute_workflow_ingest_with_inserted`]'s declared group.
@@ -578,12 +672,7 @@ pub async fn do_ingest_workflow(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
-                if let Err(e) =
-                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
-                        .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(server, wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
@@ -633,9 +722,50 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub parent_canonical_name: String,
     pub parent_generation: i32,
     pub new_generation: i32,
+    /// Left out as in [`IngestWorkflowResponse::workflow_id`].
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub workflow_id: String,
     pub claims_ingested: usize,
     pub already_ingested: bool,
+}
+
+/// The highest generation of `canonical_name`, read on the ingest system
+/// agent's stamp: the identity whose plan walk the new generation goes
+/// through, and which reads every group it ingests into. Since migration 183 a
+/// `workflows` row carries its plan's tenancy, so the plain pool would see
+/// public generations only and number a new generation at or below a
+/// group-private head; the walk would then find that row and write nothing.
+/// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a development
+/// superuser) the plain pool is read, as before.
+async fn lineage_max_generation(
+    server: &EpiGraphMcpFull,
+    canonical_name: &str,
+) -> Result<Option<i32>, McpError> {
+    match server.scoped.as_ref() {
+        Some(scoped) => {
+            let authority = epigraph_ingest_executor::system_agent_write_authority(scoped)
+                .await
+                .map_err(internal_error)?;
+            let mut tx = scoped
+                .begin_as(&authority.viewer)
+                .await
+                .map_err(internal_error)?;
+            let max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
+                &mut *tx,
+                canonical_name,
+            )
+            .await
+            .map_err(internal_error)?;
+            tx.commit().await.map_err(internal_error)?;
+            Ok(max)
+        }
+        None => epigraph_db::WorkflowRepository::max_generation_by_canonical(
+            &server.pool,
+            canonical_name,
+        )
+        .await
+        .map_err(internal_error),
+    }
 }
 
 /// Inner helper: same as [`improve_workflow_hierarchy_via_pool`] but also
@@ -649,23 +779,20 @@ async fn improve_workflow_hierarchy_with_inserted(
     mut extraction: WorkflowExtraction,
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<(ImproveWorkflowHierarchyResponse, Vec<(uuid::Uuid, String)>), McpError> {
-    let parent_max = epigraph_db::WorkflowRepository::max_generation_by_canonical(
-        &server.pool,
-        parent_canonical_name,
-    )
-    .await
-    .map_err(internal_error)?
-    .ok_or_else(|| {
-        invalid_params(format!(
-            "no workflow with canonical_name={parent_canonical_name}"
-        ))
-    })?;
+    let parent_max = lineage_max_generation(server, parent_canonical_name)
+        .await?
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "no workflow with canonical_name={parent_canonical_name}"
+            ))
+        })?;
 
     let new_generation = parent_max + 1;
 
     extraction.source.canonical_name = parent_canonical_name.to_string();
-    extraction.source.generation = u32::try_from(new_generation)
-        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.generation = u32::try_from(new_generation).map_err(|e| {
+        crate::errors::internal_error_logged("new_generation does not fit in u32", e)
+    })?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let (response, inserted) =
@@ -715,8 +842,9 @@ pub async fn improve_workflow_hierarchy_via_pool(
             })?;
     let new_generation = parent_max + 1;
     extraction.source.canonical_name = parent_canonical_name.to_string();
-    extraction.source.generation = u32::try_from(new_generation)
-        .map_err(|e| internal_error(format!("new_generation does not fit in u32: {e}")))?;
+    extraction.source.generation = u32::try_from(new_generation).map_err(|e| {
+        crate::errors::internal_error_logged("new_generation does not fit in u32", e)
+    })?;
     extraction.source.parent_canonical_name = Some(parent_canonical_name.to_string());
 
     let response = do_ingest_workflow_via_pool(pool, viewer, &extraction).await?;
@@ -762,12 +890,7 @@ pub async fn improve_workflow_hierarchy(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&goal).await {
             Ok(qvec) => {
-                if let Err(e) =
-                    epigraph_db::WorkflowRepository::set_goal_embedding(&server.pool, wf_id, &qvec)
-                        .await
-                {
-                    tracing::warn!(workflow_id=%wf_id, error=?e, "set_goal_embedding failed");
-                }
+                store_workflow_goal_embedding(server, wf_id, &qvec).await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");

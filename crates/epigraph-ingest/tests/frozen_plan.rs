@@ -243,6 +243,7 @@ fn input(edges: Vec<ExecutesEdge>) -> FrozenPlanInput {
         truth_value: 1.0,
         submitter: Some(Uuid::from_u128(0xa1)),
         edges,
+        chain_order: Vec::new(),
     }
 }
 

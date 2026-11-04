@@ -133,21 +133,28 @@ fn signing_key_verdict(
 /// What `verify_claim` reports about which key signed a claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyBinding {
-    /// The stored signature verifies under the signer's `agents.public_key` or
-    /// under an attested key (`signing` / `identity-legacy`) of the claim's
-    /// signer or author.
+    /// The stored signature verifies under a key ADMITTED for the claim's
+    /// `created_at` (backlog `06a50a30`, the edge verifier's rule): an attested
+    /// key (`signing` / `identity-legacy`) of the claim's signer or author
+    /// whose status and window admit it, or the signer's `agents.public_key`
+    /// when no attested row carries those bytes.
     pub signature_valid: bool,
     /// The verifying key is an attested key of the claim's AUTHOR that was
     /// valid when the claim was created.
     pub key_bound: bool,
-    /// The kind of the verifying key: the bound key's kind when bound, else
-    /// the kind of an attested key that verifies, else [`KEY_KIND_UNATTESTED`]
-    /// when only the signer's `agents.public_key` verifies; `None` when nothing
-    /// verifies.
+    /// The kind of the verifying ADMITTED key: the bound key's kind when
+    /// bound, else the kind of an admitted attested key that verifies, else
+    /// [`KEY_KIND_UNATTESTED`] when only the signer's admitted
+    /// `agents.public_key` verifies; `None` when nothing admitted verifies.
     pub key_kind: Option<&'static str>,
+    /// The message the verifying key's signature was made over (ruling R-34):
+    /// `v1` (claim-tagged) or `legacy` (the bare digest), for the same key
+    /// `key_kind` names; `None` when nothing verifies.
+    pub signature_scheme: Option<epigraph_crypto::SignatureScheme>,
 }
 
-/// How far before a key's `valid_from` a claim may be dated and still bind.
+/// How far before a key's `valid_from` a claim may be dated and still bind:
+/// the shared window rule's skew ([`epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS`]).
 ///
 /// `claims.created_at` is stamped by the writer's clock (`Claim::new`) and
 /// `valid_from` by the database's (`now()` at registration), so a writer a
@@ -156,58 +163,23 @@ pub struct KeyBinding {
 /// the writer and is not covered by the signature, so the lower bound never
 /// stopped a determined backdater. Only the LOWER bound is relaxed; a window's
 /// END (rotation, the legacy cut-over) stays exact.
-pub const VALID_FROM_SKEW_SECS: i64 = 60;
+pub const VALID_FROM_SKEW_SECS: i64 = epigraph_db::repos::agent_key::KEY_VALID_FROM_SKEW_SECS;
 
-/// Whether an attested key row was valid at `at`: inside `[valid_from -
-/// VALID_FROM_SKEW_SECS, valid_until)`, and ACTIVE, or ROTATED / EXPIRED with a
-/// recorded `valid_until` (a rotated key with an open window records no end,
-/// so it binds nothing). A REVOKED or PENDING key binds nothing: a revoked key
-/// is treated as compromised from the start.
-fn valid_at(row: &AttestedKeyRow, at: DateTime<Utc>) -> bool {
-    window_admits(&row.status, row.valid_from, row.valid_until, at)
-}
-
-/// [`valid_at`] over the fields alone, shared with the boot verdict so the
-/// boot check and `verify_claim` cannot disagree about a window. `status` is
-/// in the SQL spelling (`lower(btrim(..))`).
+/// Whether a key row with this status and window admits `at`: inside
+/// `[valid_from - VALID_FROM_SKEW_SECS, valid_until)`, and ACTIVE, or ROTATED
+/// / EXPIRED with a recorded `valid_until` (a rotated key with an open window
+/// records no end, so it admits nothing). A REVOKED or PENDING key admits
+/// nothing: a revoked key is treated as compromised from the start. It IS the
+/// repository's [`epigraph_db::repos::agent_key::key_window_admits`], which
+/// the shared admission rule `verify_claim` and the edge verifier apply calls
+/// too, so the boot check and both verifiers cannot disagree about a window.
 fn window_admits(
     status: &str,
     valid_from: DateTime<Utc>,
     valid_until: Option<DateTime<Utc>>,
     at: DateTime<Utc>,
 ) -> bool {
-    let opens = valid_from - chrono::Duration::seconds(VALID_FROM_SKEW_SECS);
-    if at < opens || valid_until.is_some_and(|until| at >= until) {
-        return false;
-    }
-    match status {
-        "active" => true,
-        "rotated" | "expired" => valid_until.is_some(),
-        _ => false,
-    }
-}
-
-fn kind_of(row: &AttestedKeyRow) -> Option<&'static str> {
-    match row.key_type.as_str() {
-        KEY_KIND_SIGNING => Some(KEY_KIND_SIGNING),
-        KEY_KIND_IDENTITY_LEGACY => Some(KEY_KIND_IDENTITY_LEGACY),
-        _ => None,
-    }
-}
-
-/// The first `signing` row, else the first row: a `signing` key is preferred
-/// over a legacy one when both qualify.
-fn prefer_signing<'a>(
-    rows: impl Iterator<Item = &'a AttestedKeyRow>,
-) -> Option<&'a AttestedKeyRow> {
-    let mut first = None;
-    for row in rows {
-        if row.key_type == KEY_KIND_SIGNING {
-            return Some(row);
-        }
-        first = first.or(Some(row));
-    }
-    first
+    epigraph_db::repos::agent_key::key_window_admits(status, valid_from, valid_until, at)
 }
 
 /// Bind a claim's signature to a key (design D2).
@@ -220,6 +192,18 @@ fn prefer_signing<'a>(
 /// `signature_valid`. Only attested types are ever passed in (see
 /// `AgentKeyRepository::attested_keys_for_claim`), so no
 /// application-insertable row can make a signature valid.
+///
+/// Every key is ADMITTED first, by the rule the edge verifier applies
+/// ([`epigraph_db::repos::agent_key::admitted_signature_keys`], backlog
+/// `06a50a30`): an attested key only when its status and window admit
+/// `created_at`, and `signer_key` only when no row of `keys` carries those
+/// bytes. A revoked, pending or out-of-window key therefore verifies nothing,
+/// under its row or as the bare agent key. The message rule differs from the
+/// edge verifier's (a claim accepts the v1 claim message, then the legacy bare
+/// digest, ruling R-34), and so do the rows: `keys` are the attested rows of
+/// the claim's author AND signer, so an author's attested row carrying the
+/// signer's bare key governs it here, where the edge verifier reads the
+/// signer's rows only.
 #[must_use]
 pub fn bind_signature(
     digest: &[u8; 32],
@@ -229,38 +213,71 @@ pub fn bind_signature(
     created_at: DateTime<Utc>,
     keys: &[AttestedKeyRow],
 ) -> KeyBinding {
+    let unsigned = KeyBinding {
+        signature_valid: false,
+        key_bound: false,
+        key_kind: None,
+        signature_scheme: None,
+    };
     let Some(signature) = signature else {
-        return KeyBinding {
-            signature_valid: false,
-            key_bound: false,
-            key_kind: None,
-        };
+        return unsigned;
     };
-    let verifies = |key: &[u8]| {
-        <[u8; 32]>::try_from(key).is_ok_and(|key| {
-            epigraph_crypto::SignatureVerifier::verify(&key, digest, signature).unwrap_or(false)
-        })
-    };
-    let verifying: Vec<&AttestedKeyRow> = keys
+    let lifecycle: Vec<epigraph_db::repos::agent_key::KeyLifecycle<'_>> = keys
         .iter()
-        .filter(|k| kind_of(k).is_some() && verifies(&k.public_key))
+        .map(|k| epigraph_db::repos::agent_key::KeyLifecycle {
+            public_key: &k.public_key,
+            key_type: &k.key_type,
+            status: &k.status,
+            valid_from: k.valid_from,
+            valid_until: k.valid_until,
+        })
         .collect();
-    let signer_key_verifies = verifies(signer_key);
-
-    let bound = prefer_signing(
-        verifying
-            .iter()
-            .copied()
-            .filter(|k| k.agent_id == author && valid_at(k, created_at)),
+    let admitted = epigraph_db::repos::agent_key::admitted_signature_keys(
+        &lifecycle,
+        Some(signer_key.as_slice()),
+        created_at,
     );
-    let key_kind = bound
-        .and_then(kind_of)
-        .or_else(|| prefer_signing(verifying.iter().copied()).and_then(kind_of))
-        .or(signer_key_verifies.then_some(KEY_KIND_UNATTESTED));
+    // Versioned (ruling R-34): the claim-tagged v1 message first, then the
+    // legacy bare digest. A signature tagged for another kind verifies neither.
+    let verifying: Vec<(&epigraph_db::repos::agent_key::AdmittedKey, _)> = admitted
+        .iter()
+        .filter_map(|a| {
+            epigraph_crypto::SignatureVerifier::verify_entity(
+                &a.key,
+                epigraph_crypto::SignedEntity::Claim,
+                digest,
+                signature,
+            )
+            .ok()
+            .flatten()
+            .map(|scheme| (a, scheme))
+        })
+        .collect();
+    if verifying.is_empty() {
+        return unsigned;
+    }
+    // A `signing` key is preferred over a legacy one when both qualify, and an
+    // attested key over the bare agent key.
+    let pick = |author_only: bool| {
+        let mut candidates = verifying.iter().filter(|(a, _)| {
+            a.row
+                .is_some_and(|i| !author_only || keys[i].agent_id == author)
+        });
+        let first = candidates.clone().next();
+        candidates
+            .find(|(a, _)| a.kind == KEY_KIND_SIGNING)
+            .or(first)
+            .copied()
+    };
+    let bound = pick(true);
+    let named = bound
+        .or_else(|| pick(false))
+        .or_else(|| verifying.first().copied());
     KeyBinding {
-        signature_valid: signer_key_verifies || !verifying.is_empty(),
+        signature_valid: true,
         key_bound: bound.is_some(),
-        key_kind,
+        key_kind: named.map(|(a, _)| a.kind),
+        signature_scheme: named.map(|(_, scheme)| scheme),
     }
 }
 
@@ -369,7 +386,8 @@ mod tests {
     }
 
     /// A rotated key binds only inside a recorded window; with an open
-    /// window it binds nothing, because rotation records no time.
+    /// window it binds nothing, because rotation records no time, and (the
+    /// shared admission rule, backlog 06a50a30) it verifies nothing either.
     #[test]
     fn a_rotated_key_binds_only_inside_a_recorded_window() {
         let author = Uuid::new_v4();
@@ -390,7 +408,7 @@ mod tests {
         let b = bind_signature(&digest, Some(&sig), &[0; 32], author, at, &[closed]);
         assert!(b.signature_valid && b.key_bound, "{b:?}");
         let b = bind_signature(&digest, Some(&sig), &[0; 32], author, at, &[open]);
-        assert!(b.signature_valid && !b.key_bound, "{b:?}");
+        assert!(!b.signature_valid && !b.key_bound, "{b:?}");
     }
 
     /// `claims.created_at` is stamped by the WRITER's clock (`Claim::new`)
@@ -426,8 +444,8 @@ mod tests {
             std::slice::from_ref(&row),
         );
         assert!(
-            b.signature_valid && !b.key_bound,
-            "ten minutes early is not skew: {b:?}"
+            !b.signature_valid && !b.key_bound,
+            "ten minutes early is not skew, and the key is not admitted: {b:?}"
         );
     }
 
@@ -481,7 +499,8 @@ mod tests {
             KeyBinding {
                 signature_valid: true,
                 key_bound: false,
-                key_kind: Some(KEY_KIND_UNATTESTED)
+                key_kind: Some(KEY_KIND_UNATTESTED),
+                signature_scheme: Some(epigraph_crypto::SignatureScheme::Legacy),
             }
         );
         let b = bind_signature(&digest, None, &key.public_key(), author, Utc::now(), &[]);
@@ -490,8 +509,103 @@ mod tests {
             KeyBinding {
                 signature_valid: false,
                 key_bound: false,
-                key_kind: None
+                key_kind: None,
+                signature_scheme: None,
             }
         );
+    }
+    /// Ruling R-34 at the claim verifier: a claim-tagged v1 signature verifies
+    /// and says `v1`; the SAME key's evidence-tagged signature over the same
+    /// digest is not a claim signature, under the bare agent key or an
+    /// attested one.
+    #[test]
+    fn only_a_claim_tagged_or_legacy_signature_verifies_a_claim() {
+        use epigraph_crypto::{SignatureScheme, SignedEntity};
+        let author = Uuid::new_v4();
+        let key = AgentSigner::from_bytes(&[8; 32]).expect("key");
+        let digest = [4u8; 32];
+        let row = attested(
+            author,
+            &key,
+            "signing",
+            "active",
+            Utc::now() - Duration::hours(1),
+            None,
+        );
+
+        let v1 = key.sign_entity(SignedEntity::Claim, &digest);
+        let b = bind_signature(
+            &digest,
+            Some(&v1),
+            &key.public_key(),
+            author,
+            Utc::now(),
+            std::slice::from_ref(&row),
+        );
+        assert!(b.signature_valid && b.key_bound, "{b:?}");
+        assert_eq!(b.signature_scheme, Some(SignatureScheme::V1), "{b:?}");
+
+        let as_evidence = key.sign_entity(SignedEntity::Evidence, &digest);
+        for keys in [&[][..], std::slice::from_ref(&row)] {
+            let b = bind_signature(
+                &digest,
+                Some(&as_evidence),
+                &key.public_key(),
+                author,
+                Utc::now(),
+                keys,
+            );
+            assert_eq!(
+                b,
+                KeyBinding {
+                    signature_valid: false,
+                    key_bound: false,
+                    key_kind: None,
+                    signature_scheme: None,
+                },
+                "an evidence-tagged signature verified a claim"
+            );
+        }
+    }
+    /// Backlog 06a50a30: the bare agent key is admitted only when no attested
+    /// row carries its bytes. With a REVOKED row carrying them, the same
+    /// signature that verifies under the bare key alone verifies nothing.
+    #[test]
+    fn a_row_carrying_the_agent_key_governs_it() {
+        let author = Uuid::new_v4();
+        let key = AgentSigner::from_bytes(&[9; 32]).expect("key");
+        let digest = [5u8; 32];
+        let sig = key.sign(&digest);
+        let at = Utc::now();
+        let alone = bind_signature(&digest, Some(&sig), &key.public_key(), author, at, &[]);
+        assert!(alone.signature_valid, "calibration: {alone:?}");
+        for status in ["revoked", "pending"] {
+            let row = attested(
+                author,
+                &key,
+                KEY_KIND_IDENTITY_LEGACY,
+                status,
+                at - Duration::days(1),
+                None,
+            );
+            let b = bind_signature(
+                &digest,
+                Some(&sig),
+                &key.public_key(),
+                author,
+                at,
+                std::slice::from_ref(&row),
+            );
+            assert_eq!(
+                b,
+                KeyBinding {
+                    signature_valid: false,
+                    key_bound: false,
+                    key_kind: None,
+                    signature_scheme: None,
+                },
+                "a {status} row did not govern the agent key"
+            );
+        }
     }
 }

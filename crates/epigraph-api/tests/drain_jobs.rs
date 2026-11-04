@@ -104,35 +104,9 @@ async fn job_state(pool: &PgPool, id: Uuid) -> (String, Option<String>) {
         .expect("the job row")
 }
 
-/// Claims with cluster-biased 1536-d embeddings, so the theme rebuild has
-/// work to do (and so wipes the existing theme set, a DELETE on `claim_themes`).
-async fn seed_embedded_claims(pool: &PgPool, agent: Uuid, n: usize) {
-    for i in 0..n {
-        let cluster = i % 3;
-        let v: Vec<String> = (0..1536)
-            .map(|j| {
-                let bias = if j == cluster { 1.0 } else { 0.0 };
-                format!("{}", bias + ((i + j) as f32) * 1e-7)
-            })
-            .collect();
-        let content = format!("drain fixture {i} {}", Uuid::new_v4());
-        sqlx::query(
-            "INSERT INTO claims (content, content_hash, truth_value, agent_id, embedding) \
-             VALUES ($1, sha256($1::bytea), 0.5, $2, $3::vector)",
-        )
-        .bind(&content)
-        .bind(agent)
-        .bind(format!("[{}]", v.join(",")))
-        .execute(pool)
-        .await
-        .expect("seed an embedded claim");
-    }
-}
-
-/// Every one of the SIX handlers the drain registers, run on the maintenance
+/// Every one of the FIVE handlers the drain registers, run on the maintenance
 /// login: a graph clustering run (its retention sweep DELETEs from the four
-/// clustering tables), a theme rebuild (it wipes `claim_themes`), a
-/// privatization apply and then its revert (the real lifecycle: world, plan,
+/// clustering tables), a privatization apply and then its revert (the real lifecycle: world, plan,
 /// dispatch), a privatization reseal check (clears the group's flag), and an
 /// `embedding_generation` job (the owning provider's handler, with a mock
 /// embedder, writes the claim's vector). Any grant 119 missed fails its job
@@ -144,13 +118,6 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
     let claim = viewer_fixture::seed_public_claim(&pool, world.actor, "drain apply seed").await;
     let (plan, _) = fx::create_plan(&pool, &world, &[claim]).await;
     let correlation = fx::dispatch(&pool, &world, plan, "applying").await;
-    seed_embedded_claims(&pool, world.actor, 12).await;
-    sqlx::query(
-        "INSERT INTO claim_themes (label, description, claim_count) VALUES ('old', 'x', 0)",
-    )
-    .execute(&pool)
-    .await
-    .expect("seed a theme the rebuild must wipe");
     // A previous clustering run, so the retention sweep (retain_runs = 1)
     // deletes a run row and not only zero rows.
     let old_run = Uuid::new_v4();
@@ -168,15 +135,6 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
         EpiGraphJob::ClusterGraph {
             resolution: 1.0,
             retain_runs: 1,
-        },
-    )
-    .await;
-    let theme = enqueue(
-        &pool,
-        EpiGraphJob::ThemeClusterRebuild {
-            max_themes: 4,
-            min_claims_per_theme: 1,
-            skip_if_unchanged: false,
         },
     )
     .await;
@@ -231,7 +189,6 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
     );
     for (name, id) in [
         ("cluster_graph", cluster),
-        ("theme_cluster_rebuild", theme),
         ("privatization_apply", apply),
         ("embedding_generation", embed),
         ("privatization_reseal", reseal),
@@ -251,14 +208,7 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
         ("group".to_string(), world.target_group),
         "the apply job ran but the plan's claim did not move"
     );
-    let old_themes: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM claim_themes WHERE label = 'old'")
-            .fetch_one(&pool)
-            .await
-            .expect("count old themes");
-    assert_eq!(old_themes, 0, "the theme rebuild did not wipe the old set");
-    // The theme rebuild enqueues a follow-up clustering run, which this drain
-    // also runs; so count the OLD run, not the total.
+    // Count the OLD run, not the total: the run this drain made stays.
     let old_left: i64 =
         sqlx::query_scalar("SELECT count(*) FROM graph_cluster_runs WHERE run_id = $1")
             .bind(old_run)
@@ -284,7 +234,7 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
             .expect("the group");
     assert!(!still_flagged, "the reseal check did not clear the flag");
 
-    // The sixth handler: revert the applied plan.
+    // The fifth handler: revert the applied plan.
     let revert_correlation = fx::dispatch(&pool, &world, plan, "reverting").await;
     let revert = {
         let job = fx::revert_job(plan, world.actor, &revert_correlation);
@@ -311,8 +261,7 @@ async fn the_drain_runs_every_job_type_on_the_maintenance_login(pool: PgPool) {
         "the revert job ran but the plan's claim is still restricted"
     );
 
-    // A final run: nothing left, nothing done, exit 0. (The theme rebuild's
-    // follow-up enqueue, if it made one, was drained in the first run.)
+    // A final run: nothing left, nothing done, exit 0.
     let again = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
         .await
         .expect("the second drain ran");

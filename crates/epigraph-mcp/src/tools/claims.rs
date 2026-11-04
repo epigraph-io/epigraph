@@ -164,19 +164,6 @@ const METHODOLOGY_VOCABULARY: &[(&str, Methodology, &str)] = &[
     ("heuristic", Methodology::Heuristic, "abductive"),
 ];
 
-/// Load the evidence-type weight from CalibrationConfig.
-///
-/// I-3: Checks `CALIBRATION_PATH` env var first, then falls back to the
-/// relative path "calibration.toml". On any failure silently returns 0.7 so
-/// that DS wiring is never blocked by a missing config file.
-fn load_evidence_type_weight(evidence_type: &str) -> f64 {
-    let path = std::env::var("CALIBRATION_PATH").unwrap_or_else(|_| "calibration.toml".to_string());
-    epigraph_engine::calibration::CalibrationConfig::load(std::path::Path::new(&path))
-        .ok()
-        .map(|c| c.get_evidence_type_weight(evidence_type))
-        .unwrap_or(0.7)
-}
-
 fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType, String> {
     match s.to_lowercase().as_str() {
         "empirical" => Ok(EvidenceType::Observation {
@@ -416,14 +403,21 @@ async fn prepare_submission(
     let pub_key = server.signer.public_key();
     let confidence = params.confidence.clamp(0.0, 1.0);
 
-    let weight = load_evidence_type_weight(&params.evidence_type);
+    // The served calibration (`CALIBRATION_PATH`, else the compiled-in copy),
+    // never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(&params.evidence_type);
     let raw_truth = (confidence * weight).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
     let content_hash = ContentHasher::hash(params.content.as_bytes());
     claim.content_hash = content_hash;
-    claim.signature = Some(server.signer.sign(&content_hash));
+    claim.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Claim, &content_hash),
+    );
 
     // Write-side semantic novelty gate (backlog 1bcaed94, Task 6.4). Runs
     // ONLY on genuinely new content: a read-only content-hash existence
@@ -449,6 +443,7 @@ async fn prepare_submission(
             server.embedder.as_ref(),
             &params.content,
             novelty_threshold,
+            &params.labels,
         )
         .await
         {
@@ -601,12 +596,16 @@ async fn write_submission(
     // and a provider round trip must not hold a transaction open.
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
+    // The AUTHORED / DERIVED_FROM / HAS_TRACE verb-edges are attested at
+    // INSERT by this server's key (R-49/R-50); the signer is not their author.
+    let edge_key = server.edge_signing_key().await?;
     let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
         &mut *conn,
         viewer,
         claim,
         Some(signer_agent_id),
         tool_name,
+        Some(edge_key),
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();
@@ -640,7 +639,11 @@ async fn write_submission(
     );
     let evidence_with_sig = {
         let mut e = evidence;
-        e.signature = Some(server.signer.sign(&evidence_hash));
+        e.signature = Some(
+            server
+                .signer
+                .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+        );
         e
     };
 
@@ -723,6 +726,7 @@ async fn write_submission(
         "DERIVED_FROM",
         Some(serde_json::json!({"was_created": was_created})),
         tool_name,
+        Some(edge_key),
     )
     .await?;
     crate::claim_helper::emit_verb_edge_best_effort(
@@ -734,6 +738,7 @@ async fn write_submission(
         "HAS_TRACE",
         Some(serde_json::json!({"was_created": was_created})),
         tool_name,
+        Some(edge_key),
     )
     .await?;
 
@@ -1042,8 +1047,9 @@ pub async fn get_claim(
     // page-degrade semantics).
     let lensed_belief = match lens {
         Some((frame_id, perspective_id)) => {
-            let interval = epigraph_engine::belief_query::get_perspective_belief(
+            let interval = epigraph_engine::belief_query::get_perspective_belief_scoped(
                 &server.pool,
+                server.scoped.as_ref(),
                 viewer,
                 id,
                 frame_id,
@@ -1179,13 +1185,14 @@ pub async fn verify_claim(
         if epigraph_ingest::document::stored_content_hash_is_canonical_name_scoped(&properties) {
             // Workflow structural row: the seed is the canonical_name of the
             // workflow that executes it — recovered from the edge, not guessed.
-            let names = epigraph_db::WorkflowRepository::executing_canonical_names(
-                &server.pool,
-                viewer,
-                id,
-            )
-            .await
-            .map_err(internal_error)?;
+            // On the caller's read: the executing `workflows` rows carry
+            // their plan's tenancy (migration 183, ruling R-74).
+            let mut read = super::workflows::CallerRead::open(server, viewer).await?;
+            let names =
+                epigraph_db::WorkflowRepository::executing_canonical_names(read.conn(), viewer, id)
+                    .await
+                    .map_err(internal_error)?;
+            read.close().await?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
                 &claim.content,
                 &claim.content_hash,
@@ -1238,6 +1245,7 @@ pub async fn verify_claim(
         signed,
         key_bound: binding.key_bound,
         key_kind: binding.key_kind,
+        signature_scheme: binding.signature_scheme,
         hash_check,
         hash_matches: match hash_check {
             HashCheck::Match => Some(true),
@@ -1347,7 +1355,11 @@ pub async fn update_with_evidence(
         Some(params.evidence_data),
         ClaimId::from_uuid(claim_id),
     );
-    evidence.signature = Some(server.signer.sign(&evidence_hash));
+    evidence.signature = Some(
+        server
+            .signer
+            .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
+    );
 
     // HISTORY, kept short because the next block supersedes it: before D2 this
     // evidence INSERT was deliberately left UNSTAMPED. Stamped on its own it
@@ -1363,8 +1375,8 @@ pub async fn update_with_evidence(
     // "`Evidence::new` mints a fresh v4 UUID and `EvidenceRepository::create`
     // has no `ON CONFLICT`, so each retry appends another row". #497 measured
     // that premise wrong for an IDENTICAL retry: `content_hash` is
-    // `blake3(evidence_data)` and migration 001's
-    // `evidence_content_hash_claim_unique UNIQUE (content_hash, claim_id)`
+    // `blake3(evidence_data)` and the same-owner evidence de-duplication
+    // (`EvidenceRepository::create`; migration 001's unique key until 171)
     // refuses it as "Duplicate entity already exists". Only a RE-WORDED retry
     // adds a row. That makes a committed BBA-less row WORSE, not better: it
     // blocks the identical re-submission that would land the contribution.)
@@ -1505,9 +1517,10 @@ pub async fn update_with_evidence(
             .map_err(internal_error)?
             .and_then(|c| c.pignistic_prob);
 
-    // Load type_weight from calibration (replaces deleted evidence_weight())
-    // I-3: use helper that checks CALIBRATION_PATH env var before relative path
-    let weight = load_evidence_type_weight(&params.evidence_type);
+    // Type weight from the served calibration (`CALIBRATION_PATH`, else the
+    // compiled-in copy), never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight(&params.evidence_type);
 
     // ── CDST UPDATE — A FAILURE IS A RETURNED ERROR THAT ROLLS EVERYTHING BACK ──
     //
@@ -1526,7 +1539,7 @@ pub async fn update_with_evidence(
     // truth write, no labels — and an error is now the complete and truthful
     // answer. Swallowing it instead would commit exactly the BBA-less evidence
     // row the note above explains is worse than nothing (it blocks the identical
-    // re-submit via `evidence_content_hash_claim_unique`). The error text keeps
+    // re-submit via the same-owner evidence de-duplication). The error text keeps
     // the failing step as its prefix (`assign_claim:`, `store BBA:`,
     // `update_claim_belief:`, …), so the caller still learns WHICH step failed,
     // which is the part of #497's disclosure that still has a referent.
@@ -1538,7 +1551,21 @@ pub async fn update_with_evidence(
     // the same unit as its BBA.
     //
     // C-1: pass evidence UUID as perspective_id so each evidence gets its own BBA row
-    let ds = ds_auto::auto_wire_ds_update(
+    // A promoted hypothesis's readers read `research_validity`, never
+    // `binary_truth`, so its evidence is filed there (operator rulings R-8 and
+    // R-17), instead of on `binary_truth`, never on both: the fold reads every
+    // two-hypothesis frame and would count it twice. A missing or non-binary
+    // `research_validity` is the caller's refusal, with nothing written.
+    let file_on =
+        epigraph_engine::promotion::promoted_hypothesis_filing_frame(&mut tx, viewer, claim_id)
+            .await
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { .. }
+                | epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+                other => internal_error(other),
+            })?
+            .map(|frame| frame.id);
+    let ds = ds_auto::auto_wire_ds_update_filed_on(
         &mut tx,
         viewer,
         claim_id,
@@ -1549,6 +1576,7 @@ pub async fn update_with_evidence(
         Some(&params.evidence_type),
         Some(evidence.id.as_uuid()), // C-1: evidence UUID prevents BBA upsert overwrite
         !foreign_claim, // seed the authored truth_value only on a claim this caller writes
+        file_on,
     )
     .await
     .map_err(|e| {
@@ -2201,8 +2229,11 @@ pub async fn resolve_backlog_item(
         // private basis's group. A private basis is readable here only if it is
         // this agent's own (the viewer check above), so its edge lands in a group
         // this stamp can write.
-        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
+        // returns the existing edge unchanged.
+        let (row, _was_created) = epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
             &mut tx,
+            Some(server.edge_signing_key().await?),
             *basis_uuid,
             "claim",
             resolution_uuid,
@@ -2433,6 +2464,76 @@ async fn gate_retirement_label(
     Ok(Some(grant))
 }
 
+/// The `data.rule` of [`label_not_writer`].
+pub const LABEL_NOT_WRITER_RULE: &str = "label_requires_claim_group_writer";
+
+/// The named refusal for a label write (`update_labels`, `patch_claim`, an
+/// `apply_label_dedup` unit) onto a claim whose owning group the write's stamp
+/// cannot write (backlog 3e7bfee3).
+///
+/// Migration 077's `claims_tenancy` `WITH CHECK` refuses the `UPDATE claims`
+/// with `42501` when the claim's `owner_group_id` is not in the stamp's
+/// writable set. That is a denial of authority, so it is `INVALID_REQUEST`
+/// (like `crate::errors::claim_not_writer`), not the `INTERNAL_ERROR` a server
+/// fault takes: no retry of the same request can succeed. It does not name the
+/// owning group (no claim read surface returns `owner_group_id`), and it names
+/// the two ways in: the audited admin path, or the owning group's own writer.
+fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot {action} claim {claim_id}: the claim is owned by a group this write's \
+             identity holds no live writer or admin membership in, so the database refused \
+             the write; nothing was written. Make the change as a writer of that group \
+             (the owning agent's key), or through the audited admin path over HTTP with a \
+             claims:admin token"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": LABEL_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// Map the error of a label `UPDATE claims` on a stamped transaction for the
+/// caller: the row-security `WITH CHECK` refusal ON `claims` itself (uncoded
+/// `42501`, "new row violates row-level security policy ... for table
+/// \"claims\"") is [`label_not_writer`]; everything else keeps
+/// [`db_caller_error`], so a CODED `42501` a trigger raises (a designed
+/// refusal), or a row-security refusal on ANOTHER table a trigger writes,
+/// still reaches the caller as it was before.
+///
+/// `patch_claim` routes every write through here, including a
+/// properties-only or trace-only patch: it is the same `UPDATE claims`, so the
+/// same refusal, and the message names no label-specific remedy.
+///
+/// Mapped at the statement rather than preflighted against the stamp's
+/// writable set, so it changes the ANSWER only, never which writes are
+/// admitted: the database's own decision stays the one that counts.
+fn label_write_error(e: epigraph_db::DbError, claim_id: Uuid, action: &str) -> McpError {
+    let refused_by_row_security = matches!(
+        &e,
+        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
+            if d.code().as_deref() == Some("42501")
+                && d.message().starts_with("new row violates row-level security policy")
+                && d.message().ends_with("for table \"claims\"")
+    );
+    if refused_by_row_security {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            claim_id = %claim_id,
+            action,
+            error = %e,
+            "label write refused by row security: the claim's owning group is not in the \
+             stamp's writable set; nothing was written"
+        );
+        return label_not_writer(claim_id, action);
+    }
+    db_caller_error(e)
+}
+
 pub async fn update_labels(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -2562,9 +2663,11 @@ pub(crate) async fn relabel_claim(
         .await?
         .labels
     } else {
+        // A claim owned by a group the stamp cannot write: the named
+        // `label_not_writer` refusal, not an internal error (backlog 3e7bfee3).
         ClaimRepository::update_labels_conn(tx, id, add, remove)
             .await
-            .map_err(db_caller_error)?
+            .map_err(|e| label_write_error(e, id, "relabel"))?
     };
     Ok(RelabelOutcome { labels, admin_path })
 }
@@ -2681,7 +2784,7 @@ pub async fn patch_claim(
             },
         )
         .await
-        .map_err(db_caller_error)?;
+        .map_err(|e| label_write_error(e, id, "patch"))?;
         (diff.after_labels, diff.after_props, diff.after_trace)
     };
     tx.commit().await.map_err(internal_error)?;

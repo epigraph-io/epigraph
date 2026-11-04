@@ -1,20 +1,23 @@
 //! Library-level `recall` function.
 //!
 //! Lifted from `epigraph-mcp/src/tools/memory.rs` so episcience and other
-//! crates can call it with `(pool, embedder, query, limit, min_truth)` without
-//! spawning MCP-over-stdio.
+//! crates can call it with `(pool, scoped, viewer, embedder, query, limit,
+//! min_truth)` without spawning MCP-over-stdio.
 //!
-//! The MCP handler in `tools/memory.rs` becomes a thin adapter that delegates
-//! here and shapes the result into a `CallToolResult`.
+//! The MCP `recall` tool (`tools/memory.rs::recall`) does NOT delegate here: it
+//! runs its own hybrid / lexical pipeline. This function has no production
+//! caller in this workspace; its consumer is episcience's synthesis pipeline.
 //!
 //! # Fallback behaviour
 //!
 //! If `embedder.generate_query` fails (e.g. no API key), the function falls
-//! back to text search via `ClaimRepository::list`. This matches the existing
-//! MCP behaviour.
+//! back to an ILIKE text search over **current** claims via
+//! `ClaimRepository::list_filtered`. Both legs serve current rows only: the
+//! semantic leg reads `search_by_embedding_current`, and the fallback filters
+//! `is_current` in SQL before `LIMIT` (supersede SPEC K11).
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimRepository, PgPool};
+use epigraph_db::{ClaimListFilter, ClaimRepository, PgPool, ScopedPool};
 use epigraph_embeddings::EmbeddingService;
 use thiserror::Error;
 
@@ -59,6 +62,12 @@ pub struct RecallResult {
     pub is_contested: bool,
     /// The three strongest contesters (by their own `truth_value`).
     pub contesting_claim_ids: Vec<uuid::Uuid>,
+    /// The claim row's own `is_current`, as read on the row this result was
+    /// built from (never a literal). Both legs select current rows only, so it
+    /// is `true` unless the claim was retired between the semantic leg's ANN
+    /// page and its `get_by_id` read; it is carried so that a consumer can
+    /// check currency without a second read rather than assume it.
+    pub is_current: bool,
 }
 
 /// Format a `Vec<f32>` as a pgvector string literal `[a,b,c,...]`.
@@ -72,11 +81,23 @@ fn format_pgvector(vec: &[f32]) -> String {
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
 ///
-/// Falls back to `ClaimRepository::list` text search when `embedder` returns
-/// an error (e.g. embeddings disabled, no API key).
+/// Falls back to an ILIKE text search over current claims
+/// ([`text_search_fallback`]) when `embedder` returns an error (e.g.
+/// embeddings disabled, no API key).
 ///
 /// # Parameters
-/// - `pool`      — live database connection pool
+/// - `pool`      — live database connection pool the recall READS on
+/// - `scoped`    — the caller's tenancy-aware pool, which the audit row is
+///   WRITTEN through (backlog 41841f7b). Required, not optional: as the
+///   application role `recall_events_tenancy` admits an audit row only on a
+///   connection stamped with the principal the row names, and `pool` is not
+///   stamped. See [`log_recall_event`].
+/// - `viewer`    — who the recall runs as; its principal is the audit row's
+///   `agent_id`. A `Bypass` viewer has no principal: its audit row is
+///   agent-less and is written on `pool`, so a `Bypass` viewer MUST be paired
+///   with the maintenance connection pool its lease came from. On an
+///   application-role `pool` that row is refused by `recall_events_tenancy`
+///   (the recall is still served; the audit row is lost with a warning).
 /// - `embedder`  — embedding service; only `generate_query` is called
 /// - `query`     — natural-language query string
 /// - `limit`     — maximum number of results to return (clamped 1–50 by callers)
@@ -91,6 +112,7 @@ fn format_pgvector(vec: &[f32]) -> String {
 /// Embedding errors cause silent fallback, not a returned error.
 pub async fn recall(
     pool: &PgPool,
+    scoped: &ScopedPool,
     viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn EmbeddingService,
     query: &str,
@@ -143,6 +165,8 @@ pub async fn recall(
                                 dispute_count: 0,
                                 is_contested: false,
                                 contesting_claim_ids: Vec::new(),
+                                // `get_by_id` post-fixes the row's real state.
+                                is_current: claim.is_current,
                             });
                         }
                     }
@@ -156,21 +180,22 @@ pub async fn recall(
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
-        // to text search. This matches the existing MCP behaviour.
+        // to the current-only text search.
         text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
     };
 
     let mut results = results;
     annotate_disputes(pool, viewer, &mut results).await;
 
-    // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path — episcience
-    // synthesis calls it directly, with no MCP request and therefore no auth
-    // context, so the row carries agent_id = NULL. Migration 058 made that
-    // column nullable for exactly this caller: a retrieval that fed a synthesis
-    // decision is worth auditing even when no agent identity is attached, and
-    // `tool` still distinguishes it from the MCP surfaces.
+    // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path —
+    // episcience synthesis calls it directly, with no MCP request — but not a
+    // principal-less one: the caller's `viewer` names who the recall ran as, and
+    // that principal owns the row (backlog 41841f7b). `tool` distinguishes it
+    // from the MCP surfaces.
     log_recall_event(
         pool,
+        scoped,
+        viewer,
         query,
         pgvec_for_audit.as_deref(),
         limit,
@@ -182,12 +207,54 @@ pub async fn recall(
     Ok(results)
 }
 
-/// Fire-and-forget recall audit write for the library path.
+/// Why an engine recall audit row was not written. Either way the recall is
+/// served.
+#[derive(Debug)]
+enum AuditNotWritten {
+    /// The principal holds no live membership of a personal group, so nothing
+    /// can own the row: it is DROPPED, never widened to instance-wide.
+    NoLivePersonalGroup,
+    /// The owner lookup, the insert or the commit failed.
+    Write(epigraph_db::DbError),
+}
+
+/// Best-effort recall audit write for the library path.
 ///
 /// Best-effort like its MCP siblings: a failed audit write warns and leaves the
-/// already-computed results untouched.
+/// already-computed results untouched. Awaited rather than spawned: the
+/// library's callers are background jobs, not a request path.
+///
+/// # Where the row is written (backlog 41841f7b)
+///
+/// `recall_events_tenancy` (migration 077) admits a non-bypass insert only when
+/// `epigraph_principal_id() IS NOT NULL AND agent_id = epigraph_principal_id()`.
+/// This function used to write `agent_id = NULL` on the caller's unstamped
+/// `pool`, which that check refuses STRUCTURALLY for `epigraph_app`: the
+/// episcience worker logged `new row violates row-level security policy for
+/// table "recall_events"` on every synthesis and the audit trail was empty.
+///
+/// For a viewer with a principal the row is now `(agent_id = principal,
+/// ('group', <principal's personal group>))`, resolved and inserted on ONE
+/// transaction of `scoped` stamped from that principal's own scoped viewer, so
+/// the policy is satisfied by construction. This mirrors the MCP surfaces'
+/// `tools/recall.rs::write_recall_audit`. `Viewer::detach_scoped` drops an
+/// elevation (an elevated viewer may not open a write transaction); the
+/// personal group must be in the viewer's live group set, as the MCP twin
+/// checks, so a revoked principal's row is dropped rather than owned by the
+/// group it lost.
+///
+/// A `Bypass` viewer has no principal: its row stays agent-less and
+/// instance-wide, written on `pool`. That is the only agent-less row this path
+/// writes, and it is admitted only through the bypass arm, so it lands only
+/// when the caller honours [`recall`]'s contract and passes the maintenance
+/// pool with a `Bypass` viewer. It is not routed through `scoped` instead:
+/// `ScopedPool::begin_as` refuses a `Bypass` viewer, and minting a maintenance
+/// lease inside this library would grant a bypass the caller never asked for.
+#[allow(clippy::too_many_arguments)]
 async fn log_recall_event(
     pool: &PgPool,
+    scoped: &ScopedPool,
+    viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     pgvec: Option<&str>,
     limit: usize,
@@ -198,23 +265,66 @@ async fn log_recall_event(
         .iter()
         .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
         .collect();
-    let event = epigraph_db::NewRecallEvent {
-        id: uuid::Uuid::new_v4(),
-        agent_id: None,
-        tool: "engine::recall".to_string(),
-        query_text: query.to_string(),
-        query_pgvector: pgvec.map(ToString::to_string),
-        params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
-        returned_claim_ids,
-        // No principal on this path — `agent_id` above is `None` for the same
-        // reason — so there is no personal group to own the row. See
-        // `RecallEventRepository::log` for why a memberless sentinel group
-        // cannot stand in and why the write is not refused instead.
-        owner_group_id: None,
+    let event = |agent_id: Option<uuid::Uuid>, owner_group_id: Option<uuid::Uuid>| {
+        epigraph_db::NewRecallEvent {
+            id: uuid::Uuid::new_v4(),
+            agent_id,
+            tool: "engine::recall".to_string(),
+            query_text: query.to_string(),
+            query_pgvector: pgvec.map(ToString::to_string),
+            params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
+            returned_claim_ids,
+            owner_group_id,
+        }
     };
-    if let Err(e) = epigraph_db::RecallEventRepository::log(pool, event).await {
-        tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");
+    let written = match viewer.detach_scoped() {
+        Some(own) => {
+            write_as_principal(scoped, &own, |principal, group| {
+                event(Some(principal), Some(group))
+            })
+            .await
+        }
+        None => epigraph_db::RecallEventRepository::log(pool, event(None, None))
+            .await
+            .map(|_| ())
+            .map_err(AuditNotWritten::Write),
+    };
+    match written {
+        Ok(()) => {}
+        Err(AuditNotWritten::NoLivePersonalGroup) => tracing::warn!(
+            "engine recall audit skipped rather than widened: the principal holds no live \
+             personal group; recall unaffected"
+        ),
+        Err(AuditNotWritten::Write(e)) => {
+            tracing::warn!(error = %e, "engine recall audit log failed; recall unaffected");
+        }
     }
+}
+
+/// Resolve `own`'s personal group and insert the audit row on ONE transaction
+/// of `scoped` stamped from `own`, then commit. See [`log_recall_event`].
+async fn write_as_principal(
+    scoped: &ScopedPool,
+    own: &epigraph_db::visibility::Viewer,
+    build: impl FnOnce(uuid::Uuid, uuid::Uuid) -> epigraph_db::NewRecallEvent,
+) -> Result<(), AuditNotWritten> {
+    let Some(principal) = own.principal() else {
+        // `detach_scoped` only returns principal-bearing viewers.
+        return Err(AuditNotWritten::NoLivePersonalGroup);
+    };
+    let mut tx = scoped.begin_as(own).await.map_err(AuditNotWritten::Write)?;
+    let group =
+        epigraph_db::GroupMembershipRepository::visible_personal_group_conn(&mut tx, principal)
+            .await
+            .map_err(AuditNotWritten::Write)?;
+    let group = match group {
+        Some(g) if own.group_bind().is_some_and(|live| live.contains(&g)) => g,
+        _ => return Err(AuditNotWritten::NoLivePersonalGroup),
+    };
+    epigraph_db::RecallEventRepository::log(&mut *tx, build(principal, group))
+        .await
+        .map_err(AuditNotWritten::Write)?;
+    tx.commit().await.map_err(AuditNotWritten::Write)
 }
 
 /// Batched dispute annotation (backlog 34d3400d), shared by the semantic and
@@ -279,7 +389,17 @@ async fn effective_beliefs(
     }
 }
 
-/// Text-search fallback via `ClaimRepository::list` with `ILIKE` filter.
+/// Text-search fallback: `content ILIKE '%query%'` over **current** claims,
+/// newest first.
+///
+/// The currency predicate is `ClaimListFilter::is_current`, which
+/// `ClaimRepository::list_filtered` applies in SQL before `LIMIT`. It must not
+/// move after the fetch: the page is ordered by `created_at`, so a retired
+/// revision is usually NEWER than the current match it competes with, and a
+/// filter over the already-cut page would drop it and leave the page short or
+/// empty instead of serving the current match (supersede SPEC K11).
+/// `ClaimRepository::list`, which this used to call, has no currency
+/// predicate at all.
 async fn text_search_fallback(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -287,7 +407,12 @@ async fn text_search_fallback(
     limit: i64,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    let claims = ClaimRepository::list(pool, viewer, limit, 0, Some(query)).await?;
+    let filter = ClaimListFilter {
+        search: Some(query),
+        is_current: Some(true),
+        ..ClaimListFilter::default()
+    };
+    let claims = ClaimRepository::list_filtered(pool, viewer, &filter, limit, 0).await?;
     // Same one-round-trip DS resolution the semantic leg does, so the two legs
     // cannot gate on different columns (backlog 14b98adc).
     let scores = effective_beliefs(
@@ -314,6 +439,7 @@ async fn text_search_fallback(
             dispute_count: 0,
             is_contested: false,
             contesting_claim_ids: Vec::new(),
+            is_current: c.is_current,
         })
         .collect())
 }
@@ -375,6 +501,6 @@ mod tests {
         let config = EmbeddingConfig::local(64);
         let provider = MockProvider::new(config);
         let _: &dyn EmbeddingService = &provider;
-        // If this compiles, recall(&pool, &provider, ...) will also compile.
+        // If this compiles, recall(&pool, &scoped, &viewer, &provider, ...) will also compile.
     }
 }

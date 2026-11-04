@@ -99,7 +99,7 @@ pub async fn scan_conflicts(
                 COUNT(*) AS bba_count, c.content \
          FROM mass_functions mf \
          JOIN claims c ON c.id = mf.claim_id \
-         WHERE mf.conflict_k >= $1 \
+         WHERE mf.conflict_k >= $1 AND mf.retracted_at IS NULL \
          GROUP BY mf.claim_id, mf.frame_id, c.content \
          ORDER BY max_k DESC \
          LIMIT $2",

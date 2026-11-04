@@ -1397,6 +1397,161 @@ async fn a_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) 
         .contains(&FAMILY.to_string()));
 }
 
+/// A lifecycle unit (an aged-out signal) whose target the caller does not own
+/// takes the same `other_targets` ownership check as a hygiene or close-out
+/// target: on an application-role server over stdio, the stranger's aged-out
+/// signal fails alone with `TARGET_NOT_OWNED` and stays byte-identical, and the
+/// agent's own aged-out signal in the same apply commits (backlog effa09d9).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lifecycle_target_the_caller_does_not_own_fails_only_its_own_unit(pool: PgPool) {
+    const SIGNAL: &str = "tracked-signal";
+    let mut profile = profile_value();
+    profile["lifecycle"] = json!({
+        "signal_family_label": SIGNAL,
+        "signal_family_kind": "index",
+        "signal_exclude_labels": ["resolved"],
+        "target_exclude_labels": [],
+        "age_key": ["created_at"],
+        "max_age_days": 30,
+        "graduate_add": ["resolved", "{run_tag}"],
+        "age_out_add": ["resolved", "{run_tag}"]
+    });
+    let bytes = serde_json::to_vec(&profile).expect("json");
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) = app_role_server(
+        &pool,
+        config_allowing(Some(&root), None, 5000, &[FAMILY, SIGNAL]),
+    )
+    .await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "signal-other").await;
+    // Two signals well past max_age_days on AS_OF, with no strong id any
+    // member carries: both age out (neither graduates).
+    let mine = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        "Culvert inspection lead | Acme Roads Office | ref ACME-310001",
+        &[SIGNAL],
+        "2026-08-01T00:00:00Z",
+    )
+    .await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "public",
+        "Bridge deck inspection lead | Acme Roads Office | ref ACME-310002",
+        &[SIGNAL],
+        "2026-08-02T00:00:00Z",
+    )
+    .await;
+    let foreign_before = snapshot(&pool, &[theirs]).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), &["lifecycle"]);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let (my_unit, their_unit) = (format!("lifecycle:{mine}"), format!("lifecycle:{theirs}"));
+    for unit in [&my_unit, &their_unit] {
+        assert!(
+            unit_writes(&plan)
+                .iter()
+                .any(|u| u["unit"] == unit.as_str()),
+            "precondition: the plan ages out {unit}: {plan}"
+        );
+    }
+    assert_eq!(
+        unit_check(&plan, &their_unit)["applies"],
+        false,
+        "predicted: {plan}"
+    );
+
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let failed = result_for(&out, &their_unit);
+    assert_eq!(failed["ok"], false, "{out}");
+    assert_eq!(failed["code"], "TARGET_NOT_OWNED", "{out}");
+    assert_eq!(snapshot(&pool, &[theirs]).await, foreign_before);
+    assert_eq!(result_for(&out, &my_unit)["ok"], true, "{out}");
+    let mine_after = labels_of(&pool, mine).await;
+    assert!(
+        mine_after.contains(&"resolved".to_string()) && mine_after.contains(&RUN_TAG.to_string()),
+        "the caller's own aged-out signal got age_out_add: {mine_after:?}"
+    );
+}
+
+/// `plan_label_dedup` is a read. For an identity that cannot open a write
+/// transaction (its viewer has no live writable group membership), write_check
+/// predicts every mark refused, with the reason, and the plan still answers
+/// instead of failing (backlog effa09d9). Positive control: the same plan
+/// while the membership is live predicts the mark may apply.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_plan_for_an_identity_with_no_writable_group_predicts_its_marks_refused(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let a = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let c = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let survivor: Uuid = plan["clusters"][0]["survivor"]
+        .as_str()
+        .and_then(|x| x.parse().ok())
+        .unwrap_or_else(|| panic!("precondition: one cluster: {plan}"));
+    let loser = if survivor == a { c } else { a };
+    let unit = format!("cluster:{survivor}");
+    let live = mark_check(unit_check(&plan, &unit), loser);
+    assert_eq!(live["may_mark"], true, "control, membership live: {plan}");
+
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("revoke every membership");
+    let viewer = Viewer::resolve(&pool, agent).await.expect("viewer");
+    assert!(
+        viewer.writable_groups().is_empty(),
+        "precondition: no writable group"
+    );
+
+    let plan = first_text(
+        &plan_label_dedup(&server, &viewer, p, None)
+            .await
+            .expect("a read-only plan answers without a writable group"),
+    );
+    let check = unit_check(&plan, &unit);
+    assert_eq!(check["applies"], false, "{plan}");
+    let refused = mark_check(check, loser);
+    assert_eq!(refused["may_mark"], false, "{plan}");
+    let reason = refused["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("no write transaction for this identity")
+            && reason.contains("no live writable group membership"),
+        "the refusal names why: {plan}"
+    );
+}
+
 // ── Apply, idempotency and revert ───────────────────────────────────────────
 
 /// The revert input an apply response carries, verbatim.
@@ -1601,6 +1756,14 @@ async fn one_revert_after_apply_restores_labels_marks_and_the_index(pool: PgPool
         .await
         .expect_err("an un-mark needs the administrative connection");
     assert_eq!(code(&err), "ADMIN_CONNECTION_REQUIRED", "{err:?}");
+    // It names the operator path for the marks and the label-only revert.
+    assert!(
+        err.message
+            .contains("`unmark_duplicate` CLI (`--applied-marks`)")
+            && err.message.contains("`applied_units` only"),
+        "{}",
+        err.message
+    );
     assert_eq!(snapshot(&pool, &ids).await, after, "nothing written");
 
     // THE REVERT: one call, the label writes newest first, then the mark.
@@ -2585,12 +2748,24 @@ async fn a_revert_after_the_canonical_was_superseded_restores_against_its_replac
     assert!(is_marked_onto(&pool, b, a).await, "{out}");
 
     let mut conn = pool.acquire().await.expect("acquire");
+    // The acting agent the act records (backlog 73085534): this
+    // fixture acts as the claim's own author.
+    let supersede_actor: uuid::Uuid =
+        sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(a)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the superseded claim's author");
     let (replacement, _) = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut conn,
         epigraph_core::ClaimId::from_uuid(a),
         &format!("{PUMP_A} (revised)"),
         epigraph_core::TruthValue::clamped(0.5),
         "revision",
+        epigraph_db::SupersedeActor::new(
+            supersede_actor,
+            epigraph_db::SupersedeTool::SupersedeClaim,
+        ),
     )
     .await
     .expect("supersede the canonical");

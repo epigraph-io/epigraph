@@ -237,12 +237,22 @@ pub async fn learn_convention(
     let trace_uuid = trace.id.as_uuid();
     let agent_uuid = system_agent.id.as_uuid();
 
-    let _ = epigraph_db::EdgeRepository::create(
-        pool, agent_uuid, "agent", claim_uuid, "claim", "AUTHORED", None, None, None,
+    let _ = epigraph_db::EdgeRepository::create_signed(
+        pool,
+        state.edge_signing_key(),
+        agent_uuid,
+        "agent",
+        claim_uuid,
+        "claim",
+        "AUTHORED",
+        None,
+        None,
+        None,
     )
     .await;
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         pool,
+        state.edge_signing_key(),
         evidence_uuid,
         "evidence",
         claim_uuid,
@@ -253,12 +263,22 @@ pub async fn learn_convention(
         None,
     )
     .await;
-    let _ = epigraph_db::EdgeRepository::create(
-        pool, trace_uuid, "trace", claim_uuid, "claim", "TRACES", None, None, None,
+    let _ = epigraph_db::EdgeRepository::create_signed(
+        pool,
+        state.edge_signing_key(),
+        trace_uuid,
+        "trace",
+        claim_uuid,
+        "claim",
+        "TRACES",
+        None,
+        None,
+        None,
     )
     .await;
-    let _ = epigraph_db::EdgeRepository::create(
+    let _ = epigraph_db::EdgeRepository::create_signed(
         pool,
+        state.edge_signing_key(),
         claim_uuid,
         "claim",
         trace_uuid,
@@ -355,8 +375,9 @@ pub async fn forget_convention(
     // handler autocommits on the raw pool, so this splits no transaction.
     // Best-effort, as before.
     if let Ok(mut tx) = state.write_as(&viewer, "forget_convention").await {
-        if epigraph_db::EdgeRepository::create(
-            &mut *tx,
+        if epigraph_db::EdgeRepository::create_signed_conn(
+            &mut tx,
+            state.edge_signing_key(),
             evidence.id.as_uuid(),
             "evidence",
             claim_id,
@@ -515,8 +536,9 @@ pub async fn share_skill(
     // statement of this handler autocommits on the raw pool, so this splits no
     // transaction.
     let mut tx = state.write_as(&viewer, "share_skill").await?;
-    let edge_id = epigraph_db::EdgeRepository::create(
-        &mut *tx,
+    let edge_id = epigraph_db::EdgeRepository::create_signed_conn(
+        &mut tx,
+        state.edge_signing_key(),
         shared_claim.id.as_uuid(),
         "claim",
         request.workflow_id,

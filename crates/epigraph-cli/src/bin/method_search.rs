@@ -297,11 +297,11 @@ Return 3-8 claims."#,
                 continue;
             };
 
-            // Create SUPPORTS edge from claim to hypothesis
+            // Create a supports edge (canonical lower-case spelling) from claim to hypothesis
             sqlx::query(
                 r#"
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                VALUES ($1, 'claim', $2, 'claim', 'SUPPORTS', '{}')
+                VALUES ($1, 'claim', $2, 'claim', 'supports', '{}')
                 ON CONFLICT DO NOTHING
                 "#,
             )

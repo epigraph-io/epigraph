@@ -129,7 +129,7 @@ did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK
 
 The `z` is base58btc multibase, the leading bytes inside the base58 payload are the multicodec prefix `0xed01` for Ed25519, and the rest is the 32-byte public key. Resolving a DID requires no network call — the public key is in the URI, so signature verification is purely local.
 
-Claim signatures and edge signatures use the same audit guarantee: the schema carries `signature` and `signer_id` columns on both `claims` and `edges` (edge signing was added in migration 073). Today claim signatures are universally populated; edge signing is realised per writer in the S3 plans documented in the noun/verb architecture doc — see "Edge signing" there for the current state of which writers sign. The `provenance_log` table records every create or patch independently of the row-level signature, so even an unsigned edge has a tamper-evident audit trail keyed by the requesting principal.
+The schema carries `signature`, `signer_id` and `content_hash` columns on `claims`, `evidence` and `edges` (all three since the initial schema). Every claim and evidence signature written by the MCP server and the in-tree CLIs is over an entity-tagged message, never a bare digest: `b"epigraph-sig-v1:<claim|evidence|edge>:" || digest` (`epigraph_crypto::signing_message`), and a new claim row stores only a v1 claim signature. The tag is the domain separation: a v1 signature over an evidence row's hash does not verify as a signature over a claim with the same hash. The exceptions: rows written before v1 carry a legacy signature over the bare digest; evidence signatures that HTTP packet clients supply are stored as sent (no evidence verifier checks them); and the canonical-JSON struct signatures (`Signable`, used by the harvester) and the `submit_packet` envelope signature are a separate, untagged scheme. The claim verifier tries the v1 message first and then the legacy bare digest, and reports which one verified (`verify_claim`'s `signature_scheme`: `v1` or `legacy`); a legacy signature binds no type, so a legacy evidence signature copied onto a same-content claim still verifies, reported `legacy`. The edge verifier accepts v1 only. Only the signed message changed: stored content hashes and every identity derived from one are unchanged. Claims and evidence written through MCP are signed. Edge signing has a defined attestation (`epigraph_db::repos::edge_signature`), a verifier and a coverage metric (`system_stats` with `detailed: true` reports `edges_signed` / `edges_unsigned`), but no edge writer signs yet; see "Edge signing" in the noun/verb architecture doc for the writer inventory and why. The `provenance_log` table records every create or patch independently of the row-level signature, so even an unsigned edge has a tamper-evident audit trail keyed by the requesting principal.
 
 Two flows mint different tokens, and it is easy to confuse them:
 
@@ -248,18 +248,17 @@ over claim embeddings. Themes are stored as rows in `claim_themes`
 each clustered claim points to one theme via `claims.theme_id` —
 theme membership is single-valued at the schema level. Themes are
 how you navigate the graph at coarser granularity than individual
-atoms; the `theme_cluster` MCP tool in
-[`crates/epigraph-mcp/src/tools/themes.rs`](../../crates/epigraph-mcp/src/tools/themes.rs)
-(re)builds them from the live corpus by running k-means over
-paragraph embeddings, with elbow-penalised search over
-`k_min..=k_max` when `k` is not pinned. The default `limit` is 500
-(VM OOMs at ~2000 embeddings, per `feedback_memory_limits.md`).
-`wipe_first` defaults to `false`: a run is additive, and because
-`claim_themes` has no `UNIQUE(label)` constraint, repeated additive
-runs under one `label_prefix` duplicate `auto-00, auto-01, …` rows.
-`wipe_first=true` is destructive: it deletes EVERY theme (whatever its
-prefix) and clears every `claims.theme_id`, so it needs `claims:admin`
-and is admitted only with the canonical `label_prefix` `"auto"`.
+atoms. They are built and maintained by the UMAP theme pipeline:
+`scripts/cluster_claims.py` (UMAP projection and clustering, run on the host
+for a full rebuild) and `scripts/maintain_themes.py` (incremental: assign
+unthemed claims, reassign by boundary ratio, split high-variance themes,
+recompute centroids, all through `/api/v1/themes/*`). Agents read them with
+the `list_themes` / `get_theme` MCP tools. The earlier k-means prototype
+(`theme_cluster`, `POST /api/v1/themes/build-from-corpus`, the
+`theme_cluster_rebuild` job) is retired; the `theme_cluster` name only
+answers "retired". Because `claim_themes` has no `UNIQUE(label)`
+constraint, the `auto-00, auto-01, …` rows that prototype left may repeat a
+label.
 
 Rule of thumb:
 

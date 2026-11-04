@@ -26,9 +26,9 @@
 //!
 //! # How expected values are computed
 //!
-//! The evidence BBA's mass is `strength * load_evidence_type_weight(..)`, and
-//! that weight depends on where the test process finds `calibration.toml`
-//! (`CALIBRATION_PATH`, else the cwd, else 0.7). So the tool-level tests read
+//! The evidence BBA's mass is `strength` times the evidence-type weight of the
+//! served calibration (`CalibrationConfig::cached()`: `CALIBRATION_PATH`, else
+//! the compiled-in copy; backlog d83b998a). So the tool-level tests read
 //! the evidence BBA this call STORED and compute the expected result from it
 //! with [`dempster`], a three-line binary Dempster's rule written out here, not
 //! borrowed from the code under test. The combine-time discount of an
@@ -193,8 +193,9 @@ async fn author_of(pool: &sqlx::PgPool, claim_id: Uuid) -> Uuid {
 
 /// Reported repro 1 (962bcd65's shape): t = 0.85 seeds {T 0.7, Θ 0.3}, and
 /// supporting evidence combines with it. Before the fix the prior was
-/// discarded: the evidence stood alone (BetP 0.71 under the 0.7 fallback
-/// weight, 0.80 under weight 1.0), below 0.85, with the spurious
+/// discarded: the evidence stood alone (BetP 0.80 at the calibrated
+/// `empirical` weight 1.0; 0.71 under the removed loader's 0.7 fallback),
+/// below 0.85, with the spurious
 /// "mathematically correct" warning.
 #[sqlx::test(migrations = "../../migrations")]
 async fn first_supporting_update_on_bba_less_claim_does_not_lower_betp_below_truth(

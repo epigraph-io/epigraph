@@ -1,0 +1,425 @@
+//! A supersession records the agent that PERFORMED it (backlog 73085534,
+//! operator ruling R-23).
+//!
+//! `ClaimRepository::supersede_act_conn` restates the retired claim under the
+//! retired claim's author (`claims.agent_id`), the documented contract the
+//! ruling keeps. Until this fix the acting agent appeared nowhere in the graph
+//! (only in the cascade's `security_events` rows), so a successor written by
+//! agent B read as agent A's work. The act now also writes ONE `AUTHORED` edge
+//! from the acting agent to the successor, in the act's own transaction, with
+//! the properties the workflow writes use for the same purpose (#600,
+//! `epigraph_ingest_executor::record_caller_authorship`).
+
+use epigraph_core::{ClaimId, TruthValue};
+use epigraph_db::{ClaimRepository, SupersedeActor};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+async fn seed_agent(pool: &PgPool, name: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type) \
+         VALUES (sha256(gen_random_uuid()::text::bytea), $1, 'system') RETURNING id",
+    )
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("seed agent")
+}
+
+async fn seed_claim(pool: &PgPool, author: Uuid) -> Uuid {
+    let text = format!("a claim to supersede {}", Uuid::new_v4());
+    sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2, true) RETURNING id",
+    )
+    .bind(&text)
+    .bind(author)
+    .fetch_one(pool)
+    .await
+    .expect("seed claim")
+}
+
+/// Every `AUTHORED` edge INTO `claim`: `(source_id, source_type, properties)`.
+async fn authored_into(pool: &PgPool, claim: Uuid) -> Vec<(Uuid, String, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT source_id, source_type, COALESCE(properties, '{}'::jsonb) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND target_type = 'claim' \
+          ORDER BY source_id",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("read AUTHORED edges")
+}
+
+/// Agent B supersedes agent A's claim: the successor keeps A as its author
+/// (the contract R-23 keeps) AND carries exactly one `AUTHORED` edge, from B,
+/// with the #600 properties. A gets no edge from the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_successor_keeps_its_author_and_records_the_acting_agent(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let old = seed_claim(&pool, a).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    let (new, returned_old) = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(old),
+        "a correction written by B",
+        TruthValue::clamped(0.6),
+        "B corrects A",
+        SupersedeActor::new(b, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("B's supersession lands");
+    tx.commit().await.expect("commit");
+    assert_eq!(returned_old, old);
+
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(new)
+        .fetch_one(&pool)
+        .await
+        .expect("the successor");
+    assert_eq!(author, a, "the successor inherits the predecessor's author");
+
+    assert_eq!(
+        authored_into(&pool, new).await,
+        vec![(
+            b,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )],
+        "exactly one AUTHORED edge, from the acting agent B, with the #600 properties \
+         and the act's reserved marker"
+    );
+}
+
+/// The edge is part of the ACT: when writing it fails, the act fails, and
+/// nothing of it lands (no successor, the predecessor still current), so a
+/// successor never exists without the record of who wrote it.
+///
+/// The failure is forced with a trigger on `edges` that raises only for an
+/// `AUTHORED` insert (the technique of
+/// `epigraph-engine/tests/admin_cascade_failed_reason.rs`), so the act's
+/// other writes, including its `supersedes` edge, go through.
+///
+/// Verified to fail: the edge write's error swallowed (`.ok()` in place of
+/// `?`): the act returns `Ok` and its successor lands with no actor edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_authorship_edge_fails_the_act(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let old = seed_claim(&pool, a).await;
+    sqlx::query(
+        "CREATE FUNCTION test_refuse_authored() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF NEW.relationship = 'AUTHORED' THEN \
+           RAISE EXCEPTION 'forced AUTHORED failure'; END IF; RETURN NEW; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the forcing function");
+    sqlx::query(
+        "CREATE TRIGGER test_refuse_authored BEFORE INSERT ON edges \
+         FOR EACH ROW EXECUTE FUNCTION test_refuse_authored()",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the forcing trigger");
+
+    let mut tx = pool.begin().await.expect("begin");
+    let result = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(old),
+        "a correction whose authorship cannot be recorded",
+        TruthValue::clamped(0.6),
+        "forced failure",
+        SupersedeActor::new(b, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "the act must fail when its authorship edge cannot be written: {result:?}"
+    );
+    drop(tx);
+
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("count successors");
+    assert_eq!(successors, 0, "no successor landed");
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("the predecessor");
+    assert!(current, "the failed act retired nothing");
+}
+
+/// `actor` supersedes `old` through the WHOLE supersession (the act and the
+/// edge migration, on this privileged pool), as the request paths and their
+/// cascade do. Returns the successor.
+async fn supersede_through_the_cascade(pool: &PgPool, old: Uuid, actor: Uuid) -> Uuid {
+    let (new, _) = ClaimRepository::supersede(
+        pool,
+        ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        TruthValue::clamped(0.6),
+        "chain probe",
+        SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
+    new
+}
+
+/// A chain of two supersessions: B restates A's v0 as v1, then C restates v1
+/// as v2. The act's edge records who wrote THAT claim, so the second
+/// supersession's edge migration must leave B's edge on v1 (B wrote v1, not
+/// v2), and v2 carries C's edge alone. Moving it onto v2 erased the record of
+/// v1's writer and credited B with a claim it never wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_supersession_leaves_the_first_actors_edge_on_the_claim_it_wrote(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let c = seed_agent(&pool, "actor-c").await;
+    let v0 = seed_claim(&pool, a).await;
+
+    let v1 = supersede_through_the_cascade(&pool, v0, b).await;
+    let v2 = supersede_through_the_cascade(&pool, v1, c).await;
+
+    let act = |who: Uuid| {
+        (
+            who,
+            "agent".to_string(),
+            serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+        )
+    };
+    assert_eq!(
+        authored_into(&pool, v1).await,
+        vec![act(b)],
+        "the retired v1 keeps the record of its writer B"
+    );
+    assert_eq!(
+        authored_into(&pool, v2).await,
+        vec![act(c)],
+        "v2 records C, who wrote it, and nothing from B"
+    );
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(v2)
+        .fetch_one(&pool)
+        .await
+        .expect("v2");
+    assert_eq!(author, a, "v2 still inherits the chain's author");
+}
+
+/// The act's reserved marker (`supersede_act`) is what tells an act edge
+/// apart: the act writes it, and the generic edge writers that run the
+/// reserved-property refusal reject it (MCP `link_epistemic` and
+/// `link_hierarchical` do not run it yet; supersede SPEC K12a audits them). A
+/// property that merely spells a supersession `tool` (any edge writer could
+/// set one) pins nothing. Shown on a
+/// CLAIM-sourced `AUTHORED` edge spelling the tool: it is an ordinary edge of
+/// the retired claim and moves onto the successor like every other.
+///
+/// Partly inverted by ruling R-133 (supersede SPEC §11 K1, SF-23): this test
+/// used to make the point with an AGENT-sourced `AUTHORED` edge and assert it
+/// moved. Under R-133 an agent's authorship stays on the retired claim
+/// whatever its properties, so that edge now stays, and the tool-spelling
+/// point is made on a non-agent edge instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tool_spelling_without_the_act_marker_does_not_pin_an_edge_to_the_retired_claim(
+    pool: PgPool,
+) {
+    let a = seed_agent(&pool, "author-a").await;
+    let x = seed_agent(&pool, "tool-speller-x").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let old = seed_claim(&pool, a).await;
+    let speller_claim = seed_claim(&pool, x).await;
+    let spelled: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'AUTHORED', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true}') RETURNING id",
+    )
+    .bind(speller_claim)
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .expect("a claim-sourced AUTHORED edge spelling the act's tool");
+    let agent_spelled: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, 'agent', $2, 'claim', 'AUTHORED', \
+                 '{\"tool\": \"supersede_claim\", \"was_created\": true}') RETURNING id",
+    )
+    .bind(x)
+    .bind(old)
+    .fetch_one(&pool)
+    .await
+    .expect("an agent AUTHORED edge spelling the act's tool");
+
+    let new = supersede_through_the_cascade(&pool, old, b).await;
+
+    let target_of = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>("SELECT target_id FROM edges WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("the spelled edge")
+        }
+    };
+    assert_eq!(
+        target_of(spelled).await,
+        new,
+        "an edge without the act's marker moves onto the successor"
+    );
+    assert_eq!(
+        target_of(agent_spelled).await,
+        old,
+        "an agent's AUTHORED stays on the retired claim, whatever it spells (R-133)"
+    );
+    let on_old: Vec<(Uuid, String)> = authored_into(&pool, old)
+        .await
+        .into_iter()
+        .map(|(source, kind, _)| (source, kind))
+        .collect();
+    assert_eq!(
+        on_old,
+        vec![(x, "agent".to_string())],
+        "only the agent's own authorship is left on the retired claim"
+    );
+}
+
+// =====================================================================
+// Ruling R-85 (c), backlog 1a54283d: "dedup/consolidate repairs never move a
+// supersession's act edge". REGRESSION PINS of an item that needed no code
+// change: they pass on the base. An act edge always targets a successor, a
+// successor always carries `supersedes`, and both the dedup act and the
+// consolidate act refuse such a claim before their repair runs. These pins
+// hold that refusal for a successor that carries an act edge, through the
+// whole act-plus-repair entry points: if either act ever admitted it, its
+// repair (which re-points the duplicate's / sources' incoming edges) could
+// move the act edge off the claim the actor wrote.
+// =====================================================================
+
+/// The act edge `actor` wrote onto a successor.
+fn act_edge(actor: Uuid) -> (Uuid, String, serde_json::Value) {
+    (
+        actor,
+        "agent".to_string(),
+        serde_json::json!({"tool": "supersede_claim", "was_created": true, "supersede_act": "supersede_claim"}),
+    )
+}
+
+/// The act edges (`properties ? 'supersede_act'`) whose target is `claim`.
+async fn act_edges_into(pool: &PgPool, claim: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE relationship = 'AUTHORED' AND target_id = $1 AND properties ? 'supersede_act'",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count act edges")
+}
+
+/// B restates A's v0 as S (S carries B's act edge). Marking S a duplicate of
+/// another claim Q, act and repair together, is refused as a state refusal,
+/// and S keeps B's act edge: S stays current, and Q receives no act edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_carrying_an_act_edge_is_not_marked_a_duplicate(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let v0 = seed_claim(&pool, a).await;
+    let q = seed_claim(&pool, a).await;
+    let s = supersede_through_the_cascade(&pool, v0, b).await;
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "CALIBRATION"
+    );
+
+    let r = ClaimRepository::mark_duplicate_with_repair(
+        &pool,
+        ClaimId::from_uuid(s),
+        ClaimId::from_uuid(q),
+    )
+    .await;
+    match &r {
+        Err(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message,
+        }) => assert!(message.contains("already superseded"), "{message}"),
+        other => panic!("marking a successor a duplicate must be refused: {other:?}"),
+    }
+
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "S keeps B's act edge"
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("S");
+    assert!(current, "the refused dedup retired nothing");
+    assert_eq!(act_edges_into(&pool, q).await, 0, "nothing moved onto Q");
+}
+
+/// B restates A's v0 as S (S carries B's act edge). Consolidating S with
+/// another claim Q, act and edge migration together, is refused, and S keeps
+/// B's act edge: S stays current, and no merged claim receives it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_carrying_an_act_edge_is_not_consolidated(pool: PgPool) {
+    let a = seed_agent(&pool, "author-a").await;
+    let b = seed_agent(&pool, "actor-b").await;
+    let c = seed_agent(&pool, "consolidator-c").await;
+    let v0 = seed_claim(&pool, a).await;
+    let q = seed_claim(&pool, a).await;
+    let s = supersede_through_the_cascade(&pool, v0, b).await;
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "CALIBRATION"
+    );
+
+    let r = ClaimRepository::consolidate(
+        &pool,
+        &[s, q],
+        "a merge of a successor and another claim",
+        0.7,
+        epigraph_db::ConsolidateMode::Merge,
+        "R-85 (c) pin",
+        c,
+    )
+    .await;
+    match &r {
+        Err(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message,
+        }) => assert!(message.contains("already superseded"), "{message}"),
+        other => panic!("consolidating a successor must be refused: {other:?}"),
+    }
+
+    assert_eq!(
+        authored_into(&pool, s).await,
+        vec![act_edge(b)],
+        "S keeps B's act edge"
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(s)
+        .fetch_one(&pool)
+        .await
+        .expect("S");
+    assert!(current, "the refused consolidation retired nothing");
+    let act_edges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE properties ? 'supersede_act'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(act_edges, 1, "only B's act edge exists, still on S");
+}

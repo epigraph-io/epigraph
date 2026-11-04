@@ -197,12 +197,12 @@ pub async fn do_patch_edge(
             return Err(invalid_params("properties must be a JSON object"));
         }
     }
-    if params
+    if let Some(reason) = params
         .properties
         .as_ref()
-        .is_some_and(epigraph_db::carries_dedup_identity_key)
+        .and_then(epigraph_db::reserved_edge_property_refusal)
     {
-        return Err(invalid_params(epigraph_db::DEDUP_IDENTITY_KEY_RESERVED));
+        return Err(invalid_params(reason));
     }
 
     let valid_to = resolve_valid_to(params.valid_to.as_deref())?;

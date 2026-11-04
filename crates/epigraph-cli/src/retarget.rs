@@ -20,8 +20,9 @@
 //!    lower-case spelling ([`api_relationship`]), through `POST /api/v1/edges`,
 //!    so the API's create→wire path runs and DS belief is wired on the atom
 //!    exactly as a fresh link would be. Provenance rides on the edge's
-//!    properties. `contradicts` retargets are HELD until the API accepts that
-//!    spelling ([`HELD_RELATIONSHIPS`]); `refutes` retargets are applied.
+//!    properties. Both `contradicts` and `refutes` retargets are applied: the
+//!    API accepts and stores the lower-case spelling of each
+//!    ([`HELD_RELATIONSHIPS`] is empty since backlog 3ce5e00c).
 //! 3. KEEP the parent edge and mark it `properties.retargeted_to = [...]`
 //!    through `PATCH /api/v1/edges/:id`. Its belief mass is not touched.
 //!
@@ -130,9 +131,9 @@ Items:
 /// dedup). A relationship this
 /// function does not know is returned unchanged and left to the API to judge.
 ///
-/// This is NOT always a spelling `POST /api/v1/edges` accepts: see
-/// [`hold_reason`], which stops a retarget before it reaches the API when it
-/// is not.
+/// `POST /api/v1/edges` accepts and stores these spellings (it stores every
+/// case-folded relationship lower case); [`hold_reason`] would stop a retarget
+/// whose spelling it refused.
 pub fn api_relationship(stored: &str) -> String {
     let lower = stored.to_ascii_lowercase();
     match lower.as_str() {
@@ -144,35 +145,28 @@ pub fn api_relationship(stored: &str) -> String {
 /// Conflict relationships whose retarget is HELD: planned (the dry run and
 /// the manifest still show the LLM's mapping) but never applied.
 ///
-/// # Why `contradicts` is held
+/// # Empty since backlog 3ce5e00c
 ///
-/// The HTTP whitelist (`routes/edges.rs::VALID_RELATIONSHIPS`) is
-/// case-sensitive and accepts `contradicts` ONLY as `CONTRADICTS`. An atom
-/// edge stored as `CONTRADICTS` is invisible to every reader that matches the
-/// lower-case spelling MCP `link_epistemic` stores — measured in review:
-/// after an apply, `dispute_batch` reported the parent disputed and the atom
-/// not (lower-casing the same row made the atom count 1), and a later
-/// `link_epistemic` of the same dispute onto the atom created a SECOND edge
-/// and a second BBA from the same source (DS double counting), because its
-/// symmetric dedup matches the relationship byte-exactly. Writing that split
-/// 100+ times in production is hard to undo, so it is not written at all.
-///
-/// The hold lifts when the owner of `routes/edges.rs` adds lower-case
-/// `contradicts` to `VALID_RELATIONSHIPS`: then remove it from this list.
-/// `tests/retarget_conflicts.rs` pins the hold to the whitelist, so it fails
-/// the moment the whitelist changes. `refutes` is accepted in lower case and
-/// is not held.
-pub const HELD_RELATIONSHIPS: [&str; 1] = ["contradicts"];
+/// `contradicts` was held while the HTTP whitelist
+/// (`routes/edges.rs::VALID_RELATIONSHIPS`) accepted it ONLY as
+/// `CONTRADICTS`: an atom edge stored in that spelling was invisible to the
+/// readers matching the lower-case one MCP `link_epistemic` stores, and a later
+/// `link_epistemic` of the same dispute wrote a second edge and a second BBA.
+/// The route now accepts every case of a case-folded relationship and stores
+/// it lower case, and the dedup probes match both spellings, so the hold is
+/// lifted. `tests/retarget_conflicts.rs` still pins this list to the whitelist:
+/// a relationship belongs here exactly while the API refuses its lower-case
+/// spelling.
+pub const HELD_RELATIONSHIPS: [&str; 0] = [];
 
 /// Why a retarget of `stored` must not be applied, or `None` if it may be.
 pub fn hold_reason(stored: &str) -> Option<String> {
     let lower = stored.to_ascii_lowercase();
     HELD_RELATIONSHIPS.contains(&lower.as_str()).then(|| {
         format!(
-            "HELD: `{lower}` retargets are not applied — POST /api/v1/edges accepts only \
-             `CONTRADICTS`, which readers matching `{lower}` (dispute_batch, sheaf, \
-             link_epistemic dedup) do not see; waiting on routes/edges.rs \
-             VALID_RELATIONSHIPS to accept `{lower}`"
+            "HELD: `{lower}` retargets are not applied — POST /api/v1/edges does not \
+             accept the lower-case spelling `{lower}` that the exact-case readers \
+             (dispute_batch, sheaf, link_epistemic dedup) match"
         )
     })
 }
@@ -1255,11 +1249,14 @@ mod tests {
     }
 
     #[test]
-    fn contradicts_is_held_in_every_spelling_and_refutes_is_not() {
-        for s in ["contradicts", "CONTRADICTS", "Contradicts"] {
-            assert!(hold_reason(s).is_some(), "{s} must be held");
-        }
-        for s in ["refutes", "REFUTES"] {
+    fn no_conflict_relationship_is_held_in_any_spelling() {
+        for s in [
+            "contradicts",
+            "CONTRADICTS",
+            "Contradicts",
+            "refutes",
+            "REFUTES",
+        ] {
             assert!(hold_reason(s).is_none(), "{s} must not be held");
         }
     }

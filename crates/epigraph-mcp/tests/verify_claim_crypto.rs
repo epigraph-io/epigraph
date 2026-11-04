@@ -120,8 +120,9 @@ async fn stored_signature_over_stored_hash_verifies(pool: PgPool) {
 
     let content = "Scanning probe tip functionalization is the rate-limiting step.";
     let stored_hash = ContentHasher::hash(content.as_bytes());
-    // Same message the production writers sign (`memory.rs`,
-    // `ingestion.rs`: `signer.sign(&claim.content_hash)`).
+    // The LEGACY message (the bare digest) the production writers signed
+    // before ruling R-34's tagged v1 scheme; it must keep verifying.
+    // `signature_domain_separation.rs` covers the v1 message.
     let signature = signer.sign(&stored_hash);
 
     let claim_id = insert_claim(

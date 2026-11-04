@@ -132,8 +132,11 @@ pub async fn do_link_hierarchical(
         )));
     }
 
-    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_conn(
+    // Attested at INSERT by this server's key (R-49/R-50); a dedup hit
+    // returns the existing edge unchanged.
+    let (edge_row, was_created) = EdgeRepository::create_if_not_exists_signed_conn(
         &mut tx,
+        Some(server.edge_signing_key().await?),
         source_id,
         "claim",
         target_id,
