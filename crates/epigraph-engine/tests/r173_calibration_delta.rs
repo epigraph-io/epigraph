@@ -41,7 +41,7 @@ use epigraph_db::{MassFunctionRepository, PgPool};
 use epigraph_engine::belief_profile::BeliefProfile;
 use epigraph_engine::edge_factor::{ensure_binary_frame, recompute_claim_cached_belief};
 use epigraph_engine::supersede_delta::r173::{
-    ApplyList, R173Claim, R173Options, R173Outcome, R173Report, Regime,
+    empty_vocabulary_profile, ApplyList, R173Claim, R173Options, R173Outcome, R173Report, Regime,
 };
 use epigraph_engine::supersede_delta::{run_read_only, DeltaItems, DeltaOptions};
 use uuid::Uuid;
@@ -422,6 +422,11 @@ async fn the_r173_delta_measures_each_regime_and_predicts_the_recompute(pool: Pg
     assert_ne!(
         r.calibration.served_profile_hash, r.calibration.empty_profile_hash,
         "the two regimes are different profiles"
+    );
+    assert_eq!(r.calibration.served_profile_hash, served.profile_hash());
+    assert_eq!(
+        r.calibration.empty_profile_hash,
+        empty_vocabulary_profile().profile_hash()
     );
     assert_eq!(r.snapshots.len(), 1, "one transaction, unchunked");
     assert_eq!(r.snapshots[0].transaction_read_only, "on");
@@ -1066,4 +1071,39 @@ async fn a_claim_whose_only_typed_row_is_a_cached_combination_is_no_candidate(po
         r.claims
     );
     assert_eq!(r.counts.candidates, EDGE_CANDIDATES, "{:?}", r.counts);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_restricts_the_population_and_cannot_admit_a_non_candidate(pool: PgPool) {
+    let w = world(&pool).await;
+    let one_claim = r173(&pool, &w.viewer, &opts(Some(vec![w.l1]), None, None)).await;
+    assert_eq!(one_claim.counts.candidates, 1, "{:?}", one_claim.counts);
+    assert_eq!(one_claim.only, Some(1));
+    assert_eq!(ids_of(&one_claim), vec![w.l1]);
+    assert_eq!(one_claim.lists.l1, vec![w.l1]);
+
+    let none = r173(&pool, &w.viewer, &opts(Some(vec![w.untyped]), None, None)).await;
+    assert_eq!(none.counts.candidates, 0, "{:?}", none.counts);
+    assert!(none.claims.is_empty());
+
+    // The canary: a non-candidate is measured on its own; an unknown id is
+    // reported as unreadable.
+    let canary = r173(
+        &pool,
+        &w.viewer,
+        &opts(Some(vec![w.l1]), None, Some(w.untyped)),
+    )
+    .await;
+    let c = canary.checks.c2_canary.as_ref().expect("canary");
+    let measured = c.claim.as_ref().expect("the untyped claim is read");
+    assert_eq!(measured.outcome, R173Outcome::Unchanged, "{measured:?}");
+    let ghost = Uuid::new_v4();
+    let unknown = r173(
+        &pool,
+        &w.viewer,
+        &opts(Some(vec![w.l1]), Some(1), Some(ghost)),
+    )
+    .await;
+    let c = unknown.checks.c2_canary.as_ref().expect("canary");
+    assert_eq!((c.id, c.claim.is_none(), c.e_equals_s), (ghost, true, None));
 }
