@@ -41,6 +41,12 @@ name = "refresh_truth_mirrors"
 path = "src/bin/refresh_truth_mirrors.rs"
 required-features = ["db"]
 
+# Undo a targeted edge-factor rewire's row writes (R-176(2) class E rollback).
+[[bin]]
+name = "restore_edge_factors"
+path = "src/bin/restore_edge_factors.rs"
+required-features = ["db"]
+
 # The atom-level belief shadow report (SPEC §10.4): reads only, on a
 # read-only session; writes its files under --out.
 [[bin]]
