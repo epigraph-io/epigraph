@@ -1,8 +1,7 @@
 //! `recompute_claim_belief --snapshot <wave file>`: every cache write the
 //! recompute makes is recorded as a `belief_cache::WaveRecord`, so
 //! `restore_belief_cache --from <wave file>` can undo exactly that run by
-//! compare-and-swap (R-176 apply prerequisite; calibration-recompute plan
-//! §4.5 (1a), OD-2).
+//! compare-and-swap (the R-176 rollback prerequisite).
 //!
 //! Both binaries run as real processes with a cleared environment, as an
 //! operator runs them. Claim caches start on a SENTINEL no fold produces and
@@ -10,7 +9,11 @@
 //! proves the recompute MOVED the cache (a recompute that wrote nothing would
 //! otherwise read as a restore that "worked"). Restored values are compared
 //! with what the database held before the run, never with a value this file
-//! computes.
+//! computes. The sentinel sits on a frame with no BBA, so the recompute also
+//! moves `belief_frame_id` and the restore has to put it back;
+//! `classification` does not move in these fixtures (the recompute leaves
+//! the seeded value), so its restore is not exercised here; the other six
+//! cache columns move and are put back.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -205,15 +208,19 @@ async fn cache_state(pool: &PgPool) -> String {
 }
 
 /// `n` claims with a BBA on one fresh frame and a distinct sentinel each.
+/// The sentinel is recorded on a second frame that holds no BBA, so the
+/// recompute (which owns the cache from the BBA's frame) moves
+/// `belief_frame_id` too.
 async fn seeded(pool: &PgPool, n: usize) -> (Vec<Uuid>, Vec<CacheColumns>) {
     let owner = agent(pool).await;
     let f = frame(pool).await;
+    let sentinel_frame = frame(pool).await;
     let mut ids = Vec::new();
     let mut sentinels = Vec::new();
     for i in 0..n {
         let id = claim(pool, owner).await;
         bba(pool, id, f, owner, 0.6 + 0.05 * i as f64).await;
-        sentinels.push(set_sentinel(pool, id, f, 0.01 * i as f64).await);
+        sentinels.push(set_sentinel(pool, id, sentinel_frame, 0.01 * i as f64).await);
         ids.push(id);
     }
     (ids, sentinels)
@@ -268,6 +275,10 @@ async fn a_snapshot_run_then_restore_puts_back_the_exact_prior_cache(pool: PgPoo
     for (id, sentinel) in ids.iter().zip(&sentinels) {
         let now = cache(&pool, *id).await;
         assert_ne!(&now, sentinel, "the recompute did not write claim {id}");
+        assert_ne!(
+            now.belief_frame_id, sentinel.belief_frame_id,
+            "the recompute did not move claim {id}'s belief_frame_id"
+        );
         written.push(now);
     }
     assert_eq!(
@@ -766,6 +777,41 @@ async fn a_writer_mid_transaction_when_the_run_reaches_the_claim_is_the_recorded
         cache(&pool, id).await,
         theirs,
         "the restore did not put back the other writer's value"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without `--snapshot` the run writes as before and leaves no wave file.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_without_snapshot_still_writes_and_records_nothing(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, sentinels) = seeded(&pool, 2).await;
+    let list = write_ids(&dir, &ids);
+
+    let r = run(RECOMPUTE, &dir, &db, &["--input", s(&list)]);
+    r.ok("recompute without --snapshot");
+    assert!(
+        r.stdout.contains("done: 2 claims recomputed"),
+        "not both claims recomputed: {}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.lines().any(|l| l.starts_with("recorded:")),
+        "a run without --snapshot reported records: {}",
+        r.stdout
+    );
+    for (id, sentinel) in ids.iter().zip(&sentinels) {
+        assert_ne!(&cache(&pool, *id).await, sentinel, "claim {id} not written");
+    }
+    let files: Vec<_> = std::fs::read_dir(&dir)
+        .expect("list the scratch dir")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(
+        files,
+        vec![std::ffi::OsString::from("ids.txt")],
+        "a file was written"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
