@@ -374,10 +374,10 @@ async fn a_snapshot_that_cannot_be_opened_refuses_before_any_write(pool: PgPool)
         &db,
         &["--input", s(&list), "--snapshot", s(&unopenable)],
     );
-    assert_ne!(
+    assert_eq!(
         r.code,
-        Some(0),
-        "an unopenable wave file must be refused\nstdout: {}\nstderr: {}",
+        Some(1),
+        "an unopenable wave file must be refused by the run (exit 1)\nstdout: {}\nstderr: {}",
         r.stdout,
         r.stderr
     );
@@ -400,10 +400,10 @@ async fn a_snapshot_that_cannot_be_opened_refuses_before_any_write(pool: PgPool)
         &db,
         &["--input", s(&list), "--snapshot", s(&used)],
     );
-    assert_ne!(
+    assert_eq!(
         r.code,
-        Some(0),
-        "a wave file holding records must be refused\nstdout: {}\nstderr: {}",
+        Some(1),
+        "a wave file holding records must be refused by the run (exit 1)\nstdout: {}\nstderr: {}",
         r.stdout,
         r.stderr
     );
@@ -457,12 +457,25 @@ async fn a_record_that_cannot_be_written_leaves_the_claim_unwritten_and_stops_th
             "1",
         ],
     );
-    assert_ne!(
+    // Exit 3 is the STOP: the first claim's record failed, its write rolled
+    // back, and the two after it were never attempted. Per-claim errors
+    // without the stop would exit 2 with 3 errors.
+    assert_eq!(
         r.code,
-        Some(0),
-        "a run whose records cannot be written must fail\nstdout: {}\nstderr: {}",
+        Some(3),
+        "a run whose records cannot be written must STOP (exit 3)\nstdout: {}\nstderr: {}",
         r.stdout,
         r.stderr
+    );
+    assert!(
+        r.stderr.contains("STOPPED") && r.stderr.contains("2 claims were not attempted"),
+        "the run did not stop after the failed record: {}",
+        r.stderr
+    );
+    assert!(
+        r.stdout.contains("1 errors (of 3)"),
+        "claims after the failed record were attempted: {}",
+        r.stdout
     );
     for (id, sentinel) in ids.iter().zip(&sentinels) {
         assert_eq!(
