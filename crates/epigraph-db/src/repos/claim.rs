@@ -13394,7 +13394,9 @@ async fn reverse_marked_duplicate(
 ///   deleted (`claims_deactivate_factors`): `$1` and `$2` are the canonical,
 ///   `$3` empty, `$4` the edges it moved and `$5` empty, so only those are
 ///   minted and a canonical edge whose factor something else removed stays
-///   without one.
+///   without one;
+/// * the supersede cascade binds it the same way for the successor
+///   ([`ClaimRepository::regenerate_superseded_edge_factors_conn`]).
 ///
 /// It is the body of migration 038's `auto_create_factor_from_edge`, over a
 /// set, and must stay that: a migration that changes the trigger's mapping,
@@ -13463,6 +13465,56 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
              OR (x.ft || ':' || array_to_string(x.var_ids, ',')) = ANY($3)
           ORDER BY x.ft, x.var_ids, x.created_at, x.id
          ON CONFLICT DO NOTHING"#;
+
+impl ClaimRepository {
+    /// Mint the BP factors of the edges a supersession's cascade just moved
+    /// onto `new_id` (supersede SPEC §11 K3): the third caller of
+    /// [`REGENERATE_EDGE_FACTORS_SQL`], bound the way the dedup repair binds
+    /// it (`$1` = `$2` = the claim the edges now touch, no freed slots, `$4` =
+    /// exactly the moved edges, nothing excluded).
+    ///
+    /// The retirement deleted every factor naming the predecessor
+    /// (`claims_deactivate_factors`) and the migration's re-points are
+    /// UPDATEs, which `edges_auto_factor` (INSERT only) never sees, so without
+    /// this BP never sees an edge the successor inherited. An existing
+    /// `(type, pair)` slot is kept, as the trigger keeps it. Returns the slots
+    /// minted, as `type:lo,hi`.
+    ///
+    /// Only the edges listed are minted, so a replay that finds nothing left
+    /// to move mints nothing: factorless edges an earlier cascade moved are
+    /// the retroactive backfill's set (ruling R-131), not this function's.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` on a non-privileged session;
+    /// `DbError::QueryFailed` on the INSERT.
+    pub async fn regenerate_superseded_edge_factors_conn(
+        conn: &mut sqlx::PgConnection,
+        new_id: Uuid,
+        migrated_edges: &[Uuid],
+    ) -> Result<Vec<String>, DbError> {
+        require_privileged_session(
+            &mut *conn,
+            "regenerate_superseded_edge_factors_conn (it mints factors over other writers' edges)",
+        )
+        .await?;
+        if migrated_edges.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut slots: Vec<String> = sqlx::query_scalar(&format!(
+            "{REGENERATE_EDGE_FACTORS_SQL} \
+             RETURNING factor_type || ':' || array_to_string(variable_ids, ',')"
+        ))
+        .bind(new_id)
+        .bind(new_id)
+        .bind(Vec::<String>::new())
+        .bind(Some(migrated_edges))
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&mut *conn)
+        .await?;
+        slots.sort_unstable();
+        Ok(slots)
+    }
+}
 
 /// A BBA on the duplicate (`mf`) that part 3 of the dedup repair pools: not
 /// keyed to any edge (those follow their edge, or stay with it), not an

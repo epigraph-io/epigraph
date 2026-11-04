@@ -21,6 +21,7 @@
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+mod rewire_fixture;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -34,6 +35,7 @@ use uuid::Uuid;
 const RECOMPUTE_BETP: &str = env!("CARGO_BIN_EXE_recompute_betp");
 const BACKFILL_FACTORS: &str = env!("CARGO_BIN_EXE_backfill_factors");
 const DECOMPOSE_CLAIMS: &str = env!("CARGO_BIN_EXE_decompose_claims");
+const RESTORE_EDGE_FACTORS: &str = env!("CARGO_BIN_EXE_restore_edge_factors");
 
 /// The modes a server with no belief flag set reports (SPEC §10.2 defaults).
 fn legacy_modes() -> serde_json::Value {
@@ -886,4 +888,398 @@ fn a_refusal_names_this_process_s_unrecognised_flag_value() {
             r.stderr
         );
     }
+}
+
+// ── backfill_factors targeted rewire (R-177(4) class E) ────────────────────
+
+/// A scratch directory for a targeted run's files.
+fn targeted_scratch() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cal4-targeted-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// A real targeted rewire is always an accepted list with both snapshot
+/// files: without them it is refused from argv alone (exit 2), before any
+/// connection, and writes no file.
+#[test]
+fn backfill_factors_refuses_a_targeted_real_run_without_its_list_and_snapshots() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let wave_s = wave.to_str().expect("utf-8 path");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &["--phase", "rewire-edges", "--sources-from-waves", wave_s],
+        &[("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none")],
+    );
+
+    assert_eq!(
+        r.code,
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    for needle in ["--edges-from", "--snapshot", "--edge-rows"] {
+        assert!(
+            r.stderr.contains(needle),
+            "names {needle}; stderr: {}",
+            r.stderr
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(left.len(), 1, "only the wave file: {left:?}");
+}
+
+/// A real targeted rewire is a writing run: under mode skew it is refused
+/// (exit 3) like every other writing run of this binary, before it creates
+/// its snapshot files or writes anything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_refuses_a_targeted_real_run_on_mode_skew(pool: PgPool) {
+    let _target = seed_unwired_edge(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    let edges = dir.join("accepted.txt");
+    std::fs::write(&wave, "").unwrap();
+    std::fs::write(&edges, format!("{}\n", Uuid::new_v4())).unwrap();
+    let snapshot = dir.join("e-wave.jsonl");
+    let rows = dir.join("e-rows.jsonl");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave.to_str().unwrap(),
+            "--edges-from",
+            edges.to_str().unwrap(),
+            "--snapshot",
+            snapshot.to_str().unwrap(),
+            "--edge-rows",
+            rows.to_str().unwrap(),
+            "--until-fixed",
+            "--only-changed",
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_refused_for_atom_fold(&r, "backfill_factors (targeted)");
+    assert!(
+        !snapshot.exists() && !rows.exists(),
+        "no snapshot file was created"
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
+}
+
+/// `a —supports→ b —supports→ c`, every claim fresh and both edges wired by
+/// the real wire; then a wave moves `a`, and its record is written to
+/// `<dir>/<tag>-l1.jsonl` as `recompute_claim_belief --snapshot` writes one.
+struct TargetedChain {
+    b: Uuid,
+    c: Uuid,
+    ab: Uuid,
+    bc: Uuid,
+    wave_file: std::path::PathBuf,
+}
+
+async fn targeted_chain(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    dir: &std::path::Path,
+    tag: &str,
+) -> TargetedChain {
+    use rewire_fixture::{
+        binary_frame, fresh_claim, move_claim, wired_edge, EVIDENCE_A, EVIDENCE_B, TARGET_EVIDENCE,
+    };
+    let author = rewire_fixture::seed_agent(pool, &format!("bin-targeted-{tag}")).await;
+    let frame = binary_frame(pool, viewer).await;
+    let a = fresh_claim(
+        pool,
+        viewer,
+        author,
+        frame,
+        &format!("bin a {tag}"),
+        EVIDENCE_A,
+    )
+    .await;
+    let b = fresh_claim(
+        pool,
+        viewer,
+        author,
+        frame,
+        &format!("bin b {tag}"),
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let c = fresh_claim(
+        pool,
+        viewer,
+        author,
+        frame,
+        &format!("bin c {tag}"),
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let ab = wired_edge(pool, viewer, author, a, b, "supports").await;
+    let bc = wired_edge(pool, viewer, author, b, c, "supports").await;
+    let rec = move_claim(pool, viewer, a, EVIDENCE_B).await;
+    let wave_file = dir.join(format!("{tag}-l1.jsonl"));
+    let mut f = std::fs::File::create(&wave_file).expect("wave file");
+    epigraph_cli::belief_cache::write_wave_record(&mut f, &rec).expect("write the wave record");
+    TargetedChain {
+        b,
+        c,
+        ab,
+        bc,
+        wave_file,
+    }
+}
+
+fn path_str(p: &std::path::Path) -> &str {
+    p.to_str().expect("utf-8 path")
+}
+
+fn read_predict(p: &std::path::Path) -> epigraph_cli::edge_rewire::PredictReport {
+    serde_json::from_reader(std::fs::File::open(p).expect("predict report exists"))
+        .expect("the predict report parses")
+}
+
+/// The operator's predict, through the binary: `--dry-run` on a targeted
+/// rewire writes a `--predict-json` report that parses, names the wave file
+/// it was seeded from and the options it ran with, and predicts both edges
+/// of the chain with `--until-fixed`, only the first without it (one pass is
+/// the default). Neither run writes a claim cache, a BBA row or a combined
+/// belief.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_dry_run_writes_its_predict_report_and_nothing_else(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "predict").await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let wave = path_str(&ch.wave_file);
+    let fixed = dir.join("predict-fixed.json");
+    let one = dir.join("predict-one.json");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--until-fixed",
+            "--only-changed",
+            "--predict-json",
+            path_str(&fixed),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let r1 = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--only-changed",
+            "--predict-json",
+            path_str(&one),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r1.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r1.stdout,
+        r1.stderr
+    );
+
+    let fixed = read_predict(&fixed);
+    assert_eq!(
+        fixed.would_rewrite(),
+        vec![ch.ab, ch.bc],
+        "{:?}",
+        fixed.edges
+    );
+    assert_eq!(fixed.run.wave_files, vec![wave.to_string()]);
+    assert_eq!(
+        fixed.run.max_passes,
+        epigraph_cli::edge_rewire::DEFAULT_MAX_PASSES
+    );
+    assert!(fixed.run.only_changed);
+    assert!(fixed.converged, "{:?}", fixed.passes);
+    let one = read_predict(&one);
+    assert_eq!(one.run.max_passes, 1, "one pass without --until-fixed");
+    assert_eq!(one.would_rewrite(), vec![ch.ab], "{:?}", one.edges);
+    assert_eq!(one.unconverged_edges, vec![ch.bc]);
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a predict writes nothing"
+    );
+}
+
+/// The operator's apply and undo, through the binaries. A real targeted run
+/// (`--edges-from`, `--snapshot`, `--edge-rows`, `--until-fixed`,
+/// `--only-changed`) rewires both listed edges of the chain and writes both
+/// snapshot files; a run without `--until-fixed` on a second chain rewires
+/// only pass 1. Then `restore_edge_factors --edge-rows` puts the first
+/// chain's rows back byte-identical (`created_at` included), and a second
+/// restore finds them already restored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_apply_and_restore_edge_factors_round_trip(pool: PgPool) {
+    use epigraph_cli::edge_rewire::{read_edge_row_records, EdgeRowRestoreReport};
+    use rewire_fixture::edge_rows;
+
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "apply").await;
+    let ch2 = targeted_chain(&pool, &viewer, &dir, "onepass").await;
+    let rows_pre = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+    let rows2_pre = (
+        edge_rows(&pool, ch2.ab).await,
+        edge_rows(&pool, ch2.bc).await,
+    );
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let apply = |ch: &TargetedChain, name: &str, until_fixed: bool| {
+        let list = dir.join(format!("{name}-accepted.txt"));
+        std::fs::write(&list, format!("# accepted\n{}\n{}\n", ch.ab, ch.bc)).unwrap();
+        let snapshot = dir.join(format!("{name}-e-wave.jsonl"));
+        let rows = dir.join(format!("{name}-e-rows.jsonl"));
+        let mut args = vec![
+            "--phase".to_string(),
+            "rewire-edges".into(),
+            "--sources-from-waves".into(),
+            path_str(&ch.wave_file).into(),
+            "--edges-from".into(),
+            path_str(&list).into(),
+            "--snapshot".into(),
+            path_str(&snapshot).into(),
+            "--edge-rows".into(),
+            path_str(&rows).into(),
+            "--only-changed".into(),
+        ];
+        if until_fixed {
+            args.push("--until-fixed".into());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = run(
+            BACKFILL_FACTORS,
+            &args,
+            &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+        );
+        assert_eq!(
+            r.code,
+            Some(0),
+            "stdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
+        (snapshot, rows)
+    };
+
+    let (snapshot, rows_file) = apply(&ch, "apply", true);
+    let e_wave = epigraph_cli::belief_cache::read_wave(std::io::BufReader::new(
+        std::fs::File::open(&snapshot).expect("snapshot file"),
+    ))
+    .expect("snapshot parses");
+    let records = read_edge_row_records(std::io::BufReader::new(
+        std::fs::File::open(&rows_file).expect("edge-rows file"),
+    ))
+    .expect("edge-rows parses");
+    assert_eq!(
+        e_wave.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![ch.b, ch.c]
+    );
+    assert_eq!(
+        records.iter().map(|r| r.edge_id).collect::<Vec<_>>(),
+        vec![ch.ab, ch.bc]
+    );
+    assert_ne!(edge_rows(&pool, ch.ab).await, rows_pre.0, "ab rewired");
+    assert_ne!(edge_rows(&pool, ch.bc).await, rows_pre.1, "bc rewired");
+
+    let (_, rows2_file) = apply(&ch2, "onepass", false);
+    let records2 = read_edge_row_records(std::io::BufReader::new(
+        std::fs::File::open(&rows2_file).expect("edge-rows file"),
+    ))
+    .expect("edge-rows parses");
+    assert_eq!(
+        records2.iter().map(|r| r.edge_id).collect::<Vec<_>>(),
+        vec![ch2.ab],
+        "one pass by default"
+    );
+    assert_ne!(
+        edge_rows(&pool, ch2.ab).await,
+        rows2_pre.0,
+        "pass 1 rewired"
+    );
+    assert_eq!(
+        edge_rows(&pool, ch2.bc).await,
+        rows2_pre.1,
+        "pass 2 not run without --until-fixed"
+    );
+
+    let restore = |name: &str| -> EdgeRowRestoreReport {
+        let out = dir.join(format!("{name}.outcomes.json"));
+        let r = run(
+            RESTORE_EDGE_FACTORS,
+            &[
+                "--edge-rows",
+                path_str(&rows_file),
+                "--outcomes-out",
+                path_str(&out),
+            ],
+            &[("DATABASE_URL", &db)],
+        );
+        assert_eq!(
+            r.code,
+            Some(0),
+            "stdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
+        serde_json::from_reader(std::fs::File::open(&out).expect("outcomes file"))
+            .expect("outcomes parse")
+    };
+    let mut want = vec![rows_pre.0[0].0, rows_pre.1[0].0];
+    want.sort_unstable();
+    let first = restore("restore-1");
+    let mut got = first.restored.clone();
+    got.sort_unstable();
+    assert_eq!(got, want, "{first:?}");
+    assert_eq!(
+        (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await),
+        rows_pre,
+        "rows back byte-identical, created_at included"
+    );
+    let second = restore("restore-2");
+    let mut again = second.already_restored.clone();
+    again.sort_unstable();
+    assert_eq!(again, want, "{second:?}");
+    assert!(second.restored.is_empty(), "{second:?}");
 }

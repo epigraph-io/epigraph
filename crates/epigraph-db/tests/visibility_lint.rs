@@ -2138,6 +2138,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "regenerate_superseded_edge_factors_conn",
+        "WRITE into `factors`, privileged only (refuses otherwise). The supersede cascade's \
+         factor mint for the edges its migration just moved (supersede SPEC §11 K3), on the \
+         maintenance connection; `factors` has no row security and the edge ids are the \
+         migration's own output.",
+    ),
+    (
+        "claim.rs",
         "backfill_legacy_dedup_identity_edges_conn",
         "WRITE, privileged only (refuses otherwise). The operator backfill of the identity \
          edge of legacy fuzzy_dedup_claims duplicates; its selection over claims and edges is \

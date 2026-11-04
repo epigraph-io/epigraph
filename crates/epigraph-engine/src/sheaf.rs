@@ -117,7 +117,10 @@ pub fn restriction_kind_with_profile(
         "generalizes" => RestrictionKind::Positive(profile.generalizes),
         "refutes" => RestrictionKind::Negative(profile.refutes),
         "contradicts" => RestrictionKind::Negative(profile.contradicts),
-        "supersedes" => RestrictionKind::Negative(profile.contradicts),
+        // Lineage, not evidence: a newer claim replacing an older one says
+        // nothing about the older one's truth, so it transmits no belief
+        // (supersede SPEC §11 K12(b)). Neutral also stops the DS auto-wire.
+        "supersedes" => RestrictionKind::Neutral,
         "informs" => RestrictionKind::Positive(profile.informs),
         "frame_validates" => RestrictionKind::FrameEvidence(profile.supports),
         _ => RestrictionKind::Neutral,

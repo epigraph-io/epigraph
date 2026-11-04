@@ -33,11 +33,33 @@ name = "restore_belief_cache"
 path = "src/bin/restore_belief_cache.rs"
 required-features = ["db"]
 
+# Undo a targeted edge-factor rewire's row writes (R-176(2) class E rollback).
+[[bin]]
+name = "restore_edge_factors"
+path = "src/bin/restore_edge_factors.rs"
+required-features = ["db"]
+
+# R-177(5) class D: compare-and-set refresh of truth_value copies of an old
+# belief cache, from the recomputes' wave files, and its reverse. Dry run
+# unless --apply; maintenance connection.
+[[bin]]
+name = "refresh_truth_mirrors"
+path = "src/bin/refresh_truth_mirrors.rs"
+required-features = ["db"]
+
 # The atom-level belief shadow report (SPEC §10.4): reads only, on a
 # read-only session; writes its files under --out.
 [[bin]]
 name = "belief_shadow_report"
 path = "src/bin/belief_shadow_report.rs"
+required-features = ["db"]
+
+# The supersede belief fixes' dry-run delta (supersede SPEC §11 K0, X-3):
+# one READ ONLY transaction on the maintenance connection; writes its JSON
+# report to --json only.
+[[bin]]
+name = "supersede_belief_delta"
+path = "src/bin/supersede_belief_delta.rs"
 required-features = ["db"]
 
 [[bin]]
@@ -167,6 +189,23 @@ required-features = ["db"]
 [[test]]
 name = "belief_cache_bins"
 path = "tests/belief_cache_bins.rs"
+required-features = ["db"]
+
+[[test]]
+name = "recompute_claim_belief_snapshot"
+path = "tests/recompute_claim_belief_snapshot.rs"
+required-features = ["db"]
+
+# Drives the `db`-gated `refresh_truth_mirrors` bin as well as its library.
+[[test]]
+name = "refresh_truth_mirrors"
+path = "tests/refresh_truth_mirrors.rs"
+required-features = ["db"]
+
+# Drives the supersede_belief_delta binary (a db-feature bin) without a database.
+[[test]]
+name = "supersede_belief_delta_guard"
+path = "tests/supersede_belief_delta_guard.rs"
 required-features = ["db"]
 
 # Cohort-v2 waves of `recompute_betp` as real processes (`db`-gated bins).
