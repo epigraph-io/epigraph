@@ -36,10 +36,13 @@
 //! snapshot files (`--snapshot`, `--edge-rows`). The fixed-point verify after
 //! an apply is a predict over the L1 wave files AND the apply's `--snapshot`
 //! file (an L1 claim the rewire refolded holds neither L1 value; the E
-//! records chain onto the L1 ones), and must report nothing to rewrite. Undo
-//! an apply with
-//! `restore_edge_factors --edge-rows` and then `restore_belief_cache --from
-//! <the --snapshot file>`.
+//! records chain onto the L1 ones), run WITH `--only-changed` (without it a
+//! row a fresh wire leaves identical is still counted as a rewrite), and must
+//! report nothing to rewrite. On a cycle, a finite `--epsilon` leaves each row
+//! within about epsilon of a fresh wire, so there the verify is bounded (no
+//! hold, every |d_edge| below the run's tolerance) rather than empty. Undo an
+//! apply with `restore_edge_factors --edge-rows` and then
+//! `restore_belief_cache --from <the --snapshot file>`.
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
