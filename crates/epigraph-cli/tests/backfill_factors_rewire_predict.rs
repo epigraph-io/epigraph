@@ -1,0 +1,283 @@
+//! The targeted rewire's predicting dry run (R-176(2), R-177(4) class E;
+//! design §1.5, §1.6, §1.11 items 3 and 4).
+//!
+//! `edge_rewire::predict_targeted_rewire` runs the same passes and the same
+//! per-edge decision as the apply, in one READ ONLY transaction, with an
+//! overlay in place of every write. The oracle for its numbers is the real
+//! apply run afterwards on the same database: the predicted rows are the
+//! rows the apply writes, the predicted target caches are the caches it
+//! writes. It writes nothing, it is deterministic, and after the apply a
+//! final predict reports nothing left to change (the fixed-point proof, §1.5
+//! (b)).
+#![cfg(feature = "db")]
+
+mod rewire_fixture;
+mod viewer_fixture;
+
+use epigraph_cli::belief_cache::{CacheColumns, WaveRecord};
+use epigraph_cli::edge_rewire::{
+    begin_predict_tx, predict_targeted_rewire, run_targeted_rewire, seed_from_waves, PredictReport,
+    TargetedRunOptions,
+};
+use epigraph_db::visibility::Viewer;
+use rewire_fixture::*;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+struct Chain {
+    a: Uuid,
+    b: Uuid,
+    c: Uuid,
+    ab: Uuid,
+    bc: Uuid,
+    held_edge: Uuid,
+    wave: Vec<WaveRecord>,
+}
+
+/// `a → b → c` (fresh, `r173`) plus `a → m`, whose row has the pre-#401 shape
+/// (held `row_mixed`); the wave moves `a`.
+async fn chain(pool: &PgPool, viewer: &Viewer) -> Chain {
+    let author = seed_agent(pool, "predict").await;
+    let frame = binary_frame(pool, viewer).await;
+    let a = fresh_claim(pool, viewer, author, frame, "predict a", EVIDENCE_A).await;
+    let b = fresh_claim(pool, viewer, author, frame, "predict b", TARGET_EVIDENCE).await;
+    let c = fresh_claim(pool, viewer, author, frame, "predict c", TARGET_EVIDENCE).await;
+    let m = fresh_claim(pool, viewer, author, frame, "predict m", TARGET_EVIDENCE).await;
+    let ab = wired_edge(pool, viewer, author, a, b, "supports").await;
+    let bc = wired_edge(pool, viewer, author, b, c, "contradicts").await;
+    let held_edge = wired_edge(pool, viewer, author, a, m, "supports").await;
+    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
+        .bind(held_edge)
+        .bind(STALE_PRE_401)
+        .execute(pool)
+        .await
+        .unwrap();
+    refold(pool, viewer, m).await;
+    let wave = vec![move_claim(pool, viewer, a, EVIDENCE_B).await];
+    Chain {
+        a,
+        b,
+        c,
+        ab,
+        bc,
+        held_edge,
+        wave,
+    }
+}
+
+fn opts() -> TargetedRunOptions {
+    TargetedRunOptions {
+        max_passes: 10,
+        only_changed: true,
+        ..TargetedRunOptions::default()
+    }
+}
+
+async fn predict(pool: &PgPool, viewer: &Viewer, wave: &[WaveRecord]) -> PredictReport {
+    let o = opts();
+    predict_targeted_rewire(pool, viewer, &seed_from_waves(wave, o.epsilon), &o)
+        .await
+        .expect("predict")
+}
+
+/// Everything the fixture's rows and claims hold, to show a predict wrote
+/// nothing: row counts, every edge row's text and `created_at`, every claim
+/// cache and `updated_at`.
+async fn fingerprint(
+    pool: &PgPool,
+) -> (i64, i64, Vec<(Uuid, String, String)>, Vec<(Uuid, String)>) {
+    let mf: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let cl: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let rows: Vec<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, masses::text, created_at::text FROM mass_functions ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let claims: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, concat_ws('|', belief, plausibility, pignistic_prob, mass_on_empty, \
+                mass_on_missing, belief_frame_id, classification, updated_at) \
+           FROM claims ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    (mf, cl, rows, claims)
+}
+
+/// The oracle test: what the predict says each rewired row and each target
+/// cache will be is what the real apply then writes, on the same database;
+/// held edges are predicted held and stay untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_equals_what_the_apply_then_writes(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+
+    let report = predict(&pool, &viewer, &ch.wave).await;
+    assert!(report.converged, "{report:?}");
+    assert_eq!(report.seed_mode, "db");
+    assert_eq!(
+        report.would_rewrite(),
+        vec![ch.ab, ch.bc],
+        "{:?}",
+        report.edges
+    );
+    assert_eq!(
+        report.totals.held.get("row_mixed"),
+        Some(&1),
+        "{:?}",
+        report.totals
+    );
+    assert_eq!(report.totals.would_remove, 0);
+    assert_eq!(report.totals.would_vacate, 0);
+
+    let o = opts();
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&ch.wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    assert_eq!(applied.rewired(), 2, "{applied:?}");
+
+    for e in report.edges.iter().filter(|e| e.outcome == "rewire") {
+        let stored = edge_rows(&pool, e.edge_id).await.remove(0);
+        assert!(
+            same_jsonb(&pool, e.p1_masses.as_ref().unwrap(), &stored.1).await,
+            "edge {}: predicted {:?}, written {}",
+            e.edge_id,
+            e.p1_masses,
+            stored.1
+        );
+        assert_eq!(stored.2, e.p1_source_strength);
+        assert_eq!(stored.3, e.p1_evidence_type);
+    }
+    for t in [ch.b, ch.c] {
+        let predicted: &CacheColumns = report.targets[&t].w.as_ref().expect("predicted cache");
+        let written = cache(&pool, t).await;
+        for (p, g, what) in [
+            (predicted.belief, written.belief, "belief"),
+            (predicted.plausibility, written.plausibility, "plausibility"),
+            (predicted.pignistic_prob, written.pignistic_prob, "betp"),
+        ] {
+            assert_close(g.unwrap(), p.unwrap(), 1e-12, &format!("{t} {what}"));
+        }
+        let d = report.targets[&t].d_edge.expect("d_edge");
+        assert!(d.abs() > 1e-6, "the target moves: {d}");
+    }
+    assert_eq!(
+        edge_rows(&pool, ch.held_edge).await[0].1,
+        sqlx::query_scalar::<_, String>("SELECT $1::jsonb::text")
+            .bind(STALE_PRE_401)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "the held row was not rewritten"
+    );
+
+    // §1.5 (b): after the apply, a final predict has nothing left to change.
+    let after = predict(&pool, &viewer, &ch.wave).await;
+    assert!(after.would_rewrite().is_empty(), "{:?}", after.edges);
+    assert!(after.totals.unchanged >= 1, "{:?}", after.totals);
+}
+
+/// The predict writes nothing: its transaction is READ ONLY (a write inside
+/// it fails with SQLSTATE 25006), and across a predict no row count, edge
+/// row, cache column or timestamp changes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_is_read_only_and_changes_nothing(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+
+    let mut tx = begin_predict_tx(&pool).await.expect("predict tx");
+    let err = sqlx::query("UPDATE claims SET truth_value = 0.4 WHERE id = $1")
+        .bind(ch.a)
+        .execute(&mut *tx)
+        .await
+        .expect_err("a write inside the predict transaction must fail");
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.to_string());
+    assert_eq!(code.as_deref(), Some("25006"), "{err}");
+    drop(tx);
+
+    let before = fingerprint(&pool).await;
+    let report = predict(&pool, &viewer, &ch.wave).await;
+    assert!(
+        !report.would_rewrite().is_empty(),
+        "the predict found work to do"
+    );
+    assert_eq!(
+        fingerprint(&pool).await,
+        before,
+        "the predict changed nothing"
+    );
+}
+
+/// Two predicts on one snapshot give byte-identical reports (no timestamp,
+/// ordered output).
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_is_deterministic(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let one = serde_json::to_string(&predict(&pool, &viewer, &ch.wave).await).unwrap();
+    let two = serde_json::to_string(&predict(&pool, &viewer, &ch.wave).await).unwrap();
+    assert_eq!(one, two);
+}
+
+/// On a copy restored from before the wave (the wave claim still holds its
+/// `before`), the predict seeds its overlay with the wave's `written` and
+/// predicts the same rewrites as on the post-wave database. A wave claim
+/// holding neither value was written since: the predict refuses.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_seeds_from_the_wave_and_refuses_an_unknown_state(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let post = predict(&pool, &viewer, &ch.wave).await;
+
+    let before = &ch.wave[0].before;
+    sqlx::query(
+        "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
+                mass_on_empty = $5, mass_on_missing = $6, belief_frame_id = $7, \
+                classification = $8 WHERE id = $1",
+    )
+    .bind(ch.a)
+    .bind(before.belief)
+    .bind(before.plausibility)
+    .bind(before.pignistic_prob)
+    .bind(before.mass_on_empty)
+    .bind(before.mass_on_missing)
+    .bind(before.belief_frame_id)
+    .bind(&before.classification)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let seeded = predict(&pool, &viewer, &ch.wave).await;
+    assert_eq!(seeded.seed_mode, "seeded");
+    assert_eq!(seeded.would_rewrite(), post.would_rewrite());
+    assert_eq!(seeded.edges, post.edges);
+
+    sqlx::query("UPDATE claims SET belief = 0.33 WHERE id = $1")
+        .bind(ch.a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let o = opts();
+    let err = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&ch.wave, o.epsilon), &o)
+        .await
+        .expect_err("an unknown wave-claim state is refused");
+    assert!(err.to_string().contains("l1_state_unknown"), "{err}");
+    let _ = (ch.bc, ch.c);
+}

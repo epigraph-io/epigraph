@@ -1,6 +1,7 @@
 //! The targeted edge-factor rewire (R-176(2), R-177(4): class E of the
 //! calibration recompute): passes to a fixed point, the snapshot files a
-//! rollback restores from, and the compare-and-swap restore of the edge rows.
+//! rollback restores from, the compare-and-swap restore of the edge rows, and
+//! the predicting dry run.
 //!
 //! A wave (the R-176(1) calibration recompute, `recompute_claim_belief
 //! --snapshot`) moved some claims' caches. Every edge-factor row sourced at a
@@ -27,6 +28,12 @@
 //! * **Rollback** is LIFO: [`restore_edge_rows`] puts the rows back by
 //!   compare-and-swap, then `restore_belief_cache --from <the E wave file>`
 //!   the target caches.
+//! * **Predict** ([`predict_targeted_rewire`]): the same passes, the same
+//!   per-edge decision ([`crate::backfill_factors::decide_targeted`]) and
+//!   the same pure row builder, in ONE `REPEATABLE READ, READ ONLY`
+//!   transaction, with an in-memory overlay standing in for each write. Both
+//!   loops visit edges in the same order (Gauss-Seidel), so on an unchanged
+//!   database the predict's fixed point is the apply's.
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statements on
@@ -41,8 +48,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::backfill_factors::{
-    rewire_edge_targeted, select_targeted_edges, HeldBucket, RewireCapture, StoredEdgeRow,
-    TargetedGuards, TargetedOutcome,
+    cache_of_fold, decide_targeted, rewire_edge_targeted, select_targeted_edges, selected_edge_row,
+    HeldBucket, RewireCapture, RewireEdge, RewireOverlay, StoredEdgeRow, TargetedGuards,
+    TargetedOutcome, TargetedVerdict,
 };
 use crate::belief_cache::{plan_restore, write_wave_record, CacheColumns, WaveRecord};
 
@@ -98,7 +106,7 @@ pub fn seed_from_waves(records: &[WaveRecord], epsilon: f64) -> WaveSeed {
     seed
 }
 
-/// The switches of a targeted run.
+/// The switches of a targeted run (apply or predict).
 #[derive(Debug, Clone)]
 pub struct TargetedRunOptions {
     /// The accepted edge list: an edge outside it is never rewired, and is
@@ -493,4 +501,431 @@ pub async fn restore_edge_rows(
         }
     }
     Ok(report)
+}
+
+// ── Predict ────────────────────────────────────────────────────────────────
+
+/// One edge the predict decided.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictedEdge {
+    pub edge_id: Uuid,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relationship: String,
+    pub pass: usize,
+    /// `rewire`, `unchanged`, `skipped_stale`, `chain_boundary_held`, or a
+    /// [`HeldBucket::name`].
+    pub outcome: String,
+    /// The stored row's `masses` (database text).
+    pub stored_masses: Option<String>,
+    /// A wire from the source's baseline (pre-move) interval.
+    pub p0_masses: Option<serde_json::Value>,
+    /// A wire from the source's current (or predicted) interval.
+    pub p1_masses: Option<serde_json::Value>,
+    pub p1_source_strength: Option<f64>,
+    pub p1_evidence_type: Option<String>,
+    pub p1_locality_tag: Option<String>,
+    /// The new row's locality differs from the stored row's (E-e).
+    pub locality_changed: bool,
+    /// The new row's evidence-type spelling differs from the stored one (E-f).
+    pub respelled: bool,
+}
+
+/// One target the predict touched, binary frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictedTarget {
+    /// The stored cache when the predict first reached the target.
+    pub s: CacheColumns,
+    /// BetP of the fold of its current rows then (no rewire).
+    pub r_betp: Option<f64>,
+    /// The predicted cache after the last rewire into it (`None`: none).
+    pub w: Option<CacheColumns>,
+    /// R − S on BetP: the target's own staleness.
+    pub d_stale: Option<f64>,
+    /// W − R on BetP: what the rewire moves it by.
+    pub d_edge: Option<f64>,
+    pub fresh: bool,
+    /// Thresholds crossed S → W on BetP: `up_0.50`, `down_0.75`, ...
+    pub crossings: Vec<String>,
+}
+
+/// Totals over a predict.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PredictTotals {
+    pub would_rewrite: usize,
+    pub unchanged: usize,
+    pub held: BTreeMap<String, usize>,
+    pub chain_boundary_held: usize,
+    pub would_remove: usize,
+    pub would_vacate: usize,
+    pub cycle_unconverged: usize,
+    /// |d_edge| on BetP, K0 bins.
+    pub d_edge_histogram: BTreeMap<String, usize>,
+    pub max_abs_d_edge: f64,
+    pub d_edge_over_0_10: usize,
+    pub d_edge_over_0_20: usize,
+    /// Crossings by name, summed over targets.
+    pub crossings: BTreeMap<String, usize>,
+}
+
+/// What a predict writes to `--predict-json`. Deterministic: no timestamp,
+/// ordered maps, edges in visit order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictReport {
+    pub calibration_source: String,
+    pub profile_hash: String,
+    /// `db` (the database holds the wave's written values) or `seeded` (some
+    /// wave claims still hold their `before`: the overlay was seeded with
+    /// the wave's `written`, a restored pre-wave copy).
+    pub seed_mode: String,
+    pub passes: Vec<PassSummary>,
+    pub converged: bool,
+    pub unconverged_edges: Vec<Uuid>,
+    pub edges: Vec<PredictedEdge>,
+    pub targets: BTreeMap<Uuid, PredictedTarget>,
+    pub totals: PredictTotals,
+}
+
+impl PredictReport {
+    /// Edges the predict would rewrite.
+    #[must_use]
+    pub fn would_rewrite(&self) -> Vec<Uuid> {
+        self.edges
+            .iter()
+            .filter(|e| e.outcome == "rewire")
+            .map(|e| e.edge_id)
+            .collect()
+    }
+}
+
+/// Open the predict's transaction: `REPEATABLE READ, READ ONLY`, set as its
+/// first statement, so every read sees one snapshot and any write fails
+/// (SQLSTATE 25006).
+///
+/// # Errors
+/// The begin or the `SET TRANSACTION` fails.
+pub async fn begin_predict_tx(
+    pool: &PgPool,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
+const CROSSING_THRESHOLDS: [(f64, &str); 3] = [(0.30, "0.30"), (0.50, "0.50"), (0.75, "0.75")];
+
+fn crossings(s: Option<f64>, w: Option<f64>) -> Vec<String> {
+    let (Some(s), Some(w)) = (s, w) else {
+        return Vec::new();
+    };
+    CROSSING_THRESHOLDS
+        .iter()
+        .filter_map(|&(t, name)| {
+            if s < t && w >= t {
+                Some(format!("up_{name}"))
+            } else if s >= t && w < t {
+                Some(format!("down_{name}"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn d_edge_bin(d: f64) -> &'static str {
+    let d = d.abs();
+    if d < 0.01 {
+        "lt_0.01"
+    } else if d < 0.05 {
+        "lt_0.05"
+    } else if d < 0.10 {
+        "lt_0.10"
+    } else if d < 0.20 {
+        "lt_0.20"
+    } else if d < 0.50 {
+        "lt_0.50"
+    } else {
+        "ge_0.50"
+    }
+}
+
+/// Predict the targeted rewire without writing: the passes, decisions and
+/// rows [`run_targeted_rewire`] would produce on this snapshot (module doc).
+///
+/// Refuses when a wave claim's cache equals neither its wave `before` nor
+/// its `written` (`l1_state_unknown`: someone wrote it since the wave).
+///
+/// # Errors
+/// A read fails, the binary frame is missing, or the state check refuses.
+#[allow(clippy::too_many_lines)]
+pub async fn predict_targeted_rewire(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    seed: &WaveSeed,
+    opts: &TargetedRunOptions,
+) -> anyhow::Result<PredictReport> {
+    let mut tx = begin_predict_tx(pool).await?;
+    let binary = epigraph_db::FrameRepository::get_by_name(&mut *tx, viewer, "binary_truth")
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("binary_truth frame not found"))?
+        .id;
+
+    // Seed the overlay: a wave claim still at its `before` (a restored
+    // pre-wave copy) is read at its `written`.
+    let mut overlay = RewireOverlay::default();
+    let ids: Vec<Uuid> = seed.written.keys().copied().collect();
+    let stored = crate::belief_cache::read_cache_columns(&mut *tx, &ids).await?;
+    let mut unknown: Vec<Uuid> = Vec::new();
+    for id in &ids {
+        let (Some(now), Some(written)) = (stored.get(id), seed.written.get(id)) else {
+            unknown.push(*id);
+            continue;
+        };
+        if now == written {
+            continue;
+        }
+        if seed.before.get(id) == Some(now) {
+            overlay.cache.insert(*id, written.clone());
+        } else {
+            unknown.push(*id);
+        }
+    }
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        anyhow::bail!(
+            "l1_state_unknown: {} wave claim(s) hold neither the wave's before nor its written \
+             value (written since the wave), first {:?}",
+            unknown.len(),
+            unknown.iter().take(5).collect::<Vec<_>>()
+        );
+    }
+    let seed_mode = if overlay.cache.is_empty() {
+        "db"
+    } else {
+        "seeded"
+    };
+
+    let mut baseline = seed.baseline.clone();
+    let own_rows: HashMap<Uuid, StoredEdgeRow> = HashMap::new();
+    let mut sources: BTreeSet<Uuid> = seed.moved.clone();
+    let accepted: Option<Vec<Uuid>> = opts.edges.as_ref().map(|e| e.iter().copied().collect());
+    let mut passes: Vec<PassSummary> = Vec::new();
+    let mut edges_out: Vec<PredictedEdge> = Vec::new();
+    let mut targets: BTreeMap<Uuid, PredictedTarget> = BTreeMap::new();
+    let mut converged = false;
+
+    for pass in 1..=opts.max_passes.max(1) {
+        if sources.is_empty() {
+            converged = true;
+            break;
+        }
+        let src: Vec<Uuid> = sources.iter().copied().collect();
+        let edges: Vec<RewireEdge> = select_targeted_edges(&mut tx, &src, None).await?;
+        let mut summary = PassSummary {
+            pass,
+            selected: edges.len(),
+            ..PassSummary::default()
+        };
+        let mut next: BTreeSet<Uuid> = BTreeSet::new();
+        for edge in &edges {
+            let mut out = PredictedEdge {
+                edge_id: edge.edge_id,
+                source_id: edge.source_id,
+                target_id: edge.target_id,
+                relationship: edge.relationship.clone(),
+                pass,
+                outcome: String::new(),
+                stored_masses: None,
+                p0_masses: None,
+                p1_masses: None,
+                p1_source_strength: None,
+                p1_evidence_type: None,
+                p1_locality_tag: None,
+                locality_changed: false,
+                respelled: false,
+            };
+            if accepted
+                .as_ref()
+                .is_some_and(|a| a.binary_search(&edge.edge_id).is_err())
+            {
+                summary.chain_boundary_held += 1;
+                out.outcome = "chain_boundary_held".into();
+                edges_out.push(out);
+                continue;
+            }
+            if matches!(
+                epigraph_engine::sheaf::restriction_kind_with_profile(
+                    &edge.relationship,
+                    &epigraph_engine::sheaf::RestrictionProfile::scientific()
+                ),
+                epigraph_engine::sheaf::RestrictionKind::Neutral
+            ) {
+                summary.hold(HeldBucket::NonEpistemic);
+                out.outcome = HeldBucket::NonEpistemic.name().into();
+                edges_out.push(out);
+                continue;
+            }
+            let Some(selected_id) = selected_edge_row(&mut tx, edge)
+                .await
+                .map_err(anyhow::Error::msg)?
+            else {
+                summary.skipped_stale += 1;
+                out.outcome = "skipped_stale".into();
+                edges_out.push(out);
+                continue;
+            };
+            let guards = TargetedGuards {
+                baseline: &baseline,
+                own_rows: &own_rows,
+                only_changed: opts.only_changed,
+            };
+            let d = decide_targeted(
+                &mut tx,
+                viewer,
+                edge,
+                binary,
+                selected_id,
+                &guards,
+                Some(&overlay),
+            )
+            .await
+            .map_err(anyhow::Error::msg)?;
+            out.stored_masses = d.stored.as_ref().map(|r| r.masses.clone());
+            out.p0_masses = d.p0.as_ref().map(|b| b.masses_json.clone());
+            if let Some(p1) = &d.p1 {
+                out.p1_masses = Some(p1.masses_json.clone());
+                out.p1_source_strength = Some(p1.source_strength);
+                out.p1_evidence_type = Some(p1.evidence_type.clone());
+                out.p1_locality_tag = Some(p1.locality_tag.to_string());
+                if let Some(st) = &d.stored {
+                    out.locality_changed = st.locality_tag != p1.locality_tag;
+                    out.respelled = st.evidence_type.as_deref() != Some(p1.evidence_type.as_str());
+                }
+            }
+            if let Some(s) = &d.s {
+                targets
+                    .entry(edge.target_id)
+                    .or_insert_with(|| PredictedTarget {
+                        s: s.clone(),
+                        r_betp: d.r.as_ref().map(|r| r.pignistic_prob),
+                        w: None,
+                        d_stale: match (s.pignistic_prob, d.r.as_ref()) {
+                            (Some(s), Some(r)) => Some(r.pignistic_prob - s),
+                            _ => None,
+                        },
+                        d_edge: None,
+                        fresh: !matches!(d.verdict, TargetedVerdict::Hold(HeldBucket::TargetStale)),
+                        crossings: Vec::new(),
+                    });
+            }
+            match d.verdict {
+                TargetedVerdict::Hold(b) => {
+                    summary.hold(b);
+                    out.outcome = b.name().into();
+                }
+                TargetedVerdict::Unchanged => {
+                    summary.unchanged += 1;
+                    out.outcome = "unchanged".into();
+                }
+                TargetedVerdict::Proceed => {
+                    let (Some(p1), Some(w), Some(s)) = (d.p1, d.w, d.s) else {
+                        anyhow::bail!("predict: edge {} proceeded without its fold", edge.edge_id);
+                    };
+                    summary.rewired += 1;
+                    out.outcome = "rewire".into();
+                    overlay.rows.insert(selected_id, p1);
+                    let new_cache = cache_of_fold(&w, binary, Some(&s));
+                    if crate::edge_rewire::cache_moved(&s, &new_cache, opts.epsilon) {
+                        next.insert(edge.target_id);
+                        if let (Some(b), Some(p)) = (s.belief, s.plausibility) {
+                            baseline.entry(edge.target_id).or_insert((b, p));
+                        }
+                    }
+                    if let Some(t) = targets.get_mut(&edge.target_id) {
+                        t.w = Some(new_cache.clone());
+                    }
+                    overlay.cache.insert(edge.target_id, new_cache);
+                }
+            }
+            edges_out.push(out);
+        }
+        summary.moved_targets = next.len();
+        passes.push(summary);
+        sources = next;
+    }
+    let mut unconverged_edges = Vec::new();
+    if sources.is_empty() {
+        converged = true;
+    } else {
+        let src: Vec<Uuid> = sources.iter().copied().collect();
+        unconverged_edges = select_targeted_edges(&mut tx, &src, accepted.as_deref())
+            .await?
+            .into_iter()
+            .map(|e| e.edge_id)
+            .collect();
+    }
+    // Nothing above writes; roll back regardless.
+    tx.rollback().await?;
+
+    let mut totals = PredictTotals {
+        cycle_unconverged: unconverged_edges.len(),
+        ..PredictTotals::default()
+    };
+    for p in &passes {
+        totals.would_rewrite += p.rewired;
+        totals.unchanged += p.unchanged;
+        totals.chain_boundary_held += p.chain_boundary_held;
+        for (k, v) in &p.held {
+            *totals.held.entry(k.clone()).or_default() += v;
+        }
+    }
+    totals.would_remove = totals
+        .held
+        .get(HeldBucket::WouldRemove.name())
+        .copied()
+        .unwrap_or(0);
+    totals.would_vacate = totals
+        .held
+        .get(HeldBucket::WouldVacate.name())
+        .copied()
+        .unwrap_or(0);
+    for t in targets.values_mut() {
+        let Some(w) = &t.w else { continue };
+        t.d_edge = match (w.pignistic_prob, t.r_betp) {
+            (Some(w), Some(r)) => Some(w - r),
+            _ => None,
+        };
+        t.crossings = crossings(t.s.pignistic_prob, w.pignistic_prob);
+        if let Some(d) = t.d_edge {
+            *totals
+                .d_edge_histogram
+                .entry(d_edge_bin(d).to_string())
+                .or_default() += 1;
+            totals.max_abs_d_edge = totals.max_abs_d_edge.max(d.abs());
+            if d.abs() > 0.10 {
+                totals.d_edge_over_0_10 += 1;
+            }
+            if d.abs() > 0.20 {
+                totals.d_edge_over_0_20 += 1;
+            }
+        }
+        for c in &t.crossings {
+            *totals.crossings.entry(c.clone()).or_default() += 1;
+        }
+    }
+
+    Ok(PredictReport {
+        calibration_source: epigraph_engine::calibration::CalibrationConfig::cached_source()
+            .to_string(),
+        profile_hash: epigraph_engine::belief_profile::BeliefProfile::served().profile_hash(),
+        seed_mode: seed_mode.to_string(),
+        passes,
+        converged,
+        unconverged_edges,
+        edges: edges_out,
+        targets,
+        totals,
+    })
 }
