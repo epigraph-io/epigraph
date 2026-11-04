@@ -1405,8 +1405,12 @@ every row it was copied through, the operator's own attachment included, is
 un-detached and inside its window. So detaching the identity you attached
 (`epigraph_detach_agent_from_role`) takes the group from every successor
 copied from it at once, and detaching a middle identity takes it from the
-copies below that one. The copies themselves stay attached, for 166's write
-refusal.
+copies below that one. That holds however the copies were made: when you
+attach an identity, its registered successors are attached with it, and
+since migration 195 each successor's copy names the copy of the identity
+it succeeded (not your attachment directly), the same chain the
+registration writes for a successor that appears later. The copies
+themselves stay attached, for 166's write refusal.
 
 A detach is also STICKY PER IDENTITY (migration 195). An identity that holds
 any detached attachment to the role is admitted again only by an attachment
@@ -1421,7 +1425,11 @@ these regains the group:
 * a detached identity that 166's attach-time follow attaches again when you
   attach one of its recorded predecessors by name;
 * a later identity of the job registered from such a copy (a prompt edit
-  after the revert).
+  after the revert);
+* a later identity of a detached identity that was already registered when
+  you attach one of its predecessors by name: it is attached with the rest
+  of the lineage, through the detached identity's copy, and admitted
+  nowhere.
 
 Each of those copies is still written, and still RESTRICTS: a revert is held
 by the role exactly as its parent is (166's refusal and may-run). An identity
@@ -1434,7 +1442,17 @@ into gaps): detach the running identity's old copy first, then attach it by
 name. An attachment made by name always counts, even for an identity that
 also holds a detached row, and so do the copies its later identities
 inherit from it. If the job then reverts to an identity you detached, or
-moves on from one, attach the identity that runs by name again.
+moves on from one, it is out of the group until you attach the identity
+that runs by name; the database enforces this whichever order the
+identities were registered and attached in.
+
+A successor registered from two parents (two registrations of one key)
+runs through one chain only. When both parents are the same number of
+successions from the identity you attach and one of them holds a detached
+row, the follow chains through that one, so the successor is out; a
+successor that is also reached by a shorter path free of detached
+identities is judged by the shorter path. Copies
+written before migration 195 keep the chain they were written with.
 
 #### Recipe: a role-private group for a scheduled job
 
