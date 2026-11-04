@@ -29,6 +29,11 @@
 //! refresh wrote; anything else is reported `superseded_since_refresh` and
 //! left alone. With `--dry-run` it runs the same statements and rolls back.
 //!
+//! Rollback order is last-in, first-out: restore this tool's record BEFORE
+//! `restore_belief_cache` restores the caches its waves wrote. Restoring the
+//! caches first leaves `truth_value` mirroring a cache that is no longer
+//! served.
+//!
 //! Output files are never overwritten (they are created new, before the
 //! database is touched). A writing run (`--apply`, or `--restore` without
 //! `--dry-run`) first checks that its belief modes match the API's
