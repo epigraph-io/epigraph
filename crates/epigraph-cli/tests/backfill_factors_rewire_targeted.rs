@@ -654,3 +654,38 @@ async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless(pool: PgPo
         "the un-targeted phase NULLed the target cache"
     );
 }
+
+/// A rewrite is recorded BEFORE it commits: when the snapshot record cannot
+/// be written (here the capture callback fails as a full disk would), the
+/// edge's transaction rolls back, so no committed rewrite lacks its restore
+/// record. The row (masses, `created_at`), the target cache and its
+/// `updated_at` are exactly as before.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_rolls_back_when_its_snapshot_record_cannot_be_written(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "disk-full", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    let before = footprint(&pool, &w).await;
+    let own: HashMap<Uuid, StoredEdgeRow> = HashMap::new();
+    let guards = TargetedGuards {
+        baseline: &w.baseline,
+        own_rows: &own,
+        only_changed: false,
+    };
+    let mut calls = 0usize;
+    let mut on_capture = |_: &RewireCapture| -> Result<(), String> {
+        calls += 1;
+        Err("disk full".to_string())
+    };
+
+    let out = rewire_edge_targeted(&pool, &viewer, &edge, &guards, &mut on_capture).await;
+
+    assert_eq!(calls, 1, "the rewrite reached its capture: {out:?}");
+    let err = out.expect_err("a failed snapshot record fails the edge");
+    assert!(err.contains("disk full"), "{err}");
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "rolled back: row, created_at, target cache and updated_at unchanged"
+    );
+}
