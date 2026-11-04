@@ -530,6 +530,8 @@ async fn the_r173_delta_measures_each_regime_and_predicts_the_recompute(pool: Pg
         r.all.classification_flips
     );
     assert_eq!(r.l1.claims, 2);
+    assert_eq!(r.l1_single_input.claims, 1);
+    assert_eq!(r.l1_single_input.by_regime.get("cache_eq_empty"), Some(&1));
     assert_eq!(r.a5_mirror.by_regime.get("cache_eq_empty"), Some(&1));
     assert_eq!(r.a5_mirror.by_regime.get("cache_eq_full"), Some(&1));
     assert_eq!(r.a5_mirror.claims, 2, "l1 and l3: single input, unpatched");

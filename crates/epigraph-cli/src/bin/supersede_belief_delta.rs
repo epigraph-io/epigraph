@@ -214,8 +214,10 @@ async fn measure_into(
             r.snapshots.len()
         );
         println!(
-            "r173: L1 {} (+{} not current), L2 {}, L3 {}, vacate {}",
+            "r173: L1 {} (of which single-input, the R-176(1) population: {}; +{} not \
+             current), L2 {}, L3 {}, vacate {}",
             r.lists.l1.len(),
+            r.lists.l1_single_input.len(),
             r.lists.l1_not_current.len(),
             r.lists.l2.len(),
             r.lists.l3.len(),

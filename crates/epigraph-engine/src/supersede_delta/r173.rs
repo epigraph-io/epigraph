@@ -355,6 +355,12 @@ impl R173Claim {
         }
     }
 
+    /// In ruling R-176(1)'s population ([`ApplyLists::l1_single_input`]).
+    #[must_use]
+    pub fn in_l1_single_input(&self) -> bool {
+        self.list == Some(ApplyList::L1) && self.single_input.is_some() && !self.owner_frame_patched
+    }
+
     /// The claim entered the block: it has an owner and a changed row.
     #[must_use]
     pub fn entered(&self) -> bool {
@@ -541,7 +547,11 @@ pub struct R173Counts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ApplyLists {
     pub l1: Vec<Uuid>,
-    /// The single-input share of L1 (not yet computed: empty).
+    /// The single-input share of L1: ruling R-176(1)'s accepted population.
+    /// An L1 claim whose owner frame holds ONE fold input with masses only on
+    /// singletons and the whole frame (the closed form of check C3 applies,
+    /// [`R173Claim::single_input`]), on a frame with no `belief_profile`
+    /// patch. Multi-input L1 claims are in [`Self::l1`] only.
     pub l1_single_input: Vec<Uuid>,
     pub l1_not_current: Vec<Uuid>,
     pub l2: Vec<Uuid>,
@@ -619,6 +629,8 @@ pub struct R173Report {
     /// Every entered and skipped claim.
     pub all: BlockStats,
     pub l1: BlockStats,
+    /// Over [`ApplyLists::l1_single_input`].
+    pub l1_single_input: BlockStats,
     pub l2: BlockStats,
     /// Tier A's single-input population: current, entered, one owner input,
     /// closed form applicable, owner frame unpatched.
@@ -1115,7 +1127,12 @@ pub(super) fn report(
             lists.vacate.push(c.id);
         }
         match c.list {
-            Some(ApplyList::L1) => lists.l1.push(c.id),
+            Some(ApplyList::L1) => {
+                lists.l1.push(c.id);
+                if c.in_l1_single_input() {
+                    lists.l1_single_input.push(c.id);
+                }
+            }
             Some(ApplyList::L1NotCurrent) => lists.l1_not_current.push(c.id),
             Some(ApplyList::L2) => lists.l2.push(c.id),
             Some(ApplyList::L3) => lists.l3.push(c.id),
@@ -1126,6 +1143,7 @@ pub(super) fn report(
     claims.sort_by_key(|c| c.id);
     for l in [
         &mut lists.l1,
+        &mut lists.l1_single_input,
         &mut lists.l1_not_current,
         &mut lists.l2,
         &mut lists.l3,
@@ -1148,6 +1166,7 @@ pub(super) fn report(
         lists,
         all: BlockStats::over(claims.iter(), t, top),
         l1: BlockStats::over(pick(ApplyList::L1), t, top),
+        l1_single_input: BlockStats::over(claims.iter().filter(|c| c.in_l1_single_input()), t, top),
         l2: BlockStats::over(pick(ApplyList::L2), t, top),
         a5_mirror: BlockStats::over(a5, t, top),
         checks,
