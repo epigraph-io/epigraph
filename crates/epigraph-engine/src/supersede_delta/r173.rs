@@ -38,6 +38,11 @@
 //!
 //! The report carries no timestamp; the only per-run value is each
 //! transaction's snapshot ([`R173Report::snapshots`]), kept in its own field.
+//!
+//! A read error on any one claim (a malformed stored BBA, a
+//! `statement_timeout`) ends the whole run, and with `chunk` every finished
+//! chunk is lost with it: the report is assembled at the end. The apply
+//! (`recompute_claim_belief`) counts such a claim and continues instead.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -582,6 +587,8 @@ pub struct Canary {
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct R173Checks {
     pub c1: &'static str,
+    /// What the in-binary C3 compares, and the external comparison.
+    pub c3: &'static str,
     pub c2_canary: Option<Canary>,
     /// Single-input owner frames whose closed form was compared to the fold.
     pub c3_checked: usize,
@@ -604,7 +611,12 @@ pub struct R173Checks {
     /// An unchanged claim whose E and F differ.
     pub c7_violations: Vec<Uuid>,
     /// A recomputed claim whose A is not F (the write path and the measured
-    /// fold disagree).
+    /// fold disagree). Close to tautological by construction: A
+    /// ([`preview_claim_belief_on_frame_vacating`]) and F
+    /// ([`preview_claim_belief_on_frame_with_profile`] under the served
+    /// profile) share `compute_combined_belief_over` and can differ only on
+    /// the vacate arm. What pins A is the r173 test, which compares it with
+    /// the real recompute write.
     pub a_matches_f_violations: Vec<Uuid>,
 }
 
@@ -659,6 +671,12 @@ struct FrameProfiles {
 }
 
 /// State shared by the chunks of one run.
+///
+/// `frames` holds each owner frame's resolved profiles from the FIRST chunk
+/// that met the frame; with `chunk`, later chunks fold under that frame tier
+/// even though they read the rows in a later snapshot. A frame's
+/// `belief_profile` rarely changes; a run that spans such a change measures
+/// the later chunks under the earlier tier.
 pub(super) struct Run {
     empty_base: BeliefProfile,
     frames: HashMap<Uuid, FrameProfiles>,
@@ -1068,8 +1086,14 @@ pub(super) fn report(
         ..R173Counts::default()
     };
     let mut checks = R173Checks {
-        c1: "external: compare counts.entered (current + not current) with Tier A's \
-             claim-level count of claims whose owner frame holds a changed row",
+        c1: "external: compare counts.entered (current + not current) with Tier A A4's \
+             NON-compound rows (compound = false) whose owner frame holds a changed row: \
+             the binary sends every compound to skipped_compound before the row-change \
+             test, so A4's compound rows correspond to counts.skipped_compound",
+        c3: "in-binary: each single-input owner frame's fold against its closed form \
+             (c3_checked, c3_max_abs_diff, c3_violations). External: plan C3 compares E \
+             and F with Tier A's SQL values within 1e-9; join claims[].empty / full and \
+             claims[].single_input.r_empty / r_full on id",
         c4: "the report carries no timestamp; ids and maps are sorted; snapshots are \
              the only per-run field",
         c6: "external: the k10-retro / k12b blocks' totals against X-3 Tier A",
