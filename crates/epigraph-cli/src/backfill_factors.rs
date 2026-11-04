@@ -1151,11 +1151,18 @@ async fn source_interval(
 ///    the pure core of the wire) stores a row (`held_would_remove`);
 /// 3. with `only_changed`, a wire equal to the current row is
 ///    [`TargetedVerdict::Unchanged`];
-/// 4. the target is fresh: its cache is the fold of its current rows
+/// 4. the refold would not vacate the target (ruling R-80, `would_vacate`):
+///    no admissible row folds into its cache and a recompute must vacate it.
+///    Decided on the CURRENT rows: the rewritten row keeps its id and its
+///    derivation sources, so the fold with the new row admits exactly the
+///    same rows;
+/// 5. the target is fresh: its cache is the fold of its current rows
 ///    (`target_stale`);
-/// 5. the stored row is of class `r173`: the row this run wrote, or a wire
+/// 6. the stored row is of class `r173`: the row this run wrote, or a wire
 ///    from the source's baseline interval (`row_mixed`);
-/// 6. the fold with the new row is not a vacate (`would_vacate`).
+/// 7. the fold with the new row exists. Defensive only: by (4) it is `None`
+///    only if the admissible set changed under the decision, and then the
+///    same vacate check is made again.
 ///
 /// `overlay` (the predict only) supplies earlier steps' predicted caches and
 /// rows in place of the stored ones.
@@ -1247,6 +1254,19 @@ pub async fn decide_targeted(
     .await?;
     decision.s = Some(s.clone());
     decision.r = r.clone();
+    // No admissible row folds into the target's cache. The row this edge
+    // rewrites keeps its id and its derivation sources, so a refold with the
+    // new row admits nothing either: when the cache must be vacated (ruling
+    // R-80) that refold IS a vacate, decided here before the freshness verdict
+    // below would count it as an ordinary stale target.
+    if r.is_none()
+        && epigraph_engine::derivation_scope::must_vacate_cache(&mut *conn, viewer, edge.target_id)
+            .await
+            .map_err(|e| format!("derivation scope read: {e}"))?
+    {
+        decision.verdict = TargetedVerdict::Hold(HeldBucket::WouldVacate);
+        return Ok(decision);
+    }
     if !r
         .as_ref()
         .is_some_and(|r| cache_matches_fold(&s, r, binary, FRESH_EPSILON))

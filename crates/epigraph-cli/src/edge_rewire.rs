@@ -841,7 +841,16 @@ pub async fn predict_targeted_rewire(
                             _ => None,
                         },
                         d_edge: None,
-                        fresh: !matches!(d.verdict, TargetedVerdict::Hold(HeldBucket::TargetStale)),
+                        // The S-vs-R comparison itself, not the verdict: a
+                        // held `would_vacate` target has no fold to be fresh to.
+                        fresh: d.r.as_ref().is_some_and(|r| {
+                            crate::backfill_factors::cache_matches_fold(
+                                s,
+                                r,
+                                binary,
+                                crate::backfill_factors::FRESH_EPSILON,
+                            )
+                        }),
                         crossings: Vec::new(),
                     });
             }
