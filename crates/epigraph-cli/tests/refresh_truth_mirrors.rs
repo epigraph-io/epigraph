@@ -41,6 +41,7 @@ use epigraph_cli::truth_mirror::{
     Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
 };
 use epigraph_core::{ClaimId, TruthValue};
+use epigraph_db::repos::claim_role::{self, ClaimRole};
 use epigraph_db::{ClaimRepository, Viewer};
 
 #[path = "viewer_fixture.rs"]
@@ -1092,4 +1093,93 @@ async fn apply_rolls_back_a_batch_whose_record_fails(pool: PgPool) {
     );
     assert_eq!(delivered[0].truth_written.to_bits(), new_first.to_bits());
     assert_untouched(&pool, second, t2, v2, "second batch rolled back").await;
+}
+
+// ── (14) a procedural claim (a node of a workflow-ingest tree) ─────────────
+
+/// An agent registered as the `workflow-ingest` system agent (migration 148),
+/// the one author whose `source_type: workflow` root makes a tree procedural.
+/// Planted with triggers off, as `bulk_recompute_guard.rs` does.
+async fn workflow_ingest_agent(pool: &PgPool) -> Uuid {
+    let id = seed_agent(pool).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO public.system_agents (role, agent_id, registered_public_key, reason) \
+         SELECT 'workflow-ingest', a.id, a.public_key, 'refresh-truth-mirrors test plant' \
+           FROM public.agents a WHERE a.id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the workflow-ingest system agent");
+    tx.commit().await.expect("commit");
+    id
+}
+
+/// A decomposed descendant of a workflow-ingest root can carry none of the
+/// `workflow_or_step` arms (no `executes` in-edge, no `step_lineage_id`, no
+/// `workflow` label, no `workflows` row); its procedural role is then its
+/// only guard (R-177 OD-D2). Both `classify` and the CAS refuse it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_procedural_claim_is_left_untouched(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let wf_agent = workflow_ingest_agent(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let node = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[control, node], "L1").await;
+
+    // Hand-set structure: a workflow-ingest root stamped `source_type:
+    // workflow` decomposes to `node`.
+    let content = format!("workflow thesis {}", Uuid::new_v4());
+    let root: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, is_current, properties) \
+         VALUES ($1, sha256($1::bytea), 0.5, $2, true, $3) RETURNING id",
+    )
+    .bind(&content)
+    .bind(wf_agent)
+    .bind(serde_json::json!({ "source_type": "workflow", "level": 0 }))
+    .fetch_one(&pool)
+    .await
+    .expect("workflow root");
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'claim', $2, 'claim', 'decomposes_to')",
+    )
+    .bind(root)
+    .bind(node)
+    .execute(&pool)
+    .await
+    .expect("decomposes_to edge");
+    let roles = claim_role::roles_batch(&pool, &viewer, &[control, node])
+        .await
+        .expect("roles");
+    assert_eq!(
+        roles[&node],
+        ClaimRole::Procedural,
+        "precondition: the node is procedural"
+    );
+    assert_eq!(roles[&control], ClaimRole::Standalone, "precondition");
+    let t = truth_of(&pool, node).await;
+    let p = cache_of(&pool, node).await.pignistic_prob.unwrap();
+    let v = row_version(&pool, node).await;
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, control, &report).await;
+    assert_eq!(report.bucket_of(node), Some(Bucket::Procedural));
+    assert!(written.iter().all(|r| r.claim_id != node));
+    assert_untouched(&pool, node, t, v, "procedural").await;
+
+    // The compare-and-set refuses it on its own, on the exact values.
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(
+        !cas_refresh(&mut conn, node, t, p, 0.612_3).await.unwrap(),
+        "the CAS wrote a procedural claim"
+    );
+    assert_untouched(&pool, node, t, v, "procedural, direct CAS").await;
 }

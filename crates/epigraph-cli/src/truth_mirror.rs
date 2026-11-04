@@ -825,6 +825,15 @@ mod tests {
     }
 
     #[test]
+    fn a_procedural_claim_is_refused_whatever_else_holds() {
+        let c = cand(0.612_345_678_9, 0.701_234_567_8);
+        let mut s = state(0.612_345_678_9, &c);
+        assert_eq!(classify(&c, Some(&s), true), Bucket::Refresh, "control");
+        s.role = Some(ClaimRole::Procedural);
+        assert_eq!(classify(&c, Some(&s), true), Bucket::Procedural);
+    }
+
+    #[test]
     fn the_sentinel_is_refused_on_either_side_even_with_include_round() {
         let c = cand(0.05, 0.613_7);
         assert_eq!(
