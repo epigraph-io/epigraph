@@ -17,7 +17,7 @@ mod fixture;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -645,6 +645,127 @@ async fn a_record_cut_short_by_a_full_volume_leaves_a_wave_file_the_restore_read
         cache(&pool, ids[0]).await,
         sentinels[0],
         "the restore did not put back claim 1's exact prior cache"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The row lock keeps `before` exact against a writer that is mid-transaction
+/// when the run reaches the claim: the run waits for it and records ITS
+/// value as `before`, so the restore puts that value back rather than the
+/// older one the writer replaced.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writer_mid_transaction_when_the_run_reaches_the_claim_is_the_recorded_before(
+    pool: PgPool,
+) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, sentinels) = seeded(&pool, 1).await;
+    let id = ids[0];
+
+    // The other writer: locks the row and replaces the sentinel, uncommitted.
+    let mut tx = pool.begin().await.expect("begin the other writer");
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("holder pid");
+    sqlx::query("SELECT id FROM claims WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .expect("lock the row");
+    let other_frame = frame(&pool).await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.333, plausibility = 0.777, pignistic_prob = 0.555, \
+                mass_on_empty = 0.011, mass_on_missing = 0.022, belief_frame_id = $2, \
+                classification = 'other-writer' \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(other_frame)
+    .execute(&mut *tx)
+    .await
+    .expect("the other writer's update");
+    let theirs = read_cache_columns(&mut *tx, &[id])
+        .await
+        .expect("read the other writer's cache")
+        .remove(&id)
+        .expect("claim exists");
+    assert_ne!(theirs, sentinels[0]);
+
+    let wave = dir.join("wave.jsonl");
+    let list = write_ids(&dir, &ids);
+    let mut child = Command::new(RECOMPUTE)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("RUST_LOG", "warn")
+        .env("DATABASE_URL", &db)
+        .args(["--input", s(&list), "--snapshot", s(&wave)])
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the recompute");
+
+    // Wait (bounded) until the run is blocked behind the other writer.
+    let mut blocked = false;
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder)
+        .fetch_one(&pool)
+        .await
+        .expect("read blocked sessions");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        if child.try_wait().expect("poll the recompute").is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if !blocked {
+        let _ = child.kill();
+        let out = child.wait_with_output().expect("reap the recompute");
+        let _ = tx.rollback().await;
+        panic!(
+            "the run never waited behind the other writer\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    tx.commit().await.expect("commit the other writer");
+    let out = child.wait_with_output().expect("wait for the recompute");
+    let r = Run {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    };
+    r.ok("recompute --snapshot behind another writer");
+
+    let now = cache(&pool, id).await;
+    assert_ne!(
+        now, theirs,
+        "the recompute did not write after the other writer"
+    );
+    let records = wave_records(&wave);
+    assert_eq!(records.len(), 1, "one record: {records:?}");
+    assert_eq!(
+        records[0].before,
+        theirs,
+        "`before` is not the value the other writer committed (the sentinel it replaced: {})",
+        records[0].before == sentinels[0]
+    );
+    assert_eq!(records[0].written, now);
+
+    let r = run(RESTORE, &dir, &db, &["--from", s(&wave)]);
+    r.ok("restore --from");
+    assert_eq!(r.count("restored"), 1);
+    assert_eq!(
+        cache(&pool, id).await,
+        theirs,
+        "the restore did not put back the other writer's value"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
