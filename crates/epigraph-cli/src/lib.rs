@@ -22,6 +22,8 @@ pub mod operator;
 #[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]
+pub mod recompute_claim_belief;
+#[cfg(feature = "db")]
 pub mod reembed;
 #[cfg(feature = "genai")]
 pub mod rerank;

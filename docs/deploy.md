@@ -867,6 +867,17 @@ session owns. Two consequences an operator should know:
   partially recomputed. Under the old shape the siblings were independent tasks
   and ran to completion. Both binaries are idempotent and re-runnable, so the
   remedy is a re-run; nothing needs unpicking by hand.
+* **A reversible `epigraph-recompute-belief` run takes `--snapshot <wave
+  file>`** (optionally `--wave <name>`). Each claim is then one transaction
+  (row lock, recompute, read-back) whose `belief_cache::WaveRecord` is appended
+  and synced before it commits, so `restore_belief_cache --from <wave file>`
+  puts back exactly the run's pre-images by compare-and-swap and leaves any
+  claim a later writer changed (`superseded_since_wave`). The wave file must be
+  absent or empty. A file that cannot be opened stops the run before any write;
+  a record that cannot be written rolls its claim back and stops the run with
+  exit 3. A dropped or panicking claim mid-transaction is rolled back, so the
+  file never misses a committed write; at worst it holds a record of a write
+  that never committed, which a restore reports `already_restored`.
 
 **The Python half warns about none of this.** `scripts/maintenance_dsn.py`
 mirrors the precedence and the database-name refusal, and deliberately does
