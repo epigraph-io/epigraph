@@ -36,6 +36,7 @@ use uuid::Uuid;
 use epigraph_cli::belief_cache::{
     read_cache_columns, read_wave, write_wave_record, CacheColumns, WaveRecord,
 };
+use epigraph_cli::belief_mode_check::MODE_CHECK_REFUSED_EXIT;
 use epigraph_cli::truth_mirror::{
     apply, cas_refresh, dry_run, plan_candidates, read_truth_records, restore, write_truth_record,
     Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
@@ -817,8 +818,8 @@ fn scratch_dir() -> PathBuf {
 }
 
 /// A cleared environment (no operator DSN leaks in), a cwd with no `.env`,
-/// and an API base nothing answers on (the writing runs pass the hidden
-/// `--allow-mode-skew`).
+/// and an API base nothing answers on (a writing run refuses there unless it
+/// passes the hidden `--allow-mode-skew`).
 fn run_bin(cwd: &Path, url: &str, args: &[&str]) -> Output {
     Command::new(BIN)
         .env_clear()
@@ -927,6 +928,43 @@ async fn the_binary_dry_runs_applies_and_restores_through_files(pool: PgPool) {
     assert!(!record.exists(), "a refused run created the record file");
     assert_eq!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
 
+    // A writing run without --allow-mode-skew: nothing answers at
+    // EPIGRAPH_API, so the belief-mode check refuses it (exit 3) before any
+    // output file or the database is touched.
+    let refused_record = dir.join("REFUSED-RECORD.jsonl");
+    let refused_report = dir.join("refused.json");
+    let va = row_version(&pool, a).await;
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--record",
+            refused_record.to_str().unwrap(),
+            "--report",
+            refused_report.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(
+        o.status.code(),
+        Some(MODE_CHECK_REFUSED_EXIT),
+        "an apply with unreadable server modes must refuse; stderr: {stderr}"
+    );
+    assert!(stderr.contains("belief_modes"), "stderr: {stderr}");
+    assert!(
+        !refused_record.exists(),
+        "a refused apply created its record"
+    );
+    assert!(
+        !refused_report.exists(),
+        "a refused apply created its report"
+    );
+    assert_eq!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
+    assert_eq!(row_version(&pool, a).await, va, "a refused apply wrote");
+
     // Apply.
     let o = run_bin(
         &dir,
@@ -960,6 +998,34 @@ async fn the_binary_dry_runs_applies_and_restores_through_files(pool: PgPool) {
     .unwrap();
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].claim_id, a);
+
+    // A non-dry restore without --allow-mode-skew is a writing run too: it
+    // refuses (exit 3) before its default report is created.
+    let va = row_version(&pool, a).await;
+    let o = run_bin(&dir, &url, &["--restore", record.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(
+        o.status.code(),
+        Some(MODE_CHECK_REFUSED_EXIT),
+        "a restore with unreadable server modes must refuse; stderr: {stderr}"
+    );
+    assert!(stderr.contains("belief_modes"), "stderr: {stderr}");
+    assert_eq!(
+        truth_of(&pool, a).await.to_bits(),
+        new.to_bits(),
+        "a refused restore wrote"
+    );
+    assert_eq!(row_version(&pool, a).await, va, "a refused restore wrote");
+    assert!(
+        !std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("D-RECORD.jsonl.restore-")),
+        "a refused restore created its report"
+    );
 
     // Restore, as the design spells it: no --report (it defaults next to the
     // record file). A dry run first, which writes nothing.
