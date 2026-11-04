@@ -422,6 +422,33 @@ async fn a_snapshot_that_cannot_be_opened_refuses_before_any_write(pool: PgPool)
         state,
         "the refused run wrote a cache"
     );
+
+    // A dry run writes nothing, so it must not look as if it took a snapshot.
+    let dry = dir.join("dry.jsonl");
+    let r = run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &["--input", s(&list), "--snapshot", s(&dry), "--dry-run"],
+    );
+    assert_eq!(
+        r.code,
+        Some(2),
+        "--dry-run with --snapshot must be an argv error\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("--dry-run") && r.stderr.contains("--snapshot"),
+        "refused for the wrong reason: {}",
+        r.stderr
+    );
+    assert!(!dry.exists(), "a dry run created a wave file");
+    assert_eq!(
+        cache_state(&pool).await,
+        state,
+        "the refused run wrote a cache"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

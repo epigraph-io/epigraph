@@ -90,8 +90,9 @@ struct Cli {
     /// (`{claim_id, before, written, wave, at}`) so `restore_belief_cache
     /// --from <wave file>` can undo exactly this run by compare-and-swap. Must
     /// be absent or empty (one wave file holds one run); a claim whose record
-    /// cannot be written is not written, and the run stops.
-    #[arg(long)]
+    /// cannot be written is not written, and the run stops. Refused with
+    /// `--dry-run`, which writes nothing and so opens no wave file.
+    #[arg(long, conflicts_with = "dry_run")]
     snapshot: Option<PathBuf>,
     /// The wave name every record carries. Default `recompute_claim_belief`.
     #[arg(long, requires = "snapshot")]
