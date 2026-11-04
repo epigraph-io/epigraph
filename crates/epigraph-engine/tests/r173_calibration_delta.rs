@@ -20,10 +20,22 @@
 //! * The run writes nothing, a chunked run measures what one transaction
 //!   measures, and two runs on one database are byte-identical once the
 //!   per-transaction snapshots are set aside (check C4).
+//! * A second, separate fixture ([`edges`]) reaches the branches the first
+//!   one does not, one test each: a VACATE (every owner row cites a
+//!   group-private evidence row, cache planted) and its no-cache twin
+//!   (`scope_kept`), a superseded clean-calibration claim (listed apart from
+//!   L1), a MULTI-input clean-calibration claim (in L1, not in the
+//!   single-input share R-176(1) accepted), and two claims that are no
+//!   candidate (their only typed row retracted, or a cached combination).
+//! * `--only` restricts the population, and a run on the
+//!   `epigraph_maintenance` login the binary connects as measures exactly
+//!   what the superuser measures, a GROUP-private candidate included.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
+use epigraph_db::repos::mass_function::COMBINATION_METHOD_LABELS;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PgPool};
 use epigraph_engine::belief_profile::BeliefProfile;
@@ -654,4 +666,404 @@ async fn chunked_and_repeated_runs_measure_the_same_thing(pool: PgPool) {
         without_snapshots(report.r173.expect("r173")),
         without_snapshots(one_tx)
     );
+}
+
+// ───────────────────────── the branches the main world does not reach ─────
+
+/// The edge-case claims, built alone in their own database so the main
+/// world's hand-counted totals stay as they are.
+struct Edges {
+    _scoped: epigraph_db::ScopedPool,
+    viewer: Viewer,
+    /// Its only owner row cites a group-private evidence row; cache planted.
+    vacate: Uuid,
+    /// The same inadmissible input, no cache.
+    scope_kept: Uuid,
+    /// As the main world's `l1` (S = E, one row), then superseded.
+    not_current: Uuid,
+    /// The main world's `l2` rows, cache planted at E: clean calibration,
+    /// two inputs.
+    multi: Uuid,
+    /// Its only typed row retracted, beside a live untyped one.
+    retracted_only: Uuid,
+    /// Its only typed row a cached combination, beside a live untyped one.
+    cached_only: Uuid,
+}
+
+/// The candidates [`edges`] builds: the four claims holding a live, typed,
+/// non-cached-combination row.
+const EDGE_CANDIDATES: usize = 4;
+
+/// Stamp the session as `agent` (its groups and writable groups).
+async fn stamp(conn: &mut sqlx::PgConnection, pool: &PgPool, agent: Uuid) {
+    let v = Viewer::resolve(pool, agent).await.expect("resolve viewer");
+    let csv = |g: &[Uuid]| g.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', $1, false), \
+                set_config('epigraph.writable_group_ids', $2, false), \
+                set_config('epigraph.principal_id', $3, false)",
+    )
+    .bind(csv(v.group_bind().expect("scoped viewer")))
+    .bind(csv(v.writable_groups()))
+    .bind(agent.to_string())
+    .execute(&mut *conn)
+    .await
+    .expect("stamp the session");
+}
+
+/// A public claim owned by `group` (so `owner` may retract rows it holds).
+async fn owned_claim(pool: &PgPool, owner: Uuid, group: Uuid, tag: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5)",
+    )
+    .bind(id)
+    .bind(tag)
+    .bind(&hash)
+    .bind(owner)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("a public claim owned by the owner's group");
+    id
+}
+
+/// Retract `row` as `owner` through the real repository path.
+async fn retract_as(pool: &PgPool, owner: Uuid, row: Uuid) {
+    let p = pool.clone();
+    let retracted = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        let r = MassFunctionRepository::retract_conn(&mut conn, row, "r173 fixture", None).await;
+        (conn, r)
+    })
+    .await
+    .expect("the owner retracts the row through the real path");
+    assert_eq!(retracted.status.as_str(), "retracted", "PREMISE");
+}
+
+async fn retire(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("retire by a plain flip");
+}
+
+/// A typed `empirical` row with no stored strength (empty 0.5, full 1.0)
+/// citing `evidence`; its id.
+async fn bba_citing(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid) -> Uuid {
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("auto_wire"),
+        None,
+        Some("empirical"),
+        "cross",
+        Some(evidence),
+    )
+    .await
+    .expect("store the evidence-derived BBA")
+}
+
+async fn edges(pool: &PgPool) -> Edges {
+    let (scoped, viewer) = fixture::bypass(pool).await;
+    let public = fixture::public_viewer(pool).await;
+    let (agent, _) = fixture::seed_agent_with_group(pool, "r173-edge-a").await;
+    let (agent2, _) = fixture::seed_agent_with_group(pool, "r173-edge-b").await;
+    let (member, group) = fixture::seed_agent_with_group(pool, "r173-edge-member").await;
+    let (owner, owner_group) = fixture::seed_agent_with_group(pool, "r173-edge-owner").await;
+    let binary = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary frame");
+    let lean = || serde_json::json!({"0": 0.6, "0,1": 0.4});
+    let untyped = || serde_json::json!({"1": 0.2, "0,1": 0.8});
+
+    // Evidence narrowed to a group: it inherits its group-private claim's
+    // tenancy, so a PUBLIC claim's row citing it is inadmissible (R-22).
+    let private_src = fixture::seed_group_claim(pool, member, group, "r173 private src").await;
+    let hidden = fixture::seed_evidence(pool, private_src, "observation").await;
+    let vis: String = sqlx::query_scalar("SELECT visibility::text FROM evidence WHERE id = $1")
+        .bind(hidden)
+        .fetch_one(pool)
+        .await
+        .expect("evidence visibility");
+    assert_ne!(
+        vis, "public",
+        "PREMISE: the cited evidence is group-private"
+    );
+
+    let vacate = fixture::seed_public_claim(pool, agent, "r173 vacate").await;
+    let vacate_row = bba_citing(pool, vacate, binary, agent, hidden).await;
+    plant(pool, vacate, 0.3, 1.0, one(0.5, 0.6, 0.4)).await;
+    let scope_kept = fixture::seed_public_claim(pool, agent, "r173 scope kept").await;
+    let kept_row = bba_citing(pool, scope_kept, binary, agent, hidden).await;
+    let admitted = DerivationScopeRepository::cache_admissible(pool, &[vacate_row, kept_row])
+        .await
+        .expect("cache_admissible");
+    assert!(
+        admitted.is_empty(),
+        "PREMISE: neither row may enter its public claim's cache: {admitted:?}"
+    );
+
+    let not_current = fixture::seed_public_claim(pool, agent, "r173 not current").await;
+    bba(
+        pool,
+        not_current,
+        binary,
+        agent,
+        lean(),
+        Some("auto_wire"),
+        None,
+        Some("empirical"),
+    )
+    .await;
+    plant(pool, not_current, 0.3, 1.0, one(0.5, 0.6, 0.4)).await;
+    retire(pool, not_current).await;
+
+    let multi = fixture::seed_public_claim(pool, agent, "r173 multi").await;
+    bba(
+        pool,
+        multi,
+        binary,
+        agent,
+        lean(),
+        Some("auto_wire"),
+        Some(0.7),
+        Some("testimonial"),
+    )
+    .await;
+    let against = serde_json::json!({"1": 0.3, "0,1": 0.7});
+    bba(pool, multi, binary, agent2, against, None, Some(0.8), None).await;
+    plant(pool, multi, 0.3, 0.8, l2_betp(0.7)).await;
+
+    let retracted_only = owned_claim(pool, owner, owner_group, "r173 retracted only").await;
+    let typed_row = MassFunctionRepository::store_with_perspective(
+        pool,
+        retracted_only,
+        binary,
+        Some(owner),
+        None,
+        &lean(),
+        None,
+        Some("auto_wire"),
+        None,
+        Some("empirical"),
+        "cross",
+        None,
+    )
+    .await
+    .expect("the typed row to retract");
+    bba(
+        pool,
+        retracted_only,
+        binary,
+        agent2,
+        untyped(),
+        None,
+        Some(0.8),
+        None,
+    )
+    .await;
+    retract_as(pool, owner, typed_row).await;
+
+    let cached_only = fixture::seed_public_claim(pool, agent, "r173 cached only").await;
+    // A stored combination: no source agent, no perspective, a combination
+    // label (the shape `cached_combination_predicate` names).
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        cached_only,
+        binary,
+        None,
+        None,
+        &lean(),
+        Some(0.0),
+        Some(COMBINATION_METHOD_LABELS[1]),
+        None,
+        Some("empirical"),
+        "cross",
+        None,
+    )
+    .await
+    .expect("the cached combination row");
+    bba(
+        pool,
+        cached_only,
+        binary,
+        agent2,
+        untyped(),
+        None,
+        Some(0.8),
+        None,
+    )
+    .await;
+
+    Edges {
+        _scoped: scoped,
+        viewer,
+        vacate,
+        scope_kept,
+        not_current,
+        multi,
+        retracted_only,
+        cached_only,
+    }
+}
+
+fn ids_of(r: &R173Report) -> Vec<Uuid> {
+    r.claims.iter().map(|c| c.id).collect()
+}
+
+/// Every list `id` is in.
+fn lists_of(r: &R173Report, id: Uuid) -> Vec<&'static str> {
+    let l = &r.lists;
+    [
+        ("l1", &l.l1),
+        ("l1_single_input", &l.l1_single_input),
+        ("l1_not_current", &l.l1_not_current),
+        ("l2", &l.l2),
+        ("l3", &l.l3),
+        ("vacate", &l.vacate),
+    ]
+    .into_iter()
+    .filter(|(_, v)| v.contains(&id))
+    .map(|(n, _)| n)
+    .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_vacate_is_listed_apart_and_its_no_cache_twin_is_kept(pool: PgPool) {
+    let e = edges(&pool).await;
+    let r = r173(&pool, &e.viewer, &opts(None, None, None)).await;
+
+    let v = find(&r, e.vacate);
+    assert_eq!(v.outcome, R173Outcome::Vacate, "{v:?}");
+    assert_eq!(v.changed_rows, 1, "PREMISE: the cited row changes weight");
+    assert!(
+        v.empty.is_none() && v.full.is_none(),
+        "the scope rule admits no row to E or F: {v:?}"
+    );
+    let a = v.apply.as_ref().expect("a vacate's A");
+    assert!(
+        near(a.betp, 0.5) && near(a.belief, 0.0) && near(a.plausibility, 1.0),
+        "A is full ignorance on the binary frame: {a:?}"
+    );
+    assert_eq!(a.classification.as_deref(), Some("not_enough_info"));
+    assert_eq!(v.list, None);
+    assert_eq!(
+        lists_of(&r, e.vacate),
+        vec!["vacate"],
+        "never applied under R-173"
+    );
+
+    let k = find(&r, e.scope_kept);
+    assert_eq!(k.outcome, R173Outcome::ScopeKept, "{k:?}");
+    assert!(k.stored.betp.is_none(), "PREMISE: no cache");
+    assert!(k.apply.is_none() && k.list.is_none());
+    assert!(lists_of(&r, e.scope_kept).is_empty());
+    assert!(r.checks.a_matches_f_violations.is_empty(), "{:?}", r.checks);
+    assert_eq!(r.counts.entered, EDGE_CANDIDATES, "{:?}", r.counts);
+
+    // A against the real write: the vacate writes full ignorance, the twin
+    // keeps no cache.
+    let mut conn = pool.acquire().await.expect("acquire");
+    recompute_claim_cached_belief(&mut conn, &e.viewer, e.vacate)
+        .await
+        .expect("recompute the vacate");
+    let (bel, pl, betp) = caches(&pool, &[e.vacate]).await[0];
+    assert!(
+        (bel.unwrap() - a.belief).abs() < 1e-12
+            && (pl.unwrap() - a.plausibility).abs() < 1e-12
+            && (betp.unwrap() - a.betp).abs() < 1e-12,
+        "the recompute wrote ({bel:?}, {pl:?}, {betp:?}); A was {a:?}"
+    );
+    recompute_claim_cached_belief(&mut conn, &e.viewer, e.scope_kept)
+        .await
+        .expect("recompute the twin");
+    assert_eq!(
+        caches(&pool, &[e.scope_kept]).await,
+        vec![(None, None, None)]
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_superseded_clean_calibration_claim_is_listed_apart_from_l1(pool: PgPool) {
+    let e = edges(&pool).await;
+    let r = r173(&pool, &e.viewer, &opts(None, None, None)).await;
+    let c = find(&r, e.not_current);
+    assert!(!c.is_current, "PREMISE: superseded");
+    assert_eq!(
+        (c.outcome, c.regime),
+        (R173Outcome::Recomputed, Some(Regime::CacheEqEmpty)),
+        "{c:?}"
+    );
+    assert_eq!(c.list, Some(ApplyList::L1NotCurrent));
+    assert_eq!(
+        lists_of(&r, e.not_current),
+        vec!["l1_not_current"],
+        "a superseded claim is never in the list R-177(3) applies"
+    );
+    assert_eq!(r.counts.entered_not_current, 1, "{:?}", r.counts);
+    assert_eq!(r.l1.claims, 1, "L1's stats hold the multi-input claim only");
+    assert_eq!(
+        r.a5_mirror.claims, 0,
+        "Tier A's A5 population is current claims only"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_input_clean_calibration_claim_is_in_l1_not_in_its_single_input_share(
+    pool: PgPool,
+) {
+    let e = edges(&pool).await;
+    let r = r173(&pool, &e.viewer, &opts(None, None, None)).await;
+    let m = find(&r, e.multi);
+    assert_eq!((m.owner_inputs, m.changed_rows), (2, 1), "{m:?}");
+    assert!(near(m.empty.as_ref().unwrap().betp, l2_betp(0.7)), "{m:?}");
+    assert!(near(m.full.as_ref().unwrap().betp, l2_betp(0.6)));
+    assert!(near(m.d_cal.unwrap(), l2_betp(0.6) - l2_betp(0.7)));
+    assert_eq!(m.regime, Some(Regime::CacheEqEmpty));
+    assert!(m.single_input.is_none(), "two inputs: no closed form");
+    assert_eq!(
+        lists_of(&r, e.multi),
+        vec!["l1"],
+        "clean calibration, but not the single-input population R-176(1) accepted"
+    );
+    assert!(r.lists.l1_single_input.is_empty());
+    assert_eq!(r.l1_single_input.claims, 0);
+    assert_eq!(r.a5_mirror.claims, 0);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_whose_only_typed_row_is_retracted_is_no_candidate(pool: PgPool) {
+    let e = edges(&pool).await;
+    let r = r173(&pool, &e.viewer, &opts(None, None, None)).await;
+    assert!(
+        !ids_of(&r).contains(&e.retracted_only),
+        "a retracted typed row makes no candidate: {:?}",
+        r.claims
+    );
+    assert_eq!(r.counts.candidates, EDGE_CANDIDATES, "{:?}", r.counts);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_whose_only_typed_row_is_a_cached_combination_is_no_candidate(pool: PgPool) {
+    let e = edges(&pool).await;
+    let r = r173(&pool, &e.viewer, &opts(None, None, None)).await;
+    assert!(
+        !ids_of(&r).contains(&e.cached_only),
+        "a cached combination row makes no candidate: {:?}",
+        r.claims
+    );
+    assert_eq!(r.counts.candidates, EDGE_CANDIDATES, "{:?}", r.counts);
 }
