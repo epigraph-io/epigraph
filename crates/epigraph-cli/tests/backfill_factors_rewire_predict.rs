@@ -593,6 +593,63 @@ async fn predict_counts_would_remove_for_a_vacuous_and_a_factorless_source(pool:
     assert_eq!(fingerprint(&pool).await, before, "the apply wrote nothing");
 }
 
+/// OD-E5 / K12b, the predict's twin of `targeted_rewire_holds_supersedes`: a
+/// listed `supersedes` edge holding the row a pre-K12b wire left (wired as
+/// `contradicts`, the restriction `supersedes` had before K12b, then
+/// relabelled) is predicted held in the `supersedes` bucket, not
+/// `non_epistemic`, and the apply holds it in the same bucket and writes
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_and_apply_hold_a_pre_k12b_supersedes_row_as_supersedes(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let author = seed_agent(&pool, "predict-sup").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    let src = fresh_claim(&pool, &viewer, author, frame, "sup src", EVIDENCE_A).await;
+    let tgt = fresh_claim(&pool, &viewer, author, frame, "sup tgt", TARGET_EVIDENCE).await;
+    let e = wired_edge(&pool, &viewer, author, src, tgt, "contradicts").await;
+    sqlx::query("UPDATE edges SET relationship = 'supersedes' WHERE id = $1")
+        .bind(e)
+        .execute(&pool)
+        .await
+        .expect("relabel the wired edge as a pre-K12b supersedes edge");
+    let wave = vec![move_claim(&pool, &viewer, src, EVIDENCE_B).await];
+    let before = fingerprint(&pool).await;
+    let o = TargetedRunOptions {
+        edges: Some(std::collections::BTreeSet::from([e])),
+        ..opts()
+    };
+
+    let report = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&wave, o.epsilon), &o)
+        .await
+        .expect("predict");
+    let p = report
+        .edges
+        .iter()
+        .find(|x| x.edge_id == e)
+        .expect("the predict reached the edge");
+    assert_eq!(p.outcome, "supersedes", "{p:?}");
+    assert!(report.would_rewrite().is_empty(), "{:?}", report.edges);
+
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    use epigraph_cli::backfill_factors::HeldBucket;
+    assert_eq!(applied.held(HeldBucket::Supersedes), 1, "{applied:?}");
+    assert_eq!(applied.held(HeldBucket::NonEpistemic), 0, "{applied:?}");
+    assert_eq!(applied.rewired(), 0, "{applied:?}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, before, "the apply wrote nothing");
+}
+
 /// Design §1.11 item 5, and the evidence for the recorded Gauss-Seidel
 /// deviation: on a cycle `a ⇄ b` (settled before the wave, so the wave's move
 /// of `a` is the only thing that moved), the predict converges, and what it

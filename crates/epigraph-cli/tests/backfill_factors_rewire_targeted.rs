@@ -393,11 +393,25 @@ async fn targeted_rewire_holds_compound_ends(pool: PgPool) {
 }
 
 /// OD-E5 / K12b: `supersedes` lineage rows are X-3's decision, held.
+///
+/// Since K12b the wire mints no row on a `supersedes` edge, so the fixture
+/// builds the row a pre-K12b wire left (the stock that X-3 decides): it wires
+/// the edge as `contradicts`, the restriction `supersedes` mapped to before
+/// K12b (`Negative(profile.contradicts)`), then relabels the edge.
 #[sqlx::test(migrations = "../../migrations")]
 async fn targeted_rewire_holds_supersedes(pool: PgPool) {
     let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
-    let w = world(&pool, &viewer, "sup", "supersedes", true).await;
+    let w = world(&pool, &viewer, "sup", "contradicts", true).await;
+    sqlx::query("UPDATE edges SET relationship = 'supersedes' WHERE id = $1")
+        .bind(w.edge)
+        .execute(&pool)
+        .await
+        .expect("relabel the wired edge as a pre-K12b supersedes edge");
     let edge = the_edge(&pool, &w).await;
+    assert_eq!(
+        edge.relationship, "supersedes",
+        "the selection sees the relabel"
+    );
     let before = footprint(&pool, &w).await;
 
     let (out, _) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;

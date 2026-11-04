@@ -432,7 +432,7 @@ async fn rewire_one(
     ) {
         if targeted.is_some() {
             return Ok(EdgeResult::only(EdgeRewrite::Held(
-                HeldBucket::NonEpistemic,
+                HeldBucket::for_neutral(&edge.relationship),
             )));
         }
         return Ok(EdgeResult::only(EdgeRewrite::SkippedNonEpistemic));
@@ -705,6 +705,23 @@ impl HeldBucket {
             HeldBucket::TargetStale => "target_stale",
             HeldBucket::RowMixed => "row_mixed",
             HeldBucket::WouldVacate => "would_vacate",
+        }
+    }
+
+    /// The bucket a targeted run holds a `Neutral` relationship in, when it
+    /// short-circuits before [`decide_targeted`]. `supersedes` is held as
+    /// [`HeldBucket::Supersedes`] (design §1.4 lists that bucket before
+    /// `non_epistemic`, and C-EA7 sizes it apart), the same verdict
+    /// [`EdgeShape::held`] gives it. Since K12b maps `supersedes` to
+    /// `Neutral`, the short-circuit is reached first for every such edge;
+    /// without this the pre-K12b `supersedes` rows X-3 decides would be
+    /// reported as `non_epistemic`.
+    #[must_use]
+    pub fn for_neutral(relationship: &str) -> HeldBucket {
+        if relationship.eq_ignore_ascii_case("supersedes") {
+            HeldBucket::Supersedes
+        } else {
+            HeldBucket::NonEpistemic
         }
     }
 }

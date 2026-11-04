@@ -787,8 +787,9 @@ pub async fn predict_targeted_rewire(
                 ),
                 epigraph_engine::sheaf::RestrictionKind::Neutral
             ) {
-                summary.hold(HeldBucket::NonEpistemic);
-                out.outcome = HeldBucket::NonEpistemic.name().into();
+                let bucket = HeldBucket::for_neutral(&edge.relationship);
+                summary.hold(bucket);
+                out.outcome = bucket.name().into();
                 edges_out.push(out);
                 continue;
             }
