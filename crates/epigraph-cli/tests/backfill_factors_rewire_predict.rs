@@ -339,3 +339,155 @@ async fn the_verify_predict_reads_l1_and_e_waves_together(pool: PgPool) {
     assert!(verify.totals.held.is_empty(), "{:?}", verify.totals);
     assert!(verify.totals.unchanged >= 1, "{:?}", verify.totals);
 }
+
+/// Every test above runs as the harness superuser, which skips row security
+/// and every grant. The binary runs on a maintenance LOGIN (a member of
+/// `epigraph_maintenance`, NOSUPERUSER NOBYPASSRLS): the targeted surfaces
+/// must work there too, the definer compound test and the live/retracted
+/// counts of `edge_shape`, the READ ONLY predict transaction, the guarded
+/// rewrite and its row lock, and the restore's UPDATE (`created_at`
+/// included). A read that row security filtered would come back empty and be
+/// miscounted with no error, so every count is asserted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_predict_apply_and_restore_run_on_a_maintenance_login(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    // A retracted off-key row on the mixed edge (held retracted_on_edge, read
+    // through row security), and an edge into a compound (held compound_end,
+    // decided by migration 193's definer).
+    let author = seed_agent(&pool, "maint-extra").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("cal4-maint-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let held_target: Uuid = sqlx::query_scalar("SELECT target_id FROM edges WHERE id = $1")
+        .bind(ch.held_edge)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+                                     combination_method, source_strength, evidence_type, locality_tag, \
+                                     retracted_at, retracted_by, retract_reason) \
+         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
+                 now(), $3, 'cal4 maint fixture')",
+    )
+    .bind(held_target)
+    .bind(other_frame)
+    .bind(author)
+    .bind(ch.held_edge)
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let k = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "maint compound k",
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let ak = wired_edge(&pool, &viewer, author, ch.a, k, "supports").await;
+    make_compound(&pool, k, author).await;
+    let ak_before = edge_rows(&pool, ak).await;
+    let rows_before = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+    let caches_before = (cache(&pool, ch.b).await, cache(&pool, ch.c).await);
+
+    let role = format!("cal4_maint_{}", Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD '{password}' \
+         IN ROLE epigraph_maintenance"
+    ))
+    .execute(&pool)
+    .await
+    .expect("maintenance login");
+    let base = viewer_fixture::database_url_for(&pool).await;
+    let scheme_end = base.find("://").expect("scheme") + 3;
+    let host_path = &base[base.find('@').expect("credentials") + 1..];
+    let url = format!("{}{role}:{password}@{host_path}", &base[..scheme_end]);
+    let maint = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(3)
+        .connect(&url)
+        .await
+        .expect("connect as the maintenance login");
+
+    let o = opts();
+    let seed = seed_from_waves(&ch.wave, o.epsilon);
+    let predicted = predict_targeted_rewire(&maint, &viewer, &seed, &o)
+        .await
+        .expect("predict as the maintenance login");
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(&maint, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect("apply as the maintenance login");
+    let records = epigraph_cli::edge_rewire::read_edge_row_records(r.as_slice()).unwrap();
+    let after_apply = (cache(&pool, ch.b).await, cache(&pool, ch.c).await);
+    let restored = epigraph_cli::edge_rewire::restore_edge_rows(&maint, &records, false)
+        .await
+        .expect("restore as the maintenance login");
+    let caches = epigraph_cli::belief_cache::restore_wave(
+        &maint,
+        &epigraph_cli::belief_cache::plan_restore(
+            &epigraph_cli::belief_cache::read_wave(w.as_slice()).unwrap(),
+            None,
+        ),
+        &epigraph_cli::belief_cache::RestoreOptions::default(),
+    )
+    .await
+    .expect("restore caches as the maintenance login");
+    maint.close().await;
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(&pool)
+        .await;
+
+    assert_eq!(
+        predicted.would_rewrite(),
+        vec![ch.ab, ch.bc],
+        "{:?}",
+        predicted.edges
+    );
+    for bucket in ["retracted_on_edge", "compound_end"] {
+        assert_eq!(
+            predicted.totals.held.get(bucket),
+            Some(&1),
+            "{bucket}: {:?}",
+            predicted.totals
+        );
+    }
+    assert_eq!(applied.rewired(), 2, "{applied:?}");
+    assert_eq!(
+        applied.held(epigraph_cli::backfill_factors::HeldBucket::RetractedOnEdge),
+        1
+    );
+    assert_eq!(
+        applied.held(epigraph_cli::backfill_factors::HeldBucket::CompoundEnd),
+        1
+    );
+    assert_eq!(
+        edge_rows(&pool, ak).await,
+        ak_before,
+        "the compound-ended row is untouched"
+    );
+    assert_eq!(applied.failed(), 0, "{applied:?}");
+    assert_ne!(after_apply, caches_before, "the apply moved the targets");
+    assert_eq!(restored.restored.len(), 2, "{restored:?}");
+    assert_eq!(caches.restored.len(), 2, "{caches:?}");
+    assert_eq!(
+        (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await),
+        rows_before,
+        "rows back byte-identical, created_at included"
+    );
+    assert_eq!(
+        (cache(&pool, ch.b).await, cache(&pool, ch.c).await),
+        caches_before,
+        "caches back byte-identical"
+    );
+}
