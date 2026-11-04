@@ -38,8 +38,8 @@ use epigraph_cli::belief_cache::{
 };
 use epigraph_cli::belief_mode_check::MODE_CHECK_REFUSED_EXIT;
 use epigraph_cli::truth_mirror::{
-    apply, cas_refresh, dry_run, plan_candidates, read_truth_records, restore, write_truth_record,
-    Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
+    apply, begin_dry_run_tx, cas_refresh, dry_run, plan_candidates, read_truth_records, restore,
+    write_truth_record, Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
 };
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::repos::claim_role::{self, ClaimRole};
@@ -1248,4 +1248,39 @@ async fn a_procedural_claim_is_left_untouched(pool: PgPool) {
         "the CAS wrote a procedural claim"
     );
     assert_untouched(&pool, node, t, v, "procedural, direct CAS").await;
+}
+
+// ── (15) the dry run's transaction cannot write ────────────────────────────
+
+/// Design section 2.5 test 10: the dry run's transaction is READ ONLY (a write
+/// inside it fails with 25006) and REPEATABLE READ (one snapshot).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dry_run_transaction_is_read_only_and_repeatable_read(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let t = truth_of(&pool, a).await;
+    let v = row_version(&pool, a).await;
+
+    let mut tx = begin_dry_run_tx(&pool).await.expect("open the dry run tx");
+    let iso: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(iso, "repeatable read");
+    let err = sqlx::query("UPDATE claims SET truth_value = truth_value WHERE id = $1")
+        .bind(a)
+        .execute(&mut *tx)
+        .await
+        .expect_err("a write inside the dry run's transaction succeeded");
+    let code = err
+        .as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned());
+    assert_eq!(
+        code.as_deref(),
+        Some("25006"),
+        "expected read_only_sql_transaction, got {err}"
+    );
+    tx.rollback().await.unwrap();
+    assert_untouched(&pool, a, t, v, "read-only tx").await;
 }

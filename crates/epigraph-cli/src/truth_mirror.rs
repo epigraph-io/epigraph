@@ -600,9 +600,24 @@ fn outcome(c: &Candidate, s: Option<&ClaimState>, bucket: Bucket) -> Outcome {
     }
 }
 
+/// Open the dry run's transaction: `REPEATABLE READ, READ ONLY`, set as its
+/// first statement, so every read sees one snapshot and any write inside it
+/// fails (SQLSTATE 25006).
+///
+/// # Errors
+/// Any database error.
+pub async fn begin_dry_run_tx(
+    pool: &PgPool,
+) -> anyhow::Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
+}
+
 /// Evaluate every rule for `candidates` and write nothing: one
-/// `REPEATABLE READ, READ ONLY` transaction (a write inside it fails),
-/// rolled back.
+/// [`begin_dry_run_tx`] transaction (a write inside it fails), rolled back.
 ///
 /// # Errors
 /// Any database error.
@@ -612,10 +627,7 @@ pub async fn dry_run(
     candidates: &[Candidate],
     opts: &RefreshOptions,
 ) -> anyhow::Result<MirrorReport> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await?;
+    let mut tx = begin_dry_run_tx(pool).await?;
     let mut report = MirrorReport::default();
     for chunk in candidates.chunks(opts.batch_size.max(1)) {
         let ids: Vec<Uuid> = chunk.iter().map(|c| c.claim_id).collect();
