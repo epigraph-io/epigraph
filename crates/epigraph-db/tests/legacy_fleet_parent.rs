@@ -1897,16 +1897,16 @@ async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
     assert_eq!(withheld(&pool, a2).await, Some(1));
 }
 
-/// THE REVERSE-PAIR GUARD ALONE (the chain does not reach the child). B
-/// succeeded A while nothing was attached; the operator then attaches B
-/// itself (its own root row); the job reverts, so A is registered with B as
-/// its parent. B's row names no row of A, but "B succeeded A" is on record,
-/// so nothing is copied onto A. DOCUMENTED COST: an attachment is also 166's
-/// restriction, so with the role unheld B may not run while the reverted A,
-/// holding no attachment, may. POSITIVE CONTROL: a fresh successor of B is
-/// copied.
+/// A COPY BACK ONTO THE PARENT'S OWN PREDECESSOR RESTRICTS (migration 195
+/// dropped 180's reverse-pair guard; the chain guard stays). B succeeded A
+/// while nothing was attached; the operator then attaches B itself (its own
+/// root row); the job reverts, so A is registered with B as its parent. B's
+/// row names no row of A, so the chain guard does not trip, and "B succeeded
+/// A" on record no longer withholds anything: B's row is copied onto A, so
+/// with the role unheld A is held by 166's restriction exactly as B is.
+/// Nothing is withheld. POSITIVE CONTROL: a fresh successor of B is copied.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
+async fn a_copy_onto_the_parents_own_predecessor_restricts(pool: PgPool) {
     seed_role(&pool, CYCLE_ROLE).await;
     let a_id = new_identity();
     let a = register_id(&pool, &a_id, None).await;
@@ -1931,18 +1931,17 @@ async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
         a,
         "the revert is A"
     );
-    assert!(
-        live_rows(&pool, a).await.is_empty(),
-        "nothing is copied onto the parent's own recorded predecessor"
-    );
-    assert_eq!(withheld(&pool, a).await, Some(1));
+    let a_rows = live_rows(&pool, a).await;
+    assert_eq!(a_rows.len(), 1, "B's row is copied onto its predecessor");
+    assert_eq!(a_rows[0].1, Some(rb), "from B's own row");
+    assert_eq!(withheld(&pool, a).await, Some(0), "nothing is withheld");
     assert!(
         !may_run(&pool, b).await,
         "PREMISE: B is held (the role is unheld)"
     );
     assert!(
-        may_run(&pool, a).await,
-        "DOCUMENTED COST: the reverted A holds no attachment, so 166's restriction no longer holds it"
+        !may_run(&pool, a).await,
+        "the reverted A is held by the role exactly as B is"
     );
 
     let c = register_id(&pool, &new_identity(), Some(b)).await;

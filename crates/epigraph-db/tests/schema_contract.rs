@@ -3889,11 +3889,58 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "hop.detached_at IS NULL",
         "hop.valid_from <= p_at",
         "(hop.valid_to IS NULL OR p_at < hop.valid_to)",
+        // 195: a detach is STICKY per identity. No copy counts for an agent
+        // holding a detached row for the role, nor through a copy such an
+        // agent holds. Losing it lets an identity the operator detached back
+        // in through a later copy (a multi-hop revert, an attach-time follow,
+        // or a successor registered from such a copy).
+        "WHERE dd.agent_id = ra.agent_id",
+        "WHERE dd.agent_id = hop.agent_id",
+        "AND dd.detached_at IS NOT NULL",
     ] {
         assert!(
             body.contains(fragment),
             "epigraph_role_derived_memberships at head lost {fragment:?} (re-state it from the \
              head body, keeping every delta)"
+        );
+    }
+}
+
+/// Migration 195: a revert always restricts AT HEAD. The registration's step
+/// 5b keeps 180's chain guard (never copy a parent row whose `inherited_from`
+/// chain reaches a row of the child) and no longer carries 180's reverse-pair
+/// guard, whose withheld copy left a reverted identity outside the role's
+/// restriction (ROL01, may-run) while its parent was held. A later
+/// re-statement of the registration must keep both properties.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_195_registration_restricts_a_revert_at_head(pool: PgPool) {
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p \
+          WHERE p.oid = to_regprocedure('public.epigraph_register_agent_identity(bytea, uuid, \
+                                         text, text, text, bytea, jsonb)')",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("pg_proc lookup");
+    let body = body.expect("the registration must exist");
+    for fragment in [
+        // 166's step 5b copy, and 180's chain guard on it.
+        "INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason,",
+        "WITH RECURSIVE up (hop_id, hop_agent, hop_source)",
+        "SELECT 1 FROM up WHERE up.hop_agent = v_child",
+        "'role_attachments_withheld', v_withheld",
+    ] {
+        assert!(
+            body.contains(fragment),
+            "epigraph_register_agent_identity at head lost {fragment:?} (re-state it from the \
+             head body, keeping every delta)"
+        );
+    }
+    for gone in ["v_reverse", "s.child_agent_id = v_parent"] {
+        assert!(
+            !body.contains(gone),
+            "epigraph_register_agent_identity at head carries {gone:?} again: a copy onto the \
+             parent's recorded predecessor must restrict (migration 195)"
         );
     }
 }
