@@ -887,3 +887,94 @@ fn a_refusal_names_this_process_s_unrecognised_flag_value() {
         );
     }
 }
+
+// ── backfill_factors targeted rewire (R-177(4) class E) ────────────────────
+
+/// A scratch directory for a targeted run's files.
+fn targeted_scratch() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cal4-targeted-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}
+
+/// A real targeted rewire is always an accepted list with both snapshot
+/// files: without them it is refused from argv alone (exit 2), before any
+/// connection, and writes no file.
+#[test]
+fn backfill_factors_refuses_a_targeted_real_run_without_its_list_and_snapshots() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let wave_s = wave.to_str().expect("utf-8 path");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &["--phase", "rewire-edges", "--sources-from-waves", wave_s],
+        &[("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none")],
+    );
+
+    assert_eq!(
+        r.code,
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    for needle in ["--edges-from", "--snapshot", "--edge-rows"] {
+        assert!(
+            r.stderr.contains(needle),
+            "names {needle}; stderr: {}",
+            r.stderr
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(left.len(), 1, "only the wave file: {left:?}");
+}
+
+/// A real targeted rewire is a writing run: under mode skew it is refused
+/// (exit 3) like every other writing run of this binary, before it creates
+/// its snapshot files or writes anything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_refuses_a_targeted_real_run_on_mode_skew(pool: PgPool) {
+    let _target = seed_unwired_edge(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    let edges = dir.join("accepted.txt");
+    std::fs::write(&wave, "").unwrap();
+    std::fs::write(&edges, format!("{}\n", Uuid::new_v4())).unwrap();
+    let snapshot = dir.join("e-wave.jsonl");
+    let rows = dir.join("e-rows.jsonl");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave.to_str().unwrap(),
+            "--edges-from",
+            edges.to_str().unwrap(),
+            "--snapshot",
+            snapshot.to_str().unwrap(),
+            "--edge-rows",
+            rows.to_str().unwrap(),
+            "--until-fixed",
+            "--only-changed",
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_refused_for_atom_fold(&r, "backfill_factors (targeted)");
+    assert!(
+        !snapshot.exists() && !rows.exists(),
+        "no snapshot file was created"
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
+}
