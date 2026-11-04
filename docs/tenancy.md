@@ -1415,44 +1415,61 @@ themselves stay attached, for 166's write refusal.
 A detach is also STICKY PER IDENTITY (migration 195). An identity that holds
 any detached attachment to the role is admitted again only by an attachment
 you make for it BY NAME: no succession copy admits it, whatever wrote the
-copy, and nothing copied through a copy it holds admits anyone. So none of
-these regains the group:
+copy, and nothing copied through a copy it holds admits anyone.
+
+And a detach CUTS OFF THE LINEAGE below the detached identity (migration
+195). The host records each identity's parents (`agent_succession`: the
+identity the group ran before it, including the later identity a job
+reverts FROM). No succession copy admits an identity that descends from a
+detached identity through identities holding no live attachment you made
+by name, however many registrations lie in between. The first identity on
+the way up that you attached by name stops the walk. So none of these
+regains the group:
 
 * a revert (the job goes back to an earlier prompt or model, so the host
   registers the earlier, detached identity again with a later identity as
   its parent), however many identities back it goes and whichever identity
   is named as the parent;
+* a revert FROM a detached identity to an earlier one that still holds the
+  copy it inherited before the detach, and never was detached itself:
+  detaching the identity a job runs cuts the job off, also when it then
+  reverts, moves on and reverts again, or reverted before the detach;
 * a detached identity that 166's attach-time follow attaches again when you
   attach one of its recorded predecessors by name;
-* a later identity of the job registered from such a copy (a prompt edit
-  after the revert);
+* a later identity of the job registered after the detach or the revert (a
+  prompt edit), whether it inherited a copy or nothing;
 * a later identity of a detached identity that was already registered when
   you attach one of its predecessors by name: it is attached with the rest
-  of the lineage, through the detached identity's copy, and admitted
-  nowhere.
+  of the lineage, and admitted nowhere;
+* a successor registered from two parents, one of them detached: it is out
+  whichever parent its copy chains through and whichever order the
+  registrations, attaches and detaches came in.
 
 Each of those copies is still written, and still RESTRICTS: a revert is held
 by the role exactly as its parent is (166's refusal and may-run). An identity
-you never detached keeps the group through its copies as before.
+you never detached, and that does not descend from one you detached, keeps
+the group through its copies as before.
+
+An attachment made BY NAME always counts, even for an identity that also
+holds a detached row or descends from one. So detaching the identity a job
+runs does NOT cut off an identity you attached by name: if the job reverts
+to the identity you attached (the chain root), it keeps the group through
+that attachment, and so do the identities registered from it afterwards.
+To take the group from a job altogether, detach the identity you attached
+by name too; every copy chained from it stops counting.
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
 whose old copy still covers the window (166's lineage follow copies only
 into gaps): detach the running identity's old copy first, then attach it by
-name. An attachment made by name always counts, even for an identity that
-also holds a detached row, and so do the copies its later identities
-inherit from it. If the job then reverts to an identity you detached, or
-moves on from one, it is out of the group until you attach the identity
-that runs by name; the database enforces this whichever order the
-identities were registered and attached in.
+name. The copies its later identities inherit from that attachment count
+again.
 
-A successor registered from two parents (two registrations of one key)
-runs through one chain only. When both parents are the same number of
-successions from the identity you attach and one of them holds a detached
-row, the follow chains through that one, so the successor is out; a
-successor that is also reached by a shorter path free of detached
-identities is judged by the shorter path. Copies
-written before migration 195 keep the chain they were written with.
+The lineage walk reads only recorded successions. A copy written by hand
+for an identity with no recorded parent is judged by its copy chain alone
+(a copy held by a detached identity on that chain is still a dead hop).
+Copies written before migration 195 keep the chain they were written with;
+a detach reaches them through the lineage walk whatever chain they name.
 
 #### Recipe: a role-private group for a scheduled job
 

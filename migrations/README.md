@@ -2043,9 +2043,11 @@ restart.
   RAISEs `55000` (changing nothing) over any other body; a LATER re-statement
   of the derivation must start from 179's body (the head pin fails
   otherwise). Slot: 170-178 are carried or reserved by other in-flight work.
-  Amended by **195** (a detach is sticky per identity: no copy admits an
-  identity holding a detached row for the role, nor anything copied through
-  a copy it holds).
+  Amended by **195** (a detach is sticky per identity and cuts off the
+  lineage below it: no copy admits an identity holding a detached row for
+  the role, or descending from one through identities with no live
+  attachment made by name, nor anything copied through a copy such an
+  identity holds).
   **Deploy order:** after 165 and 166; before any operator CLI call with
   `--agent-mode attached_agents` (the other modes work without it).
 - **181**: public `group_admin_reseal_mark` (backlog 323773fe, ruling
@@ -2374,7 +2376,7 @@ restart.
   text)')` must print 117's md5 and one of the two paths.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
-- **195**: public `role_detach_sticky_and_revert_restricts`. Three measured
+- **195**: public `role_detach_sticky_and_revert_restricts`. Four measured
   gaps in 166/179/180's handling of role attachments.
   (1) A detach was per ROW, so an identity the operator detached was
   admitted again in 179's attached mode by a later copy whose chain did not
@@ -2391,14 +2393,30 @@ restart.
   by the registration answered the other way. (3) 180's reverse-pair guard
   withheld the registration's copy from an identity that was never
   detached, so after the operator attached B by name a revert to A left A
-  outside 166's restriction (ROL01, may-run) while B was held. Re-states
+  outside 166's restriction (ROL01, may-run) while B was held. (4) A
+  detach of the identity a job runs did not cut off the job: a copy's chain
+  names rows, not the identities an agent was registered from, so when the
+  job reverted to an earlier identity that still held a live copy (Q
+  attached by name; P, A succeed it; detach A; the job reverts to P, parent
+  A) that identity kept the group, read and write, and a successor
+  registered from a detached and a clean parent was admitted or not by
+  which parent its copy chained through (order-dependent). Re-states
   `epigraph_role_derived_memberships` from 179's body: a succession copy
-  (`inherited_from` set) admits nothing to an agent holding ANY detached
-  `role_agents` row for the role, and the chain walk treats a COPY held by
-  such an agent as a dead hop; a DIRECT attachment counts as before
-  wherever it sits (so attaching an identity by name re-admits it, and the
-  documented restore still restores the running identity and its later
-  successors). Re-states `epigraph_register_agent_identity` from 180's body:
+  (`inherited_from` set) admits nothing to an agent that is CUT OFF from
+  the role, nor through a copy such an agent holds. An agent is cut off
+  when it holds ANY detached `role_agents` row for the role, or when a
+  parent recorded in `agent_succession` (a revert's included) is cut off
+  and holds no live DIRECT row for the role at the instant asked. So a
+  detach cuts off every identity registered below the detached one, in
+  either direction of a revert and however many registrations later, up
+  to the first identity on the way that the operator attached by name; the
+  answer depends on the final lineage only, not on the order it was built
+  in or on which parent a copy chains through. A DIRECT attachment counts
+  as before wherever it sits (so attaching an identity by name re-admits
+  it, a revert to an identity attached by name keeps the group through
+  that row, and the documented restore still restores the running
+  identity and its later successors). A copy written by hand for an agent
+  with no recorded succession is judged by its chain alone. Re-states `epigraph_register_agent_identity` from 180's body:
   step 5b keeps 180's chain guard and drops the reverse-pair guard, so a
   revert onto a predecessor is copied and restricts like any succession
   (`role_attachments_withheld` now counts chain-guard rows only).
@@ -2418,11 +2436,12 @@ restart.
   (`c31ae71f307a0573716e51fe17aa5dc8`) and 166's follow
   (`f273e115ab880c9ff2cf7e2bab2f6060`) and RAISEs `55000` (changing
   nothing) over any other body; a later re-statement of any of them starts
-  from 195's (derivation `e63dc71ab1c75c87a3cb23b0506dc665`, registration
+  from 195's (derivation `1c5c6925547d6aa0d0a54e718ce6bd47`, registration
   `a792b630dd34b1ab8c36218b5cb698d1`, follow
   `f60c55756be189b751565de942d63a0a`). Rows already written are left as
   they are (the table is append-only): a copy the 166 follow flattened
-  keeps naming the attachment it came from. Pinned by
+  keeps naming the attachment it came from, and a detach still reaches it
+  through the lineage walk (it no longer depends on the chain). Pinned by
   `epigraph-db/tests/group_role_membership.rs` (the 195 sections),
   `role_attached_agents.rs::attaching_an_identity_attaches_a_shared_successor_and_flags_it_once`,
   `legacy_fleet_parent.rs` (`a_copy_onto_the_parents_own_predecessor_restricts`,
