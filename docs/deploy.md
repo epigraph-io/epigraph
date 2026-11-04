@@ -50,8 +50,8 @@ may use others.
 |---|---|---|---|---|
 | HTTP API | `server` (`epigraph-api`) | `DATABASE_URL` | `epigraph_app`, the application login | Serves requests. **Refuses to start when `MAINTENANCE_DATABASE_URL` is set.** Builds no job pool, no maintenance pool and no job runner. |
 | MCP server | `epigraph-mcp-full` (`epigraph-mcp`) | `--database-url` / `DATABASE_URL` | `epigraph_app` | stdio by default. HTTP with `--listen`, which needs `--jwt-secret`. Same refusal on `MAINTENANCE_DATABASE_URL`, on every transport. |
-| Migrator | `epigraph-migrate` (`epigraph-api`) | `MIGRATION_DATABASE_URL` (falls back to `DATABASE_URL` with a WARN) | the migration login: the schema owner or a superuser | Applies every embedded migration up to the build's head, then exits. |
-| Cascade replay | `replay_deferred_cascades` (`epigraph-cli`) | `MAINTENANCE_DATABASE_URL` (**required**; no fallback) | the maintenance login | Applies the cascades every request process defers. Suggested unit: `epigraph-cascade-replay.timer`. |
+| Migrator | `epigraph-migrate` (`epigraph-api`) | `MIGRATION_DATABASE_URL` (falls back to `DATABASE_URL` with a WARN, shown only when `RUST_LOG` enables `warn`; the default filter shows errors only) | the migration login: the schema owner or a superuser | Applies every embedded migration up to the build's head, then exits. |
+| Cascade replay | `replay_deferred_cascades` (`epigraph-cli`) | `MAINTENANCE_DATABASE_URL` (**required**; no fallback) and `DATABASE_URL` (naming the same database) | the maintenance login | Applies the cascades every request process defers. Suggested unit: `epigraph-cascade-replay.timer`. |
 | Job drain | `drain_jobs` (`epigraph-api`) | `MAINTENANCE_DATABASE_URL` (**required**) and `DATABASE_URL` (the same database) | the maintenance login | Drains the job queue once per run. Suggested unit: `epigraph-jobs-drain.timer`. |
 | Operator CLI | `epigraph-operator` (`epigraph-cli`) | `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` **only** | the maintenance login (some verbs need a superuser; each says so) | Audited administrative acts. No fallback to any other variable. |
 | Other CLIs | `bootstrap_clients`, `embed_backfill`, `recompute_claim_belief`, `epigraph-tenancy-backfill`, `unmark_duplicate`, `sweep_semantic_duplicates`, `backfill_evidence_type`, `prune_recall_events` and others (`epigraph-cli`) | `MAINTENANCE_DATABASE_URL`, falling back to `DATABASE_URL` with a WARN | the maintenance login | Some refuse the fallback (see section 5). `decompose_claims --as-agent <id>` runs on the application login. |
@@ -63,16 +63,16 @@ The four logins:
 | **migration login** | you, before the first migrate | Owns the schema or is a superuser. DDL on every table; creates roles and extensions. Used by `epigraph-migrate` and the undo runbooks. |
 | **`epigraph_app`** | migration 060 creates the role `NOLOGIN`; **you** give it `LOGIN` and a password | The request path's DML, which row security is written against. Never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB. |
 | **maintenance login** | you: a login role that is a member of `epigraph_maintenance` | `epigraph_bypass()` is true on it, so it can do cross-tenant maintenance. It must be a NON-superuser with no CREATE on schema `public`. |
-| **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | EXECUTE on agent-identity registration only. Needed only if a host registers agent identities (section 9). |
+| **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
 
 Migration 060 also creates `epigraph_seed` (`NOLOGIN`), the fixture escape
 hatch of migration 074. Nothing connects as it in production.
 
-Four `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
+Five `epigraph-operator` verbs need a SUPERUSER DSN, because their probe
 switches the session to the application role: `reown-claims`,
-`reown-linked`, `reown-reverse` and `restrict-claims`. For those runs only,
-point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at a superuser login (the migration
-login, if it is one). The standing maintenance login, the one in
+`reown-linked`, `reown-reverse`, `restrict-claims` and `hide-evidence` (its
+`--apply`). For those runs only, point `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` at
+a superuser login (the migration login, if it is one). The standing maintenance login, the one in
 `MAINTENANCE_DATABASE_URL` and in every other operator run, stays a
 non-superuser.
 
@@ -319,17 +319,23 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 
 Nothing in a request process applies cascades or runs jobs. Create these on
 the host that holds the maintenance DSN, each with a 0600 environment file
-holding `MAINTENANCE_DATABASE_URL` (and `DATABASE_URL` where noted):
+holding `MAINTENANCE_DATABASE_URL` and `DATABASE_URL` (naming the same
+database). All four refuse to start without `DATABASE_URL`; the three
+`epigraph-cli` binaries also accept it as `--database-url`, while `drain_jobs`
+reads it from the environment only:
 
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
-| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Needs `DATABASE_URL` too, naming the same database. Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 3 out of time with work pending. |
-| Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. |
+| Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 3 out of time with work pending. |
+| Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 
-Every timer takes its own session advisory lock, so an overlapping or
-hand-started run prints `{"locked": true}`, exits 0 and does nothing.
+`replay_deferred_cascades` and `drain_jobs` each take their own session
+advisory lock, so an overlapping or hand-started run prints
+`{"locked": true}`, exits 0 and does nothing. `embed_backfill` and
+`prune_recall_events` take no lock; do not schedule overlapping runs of
+them.
 
 ### Step 11 — Bind writers and arm, when you are ready
 
@@ -349,8 +355,9 @@ sections (the legacy-author tie, the backfill, the re-own) find nothing to do.
 ## 3. Configuration reference
 
 Variables are read once at startup unless a row says otherwise. Boolean flags
-of the `1`/`true`/`yes` kind are trimmed and case-insensitive; anything else
-is off.
+of the `1`/`true`/`yes` kind are case-insensitive; `EPIGRAPH_MIGRATE_ON_BOOT`
+and `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` also ignore surrounding whitespace.
+Anything else is off.
 
 ### `server` (the HTTP API)
 
@@ -425,7 +432,7 @@ not to the API.
 
 | Flag / variable | Meaning |
 |---|---|
-| `MIGRATION_DATABASE_URL` | The migration DSN. Unset → `DATABASE_URL`, with a WARN. |
+| `MIGRATION_DATABASE_URL` | The migration DSN. Unset → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
 | `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` | The deliberate-rollback opt-in (section 4). |
 
 ### `drain_jobs` and `replay_deferred_cascades`
@@ -442,7 +449,7 @@ not to the API.
 
 | Variable | Meaning |
 |---|---|
-| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Several verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`). |
+| `EPIGRAPH_OPERATOR_MAINTENANCE_DSN` | The only DSN it reads. A login outside `epigraph_maintenance` is refused. Five verbs need a superuser DSN instead and say so (`reown-claims`, `reown-linked`, `reown-reverse`, `restrict-claims`, and `hide-evidence` for its `--apply`). |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | Required by `verify-confirmations`: the values the API's ceremonies ran under. |
 
 ### Other CLIs and scripts
@@ -450,8 +457,9 @@ not to the API.
 | Variable | Read by | Meaning |
 |---|---|---|
 | `MAINTENANCE_DATABASE_URL` | the maintenance CLIs | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). |
-| `EPIGRAPH_API_URL` | `dekg`, `decompose_claims`, `recompute_betp` (its belief-mode check reads `EPIGRAPH_API` first), `scripts/maintain_themes.py` | The API's base URL, for CLIs that call the HTTP API. |
-| `EPIGRAPH_TOKEN` | `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py` | A Bearer token. The listed scripts exit when it is unset. |
+| `EPIGRAPH_API` | `decompose_claims` and the belief-mode check in `recompute_betp`, `backfill_factors` and `refresh_truth_mirrors` (read before `EPIGRAPH_API_URL`); `epigraph-privatize` (the only API variable it reads); `scripts/reconcile_backlog_labels.py` (`--base-url` default) | The API's base URL, explicit override. |
+| `EPIGRAPH_API_URL` | among them `dekg`, `decompose_claims`, `recompute_betp`, `backfill_factors`, `refresh_truth_mirrors`, `scripts/maintain_themes.py`, `scripts/run_assessment_worker.py` | The API's base URL, for CLIs that call the HTTP API. |
+| `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims` | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `EPIGRAPH_AGENT_ID` | `scripts/_api_client.py` | The `agent_id` claim of tokens the Python helpers mint (section 7). |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
@@ -477,7 +485,9 @@ an unattended boot-time apply turns a precondition failure into a crash loop.
 Keep migration an explicit step.
 
 `epigraph-migrate` reads `MIGRATION_DATABASE_URL`, falling back to
-`DATABASE_URL` with a `WARN`. The two are different credentials on purpose.
+`DATABASE_URL` with a `WARN`. That WARN is shown only when `RUST_LOG` enables
+`warn` (for example `RUST_LOG=info`); the default filter shows errors only.
+The two are different credentials on purpose.
 Applying migrations needs **DDL privilege on every tier-A table** (from
 migration 074 on, the migrator drops column defaults and creates 23
 triggers), which is strictly stronger than either of the other two roles:
@@ -937,14 +947,20 @@ The precedence carries a refusal that is not optional politeness. Giving
 exported, would otherwise have every write in this family silently
 redirected, and several of these scripts write.
 
-Eight scripts fall back to a hardcoded DSN when neither variable is set:
-`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph`, or an
-`epigraph_ro` variant. They are `scripts/cluster_claims.py`,
-`evidential_clustering.py`, `subcluster_outliers.py`,
-`run_assessment_worker.py`, `lib/tiered_enrichment.py`, `theme_lib.py`,
-`refine_clusters.py` and `label_themes_llm.py`. Those logins are not created
-by this repository. Always set `MAINTENANCE_DATABASE_URL` (or `DATABASE_URL`)
-explicitly when you run them.
+Many scripts under `scripts/` fall back to a hardcoded DSN when neither
+variable is set. Among them are
+`postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph` (also
+spelled with `127.0.0.1`), `epigraph_ro` variants, and
+`postgres://epigraph:epigraph@127.0.0.1:5432/epigraph`. List the candidates
+with:
+
+```bash
+grep -rlE 'postgres(ql)?://[a-z_]+:[a-z_]+@' scripts/
+```
+
+(The hits under `scripts/e2e/` are example DSNs in comments.) This repository
+creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
+`DATABASE_URL`) explicitly when you run a script.
 
 ## 6. Session settings and connection poolers
 
@@ -2195,10 +2211,11 @@ application DSN, so registration is gated on the connection's ROLE:
 * `epigraph_identity_attestor` is created by 161 as `NOLOGIN`, a member of
   nothing. Give it LOGIN and a password out of band:
   `ALTER ROLE epigraph_identity_attestor LOGIN PASSWORD '<secret>';`. Its
-  only privilege is EXECUTE on `epigraph_register_agent_identity`, a
-  `SECURITY DEFINER` owned by `epigraph_maintenance` whose EXECUTE is revoked
-  from PUBLIC, from `epigraph_app` and from its owner. No API route
-  registers.
+  privileges are USAGE on schema `public`, EXECUTE on
+  `epigraph_register_agent_identity`, a `SECURITY DEFINER` owned by
+  `epigraph_maintenance` whose EXECUTE is revoked from PUBLIC, from
+  `epigraph_app` and from its owner, and, from migration 166, EXECUTE on
+  `epigraph_role_agent_may_run(uuid)`. No API route registers.
 * **Check it** at any time, on the maintenance DSN:
   `SELECT public.epigraph_identity_attestor_faults();`. It must return `{}`.
   It lists any elevated attribute, any membership of the attestor's own, and
@@ -2376,7 +2393,9 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 `reown-claims --claims-file <f> --operator <person> --derived <mode>
 --manifest-out <path> [--apply]` moves listed claims into the operator's
 personal group. `hide-evidence` hides and pins selected evidence on the
-operator's claims. Both are reversed by `reown-reverse`.
+operator's claims; it needs a SUPERUSER DSN for `--apply`, like
+`reown-claims`, and `--apply` also requires `--manifest-out <new file>`.
+Both are reversed by `reown-reverse`.
 
 ### `backfill_evidence_type` — legacy BBA typing (no migration, operator-gated)
 
@@ -3663,13 +3682,22 @@ reached `main` through a merge, the PR is given as "landed via #N".
     - an undo-script index naming `149-`, `166-`, `169-`, `180-` and
       `194-undo.sql`, the case-fold pair, and the two legacy pre-migrate
       runbooks;
-    - a troubleshooting table.
+    - a troubleshooting table;
+    - per scheduled job: the database variables it needs (`DATABASE_URL`
+      and `MAINTENANCE_DATABASE_URL`), `embed_backfill`'s `OPENAI_API_KEY` /
+      `--allow-mock`, and which jobs take an advisory lock;
+    - the five operator verbs that need a superuser DSN, including
+      `hide-evidence --apply`;
+    - that `epigraph-migrate`'s fallback WARN shows only when `RUST_LOG`
+      enables `warn`, which boolean flags trim whitespace, and the readers of
+      `EPIGRAPH_API`, `EPIGRAPH_API_URL` and `EPIGRAPH_TOKEN`.
   - **Corrected:**
     - the anonymous surface is 25 paths, not 13;
     - checkouts stamp five session settings, not three;
     - the API holds no job pool or maintenance pool;
     - the job statement timeout applies to `drain_jobs`;
-    - the hardcoded-DSN scripts number eight, not twelve;
+    - the count of scripts with a hardcoded DSN ("twelve") is replaced by
+      a grep that lists them;
     - the migrate marker example is head 194, and the gap list is complete;
     - reclassification is possible through `restrict-claims`;
     - 175's "only epigraph-api applies migrations" is restated for
@@ -3677,7 +3705,9 @@ reached `main` through a merge, the PR is given as "landed via #N".
     - the cross-worktree rebuild no longer mixes `--bin` with whole-package
       builds.
   - **Removed:** host paths, unit and container names, and internal ruling,
-    plan and backlog labels. Strings the code emits, the refusal codes, and
+    plan and backlog labels, from the body. The old section titles, some of
+    which carry such labels, are quoted below only so readers can trace where
+    each section went. Strings the code emits, the refusal codes, and
     the md5 and world-group schema constants are kept verbatim.
   - **Moved:** the 2026-05-05 reconcile, the pre-074 ordering, the 084
     ownership retirement and the `agent_id` precondition now sit in section 13
