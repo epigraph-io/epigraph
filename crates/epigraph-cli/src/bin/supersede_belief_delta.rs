@@ -204,13 +204,15 @@ async fn measure_into(
         println!("r173: calibration {}", r.calibration.source);
         println!(
             "r173: {} candidates, {} entered ({} current), {} unchanged, {} compound, \
-             {} template-only; {} read-only transactions",
+             {} template-only, {} no input, {} vanished; {} read-only transactions",
             r.counts.candidates,
             r.counts.entered,
             r.counts.entered_current,
             r.counts.unchanged,
             r.counts.skipped_compound,
             r.counts.skipped_template_only,
+            r.counts.skipped_no_input,
+            r.counts.vanished,
             r.snapshots.len()
         );
         println!(

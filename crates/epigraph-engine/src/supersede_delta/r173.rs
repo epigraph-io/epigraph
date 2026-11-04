@@ -144,6 +144,10 @@ pub enum R173Outcome {
     SkippedTemplateOnly,
     /// No combine input the run can read: no owner.
     SkippedNoInput,
+    /// Enumerated as a candidate, but no longer readable when its chunk ran
+    /// (deleted in between: chunks see later snapshots). Nothing measured;
+    /// counted apart from the skips so it does not blur check C1.
+    Vanished,
 }
 
 impl R173Outcome {
@@ -156,6 +160,7 @@ impl R173Outcome {
             Self::SkippedCompound => "skipped_compound",
             Self::SkippedTemplateOnly => "skipped_template_only",
             Self::SkippedNoInput => "skipped_no_input",
+            Self::Vanished => "vanished",
         }
     }
 }
@@ -540,6 +545,8 @@ pub struct R173Counts {
     pub skipped_compound: usize,
     pub skipped_template_only: usize,
     pub skipped_no_input: usize,
+    /// Enumerated, then gone before its chunk read it ([`R173Outcome::Vanished`]).
+    pub vanished: usize,
 }
 
 /// The apply lists (plan §4.3), sorted. Ids only: the values are on each
@@ -637,7 +644,8 @@ pub struct R173Report {
     pub a5_mirror: BlockStats,
     pub checks: R173Checks,
     pub not_measured: Vec<&'static str>,
-    /// Entered and skipped claims, by id. Unchanged ones are counted only.
+    /// Entered, skipped and vanished claims, by id. Unchanged ones are
+    /// counted only.
     pub claims: Vec<R173Claim>,
 }
 
@@ -808,11 +816,12 @@ pub(super) async fn measure_ids(
     let mut out = Vec::with_capacity(ids.len());
     for &id in ids {
         let Some((s, is_current)) = stored.get(&id).cloned() else {
-            // Unreadable (removed since enumeration, in a later chunk).
+            // Unreadable (removed since enumeration, in a later chunk). Its
+            // currency is unknown; `false` keeps it out of every current set.
             out.push(R173Claim::bare(
                 id,
-                true,
-                R173Outcome::SkippedNoInput,
+                false,
+                R173Outcome::Vanished,
                 Stored::default(),
             ));
             continue;
@@ -1107,6 +1116,7 @@ pub(super) fn report(
             R173Outcome::SkippedCompound => counts.skipped_compound += 1,
             R173Outcome::SkippedTemplateOnly => counts.skipped_template_only += 1,
             R173Outcome::SkippedNoInput => counts.skipped_no_input += 1,
+            R173Outcome::Vanished => counts.vanished += 1,
             R173Outcome::Recomputed | R173Outcome::Vacate | R173Outcome::ScopeKept => {
                 counts.entered += 1;
                 if c.is_current {

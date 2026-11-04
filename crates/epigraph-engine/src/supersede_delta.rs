@@ -663,7 +663,7 @@ async fn r173_canary(
             .await?
             .into_iter()
             .next()
-            .filter(|c| c.outcome != r173::R173Outcome::SkippedNoInput || c.stored.betp.is_some()),
+            .filter(|c| c.outcome != r173::R173Outcome::Vanished),
     };
     Ok(r173::canary_of(id, claim))
 }
