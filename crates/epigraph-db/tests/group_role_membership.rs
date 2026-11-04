@@ -4133,9 +4133,12 @@ async fn a_job_that_reverts_from_its_detached_identity_to_an_earlier_copy_holder
 
 /// THE SAME LINEAGE, REVERT BEFORE THE DETACH. Q by name; P succeeds Q; A
 /// succeeds P; the job reverts to P (A named as parent) while nothing is
-/// detached, so P is a member; only then does the operator detach A. P is
-/// out from that instant: the answer does not depend on whether the revert
-/// was registered before or after the detach.
+/// detached, so P is a member; the job then moves on from P to B and C. Only
+/// then does the operator detach the OLD identity A, which no longer runs.
+/// P, B and C (the identity that runs now) are out from that instant: the
+/// answer does not depend on whether the revert was registered before or
+/// after the detach, and a detach reaches the running identity through the
+/// revert's succession edge. CONTROL: Q, attached by name.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_detach_after_the_revert_takes_the_group_from_the_reverted_identity(pool: PgPool) {
     let (h, _) = human(&pool, "cut-off-late-h").await;
@@ -4153,12 +4156,30 @@ async fn a_detach_after_the_revert_takes_the_group_from_the_reverted_identity(po
         (true, true),
         "PREMISE: P, reverted to while nothing is detached"
     );
+    let b = register_in(&pool, &identity_key(), Some(p), "g-job").await;
+    let c = register_in(&pool, &identity_key(), Some(b), "g-job").await;
+    assert_eq!(
+        resolves(&pool, c, group).await,
+        (true, true),
+        "PREMISE: C, the identity that runs, is a member"
+    );
     assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
     assert_eq!(
         resolves(&pool, p, group).await,
         (false, false),
         "P is out once A is detached"
     );
+    assert_eq!(
+        resolves(&pool, b, group).await,
+        (false, false),
+        "B, registered from P after the revert, is out"
+    );
+    assert_eq!(
+        resolves(&pool, c, group).await,
+        (false, false),
+        "C, the identity that runs now, is out"
+    );
+    assert_eq!(derived_rows(&pool, c).await, 0, "C is admitted nowhere");
     assert_eq!(
         resolves(&pool, q, group).await,
         (true, true),
@@ -4449,7 +4470,10 @@ async fn a_follow_written_chain_through_a_detached_identity_two_levels_up_admits
 /// follow at R's attach gives A a copy of R's row. X, an identity with no
 /// recorded succession from A or R, gets a hand-written copy of A's copy. X
 /// does not descend from A, so only the chain decides: A's copy is a dead hop
-/// and X is out. CONTROL: X2, hand-copied straight from R's row, is a member.
+/// and X is out. X3, hand-copied from X's copy (no recorded succession
+/// either), has the dead hop TWO hops up its chain and is out too. CONTROL:
+/// X2, hand-copied straight from R's row, is a member, and so is X4,
+/// hand-copied from X2's copy (a clean two-hop hand chain).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_hand_written_copy_of_a_detached_identitys_copy_admits_nothing(pool: PgPool) {
     let (h, _) = human(&pool, "cut-off-hand-h").await;
@@ -4468,8 +4492,8 @@ async fn a_hand_written_copy_of_a_detached_identitys_copy_admits_nothing(pool: P
     link_to(&pool, x, h).await;
     let x2 = register_in(&pool, &identity_key(), None, "g-job").await;
     link_to(&pool, x2, h).await;
-    hand_copy_of(&pool, x, a_row).await;
-    hand_copy_of(&pool, x2, r_row).await;
+    let x_row = hand_copy_of(&pool, x, a_row).await;
+    let x2_row = hand_copy_of(&pool, x2, r_row).await;
     assert_eq!(
         resolves(&pool, x, group).await,
         (false, false),
@@ -4480,6 +4504,36 @@ async fn a_hand_written_copy_of_a_detached_identitys_copy_admits_nothing(pool: P
         resolves(&pool, x2, group).await,
         (true, true),
         "CONTROL: X2, copied from R's row"
+    );
+
+    let x3 = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, x3, h).await;
+    let x4 = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, x4, h).await;
+    hand_copy_of(&pool, x3, x_row).await;
+    hand_copy_of(&pool, x4, x2_row).await;
+    assert_eq!(
+        copy_source(&pool, x3).await,
+        Some(x_row),
+        "PREMISE: X3's copy names X's copy (A's copy two hops up)"
+    );
+    assert_eq!(
+        resolves(&pool, x3, group).await,
+        (false, false),
+        "X3, the detached A's copy two hops up its hand-written chain"
+    );
+    assert_eq!(derived_rows(&pool, x3).await, 0, "X3 derives nothing");
+    assert_eq!(
+        resolves(&pool, x4, group).await,
+        (true, true),
+        "CONTROL: X4, a clean two-hop hand chain to R's row"
+    );
+    arm(&pool).await;
+    assert_refused(
+        &write_forged(&pool, x3, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "X3 two hops below the detached A's copy, forged stamp (armed)",
     );
 }
 
