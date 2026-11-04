@@ -633,7 +633,7 @@ pub struct R173Report {
     pub snapshots: Vec<ChunkSnapshot>,
     pub counts: R173Counts,
     pub lists: ApplyLists,
-    /// Every entered and skipped claim.
+    /// Every claim in [`Self::claims`].
     pub all: BlockStats,
     pub l1: BlockStats,
     /// Over [`ApplyLists::l1_single_input`].
@@ -645,7 +645,7 @@ pub struct R173Report {
     pub checks: R173Checks,
     pub not_measured: Vec<&'static str>,
     /// Entered, skipped and vanished claims, by id. Unchanged ones are
-    /// counted only.
+    /// counted only, except a C7 violator, which is listed with its E and F.
     pub claims: Vec<R173Claim>,
 }
 
@@ -1108,10 +1108,11 @@ pub(super) fn report(
                     (None, None) => true,
                     _ => false,
                 };
-                if !same {
-                    checks.c7_violations.push(c.id);
+                if same {
+                    continue;
                 }
-                continue;
+                // Kept in `claims` so its E and F can be read.
+                checks.c7_violations.push(c.id);
             }
             R173Outcome::SkippedCompound => counts.skipped_compound += 1,
             R173Outcome::SkippedTemplateOnly => counts.skipped_template_only += 1,
@@ -1287,6 +1288,42 @@ mod tests {
             (r.checks.c5_max_raw_excursion - 0.3).abs() < 1e-12,
             "the largest raw excursion (Pl 1.3) is reported: {}",
             r.checks.c5_max_raw_excursion
+        );
+    }
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn folded(betp: f64) -> Folded {
+        Folded {
+            belief: 0.1,
+            plausibility: 0.9,
+            betp,
+            classification: None,
+            raw_non_finite: false,
+            raw_excursion: 0.0,
+        }
+    }
+
+    fn e_and_f(n: u128, outcome: R173Outcome, e: f64, f: f64) -> R173Claim {
+        let mut c = R173Claim::bare(id(n), true, outcome, Stored::default());
+        c.empty = Some(folded(e));
+        c.full = Some(folded(f));
+        c
+    }
+
+    #[test]
+    fn c7_fires_on_an_unchanged_claim_whose_e_and_f_differ_and_lists_it() {
+        let moved = e_and_f(1, R173Outcome::Unchanged, 0.6, 0.65);
+        let still = e_and_f(2, R173Outcome::Unchanged, 0.6, 0.6);
+        let r = report_of(vec![moved, still]);
+        assert_eq!((r.counts.unchanged, r.checks.c7_checked), (2, 2));
+        assert_eq!(r.checks.c7_violations, vec![id(1)], "{:?}", r.checks);
+        assert_eq!(
+            r.claims.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![id(1)],
+            "the violator is listed with its E and F; a clean unchanged claim is counted only"
         );
     }
 
