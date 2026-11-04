@@ -491,3 +491,104 @@ async fn targeted_predict_apply_and_restore_run_on_a_maintenance_login(pool: PgP
         "caches back byte-identical"
     );
 }
+
+/// A wave record for a move made by hand: the claim's cache before, the
+/// UPDATE `set` (a SQL `SET` list over `claims`), and the cache after.
+async fn hand_move(pool: &PgPool, claim: Uuid, set: &str) -> WaveRecord {
+    let before = cache(pool, claim).await;
+    sqlx::query(&format!("UPDATE claims SET {set} WHERE id = $1"))
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("move the claim's cache");
+    let written = cache(pool, claim).await;
+    assert_ne!(before, written, "fixture move must move the cache");
+    WaveRecord {
+        claim_id: claim,
+        before,
+        written,
+        wave: "l1-fixture".to_string(),
+        at: chrono::Utc::now(),
+    }
+}
+
+/// OD-E1's count is measured, not assumed: two listed edges whose fresh wire
+/// would store nothing, one from a source the wave left VACUOUS (Bel 0, Pl 1)
+/// and one from a source it left FACTORLESS (NULL). The predict reports each
+/// `held_would_remove` and `totals.would_remove == 2`; the real apply with the
+/// same options holds the same two and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_counts_would_remove_for_a_vacuous_and_a_factorless_source(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let author = seed_agent(&pool, "predict-f2").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    let vac = fresh_claim(&pool, &viewer, author, frame, "f2 vacuous src", EVIDENCE_A).await;
+    let nul = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "f2 factorless src",
+        EVIDENCE_A,
+    )
+    .await;
+    let t1 = seed_claim(&pool, author, "f2 edge-only target 1", None, 0.0).await;
+    let t2 = seed_claim(&pool, author, "f2 edge-only target 2", None, 0.0).await;
+    let e1 = wired_edge(&pool, &viewer, author, vac, t1, "supports").await;
+    let e2 = wired_edge(&pool, &viewer, author, nul, t2, "supports").await;
+    let wave = vec![
+        hand_move(
+            &pool,
+            vac,
+            "belief = 0.0, plausibility = 1.0, pignistic_prob = 0.5",
+        )
+        .await,
+        hand_move(
+            &pool,
+            nul,
+            "belief = NULL, plausibility = NULL, pignistic_prob = NULL",
+        )
+        .await,
+    ];
+    let before = fingerprint(&pool).await;
+    let o = TargetedRunOptions {
+        edges: Some(std::collections::BTreeSet::from([e1, e2])),
+        ..opts()
+    };
+
+    let report = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&wave, o.epsilon), &o)
+        .await
+        .expect("predict");
+
+    assert_eq!(report.totals.would_remove, 2, "{:?}", report.totals);
+    for e in [e1, e2] {
+        let p = report
+            .edges
+            .iter()
+            .find(|x| x.edge_id == e)
+            .expect("the predict reached the edge");
+        assert_eq!(p.outcome, "held_would_remove", "{p:?}");
+    }
+    assert!(report.would_rewrite().is_empty(), "{:?}", report.edges);
+
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    assert_eq!(
+        applied.held(epigraph_cli::backfill_factors::HeldBucket::WouldRemove),
+        2,
+        "{applied:?}"
+    );
+    assert_eq!(applied.rewired(), 0, "{applied:?}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, before, "the apply wrote nothing");
+}

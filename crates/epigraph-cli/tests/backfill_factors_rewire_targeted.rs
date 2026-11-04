@@ -602,3 +602,55 @@ async fn targeted_rewire_holds_a_target_that_would_vacate(pool: PgPool) {
         predicted.targets[&w.target]
     );
 }
+
+/// OD-E1, the factorless arm: the source lost its cache after the edge was
+/// selected (NULL belief, plausibility and BetP). A fresh wire would store
+/// nothing; the targeted rewire keeps the row and the edge-only target's
+/// cache and counts `held_would_remove`. The control is the un-targeted
+/// phase on the same edge: it DELETES the row and NULLs the cache, so the
+/// "kept" assertions above are measured against the destructive behaviour.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "factorless", "supports", false).await;
+    let edge = the_edge(&pool, &w).await;
+    sqlx::query(
+        "UPDATE claims SET belief = NULL, plausibility = NULL, pignistic_prob = NULL \
+          WHERE id = $1",
+    )
+    .bind(w.source)
+    .execute(&pool)
+    .await
+    .expect("the source turns factorless");
+    let before = footprint(&pool, &w).await;
+    assert!(before.1.belief.is_some(), "fixture: the target has a cache");
+    assert_eq!(before.0.len(), 1, "fixture: one live row");
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row and target cache unchanged"
+    );
+    assert!(
+        cache(&pool, w.target).await.belief.is_some(),
+        "the target cache is not NULL"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::WouldRemove);
+
+    // Control: the un-targeted phase removes the same row and NULLs the cache.
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("un-targeted");
+    assert!(summary.removed_source_factorless >= 1, "{summary:?}");
+    assert!(
+        edge_rows(&pool, w.edge).await.is_empty(),
+        "the un-targeted phase deleted the row"
+    );
+    assert!(
+        cache(&pool, w.target).await.belief.is_none(),
+        "the un-targeted phase NULLed the target cache"
+    );
+}
