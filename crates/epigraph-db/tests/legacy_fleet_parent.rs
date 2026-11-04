@@ -1697,7 +1697,7 @@ const DERIVATION_SIG: &str =
     "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)";
 /// The md5 of `prosrc` 195 leaves for each function it re-states (the deploy
 /// gate's values). A later re-statement starts from these bodies.
-const DERIVATION_195_MD5: &str = "e63dc71ab1c75c87a3cb23b0506dc665";
+const DERIVATION_195_MD5: &str = "1c5c6925547d6aa0d0a54e718ce6bd47";
 const REGISTRATION_195_MD5: &str = "a792b630dd34b1ab8c36218b5cb698d1";
 const FOLLOW_195_MD5: &str = "f60c55756be189b751565de942d63a0a";
 

@@ -1,7 +1,7 @@
 -- ===================================================================
--- 195-undo.sql: take migration 195 (a detach is sticky per identity; a
--- revert always restricts) back out, in ONE transaction, on the migration
--- (superuser) DSN.
+-- 195-undo.sql: take migration 195 (a detach is sticky per identity and
+-- cuts off the lineage below it; a revert always restricts) back out, in ONE
+-- transaction, on the migration (superuser) DSN.
 --
 -- READ FIRST. Once undone:
 --   * in 179's attached mode, a succession copy again admits an identity the
@@ -9,6 +9,10 @@
 --     detached row (a multi-hop revert after a restore, or 166's attach-time
 --     follow onto a reverted identity), and admits any successor registered
 --     from such a copy;
+--   * a detach of the identity a job runs no longer cuts off the job: an
+--     earlier identity the job reverts to that still holds a live copy keeps
+--     the group, and so does a successor registered from a detached and a
+--     clean parent whose copy chains through the clean one;
 --   * 166's attach-time follow flattens again: a successor's copy names the
 --     new attachment past every identity in between, so a detached identity
 --     in between is no dead hop for it, and a later detach of an identity in
@@ -51,7 +55,7 @@ BEGIN
     FOR v_check IN
         SELECT * FROM (VALUES
             ('public.epigraph_role_derived_memberships(uuid, timestamptz)',
-             'e63dc71ab1c75c87a3cb23b0506dc665',    -- 195's
+             '1c5c6925547d6aa0d0a54e718ce6bd47',    -- 195's
              '65bd0fc12e34b4172607dd2864fb7f66'),   -- 179's
             ('public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)',
              'a792b630dd34b1ab8c36218b5cb698d1',    -- 195's

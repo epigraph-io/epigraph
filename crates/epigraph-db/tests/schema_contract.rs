@@ -3889,13 +3889,22 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "hop.detached_at IS NULL",
         "hop.valid_from <= p_at",
         "(hop.valid_to IS NULL OR p_at < hop.valid_to)",
-        // 195: a detach is STICKY per identity. No copy counts for an agent
-        // holding a detached row for the role, nor through a copy such an
-        // agent holds. Losing it lets an identity the operator detached back
-        // in through a later copy (a multi-hop revert, an attach-time follow,
-        // or a successor registered from such a copy).
-        "WHERE dd.agent_id = ra.agent_id",
-        "WHERE dd.agent_id = hop.agent_id",
+        // 195: a detach is STICKY per identity and CUTS OFF the lineage below
+        // it. No copy counts for an agent holding a detached row for the
+        // role, for an agent descending from one along `agent_succession`
+        // through agents with no live row made by name, nor through a copy
+        // held by such an agent. Losing any of it lets an identity the
+        // operator detached, or a job that moved on or reverted from it, back
+        // in through a copy (a multi-hop revert, an attach-time follow, a
+        // revert to an earlier copy holder, or a successor of either).
+        "judged (agent_id) AS (",
+        "SELECT ra.agent_id",
+        "WHERE ch.inherited_from IS NOT NULL",
+        "lineage (agent_id) AS (",
+        "JOIN public.agent_succession s",
+        "ON s.child_agent_id = l.agent_id",
+        "AND dr.inherited_from IS NULL",
+        "AND dr.detached_at IS NULL",
         "AND dd.detached_at IS NOT NULL",
     ] {
         assert!(

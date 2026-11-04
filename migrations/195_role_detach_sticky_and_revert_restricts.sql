@@ -1,6 +1,6 @@
 -- 195_role_detach_sticky_and_revert_restricts.sql
--- A detach is sticky per identity, a revert always restricts, and the
--- attach-time lineage follow chains its copies.
+-- A detach is sticky per identity and cuts off the lineage below it, a revert
+-- always restricts, and the attach-time lineage follow chains its copies.
 --
 -- ===================================================================
 -- 1. WHY
@@ -14,8 +14,9 @@
 -- reaches a row of the child (the CHAIN guard), and never copy onto an
 -- identity the parent is recorded as having succeeded (the REVERSE-PAIR
 -- guard). Both were measured insufficient, in opposite directions (the
--- first and third bullets), and 166's follow hid part of every lineage it
--- copied from 179's walk (the second):
+-- first and fourth bullets), 166's follow hid part of every lineage it
+-- copied from 179's walk (the second), and a detach of the identity a job
+-- runs did not reach the job's next identity (the third):
 --
 --   * A detach is recorded on one ROW, but it is the operator's act on an
 --     IDENTITY, and a later copy whose chain does not pass through that row
@@ -43,6 +44,16 @@
 --     revoked nothing the follow had copied below A, while the same lineage
 --     built by the registration (each copy naming its parent's row) was
 --     revoked both times.
+--   * A detach is the operator's act on the identity a JOB runs, but a
+--     copy's chain names only the rows it was copied through, not the
+--     identities the agent was registered from. So detaching the running
+--     identity A did not cut off the job: when it reverted a prompt edit
+--     (the host registers the earlier identity P again, naming A as its
+--     parent), P, never detached and still holding the live copy it
+--     inherited before the detach, kept the group, read and write; and a
+--     successor registered from two parents, one of them detached, was
+--     admitted or not by which parent its copy happened to name, so the same
+--     final lineage answered differently by the order it was built in.
 --   * The reverse-pair guard withheld the copy from an identity that was
 --     NEVER detached, and an attachment is also 166's RESTRICTION (`ROL01`,
 --     may-run). So after the operator attached B by name, a revert to A
@@ -52,22 +63,44 @@
 -- ===================================================================
 -- 2. THE RULES
 --
--- STICKY DETACH (the derivation, `epigraph_role_derived_memberships`): in
+-- A DETACH IS STICKY AND CUTS OFF THE LINEAGE (the derivation,
+-- `epigraph_role_derived_memberships`): call an agent CUT OFF from a role
+-- when it holds ANY detached row for the role (at any time), or when it has
+-- a parent in `agent_succession` (any recorded parent, a revert's included)
+-- that is cut off and holds no live DIRECT row for the role at `p_at`. In
 -- the attached arm, a SUCCESSION COPY (`inherited_from` set) admits nothing
---   * to an agent that holds ANY detached row for the role, at any time; and
---   * to any agent whose copy chain passes through a COPY held by such an
---     agent (the dead hop ends the walk before the root, as a detached or
---     closed hop already does).
+--   * to a cut-off agent; and
+--   * to any agent whose copy chain passes through a COPY held by a cut-off
+--     agent (a dead hop).
+-- Equivalently: walk up `agent_succession` from the agent asked about and
+-- from the agent of every copy on its chain, through parents that hold no
+-- live row made by name; the copy counts only if no agent judged or reached
+-- holds a detached row for the role. The answer is a function of the final
+-- lineage, whatever order its registrations, attaches and detaches came in,
+-- and whichever parent a copy happens to chain through.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
--- as a chain's root, even when its agent also holds a detached row. So:
+-- as a chain's root, even when its agent also holds a detached row, and an
+-- agent holding a live one ends the walk up the lineage. So:
 --   * an identity the operator detached is admitted again only by attaching
 --     it by name;
+--   * a detach of the identity a job runs cuts off the job: its later
+--     identities (prompt edits) and an earlier identity it reverts to (one
+--     that still holds a live copy) are out, however many registrations
+--     later, until the operator attaches the identity that runs by name;
+--   * but an identity the operator attached by name keeps the group through
+--     that row, also when the job reverts to it: to cut such a job off,
+--     detach that identity too;
 --   * the documented restore still works: detach the running identity's
 --     stale copy, attach it by name; it and its later successors (copies
 --     whose root is that direct row) are members again;
 --   * a successor of a detached identity's copy must be attached by name
 --     too, if it is to be a member.
+-- Limits: the walk follows `agent_succession`, so a copy written by hand for
+-- an agent with no recorded succession is judged by its chain alone (its
+-- dead hops still count). Detached rows are read without an index (166's
+-- `idx_role_agents_live` covers un-detached rows only); `role_agents` holds
+-- one row per attachment and copy, so the read stays small.
 -- Everything else in 179's rule is unchanged: the holder test, the one-folder
 -- rule, the live-hop chain walk, the binding window.
 --
@@ -99,12 +132,12 @@
 --   * a successor whose predecessor already holds a row of its own chains
 --     through that row, so it is admitted exactly when it would have been
 --     had it registered after that row existed.
--- A successor with two parents on the level above is judged through ONE of
--- them (one `inherited_from` chain names one path): a parent that holds a
--- detached row for the role, or was itself reached through one, comes first
--- (fail closed), then the lowest id. A longer path through a detached
--- identity does not count against a successor reached by a shorter clean
--- one.
+-- A successor with two parents on the level above has its copy chained
+-- through ONE of them (one `inherited_from` chain names one path): a parent
+-- that holds a detached row for the role, or was itself reached through one,
+-- comes first, then the lowest id. Which one it is no longer decides whether
+-- a detach reaches the successor: the derivation's walk up the lineage reads
+-- every recorded parent (above).
 -- The follow still copies into every GAP of every successor, a detached
 -- successor included: its copy restricts (166), and under the sticky rule
 -- grants it nothing. Skipping it would take the restriction away from that
@@ -143,7 +176,9 @@
 -- registration and 166's follow byte for byte (md5-guarded: it refuses over
 -- any body but 195's or the one it restores). Run it BEFORE `180-undo.sql`,
 -- which refuses a 195 registration. After an undo, a detached identity can
--- be re-admitted by a later copy again, a revert onto a predecessor of an
+-- be re-admitted by a later copy again, a job whose running identity was
+-- detached keeps the group through a revert to an earlier copy holder
+-- again, a revert onto a predecessor of an
 -- identity attached by name is withheld (unrestricted) again, and the follow
 -- flattens again: detach any such copy, or attach the running identity by
 -- name, by hand. The rows written while 195 was in force stay as written
@@ -193,11 +228,12 @@ BEGIN
 END $$;
 
 -- -------------------------------------------------------------------
--- The derivation (179's body); delta: the sticky detach (section 2). In the
--- attached arm a succession copy counts for nothing when its agent holds a
--- detached row for the role, and the chain walk treats a COPY held by such
--- an agent as a dead hop (its root is then never reached). Direct rows are
--- never dead hops.
+-- The derivation (179's body); delta: the sticky detach that cuts off the
+-- lineage (section 2). In the attached arm a succession copy counts for
+-- nothing when its agent, or the agent of any copy on its chain, holds a
+-- detached row for the role or descends from such an agent through agents
+-- with no live row made by name. Direct rows are never judged, and an agent
+-- holding a live one ends the walk up the lineage.
 -- -------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.epigraph_role_derived_memberships(
     p_agent uuid, p_at timestamptz)
@@ -227,9 +263,11 @@ SET search_path = public, pg_temp AS $$
             -- successor, a successor in another folder and a copy of their
             -- copies admit nothing (section 1). Every row of the copy
             -- chain, the root included, must be live at `p_at`: a detach
-            -- anywhere above a copy revokes it. 195: and a detach is sticky
-            -- per identity: no copy counts for an agent holding a detached
-            -- row for the role, nor through a copy such an agent holds.
+            -- anywhere above a copy revokes it. 195: and a detach CUTS OFF the
+            -- lineage below it: no copy counts for an agent that holds a
+            -- detached row for the role, or that descends from one along
+            -- `agent_succession` through agents with no live row made by
+            -- name, nor through a copy held by such an agent.
             OR (b.attached_agents
                 AND EXISTS (SELECT 1 FROM public.role_agents ra
                              WHERE ra.agent_id = p_agent AND ra.role = b.role
@@ -237,19 +275,7 @@ SET search_path = public, pg_temp AS $$
                                AND ra.valid_from <= p_at
                                AND (ra.valid_to IS NULL OR p_at < ra.valid_to)
                                AND (ra.inherited_from IS NULL
-                                    OR (
-                                        -- 195: a detach is STICKY per
-                                        -- identity. A copy admits nothing
-                                        -- to an agent that holds ANY
-                                        -- detached row for the role (only
-                                        -- an attachment the operator makes
-                                        -- for it by name re-admits it).
-                                        NOT EXISTS (
-                                            SELECT 1 FROM public.role_agents dd
-                                             WHERE dd.agent_id = ra.agent_id
-                                               AND dd.role = ra.role
-                                               AND dd.detached_at IS NOT NULL)
-                                    AND EXISTS (
+                                    OR EXISTS (
                                         -- Every hop must be live at `p_at`
                                         -- (not detached, inside its window),
                                         -- the root included: a dead hop ends
@@ -263,15 +289,6 @@ SET search_path = public, pg_temp AS $$
                                                AND hop.detached_at IS NULL
                                                AND hop.valid_from <= p_at
                                                AND (hop.valid_to IS NULL OR p_at < hop.valid_to)
-                                               -- 195: nor through a COPY held
-                                               -- by such an agent (a direct
-                                               -- row is never a dead hop).
-                                               AND (hop.inherited_from IS NULL
-                                                    OR NOT EXISTS (
-                                                        SELECT 1 FROM public.role_agents dd
-                                                         WHERE dd.agent_id = hop.agent_id
-                                                           AND dd.role = hop.role
-                                                           AND dd.detached_at IS NOT NULL))
                                             UNION
                                             SELECT hop.id, hop.agent_id, hop.inherited_from
                                               FROM public.role_agents hop
@@ -279,15 +296,40 @@ SET search_path = public, pg_temp AS $$
                                              WHERE hop.detached_at IS NULL
                                                AND hop.valid_from <= p_at
                                                AND (hop.valid_to IS NULL OR p_at < hop.valid_to)
-                                               -- 195: nor through a COPY held
-                                               -- by such an agent (a direct
-                                               -- row is never a dead hop).
-                                               AND (hop.inherited_from IS NULL
-                                                    OR NOT EXISTS (
-                                                        SELECT 1 FROM public.role_agents dd
-                                                         WHERE dd.agent_id = hop.agent_id
-                                                           AND dd.role = hop.role
-                                                           AND dd.detached_at IS NOT NULL))
+                                        ),
+                                        -- 195: the agents this copy's answer
+                                        -- rests on: the agent asked about and
+                                        -- the agent of every COPY on the chain
+                                        -- (a row made by name is never judged).
+                                        judged (agent_id) AS (
+                                            SELECT ra.agent_id
+                                            UNION
+                                            SELECT ch.agent_id FROM chain ch
+                                             WHERE ch.inherited_from IS NOT NULL
+                                        ),
+                                        -- 195: and what they descend from:
+                                        -- up `agent_succession` (every
+                                        -- recorded parent, a revert's
+                                        -- included), through parents that hold
+                                        -- no live row made by name at `p_at`.
+                                        -- An agent the operator attached by
+                                        -- name ends the walk.
+                                        lineage (agent_id) AS (
+                                            SELECT j.agent_id FROM judged j
+                                            UNION
+                                            SELECT s.parent_agent_id
+                                              FROM lineage l
+                                              JOIN public.agent_succession s
+                                                ON s.child_agent_id = l.agent_id
+                                             WHERE NOT EXISTS (
+                                                       SELECT 1 FROM public.role_agents dr
+                                                        WHERE dr.agent_id = s.parent_agent_id
+                                                          AND dr.role = ra.role
+                                                          AND dr.inherited_from IS NULL
+                                                          AND dr.detached_at IS NULL
+                                                          AND dr.valid_from <= p_at
+                                                          AND (dr.valid_to IS NULL
+                                                               OR p_at < dr.valid_to))
                                         ),
                                         folders AS (
                                             SELECT DISTINCT s.group_folder
@@ -301,7 +343,18 @@ SET search_path = public, pg_temp AS $$
                                          WHERE root.inherited_from IS NULL
                                            AND (SELECT count(*) FROM folders) = 1
                                            AND rs.group_folder IN (SELECT f.group_folder
-                                                                     FROM folders f)))))))
+                                                                     FROM folders f)
+                                           -- 195: a detach is sticky and cuts
+                                           -- off the lineage: no agent judged
+                                           -- or reached holds a detached row
+                                           -- for the role, at any time.
+                                           AND NOT EXISTS (
+                                                   SELECT 1
+                                                     FROM lineage l
+                                                     JOIN public.role_agents dd
+                                                       ON dd.agent_id = l.agent_id
+                                                    WHERE dd.role = ra.role
+                                                      AND dd.detached_at IS NOT NULL))))))
      WHERE p_agent IS NOT NULL AND p_at IS NOT NULL
        AND b.created_at <= p_at AND (b.revoked_at IS NULL OR p_at < b.revoked_at)
        AND public.epigraph_live_role_assignment(c.human, b.role, p_at) IS NOT NULL
