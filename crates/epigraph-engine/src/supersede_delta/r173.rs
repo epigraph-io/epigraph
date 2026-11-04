@@ -1151,6 +1151,59 @@ mod tests {
         .expect("the shipped calibration passes");
     }
 
+    fn preview(belief: f64, plausibility: f64, pignistic_prob: f64) -> CombinedBeliefPreview {
+        CombinedBeliefPreview {
+            belief,
+            plausibility,
+            pignistic_prob,
+            conflict_k: 0.0,
+            missing_mass: 0.0,
+            classification: None,
+        }
+    }
+
+    fn report_of(measured: Vec<R173Claim>) -> R173Report {
+        let n = measured.len();
+        report(
+            CalibrationIdentity::default(),
+            &R173Options::default(),
+            10,
+            Vec::new(),
+            n,
+            measured,
+            None,
+        )
+    }
+
+    fn with_empty(n: u128, f: Folded) -> R173Claim {
+        let mut c = R173Claim::bare(
+            Uuid::from_u128(n),
+            true,
+            R173Outcome::Recomputed,
+            Stored::default(),
+        );
+        c.empty = Some(f);
+        c
+    }
+
+    #[test]
+    fn c5_flags_a_raw_fold_outside_the_unit_interval_that_the_clamp_hides() {
+        // The write clamps NaN to 0 and 1.2 to 1: a check over the clamped
+        // values alone can never fire on a fold.
+        let nan = with_empty(1, Folded::of(preview(0.2, 0.9, f64::NAN)));
+        let over = with_empty(2, Folded::of(preview(1.2, 1.3, 0.9)));
+        // Float noise the clamp exists to absorb is not a violation.
+        let noise = with_empty(3, Folded::of(preview(0.0, 1.0 + 4.0 * f64::EPSILON, 0.5)));
+        let clean = with_empty(4, Folded::of(preview(0.3, 0.8, 0.55)));
+        let r = report_of(vec![nan, over, noise, clean]);
+        assert_eq!(
+            r.checks.c5_violations,
+            vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            "a non-finite or out-of-range RAW fold is a C5 violation: {:?}",
+            r.checks
+        );
+    }
+
     #[test]
     fn crossings_count_a_value_at_the_threshold_as_above() {
         let mut c = R173Claim::bare(
