@@ -1087,6 +1087,7 @@ pub fn resolve_hypothesis_index(stored: Option<i32>, hypothesis_count: usize) ->
 /// of the stored ones, under the same frame tier (`frame_overrides`) layered
 /// over the global profile `base` (the served profile on every write path).
 /// `None` when `all_rows` is empty.
+#[allow(clippy::too_many_arguments)]
 async fn compute_combined_belief_over(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
