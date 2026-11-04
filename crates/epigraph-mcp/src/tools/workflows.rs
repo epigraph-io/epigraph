@@ -16,18 +16,6 @@ use epigraph_db::{
 
 use crate::embed::format_pgvector;
 
-/// Load the evidence-type weight from CalibrationConfig.
-///
-/// Checks `CALIBRATION_PATH` env var first, then falls back to the
-/// relative path "calibration.toml". On any failure silently returns 0.7.
-fn load_evidence_type_weight(evidence_type: &str) -> f64 {
-    let path = std::env::var("CALIBRATION_PATH").unwrap_or_else(|_| "calibration.toml".to_string());
-    epigraph_engine::calibration::CalibrationConfig::load(std::path::Path::new(&path))
-        .ok()
-        .map(|c| c.get_evidence_type_weight(evidence_type))
-        .unwrap_or(0.7)
-}
-
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(value).map_err(internal_error)?,
@@ -1267,7 +1255,10 @@ pub async fn report_workflow_outcome(
     // CDST update: replace Bayesian update with calibration-weighted DS combination.
     // Evidence type "observation" (matches the EvidenceType::Observation created above).
     // quality is the confidence signal; success determines supports/refutes direction.
-    let weight = load_evidence_type_weight("observation");
+    // The served calibration (`CALIBRATION_PATH`, else the compiled-in copy),
+    // never a cwd file with a 0.7 fallback (backlog d83b998a).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight("observation");
     let ds = ds_auto::auto_wire_ds_update(
         &mut tx,
         viewer,
