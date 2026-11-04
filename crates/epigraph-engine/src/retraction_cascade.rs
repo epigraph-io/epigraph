@@ -175,16 +175,25 @@ impl CascadeReport {
 
 /// Repair belief downstream of `ClaimRepository::supersede`.
 ///
-/// `new_claim_id` is the **replacement** claim, not the retracted one: the
-/// supersede transaction re-points every non-`supersedes` outgoing edge onto
-/// the replacement before it commits, so enumerating from the retracted uuid
-/// finds nothing at all (see
-/// [`EdgeRepository::list_current_claim_targets`]).
+/// Two walks, then one recompute pass over everything either touched:
+///
+/// * the edges the migration re-sourced onto `new_claim_id` (the
+///   **replacement**): their BBAs still encode the retired claim's interval,
+///   so each is invalidated and re-derived from the replacement
+///   ([`invalidate_and_rewire`], enumerated by
+///   [`EdgeRepository::list_current_claim_targets`]);
+/// * the edges that STAYED on `old_claim_id` (the weakening ones, #398, and
+///   the frozen sets): the retired claim is inert (supersede SPEC §1, §11
+///   K10(2)), so the BBAs they froze onto current claims are invalidated and
+///   NOT re-derived ([`invalidate_only`]). Re-wiring them would re-mint the
+///   retired claim's mass, which is what `invalidate_and_rewire` does from
+///   whatever sources the edge.
 ///
 /// Never fails: see the module docs on best-effort semantics.
 pub async fn cascade_after_supersede(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
+    old_claim_id: Uuid,
     new_claim_id: Uuid,
 ) -> CascadeReport {
     let mut report = CascadeReport::default();
@@ -219,9 +228,46 @@ pub async fn cascade_after_supersede(
         &mut report,
     )
     .await;
-    repair_targets(&mut *conn, viewer, frame_id, &targets, &mut report).await;
+
+    // The retired claim is inert: the BBAs its stayed edges froze onto
+    // current claims go, with nothing re-derived in their place. The
+    // selection is the one the dry-run delta measures
+    // (`supersede_delta::RETIRED_SOURCE_EDGE_BBAS_SQL`). Its own `visited`:
+    // a claim the first walk queued may also hold a stayed edge's BBA, and
+    // that BBA must still be invalidated.
+    let stayed =
+        match crate::supersede_delta::retired_source_edge_bbas(&mut *conn, Some(&[old_claim_id]))
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                report.note_error("enumerate the retired claim's stayed edge BBAs", e);
+                Vec::new()
+            }
+        };
+    let mut inert_visited: HashSet<Uuid> = HashSet::from([old_claim_id]);
+    let inert = invalidate_only(
+        &mut *conn,
+        viewer,
+        frame_id,
+        &stayed,
+        &mut inert_visited,
+        &mut report,
+    )
+    .await;
+
+    // One recompute pass, strictly after every invalidation (module docs).
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let to_repair: Vec<Uuid> = targets
+        .iter()
+        .chain(inert.iter())
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    repair_targets(&mut *conn, viewer, frame_id, &to_repair, &mut report).await;
 
     tracing::info!(
+        retired = %old_claim_id,
         replacement = %new_claim_id,
         targets = ?report.targets,
         invalidated_bbas = report.invalidated_bbas,
@@ -587,6 +633,89 @@ async fn invalidate_and_rewire(
 
         if visited.insert(*target_id) {
             queued.push(*target_id);
+        }
+    }
+    queued
+}
+
+/// Invalidate the edge-keyed BBAs a RETIRED claim's stayed edges froze onto
+/// current claims (`rows`, from
+/// [`crate::supersede_delta::retired_source_edge_bbas`]), and queue their
+/// holders for the recompute pass. Nothing is re-wired: the retired claim
+/// exerts no belief (supersede SPEC §11 K10(2), delivery council N5).
+///
+/// Per edge, like [`invalidate_and_rewire`]: one savepoint, the delete
+/// ([`MassFunctionRepository::delete_for_perspective`], whose privileged arm
+/// keeps retracted rows once K4a lands; the selection already names live
+/// rows only), and a repair probe of every holder before the savepoint
+/// commits, so a holder this connection cannot write keeps both its BBA and a
+/// belief consistent with it, and is reported.
+///
+/// Returns the newly queued holders (deduplicated against `visited`).
+async fn invalidate_only(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    frame_id: Uuid,
+    rows: &[crate::supersede_delta::EdgeKeyedBba],
+    visited: &mut HashSet<Uuid>,
+    report: &mut CascadeReport,
+) -> Vec<Uuid> {
+    let mut queued = Vec::new();
+    // Rows arrive ordered by edge; group each edge's holders.
+    let mut edges: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+    for row in rows {
+        match edges.last_mut() {
+            Some((edge, holders)) if *edge == row.edge_id => {
+                if !holders.contains(&row.holder_id) {
+                    holders.push(row.holder_id);
+                }
+            }
+            _ => edges.push((row.edge_id, vec![row.holder_id])),
+        }
+    }
+    'edges: for (edge_id, holders) in &edges {
+        let mut sp = match conn.begin().await {
+            Ok(sp) => sp,
+            Err(e) => {
+                report.note_error(&format!("savepoint for stayed edge {edge_id}"), e);
+                return queued;
+            }
+        };
+        let deleted = match MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id).await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                report.note_error(&format!("invalidate BBA for stayed edge {edge_id}"), e);
+                let _ = sp.rollback().await;
+                continue;
+            }
+        };
+        if deleted == 0 {
+            let _ = sp.rollback().await;
+            continue;
+        }
+        for holder in holders {
+            if let Err(e) = repair_one(&mut sp, viewer, frame_id, *holder).await {
+                let _ = sp.rollback().await;
+                report.note_error(
+                    &format!("repair claim {holder} after invalidating stayed edge {edge_id}"),
+                    format!(
+                        "{e}; the edge BBA was NOT invalidated (rolled back), so the claim keeps \
+                         the retired claim's frozen mass and a belief consistent with it"
+                    ),
+                );
+                continue 'edges;
+            }
+        }
+        if let Err(e) = sp.commit().await {
+            report.note_error(&format!("release savepoint for stayed edge {edge_id}"), e);
+            continue;
+        }
+        report.invalidated_bbas += deleted;
+        for holder in holders {
+            if visited.insert(*holder) {
+                queued.push(*holder);
+            }
         }
     }
     queued

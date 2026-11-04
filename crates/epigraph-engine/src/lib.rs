@@ -65,6 +65,7 @@ pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;
 pub mod source_dependence;
+pub mod supersede_delta;
 pub mod theme_cluster;
 pub mod triple_extractor;
 pub mod uncertainty;

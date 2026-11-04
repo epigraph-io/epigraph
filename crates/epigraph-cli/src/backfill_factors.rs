@@ -44,7 +44,9 @@
 //! The un-targeted phase ([`run_rewire_phase`]) is unchanged.
 
 /// Edge-phase eligibility: factorless target claim, claim-to-claim edge with
-/// epistemic relationship. The edge factor is wired under the SOURCE claim's
+/// epistemic relationship. `supersedes` is not one: lineage carries no mass
+/// (supersede SPEC §11 K12(b)), and listing it would count edges the wire
+/// cannot write a BBA for. The edge factor is wired under the SOURCE claim's
 /// author (`agent_id`, always populated): they assert the
 /// support/contradiction via the edge.
 ///
@@ -64,7 +66,7 @@ WHERE tgt.is_current AND src.is_current
   AND e.source_type = 'claim' AND e.target_type = 'claim'
   AND LOWER(e.relationship) IN (
     'supports','corroborates','contradicts','refutes','refines','undercuts','rebuts',
-    'elaborates','specializes','generalizes','supersedes','informs','frame_validates'
+    'elaborates','specializes','generalizes','informs','frame_validates'
   )
   AND NOT EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.claim_id = tgt.id)
 ORDER BY e.target_id, e.created_at
