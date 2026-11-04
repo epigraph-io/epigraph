@@ -497,6 +497,12 @@ async fn the_r173_delta_measures_each_regime_and_predicts_the_recompute(pool: Pg
     assert_eq!(r.lists.l1, want_l1);
     assert_eq!(r.lists.l2, vec![w.l2]);
     assert_eq!(r.lists.l3, vec![w.l3]);
+    assert_eq!(
+        r.lists.l1_single_input,
+        vec![w.l1],
+        "R-176(1)'s population: L1 with one owner input in the closed-form shape, on an \
+         unpatched frame (the patched claim is in L1 but not here)"
+    );
     assert!(r.lists.l1_not_current.is_empty() && r.lists.vacate.is_empty());
     assert_eq!(l1.list, Some(ApplyList::L1));
 

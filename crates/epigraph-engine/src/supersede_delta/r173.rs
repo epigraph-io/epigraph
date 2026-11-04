@@ -541,6 +541,8 @@ pub struct R173Counts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ApplyLists {
     pub l1: Vec<Uuid>,
+    /// The single-input share of L1 (not yet computed: empty).
+    pub l1_single_input: Vec<Uuid>,
     pub l1_not_current: Vec<Uuid>,
     pub l2: Vec<Uuid>,
     pub l3: Vec<Uuid>,
