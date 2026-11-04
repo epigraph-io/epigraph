@@ -592,3 +592,98 @@ async fn predict_counts_would_remove_for_a_vacuous_and_a_factorless_source(pool:
     assert!(w.is_empty() && r.is_empty(), "no snapshot record");
     assert_eq!(fingerprint(&pool).await, before, "the apply wrote nothing");
 }
+
+/// Design §1.11 item 5, and the evidence for the recorded Gauss-Seidel
+/// deviation: on a cycle `a ⇄ b` (settled before the wave, so the wave's move
+/// of `a` is the only thing that moved), the predict converges, and what it
+/// says the apply will do is what the apply then does on the same database:
+/// the same number of passes, the same sequence of rewrites, and each
+/// target's predicted cache equal to the cache the apply wrote.
+///
+/// Both run at epsilon 1e-12. At the default 1e-9 a stored cycle row and a
+/// fresh wire differ by about epsilon, which is `ROW_CLASS_EPSILON` itself, so
+/// a verify could hold the row as `row_mixed`. At a finite epsilon a cycle's
+/// rows are never EXACTLY a fresh wire, so the verify over the L1 and E waves
+/// is bounded rather than empty: it converges, holds nothing, and moves no
+/// target by more than 1e-9.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let author = seed_agent(&pool, "predict-cycle").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    let a = fresh_claim(&pool, &viewer, author, frame, "pcycle a", EVIDENCE_A).await;
+    let b = fresh_claim(&pool, &viewer, author, frame, "pcycle b", TARGET_EVIDENCE).await;
+    let _ab = wired_edge(&pool, &viewer, author, a, b, "supports").await;
+    let _ba = wired_edge(&pool, &viewer, author, b, a, "supports").await;
+    settle(&pool, &viewer, &[a, b]).await;
+    let wave = vec![move_claim(&pool, &viewer, a, EVIDENCE_B).await];
+    let o = TargetedRunOptions {
+        max_passes: 200,
+        epsilon: 1e-12,
+        only_changed: true,
+        ..TargetedRunOptions::default()
+    };
+
+    let predicted = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&wave, o.epsilon), &o)
+        .await
+        .expect("predict");
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    let applied = run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    let records = epigraph_cli::edge_rewire::read_edge_row_records(r.as_slice()).unwrap();
+    let e_wave = epigraph_cli::belief_cache::read_wave(w.as_slice()).unwrap();
+
+    assert!(predicted.converged, "{:?}", predicted.passes);
+    assert!(applied.converged, "{applied:?}");
+    assert!(
+        predicted.passes.len() > 2,
+        "the cycle takes several passes: {:?}",
+        predicted.passes
+    );
+    assert_eq!(
+        predicted.passes.len(),
+        applied.passes.len(),
+        "same number of passes"
+    );
+    assert!(predicted.totals.held.is_empty(), "{:?}", predicted.totals);
+    assert_eq!(
+        predicted.would_rewrite(),
+        records.iter().map(|x| x.edge_id).collect::<Vec<_>>(),
+        "the predict's rewrites, in visit order, are the apply's"
+    );
+    for t in [a, b] {
+        let p: &CacheColumns = predicted.targets[&t].w.as_ref().expect("predicted cache");
+        let g = cache(&pool, t).await;
+        for (pv, gv, what) in [
+            (p.belief, g.belief, "belief"),
+            (p.plausibility, g.plausibility, "plausibility"),
+            (p.pignistic_prob, g.pignistic_prob, "betp"),
+        ] {
+            assert_close(gv.unwrap(), pv.unwrap(), 1e-9, &format!("{t} {what}"));
+        }
+    }
+
+    // The fixed-point verify: the L1 wave and the apply's E wave together.
+    let mut both = wave.clone();
+    both.extend(e_wave);
+    let verify = predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&both, o.epsilon), &o)
+        .await
+        .expect("verify predict");
+    assert_eq!(verify.seed_mode, "db");
+    assert!(verify.converged, "{:?}", verify.passes);
+    assert!(verify.totals.held.is_empty(), "{:?}", verify.totals);
+    assert!(
+        verify.totals.max_abs_d_edge < 1e-9,
+        "the verify moves no target by more than 1e-9: {:?}",
+        verify.totals
+    );
+}

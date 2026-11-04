@@ -256,3 +256,36 @@ pub fn assert_close(got: f64, want: f64, eps: f64, what: &str) {
         "{what}: expected {want}, got {got}"
     );
 }
+
+/// Bring a cyclic world to its pre-wave fixed point with the un-targeted
+/// phase (each row then IS the wire from its source's current cache, as on a
+/// settled corpus), so the wave is the only thing that moved.
+pub async fn settle(pool: &PgPool, viewer: &Viewer, claims: &[Uuid]) {
+    let mut last = Vec::new();
+    for _ in 0..400 {
+        epigraph_cli::backfill_factors::run_rewire_phase(
+            pool,
+            viewer,
+            &epigraph_cli::backfill_factors::RewireOptions::default(),
+        )
+        .await
+        .expect("settle");
+        let mut now = Vec::new();
+        for c in claims {
+            let k = cache(pool, *c).await;
+            now.push((k.belief.unwrap(), k.plausibility.unwrap()));
+        }
+        if now
+            .iter()
+            .zip(&last)
+            .all(|(x, y): (&(f64, f64), &(f64, f64))| {
+                (x.0 - y.0).abs() < 1e-14 && (x.1 - y.1).abs() < 1e-14
+            })
+            && !last.is_empty()
+        {
+            return;
+        }
+        last = now;
+    }
+    panic!("the cyclic fixture did not settle");
+}

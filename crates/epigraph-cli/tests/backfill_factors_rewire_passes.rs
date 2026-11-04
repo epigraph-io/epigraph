@@ -317,8 +317,10 @@ async fn targeted_passes_converge_on_a_cycle(pool: PgPool) {
         held, 0,
         "a cycle's second visit is not held as mixed: {report:?}"
     );
-    // Fixed point: one more pass from the final state changes nothing.
-    let (again, _, _) = apply(
+    // Fixed point: one more run from the final state moves no target by more
+    // than 1e-6 (a cycle's rows are within about epsilon of a fresh wire, so
+    // a further rewrite may land, but only that residual).
+    let (again, again_wave, _) = apply(
         &pool,
         &viewer,
         &[WaveRecord {
@@ -336,6 +338,14 @@ async fn targeted_passes_converge_on_a_cycle(pool: PgPool) {
     )
     .await;
     assert!(again.passes.iter().all(|p| p.held.is_empty()), "{again:?}");
+    assert!(again.converged, "{again:?}");
+    for rec in &again_wave {
+        assert!(
+            !epigraph_cli::edge_rewire::cache_moved(&rec.before, &rec.written, 1e-6),
+            "one more run moved {} by more than 1e-6: {rec:?}",
+            rec.claim_id
+        );
+    }
     for (edge, src) in [(ab, a), (ba, b)] {
         let now = edge_rows(&pool, edge).await.remove(0).1;
         let fresh = fresh_wire_masses(&pool, &viewer, author, frame, src).await;
@@ -350,39 +360,6 @@ async fn targeted_passes_converge_on_a_cycle(pool: PgPool) {
         .unwrap();
         assert!(close, "edge {edge}: {now} vs fresh {fresh}");
     }
-}
-
-/// Bring a cyclic world to its pre-wave fixed point with the un-targeted
-/// phase (each row then IS the wire from its source's current cache, as on a
-/// settled corpus), so the wave is the only thing that moved.
-async fn settle(pool: &PgPool, viewer: &Viewer, claims: &[Uuid]) {
-    let mut last = Vec::new();
-    for _ in 0..400 {
-        epigraph_cli::backfill_factors::run_rewire_phase(
-            pool,
-            viewer,
-            &epigraph_cli::backfill_factors::RewireOptions::default(),
-        )
-        .await
-        .expect("settle");
-        let mut now = Vec::new();
-        for c in claims {
-            let k = cache(pool, *c).await;
-            now.push((k.belief.unwrap(), k.plausibility.unwrap()));
-        }
-        if now
-            .iter()
-            .zip(&last)
-            .all(|(x, y): (&(f64, f64), &(f64, f64))| {
-                (x.0 - y.0).abs() < 1e-14 && (x.1 - y.1).abs() < 1e-14
-            })
-            && !last.is_empty()
-        {
-            return;
-        }
-        last = now;
-    }
-    panic!("the cyclic fixture did not settle");
 }
 
 /// Rollback round trip (§1.8): restore the rows from the edge-rows file and
@@ -484,4 +461,120 @@ async fn targeted_rewire_restores_rows_and_caches_byte_identical(pool: PgPool) {
     let again = restore_edge_rows(&pool, &rows, false).await.unwrap();
     assert_eq!(again.already_restored, vec![id(0)], "{again:?}");
     assert!(again.restored.is_empty());
+}
+
+/// A settled cycle `a ⇄ b` and a wave that moved `a`. Returns the claims,
+/// the edges and the wave.
+async fn settled_cycle(
+    pool: &PgPool,
+    viewer: &Viewer,
+    tag: &str,
+) -> ((Uuid, Uuid), (Uuid, Uuid), Vec<WaveRecord>) {
+    let author = seed_agent(pool, &format!("cycle-restore-{tag}")).await;
+    let frame = binary_frame(pool, viewer).await;
+    let a = fresh_claim(
+        pool,
+        viewer,
+        author,
+        frame,
+        &format!("cr a {tag}"),
+        EVIDENCE_A,
+    )
+    .await;
+    let b = fresh_claim(
+        pool,
+        viewer,
+        author,
+        frame,
+        &format!("cr b {tag}"),
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let ab = wired_edge(pool, viewer, author, a, b, "supports").await;
+    let ba = wired_edge(pool, viewer, author, b, a, "supports").await;
+    settle(pool, viewer, &[a, b]).await;
+    let wave = vec![move_claim(pool, viewer, a, EVIDENCE_B).await];
+    ((a, b), (ab, ba), wave)
+}
+
+/// Rollback of a CYCLE run (§1.8): the run rewrites each of the two rows in
+/// several passes, so the edge-rows file holds a chain of records per row
+/// (each `before` the previous `written`) and the wave file a chain per
+/// claim. The restore walks each chain back to its first `before`: both rows
+/// (`created_at` included) and both caches come back byte-identical to the
+/// state before the run, LIFO over the last write. A row rewritten
+/// organically after the run (its last `written` no longer matches) is
+/// `superseded_since_rewire` and left alone; the other row is restored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_restore_unwinds_a_cycle_run_to_the_pre_run_rows(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ((a, b), (ab, ba), wave) = settled_cycle(&pool, &viewer, "one").await;
+    let rows_pre = (edge_rows(&pool, ab).await, edge_rows(&pool, ba).await);
+    let caches_pre = (cache(&pool, a).await, cache(&pool, b).await);
+
+    let (report, wave_e, rows) = apply(&pool, &viewer, &wave, &until_fixed(80)).await;
+    assert!(report.converged, "{report:?}");
+    let per_row = |id: Uuid| rows.iter().filter(|r| r.mf_id == id).count();
+    let (ab_id, ba_id) = (rows_pre.0[0].0, rows_pre.1[0].0);
+    assert!(
+        per_row(ab_id) > 1 && per_row(ba_id) > 1,
+        "PREMISE: the cycle rewrote each row more than once ({} and {} records)",
+        per_row(ab_id),
+        per_row(ba_id)
+    );
+    assert_ne!(
+        (edge_rows(&pool, ab).await, edge_rows(&pool, ba).await),
+        rows_pre,
+        "the run moved the rows"
+    );
+
+    let restored = restore_edge_rows(&pool, &rows, false)
+        .await
+        .expect("restore rows");
+    let mut got = restored.restored.clone();
+    got.sort_unstable();
+    let mut want = vec![ab_id, ba_id];
+    want.sort_unstable();
+    assert_eq!(got, want, "{restored:?}");
+    let caches = restore_wave(
+        &pool,
+        &plan_restore(&wave_e, None),
+        &RestoreOptions::default(),
+    )
+    .await
+    .expect("restore caches");
+    assert_eq!(caches.restored.len(), 2, "{caches:?}");
+    assert_eq!(
+        (edge_rows(&pool, ab).await, edge_rows(&pool, ba).await),
+        rows_pre,
+        "rows back to the pre-run rows, created_at included"
+    );
+    assert_eq!(
+        (cache(&pool, a).await, cache(&pool, b).await),
+        caches_pre,
+        "caches back to the pre-run caches"
+    );
+
+    // Variant: a second cycle, one row rewritten organically after the run.
+    let ((_a2, _b2), (ab2, ba2), wave2) = settled_cycle(&pool, &viewer, "two").await;
+    let ba2_pre = edge_rows(&pool, ba2).await;
+    let (_, _, rows2) = apply(&pool, &viewer, &wave2, &until_fixed(80)).await;
+    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
+        .bind(ab2)
+        .bind(STALE_PRE_401)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ab2_now = edge_rows(&pool, ab2).await;
+    let restored2 = restore_edge_rows(&pool, &rows2, false)
+        .await
+        .expect("restore rows");
+    assert_eq!(
+        restored2.superseded_since_rewire,
+        vec![ab2_now[0].0],
+        "{restored2:?}"
+    );
+    assert_eq!(restored2.restored, vec![ba2_pre[0].0], "{restored2:?}");
+    assert_eq!(edge_rows(&pool, ab2).await, ab2_now, "left alone");
+    assert_eq!(edge_rows(&pool, ba2).await, ba2_pre, "restored");
 }
