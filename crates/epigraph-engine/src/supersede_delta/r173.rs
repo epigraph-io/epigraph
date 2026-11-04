@@ -1339,6 +1339,48 @@ mod tests {
     }
 
     #[test]
+    fn c3_fires_on_a_fold_off_its_closed_form() {
+        let closed = |e_closed: f64| SingleInput {
+            r_empty: 0.5,
+            r_full: 1.0,
+            e_closed,
+            f_closed: 0.7,
+        };
+        let mut off = e_and_f(1, R173Outcome::Recomputed, 0.6, 0.7);
+        off.single_input = Some(closed(0.6 + 1e-6));
+        let mut on = e_and_f(2, R173Outcome::Recomputed, 0.6, 0.7);
+        on.single_input = Some(closed(0.6));
+        let r = report_of(vec![off, on]);
+        assert_eq!(r.checks.c3_checked, 2);
+        assert_eq!(r.checks.c3_violations, vec![id(1)], "{:?}", r.checks);
+        assert!(
+            (r.checks.c3_max_abs_diff - 1e-6).abs() < 1e-12,
+            "{}",
+            r.checks.c3_max_abs_diff
+        );
+    }
+
+    #[test]
+    fn c5_fires_on_a_clamped_value_out_of_range_and_on_a_bad_stored_cache() {
+        let mut wide = e_and_f(1, R173Outcome::Recomputed, 0.6, 0.7);
+        wide.full.as_mut().expect("F").belief = 1.2;
+        let mut stored = e_and_f(2, R173Outcome::Recomputed, 0.6, 0.7);
+        stored.stored.betp = Some(f64::NAN);
+        let mut excursion = e_and_f(3, R173Outcome::Recomputed, 0.6, 0.7);
+        excursion.full.as_mut().expect("F").raw_excursion = 1e-6;
+        let mut noise = e_and_f(4, R173Outcome::Recomputed, 0.6, 0.7);
+        noise.full.as_mut().expect("F").raw_excursion = 1e-12;
+        let clean = e_and_f(5, R173Outcome::Recomputed, 0.6, 0.7);
+        let r = report_of(vec![wide, stored, excursion, noise, clean]);
+        assert_eq!(
+            r.checks.c5_violations,
+            vec![id(1), id(2), id(3)],
+            "{:?}",
+            r.checks
+        );
+    }
+
+    #[test]
     fn c7_fires_on_an_unchanged_claim_whose_e_and_f_differ_and_lists_it() {
         let moved = e_and_f(1, R173Outcome::Unchanged, 0.6, 0.65);
         let still = e_and_f(2, R173Outcome::Unchanged, 0.6, 0.6);
@@ -1350,6 +1392,25 @@ mod tests {
             vec![id(1)],
             "the violator is listed with its E and F; a clean unchanged claim is counted only"
         );
+    }
+
+    #[test]
+    fn a_matches_f_fires_when_the_apply_value_is_not_the_full_fold() {
+        let mut off = e_and_f(1, R173Outcome::Recomputed, 0.6, 0.7);
+        off.apply = Some(folded(0.8));
+        let mut on = e_and_f(2, R173Outcome::Recomputed, 0.6, 0.7);
+        on.apply = Some(folded(0.7));
+        // A vacate's A is full ignorance, never F: not this check's business.
+        let mut vacate = e_and_f(3, R173Outcome::Vacate, 0.6, 0.7);
+        vacate.apply = Some(folded(0.5));
+        let r = report_of(vec![off, on, vacate]);
+        assert_eq!(
+            r.checks.a_matches_f_violations,
+            vec![id(1)],
+            "{:?}",
+            r.checks
+        );
+        assert_eq!(r.lists.vacate, vec![id(3)]);
     }
 
     #[test]
