@@ -31,6 +31,8 @@ use epigraph_cli::backfill_factors::{
     rewire_edge_targeted, run_rewire_phase, select_targeted_edges, HeldBucket, RewireCapture,
     RewireEdge, RewireOptions, StoredEdgeRow, TargetedGuards, TargetedOutcome,
 };
+use epigraph_cli::belief_cache::WaveRecord;
+use epigraph_cli::edge_rewire::{predict_targeted_rewire, seed_from_waves, TargetedRunOptions};
 use epigraph_db::visibility::Viewer;
 use rewire_fixture::*;
 use sqlx::PgPool;
@@ -46,6 +48,8 @@ struct World {
     edge: Uuid,
     /// `(belief, plausibility)` the source held before the wave moved it.
     baseline: HashMap<Uuid, (f64, f64)>,
+    /// The wave's record of the source's move (what a predict is seeded from).
+    wave: Vec<WaveRecord>,
 }
 
 async fn world(
@@ -96,6 +100,7 @@ async fn world(
         target,
         edge,
         baseline,
+        wave: vec![rec],
     }
 }
 
@@ -525,5 +530,75 @@ async fn targeted_selection_is_restricted_to_the_listed_sources_and_edges(pool: 
     assert_eq!(
         listed.iter().map(|e| e.edge_id).collect::<Vec<_>>(),
         vec![v.edge]
+    );
+}
+
+/// Narrow `edge` to `group` (both endpoints stay public), as
+/// `epigraph-engine/tests/derivation_scope_admissibility.rs` does: its
+/// edge-factor row may no longer enter the public target's cache.
+async fn narrow_edge_to_group(pool: &PgPool, edge: Uuid, group: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("narrow the edge to a group");
+}
+
+/// Design E-d / ruling R-80: the edge's row is the edge-only target's only
+/// binary input, and it is no longer admissible for the target's cache (the
+/// edge was narrowed to a group), so any refold of the target VACATES its
+/// cache. The targeted rewire holds the edge as `would_vacate` (not as an
+/// ordinary stale target), leaves the row, the cache and `updated_at` exactly
+/// as they were, and the predict counts it (`totals.would_vacate`), so the
+/// gate the design asks for is measured rather than assumed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_holds_a_target_that_would_vacate(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "vacate", "supports", false).await;
+    let edge = the_edge(&pool, &w).await;
+    let (_member, group) = viewer_fixture::seed_agent_with_group(&pool, "cal4-vacate").await;
+    narrow_edge_to_group(&pool, w.edge, group).await;
+    let must_vacate = {
+        let mut conn = pool.acquire().await.expect("conn");
+        epigraph_engine::derivation_scope::must_vacate_cache(&mut conn, &viewer, w.target)
+            .await
+            .expect("derivation scope read")
+    };
+    assert!(
+        must_vacate,
+        "PREMISE: a refold of the target vacates its cache"
+    );
+    let before = footprint(&pool, &w).await;
+    assert!(before.1.belief.is_some(), "fixture: the target has a cache");
+
+    let o = TargetedRunOptions::default();
+    let predicted =
+        predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&w.wave, o.epsilon), &o)
+            .await
+            .expect("predict");
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row, target cache and updated_at unchanged"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::WouldVacate);
+    let predicted_edge = predicted
+        .edges
+        .iter()
+        .find(|e| e.edge_id == w.edge)
+        .expect("the predict reached the edge");
+    assert_eq!(predicted_edge.outcome, "would_vacate", "{predicted:?}");
+    assert_eq!(predicted.totals.would_vacate, 1, "{:?}", predicted.totals);
+    assert!(
+        !predicted.targets[&w.target].fresh,
+        "a target with no admissible fold is not reported fresh: {:?}",
+        predicted.targets[&w.target]
     );
 }
