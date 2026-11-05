@@ -1400,6 +1400,32 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Find a person, an LLM agent or a system identity by NAME (or by exact ORCID / ROR id). Case-insensitive and accent-folded; ranked orcid/ror > exact > prefix (of the name or one of its words) > similar (trigram), then oldest first. Display names collide (many agents share a name), so each result carries what tells them apart: id, display_name, kind (human / llm_agent / system / role / ingest_author / unknown, derived from evidence you may see: a registered human, an LLM model on a visible profile, an operator link you may see, the system registry, the document ingest's name-derived author key), kind_evidence, roles (live assignments you may see), orcid / ror_id (when the profile is visible to you), operator_human (the human the agent acts for, shown only to that human and to admins), created_at, and counts (authored_papers, asserted_claims: claims it authored or an ingest attributed to it; computed only over what you can read, capped at 10000 with capped=true), plus tier and score. kind and role filters apply before the limit; candidates_truncated=true means more than 200 agents matched, so narrow the name. Never matches email or any contact field. Same rules as GET /api/v1/agents/search."
+    )]
+    async fn find_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::FindAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::find_agent(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Look up one agent by id (for example the agent_id of a claim, to name who filed it). Returns the same card as find_agent: id, display_name, kind and kind_evidence, roles, orcid / ror_id (visible profiles only), operator_human (only for that human and admins), created_at and counts computed over what you can read. Not found for an id with no agent."
+    )]
+    async fn get_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::GetAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::get_agent(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
     )]
     async fn get_claim(
