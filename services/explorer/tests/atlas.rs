@@ -2513,25 +2513,51 @@ fn atlas_belief_ramp_is_monotonic_and_visible_in_both_themes() {
 }
 
 /// sha256 of each vendored file, recorded when vendoring and cross-checked
-/// against the npm registry's `integrity`. PLACEHOLDERS until the files are
-/// supplied: replace each value and drop the `#[ignore]`.
+/// against the npm registry's `integrity`.
 const VENDOR_PINS: &[(&str, &str, &str)] = &[
-    ("d3-color", "3.1.0", "PLACEHOLDER-sha256-d3-color"),
+    (
+        "d3-color",
+        "3.1.0",
+        "a12639010163230b8c130fbeb92a3a49bb5f6989a566d3664d759522db458489",
+    ),
     (
         "d3-interpolate",
         "3.0.1",
-        "PLACEHOLDER-sha256-d3-interpolate",
+        "bfc321e4c3f3b3aadc88cfe15ccb5e443abfeadef8b75c65b41c33a4d78a98ae",
     ),
-    ("d3-ease", "3.0.1", "PLACEHOLDER-sha256-d3-ease"),
-    ("d3-hierarchy", "3.1.2", "PLACEHOLDER-sha256-d3-hierarchy"),
-    ("d3-dispatch", "3.0.1", "PLACEHOLDER-sha256-d3-dispatch"),
-    ("d3-timer", "3.0.1", "PLACEHOLDER-sha256-d3-timer"),
-    ("d3-quadtree", "3.0.1", "PLACEHOLDER-sha256-d3-quadtree"),
-    ("d3-force", "3.0.0", "PLACEHOLDER-sha256-d3-force"),
+    (
+        "d3-ease",
+        "3.0.1",
+        "e60a1ed750a1ad138dd18e8d3f463238113cfbf7d89685a13d19bd4e048dc3ce",
+    ),
+    (
+        "d3-hierarchy",
+        "3.1.2",
+        "a8771380454be89ec5ffe9a6396ba7c247081e348ae740dc9cb9629abd4c0e43",
+    ),
+    (
+        "d3-dispatch",
+        "3.0.1",
+        "94b3bbdb6b98dc1325a15762b051013e8253999b0e0436b27d1da17b952ba0af",
+    ),
+    (
+        "d3-timer",
+        "3.0.1",
+        "911ceda305f014b6b53ca68d5c896a9a387da120cfd56a421a2c60cca2fc9b36",
+    ),
+    (
+        "d3-quadtree",
+        "3.0.1",
+        "57e2ad12824ed82893ba447523f2a2fb9beeb9222aafb2c778a9f5b313348b0e",
+    ),
+    (
+        "d3-force",
+        "3.0.0",
+        "1e07b473241328795d5ea9ad479a7bbabd765012fa2ef95633c83b69868dff6b",
+    ),
 ];
 
 #[tokio::test]
-#[ignore = "d3 vendor files pending"]
 async fn vendored_d3_is_pinned_and_licensed() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("static/vendor");
     assert_eq!(VENDOR_PINS.len(), VENDOR_SCRIPTS.len());
