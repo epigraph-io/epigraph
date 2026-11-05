@@ -37,11 +37,18 @@
 //!   back; re-measures and requires no slot left to fill; writes the undo
 //!   record (and syncs it); then commits. Any mismatch rolls the whole run
 //!   back. A second apply after a successful one finds nothing to mint.
-//! * [`undo`]: deletes each recorded factor only where every column the mint
-//!   wrote still holds the recorded value (compared in SQL as typed values),
-//!   so a factor changed or removed since is reported and left alone, and no
-//!   factor this tool did not mint can be deleted. A dry run executes the
-//!   deletes and rolls back.
+//! * [`undo`]: deletes only the factors the record names, and each only while
+//!   every column the mint wrote still holds the recorded value (compared in
+//!   SQL as typed values). A factor changed or removed since is reported and
+//!   left alone. The record is the authority: the undo trusts the record
+//!   file the apply wrote, so keep it where only the operator can change it.
+//!   A dry run executes the deletes and rolls back.
+//!
+//!   The undo restores the `factors` table only as far as the rows it
+//!   minted. An edge inserted on a minted pair after the apply got no factor
+//!   of its own (its INSERT trigger found the slot held), so once the undo
+//!   deletes the minted factor that edge is factorless on an empty slot: it
+//!   is back in the R-131 set, and a fresh dry run plans it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
