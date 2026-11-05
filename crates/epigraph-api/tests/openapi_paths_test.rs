@@ -132,6 +132,33 @@ async fn openapi_documents_in_scope_paths() {
     // -------------------------------------------------------------------------
     // PATCH /api/v1/claims/{id}
     // -------------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // GET /api/v1/claims/{id}: the claim, with its `authored_by` block
+    // -------------------------------------------------------------------------
+    let claim_get = &paths["/api/v1/claims/{id}"]["get"];
+    assert!(
+        claim_get.is_object(),
+        "GET /api/v1/claims/{{id}} not registered as a path operation"
+    );
+    let get_ok = claim_get["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        .as_str()
+        .expect("GET /api/v1/claims/{id}: 200 body must be a $ref");
+    assert!(
+        get_ok.ends_with("/ClaimResponse"),
+        "GET /api/v1/claims/{{id}} body should be ClaimResponse, got {get_ok}"
+    );
+    let schemas = &doc["components"]["schemas"];
+    for name in ["AuthoredByView", "AuthorRefView", "PromptSnapshotView"] {
+        assert!(
+            schemas[name].is_object(),
+            "components.schemas missing {name}"
+        );
+    }
+    assert!(
+        schemas["ClaimResponse"]["properties"]["authored_by"].is_object(),
+        "ClaimResponse documents authored_by"
+    );
+
     let claim_patch = &paths["/api/v1/claims/{id}"]["patch"];
     assert!(
         claim_patch.is_object(),
