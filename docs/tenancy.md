@@ -1418,22 +1418,25 @@ you make for it BY NAME: no succession copy admits it, whatever wrote the
 copy, and nothing copied through a copy it holds admits anyone.
 
 And a detach CUTS OFF THE LINEAGE below the detached identity (migration
-195). The host records each identity's parents (`agent_succession`: the
-identity the group ran before it, including the later identity a job
-reverts FROM). No succession copy admits an identity that descends from a
-detached identity through identities holding no live attachment you made
-by name, however many registrations lie in between. The first identity on
+195), as far as `agent_succession` records it. The registration records
+each identity's parents: the identity the group ran before it and, for a
+revert the host registers (the earlier identity's key again, naming the
+identity the job reverts FROM as its parent), that later identity too. A
+revert the host does not register records nothing (see "What the
+cut-off cannot see" below). No succession copy admits an identity that
+descends from a detached identity through identities holding no live
+attachment you made by name, however many registrations lie in between. The first identity on
 the way up that you attached by name stops the walk. So none of these
 regains the group:
 
-* a revert (the job goes back to an earlier prompt or model, so the host
-  registers the earlier, detached identity again with a later identity as
-  its parent), however many identities back it goes and whichever identity
-  is named as the parent;
-* a revert FROM a detached identity to an earlier one that still holds the
-  copy it inherited before the detach, and never was detached itself:
-  detaching the identity a job runs cuts the job off, also when it then
-  reverts, moves on and reverts again, or reverted before the detach;
+* a revert to a detached identity (the job goes back to an earlier prompt
+  or model), however many identities back it goes and whichever identity
+  is named as the parent: the identity holds a detached row, so no copy
+  admits it, registered again or not;
+* a registered revert FROM a detached identity to an earlier one that still
+  holds the copy it inherited before the detach, and never was detached
+  itself: detaching the identity a job runs cuts the job off, also when it
+  then reverts, moves on and reverts again, or reverted before the detach;
 * a detached identity that 166's attach-time follow attaches again when you
   attach one of its recorded predecessors by name;
 * a later identity of the job registered after the detach or the revert (a
@@ -1443,7 +1446,9 @@ regains the group:
   of the lineage, and admitted nowhere;
 * a successor registered from two parents, one of them detached: it is out
   whichever parent its copy chains through and whichever order the
-  registrations, attaches and detaches came in.
+  registrations, attaches and detaches came in, unless the detached parent
+  holds a live attachment made by name again (the documented restore): then
+  its copy chain decides (below).
 
 Each of those copies is still written, and still RESTRICTS: a revert is held
 by the role exactly as its parent is (166's refusal and may-run). An identity
@@ -1458,20 +1463,34 @@ that attachment, and so do the identities registered from it afterwards.
 To take the group from a job altogether, detach the identity you attached
 by name too; every copy chained from it stops counting.
 
+A row made by name also ENDS THE WALK up the lineage, so below it the
+answer is no longer a function of the succession edges, detached rows and
+rows made by name alone: an identity there is judged by its own copy chain.
+The documented restore makes such a row (a detached identity attached by
+name again). A successor registered from it BEFORE the detach holds a copy
+of its old copy, now detached, and stays out; a successor registered AFTER
+the restore holds a copy of the row made by name and is in; so is one whose
+copy chains through a clean second parent. The same holds below any
+identity attached by name whose older copy runs through a detached
+identity. So which successors a restore gives back depends on when they
+were registered: attach by name any successor you want back.
+
 The cut-off follows the recorded successions, not only the identity that
 runs now. Detaching ANY identity, an old one included, takes the group
 from every identity registered below it through identities with no live
-attachment made by name, and a revert records an edge too. For example:
-you attach Q by name; the job runs P, then A, reverts to P (A is recorded
-as P's parent), and goes on to B and C; detaching the old A months later
-takes the group from P, B and C, the identity that runs now included.
-Before any detach, list the identities reachable DOWN `agent_succession`
-from the one you detach (revert edges included), up to the first one
-holding a live attachment made by name, and confirm the running identity
-is meant to be among them. The walk ignores when a succession was recorded
-and when a detach was made, so the answer for a past instant also changes
-after a later revert or detach (the same "at any time" reading as the
-sticky detach itself).
+attachment made by name, and a registered revert records an edge too. For
+example: you attach Q by name; the job runs P, then A, reverts to P (the host
+registers the revert, so A is recorded as P's parent), and goes on to B and
+C; detaching the old A months later takes the group from P, B and C, the
+identity that runs now included. Before any detach, list the identities
+reachable DOWN `agent_succession` from the one you detach (registered
+reverts included), up to the first one holding a live attachment made by
+name: the detach takes the group from all of them. The identity that runs
+now is among them only if every revert on the way was registered (see
+"What the cut-off cannot see" below). The walk ignores when a succession
+was recorded and when a detach was made, so the answer for a past instant
+also changes after a later revert or detach (the same "at any time"
+reading as the sticky detach itself).
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
@@ -1485,6 +1504,20 @@ for an identity with no recorded parent is judged by its copy chain alone
 (a copy held by a detached identity on that chain is still a dead hop).
 Copies written before migration 195 keep the chain they were written with;
 a detach reaches them through the lineage walk whatever chain they name.
+
+WHAT THE CUT-OFF CANNOT SEE. The database learns of a revert only from the
+registration. A host that, on a revert, reuses an identity it registered
+earlier without calling the registration again records no succession: the
+identity the job goes back to keeps the parents it was registered from
+before, and, when they are clean, keeps the group through its old copy,
+read and write, even though the identity the job reverted FROM is
+detached. Nor is the identity that runs then recorded as the parent of the
+job's next one. So for the cut-off to reach a revert, the host must
+register it (the earlier identity's key again, naming the identity it
+reverts from as its parent; a repeat is a no-op). Whatever the host
+records, detaching the identity you attached BY NAME at the top of the
+job's copy chain takes the group from every identity whose copy chains
+from it, the reverted one included.
 
 #### Recipe: a role-private group for a scheduled job
 

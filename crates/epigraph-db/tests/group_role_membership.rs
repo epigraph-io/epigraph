@@ -3190,8 +3190,8 @@ async fn detaching_the_attached_identity_revokes_its_same_folder_successor(pool:
 
 /// A REVERT TO A DETACHED IDENTITY REGAINS NOTHING. Attach A; a prompt change
 /// makes B (same folder), which 166 copies A's attachment to; the operator
-/// detaches A; the job reverts, so the host registers A AGAIN with B as its
-/// parent. A must be admitted nowhere (its own attachment is detached, and
+/// detaches A; the job reverts, and the revert is registered: A AGAIN, with B
+/// as its parent. A must be admitted nowhere (its own attachment is detached, and
 /// whatever a revert copies back onto it runs through that detached row), its
 /// armed forged write is refused, and B, whose copy came from the detached A,
 /// is out as well.
@@ -3339,7 +3339,7 @@ async fn may_run(pool: &PgPool, agent: Uuid) -> bool {
 /// A; B and C succeed it (copies); the operator detaches A (all three are
 /// out); the operator restores the running C as documented (detach C's stale
 /// copy, attach C by name). Later the job reverts to A's prompt and model, and
-/// the host names C as A's parent. C's new row is a root and the pair "C
+/// the revert is registered with C named as A's parent. C's new row is a root and the pair "C
 /// succeeded A" is not on record, so the registration copies it onto A. That
 /// copy restricts A (166) but admits A nowhere: A is the identity the
 /// operator detached. CONTROL: C, attached by name, stays a member.
@@ -3539,8 +3539,8 @@ async fn a_successor_copied_through_a_detached_identitys_copy_regains_nothing(po
 
 /// A REVERT ALWAYS RESTRICTS. A precedes B and was never attached; the
 /// operator attaches B by name (the documented recovery shape) while the role
-/// has no holder, so B is refused ROL01. The job reverts to A (the host names
-/// B as A's parent). The registration copies B's row onto A, so A is held by
+/// has no holder, so B is refused ROL01. The job reverts to A (registered with
+/// B named as A's parent). The registration copies B's row onto A, so A is held by
 /// the role exactly as B is: refused ROL01, may not run. Once the role is
 /// held, A, an identity the operator never detached, is a member like B.
 #[sqlx::test(migrations = "../../migrations")]
@@ -4064,8 +4064,10 @@ async fn hand_copy_of(pool: &PgPool, agent: Uuid, source: Uuid) -> Uuid {
 /// THE JOB REVERTS FROM THE DETACHED RUNNING IDENTITY TO AN EARLIER ONE. Q is
 /// attached by name; P succeeds Q and A succeeds P (copies); the operator
 /// detaches A, the identity that runs. The job then reverts its last prompt
-/// edit: the host registers P's key again, naming A as its parent. P still
-/// holds the live copy it inherited from Q before the detach and was never
+/// edit, and the revert is registered: P's key again, naming A as its parent
+/// (the registration a host must make for the cut-off to see a revert; one
+/// that reuses P's earlier registration records no edge, and P keeps the
+/// group). P still holds the live copy it inherited from Q before the detach and was never
 /// detached itself, but it now descends from the detached A, so it is out,
 /// read and write, armed forged write refused; its copy still restricts.
 /// CONTROL: Q, attached by name, stays a member. The operator gives the group

@@ -2409,13 +2409,25 @@ restart.
   and holds no live DIRECT row for the role at the instant asked. So a
   detach cuts off every identity registered below the detached one, in
   either direction of a revert and however many registrations later, up
-  to the first identity on the way that the operator attached by name; the
-  answer depends on the final lineage only, not on the order it was built
-  in or on which parent a copy chains through. That includes the identity
-  that runs now when the operator detaches an OLD identity it descends from
-  (a revert records a succession too), and the walk ignores when a
-  succession or a detach was recorded, so an answer for a past instant can
-  change after a later revert or detach. A DIRECT attachment counts
+  to the first identity on the way that the operator attached by name. Up
+  to that identity the answer does not depend on the order the lineage was
+  built in or on which parent a copy chains through; below it (for example
+  a successor of a detached identity that was then attached by name again,
+  the documented restore) the identity's own copy chain decides: out when
+  it runs through the old, detached copy (registered before the detach),
+  in when it names the row made by name (registered after the restore) or
+  chains through a clean parent. The walk sees only recorded successions:
+  a revert counts only when it is registered (the earlier identity's key
+  again, naming the one it reverts from as parent); a job that goes back
+  to an identity without that registration records no edge, and that
+  identity keeps the group through a clean old copy. Detaching the
+  identity attached by name at the top of the job's chain is the lever
+  that holds whatever was recorded. A detach also reaches the
+  identity that runs now when the operator detaches an OLD identity it
+  descends from (a registered revert records a succession too), and the
+  walk ignores when a succession or a detach was recorded, so an answer
+  for a past instant can change after a later revert or detach. A DIRECT
+  attachment counts
   as before wherever it sits (so attaching an identity by name re-admits
   it, a revert to an identity attached by name keeps the group through
   that row, and the documented restore still restores the running

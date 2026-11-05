@@ -48,12 +48,13 @@
 --     copy's chain names only the rows it was copied through, not the
 --     identities the agent was registered from. So detaching the running
 --     identity A did not cut off the job: when it reverted a prompt edit
---     (the host registers the earlier identity P again, naming A as its
---     parent), P, never detached and still holding the live copy it
---     inherited before the detach, kept the group, read and write; and a
---     successor registered from two parents, one of them detached, was
---     admitted or not by which parent its copy happened to name, so the same
---     final lineage answered differently by the order it was built in.
+--     and the revert was registered (the earlier identity P's key again,
+--     naming A as its parent), P, never detached and still holding the
+--     live copy it inherited before the detach, kept the group, read and
+--     write; and a successor registered from two parents, one of them
+--     detached, was admitted or not by which parent its copy happened to
+--     name, so the same final lineage answered differently by the order it
+--     was built in.
 --   * The reverse-pair guard withheld the copy from an identity that was
 --     NEVER detached, and an attachment is also 166's RESTRICTION (`ROL01`,
 --     may-run). So after the operator attached B by name, a revert to A
@@ -75,9 +76,24 @@
 -- Equivalently: walk up `agent_succession` from the agent asked about and
 -- from the agent of every copy on its chain, through parents that hold no
 -- live row made by name; the copy counts only if no agent judged or reached
--- holds a detached row for the role. The answer is a function of the final
--- lineage, whatever order its registrations, attaches and detaches came in,
--- and whichever parent a copy happens to chain through.
+-- holds a detached row for the role. Up to the first identity on the way
+-- that holds a live row made by name, the answer does not depend on the
+-- order the registrations, attaches and detaches came in, nor on which
+-- parent a copy happens to chain through. That identity ends the walk, so an
+-- identity below it is judged by its own copy chain: out when the chain runs
+-- through a detached row, in when it names the row made by name or chains
+-- through a clean parent. The documented restore (a detached identity
+-- attached by name again) is the usual case: its successor registered before
+-- the detach holds a copy of its old, now detached copy and stays out; one
+-- registered after the restore is in, with the same succession edges,
+-- detached rows and rows made by name.
+-- The walk reads only the successions the registration recorded: a revert
+-- counts only when it is registered (the earlier identity's key again, naming
+-- the identity it reverts from as parent). A job that goes back to an
+-- identity without that registration records no edge, so that identity is
+-- judged by the parents it was registered from before, and keeps its old
+-- copy when they are clean. Detaching the identity attached by name at the
+-- top of the job's chain cuts the job off whatever was recorded.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
 -- as a chain's root, even when its agent also holds a detached row, and an
@@ -86,8 +102,9 @@
 --     it by name;
 --   * a detach of the identity a job runs cuts off the job: its later
 --     identities (prompt edits) and an earlier identity it reverts to (one
---     that still holds a live copy) are out, however many registrations
---     later, until the operator attaches the identity that runs by name;
+--     that still holds a live copy; the revert registered, as above) are
+--     out, however many registrations later, until the operator attaches
+--     the identity that runs by name;
 --   * but an identity the operator attached by name keeps the group through
 --     that row, also when the job reverts to it: to cut such a job off,
 --     detach that identity too;
