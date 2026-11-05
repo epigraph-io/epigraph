@@ -473,12 +473,16 @@ impl Api<'_> {
 }
 
 /// A theme-pinned answer must say it ran in that theme.
+/// The [`UpstreamError::Decode`] message for a 200 that ignored `theme_id`:
+/// the API predates the theme filter on semantic search.
+pub const THEME_ID_IGNORED: &str = "upstream ignored theme_id";
+
 pub fn check_theme_scope(
     theme_id: Option<Uuid>,
     resp: SemanticSearchResponse,
 ) -> Result<SemanticSearchResponse, UpstreamError> {
     match (theme_id, &resp.theme_scope) {
-        (Some(_), None) => Err(UpstreamError::Decode("upstream ignored theme_id".into())),
+        (Some(_), None) => Err(UpstreamError::Decode(THEME_ID_IGNORED.into())),
         (Some(t), Some(s)) if s.theme_id != t => Err(UpstreamError::Decode(
             "upstream answered for another theme".into(),
         )),
