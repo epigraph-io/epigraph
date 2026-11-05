@@ -1029,8 +1029,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // no SQL: the query embedding.
     ("rag.rs", "rag_context", &["generate_query_embedding"]),
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
-    // no SQL (embeddings), untenanted (claim_themes, the centroid-dimension
-    // probe), and the content read registered in viewer_route_table_lint.rs's
+    // no SQL (embeddings, including `generate_walk_query_embedding`, the
+    // pageable request's variant that answers 503 instead of the mock when the
+    // service fails), untenanted (claim_themes, the centroid-dimension probe),
+    // and the content read registered in viewer_route_table_lint.rs's
     // UNCOMPENSATED_INLINE_READS (ids from a viewer-spliced theme read).
     (
         "search.rs",
@@ -1040,6 +1042,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "generate_query_embedding",
             "generate_query_embedding",
             "generate_query_embedding_with_dim",
+            "generate_walk_query_embedding",
             "sqlx::query(SELECT).fetch_all",
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
