@@ -228,6 +228,71 @@ pub struct ClaimResponse {
     /// the create handler; omitted from non-create responses (GET/PATCH/list).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_created: bool,
+    /// Who filed the claim, as the caller may see it. Present on
+    /// `GET /api/v1/claims/:id` only; omitted from every other claim response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_by: Option<AuthoredByView>,
+}
+
+/// A claim's `authored_by` block (`epigraph_db::authored_by`): the agent that
+/// filed it, the human it acts for, and the prompt snapshot it was running.
+/// A part the caller may not see is `null`, exactly as a part that does not
+/// exist (an agent bound to no human, no snapshot recorded).
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct AuthoredByView {
+    /// The agent that filed the claim (`agent_id`), for every reader.
+    pub agent: AuthorRefView,
+    /// The human the agent acts for (migration 149's `epigraph_human_of`, any
+    /// link state). Shown only to that human and to a caller who can read the
+    /// agent's `OPERATED_BY` edge to that human; otherwise `null`.
+    pub human: Option<AuthorRefView>,
+    /// The prompt snapshot the agent was running at the claim's `created_at`.
+    /// Shown to the audience `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names
+    /// (default: the agent's linked human and admins, the prompt-history
+    /// gate); otherwise `null`.
+    pub prompt_snapshot: Option<PromptSnapshotView>,
+}
+
+/// One agent: the two fields `GET /api/v1/agents/:id` names.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct AuthorRefView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+}
+
+/// The prompt snapshot (design D4) an agent was running at an instant. No
+/// prompt text: that stays behind `GET /api/v1/agents/:id/prompt-history`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PromptSnapshotView {
+    /// The snapshot, as `GET /api/v1/agents/:id/prompt-history` lists it.
+    pub snapshot_id: Uuid,
+    pub model: String,
+    /// The identity prompt hash (64 hex digits); the same for every snapshot
+    /// of one agent.
+    pub prompt_hash: String,
+    /// The snapshot's latest recorded start at or before the claim's
+    /// `created_at`.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthoredBy> for AuthoredByView {
+    fn from(b: epigraph_db::AuthoredBy) -> Self {
+        let author = |a: epigraph_db::AuthorRef| AuthorRefView {
+            id: a.id,
+            display_name: a.display_name,
+        };
+        Self {
+            agent: author(b.agent),
+            human: b.human.map(author),
+            prompt_snapshot: b.prompt_snapshot.map(|p| PromptSnapshotView {
+                snapshot_id: p.snapshot_id,
+                model: p.model,
+                prompt_hash: p.prompt_hash,
+                started_at: p.started_at,
+            }),
+        }
+    }
 }
 
 impl From<Claim> for ClaimResponse {
@@ -246,6 +311,7 @@ impl From<Claim> for ClaimResponse {
             group_id: None,
             labels: Vec::new(),
             was_created: false,
+            authored_by: None,
         }
     }
 }
@@ -1147,6 +1213,7 @@ pub async fn create_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
     };
 
     Ok(Json(response))
@@ -1300,10 +1367,24 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
+    // Who filed it, on the same stamped connection: the human through a
+    // binding this caller can read, the prompt snapshot through the audience
+    // `PROMPT_SNAPSHOT_AUDIENCE` names (default: the prompt-history gate).
+    // Only reached for a claim the caller has just read.
+    let authored_by = epigraph_db::AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim.agent_id.as_uuid(),
+        claim.created_at,
+        epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,
+    )
+    .await?;
+
     drop(read);
 
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
+    response.authored_by = Some(authored_by.into());
 
     if let Some(enc) = encryption {
         response.privacy_tier = Some(enc.privacy_tier);
@@ -1349,6 +1430,7 @@ pub async fn get_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        authored_by: None,
     };
 
     Ok(Json(response))

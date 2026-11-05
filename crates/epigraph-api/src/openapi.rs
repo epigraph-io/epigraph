@@ -17,7 +17,8 @@ use crate::routes::admin::{
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
-    ClaimResponse, PatchClaimRequest, UpdateLabelsRequest, UpdateLabelsResponse,
+    AuthorRefView, AuthoredByView, ClaimResponse, PatchClaimRequest, PromptSnapshotView,
+    UpdateLabelsRequest, UpdateLabelsResponse,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -92,6 +93,7 @@ use workflow_schema_stubs::{
         supersede_claim_doc,
         mark_duplicate_doc,
         unmark_duplicate_doc,
+        get_claim_doc,
         patch_claim_doc,
         update_labels_doc,
         evolve_step_doc,
@@ -133,6 +135,9 @@ use workflow_schema_stubs::{
             UndedupResponse,
             PatchClaimRequest,
             ClaimResponse,
+            AuthoredByView,
+            AuthorRefView,
+            PromptSnapshotView,
             UpdateLabelsRequest,
             UpdateLabelsResponse,
             EvolveStepRequest,
@@ -393,6 +398,29 @@ async fn mark_duplicate_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn unmark_duplicate_doc() {}
+
+/// Read one claim (doc stub)
+///
+/// A claim the caller may not read is 404, exactly as an id with no claim.
+/// The response carries `authored_by`: `agent` for every reader; `human`
+/// only to that human and to a caller who can read the agent's
+/// `OPERATED_BY` edge to it; `prompt_snapshot` only to the audience
+/// `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names (default: the agent's linked
+/// human and admins, the prompt-history gate). A part the caller may not see
+/// is `null`, exactly as a part that does not exist.
+#[utoipa::path(
+    get,
+    path = "/api/v1/claims/{id}",
+    tag = "claims",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the claim")),
+    responses(
+        (status = 200, body = ClaimResponse),
+        (status = 401),
+        (status = 403),
+        (status = 404),
+    )
+)]
+async fn get_claim_doc() {}
 
 /// Partial update of a claim (doc stub)
 #[utoipa::path(
