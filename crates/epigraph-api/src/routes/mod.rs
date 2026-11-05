@@ -772,6 +772,9 @@ pub fn create_router_with_extensions(
         .route("/claims/:id", get(claims::get_claim))
         .route("/agents", get(agents::list_agents))
         .route("/api/v1/agents", get(agents::list_agents))
+        // Name search (find_agent): registered before `/api/v1/agents/:id`
+        // for readability; axum's router prefers the static segment anyway.
+        .route("/api/v1/agents/search", get(agents::search_agents))
         .route("/agents/:id", get(agents::get_agent))
         .route("/api/v1/agents/:id", get(agents::get_agent))
         .route("/agents/:id/reputation", get(agents::get_agent_reputation))
