@@ -781,7 +781,7 @@ async fn apply_mints_exactly_the_planned_slots_bp_only_and_once(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn apply_refuses_a_drifted_plan_an_existing_record_and_a_held_lock(pool: PgPool) {
     let logins = Logins::new(&pool).await;
-    let _w = world(&pool).await;
+    let w = world(&pool).await;
     let dir = Dir::new();
     let (r, plan_file) = dry_run(&dir, &logins, "plan.json");
     r.ok();
@@ -827,6 +827,58 @@ async fn apply_refuses_a_drifted_plan_an_existing_record_and_a_held_lock(pool: P
         .expect("release");
     drop(holder);
     assert_eq!(factor_rows(&pool).await, before);
+
+    // A drift that keeps every count: the pair's second edge is withdrawn and
+    // a third factorless edge joins the same slot. Same edges, slots and held
+    // counts, a different set: refused, and the message tells the plans apart.
+    let plan = read_plan(&plan_file);
+    sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
+        .bind(w.pair.1)
+        .execute(&pool)
+        .await
+        .expect("withdraw");
+    let (a, b) = w.pair_ends;
+    let third = factorless(&pool, a, b, "corroborates").await;
+    let (edges_now, slots_now) = measure(&pool).await;
+    assert_eq!(
+        (
+            edges_now.len(),
+            slots_now.len(),
+            edges_now.iter().filter(|e| e.slot_held).count()
+        ),
+        (plan.edges, plan.slots_minted, plan.edges_on_held_slots),
+        "PREMISE: the drift keeps every count"
+    );
+    assert!(edges_now.iter().any(|e| e.edge_id == third), "PREMISE");
+    let before = factor_rows(&pool).await;
+    let record = dir.path("same-counts.jsonl");
+    let r = run(
+        &dir.0,
+        &["--apply", "--plan", &plan_file, "--record", &record],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    );
+    assert_eq!(
+        r.code,
+        Some(1),
+        "a same-counts drift was applied: {}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.contains("no longer equals the plan"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains(&format!("sha256 {}", plan.sha256())),
+        "the refusal names the reviewed plan's sha256: {}",
+        r.stderr
+    );
+    assert!(
+        !Path::new(&record).exists(),
+        "a refused apply left a record"
+    );
+    assert_eq!(factor_rows(&pool).await, before, "a refused apply wrote");
 
     // The live set gained a factorless edge since the plan: refused.
     let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "r131-drift").await;
