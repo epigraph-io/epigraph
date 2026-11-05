@@ -4029,9 +4029,13 @@ async fn a_successor_of_a_detached_and_a_clean_parent_runs_through_the_detached_
 // operator detaches stays out when it MOVES ON (a later prompt edit) or
 // REVERTS (to an earlier identity that still holds a live copy), however
 // many registrations later, until the operator attaches the identity that
-// runs by name. The answer is a function of the final lineage (succession
-// edges, detached rows, rows made by name), not of the order it was built
-// in, and not of which parent a successor's copy happens to chain through.
+// runs by name. Up to the first identity on the way that holds a live row
+// made by name, the answer does not depend on the order the lineage was
+// built in, nor on which parent a successor's copy happens to chain through.
+// That row ends the walk, so below it the copy chain decides: a successor of
+// a restored identity (detached, then attached by name again) is out when its
+// copy runs through the old, detached copy and in when it names the row made
+// by name (`below_an_identity_attached_by_name_the_copy_chain_decides`).
 // A row made by name keeps counting: a revert to the identity the operator
 // attached by name keeps the group through that row.
 // =====================================================================
@@ -4376,6 +4380,175 @@ async fn a_successor_of_a_detached_and_a_clean_parent_is_out_when_it_registered_
         resolves(&pool, clean, group).await,
         (true, true),
         "CONTROL: the clean parent"
+    );
+}
+
+/// `agent`'s copies of ROLE live at `now()` (un-detached, inside their
+/// window): the row each one names.
+async fn copy_sources_now(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT inherited_from FROM role_agents \
+          WHERE agent_id = $1 AND role = $2 AND detached_at IS NULL \
+            AND inherited_from IS NOT NULL AND valid_from <= now() \
+            AND (valid_to IS NULL OR now() < valid_to)",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("live copies")
+}
+
+/// Every ROLE row of `agent`, for an assertion message.
+async fn role_rows_text(pool: &PgPool, agent: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT id::text || ' from ' || COALESCE(inherited_from::text, 'by name') \
+                || ' [' || valid_from::text || ', ' || COALESCE(valid_to::text, 'open') || ')' \
+                || CASE WHEN detached_at IS NULL THEN '' ELSE ' DETACHED' END \
+           FROM role_agents WHERE agent_id = $1 AND role = $2 ORDER BY valid_from, id",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("role rows")
+}
+
+/// The facts the cut-off's walk reads for `agents`, each id replaced by its
+/// label and each list sorted: (succession edges among them as
+/// "parent->child", agents holding a detached ROLE row, agents holding a ROLE
+/// row made by name live at `now()`).
+async fn walk_facts(pool: &PgPool, agents: &[(Uuid, &str)]) -> [Vec<String>; 3] {
+    let ids: Vec<Uuid> = agents.iter().map(|(id, _)| *id).collect();
+    let label = |id: Uuid| -> String {
+        agents
+            .iter()
+            .find(|(a, _)| *a == id)
+            .map_or_else(|| id.to_string(), |(_, l)| (*l).to_string())
+    };
+    let edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT parent_agent_id, child_agent_id FROM agent_succession \
+          WHERE parent_agent_id = ANY($1) AND child_agent_id = ANY($1)",
+    )
+    .bind(ids.as_slice())
+    .fetch_all(pool)
+    .await
+    .expect("succession edges");
+    let detached: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT agent_id FROM role_agents \
+          WHERE agent_id = ANY($1) AND role = $2 AND detached_at IS NOT NULL",
+    )
+    .bind(ids.as_slice())
+    .bind(ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("detached rows");
+    let by_name: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT agent_id FROM role_agents \
+          WHERE agent_id = ANY($1) AND role = $2 AND detached_at IS NULL \
+            AND inherited_from IS NULL AND valid_from <= now() \
+            AND (valid_to IS NULL OR now() < valid_to)",
+    )
+    .bind(ids.as_slice())
+    .bind(ROLE)
+    .fetch_all(pool)
+    .await
+    .expect("rows made by name");
+    let mut e: Vec<String> = edges
+        .into_iter()
+        .map(|(p, c)| format!("{}->{}", label(p), label(c)))
+        .collect();
+    let mut d: Vec<String> = detached.into_iter().map(label).collect();
+    let mut n: Vec<String> = by_name.into_iter().map(label).collect();
+    e.sort();
+    d.sort();
+    n.sort();
+    [e, d, n]
+}
+
+/// BELOW AN IDENTITY ATTACHED BY NAME, THE COPY CHAIN DECIDES (a
+/// characterization of 195's limit, not a regression test). Q is attached by
+/// name; A succeeds Q (a copy); the operator detaches A and restores it as
+/// documented (attaches A by name again). The job's next identity N succeeds
+/// A: in the FIRST build N is registered BEFORE the detach, in the SECOND
+/// after the restore. Both end with the same succession edges (Q->A, A->N),
+/// detached rows (A's) and rows made by name (Q's, A's). A's row made by name
+/// ends the walk up N's lineage, so N is judged by its own copy chain: in the
+/// first build N's copy that covers now names A's old copy, detached (a dead
+/// hop), and N is out; in the second it names A's row made by name and N is
+/// in. The answer below a row made by name is a function of which row the
+/// copy names, not of the lineage alone. CONTROL: A, restored, is a member in
+/// both builds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn below_an_identity_attached_by_name_the_copy_chain_decides(pool: PgPool) {
+    let (h, _) = human(&pool, "cut-off-restored-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Cut Off Restored Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let mut facts = Vec::new();
+    for n_before_detach in [true, false] {
+        let q = register_in(&pool, &identity_key(), None, "g-job").await;
+        link_to(&pool, q, h).await;
+        attach_to_role(&pool, ROLE, q).await;
+        let a = register_in(&pool, &identity_key(), Some(q), "g-job").await;
+        let early = if n_before_detach {
+            Some(register_in(&pool, &identity_key(), Some(a), "g-job").await)
+        } else {
+            None
+        };
+        assert_eq!(
+            detach_from_role(&pool, ROLE, a).await,
+            1,
+            "A's copy detached"
+        );
+        attach_to_role(&pool, ROLE, a).await;
+        let a_row = live_attachment(&pool, a).await;
+        let n = match early {
+            Some(n) => n,
+            None => register_in(&pool, &identity_key(), Some(a), "g-job").await,
+        };
+        assert_eq!(
+            resolves(&pool, a, group).await,
+            (true, true),
+            "CONTROL: A, attached by name again (N before the detach: {n_before_detach})"
+        );
+        let sources = copy_sources_now(&pool, n).await;
+        let rows = role_rows_text(&pool, n).await;
+        if n_before_detach {
+            assert!(
+                !sources.contains(&a_row),
+                "PREMISE: no copy of N live now names A's row made by name ({a_row}); N's rows: {rows:?}"
+            );
+            assert_eq!(
+                resolves(&pool, n, group).await,
+                (false, false),
+                "N, registered before the detach, its copy through A's old copy"
+            );
+            assert_eq!(derived_rows(&pool, n).await, 0, "N derives nothing");
+        } else {
+            assert!(
+                sources.contains(&a_row),
+                "PREMISE: N's copy live now names A's row made by name ({a_row}); N's rows: {rows:?}"
+            );
+            assert_eq!(
+                resolves(&pool, n, group).await,
+                (true, true),
+                "N, registered after the restore, its copy through A's row made by name"
+            );
+        }
+        facts.push(walk_facts(&pool, &[(q, "Q"), (a, "A"), (n, "N")]).await);
+    }
+    assert_eq!(
+        facts[0],
+        [
+            vec!["A->N".to_string(), "Q->A".to_string()],
+            vec!["A".to_string()],
+            vec!["A".to_string(), "Q".to_string()],
+        ],
+        "PREMISE: the first build's walk facts"
+    );
+    assert_eq!(
+        facts[0], facts[1],
+        "the two builds end with the same edges, detached rows and rows made by name"
     );
 }
 
