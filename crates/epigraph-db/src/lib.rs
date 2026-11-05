@@ -86,6 +86,10 @@ pub use refusal_codes::{
 };
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
+pub use repos::{
+    agent_lookup, AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef,
+    AgentSearchHit, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+};
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,

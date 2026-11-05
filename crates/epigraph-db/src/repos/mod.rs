@@ -11,6 +11,7 @@ pub mod admin_scope_enforcement;
 pub mod agent;
 pub mod agent_identity;
 pub mod agent_key;
+pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
 pub mod atom_axiom;
@@ -105,6 +106,10 @@ pub use agent_identity::{
     PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
+pub use agent_lookup::{
+    AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
+    CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
