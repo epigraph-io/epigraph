@@ -44,6 +44,8 @@ pub mod batch;
 pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
+#[cfg(feature = "db")]
+pub mod claim_context;
 pub mod claims;
 pub mod claims_query;
 pub mod clusters;
@@ -901,6 +903,10 @@ pub fn create_router_with_extensions(
             get(provenance_chain::claim_provenance_chain),
         )
         .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/context",
+            get(claim_context::claim_context),
+        )
         .route(
             "/api/v1/claims/:id/placement",
             get(placement::claim_placement),
