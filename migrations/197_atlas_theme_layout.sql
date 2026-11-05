@@ -99,12 +99,29 @@ CREATE INDEX atlas_layout_theme_links_b_idx
 -- is repointed (viewer_fixture.rs, seed_edge_owned_by), which a column list
 -- would miss. The WHEN is evaluated without calling the function, so ordinary
 -- updates (truth_value recomputes, is_current flips) queue nothing.
+--
+-- Once per transaction, not once per row. A bulk narrowing that updated the
+-- singleton for every row would stack one row version per narrowed row inside
+-- its own open transaction, and each later bump walks them all: the cost
+-- grows with the square of the row count. The epoch only has to differ from
+-- the build's snapshot, so one bump per transaction is enough. The guard is a
+-- transaction-local setting holding this transaction's id: it ends with the
+-- transaction, and a ROLLBACK TO SAVEPOINT reverts it together with the bump
+-- it guarded, so a later narrowing in the same transaction bumps again. A
+-- session-level value cannot suppress the bump, because it would have to
+-- predict the id of a transaction that has not started yet.
 CREATE OR REPLACE FUNCTION public.epigraph_atlas_layout_narrowed()
 RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    xact text := pg_catalog.txid_current()::text;
 BEGIN
-    UPDATE public.atlas_layout_epoch SET n = n + 1 WHERE singleton;
+    IF pg_catalog.current_setting('epigraph.atlas_layout_bumped_xact', true)
+           IS DISTINCT FROM xact THEN
+        UPDATE public.atlas_layout_epoch SET n = n + 1 WHERE singleton;
+        PERFORM pg_catalog.set_config('epigraph.atlas_layout_bumped_xact', xact, true);
+    END IF;
     RETURN NULL;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_atlas_layout_narrowed() FROM PUBLIC;

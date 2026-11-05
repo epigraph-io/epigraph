@@ -2386,8 +2386,10 @@ restart.
   triggers `claims_atlas_layout_narrowed` and `edges_atlas_layout_narrowed`
   (AFTER UPDATE, no column list, `WHEN OLD.visibility = 'public' AND
   NEW.visibility IS DISTINCT FROM 'public'`): any narrowing of a public row,
-  whatever the write path, bumps the epoch in its own transaction, and a run
-  is served only while its recorded epoch equals the current one. The
+  whatever the write path, bumps the epoch in its own transaction (once per
+  transaction, through a transaction-local guard, so a bulk narrowing does not
+  stack one epoch row version per row), and a run is served only while its
+  recorded epoch equals the current one. The
   application role keeps SELECT only on all five tables; the maintenance role
   gets SELECT, INSERT, DELETE on the four layout tables and SELECT, UPDATE on
   the epoch. Sets `lock_timeout = '3s'`. Pinned by

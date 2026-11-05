@@ -43,10 +43,12 @@
 //! effectively newest-first.
 //!
 //! A 404 is the same for an id that names nothing and for one whose members
-//! the caller cannot read; the body echoes only the caller's own id. The
-//! overlap 400 (a theme inside the region it is paired with) is checked only
-//! after both sides passed that check, so it cannot reveal where a hidden
-//! theme sits.
+//! the caller cannot read; the body echoes only the caller's own id. The sides
+//! are decided in a fixed order (`from`, then `to`) and the first failing one
+//! is echoed, whatever the other side is. The `layout_invalidated` 200 and the
+//! overlap 400 (a theme inside the region it is paired with) come only after
+//! both sides passed that check, so neither can reveal that a hidden theme or
+//! region exists, or where a hidden theme sits.
 //!
 //! All SQL lives in `epigraph_db::AtlasLayoutRepository`.
 
@@ -61,8 +63,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use epigraph_db::repos::atlas_layout::{
     theme_sets_overlap, DetailPart, LayoutLinkCursor, LayoutLinkRow, LayoutRunRow, LinkPairCursor,
-    LinkSideKind, ThemePageCursor, UnplacedCursor, VisibleRegionRow, VisibleThemeRow,
-    ATLAS_DEFAULT_RELATIONSHIPS, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX,
+    LinkSideKind, ThemePageCursor, ThemePlacement, UnplacedCursor, VisibleRegionRow,
+    VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX,
     ATLAS_STRUCTURE_RELATIONSHIPS,
 };
 use epigraph_db::AtlasLayoutRepository;
@@ -261,7 +263,9 @@ pub struct ThemeOut {
     pub id: Uuid,
     pub label: String,
     pub region_id: Option<Uuid>,
-    pub placement: &'static str,
+    /// `"shared"` or `"viewer"`; `null` for a theme listed under
+    /// `region_id=unplaced`, which has no position of either kind.
+    pub placement: Option<&'static str>,
     pub x: Option<f64>,
     pub y: Option<f64>,
     pub member_count: i64,
@@ -273,7 +277,10 @@ impl ThemeOut {
             id: t.theme_id,
             label: clip_label(&t.label),
             region_id: t.region_id,
-            placement: t.placement.as_str(),
+            placement: match t.placement {
+                ThemePlacement::Unplaced => None,
+                p => Some(p.as_str()),
+            },
             x: t.x,
             y: t.y,
             member_count: t.member_count,
@@ -639,15 +646,13 @@ pub async fn graph_links(
         .await
         .map_err(|e| scoped_read_failed(e, "graph_links"))?;
 
-    // 3. The run (it resolves region ids).
+    // 3. The run (it resolves region ids). An unknown explicit run is the
+    //    same 404 shape as every other 404 on this route.
     let run = AtlasLayoutRepository::run(&mut *read, q.run_id).await?;
     if run.is_none() {
         if let Some(id) = q.run_id {
             crate::routes::finish_scoped_read(read, "graph_links").await?;
-            return Err(ApiError::NotFound {
-                entity: "Layout run".to_string(),
-                id: id.to_string(),
-            });
+            return Err(side_not_found(id));
         }
     }
 
@@ -655,14 +660,36 @@ pub async fn graph_links(
     let (from_side, to_side) =
         AtlasLayoutRepository::resolve_sides(&mut *read, run.as_ref().map(|r| r.id), from, to)
             .await?;
-    let Some(from_side) = from_side else {
+
+    // 5. Each side, in a fixed order (`from`, then `to`), must name a theme
+    //    or region AND hold a current member the caller can read. Both
+    //    failures are the same 404, and the first failing side is the one
+    //    echoed, so neither the echoed id nor the status says whether a side
+    //    the caller cannot read exists. This runs before the
+    //    `layout_invalidated` answer, which would otherwise be a 200 for a
+    //    hidden theme and a 404 for a random id.
+    let from_ok = match &from_side {
+        Some(s) => {
+            AtlasLayoutRepository::any_visible_member(&mut read, &viewer, &s.theme_ids).await?
+        }
+        None => false,
+    };
+    let Some(from_side) = from_side.filter(|_| from_ok) else {
         crate::routes::finish_scoped_read(read, "graph_links").await?;
         return Err(side_not_found(from));
     };
-    let Some(to_side) = to_side else {
+    let to_ok = match &to_side {
+        Some(s) => {
+            AtlasLayoutRepository::any_visible_member(&mut read, &viewer, &s.theme_ids).await?
+        }
+        None => false,
+    };
+    let Some(to_side) = to_side.filter(|_| to_ok) else {
         crate::routes::finish_scoped_read(read, "graph_links").await?;
         return Err(side_not_found(to));
     };
+
+    // 6. A region side needs a current run.
     let any_region = from_side.kind == LinkSideKind::Region || to_side.kind == LinkSideKind::Region;
     let run_id = if any_region {
         run.as_ref().map(|r| r.id)
@@ -688,18 +715,7 @@ pub async fn graph_links(
         }));
     }
 
-    // 5. Each side must hold a current member the caller can read; the same
-    //    404 as an id that names nothing.
-    if !AtlasLayoutRepository::any_visible_member(&mut read, &viewer, &from_side.theme_ids).await? {
-        crate::routes::finish_scoped_read(read, "graph_links").await?;
-        return Err(side_not_found(from));
-    }
-    if !AtlasLayoutRepository::any_visible_member(&mut read, &viewer, &to_side.theme_ids).await? {
-        crate::routes::finish_scoped_read(read, "graph_links").await?;
-        return Err(side_not_found(to));
-    }
-
-    // 6. Only now: a theme inside the region it is paired with.
+    // 7. Only now: a theme inside the region it is paired with.
     if theme_sets_overlap(&from_side.theme_ids, &to_side.theme_ids) {
         crate::routes::finish_scoped_read(read, "graph_links").await?;
         return Err(bad_request(
@@ -708,7 +724,7 @@ pub async fn graph_links(
         ));
     }
 
-    // 7. The page and its counts, inside the viewer predicate.
+    // 8. The page and its counts, inside the viewer predicate.
     let page = AtlasLayoutRepository::links_between(
         &mut read,
         &viewer,
@@ -768,6 +784,26 @@ pub async fn graph_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn theme_row(placement: ThemePlacement) -> VisibleThemeRow {
+        VisibleThemeRow {
+            theme_id: Uuid::nil(),
+            label: "t".into(),
+            region_id: None,
+            placement,
+            x: None,
+            y: None,
+            member_count: 1,
+        }
+    }
+
+    #[test]
+    fn an_unplaced_theme_serialises_placement_as_null() {
+        let v = |p| serde_json::to_value(ThemeOut::of(&theme_row(p))).unwrap()["placement"].clone();
+        assert_eq!(v(ThemePlacement::Shared), serde_json::json!("shared"));
+        assert_eq!(v(ThemePlacement::Viewer), serde_json::json!("viewer"));
+        assert_eq!(v(ThemePlacement::Unplaced), serde_json::Value::Null);
+    }
 
     #[test]
     fn the_default_set_is_epistemic_plus_cites_and_structure_is_opt_in() {

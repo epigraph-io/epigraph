@@ -488,6 +488,95 @@ async fn narrowing_a_public_claim_invalidates_the_run(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn a_bulk_narrowing_bumps_the_epoch_once_per_transaction(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "atlas-bulk").await;
+    let t1 = seed_theme(&pool, "T1").await;
+    let mut ps = Vec::new();
+    for _ in 0..8 {
+        ps.push(claim_in(&pool, agent, None, t1, None).await);
+    }
+    let narrow_sql =
+        "UPDATE claims SET visibility = 'group', owner_group_id = $2 WHERE id = ANY($1)";
+
+    // One statement narrowing three rows: one bump, not three.
+    let before = epoch(&pool).await;
+    sqlx::query(narrow_sql)
+        .bind(&ps[0..3])
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("bulk narrow");
+    assert_eq!(epoch(&pool).await, before + 1, "one bump for one statement");
+
+    // Two statements in one transaction: still one bump.
+    let before = epoch(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    for p in [ps[3], ps[4]] {
+        sqlx::query(narrow_sql)
+            .bind(vec![p])
+            .bind(group)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert_eq!(
+        epoch(&pool).await,
+        before + 1,
+        "one bump for one transaction"
+    );
+
+    // A bump rolled back to a savepoint takes its guard with it, so the next
+    // narrowing in the same transaction bumps again.
+    let before = epoch(&pool).await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SAVEPOINT s").execute(&mut *tx).await.unwrap();
+    sqlx::query(narrow_sql)
+        .bind(vec![ps[5]])
+        .bind(group)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("ROLLBACK TO SAVEPOINT s")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query(narrow_sql)
+        .bind(vec![ps[6]])
+        .bind(group)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        epoch(&pool).await,
+        before + 1,
+        "the narrowing after the rollback still bumps"
+    );
+
+    // The guard does not outlive its transaction, and a session-level value
+    // cannot suppress a later bump.
+    let before = epoch(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET epigraph.atlas_layout_bumped_xact = '1'")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(narrow_sql)
+        .bind(vec![ps[7]])
+        .bind(group)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("RESET epigraph.atlas_layout_bumped_xact")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert_eq!(epoch(&pool).await, before + 1, "a fresh transaction bumps");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn narrowing_a_public_edge_invalidates_the_run(pool: PgPool) {
     let (agent, group) = fixture::seed_agent_with_group(&pool, "atlas-narrow-e").await;
     let t1 = seed_theme(&pool, "T1").await;

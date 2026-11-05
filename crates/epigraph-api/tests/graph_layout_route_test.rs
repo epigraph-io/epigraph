@@ -361,15 +361,41 @@ async fn a_narrowed_row_turns_the_layout_off(pool: PgPool) {
             assert_eq!(body["next"]["themes"], Value::Null);
             assert!(body.get("counts").is_none());
         }
-        let (status, body, _) = get(
+    }
+    // O reads a member on both sides, so a region drill-down is the
+    // `layout_invalidated` 200.
+    let (status, body, _) = get(
+        &app,
+        &format!("/api/v1/graph/links?from={}&to={}", w.ra, w.rb),
+        &o,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "layout_invalidated");
+    assert_eq!(body["items"], serde_json::json!([]));
+    // S can no longer read any member of RB (P2 was its only public member)
+    // and never could read T3: each is the same 404 as a random id, not the
+    // invalidated 200, even while the run is off.
+    let random = Uuid::new_v4();
+    let (st_r, _, body_r) = get(
+        &app,
+        &format!("/api/v1/graph/links?from={}&to={random}", w.ra),
+        &s,
+    )
+    .await;
+    assert_eq!(st_r, StatusCode::NOT_FOUND, "{body_r}");
+    for hidden in [w.rb, w.t3] {
+        let (st, _, text) = get(
             &app,
-            &format!("/api/v1/graph/links?from={}&to={}", w.ra, w.rb),
-            t,
+            &format!("/api/v1/graph/links?from={}&to={hidden}", w.ra),
+            &s,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["status"], "layout_invalidated");
-        assert_eq!(body["items"], serde_json::json!([]));
+        assert_eq!(st, StatusCode::NOT_FOUND, "{hidden}: {text}");
+        assert_eq!(
+            text.replace(&hidden.to_string(), "<id>"),
+            body_r.replace(&random.to_string(), "<id>")
+        );
     }
     // Theme-to-theme drill-downs need no run and are served live. O reads
     // both members; S can no longer read any member of T2, which is the
@@ -682,6 +708,86 @@ async fn links_route_hidden_theme_against_its_region_is_the_plain_404(pool: PgPo
     )
     .await;
     assert_eq!(st_o, StatusCode::BAD_REQUEST, "overlap for O: {body_o}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn links_404_echoes_the_first_failing_side_whatever_the_other_is(pool: PgPool) {
+    let w = atlas_world(&pool, false).await;
+    let app = router(&pool).await;
+    let s = token(Uuid::new_v4());
+    let (r1, r2) = (Uuid::new_v4(), Uuid::new_v4());
+    let (st, _, both_random) =
+        get(&app, &format!("/api/v1/graph/links?from={r1}&to={r2}"), &s).await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{both_random}");
+    assert!(both_random.contains(&r1.to_string()), "{both_random}");
+    assert!(!both_random.contains(&r2.to_string()), "{both_random}");
+    let expected = both_random.replace(&r1.to_string(), "<id>");
+
+    // A theme (T3) and a region (RC) that S cannot read behave exactly like
+    // a random id in either position: the 404 names the first failing side.
+    for hidden in [w.t3, w.rc] {
+        let r = Uuid::new_v4();
+        let (st, _, text) = get(
+            &app,
+            &format!("/api/v1/graph/links?from={hidden}&to={r}"),
+            &s,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{hidden} first: {text}");
+        assert!(!text.contains(&r.to_string()), "{hidden} first: {text}");
+        assert_eq!(text.replace(&hidden.to_string(), "<id>"), expected);
+
+        let (st, _, text) = get(
+            &app,
+            &format!("/api/v1/graph/links?from={r}&to={hidden}"),
+            &s,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{hidden} second: {text}");
+        assert!(
+            !text.contains(&hidden.to_string()),
+            "{hidden} second: {text}"
+        );
+        assert_eq!(text.replace(&r.to_string(), "<id>"), expected);
+    }
+
+    // An unknown explicit run_id is the same 404 body as an unknown side.
+    let run = Uuid::new_v4();
+    let (st, _, text) = get(
+        &app,
+        &format!("/api/v1/graph/links?from={}&to={}&run_id={run}", w.t1, w.t2),
+        &s,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(text.replace(&run.to_string(), "<id>"), expected);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn unplaced_themes_carry_a_null_placement(pool: PgPool) {
+    let w = atlas_world(&pool, false).await;
+    // T7: O can read its member, which has no embedding, so no region can be
+    // chosen for it. Inserting a group claim is not a narrowing; the run
+    // stays current.
+    let t7 = seed_theme(&pool, "Unembedded notes").await;
+    claim_in(&pool, w.owner, Some(w.group), t7, "private claim t7", None).await;
+    let app = router(&pool).await;
+    let (st, body, _) = get(
+        &app,
+        "/api/v1/graph/themes/layout?region_id=unplaced",
+        &token(w.owner),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let themes = body["themes"].as_array().expect("themes");
+    let t = themes
+        .iter()
+        .find(|t| t["id"] == t7.to_string())
+        .unwrap_or_else(|| panic!("T7 unplaced for O: {body}"));
+    assert_eq!(t.get("placement"), Some(&Value::Null), "{body}");
+    assert_eq!(t["region_id"], Value::Null);
+    assert_eq!(t["x"], Value::Null);
+    assert_eq!(t["y"], Value::Null);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
