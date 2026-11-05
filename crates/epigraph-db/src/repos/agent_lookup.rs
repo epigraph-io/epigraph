@@ -455,7 +455,8 @@ impl AgentLookupRepository {
             ident_orcid = ident_sql("a.orcid"),
             ident_ror = ident_sql("a.ror_id"),
         );
-        let rows: Vec<(Uuid, Option<String>, DateTime<Utc>, String, f64)> = sqlx::query_as(&sql)
+        type MatchRow = (Uuid, Option<String>, DateTime<Utc>, String, f64);
+        let rows: Vec<MatchRow> = sqlx::query_as(&sql)
             .bind(query)
             .bind(viewer.principal())
             .bind(viewer.group_bind().unwrap_or(&[]))
@@ -696,7 +697,8 @@ impl AgentLookupRepository {
         conn: &mut PgConnection,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<CardRole>>, DbError> {
-        let rows: Vec<(Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+        type RoleRow = (Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>);
+        let rows: Vec<RoleRow> = sqlx::query_as(
             "SELECT agent_id, role, valid_from, valid_to \
                FROM public.epigraph_disclosed_role_assignments($1::uuid[])",
         )
