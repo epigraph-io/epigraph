@@ -72,12 +72,14 @@ impl PromptSnapshotAudience {
     }
 }
 
-/// THE OWNER'S PENDING CALL, IN ONE PLACE. Proposed: show the model and the
-/// prompt hash to every reader of the claim
-/// ([`PromptSnapshotAudience::ClaimReaders`]) while prompt text stays gated.
-/// Until the owner rules, the conservative default: the snapshot is shown
-/// only through the prompt-text gate. Changing this line is the whole change;
-/// the claim routes' tests read it and assert whichever setting is live.
+/// THE OWNER'S CALL, IN ONE PLACE: who sees a claim's prompt snapshot.
+/// Proposed: every reader of the claim
+/// ([`PromptSnapshotAudience::ClaimReaders`]), prompt text staying gated.
+/// The conservative setting, shipped while the call is pending, is
+/// [`PromptSnapshotAudience::OperatorAndAdmins`] (the prompt-text gate).
+/// Changing the value below is the whole change: the REST and MCP claim
+/// tests read it and assert whichever setting is live, and the repo tests
+/// drive both settings explicitly.
 pub const PROMPT_SNAPSHOT_AUDIENCE: PromptSnapshotAudience =
     PromptSnapshotAudience::OperatorAndAdmins;
 

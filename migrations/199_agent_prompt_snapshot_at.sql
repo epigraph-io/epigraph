@@ -44,7 +44,7 @@
 -- exists for the owner's pending call on who may see a claim's model and
 -- prompt hash (proposed: every reader of the claim). The request server
 -- passes it from ONE constant, `epigraph_db::authored_by::
--- PROMPT_SNAPSHOT_AUDIENCE`, which defaults to the gated audience; the
+-- PROMPT_SNAPSHOT_AUDIENCE` (the gated audience when this was written); the
 -- server calls this function only for a claim the caller has already read
 -- under its viewer.
 --

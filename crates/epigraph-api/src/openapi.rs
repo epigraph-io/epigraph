@@ -405,9 +405,9 @@ async fn unmark_duplicate_doc() {}
 /// The response carries `authored_by`: `agent` for every reader; `human`
 /// only to that human and to a caller who can read the agent's
 /// `OPERATED_BY` edge to it; `prompt_snapshot` only to the audience
-/// `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names (default: the agent's linked
-/// human and admins, the prompt-history gate). A part the caller may not see
-/// is `null`, exactly as a part that does not exist.
+/// `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names (the agent's linked human and
+/// admins, the prompt-history gate; or every reader of the claim). A part the
+/// caller may not see is `null`, exactly as a part that does not exist.
 #[utoipa::path(
     get,
     path = "/api/v1/claims/{id}",

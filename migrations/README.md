@@ -2380,7 +2380,7 @@ restart.
   `epigraph_human_of(agent, false)` against the session principal): a
   refused caller gets ZERO rows, never AID06. `p_open = true` skips the gate;
   the request server passes it from the one constant
-  `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` (default gated), and only for a
+  `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` (gated when written), and only for a
   claim the caller already read. Returns no file content. EXECUTE revoked
   from PUBLIC, granted to `epigraph_app` and `epigraph_maintenance`
   (role-guarded); registered at 199 in `tenancy_backfill.rs`

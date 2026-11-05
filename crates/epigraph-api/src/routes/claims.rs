@@ -248,8 +248,9 @@ pub struct AuthoredByView {
     pub human: Option<AuthorRefView>,
     /// The prompt snapshot the agent was running at the claim's `created_at`.
     /// Shown to the audience `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names
-    /// (default: the agent's linked human and admins, the prompt-history
-    /// gate); otherwise `null`.
+    /// (`OperatorAndAdmins`: the agent's linked human and admins, the
+    /// prompt-history gate; `ClaimReaders`: every reader of the claim);
+    /// otherwise `null`.
     pub prompt_snapshot: Option<PromptSnapshotView>,
 }
 
