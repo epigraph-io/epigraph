@@ -69,6 +69,14 @@ fn hnsw_ef_search_for_pool(candidate_pool: i64) -> i64 {
     candidate_pool.clamp(40, 1000)
 }
 
+/// `hnsw.ef_search` for an unpinned [`ClaimRepository::semantic_search_flat`]
+/// page of `limit` rows. It takes no offset ON PURPOSE: every page of a cursor
+/// walk must run the same approximate scan, or `OFFSET` over a different scan
+/// can skip or repeat a row (see that fn's "Paging" section).
+fn flat_ef_search(limit: i64) -> i64 {
+    limit.clamp(40, 1000)
+}
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -377,7 +385,22 @@ pub struct ClaimVersionHit {
     pub superseded_by: Option<Uuid>,
 }
 
+/// What [`ClaimRepository::semantic_search_flat`] ranks by.
+#[derive(Debug, Clone, Copy)]
+pub enum FlatRanking<'q> {
+    /// Cosine distance to this pgvector text literal (the query embedding).
+    Query(&'q str),
+    /// Cosine distance to the pinned theme's core: the mean of its PUBLIC
+    /// embedded members, else the mean of the members this viewer can read.
+    /// Never `claim_themes.centroid`. Valid only with `theme_id = Some(_)`.
+    ThemeCore,
+}
+
 /// Result row for [`ClaimRepository::semantic_search_flat`].
+///
+/// `similarity` is `1 - cosine distance` to whatever the call ranked by: the
+/// query vector under [`FlatRanking::Query`], the theme core under
+/// [`FlatRanking::ThemeCore`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SemanticFlatHit {
     pub claim_id: Uuid,
@@ -2764,12 +2787,15 @@ impl ClaimRepository {
     /// An HNSW index scan yields at most `hnsw.ef_search` rows (pgvector
     /// default 40), and the scope predicates (`claim_type`, the dates,
     /// `agent_id`, the visibility splice, `min_similarity`) are applied AFTER
-    /// it. So the query runs in a short transaction that first sets, `is_local`:
+    /// it. So the unpinned query runs in a short transaction that first sets,
+    /// `is_local`:
     ///
     ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
-    ///    until `LIMIT $7` matching rows are found, in exact distance order.
+    ///    until `LIMIT $7 + $9` matching rows are found, in exact distance
+    ///    order.
     ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
-    ///    covers an unscoped `limit`.
+    ///    covers an unscoped first page. It deliberately does NOT depend on
+    ///    `offset` (see "Paging" below).
     ///
     /// The transaction is ROLLED BACK, not committed: on a caller's own
     /// transaction `begin()` opens a savepoint, and releasing it would carry the
@@ -2780,74 +2806,233 @@ impl ClaimRepository {
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`); prod runs 0.8.2.
     ///
+    /// # Theme pin
+    ///
+    /// `theme_id = Some(t)` confines every hit to `claims.theme_id = t`. The
+    /// predicate sits inside the member set, above every cut (`min_similarity`,
+    /// `LIMIT`, `OFFSET`), the placement the recall theme pin uses, so a theme
+    /// whose members are all far from the query still fills its page.
+    /// Embedded implies current (`chk_deprecated_no_embedding`, migrations 052
+    /// and 144), so `embedding IS NOT NULL` already excludes retired members
+    /// and no `is_current` term is needed.
+    ///
+    /// # Theme core
+    ///
+    /// [`FlatRanking::ThemeCore`] ranks a pinned theme's members by cosine
+    /// distance to its core, computed here in SQL on every call:
+    ///
+    /// ```text
+    /// core = COALESCE(mean embedding of the theme's PUBLIC members,
+    ///                 mean embedding of the members this viewer can read)
+    /// ```
+    ///
+    /// The public mean comes first, so every viewer of a theme with a public
+    /// member ranks against the same reference point, derived from public
+    /// claims only. Its subquery is deliberately public-only and NOT
+    /// viewer-scoped: its predicate is strictly narrower than any viewer's, and
+    /// under migration 077's policies public rows are readable by every role.
+    /// The fallback averages only rows the viewer can read, so it carries
+    /// nothing the viewer cannot see (the reasoning on
+    /// `ClaimThemeRepository::set_centroid_from_claims`). The stored
+    /// `claim_themes.centroid` is never read: it averages every member under
+    /// the `ThemeClustering` bypass, so ranking by it would send a signal
+    /// derived from private embeddings to every viewer. When neither mean
+    /// exists the core is NULL and the call returns no rows. `ThemeCore`
+    /// without a theme is refused with `DbError::InvalidData` before any SQL
+    /// runs.
+    ///
+    /// # Paging
+    ///
+    /// `offset` skips that many rows of the ranking (0 is the first page). The
+    /// order is total, `(distance, id)`, on both statement shapes. Unpinned, a
+    /// tie group that straddles the inner `LIMIT $7 + $9` cut stays arbitrary,
+    /// the same residual the hybrid recall leg records.
+    ///
+    /// Unpinned pages are prefixes of ONE approximate scan only while
+    /// `hnsw.ef_search` stays the same from page to page: an index access
+    /// method never sees the `LIMIT`, so with a fixed `ef_search` the
+    /// iterative scan emits the same stream and a deeper page just reads
+    /// further along it. A different `ef_search` is a different stream, and
+    /// `OFFSET` over a different stream can skip a row or repeat one. So
+    /// `ef_search` is derived from `limit` alone, never from `offset`, and a
+    /// walk with a constant `limit` reads one stream. Residuals: a caller that
+    /// changes `limit` mid-walk, index writes between pages, a planner that
+    /// switches away from the index at a deeper `LIMIT`, and a query
+    /// re-embedded differently on a later page can each still move a row
+    /// across a page boundary.
+    ///
+    /// # Exactness of the pinned path
+    ///
+    /// The pinned statement materializes the theme's visible, embedded members
+    /// with their distances in a `MATERIALIZED` CTE that has no `ORDER BY`, so
+    /// no ordering-operator index path applies inside it (pgvector's HNSW
+    /// access method serves only ordered scans), and the ordering happens over
+    /// that CTE's `(uuid, float8)` rows. The read is exact whatever the planner
+    /// does, needs no `hnsw.*` settings, and does not depend on
+    /// `hnsw.max_scan_tuples`. Its cost is one distance per visible member.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the database query fails, and
+    /// `DbError::InvalidData` for `ThemeCore` without a `theme_id`.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(executor, viewer, embedding))]
+    #[instrument(skip(executor, viewer, ranking))]
     pub async fn semantic_search_flat<'a, A>(
         executor: A,
         viewer: &crate::visibility::Viewer,
-        embedding: &str,
+        ranking: FlatRanking<'_>,
         min_similarity: f64,
         claim_type: Option<&str>,
         created_after: Option<chrono::DateTime<chrono::Utc>>,
         created_before: Option<chrono::DateTime<chrono::Utc>>,
         agent_id: Option<Uuid>,
         limit: i64,
+        theme_id: Option<Uuid>,
+        offset: i64,
     ) -> Result<Vec<SemanticFlatHit>, DbError>
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
-        let sql = viewer.splice(
-            r#"
-            WITH query_vec AS (
-                SELECT $1::vector AS vec
-            )
-            SELECT
-                c.id as claim_id,
-                c.content as statement,
-                1 - (c.embedding <=> q.vec) as similarity,
-                c.truth_value,
-                c.belief,
-                c.plausibility,
-                c.agent_id,
-                c.trace_id,
-                c.labels[1] as claim_type,
-                c.created_at
-            FROM claims c, query_vec q
-            WHERE c.embedding IS NOT NULL
-              AND 1 - (c.embedding <=> q.vec) >= $2
-              AND ($3::text IS NULL OR $3 = ANY(c.labels))
-              AND ($4::timestamptz IS NULL OR c.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR c.created_at <= $5)
-              AND ($6::uuid IS NULL OR c.agent_id = $6)
-              /* {VISIBILITY:c} */
-            ORDER BY c.embedding <=> q.vec
-            LIMIT $7
-            "#,
-            8,
-        );
+        let query_literal: Option<&str> = match (ranking, theme_id) {
+            (FlatRanking::Query(v), _) => Some(v),
+            (FlatRanking::ThemeCore, Some(_)) => None,
+            (FlatRanking::ThemeCore, None) => {
+                return Err(DbError::InvalidData {
+                    reason: "ThemeCore needs a theme_id".to_string(),
+                })
+            }
+        };
+
+        // Two statement templates, chosen here. Neither carries caller text:
+        // every value is a bind, and the only interpolated fragment is one of
+        // two literals below. The pinned one is a `format!` template, so its
+        // own markers are written with doubled braces.
+        let sql = match theme_id {
+            // (U) Unpinned: the HNSW form. The inner ORDER BY / LIMIT is the
+            // shape the index serves; the outer sort only orders that prefix
+            // totally and pages it.
+            None => r#"
+                WITH query_vec AS (SELECT $1::vector AS vec),
+                nearest AS (
+                    SELECT k.id, (k.embedding <=> q.vec) AS dist
+                    FROM claims k, query_vec q
+                    WHERE k.embedding IS NOT NULL
+                      AND 1 - (k.embedding <=> q.vec) >= $2
+                      AND ($3::text IS NULL OR $3 = ANY(k.labels))
+                      AND ($4::timestamptz IS NULL OR k.created_at >= $4)
+                      AND ($5::timestamptz IS NULL OR k.created_at <= $5)
+                      AND ($6::uuid IS NULL OR k.agent_id = $6)
+                      AND $8::uuid IS NULL
+                      /* {VISIBILITY:k} */
+                    ORDER BY k.embedding <=> q.vec
+                    LIMIT $7 + $9
+                )
+                SELECT
+                    c.id AS claim_id,
+                    c.content AS statement,
+                    (1 - n.dist)::float8 AS similarity,
+                    c.truth_value,
+                    c.belief,
+                    c.plausibility,
+                    c.agent_id,
+                    c.trace_id,
+                    c.labels[1] AS claim_type,
+                    c.created_at
+                FROM nearest n JOIN claims c ON c.id = n.id
+                WHERE c.embedding IS NOT NULL /* {VISIBILITY:c} */
+                ORDER BY n.dist, n.id
+                LIMIT $7 OFFSET $9
+                "#
+            .to_string(),
+            // (P) Pinned: exact, and independent of the planner. See
+            // "Exactness of the pinned path" above.
+            Some(_) => {
+                let query_vec = match ranking {
+                    FlatRanking::Query(_) => "SELECT $1::vector AS vec",
+                    // `$1` is always NULL in this mode; it is referenced so the
+                    // bind arity is the same for every shape. The `p` subquery
+                    // is PUBLIC-ONLY by design (see "Theme core" above): it is
+                    // the shared reference, not a viewer read.
+                    FlatRanking::ThemeCore => {
+                        "SELECT COALESCE( \
+                             $1::vector, \
+                             (SELECT AVG(p.embedding) FROM claims p \
+                               WHERE p.theme_id = $8::uuid AND p.embedding IS NOT NULL \
+                                 AND p.visibility = 'public'), \
+                             (SELECT AVG(v.embedding) FROM claims v \
+                               WHERE v.theme_id = $8::uuid AND v.embedding IS NOT NULL \
+                                 /* {VISIBILITY:v} */) \
+                         )::vector AS vec"
+                    }
+                };
+                format!(
+                    r#"
+                    WITH query_vec AS MATERIALIZED ({query_vec}),
+                    members AS MATERIALIZED (
+                        SELECT k.id, (k.embedding <=> q.vec) AS dist
+                        FROM claims k, query_vec q
+                        WHERE k.theme_id = $8::uuid
+                          AND k.embedding IS NOT NULL
+                          AND ($3::text IS NULL OR $3 = ANY(k.labels))
+                          AND ($4::timestamptz IS NULL OR k.created_at >= $4)
+                          AND ($5::timestamptz IS NULL OR k.created_at <= $5)
+                          AND ($6::uuid IS NULL OR k.agent_id = $6)
+                          /* {{VISIBILITY:k}} */
+                    ),
+                    page AS (
+                        SELECT id, dist FROM members
+                        WHERE 1 - dist >= $2
+                        ORDER BY dist, id
+                        LIMIT $7 OFFSET $9
+                    )
+                    SELECT
+                        c.id AS claim_id,
+                        c.content AS statement,
+                        (1 - n.dist)::float8 AS similarity,
+                        c.truth_value,
+                        c.belief,
+                        c.plausibility,
+                        c.agent_id,
+                        c.trace_id,
+                        c.labels[1] AS claim_type,
+                        c.created_at
+                    FROM page n JOIN claims c ON c.id = n.id
+                    WHERE c.embedding IS NOT NULL /* {{VISIBILITY:c}} */
+                    ORDER BY n.dist, n.id
+                    "#
+                )
+            }
+        };
+        // `{{` in the pinned template emits the single brace `splice` looks
+        // for (the interpolated theme-core fragment is not a template and
+        // carries a single brace already). Every marker resolves to `$10`.
+        let sql = viewer.splice(&sql, 10);
         let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
-            .bind(embedding)
-            .bind(min_similarity)
-            .bind(claim_type)
-            .bind(created_after)
-            .bind(created_before)
-            .bind(agent_id)
-            .bind(limit);
+            .bind(query_literal) // $1
+            .bind(min_similarity) // $2
+            .bind(claim_type) // $3
+            .bind(created_after) // $4
+            .bind(created_before) // $5
+            .bind(agent_id) // $6
+            .bind(limit) // $7
+            .bind(theme_id) // $8
+            .bind(offset); // $9
         if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+            q = q.bind(g); // $10
         }
 
-        // See "The scan is served by the HNSW index" above.
+        // One code path for both shapes. The pinned read needs no HNSW
+        // settings; running it in the same rolled-back transaction is harmless.
         let mut tx = executor.begin().await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(limit.clamp(40, 1000).to_string())
-        .execute(&mut *tx)
-        .await?;
+        if theme_id.is_none() {
+            // See "The scan is served by the HNSW index" above.
+            sqlx::query(
+                "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
+                        set_config('hnsw.ef_search', $1, true)",
+            )
+            .bind(flat_ef_search(limit).to_string())
+            .execute(&mut *tx)
+            .await?;
+        }
         let rows = q.fetch_all(&mut *tx).await?;
         tx.rollback().await?;
 

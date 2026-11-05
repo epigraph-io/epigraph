@@ -642,3 +642,54 @@ async fn overview_page_policy_half_on_a_stamped_connection_in_session_mode(pool:
 async fn overview_page_policy_half_on_a_stamped_connection_in_transaction_mode(pool: PgPool) {
     overview_policy_half(pool, epigraph_db::SessionGucMode::Transaction).await;
 }
+
+/// `get_summary` is generic over `sqlx::PgExecutor` so `routes/search.rs`'s
+/// theme pin can run it on the request's viewer-stamped connection. On a bare
+/// `&mut PgConnection` its `member_count` is still the viewer's count: two
+/// public members for a stranger, three for a member of the group that owns
+/// the third.
+///
+/// This observes only the in-query `$V` predicate (the harness connection is a
+/// superuser); the row-policy half is the `ThemeSummary` arm of
+/// `search_voids_methods_scoped_read_policy.rs`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_summary_on_an_executor_counts_only_visible_members(pool: PgPool) {
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "summary-exec").await;
+    let theme = seed_theme(&pool, "summary-exec-00", 0, Some(1536)).await;
+    let p1 = viewer_fixture::seed_public_claim(&pool, agent, "summary-exec public one").await;
+    let p2 = viewer_fixture::seed_public_claim(&pool, agent, "summary-exec public two").await;
+    let x = viewer_fixture::seed_group_claim(&pool, agent, group, "summary-exec private").await;
+    for c in [p1, p2, x] {
+        sqlx::query("UPDATE claims SET theme_id = $2 WHERE id = $1")
+            .bind(c)
+            .bind(theme)
+            .execute(&pool)
+            .await
+            .expect("attach theme");
+    }
+
+    let stranger = viewer_fixture::public_viewer(&pool).await;
+    let member = epigraph_db::Viewer::resolve(&pool, agent)
+        .await
+        .expect("resolve the group member");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let seen_by_stranger = ClaimThemeRepository::get_summary(&mut *conn, &stranger, theme)
+        .await
+        .expect("get_summary as stranger")
+        .expect("the theme row is corpus-wide");
+    let seen_by_member = ClaimThemeRepository::get_summary(&mut *conn, &member, theme)
+        .await
+        .expect("get_summary as member")
+        .expect("the theme row is corpus-wide");
+
+    assert_eq!(
+        seen_by_stranger.member_count, 2,
+        "a stranger's member_count must count only the public members; a 3 here is a \
+         cardinality oracle over the private one"
+    );
+    assert_eq!(
+        seen_by_member.member_count, 3,
+        "the owning group's member must count its own private member too"
+    );
+}

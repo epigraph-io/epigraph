@@ -277,6 +277,31 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
     res
 }
 
+/// Response headers for a route whose every response is viewer-scoped
+/// (`POST /api/v1/search/semantic`): its body depends on who asks, so no
+/// shared cache may store it, and a private cache must key on the credential.
+///
+/// * `Cache-Control: private, no-store`.
+/// * `Vary: Authorization`.
+///
+/// Inserted, not appended, so a handler cannot weaken them. Applied with
+/// `middleware::map_response` on the method router, inside the protected
+/// chain, so bearer auth still wraps it; the handler's own return type is
+/// unchanged.
+#[cfg(feature = "db")]
+async fn viewer_scoped_cache_headers(
+    mut res: axum::response::Response,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    h.insert(header::VARY, HeaderValue::from_static("Authorization"));
+    res
+}
+
 /// Create the main application router with all routes.
 ///
 /// # Route structure — authenticated by default
@@ -808,7 +833,11 @@ pub fn create_router_with_extensions(
             get(timeline::get_agent_timeline),
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
-        .route("/api/v1/search/semantic", post(search::semantic_search))
+        .route(
+            "/api/v1/search/semantic",
+            post(search::semantic_search)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",

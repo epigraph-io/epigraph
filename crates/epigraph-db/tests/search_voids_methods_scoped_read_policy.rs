@@ -1,7 +1,13 @@
-//! The POLICY half of PR-29: on a genuinely filtered session, each of the five
+//! The POLICY half of PR-29: on a genuinely filtered session, each of the nine
 //! RLS-relevant reads the converted `search.rs` / `voids.rs` / `methods.rs`
 //! handlers run returns the viewer's own rows through a viewer-stamped
 //! connection and NOTHING through an unstamped one.
+//!
+//! Five are PR-29's own (below). Four more came with the `theme_id` /
+//! `rank_by=theme_core` pin on `search.rs`: the pinned flat statement under
+//! both rankings, the theme-pin resolution `ClaimThemeRepository::get_summary`,
+//! and the pinned diverse candidate pull
+//! `ClaimThemeRepository::claims_in_theme_exact_at_dim`.
 //!
 //! # Why this file exists separately from the api-crate one
 //!
@@ -70,7 +76,9 @@
 mod viewer_fixture;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ClaimRepository, ClaimThemeRepository, MethodRepository, SessionGucMode};
+use epigraph_db::{
+    ClaimRepository, ClaimThemeRepository, FlatRanking, MethodRepository, SessionGucMode,
+};
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 use viewer_fixture::{scoped_pool_with_mode, seed_agent_with_group, seed_edge, seed_group_claim};
@@ -128,6 +136,20 @@ enum Read {
     /// `methods.rs`'s evidence read, which reaches `claims` through
     /// `unnest(m.source_claim_ids)` rather than through a WHERE on `claims`.
     MethodEvidence,
+    /// `search.rs`'s pinned flat path (`theme_id`): the exact member-set
+    /// statement, ranked by the query vector.
+    SemanticFlatInTheme,
+    /// `search.rs`'s `rank_by=theme_core`: the same statement ranked by the
+    /// theme core. The theme's only member is group-private, so the core is
+    /// the viewer-visible mean; unstamped, RLS hides it from both means and
+    /// the core is NULL.
+    SemanticFlatThemeCore,
+    /// `search.rs`'s theme-pin resolution, `ClaimThemeRepository::get_summary`
+    /// on the stamped connection. Its differential is the `member_count`.
+    ThemeSummary,
+    /// `search.rs`'s pinned diverse candidate pull,
+    /// `ClaimThemeRepository::claims_in_theme_exact_at_dim`.
+    ThemeExactCandidates,
 }
 
 /// Everything the five reads need, seeded once so that every arm's expected
@@ -227,11 +249,20 @@ impl Read {
         let vec = unit_vec();
         Ok(match self {
             Read::SemanticFlat => ClaimRepository::semantic_search_flat(
-                &mut *conn, viewer, &vec,
+                &mut *conn,
+                viewer,
+                FlatRanking::Query(&vec),
                 // The floor `voids.rs` passes: cosine similarity is bounded
                 // below by -1, so it excludes nothing and the read is the
                 // unbounded nearest-neighbour lookup both handlers want.
-                -1.0, None, None, None, None, 100,
+                -1.0,
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+                0,
             )
             .await?
             .into_iter()
@@ -239,6 +270,57 @@ impl Read {
             // other arm counts, so the expected cardinality is uniformly 1.
             .filter(|h| h.claim_id == corpus.claim)
             .count(),
+            Read::SemanticFlatInTheme => ClaimRepository::semantic_search_flat(
+                &mut *conn,
+                viewer,
+                FlatRanking::Query(&vec),
+                -1.0,
+                None,
+                None,
+                None,
+                None,
+                100,
+                Some(corpus.theme),
+                0,
+            )
+            .await?
+            .into_iter()
+            .filter(|h| h.claim_id == corpus.claim)
+            .count(),
+            Read::SemanticFlatThemeCore => ClaimRepository::semantic_search_flat(
+                &mut *conn,
+                viewer,
+                FlatRanking::ThemeCore,
+                -1.0,
+                None,
+                None,
+                None,
+                None,
+                100,
+                Some(corpus.theme),
+                0,
+            )
+            .await?
+            .into_iter()
+            .filter(|h| h.claim_id == corpus.claim)
+            .count(),
+            Read::ThemeSummary => {
+                ClaimThemeRepository::get_summary(&mut *conn, viewer, corpus.theme)
+                    .await?
+                    .map_or(0, |s| s.member_count as usize)
+            }
+            Read::ThemeExactCandidates => ClaimThemeRepository::claims_in_theme_exact_at_dim(
+                &mut *conn,
+                viewer,
+                corpus.theme,
+                &vec,
+                100,
+                1536,
+                None,
+                -1.0,
+            )
+            .await?
+            .len(),
             Read::DensityStats => {
                 let (count, _avg) =
                     ClaimRepository::embedding_density_stats(&mut *conn, viewer, &vec, 0.60)
@@ -484,4 +566,84 @@ async fn the_stamped_method_evidence_serves_the_viewers_own_rows_and_the_unstamp
     pool: PgPool,
 ) {
     coherence_case_for(pool, SessionGucMode::Transaction, Read::MethodEvidence).await;
+}
+
+// ── The `theme_id` / `rank_by=theme_core` pin on `POST /api/v1/search/semantic` ──
+//
+// Four more reads the converted `search.rs` runs on its stamped connection when
+// a request pins a theme. Each is driven on both `SessionGucMode` arms, like
+// the five above.
+
+/// The pinned flat statement (`semantic_search_flat` with `theme_id`): exact
+/// member set, ranked by the query vector.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_pinned_flat_search_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::SemanticFlatInTheme).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_pinned_flat_search_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::SemanticFlatInTheme).await;
+}
+
+/// `rank_by=theme_core`: with no public member, the core is the mean of the
+/// members the session can read, so an unstamped session has no core at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_theme_core_ranking_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::SemanticFlatThemeCore).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_theme_core_ranking_serves_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(
+        pool,
+        SessionGucMode::Transaction,
+        Read::SemanticFlatThemeCore,
+    )
+    .await;
+}
+
+/// The theme-pin resolution's member count, the number the route echoes as
+/// `theme_scope.member_count` and the one its 404 rule reads.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_theme_summary_counts_the_viewers_own_rows_and_the_unstamped_one_does_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::ThemeSummary).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_theme_summary_counts_the_viewers_own_rows_and_the_unstamped_one_does_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Transaction, Read::ThemeSummary).await;
+}
+
+/// The pinned diverse candidate pull, the source of the id list the
+/// `full_sql` fetch and the neighbour join are bounded by on a pinned request.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_exact_theme_candidates_serve_the_viewers_own_rows_and_the_unstamped_ones_do_not_in_session_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(pool, SessionGucMode::Session, Read::ThemeExactCandidates).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stamped_exact_theme_candidates_serve_the_viewers_own_rows_and_the_unstamped_ones_do_not_in_transaction_mode(
+    pool: PgPool,
+) {
+    coherence_case_for(
+        pool,
+        SessionGucMode::Transaction,
+        Read::ThemeExactCandidates,
+    )
+    .await;
 }
