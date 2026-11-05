@@ -15,11 +15,15 @@
 //!   measurement and refused with the stale one.
 //! * The undo puts every row back bit-identical and every cache back by
 //!   compare-and-set; a cache or key written since the sweep is left alone;
-//!   a dry-run undo writes nothing.
-//! * Every guard refuses with nothing written: no configured maintenance DSN,
-//!   an unprivileged login, a missing agent, an empty reason, a held replay
-//!   lock, an existing snapshot path, a plan that differs from the
-//!   measurement, and a belief-mode skew (exit 3).
+//!   a dry-run undo writes nothing; a second undo finds everything as
+//!   recorded and writes nothing.
+//! * Every guard refuses with nothing written, for the apply AND the undo: no
+//!   configured maintenance DSN, an unprivileged login (the dry run too), a
+//!   missing agent, an empty reason, a held replay lock, an existing output
+//!   path, a plan that differs from the measurement, a holder the measurement
+//!   cannot predict (`vacate_possible`), and a belief-mode skew (exit 3).
+//! * A failure AFTER the delete (a row's delete faults, a holder's re-fold is
+//!   not the predicted value) rolls the whole apply back.
 //!
 //! The logins are created per test (roles are cluster-global, so each name is
 //! unique) and dropped at the end; neither is a superuser. The superuser
@@ -190,6 +194,10 @@ fn apply_args<'a>(expect: &'a Path, snapshot: &'a Path, agent: &'a str) -> Vec<&
 
 struct World {
     _scoped: epigraph_db::ScopedPool,
+    /// The author of every fixture edge.
+    agent: Uuid,
+    public: Viewer,
+    bypass: Viewer,
     owner: Uuid,
     /// Refuted by the retired claim AND supported by a current one: re-folded.
     refuted: Uuid,
@@ -371,6 +379,9 @@ async fn world(pool: &PgPool) -> World {
 
     World {
         _scoped: scoped,
+        agent,
+        public,
+        bypass,
         owner,
         refuted,
         lonely,
@@ -674,14 +685,109 @@ async fn the_sweep_applies_exactly_the_measured_rows_and_the_undo_puts_them_back
         (start.0.clone(), start.1.clone()),
         "the undo is not exact"
     );
-    assert_eq!(
-        count(
-            &pool,
-            "SELECT count(*) FROM security_events WHERE event_type = 'k10_retro.sweep_undone'"
-        )
-        .await,
-        1
+    let undone_rows =
+        "SELECT count(*) FROM security_events WHERE event_type = 'k10_retro.sweep_undone'";
+    assert_eq!(count(&pool, undone_rows).await, 1);
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'k10_retro.sweep_undone'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the undo's audit row");
+    assert_eq!(details["reason"], "k10 retro undo test", "{details}");
+    assert_eq!(details["acting_agent"], agent, "{details}");
+    assert!(
+        snapshot["audit_event_id"].is_string(),
+        "PREMISE: the apply's audit id: {snapshot}"
     );
+    assert_eq!(
+        details["undoes"], snapshot["audit_event_id"],
+        "the undo's audit row names the apply it undoes: {details}"
+    );
+    let undone = footprint(&pool).await;
+
+    // A second undo (what an operator runs when a COMMIT's answer was lost):
+    // every row and cache is found as recorded, nothing is written, and no
+    // second audit row appears. Then the same as a dry run.
+    let holders = {
+        let mut h = vec![
+            w.refuted.to_string(),
+            w.lonely.to_string(),
+            w.private_holder.to_string(),
+        ];
+        h.sort();
+        h
+    };
+    let strings = |v: &serde_json::Value| -> Vec<String> {
+        let mut out: Vec<String> = v
+            .as_array()
+            .unwrap_or_else(|| panic!("an array: {v}"))
+            .iter()
+            .map(|x| x.as_str().expect("an id").to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    for (name, dry) in [("undo-again.json", false), ("undo-again-dry.json", true)] {
+        let again = dir.path(name);
+        let mut args = vec![
+            "--undo",
+            snap.to_str().unwrap(),
+            "--report",
+            again.to_str().unwrap(),
+            "--acting-agent",
+            &agent,
+            "--reason",
+            "k10 retro second undo test",
+            "--allow-mode-skew",
+        ];
+        if dry {
+            args.push("--dry-run");
+        }
+        let r = run(SWEEP, &dir.0, &args, &l.app, Some(&l.maint));
+        assert!(r.ok(), "{name}: {r}");
+        let out: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&again).expect("the report"))
+                .expect("JSON");
+        assert_eq!(
+            out["rows"]["already_restored"].as_array().map(Vec::len),
+            Some(3),
+            "{name}: every row is found as stored: {out}"
+        );
+        for bucket in ["restored", "superseded_since_sweep", "missing", "failed"] {
+            assert_eq!(
+                out["rows"][bucket].as_array().map(Vec::len),
+                Some(0),
+                "{name}: rows.{bucket}: {out}"
+            );
+        }
+        assert_eq!(
+            strings(&out["caches"]["already_restored"]),
+            holders,
+            "{name}: every cache is found as recorded: {out}"
+        );
+        assert_eq!(
+            strings(&out["caches"]["restored"]),
+            Vec::<String>::new(),
+            "{out}"
+        );
+        assert_eq!(
+            strings(&out["caches_held_back"]),
+            Vec::<String>::new(),
+            "{out}"
+        );
+        assert_eq!(
+            footprint(&pool).await,
+            undone,
+            "{name}: a second undo wrote something"
+        );
+        assert_eq!(
+            count(&pool, undone_rows).await,
+            1,
+            "{name}: a second audit row"
+        );
+    }
+
     // And the measurement is the accepted one again.
     let r = run(
         SWEEP,
@@ -1023,5 +1129,441 @@ async fn an_apply_refuses_every_missing_precondition_and_writes_nothing(pool: Pg
     assert!(!snap.exists(), "a refused run left its snapshot");
     // Every refusal above left the measured rows in place.
     assert_eq!(selected(&pool).await.len(), 3);
+    l.drop(&pool).await;
+}
+
+/// The undo reports left next to `snap` under the default name
+/// (`<snapshot>.undo-<stamp>[-dry-run].json`).
+fn undo_reports(dir: &TempDir, snap: &Path) -> Vec<PathBuf> {
+    let prefix = format!(
+        "{}.undo-",
+        snap.file_name().and_then(|n| n.to_str()).expect("a name")
+    );
+    std::fs::read_dir(&dir.0)
+        .expect("read the temp dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect()
+}
+
+fn owned(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// A writing undo of `snap`, optionally without the agent, the reason or the
+/// mode-skew override.
+fn undo_args(snap: &Path, agent: Option<&str>, reason: Option<&str>, skew: bool) -> Vec<String> {
+    let mut a = vec!["--undo".to_string(), snap.to_str().unwrap().to_string()];
+    if let Some(agent) = agent {
+        a.extend(["--acting-agent".to_string(), agent.to_string()]);
+    }
+    if let Some(reason) = reason {
+        a.extend(["--reason".to_string(), reason.to_string()]);
+    }
+    if skew {
+        a.push("--allow-mode-skew".to_string());
+    }
+    a
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undo_refuses_every_missing_precondition_and_writes_nothing(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (k0, _) = measure(&dir, "k0.json", &l);
+    let gone = selected(&pool).await;
+    assert_eq!(gone.len(), 3, "PREMISE");
+    let snap = dir.path("snap.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "PREMISE: the apply: {r}");
+    let swept = footprint(&pool).await;
+    let maint = Some(l.maint.as_str());
+
+    // Each refused run: nothing written, no undo report left, the swept rows
+    // still gone.
+    let check = |case: &'static str| {
+        let (pool, dir, snap, swept, gone) = (&pool, &dir, &snap, &swept, &gone);
+        async move {
+            assert_eq!(
+                &footprint(pool).await,
+                swept,
+                "{case}: a refused run wrote something"
+            );
+            assert_eq!(
+                undo_reports(dir, snap),
+                Vec::<PathBuf>::new(),
+                "{case}: a refused run left its undo report"
+            );
+            for id in gone {
+                assert!(!exists(pool, *id).await, "{case}: {id} came back");
+            }
+        }
+    };
+
+    // No --acting-agent.
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&snap, None, Some("undo test"), true)),
+        &l.app,
+        maint,
+    );
+    assert!(!r.ok(), "{r}");
+    assert!(r.says("--acting-agent"), "{r}");
+    check("no agent").await;
+
+    // An agent that does not exist.
+    let ghost = Uuid::new_v4().to_string();
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&snap, Some(&ghost), Some("undo test"), true)),
+        &l.app,
+        maint,
+    );
+    assert!(!r.ok(), "{r}");
+    assert!(r.says("is not an agent"), "{r}");
+    check("ghost agent").await;
+
+    // A blank reason, and none.
+    for reason in [Some("  "), None] {
+        let r = run(
+            SWEEP,
+            &dir.0,
+            &owned(&undo_args(&snap, Some(&agent), reason, true)),
+            &l.app,
+            maint,
+        );
+        assert!(!r.ok(), "{r}");
+        assert!(r.says("non-empty --reason"), "{r}");
+        check("reason").await;
+    }
+
+    // Another maintenance run holds the replay lock.
+    let mut holder = pool.acquire().await.unwrap();
+    let key = epigraph_db::repos::maintenance_lock::REPLAY_LOCK_KEY;
+    assert!(
+        epigraph_db::repos::maintenance_lock::try_take(&mut holder, key)
+            .await
+            .unwrap()
+    );
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&snap, Some(&agent), Some("undo test"), true)),
+        &l.app,
+        maint,
+    );
+    assert!(
+        epigraph_db::repos::maintenance_lock::release(&mut holder, key)
+            .await
+            .unwrap()
+    );
+    drop(holder);
+    assert!(!r.ok(), "{r}");
+    assert!(r.says("holds its lock"), "{r}");
+    check("replay lock").await;
+
+    // A belief-mode skew (nothing answers at EPIGRAPH_API): exit 3.
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&snap, Some(&agent), Some("undo test"), false)),
+        &l.app,
+        maint,
+    );
+    assert_eq!(r.code, Some(3), "{r}");
+    check("mode skew").await;
+
+    // An explicit --report path that already exists: refused, not overwritten.
+    let existing = dir.path("undo-existing.json");
+    std::fs::write(&existing, "keep me").unwrap();
+    let mut args = undo_args(&snap, Some(&agent), Some("undo test"), true);
+    args.extend([
+        "--report".to_string(),
+        existing.to_str().unwrap().to_string(),
+    ]);
+    let r = run(SWEEP, &dir.0, &owned(&args), &l.app, maint);
+    assert!(!r.ok(), "{r}");
+    assert_eq!(
+        std::fs::read_to_string(&existing).unwrap(),
+        "keep me",
+        "the existing report was overwritten"
+    );
+    std::fs::remove_file(&existing).unwrap();
+    check("existing report").await;
+
+    // No MAINTENANCE_DATABASE_URL: the application DSN is never used.
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&snap, Some(&agent), Some("undo test"), true)),
+        &l.maint,
+        None,
+    );
+    assert!(!r.ok(), "{r}");
+    assert!(
+        r.says("explicitly configured MAINTENANCE_DATABASE_URL"),
+        "{r}"
+    );
+    check("no maintenance DSN").await;
+
+    // A login that cannot bypass row security, as the maintenance DSN: the
+    // writing undo, the dry-run undo, and the sweep's dry run (an
+    // RLS-filtered plan would silently drop the group-private holder).
+    let mut dry_undo = undo_args(&snap, None, None, false);
+    dry_undo.push("--dry-run".to_string());
+    for (case, args) in [
+        (
+            "unprivileged undo",
+            undo_args(&snap, Some(&agent), Some("undo test"), true),
+        ),
+        ("unprivileged dry-run undo", dry_undo),
+        (
+            "unprivileged dry run",
+            vec!["--expect".to_string(), k0.to_str().unwrap().to_string()],
+        ),
+    ] {
+        let r = run(SWEEP, &dir.0, &owned(&args), &l.app, Some(&l.app));
+        assert!(!r.ok(), "{case}: {r}");
+        assert!(r.says("does not satisfy epigraph_bypass()"), "{case}: {r}");
+        check(case).await;
+    }
+
+    // CONTROL: the snapshot every refusal above was given is a good one.
+    let report = dir.path("undo-control.json");
+    let mut args = undo_args(&snap, Some(&agent), Some("undo test"), true);
+    args.extend(["--report".to_string(), report.to_str().unwrap().to_string()]);
+    let r = run(SWEEP, &dir.0, &owned(&args), &l.app, maint);
+    assert!(r.ok(), "{r}");
+    for id in &gone {
+        assert!(exists(&pool, *id).await, "{id} did not come back");
+    }
+    l.drop(&pool).await;
+}
+
+/// Install a fixture trigger (a plpgsql SECURITY INVOKER function, executable
+/// by every login) on `table`; [`drop_fault`] removes it.
+async fn install_fault(pool: &PgPool, name: &str, timing: &str, table: &str, body: &str) {
+    for sql in [
+        format!(
+            "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN {body} END $f$"
+        ),
+        format!("GRANT EXECUTE ON FUNCTION {name}() TO PUBLIC"),
+        format!("CREATE TRIGGER {name} {timing} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}()"),
+    ] {
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+async fn drop_fault(pool: &PgPool, name: &str, table: &str) {
+    for sql in [
+        format!("DROP TRIGGER {name} ON {table}"),
+        format!("DROP FUNCTION {name}()"),
+    ] {
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failure_after_the_delete_rolls_the_whole_apply_back(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (k0, report) = measure(&dir, "k0.json", &l);
+    let planned = selected(&pool).await;
+    assert_eq!(planned.len(), 3, "PREMISE");
+    let start = footprint(&pool).await;
+    let snap = dir.path("snap.json");
+
+    // Fault 1: the DELETE of ONE planned row raises. Its edge rolls back to
+    // its savepoint and the repair records the error; the other edges'
+    // deletes have run inside the outer transaction, which must not commit.
+    let faulty: Uuid =
+        sqlx::query_scalar("SELECT id FROM mass_functions WHERE claim_id = $1 AND id = ANY($2)")
+            .bind(w.lonely)
+            .bind(&planned)
+            .fetch_one(&pool)
+            .await
+            .expect("lonely's planned row");
+    install_fault(
+        &pool,
+        "k10r_fault_delete",
+        "BEFORE DELETE",
+        "mass_functions",
+        &format!(
+            "IF OLD.id = '{faulty}'::uuid THEN RAISE EXCEPTION 'k10r injected delete fault'; \
+             END IF; RETURN OLD;"
+        ),
+    )
+    .await;
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    drop_fault(&pool, "k10r_fault_delete", "mass_functions").await;
+    assert_eq!(r.code, Some(1), "{r}");
+    assert!(r.says("the sweep's repair reported"), "{r}");
+    assert!(r.says("k10r injected delete fault"), "{r}");
+    assert_eq!(
+        footprint(&pool).await,
+        start,
+        "a delete fault: the other edges' deletes were committed"
+    );
+    assert!(!snap.exists(), "a rolled-back apply left its snapshot");
+    assert_eq!(selected(&pool).await, planned);
+
+    // Fault 2: every delete succeeds but `refuted`'s re-fold is not the
+    // predicted value (a BEFORE UPDATE trigger halves its belief).
+    let predicted = f(&claim(&report, w.refuted)["new"]["belief"]).expect("a predicted belief");
+    assert!(
+        predicted > 0.05,
+        "PREMISE: halving the belief is a real change: {predicted}"
+    );
+    install_fault(
+        &pool,
+        "k10r_fault_cache",
+        "BEFORE UPDATE",
+        "claims",
+        &format!(
+            "IF NEW.id = '{}'::uuid AND NEW.belief IS NOT NULL THEN \
+             NEW.belief := NEW.belief / 2; END IF; RETURN NEW;",
+            w.refuted
+        ),
+    )
+    .await;
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    drop_fault(&pool, "k10r_fault_cache", "claims").await;
+    assert_eq!(r.code, Some(1), "{r}");
+    assert!(r.says("not what the measurement predicted"), "{r}");
+    assert!(r.says(&w.refuted.to_string()), "the holder is named: {r}");
+    assert_eq!(
+        footprint(&pool).await,
+        start,
+        "a mispredicted holder: the sweep was committed"
+    );
+    assert!(!snap.exists(), "a rolled-back apply left its snapshot");
+    assert_eq!(selected(&pool).await, planned);
+
+    // CONTROL: without the faults, the same apply goes through.
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    assert_eq!(selected(&pool).await, Vec::<Uuid>::new());
+    l.drop(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_holder_the_measurement_cannot_predict_refuses_the_apply(pool: PgPool) {
+    let w = world(&pool).await;
+    // A PUBLIC current holder with one live row from a newly retired public
+    // source, and its only other binary-frame row from a GROUP-PRIVATE
+    // source: that row may not enter a public claim's cache (R-22), so the
+    // fold without the swept row admits nothing and the measurement cannot
+    // predict the cache (`vacate_possible`).
+    let source = believed(&pool, w.agent, "k10r vacate source", 0.9, 0.95).await;
+    let vacate = fixture::seed_public_claim(&pool, w.agent, "k10r vacate holder").await;
+    wire(&pool, &w.public, w.agent, source, vacate, "refutes").await;
+    let (pagent, pgroup) = fixture::seed_agent_with_group(&pool, "k10r-vacate-private").await;
+    let private_source =
+        fixture::seed_group_claim(&pool, pagent, pgroup, "k10r vacate private source").await;
+    sqlx::query("UPDATE claims SET belief = 0.7, plausibility = 0.8 WHERE id = $1")
+        .bind(private_source)
+        .execute(&pool)
+        .await
+        .expect("plant an interval");
+    wire(
+        &pool,
+        &w.bypass,
+        w.agent,
+        private_source,
+        vacate,
+        "supports",
+    )
+    .await;
+    retire(&pool, source).await;
+
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (k0, report) = measure(&dir, "k0.json", &l);
+    assert_eq!(
+        claim(&report, vacate)["outcome"],
+        "vacate_possible",
+        "PREMISE: {report}"
+    );
+    let planned = selected(&pool).await;
+    assert_eq!(
+        planned.len(),
+        4,
+        "PREMISE: the world's 3 and the vacate holder's"
+    );
+    let start = footprint(&pool).await;
+    let snap = dir.path("snap.json");
+
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(!r.ok(), "an unpredicted holder was swept: {r}");
+    assert!(r.says("vacate_possible"), "{r}");
+    assert!(r.says(&vacate.to_string()), "the holder is named: {r}");
+    assert_eq!(
+        footprint(&pool).await,
+        start,
+        "a refused run wrote something"
+    );
+    assert!(!snap.exists(), "a refused run left its snapshot");
+    assert_eq!(selected(&pool).await, planned);
+
+    // The dry run still prints the plan, and it matches the measurement.
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &["--expect", k0.to_str().unwrap()],
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("the plan is JSON");
+    assert_eq!(plan["matches_expect"], true, "{plan}");
+    assert_eq!(plan["rows"].as_array().map(Vec::len), Some(4), "{plan}");
     l.drop(&pool).await;
 }
