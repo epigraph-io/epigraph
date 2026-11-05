@@ -309,6 +309,19 @@ name = "backfill_dedup_identity_edges_bin"
 path = "tests/backfill_dedup_identity_edges_bin.rs"
 required-features = ["db"]
 
+# The Atlas theme-layout build (migration 197): public claims and edges only,
+# on the maintenance connection. Dry run unless --apply.
+[[bin]]
+name = "atlas_layout"
+path = "src/bin/atlas_layout.rs"
+required-features = ["db"]
+
+# Spawns the `db`-gated binary above.
+[[test]]
+name = "atlas_layout_bin"
+path = "tests/atlas_layout_bin.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every

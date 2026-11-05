@@ -77,6 +77,9 @@ pub mod extensions;
 pub mod gaps;
 #[cfg(feature = "db")]
 pub mod graph;
+/// The Atlas layout and its bundle drill-down (migration 197).
+#[cfg(feature = "db")]
+pub mod graph_layout;
 #[cfg(feature = "db")]
 pub mod graph_neighborhood;
 #[cfg(feature = "db")]
@@ -720,6 +723,11 @@ pub fn create_router_with_extensions(
         .route("/api/v1/graph/communities/:id/expand", get(graph::expand))
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
         .route("/api/v1/graph/themes/overview", get(graph::themes_overview))
+        .route(
+            "/api/v1/graph/themes/layout",
+            get(graph_layout::themes_layout),
+        )
+        .route("/api/v1/graph/links", get(graph_layout::graph_links))
         .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),

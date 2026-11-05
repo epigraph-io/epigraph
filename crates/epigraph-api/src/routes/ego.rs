@@ -155,7 +155,7 @@ pub struct EgoResponse {
 }
 
 /// Cut `label` to [`MAX_LABEL_CHARS`] characters, never mid-character.
-fn clip_label(label: &str) -> String {
+pub(crate) fn clip_label(label: &str) -> String {
     if label.chars().count() <= MAX_LABEL_CHARS {
         return label.to_string();
     }

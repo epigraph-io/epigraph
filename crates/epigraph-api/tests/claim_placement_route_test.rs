@@ -218,6 +218,7 @@ async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
             "claim_id",
             "cluster_id",
             "cluster_run_id",
+            "layout",
             "neighborhood_id",
             "run_completed_at",
             "theme_id",
