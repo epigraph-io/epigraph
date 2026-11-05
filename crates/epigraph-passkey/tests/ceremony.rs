@@ -11,8 +11,9 @@ mod support;
 use std::collections::BTreeSet;
 
 use epigraph_passkey::{
-    AttestationPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState, RelyingParty,
-    StoredPasskey, Verifier,
+    act_challenge, is_hardware_attested, AaguidAllowlist, ActAnchor, AnchorRefusal,
+    AttestationPolicy, AttestedPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState,
+    RelyingParty, StoredPasskey, Verifier, ACT_NONCE_LEN,
 };
 use serde_json::Value;
 use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
@@ -636,4 +637,567 @@ async fn the_counter_deferring_start_leaves_the_counter_to_the_caller() {
         .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
         .expect("the counter is the caller's to check");
     assert_eq!(a.counter, 0, "the asserted counter is reported");
+}
+
+// =====================================================================
+// Android key roots (a blanket root, `android-key` only, device-bound)
+// =====================================================================
+
+/// The attested policy: `allow` the per-model allowlist (root and models),
+/// `android` the Android key roots, `anchored` the anchored path.
+fn attested(
+    allow: Option<(&TestAttestation, &[Uuid])>,
+    android: Option<&TestAttestation>,
+    anchored: bool,
+) -> Passkeys {
+    Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Attested(AttestedPolicy {
+            allowlist: allow.map(|(att, models)| AaguidAllowlist {
+                ca_pem: att.root_pem(),
+                aaguids: models.iter().copied().collect(),
+            }),
+            android_key_ca_pem: android.map(TestAttestation::root_pem),
+            allow_synced_anchored: anchored,
+        }),
+    })
+    .expect("relying party")
+}
+
+/// The policy refusal text, or a panic naming what came back instead.
+fn policy_refusal(err: PasskeyError) -> String {
+    match err {
+        PasskeyError::AttestationRefused(why) => why,
+        other => panic!("expected a policy refusal, got {other:?}"),
+    }
+}
+
+/// THE MEASURED FAILURE, fixed: a device-bound `android-key` attestation
+/// chaining to a configured Android root verifies and is recorded as
+/// `android-key`, device-bound and user-verified, with the nil AAGUID (an
+/// Android key names no model), whatever model the authenticator data
+/// claims. The challenge offers `android-key` to the client. CALIBRATION:
+/// the SAME response under the same root inserted as a per-model allowlist
+/// root (today's only option) is refused exactly as production refused it.
+///
+/// Mutation: the Android roots built with `allowlist_cas` (per-model) ->
+/// red with "does not have an aaguid".
+#[tokio::test]
+async fn an_android_key_attestation_verifies_under_a_blanket_android_root() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), false);
+    let (options, state) = start(&rp);
+    let formats = options["publicKey"]["attestationFormats"].clone();
+    assert!(
+        formats
+            .as_array()
+            .is_some_and(|f| f.iter().any(|v| v == "android-key")),
+        "the challenge offers android-key: {formats}"
+    );
+    let mut auth = SoftAuthenticator::new(OTHER_MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let response = google.android_key(&auth, &created, true);
+    let reg = rp
+        .finish_registration(&response, &state)
+        .expect("a device-bound android-key attestation verifies");
+    assert_eq!(reg.attestation_format, "android-key");
+    assert_eq!(reg.aaguid, Uuid::nil());
+    assert!(reg.user_verified);
+    assert!(!reg.backup_eligible);
+    assert!(is_hardware_attested(
+        &reg.attestation_format,
+        reg.aaguid,
+        reg.backup_eligible
+    ));
+
+    let per_model = allowlist(&google, &[OTHER_MODEL]);
+    let (options, state) = start(&per_model);
+    let mut auth = SoftAuthenticator::new(OTHER_MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let why = refusal(
+        per_model
+            .finish_registration(&google.android_key(&auth, &created, true), &state)
+            .unwrap_err(),
+    );
+    assert!(why.contains("does not have an aaguid"), "{why}");
+}
+
+/// A `packed` attestation whose certificate chains to an ANDROID root is
+/// refused: the blanket root vouches for the `android-key` format only. With
+/// the allowlist configured beside it (another root), the packed statement
+/// by an ALLOWLISTED model still does not pass through the Android root.
+/// Mutation: the format check in `android_key_rules` removed -> accepted.
+#[tokio::test]
+async fn a_packed_attestation_chaining_to_an_android_root_is_refused() {
+    let google = TestAttestation::new("Android");
+    let vendor = TestAttestation::new("Allowlisted");
+    for rp in [
+        attested(None, Some(&google), false),
+        attested(Some((&vendor, &[MODEL])), Some(&google), false),
+    ] {
+        let (options, state) = start(&rp);
+        let mut auth = SoftAuthenticator::new(MODEL).hardware();
+        let response = google.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+        let why = policy_refusal(rp.finish_registration(&response, &state).unwrap_err());
+        assert!(why.contains("android-key attestation format"), "{why}");
+    }
+}
+
+/// A BACKUP-ELIGIBLE `android-key` credential is refused. The library's
+/// attested state refuses it already; a stored state rewritten to allow
+/// synced credentials (the request DSN can write it) is refused by this
+/// crate's own rule. Mutation: the `backup_eligible` check in
+/// `android_key_rules` removed -> the tampered case is accepted.
+#[tokio::test]
+async fn a_backup_eligible_android_key_credential_is_refused() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), false);
+
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let why = refusal(
+        rp.finish_registration(&google.android_key(&auth, &created, false), &state)
+            .unwrap_err(),
+    );
+    assert!(
+        why.contains("hardware"),
+        "CALIBRATION: the library's refusal: {why}"
+    );
+
+    let (options, state) = start(&rp);
+    let mut tampered = state.to_json();
+    tampered["library"]["rs"]["allow_synchronised_authenticators"] = Value::from(true);
+    let tampered = RegistrationState::from_json(tampered);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let why = policy_refusal(
+        rp.finish_registration(&google.android_key(&auth, &created, false), &tampered)
+            .unwrap_err(),
+    );
+    assert!(why.contains("backup-eligible"), "{why}");
+}
+
+/// With the Android roots beside it, the per-model allowlist is unchanged:
+/// a packed attestation by an allowlisted model verifies through it
+/// (recorded `packed` with its model), a model it does not name is still
+/// refused with the allowlist's reason, and an android-key attestation
+/// verifies through the Android root. Mutation: the allowlist attempt
+/// skipped when the Android roots are set -> the packed case is refused.
+#[tokio::test]
+async fn the_allowlist_is_unchanged_beside_the_android_roots() {
+    let google = TestAttestation::new("Android");
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), Some(&google), false);
+
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let response = vendor.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let reg = rp
+        .finish_registration(&response, &state)
+        .expect("an allowlisted packed attestation verifies");
+    assert_eq!(
+        (reg.attestation_format.as_str(), reg.aaguid),
+        ("packed", MODEL)
+    );
+
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(OTHER_MODEL);
+    let response = vendor.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let why = refusal(rp.finish_registration(&response, &state).unwrap_err());
+    assert!(why.contains("limits the aaguids allowed"), "{why}");
+
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let reg = rp
+        .finish_registration(&google.android_key(&auth, &created, true), &state)
+        .expect("an android-key attestation verifies beside the allowlist");
+    assert_eq!(reg.attestation_format, "android-key");
+}
+
+/// `none` attestation is refused under the Android roots too (the blanket is
+/// for attested keys only), and a root in BOTH files is a configuration
+/// error, never a silent widening of the per-model root. Mutation: the
+/// overlap check removed -> the relying party builds.
+#[tokio::test]
+async fn none_is_refused_under_the_android_roots_and_a_shared_root_is_refused() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), false);
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let response = hardware_bound(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let why = refusal(rp.finish_registration(&response, &state).unwrap_err());
+    assert!(
+        why.contains("not a format valid for CA chain validation"),
+        "{why}"
+    );
+
+    let shared = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::Attested(AttestedPolicy {
+            allowlist: Some(AaguidAllowlist {
+                ca_pem: google.root_pem(),
+                aaguids: [MODEL].into_iter().collect::<BTreeSet<_>>(),
+            }),
+            android_key_ca_pem: Some(google.root_pem()),
+            allow_synced_anchored: false,
+        }),
+    });
+    match shared {
+        Err(PasskeyError::Config(why)) => assert!(why.contains("in both"), "{why}"),
+        other => panic!("a shared root must be refused: {other:?}"),
+    }
+}
+
+// =====================================================================
+// The anchored path: a later, unattested passkey anchored by an attested one
+// =====================================================================
+
+/// A hardware-attested passkey registered under `rp` (packed, allowlisted
+/// MODEL by `vendor`), and its authenticator.
+async fn attested_passkey(
+    rp: &Passkeys,
+    vendor: &TestAttestation,
+) -> (SoftAuthenticator, epigraph_passkey::RegisteredPasskey) {
+    let (options, state) = start(rp);
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let response = vendor.rewrap(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let reg = rp.finish_registration(&response, &state).expect("attested");
+    (auth, reg)
+}
+
+/// An act confirmed by `auth`'s passkey `reg` exactly as the act ceremony
+/// confirms one: its challenge is `act_challenge(act, digest, nonce)`, the
+/// stored state wraps the library's state with the nonce, and the evidence is
+/// the verified assertion's. Returns the anchor an enrollment of `person`
+/// on that act would read.
+async fn confirmed_anchor(
+    rp: &Passkeys,
+    auth: &mut SoftAuthenticator,
+    reg: &epigraph_passkey::RegisteredPasskey,
+    person: Uuid,
+) -> ActAnchor {
+    let act = Uuid::new_v4();
+    let digest = [0x5A_u8; 32];
+    let nonce = [0xC3_u8; ACT_NONCE_LEN];
+    let challenge = act_challenge(act, &digest, &nonce);
+    let stored = StoredPasskey {
+        passkey: reg.passkey.clone(),
+        sign_count: 0,
+    };
+    let (options, state) = rp
+        .start_authentication_deferring_counter(std::slice::from_ref(&stored), Some(&challenge))
+        .unwrap();
+    let assertion = rp
+        .finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+        .expect("the confirmation verifies");
+    ActAnchor {
+        act_id: act,
+        act_kind: "passkey.register".into(),
+        act_outcome: Some("confirmed".into()),
+        args_digest: digest.to_vec(),
+        act_challenge_state: Some(serde_json::json!({
+            "v": 1,
+            "ceremony": state.to_json(),
+            "nonce": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, nonce),
+        })),
+        assertion_evidence: Some(assertion.evidence),
+        enrollment_person: person,
+        anchor_person: person,
+        anchor_credential_id: reg.credential_id.clone(),
+        anchor_passkey: reg.passkey.clone(),
+        anchor_aaguid: reg.aaguid,
+        anchor_attestation_format: reg.attestation_format.clone(),
+        anchor_backup_eligible: reg.backup_eligible,
+        anchor_revoked: false,
+    }
+}
+
+/// The anchored path end to end: a later passkey from a SYNCED provider,
+/// with `none` attestation, registers when its act was confirmed by the same
+/// person's hardware-attested passkey, and is recorded as `none`,
+/// backup-eligible, with the nil AAGUID, so it can never anchor in turn.
+/// The anchored challenge asks for no attestation and allows a synced
+/// credential. Mutation: `finish_anchored_registration` finishing as an
+/// attested registration -> refused (the CALIBRATION that the path is what
+/// admits it).
+#[tokio::test]
+async fn a_later_unattested_passkey_anchored_by_an_attested_one_registers() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let person = Uuid::new_v4();
+    let (mut first, reg) = attested_passkey(&rp, &vendor).await;
+    let anchor = confirmed_anchor(&rp, &mut first, &reg, person).await;
+    rp.check_anchor(&anchor).expect("the anchor admits it");
+
+    let (options, state) = rp
+        .start_anchored_registration(person, "operator", "Operator")
+        .expect("anchored start");
+    assert_eq!(options["publicKey"]["attestation"], "none", "{options}");
+    let mut synced = SoftAuthenticator::new(OTHER_MODEL);
+    let response = synced
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let later = rp
+        .finish_anchored_registration(&response, &state, &anchor)
+        .expect("the anchored passkey registers");
+    assert_eq!(later.attestation_format, "none");
+    assert_eq!(later.aaguid, Uuid::nil());
+    assert!(later.backup_eligible && later.user_verified);
+    assert!(!is_hardware_attested(
+        &later.attestation_format,
+        later.aaguid,
+        later.backup_eligible
+    ));
+
+    // CALIBRATION: the same kind of response on the attested path is refused.
+    let (options, state) = start(&rp);
+    let mut synced = SoftAuthenticator::new(OTHER_MODEL);
+    let response = synced
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    assert!(rp.finish_registration(&response, &state).is_err());
+}
+
+/// A FIRST passkey is attested whatever the anchored setting says: with it
+/// on, `none` is refused on the attested path, and an attested state
+/// relabelled `anchored` (the request DSN can write the state) is refused by
+/// both finishes: the attested one by its kind, the anchored one without an
+/// anchor that admits it. Mutation: `finish_registration` accepting a state
+/// of kind `anchored` -> the relabelled state finishes.
+#[tokio::test]
+async fn a_first_passkey_with_none_is_refused_with_the_anchored_setting_on() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let (options, state) = start(&rp);
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let response = hardware_bound(&auth.register(ORIGIN, options, ClientUv::AsRequested).await);
+    let why = refusal(rp.finish_registration(&response, &state).unwrap_err());
+    assert!(
+        why.contains("not a format valid for CA chain validation"),
+        "{why}"
+    );
+
+    let (options, state) = rp
+        .start_anchored_registration(Uuid::new_v4(), "operator", "Operator")
+        .unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL);
+    let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let err = rp.finish_registration(&response, &state).unwrap_err();
+    assert!(matches!(err, PasskeyError::State(_)), "{err:?}");
+}
+
+/// A confirmation by a passkey that is NOT hardware-attested anchors
+/// nothing: a synced passkey (BE set) and an unattested device-bound one
+/// (`none`, BE clear) are both refused `anchor_not_attested`, and so is a
+/// self-attested `packed` one (the nil AAGUID). Their confirmations are
+/// genuine. Mutation: `is_hardware_attested` answering true -> the
+/// device-bound `none` anchor admits it.
+#[tokio::test]
+async fn a_confirmation_by_an_unattested_passkey_anchors_nothing() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let soft = software();
+    let person = Uuid::new_v4();
+    for (label, shape) in [
+        ("synced none", 0_u8),
+        ("device-bound none", 1),
+        ("self-attested packed", 2),
+    ] {
+        let (options, state) = start(&soft);
+        let mut auth = if shape == 0 {
+            SoftAuthenticator::new(MODEL)
+        } else {
+            SoftAuthenticator::new(MODEL).hardware()
+        };
+        let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        let response = if shape == 2 {
+            auth.self_attest(&created)
+        } else {
+            created
+        };
+        let reg = soft.finish_registration(&response, &state).expect(label);
+        let anchor = confirmed_anchor(&rp, &mut auth, &reg, person).await;
+        assert_eq!(
+            rp.check_anchor(&anchor),
+            Err(AnchorRefusal::AnchorNotAttested),
+            "{label}"
+        );
+        let (options, state) = rp
+            .start_anchored_registration(person, "operator", "Operator")
+            .unwrap();
+        let mut later = SoftAuthenticator::new(OTHER_MODEL);
+        let response = later.register(ORIGIN, options, ClientUv::AsRequested).await;
+        assert!(
+            matches!(
+                rp.finish_anchored_registration(&response, &state, &anchor),
+                Err(PasskeyError::Anchor(AnchorRefusal::AnchorNotAttested))
+            ),
+            "{label}"
+        );
+    }
+}
+
+/// The act's recorded confirmation is RE-VERIFIED: a confirmation whose
+/// signature was tampered with, one recorded over another act's challenge,
+/// one by another credential, an anchor of another person, a revoked
+/// anchor, an act that is not confirmed or not a `passkey.register` act are
+/// each refused with its reason. Mutations: `reverify` skipped in
+/// `check_anchor` -> the tampered signature admits; the challenge binding
+/// skipped -> the other act's challenge admits; the person check removed ->
+/// the other person's anchor admits; the revoked check removed -> admits.
+#[tokio::test]
+async fn the_recorded_confirmation_is_reverified() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let person = Uuid::new_v4();
+    let (mut auth, reg) = attested_passkey(&rp, &vendor).await;
+    let good = confirmed_anchor(&rp, &mut auth, &reg, person).await;
+    assert_eq!(rp.check_anchor(&good), Ok(()), "CALIBRATION");
+
+    let mut sig = good.clone();
+    let evidence = sig.assertion_evidence.as_mut().unwrap();
+    let raw = evidence["response"]["response"]["signature"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    evidence["response"]["response"]["signature"] = Value::from(base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        &bytes,
+    ));
+    assert_eq!(
+        rp.check_anchor(&sig),
+        Err(AnchorRefusal::AssertionDoesNotVerify)
+    );
+
+    // A genuine confirmation of ANOTHER act, stored on this one.
+    let other = confirmed_anchor(&rp, &mut auth, &reg, person).await;
+    let mut moved = good.clone();
+    moved.assertion_evidence = other.assertion_evidence.clone();
+    moved.act_challenge_state = other.act_challenge_state.clone();
+    assert_eq!(
+        rp.check_anchor(&moved),
+        Err(AnchorRefusal::ChallengeNotBound)
+    );
+
+    let (_, second) = attested_passkey(&rp, &vendor).await;
+    let mut cred = good.clone();
+    cred.anchor_credential_id = second.credential_id;
+    assert_eq!(
+        rp.check_anchor(&cred),
+        Err(AnchorRefusal::CredentialMismatch)
+    );
+
+    let mut someone = good.clone();
+    someone.enrollment_person = Uuid::new_v4();
+    assert_eq!(
+        rp.check_anchor(&someone),
+        Err(AnchorRefusal::PersonMismatch)
+    );
+    let mut revoked = good.clone();
+    revoked.anchor_revoked = true;
+    assert_eq!(rp.check_anchor(&revoked), Err(AnchorRefusal::AnchorRevoked));
+    let mut refused = good.clone();
+    refused.act_outcome = Some("refused".into());
+    assert_eq!(rp.check_anchor(&refused), Err(AnchorRefusal::NotConfirmed));
+    let mut grant = good;
+    grant.act_kind = "role.grant".into();
+    assert_eq!(rp.check_anchor(&grant), Err(AnchorRefusal::NotARegisterAct));
+}
+
+/// The anchored path verifies NO attestation, so it accepts none: a
+/// response carrying a statement (a packed one with a certificate, or self
+/// attestation) is refused rather than recorded as if it were verified, which
+/// would let it anchor a further passkey. Mutation: the `none`-only check
+/// removed -> the packed response is recorded `packed` with its model.
+#[tokio::test]
+async fn the_anchored_path_refuses_an_attestation_statement() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let person = Uuid::new_v4();
+    let (mut first, reg) = attested_passkey(&rp, &vendor).await;
+    let anchor = confirmed_anchor(&rp, &mut first, &reg, person).await;
+    for statement in ["x5c", "self"] {
+        let (options, state) = rp
+            .start_anchored_registration(person, "operator", "Operator")
+            .unwrap();
+        let mut auth = SoftAuthenticator::new(MODEL).hardware();
+        let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+        let response = if statement == "x5c" {
+            vendor.rewrap(&created)
+        } else {
+            auth.self_attest(&created)
+        };
+        let why = policy_refusal(
+            rp.finish_anchored_registration(&response, &state, &anchor)
+                .unwrap_err(),
+        );
+        assert!(why.contains("without attestation"), "{statement}: {why}");
+    }
+}
+
+/// With the setting OFF the anchored path does not exist: neither its start
+/// nor its finish runs, even with an anchor that would admit it, and a
+/// registration starts attested as before. Mutation: the setting check in
+/// `start_anchored_registration` removed -> it starts.
+#[tokio::test]
+async fn the_anchored_path_is_off_unless_configured() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let off = attested(Some((&vendor, &[MODEL])), None, false);
+    let on = attested(Some((&vendor, &[MODEL])), None, true);
+    let person = Uuid::new_v4();
+    let (mut first, reg) = attested_passkey(&on, &vendor).await;
+    let anchor = confirmed_anchor(&on, &mut first, &reg, person).await;
+    assert!(!off.allows_synced_anchored() && on.allows_synced_anchored());
+    assert!(matches!(
+        off.start_anchored_registration(person, "operator", "Operator"),
+        Err(PasskeyError::Config(_))
+    ));
+    let (options, state) = on
+        .start_anchored_registration(person, "operator", "Operator")
+        .unwrap();
+    let mut auth = SoftAuthenticator::new(OTHER_MODEL);
+    let response = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    assert!(matches!(
+        off.finish_anchored_registration(&response, &state, &anchor),
+        Err(PasskeyError::Config(_))
+    ));
+    assert!(!allowlist(&vendor, &[MODEL]).allows_synced_anchored());
+    let (_, state) = start(&off);
+    assert_eq!(state.to_json()["kind"], "attested");
+}
+
+/// What counts as hardware-attested, from what a registration recorded.
+/// Mutations: the backup-eligible clause dropped -> the synced packed row
+/// passes; the AAGUID clause dropped -> self-attested packed passes;
+/// `android-key` left out -> the Android key fails.
+#[test]
+fn hardware_attested_is_device_bound_and_names_its_attestation() {
+    let model = MODEL;
+    let nil = Uuid::nil();
+    for (format, aaguid, be, expected) in [
+        ("packed", model, false, true),
+        ("tpm", model, false, true),
+        ("android-key", nil, false, true),
+        ("packed", model, true, false),
+        ("android-key", nil, true, false),
+        ("packed", nil, false, false),
+        ("none", nil, false, false),
+        ("none", model, false, false),
+        ("fido-u2f", model, false, false),
+        ("apple", nil, false, false),
+    ] {
+        assert_eq!(
+            is_hardware_attested(format, aaguid, be),
+            expected,
+            "{format} {aaguid} be={be}"
+        );
+    }
 }

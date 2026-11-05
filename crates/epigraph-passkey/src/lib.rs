@@ -15,6 +15,13 @@
 //! * the attestation roots and AAGUID allowlist come from THIS process's
 //!   configuration at finish time, never from the stored state
 //!   ([`Passkeys::finish_registration`]);
+//! * the Android key rules (the `android-key` format, a device-bound
+//!   credential) are checked here on the registered credential, whatever
+//!   the stored state allowed;
+//! * whether a registration may carry no attestation (the anchored path) is
+//!   the caller's finding from rows the request DSN cannot write
+//!   ([`ActAnchor`]), re-verified here ([`Passkeys::check_anchor`]); the
+//!   stored state only has to agree with it;
 //! * user verification is checked on the registered credential and on every
 //!   assertion here, whatever policy the stored state names (operator ruling
 //!   D5: a passkey with user verification);
@@ -35,6 +42,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
     AttestationCaList, AttestationCaListBuilder, AttestedPasskeyRegistration, Passkey,
@@ -42,7 +50,9 @@ use webauthn_rs::prelude::{
     Webauthn, WebauthnBuilder, WebauthnError,
 };
 
-pub use config::{AttestationPolicy, ConfigError, PasskeyConfig, RelyingParty};
+pub use config::{
+    AaguidAllowlist, AttestationPolicy, AttestedPolicy, ConfigError, PasskeyConfig, RelyingParty,
+};
 
 /// The shortest challenge [`Passkeys::start_authentication`] accepts as an
 /// override (WebAuthn recommends at least 16 random bytes).
@@ -73,6 +83,14 @@ pub enum PasskeyError {
     /// The stored ceremony state is not one this process can finish.
     #[error("ceremony state: {0}")]
     State(String),
+    /// The library verified the attestation, and this crate's policy refused
+    /// it (an attestation under an Android root that is not a device-bound
+    /// `android-key` one; an attestation statement on the anchored path).
+    #[error("the attestation was refused: {0}")]
+    AttestationRefused(String),
+    /// The anchored path's anchor does not admit this registration.
+    #[error("the passkey.register act does not anchor this passkey: {0}")]
+    Anchor(AnchorRefusal),
     /// A request or stored value is malformed.
     #[error("malformed {what}: {detail}")]
     Malformed {
@@ -161,7 +179,8 @@ pub struct RegisteredPasskey {
     /// The authenticator model, from a verified attestation; the nil UUID for
     /// `none` and self attestation.
     pub aaguid: Uuid,
-    /// The attestation statement format (`packed`, `tpm`, `none`, ...).
+    /// The attestation statement format (`packed`, `tpm`, `android-key`,
+    /// `none`, ...).
     pub attestation_format: String,
     /// Whether the authenticator verified its user. Always true: a
     /// registration that did not is refused.
@@ -205,9 +224,15 @@ pub struct Assertion {
 pub struct Passkeys {
     config: PasskeyConfig,
     webauthn: Webauthn,
-    /// Built from [`AttestationPolicy::Allowlist`]; `None` for
-    /// [`AttestationPolicy::SoftwareAllowed`].
-    ca_list: Option<AttestationCaList>,
+    /// The per-model allowlist's roots, each admitting only the listed
+    /// AAGUIDs; `None` without an allowlist.
+    allowlist_cas: Option<AttestationCaList>,
+    /// The Android key roots, each a BLANKET allow; `None` without them. A
+    /// separate list, never merged into `allowlist_cas`: the library's union
+    /// of a blanket and a restricted entry for one root is a blanket allow.
+    android_cas: Option<AttestationCaList>,
+    /// [`config::ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`].
+    allow_synced_anchored: bool,
 }
 
 impl std::fmt::Debug for Passkeys {
@@ -226,6 +251,53 @@ impl std::fmt::Debug for Passkeys {
 const STATE_VERSION: u64 = 1;
 const KIND_ATTESTED: &str = "attested";
 const KIND_SOFTWARE: &str = "software";
+const KIND_ANCHORED: &str = "anchored";
+
+/// The allowlist's roots: every (root, AAGUID) pair, so a root admits ONLY
+/// the listed models, never a blanket allow.
+fn allowlist_cas(
+    ca_pem: &[u8],
+    aaguids: &BTreeSet<Uuid>,
+) -> Result<AttestationCaList, PasskeyError> {
+    let certs = config::pem_certificates(ca_pem);
+    if certs.is_empty() || aaguids.is_empty() {
+        return Err(PasskeyError::Config(
+            "the attestation allowlist needs a root and an AAGUID".into(),
+        ));
+    }
+    let mut builder = AttestationCaListBuilder::new();
+    for cert in &certs {
+        for aaguid in aaguids {
+            builder
+                .insert_device_pem(
+                    cert,
+                    *aaguid,
+                    format!("allowlisted authenticator {aaguid}"),
+                    std::collections::BTreeMap::new(),
+                )
+                .map_err(|e| PasskeyError::Config(format!("attestation root: {e}")))?;
+        }
+    }
+    Ok(builder.build())
+}
+
+/// The Android key roots: each certificate of the bundle on its own (the
+/// library's PEM constructor reads only the first) as a BLANKET allow.
+fn android_key_cas(ca_pem: &[u8]) -> Result<AttestationCaList, PasskeyError> {
+    let certs = config::pem_certificates(ca_pem);
+    if certs.is_empty() {
+        return Err(PasskeyError::Config(
+            "the Android key roots need a certificate".into(),
+        ));
+    }
+    let mut list = AttestationCaList::default();
+    for cert in &certs {
+        let one = AttestationCaList::try_from(cert.as_slice())
+            .map_err(|e| PasskeyError::Config(format!("Android key attestation root: {e}")))?;
+        list.union(&one);
+    }
+    Ok(list)
+}
 
 impl Passkeys {
     /// Build the relying party for `config`.
@@ -240,38 +312,64 @@ impl Passkeys {
             .rp_name(RP_NAME)
             .build()
             .map_err(|e| PasskeyError::Config(e.to_string()))?;
-        let ca_list = match &config.policy {
-            AttestationPolicy::SoftwareAllowed => None,
+        let (allowlist, android, allow_synced_anchored) = match &config.policy {
+            AttestationPolicy::SoftwareAllowed => (None, None, false),
             AttestationPolicy::Allowlist { ca_pem, aaguids } => {
-                let certs = config::pem_certificates(ca_pem);
-                if certs.is_empty() || aaguids.is_empty() {
+                (Some(allowlist_cas(ca_pem, aaguids)?), None, false)
+            }
+            AttestationPolicy::Attested(p) => {
+                let allowlist = p
+                    .allowlist
+                    .as_ref()
+                    .map(|a| allowlist_cas(&a.ca_pem, &a.aaguids))
+                    .transpose()?;
+                let android = p
+                    .android_key_ca_pem
+                    .as_deref()
+                    .map(android_key_cas)
+                    .transpose()?;
+                if allowlist.is_none() && android.is_none() {
                     return Err(PasskeyError::Config(
-                        "the attestation allowlist needs a root and an AAGUID".into(),
+                        "the attested policy needs the allowlist or the Android key roots".into(),
                     ));
                 }
-                // Every (root, AAGUID) pair: a root admits ONLY the listed
-                // models, never a blanket allow.
-                let mut builder = AttestationCaListBuilder::new();
-                for cert in &certs {
-                    for aaguid in aaguids {
-                        builder
-                            .insert_device_pem(
-                                cert,
-                                *aaguid,
-                                format!("allowlisted authenticator {aaguid}"),
-                                std::collections::BTreeMap::new(),
-                            )
-                            .map_err(|e| PasskeyError::Config(format!("attestation root: {e}")))?;
-                    }
-                }
-                Some(builder.build())
+                (allowlist, android, p.allow_synced_anchored)
             }
         };
+        if let (Some(a), Some(b)) = (&allowlist, &android) {
+            // One root in both files would be trusted for every key it
+            // attests in one list and for some models in the other: refuse
+            // the ambiguity rather than pick.
+            if a.cas().keys().any(|kid| b.cas().contains_key(kid)) {
+                return Err(PasskeyError::Config(format!(
+                    "a root is in both {} and {}; an Android key root is trusted for every \
+                     key it attests, so it cannot also be a per-model allowlist root",
+                    config::ENV_ATTESTATION_CA_FILE,
+                    config::ENV_ANDROID_KEY_CA_FILE
+                )));
+            }
+        }
         Ok(Self {
             config,
             webauthn,
-            ca_list,
+            allowlist_cas: allowlist,
+            android_cas: android,
+            allow_synced_anchored,
         })
+    }
+
+    /// Whether this relying party runs the anchored path
+    /// ([`Self::start_anchored_registration`]).
+    #[must_use]
+    pub fn allows_synced_anchored(&self) -> bool {
+        self.allow_synced_anchored
+    }
+
+    /// The roots a registration is started with: either list (the finish
+    /// splices in its own, whatever the state holds). `None`: the software
+    /// policy.
+    fn start_cas(&self) -> Option<&AttestationCaList> {
+        self.allowlist_cas.as_ref().or(self.android_cas.as_ref())
     }
 
     /// The configuration this relying party runs.
@@ -286,7 +384,8 @@ impl Passkeys {
     /// back.
     ///
     /// Under the allowlist policy this is an ATTESTED registration (direct
-    /// attestation, packed or TPM, a hardware-bound key); under the software
+    /// attestation, packed or TPM, a hardware-bound key; with the Android key
+    /// roots configured, `android-key` is offered too); under the software
     /// policy a plain passkey registration. Both require user verification.
     ///
     /// # Errors
@@ -297,7 +396,7 @@ impl Passkeys {
         user_name: &str,
         display_name: &str,
     ) -> Result<(Value, RegistrationState), PasskeyError> {
-        let (options, kind, library) = match &self.ca_list {
+        let (options, kind, library) = match self.start_cas() {
             Some(ca_list) => {
                 let (ccr, state) = self
                     .webauthn
@@ -310,8 +409,20 @@ impl Passkeys {
                         None,
                     )
                     .map_err(|e| refused(&e))?;
+                let mut options =
+                    serde_json::to_value(&ccr).map_err(|e| malformed("options", e))?;
+                if self.android_cas.is_some() {
+                    // A hint to the client (WebAuthn L3 `attestationFormats`):
+                    // the library offers packed and TPM only.
+                    if let Some(formats) = options
+                        .pointer_mut("/publicKey/attestationFormats")
+                        .and_then(Value::as_array_mut)
+                    {
+                        formats.push(Value::from("android-key"));
+                    }
+                }
                 (
-                    serde_json::to_value(&ccr).map_err(|e| malformed("options", e))?,
+                    options,
                     KIND_ATTESTED,
                     serde_json::to_value(&state).map_err(|e| malformed("state", e))?,
                 )
@@ -360,10 +471,20 @@ impl Passkeys {
     /// over whatever the stored state carries; user verification is checked on
     /// the credential whatever policy the stored state names.
     ///
+    /// With both the allowlist and the Android key roots, the response is
+    /// verified against the allowlist first (today's path, unchanged) and,
+    /// only when that refuses it, against the Android roots ALONE. A
+    /// registration verified that way is accepted only as a device-bound
+    /// `android-key` attestation ([`android_key_rules`]): a `packed` or `tpm`
+    /// certificate chaining to an Android root is refused, as is a
+    /// backup-eligible credential, whatever the stored state allowed.
+    ///
     /// # Errors
     /// [`PasskeyError::Refused`] / [`PasskeyError::UserNotVerified`]: the
     /// response does not verify (wrong origin or rp id, bad signature, an
     /// attestation that is not allowlisted, no user verification, ...).
+    /// [`PasskeyError::AttestationRefused`]: it verified under an Android
+    /// root, and is not a device-bound `android-key` attestation.
     /// [`PasskeyError::State`]: the state was not started under this policy.
     pub fn finish_registration(
         &self,
@@ -372,24 +493,33 @@ impl Passkeys {
     ) -> Result<RegisteredPasskey, PasskeyError> {
         let reg: RegisterPublicKeyCredential =
             serde_json::from_value(response.clone()).map_err(|e| malformed("response", e))?;
-        let passkey_json = match &self.ca_list {
-            Some(ca_list) => {
-                let mut library = self.library_state(&state.0, KIND_ATTESTED)?.clone();
-                // The roots are ours, not the row's.
-                let ours = serde_json::to_value(ca_list).map_err(|e| malformed("roots", e))?;
-                match library.as_object_mut() {
-                    Some(obj) => {
-                        obj.insert("ca_list".into(), ours);
+        let passkey_json = match self.start_cas() {
+            Some(_) => {
+                let library = self.library_state(&state.0, KIND_ATTESTED)?;
+                let allowlisted = self
+                    .allowlist_cas
+                    .as_ref()
+                    .map(|cas| self.finish_attested_under(&reg, library, cas));
+                match (allowlisted, &self.android_cas) {
+                    (Some(Ok(pk)), _) => pk,
+                    (first, Some(android)) => {
+                        match self.finish_attested_under(&reg, library, android) {
+                            Ok(pk) => {
+                                android_key_rules(&pk)?;
+                                pk
+                            }
+                            Err(second) => {
+                                return Err(match first {
+                                    None => second,
+                                    Some(Err(first)) => both_refused(first, second),
+                                    Some(Ok(_)) => unreachable!("matched above"),
+                                })
+                            }
+                        }
                     }
-                    None => return Err(PasskeyError::State("not an object".into())),
+                    (Some(Err(e)), None) => return Err(e),
+                    (None, None) => unreachable!("start_cas is Some"),
                 }
-                let st: AttestedPasskeyRegistration =
-                    serde_json::from_value(library).map_err(|e| malformed("state", e))?;
-                let pk = self
-                    .webauthn
-                    .finish_attested_passkey_registration(&reg, &st)
-                    .map_err(|e| refused(&e))?;
-                serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?
             }
             None => {
                 let library = self.library_state(&state.0, KIND_SOFTWARE)?.clone();
@@ -403,6 +533,198 @@ impl Passkeys {
             }
         };
         registered_from(passkey_json)
+    }
+
+    /// Finish an attested registration of `library` (the stored library
+    /// state) under `cas`, spliced over the state's own roots.
+    fn finish_attested_under(
+        &self,
+        reg: &RegisterPublicKeyCredential,
+        library: &Value,
+        cas: &AttestationCaList,
+    ) -> Result<Value, PasskeyError> {
+        let mut library = library.clone();
+        // The roots are ours, not the row's.
+        let ours = serde_json::to_value(cas).map_err(|e| malformed("roots", e))?;
+        match library.as_object_mut() {
+            Some(obj) => {
+                obj.insert("ca_list".into(), ours);
+            }
+            None => return Err(PasskeyError::State("not an object".into())),
+        }
+        let st: AttestedPasskeyRegistration =
+            serde_json::from_value(library).map_err(|e| malformed("state", e))?;
+        let pk = self
+            .webauthn
+            .finish_attested_passkey_registration(reg, &st)
+            .map_err(|e| refused(&e))?;
+        serde_json::to_value(&pk).map_err(|e| malformed("credential", e))
+    }
+
+    /// Start registering a LATER passkey on the anchored path: a plain
+    /// passkey registration (no attestation asked, a synced credential
+    /// allowed, user verification required), stored as an `anchored` state.
+    ///
+    /// The caller decides it is the anchored path from rows the request DSN
+    /// cannot write, and only when [`Self::check_anchor`] admits the
+    /// enrollment's [`ActAnchor`]; [`Self::finish_anchored_registration`]
+    /// checks it again.
+    ///
+    /// # Errors
+    /// [`PasskeyError::Config`]: the anchored path is not enabled; or the
+    /// library refused to build the challenge.
+    pub fn start_anchored_registration(
+        &self,
+        user_id: Uuid,
+        user_name: &str,
+        display_name: &str,
+    ) -> Result<(Value, RegistrationState), PasskeyError> {
+        if !self.allow_synced_anchored {
+            return Err(PasskeyError::Config(format!(
+                "the anchored registration is off ({})",
+                config::ENV_ALLOW_SYNCED_ANCHORED_PASSKEY
+            )));
+        }
+        let (ccr, state) = self
+            .webauthn
+            .start_passkey_registration(user_id, user_name, display_name, None)
+            .map_err(|e| refused(&e))?;
+        let state = serde_json::json!({
+            "v": STATE_VERSION,
+            "kind": KIND_ANCHORED,
+            "library": serde_json::to_value(&state).map_err(|e| malformed("state", e))?,
+        });
+        Ok((
+            serde_json::to_value(&ccr).map_err(|e| malformed("options", e))?,
+            RegistrationState(state),
+        ))
+    }
+
+    /// Finish a registration on the anchored path: `anchor` must admit it
+    /// ([`Self::check_anchor`], re-run here), the state must have been
+    /// started as an anchored one, and the response must carry NO
+    /// attestation statement (`none`): this path verifies none, so a
+    /// statement here would be recorded as if it had been, and could anchor
+    /// a further passkey. The passkey is recorded as `none` with the nil
+    /// AAGUID; [`is_hardware_attested`] never admits it as an anchor.
+    ///
+    /// # Errors
+    /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
+    /// [`PasskeyError::State`], [`PasskeyError::AttestationRefused`] (an
+    /// attestation statement), or the library's refusal.
+    pub fn finish_anchored_registration(
+        &self,
+        response: &Value,
+        state: &RegistrationState,
+        anchor: &ActAnchor,
+    ) -> Result<RegisteredPasskey, PasskeyError> {
+        if !self.allow_synced_anchored {
+            return Err(PasskeyError::Config(format!(
+                "the anchored registration is off ({})",
+                config::ENV_ALLOW_SYNCED_ANCHORED_PASSKEY
+            )));
+        }
+        self.check_anchor(anchor).map_err(PasskeyError::Anchor)?;
+        let library = self.library_state(&state.0, KIND_ANCHORED)?.clone();
+        let reg: RegisterPublicKeyCredential =
+            serde_json::from_value(response.clone()).map_err(|e| malformed("response", e))?;
+        let st: PasskeyRegistration =
+            serde_json::from_value(library).map_err(|e| malformed("state", e))?;
+        let pk = self
+            .webauthn
+            .finish_passkey_registration(&reg, &st)
+            .map_err(|e| refused(&e))?;
+        let registered =
+            registered_from(serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?)?;
+        if registered.attestation_format != "none" {
+            return Err(PasskeyError::AttestationRefused(format!(
+                "an anchored passkey is registered without attestation, and this response \
+                 carries a `{}` statement this path does not verify",
+                registered.attestation_format
+            )));
+        }
+        Ok(registered)
+    }
+
+    /// Whether `anchor` admits an anchored registration: its act is a
+    /// CONFIRMED `passkey.register` act of the enrollment's person, its
+    /// confirming passkey is that person's, live and hardware-attested
+    /// ([`is_hardware_attested`]), and the confirmation's stored assertion
+    /// RE-VERIFIES: made over the act's own challenge
+    /// ([`act_challenge`] of the act id, its stored args digest and its
+    /// stored nonce, which is also the stored ceremony's), by that passkey's
+    /// key, for this relying party, asserting that credential, and not as
+    /// backup-eligible. The database cannot verify a signature, so an
+    /// application-DSN holder can record a confirmation with fabricated
+    /// evidence; that confirmation anchors nothing here.
+    ///
+    /// # Errors
+    /// The first [`AnchorRefusal`] that applies.
+    pub fn check_anchor(&self, anchor: &ActAnchor) -> Result<(), AnchorRefusal> {
+        if anchor.act_kind != "passkey.register" {
+            return Err(AnchorRefusal::NotARegisterAct);
+        }
+        if anchor.act_outcome.as_deref() != Some("confirmed") {
+            return Err(AnchorRefusal::NotConfirmed);
+        }
+        if anchor.anchor_person != anchor.enrollment_person {
+            return Err(AnchorRefusal::PersonMismatch);
+        }
+        if anchor.anchor_revoked {
+            return Err(AnchorRefusal::AnchorRevoked);
+        }
+        if !is_hardware_attested(
+            &anchor.anchor_attestation_format,
+            anchor.anchor_aaguid,
+            anchor.anchor_backup_eligible,
+        ) {
+            return Err(AnchorRefusal::AnchorNotAttested);
+        }
+        let evidence = anchor
+            .assertion_evidence
+            .as_ref()
+            .ok_or(AnchorRefusal::ChallengeNotBound)?;
+        let asserted_over =
+            evidence_challenge(evidence).map_err(|_| AnchorRefusal::ChallengeNotBound)?;
+        let digest: [u8; 32] = anchor
+            .args_digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| AnchorRefusal::ChallengeNotBound)?;
+        let stored = anchor
+            .act_challenge_state
+            .as_ref()
+            .ok_or(AnchorRefusal::ChallengeNotBound)?;
+        let nonce: [u8; ACT_NONCE_LEN] = stored
+            .get("nonce")
+            .and_then(Value::as_str)
+            .and_then(|n| URL_SAFE_NO_PAD.decode(n).ok())
+            .and_then(|n| n.try_into().ok())
+            .ok_or(AnchorRefusal::ChallengeNotBound)?;
+        let started_with = stored
+            .get("ceremony")
+            .cloned()
+            .map(AuthenticationState::from_json)
+            .and_then(|c| c.challenge().ok())
+            .ok_or(AnchorRefusal::ChallengeNotBound)?;
+        let bound = act_challenge(anchor.act_id, &digest, &nonce);
+        if asserted_over != bound.as_slice() || started_with != bound.as_slice() {
+            return Err(AnchorRefusal::ChallengeNotBound);
+        }
+        let snapshot = StoredPasskey {
+            passkey: anchor.anchor_passkey.clone(),
+            sign_count: 0,
+        };
+        let asserted = self
+            .reverify(evidence, &snapshot)
+            .map_err(|_| AnchorRefusal::AssertionDoesNotVerify)?;
+        if asserted.credential_id != anchor.anchor_credential_id {
+            return Err(AnchorRefusal::CredentialMismatch);
+        }
+        if asserted.backup_eligible {
+            return Err(AnchorRefusal::BackupEligibilityChanged);
+        }
+        Ok(())
     }
 
     fn passkey_of(stored: &StoredPasskey, counter: u32) -> Result<Passkey, PasskeyError> {
@@ -613,6 +935,154 @@ impl Verifier {
         snapshot: &StoredPasskey,
     ) -> Result<Assertion, PasskeyError> {
         self.0.reverify(evidence, snapshot)
+    }
+}
+
+/// What the anchored path knows of an enrollment's `passkey.register` act and
+/// the passkey that confirmed it (migration 200's
+/// `epigraph_enrollment_anchor`): rows the request DSN reads but does not
+/// write, except for the confirmation, which [`Passkeys::check_anchor`]
+/// re-verifies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActAnchor {
+    /// The act the enrollment was opened on.
+    pub act_id: Uuid,
+    /// Its kind.
+    pub act_kind: String,
+    /// Its outcome (`confirmed`, `refused`, or none yet).
+    pub act_outcome: Option<String>,
+    /// Its stored canonical args digest (32 bytes).
+    pub args_digest: Vec<u8>,
+    /// Its stored confirmation ceremony (`{"ceremony": ..., "nonce": ...}`).
+    pub act_challenge_state: Option<Value>,
+    /// Its stored assertion ([`Assertion::evidence`]).
+    pub assertion_evidence: Option<Value>,
+    /// The person the enrollment registers a passkey for.
+    pub enrollment_person: Uuid,
+    /// The person whose passkey confirmed the act.
+    pub anchor_person: Uuid,
+    /// The confirming passkey's credential id.
+    pub anchor_credential_id: Vec<u8>,
+    /// The confirming passkey's stored credential.
+    pub anchor_passkey: Value,
+    /// What its registration recorded: the AAGUID, ...
+    pub anchor_aaguid: Uuid,
+    /// ... the attestation format, ...
+    pub anchor_attestation_format: String,
+    /// ... and whether it may be synced.
+    pub anchor_backup_eligible: bool,
+    /// Whether it has been revoked since.
+    pub anchor_revoked: bool,
+}
+
+/// Why an [`ActAnchor`] does not admit an anchored registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AnchorRefusal {
+    /// The act is not a `passkey.register` act.
+    #[error("the enrollment's act is not a passkey.register act")]
+    NotARegisterAct,
+    /// The act was not confirmed.
+    #[error("the enrollment's act was not confirmed")]
+    NotConfirmed,
+    /// The confirming passkey is another person's.
+    #[error("the act was confirmed by another person's passkey")]
+    PersonMismatch,
+    /// The confirming passkey has been revoked.
+    #[error("the passkey that confirmed the act has been revoked")]
+    AnchorRevoked,
+    /// The confirming passkey is not hardware-attested.
+    #[error(
+        "the passkey that confirmed the act is not hardware-attested (a synced or unattested \
+         passkey anchors nothing)"
+    )]
+    AnchorNotAttested,
+    /// The stored assertion was not made over the act's own challenge.
+    #[error("the act's recorded confirmation is not over the act's own challenge")]
+    ChallengeNotBound,
+    /// The stored assertion does not verify against the confirming passkey.
+    #[error("the act's recorded confirmation does not verify against the confirming passkey")]
+    AssertionDoesNotVerify,
+    /// The stored assertion is by another credential.
+    #[error("the act's recorded confirmation asserts another credential")]
+    CredentialMismatch,
+    /// The stored assertion is backup-eligible, by a device-bound passkey.
+    #[error("the act's recorded confirmation asserted a backup-eligible credential")]
+    BackupEligibilityChanged,
+}
+
+impl AnchorRefusal {
+    /// A stable snake_case code for logs and responses.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotARegisterAct => "not_a_register_act",
+            Self::NotConfirmed => "act_not_confirmed",
+            Self::PersonMismatch => "person_mismatch",
+            Self::AnchorRevoked => "anchor_revoked",
+            Self::AnchorNotAttested => "anchor_not_attested",
+            Self::ChallengeNotBound => "challenge_not_bound",
+            Self::AssertionDoesNotVerify => "assertion_does_not_verify",
+            Self::CredentialMismatch => "credential_mismatch",
+            Self::BackupEligibilityChanged => "backup_eligibility_changed",
+        }
+    }
+}
+
+/// Whether a stored passkey was registered HARDWARE-ATTESTED, from what its
+/// registration recorded: device-bound (not backup-eligible), and either a
+/// `packed` / `tpm` attestation naming its model (a non-nil AAGUID: `none`
+/// and self attestation record the nil one) or an `android-key` one (which
+/// names no model). Under the attested policy those are recorded only from
+/// an attestation verified against the configured roots; the anchored path
+/// records `none` only.
+#[must_use]
+pub fn is_hardware_attested(attestation_format: &str, aaguid: Uuid, backup_eligible: bool) -> bool {
+    !backup_eligible
+        && match attestation_format {
+            "packed" | "tpm" => !aaguid.is_nil(),
+            "android-key" => true,
+            _ => false,
+        }
+}
+
+/// The rules for a registration that verified under the Android key roots
+/// (a blanket allow): the `android-key` format with Android key metadata,
+/// and a device-bound credential. User verification is
+/// [`registered_from`]'s, as for every registration.
+fn android_key_rules(passkey: &Value) -> Result<(), PasskeyError> {
+    let cred = passkey
+        .get("cred")
+        .ok_or_else(|| malformed("credential", "no cred"))?;
+    let format = cred.get("attestation_format").and_then(Value::as_str);
+    let android_metadata = cred
+        .pointer("/attestation/metadata/AndroidKey")
+        .is_some_and(Value::is_object);
+    if format != Some("android-key") || !android_metadata {
+        return Err(PasskeyError::AttestationRefused(format!(
+            "an Android key root vouches only for the android-key attestation format, and this \
+             is `{}`",
+            format.unwrap_or("unknown")
+        )));
+    }
+    if cred.get("backup_eligible").and_then(Value::as_bool) != Some(false) {
+        return Err(PasskeyError::AttestationRefused(
+            "an Android key attestation is accepted only for a device-bound credential, and \
+             this one is backup-eligible"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Both attested attempts refused: the allowlist's reason and the Android
+/// roots'. A reason that is not the library's (user verification, the
+/// state) is reported alone, as it would be without the Android roots.
+fn both_refused(allowlist: PasskeyError, android: PasskeyError) -> PasskeyError {
+    match (allowlist, android) {
+        (PasskeyError::Refused(a), PasskeyError::Refused(b)) => PasskeyError::Refused(format!(
+            "attestation allowlist: {a}; Android key roots: {b}"
+        )),
+        (PasskeyError::Refused(_), other) | (other, _) => other,
     }
 }
 

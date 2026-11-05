@@ -27,6 +27,30 @@
 //! accepted). It exists for tests and local development only, and a request
 //! binary refuses to start with it on a database armed for operator binding
 //! (the same refusal shape as operator ruling OQ-7 (b)).
+//!
+//! # Android hardware keys, and a synced passkey anchored by an attested one
+//!
+//! Two settings widen the attested policy without weakening its first
+//! passkey ([`AttestationPolicy::Attested`]):
+//!
+//! * [`ENV_ANDROID_KEY_CA_FILE`]: roots trusted for EVERY key they attest (a
+//!   blanket root, unlike the allowlist's per-model roots), but only for the
+//!   `android-key` attestation format, from a device-bound
+//!   (not backup-eligible), user-verified credential. `webauthn-rs` checks an
+//!   AAGUID only for `packed` and `tpm` attestation, so an Android key can
+//!   only ever verify under a blanket root; any other format verified under
+//!   one of these roots is refused. Usable alone or beside the allowlist.
+//! * [`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`]: a LATER passkey (one enrolled on a
+//!   confirmed `passkey.register` admin act) may carry no attestation, so a
+//!   synced passkey (a password manager's) can be registered, when the act
+//!   was confirmed by one of the same person's live, HARDWARE-ATTESTED
+//!   passkeys ([`crate::is_hardware_attested`]). A person's FIRST passkey is
+//!   attested whatever this says, so it is served on an armed database: it
+//!   never lets a maintenance-DSN holder plant a first key. The accepted
+//!   cost: once a synced passkey is registered, an elevation is as strong as
+//!   that password-manager account.
+//!
+//! Neither combines with [`ENV_ALLOW_SOFTWARE_ATTESTATION`].
 
 use std::collections::BTreeSet;
 
@@ -53,6 +77,16 @@ pub const ENV_ATTESTATION_CA_FILE: &str = "EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE
 /// authenticator). Refused at boot on an armed database.
 pub const ENV_ALLOW_SOFTWARE_ATTESTATION: &str = "EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION";
 
+/// A PEM file of Android hardware attestation roots, trusted for every key
+/// they attest, for the `android-key` format only (module docs).
+pub const ENV_ANDROID_KEY_CA_FILE: &str = "EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE";
+
+/// Opt-in (default off): a later passkey, enrolled on a `passkey.register`
+/// act confirmed by a hardware-attested passkey of the same person, may carry
+/// no attestation (module docs).
+pub const ENV_ALLOW_SYNCED_ANCHORED_PASSKEY: &str =
+    "EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY";
+
 /// Every variable this module reads, for a caller that reports which are set.
 pub const ALL_ENV: &[&str] = &[
     ENV_RP_ID,
@@ -60,6 +94,8 @@ pub const ALL_ENV: &[&str] = &[
     ENV_AAGUIDS,
     ENV_ATTESTATION_CA_FILE,
     ENV_ALLOW_SOFTWARE_ATTESTATION,
+    ENV_ANDROID_KEY_CA_FILE,
+    ENV_ALLOW_SYNCED_ANCHORED_PASSKEY,
 ];
 
 /// Which registrations the relying party accepts.
@@ -75,8 +111,35 @@ pub enum AttestationPolicy {
         /// AAGUID (which is what `none` attestation reports).
         aaguids: BTreeSet<Uuid>,
     },
+    /// The attested policy with either of the two settings of the module
+    /// docs. The configuration that sets neither reads as
+    /// [`AttestationPolicy::Allowlist`], exactly as before they existed.
+    Attested(AttestedPolicy),
     /// TEST AND DEVELOPMENT ONLY: `none` and self attestation accepted.
     SoftwareAllowed,
+}
+
+/// The per-model attestation allowlist: [`AttestationPolicy::Allowlist`]'s
+/// fields, as one part of an [`AttestedPolicy`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AaguidAllowlist {
+    /// The attestation roots, PEM (one or more certificates).
+    pub ca_pem: Vec<u8>,
+    /// The accepted authenticator models. Never empty, never the nil AAGUID.
+    pub aaguids: BTreeSet<Uuid>,
+}
+
+/// [`AttestationPolicy::Attested`]: at least one of `allowlist` and
+/// `android_key_ca_pem`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestedPolicy {
+    /// `packed` / `tpm` attestation by an allowlisted model chaining to its
+    /// roots, exactly as [`AttestationPolicy::Allowlist`].
+    pub allowlist: Option<AaguidAllowlist>,
+    /// [`ENV_ANDROID_KEY_CA_FILE`]'s roots (PEM, one or more certificates).
+    pub android_key_ca_pem: Option<Vec<u8>>,
+    /// [`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`].
+    pub allow_synced_anchored: bool,
 }
 
 /// A complete relying-party configuration.
@@ -125,9 +188,26 @@ pub enum ConfigError {
     #[error(
         "attestation is required ({ENV_ALLOW_SOFTWARE_ATTESTATION} is off): set {ENV_AAGUIDS} \
          to the accepted authenticator models and {ENV_ATTESTATION_CA_FILE} to their \
-         attestation roots ({0} missing)"
+         attestation roots ({0} missing), or set only {ENV_ANDROID_KEY_CA_FILE} to the \
+         Android hardware attestation roots"
     )]
     AllowlistMissing(&'static str),
+    /// [`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`] holds something other than a
+    /// flag.
+    #[error(
+        "{ENV_ALLOW_SYNCED_ANCHORED_PASSKEY} must be 1/true/yes or 0/false/no (or unset), got \
+         {0:?}"
+    )]
+    AnchoredFlag(String),
+    /// The software flag was combined with a setting of the attested policy.
+    #[error(
+        "{ENV_ALLOW_SOFTWARE_ATTESTATION} replaces attestation and does not combine with {0}; \
+         unset one of them"
+    )]
+    SoftwareWith(&'static str),
+    /// [`ENV_ANDROID_KEY_CA_FILE`] could not be read or holds no certificate.
+    #[error("{ENV_ANDROID_KEY_CA_FILE}: {0}")]
+    AndroidKeyCaFile(String),
     /// An entry of [`ENV_AAGUIDS`] is not a UUID, or is the nil UUID.
     #[error("{ENV_AAGUIDS}: {0:?} is not an authenticator AAGUID")]
     Aaguid(String),
@@ -139,10 +219,14 @@ pub enum ConfigError {
 /// `1`/`true`/`yes` is on, `0`/`false`/`no` or empty is off (trimmed,
 /// case-insensitive); anything else is an error, not off.
 fn parse_flag(raw: &str) -> Result<bool, ConfigError> {
+    parse_bool(raw).ok_or_else(|| ConfigError::Flag(raw.to_string()))
+}
+
+fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "" | "0" | "false" | "no" => Ok(false),
-        _ => Err(ConfigError::Flag(raw.to_string())),
+        "1" | "true" | "yes" => Some(true),
+        "" | "0" | "false" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -218,41 +302,57 @@ impl PasskeyConfig {
         };
         let aaguids = val(ENV_AAGUIDS);
         let ca_file = val(ENV_ATTESTATION_CA_FILE);
+        let android_file = val(ENV_ANDROID_KEY_CA_FILE);
+        let anchored = match val(ENV_ALLOW_SYNCED_ANCHORED_PASSKEY) {
+            Some(raw) => parse_bool(&raw).ok_or(ConfigError::AnchoredFlag(raw))?,
+            None => false,
+        };
 
         let policy = if software {
             if aaguids.is_some() || ca_file.is_some() {
                 return Err(ConfigError::FlagWithAllowlist);
             }
+            if android_file.is_some() {
+                return Err(ConfigError::SoftwareWith(ENV_ANDROID_KEY_CA_FILE));
+            }
+            if anchored {
+                return Err(ConfigError::SoftwareWith(ENV_ALLOW_SYNCED_ANCHORED_PASSKEY));
+            }
             AttestationPolicy::SoftwareAllowed
+        } else if android_file.is_none() && !anchored {
+            // Neither new setting: exactly the policy (and the refusals) of
+            // before they existed.
+            let (ca_pem, aaguids) = read_allowlist(aaguids, ca_file, &read_file)?;
+            AttestationPolicy::Allowlist { ca_pem, aaguids }
         } else {
-            let aaguids = aaguids.ok_or(ConfigError::AllowlistMissing(ENV_AAGUIDS))?;
-            let ca_file = ca_file.ok_or(ConfigError::AllowlistMissing(ENV_ATTESTATION_CA_FILE))?;
-            let mut set = BTreeSet::new();
-            for raw in aaguids.split(|c: char| c == ',' || c.is_whitespace()) {
-                if raw.is_empty() {
-                    continue;
+            let allowlist = if aaguids.is_none() && ca_file.is_none() && android_file.is_some() {
+                None
+            } else {
+                // A partial allowlist is refused here as it is without the
+                // Android roots.
+                let (ca_pem, aaguids) = read_allowlist(aaguids, ca_file, &read_file)?;
+                Some(AaguidAllowlist { ca_pem, aaguids })
+            };
+            let android_key_ca_pem = match android_file {
+                Some(path) => {
+                    let pem = read_file(path.trim()).map_err(|e| {
+                        ConfigError::AndroidKeyCaFile(format!("cannot read {}: {e}", path.trim()))
+                    })?;
+                    if pem_certificates(&pem).is_empty() {
+                        return Err(ConfigError::AndroidKeyCaFile(format!(
+                            "{} holds no PEM certificate",
+                            path.trim()
+                        )));
+                    }
+                    Some(pem)
                 }
-                let id = Uuid::parse_str(raw).map_err(|_| ConfigError::Aaguid(raw.to_string()))?;
-                if id.is_nil() {
-                    return Err(ConfigError::Aaguid(raw.to_string()));
-                }
-                set.insert(id);
-            }
-            if set.is_empty() {
-                return Err(ConfigError::AllowlistMissing(ENV_AAGUIDS));
-            }
-            let ca_pem = read_file(ca_file.trim())
-                .map_err(|e| ConfigError::CaFile(format!("cannot read {}: {e}", ca_file.trim())))?;
-            if pem_certificates(&ca_pem).is_empty() {
-                return Err(ConfigError::CaFile(format!(
-                    "{} holds no PEM certificate",
-                    ca_file.trim()
-                )));
-            }
-            AttestationPolicy::Allowlist {
-                ca_pem,
-                aaguids: set,
-            }
+                None => None,
+            };
+            AttestationPolicy::Attested(AttestedPolicy {
+                allowlist,
+                android_key_ca_pem,
+                allow_synced_anchored: anchored,
+            })
         };
 
         Ok(Some(Self {
@@ -269,6 +369,54 @@ impl PasskeyConfig {
     pub fn allows_software_attestation(&self) -> bool {
         matches!(self.policy, AttestationPolicy::SoftwareAllowed)
     }
+
+    /// Whether a later passkey anchored by a hardware-attested one may carry
+    /// no attestation ([`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`]).
+    #[must_use]
+    pub fn allows_synced_anchored(&self) -> bool {
+        matches!(
+            self.policy,
+            AttestationPolicy::Attested(AttestedPolicy {
+                allow_synced_anchored: true,
+                ..
+            })
+        )
+    }
+}
+
+/// The allowlist's AAGUIDs and roots, both required: [`ENV_AAGUIDS`] and
+/// [`ENV_ATTESTATION_CA_FILE`] as read before the attested policy's other
+/// settings existed.
+fn read_allowlist(
+    aaguids: Option<String>,
+    ca_file: Option<String>,
+    read_file: &impl Fn(&str) -> std::io::Result<Vec<u8>>,
+) -> Result<(Vec<u8>, BTreeSet<Uuid>), ConfigError> {
+    let aaguids = aaguids.ok_or(ConfigError::AllowlistMissing(ENV_AAGUIDS))?;
+    let ca_file = ca_file.ok_or(ConfigError::AllowlistMissing(ENV_ATTESTATION_CA_FILE))?;
+    let mut set = BTreeSet::new();
+    for raw in aaguids.split(|c: char| c == ',' || c.is_whitespace()) {
+        if raw.is_empty() {
+            continue;
+        }
+        let id = Uuid::parse_str(raw).map_err(|_| ConfigError::Aaguid(raw.to_string()))?;
+        if id.is_nil() {
+            return Err(ConfigError::Aaguid(raw.to_string()));
+        }
+        set.insert(id);
+    }
+    if set.is_empty() {
+        return Err(ConfigError::AllowlistMissing(ENV_AAGUIDS));
+    }
+    let ca_pem = read_file(ca_file.trim())
+        .map_err(|e| ConfigError::CaFile(format!("cannot read {}: {e}", ca_file.trim())))?;
+    if pem_certificates(&ca_pem).is_empty() {
+        return Err(ConfigError::CaFile(format!(
+            "{} holds no PEM certificate",
+            ca_file.trim()
+        )));
+    }
+    Ok((ca_pem, set))
 }
 
 /// The relying party alone: the rp id and the origin, without an attestation
@@ -358,7 +506,7 @@ mod tests {
         PasskeyConfig::from_lookup(
             |k| map.get(k).cloned(),
             |p| {
-                if p == "/ca.pem" {
+                if p == "/ca.pem" || p == "/android.pem" {
                     Ok(CA.as_bytes().to_vec())
                 } else if p == "/empty.pem" {
                     Ok(b"not a certificate".to_vec())
@@ -421,6 +569,7 @@ mod tests {
                 assert_eq!(ca_pem, CA.as_bytes());
             }
             AttestationPolicy::SoftwareAllowed => panic!("software"),
+            AttestationPolicy::Attested(_) => panic!("attested"),
         }
         assert!(!read(&full())
             .unwrap()
@@ -539,6 +688,129 @@ mod tests {
         let mut v = full()[..2].to_vec();
         v[0] = (ENV_RP_ID, "auth.example.com:443");
         assert!(matches!(rp(&v), Err(ConfigError::RpId(_))));
+    }
+
+    /// Neither new setting (or the anchor flag spelled off) is TODAY's
+    /// configuration, variant for variant: the allowlist, not the attested
+    /// policy. Mutation: `from_lookup` always building `Attested` -> the
+    /// variant differs.
+    #[test]
+    fn without_the_new_settings_the_policy_is_unchanged() {
+        let today = read(&full()).unwrap().unwrap();
+        assert!(matches!(today.policy, AttestationPolicy::Allowlist { .. }));
+        let mut off = full();
+        off.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "0"));
+        assert_eq!(read(&off).unwrap().unwrap(), today);
+        assert!(!today.allows_synced_anchored());
+    }
+
+    /// The Android roots alone are a complete attested policy (no allowlist
+    /// needed), and beside the allowlist both are kept. Mutations: the
+    /// Android file ignored -> the Android-only case is `AllowlistMissing`;
+    /// the allowlist dropped when the Android file is set -> the combined case
+    /// has no allowlist.
+    #[test]
+    fn android_key_roots_stand_alone_or_beside_the_allowlist() {
+        let mut alone = full()[..2].to_vec();
+        alone.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        let cfg = read(&alone).unwrap().unwrap();
+        assert_eq!(
+            cfg.policy,
+            AttestationPolicy::Attested(AttestedPolicy {
+                allowlist: None,
+                android_key_ca_pem: Some(CA.as_bytes().to_vec()),
+                allow_synced_anchored: false,
+            })
+        );
+        assert!(!cfg.allows_software_attestation());
+        assert!(!cfg.allows_synced_anchored());
+
+        let mut both = full();
+        both.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        match read(&both).unwrap().unwrap().policy {
+            AttestationPolicy::Attested(p) => {
+                let list = p.allowlist.expect("the allowlist is kept");
+                assert_eq!(list.aaguids.len(), 1);
+                assert!(p.android_key_ca_pem.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The anchor flag is a strict flag; on, it reads as `allows_synced_anchored`
+    /// and NEVER as the software policy (it is served on an armed database).
+    /// It needs an attested policy to anchor: alone it is the missing
+    /// allowlist. Mutations: an unknown value read as off -> `"on"` answers
+    /// Ok; `allows_software_attestation` true for the anchored policy -> the
+    /// armed boot refuses it.
+    #[test]
+    fn the_anchor_flag_is_strict_and_never_the_software_policy() {
+        let mut on = full();
+        on.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, " Yes "));
+        let cfg = read(&on).unwrap().unwrap();
+        assert!(cfg.allows_synced_anchored());
+        assert!(!cfg.allows_software_attestation());
+        let mut bad = full();
+        bad.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "on"));
+        assert_eq!(read(&bad), Err(ConfigError::AnchoredFlag("on".to_string())));
+        let mut bare = full()[..2].to_vec();
+        bare.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "1"));
+        assert_eq!(read(&bare), Err(ConfigError::AllowlistMissing(ENV_AAGUIDS)));
+        let mut android = bare.clone();
+        android.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        assert!(read(&android).unwrap().unwrap().allows_synced_anchored());
+    }
+
+    /// Partial and malformed configurations of the new settings are boot
+    /// errors, never a silent policy: a half allowlist beside the Android
+    /// roots, an Android file that is missing or holds no certificate, and
+    /// either new setting with the software flag. The new variables alone
+    /// (no relying party) are a partial configuration. Mutations: the
+    /// partial-allowlist check skipped when the Android file is set -> the
+    /// AAGUID-only case answers Ok with the Android roots alone; the
+    /// software-combination checks removed -> those cases answer
+    /// `SoftwareAllowed`.
+    #[test]
+    fn the_new_settings_refuse_partial_or_conflicting_configurations() {
+        let mut half = full()[..3].to_vec();
+        half.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        assert_eq!(
+            read(&half),
+            Err(ConfigError::AllowlistMissing(ENV_ATTESTATION_CA_FILE))
+        );
+        let mut half = full();
+        half.remove(2);
+        half.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        assert_eq!(read(&half), Err(ConfigError::AllowlistMissing(ENV_AAGUIDS)));
+        for path in ["/missing.pem", "/empty.pem"] {
+            let mut v = full()[..2].to_vec();
+            v.push((ENV_ANDROID_KEY_CA_FILE, path));
+            assert!(
+                matches!(read(&v), Err(ConfigError::AndroidKeyCaFile(_))),
+                "{path}"
+            );
+        }
+        for (var, value) in [
+            (ENV_ANDROID_KEY_CA_FILE, "/android.pem"),
+            (ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "1"),
+        ] {
+            let mut v = full()[..2].to_vec();
+            v.push((ENV_ALLOW_SOFTWARE_ATTESTATION, "1"));
+            v.push((var, value));
+            assert_eq!(read(&v), Err(ConfigError::SoftwareWith(var)), "{var}");
+            match read(&[(var, value)]) {
+                Err(ConfigError::Partial { set }) => assert!(set.contains(var), "{set}"),
+                other => panic!("{var}: {other:?}"),
+            }
+        }
+        // The anchor flag spelled OFF does combine with the software flag.
+        let mut v = full()[..2].to_vec();
+        v.push((ENV_ALLOW_SOFTWARE_ATTESTATION, "1"));
+        v.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "no"));
+        assert_eq!(
+            read(&v).unwrap().unwrap().policy,
+            AttestationPolicy::SoftwareAllowed
+        );
     }
 
     #[test]

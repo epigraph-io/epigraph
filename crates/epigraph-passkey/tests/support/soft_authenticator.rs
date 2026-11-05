@@ -30,7 +30,10 @@
 //! * `clientDataJSON` `{"type", "challenge", "origin", "crossOrigin"}`, the
 //!   challenge copied verbatim from the options.
 //! * Attestation `none`, `packed` self attestation (signed by the credential
-//!   key), or `packed` with an `x5c` from a [`TestAttestation`] root.
+//!   key), `packed` with an `x5c` from a [`TestAttestation`] root, or
+//!   `android-key` (WebAuthn §8.4): a certificate FOR THE CREDENTIAL KEY,
+//!   issued by a [`TestAttestation`] root and carrying the Android key
+//!   attestation extension, the statement signed by the credential key.
 //! * Assertions: a DER ECDSA signature over `authenticatorData ‖
 //!   SHA-256(clientDataJSON)`.
 //!
@@ -47,7 +50,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ciborium::Value as Cbor;
-use openssl::asn1::Asn1Time;
+use openssl::asn1::{Asn1Object, Asn1OctetString, Asn1Time};
 use openssl::bn::{BigNum, BigNumContext, MsbOption};
 use openssl::ec::{EcGroup, EcKey};
 use openssl::hash::MessageDigest;
@@ -55,7 +58,7 @@ use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
 use openssl::sign::Signer;
 use openssl::x509::extension::{BasicConstraints, KeyUsage};
-use openssl::x509::{X509Builder, X509NameBuilder, X509};
+use openssl::x509::{X509Builder, X509Extension, X509NameBuilder, X509};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -108,6 +111,30 @@ fn sign(key: &PKey<Private>, data: &[u8]) -> Vec<u8> {
 fn p256() -> PKey<Private> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256");
     PKey::from_ec_key(EcKey::generate(&group).expect("key")).expect("pkey")
+}
+
+/// A CREDENTIAL key: P-256 with both affine coordinates a full 32 bytes (no
+/// leading zero byte). `webauthn-rs-core` 0.5.5 reads the public key out of an
+/// `android-key` attestation certificate with `COSEKey::try_from((alg,
+/// &X509))`, which refuses a coordinate whose `num_bytes()` is not 32
+/// ("The COSEKey contains invalid ECDSA X/Y coordinate data"): about one
+/// genuine key in 64. That is the library's behaviour (a real device that hits
+/// it registers on a retry, with a new key); a test that drew such a key would
+/// fail at random, so the test authenticator never does.
+fn credential_key() -> PKey<Private> {
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256");
+    loop {
+        let key = EcKey::generate(&group).expect("key");
+        let mut ctx = BigNumContext::new().expect("ctx");
+        let mut x = BigNum::new().expect("x");
+        let mut y = BigNum::new().expect("y");
+        key.public_key()
+            .affine_coordinates(&group, &mut x, &mut y, &mut ctx)
+            .expect("coordinates");
+        if x.num_bytes() == 32 && y.num_bytes() == 32 {
+            return PKey::from_ec_key(key).expect("pkey");
+        }
+    }
 }
 
 fn cbor(v: &Cbor) -> Vec<u8> {
@@ -318,7 +345,7 @@ impl SoftAuthenticator {
         }))
         .expect("client data");
 
-        let key = p256();
+        let key = credential_key();
         let mut id = vec![0_u8; 32];
         openssl::rand::rand_bytes(&mut id).expect("rand");
         let mut auth_data = sha256(rp_id.as_bytes());
@@ -371,6 +398,18 @@ impl SoftAuthenticator {
             (text("sig"), Cbor::Bytes(sign(&cred.key, &signed))),
         ]);
         with_attestation(registration, "packed", stmt, auth_data)
+    }
+
+    /// The private key of the credential `registration` (made by this
+    /// authenticator) registered.
+    fn key_of(&self, registration: &Value) -> &PKey<Private> {
+        let id = unb64(&registration["rawId"], "rawId");
+        &self
+            .credentials
+            .iter()
+            .find(|c| c.id == id)
+            .expect("a credential of this authenticator")
+            .key
     }
 
     /// Assert with a credential of this authenticator from `origin`, for
@@ -447,8 +486,61 @@ pub fn hardware_bound(registration: &Value) -> Value {
 /// A test attestation root and an attestation certificate it issued.
 pub struct TestAttestation {
     root: X509,
+    root_key: PKey<Private>,
     leaf: X509,
     leaf_key: PKey<Private>,
+}
+
+/// One DER TLV: `tag` (its identifier octets, already encoded) and `content`,
+/// with a definite length (X.690 §8.1.3).
+fn der(tag: &[u8], content: &[u8]) -> Vec<u8> {
+    let mut out = tag.to_vec();
+    let len = content.len();
+    if len < 0x80 {
+        out.push(u8::try_from(len).expect("short length"));
+    } else {
+        let bytes: Vec<u8> = len
+            .to_be_bytes()
+            .iter()
+            .copied()
+            .skip_while(|b| *b == 0)
+            .collect();
+        out.push(0x80 | u8::try_from(bytes.len()).expect("length of length"));
+        out.extend_from_slice(&bytes);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+/// The Android key attestation extension's value (`KeyDescription`, Android
+/// Keystore schema), as `webauthn-rs-core` 0.5.5 parses it: version 3,
+/// attestation and keymaster security level 1 (TEE; the parser knows only 0
+/// and 1), the attestation challenge, an empty unique id, an empty
+/// software-enforced list, and a TEE-enforced list holding `purpose` [1] =
+/// {SIGN (2)} and `origin` [702] = GENERATED (0), with no `allApplications`
+/// [600] (WebAuthn §8.4.1: the key is scoped to the RP id).
+fn android_key_description(challenge: &[u8]) -> Vec<u8> {
+    let tee = [
+        // [1] EXPLICIT SET OF INTEGER { 2 }
+        der(&[0xA1], &der(&[0x31], &der(&[0x02], &[0x02]))),
+        // [702] EXPLICIT INTEGER 0: high tag number form, 702 = 5 * 128 + 62.
+        der(&[0xBF, 0x85, 0x3E], &der(&[0x02], &[0x00])),
+    ]
+    .concat();
+    der(
+        &[0x30],
+        &[
+            der(&[0x02], &[0x03]),
+            der(&[0x0A], &[0x01]),
+            der(&[0x02], &[0x04]),
+            der(&[0x0A], &[0x01]),
+            der(&[0x04], challenge),
+            der(&[0x04], &[]),
+            der(&[0x30], &[]),
+            der(&[0x30], &tee),
+        ]
+        .concat(),
+    )
 }
 
 fn serial() -> openssl::asn1::Asn1Integer {
@@ -518,9 +610,73 @@ impl TestAttestation {
             .expect("sign leaf");
         Self {
             root,
+            root_key,
             leaf: b.build(),
             leaf_key,
         }
+    }
+
+    /// `registration` (made by `auth`) re-made as an `android-key`
+    /// attestation chained to THIS root (WebAuthn §8.4): the certificate in
+    /// `x5c` is issued for the CREDENTIAL's public key and carries the
+    /// Android key attestation extension (OID 1.3.6.1.4.1.11129.2.1.17)
+    /// whose challenge is SHA-256(clientDataJSON); the statement is signed by
+    /// the credential key. `device_bound` clears BE and BS before signing (a
+    /// hardware-backed Android key); otherwise the flags stay as `auth` set
+    /// them (a backup-eligible credential, which the relying party must
+    /// refuse).
+    #[must_use]
+    pub fn android_key(
+        &self,
+        auth: &SoftAuthenticator,
+        registration: &Value,
+        device_bound: bool,
+    ) -> Value {
+        let cred_key = auth.key_of(registration);
+        let mut auth_data = auth_data_of(registration);
+        if device_bound {
+            auth_data[FLAGS_AT] &= !(BE | BS);
+        }
+        let cdj = unb64(
+            &registration["response"]["clientDataJSON"],
+            "clientDataJSON",
+        );
+        let client_data_hash = sha256(&cdj);
+
+        let mut name = X509NameBuilder::new().expect("name");
+        name.append_entry_by_text("CN", "Android Keystore Key")
+            .expect("cn");
+        let leaf_name = name.build();
+        let mut b = X509Builder::new().expect("builder");
+        b.set_version(2).expect("v3");
+        b.set_serial_number(&serial()).expect("serial");
+        b.set_subject_name(&leaf_name).expect("subject");
+        b.set_issuer_name(self.root.subject_name()).expect("issuer");
+        b.set_pubkey(cred_key).expect("pubkey");
+        b.set_not_before(&Asn1Time::from_unix(now_unix() - 86_400).expect("t"))
+            .expect("nb");
+        b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
+            .expect("na");
+        let oid = Asn1Object::from_str("1.3.6.1.4.1.11129.2.1.17").expect("oid");
+        let value = Asn1OctetString::new_from_bytes(&android_key_description(&client_data_hash))
+            .expect("octets");
+        b.append_extension(X509Extension::new_from_der(&oid, false, &value).expect("ext"))
+            .expect("android key extension");
+        b.sign(&self.root_key, MessageDigest::sha256())
+            .expect("sign android leaf");
+        let leaf = b.build();
+
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_data_hash);
+        let stmt = Cbor::Map(vec![
+            (text("alg"), Cbor::Integer((-7).into())),
+            (text("sig"), Cbor::Bytes(sign(cred_key, &signed))),
+            (
+                text("x5c"),
+                Cbor::Array(vec![Cbor::Bytes(leaf.to_der().expect("der"))]),
+            ),
+        ]);
+        with_attestation(registration, "android-key", stmt, auth_data)
     }
 
     /// The root, PEM, as a relying party's CA file holds it.
