@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::Router;
 use common::{spawn, spawn_with, TestApp, TestResponse};
 use epigraph_explorer::auth::flow::validate_return_to;
+use epigraph_explorer::bff::atlas::THEME_FILTER_UNSUPPORTED;
 use epigraph_explorer::config::ENV_UPSTREAM_TIMEOUT_MS;
 use epigraph_explorer::links::Links;
 use epigraph_explorer::pages::atlas::VENDOR_SCRIPTS;
@@ -1151,7 +1152,7 @@ async fn theme_claims_404_is_identical_for_absent_unreadable_and_forbidden_theme
 }
 
 #[tokio::test]
-async fn theme_search_rejects_an_upstream_that_ignored_theme_id() {
+async fn an_api_without_the_theme_filter_is_a_503_that_shows_no_global_hits() {
     let app = spawn().await;
     mount_dir(&app, "tok", dir_default()).await;
     Mock::given(method("POST"))
@@ -1169,8 +1170,14 @@ async fn theme_search_rejects_an_upstream_that_ignored_theme_id() {
         format!("/explorer/bff/atlas/search?q=x&theme={T}"),
     ] {
         let res = app.get_as(&uri, &sid).await;
-        assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{uri}: {}", res.body);
+        assert_eq!(
+            res.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri}: {}",
+            res.body
+        );
         assert!(!res.body.contains(C4) && !res.body.contains("global statement"));
+        assert_eq!(res.json()["message"], THEME_FILTER_UNSUPPORTED, "{uri}");
     }
     assert!(requests(&app, BATCH).await.is_empty());
 
@@ -1187,7 +1194,28 @@ async fn theme_search_rejects_an_upstream_that_ignored_theme_id() {
     let res = app
         .get_as(&format!("/explorer/bff/atlas/theme/{T}/claims"), &sid)
         .await;
+    assert_eq!(res.status, StatusCode::SERVICE_UNAVAILABLE, "{}", res.body);
+    assert_eq!(res.json()["message"], THEME_FILTER_UNSUPPORTED);
+    assert_eq!(res.json()["error"], "degraded");
+
+    // An answer for ANOTHER theme is a misbehaving API, not an old one.
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    Mock::given(method("POST"))
+        .and(path(SEARCH))
+        .respond_with(ok(search_body(
+            vec![hit(C4, "A statement from the other theme", 0.5)],
+            Some((C1, 3)),
+            None,
+        )))
+        .mount(&app.upstream)
+        .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/theme/{T}/claims"), &sid)
+        .await;
     assert_eq!(res.status, StatusCode::BAD_GATEWAY, "{}", res.body);
+    assert!(!res.body.contains(C4));
 }
 
 #[tokio::test]

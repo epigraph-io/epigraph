@@ -61,7 +61,7 @@ use crate::upstream::atlas::{
     ContextPaper, GraphLinks, LayoutLink, LayoutQuery, LayoutRegion, LayoutRun, LinkEnd,
     LinksQuery, RelCount, ThemesLayout, BATCH_GET_MAX_IDS,
 };
-use crate::upstream::core::{LabelHit, SemanticHit};
+use crate::upstream::core::{LabelHit, SemanticHit, THEME_ID_IGNORED};
 use crate::upstream::{
     Api, ClaimResponse, Degraded, EdgeDirection, PlacementResponse, UpstreamError,
 };
@@ -306,6 +306,28 @@ pub fn atlas_id_err(what: &'static str) -> impl Fn(UpstreamError) -> AppError {
             AppError::NotFound(what.into())
         }
         other => atlas_err(other),
+    }
+}
+
+/// Shown when the API predates the theme filter on semantic search, so no
+/// route can list a theme's claims.
+pub const THEME_FILTER_UNSUPPORTED: &str = "This EpiGraph API cannot list a theme's claims yet: \
+     it predates the Atlas theme filter. The map and claim pages still work.";
+
+/// An API that predates the theme filter either refuses a theme-core
+/// request (axum's 422: the body has no `query`) or ignores `theme_id` and
+/// answers globally. Either is a 503 with [`THEME_FILTER_UNSUPPORTED`], not
+/// a 502: nothing failed, the feature is not deployed. An answer for
+/// ANOTHER theme is a misbehaving API and stays a 502.
+pub fn theme_scoped_err(what: &'static str) -> impl Fn(UpstreamError) -> AppError {
+    move |e| match &e {
+        UpstreamError::Rejected { status: 422, .. } => {
+            AppError::Degraded(THEME_FILTER_UNSUPPORTED.into())
+        }
+        UpstreamError::Decode(m) if m == THEME_ID_IGNORED => {
+            AppError::Degraded(THEME_FILTER_UNSUPPORTED.into())
+        }
+        _ => atlas_id_err(what)(e),
     }
 }
 
@@ -1226,7 +1248,7 @@ async fn theme_claims(
         api.search_semantic_in_theme(Some(id), "theme_core", None, limit, Some(cursor.as_str())),
         theme_directory(&state, &user),
     );
-    let found = found.map_err(atlas_id_err("theme"))?;
+    let found = found.map_err(theme_scoped_err("theme"))?;
     let dir = dir?;
 
     let hits: Vec<SemanticHit> = found
@@ -2059,7 +2081,7 @@ async fn search(
     let (found, dir) = match theme {
         Some(_) => {
             let (f, d) = tokio::join!(call, theme_directory(&state, &user));
-            (f.map_err(atlas_id_err("theme"))?, Some(d?))
+            (f.map_err(theme_scoped_err("theme"))?, Some(d?))
         }
         None => (call.await.map_err(atlas_err)?, None),
     };
