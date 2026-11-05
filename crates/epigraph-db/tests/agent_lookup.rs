@@ -524,6 +524,16 @@ async fn counts_are_computed_under_the_callers_viewer(pool: PgPool) {
         "authored AND asserted, the same claim counted once"
     );
 
+    // find_agent returns the same counts (computed for its results only).
+    let r = find_as(&pool, member, "ada fenwright", None, None, None).await;
+    let hit = r
+        .results
+        .iter()
+        .find(|h| h.card.id == with_private)
+        .expect("listed");
+    assert_eq!(hit.card.counts.asserted_claims, 1);
+    assert_eq!(hit.card.counts.authored_papers, 1);
+
     // Public claims count for everyone.
     fixture::seed_public_claim(&pool, without, "a public finding").await;
     assert_eq!(

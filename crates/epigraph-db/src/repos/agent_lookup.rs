@@ -480,6 +480,18 @@ impl AgentLookupRepository {
         viewer: &Viewer,
         ids: &[Uuid],
     ) -> Result<Vec<AgentCard>, DbError> {
+        Self::cards_inner(conn, viewer, ids, true).await
+    }
+
+    /// [`Self::cards`], with the (capped, but per-agent) counts computed only
+    /// when `with_counts`; otherwise they are zero and `find` fills them in for
+    /// the cards it returns, so a 200-candidate pool never costs 200 counts.
+    async fn cards_inner(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        ids: &[Uuid],
+        with_counts: bool,
+    ) -> Result<Vec<AgentCard>, DbError> {
         let mut seen = std::collections::HashSet::new();
         let ids: Vec<Uuid> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
         if ids.is_empty() {
@@ -561,7 +573,11 @@ impl AgentLookupRepository {
         };
 
         // 4. Counts under the caller's viewer.
-        let counts = Self::counts(conn, viewer, &ids).await?;
+        let counts = if with_counts {
+            Self::counts(conn, viewer, &ids).await?
+        } else {
+            HashMap::new()
+        };
 
         let mut out = Vec::with_capacity(rows.len());
         for (
@@ -658,11 +674,13 @@ impl AgentLookupRepository {
         let candidates_truncated = matches.len() > pool;
         matches.truncate(pool);
         let ids: Vec<Uuid> = matches.iter().map(|m| m.agent_id).collect();
-        let cards = Self::cards(conn, viewer, &ids).await?;
+        // Cards WITHOUT counts for the whole pool (counts never filter), then
+        // counts for the survivors only.
+        let cards = Self::cards_inner(conn, viewer, &ids, false).await?;
         let by_id: HashMap<Uuid, &AgentNameMatch> =
             matches.iter().map(|m| (m.agent_id, m)).collect();
         let limit = usize::try_from(query.limit).unwrap_or(1);
-        let results = cards
+        let mut results: Vec<AgentSearchHit> = cards
             .into_iter()
             .filter(|c| query.kind.is_none_or(|k| c.kind == k))
             .filter(|c| {
@@ -680,6 +698,15 @@ impl AgentLookupRepository {
                 })
             })
             .collect();
+        let survivors: Vec<Uuid> = results.iter().map(|h| h.card.id).collect();
+        if !survivors.is_empty() {
+            let counts = Self::counts(conn, viewer, &survivors).await?;
+            for hit in &mut results {
+                if let Some(c) = counts.get(&hit.card.id) {
+                    hit.card.counts = *c;
+                }
+            }
+        }
         Ok(FindAgentResult {
             results,
             candidates_truncated,
