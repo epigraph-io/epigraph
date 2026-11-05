@@ -3790,6 +3790,60 @@ impl ClaimRepository {
         row.map(|r| Ok((r.row.into_claim()?, r.labels))).transpose()
     }
 
+    /// Set-based twin of [`Self::get_by_id_with_labels`]: the same projection,
+    /// row type and post-fixes, for many ids in one statement. Rows the viewer
+    /// may not read and ids that match nothing are both simply absent. No
+    /// ORDER BY: the caller orders by its own request. The caller bounds `ids`
+    /// (`POST /api/v1/claims/batch-get` caps it at 100).
+    ///
+    /// The row's raw `trace_id` is returned as stored. Whether the viewer may
+    /// read that trace is a separate question
+    /// ([`crate::ReasoningTraceRepository::readable_ids`]) that the caller
+    /// answers, so this read stays field-for-field equal to the single read.
+    ///
+    /// One marker, on `c`: `agents` carries no `owner_group_id`, the same
+    /// reason as [`Self::get_by_id_with_labels`].
+    ///
+    /// # Errors
+    /// * [`DbError::QueryFailed`] if the database query fails or a column does
+    ///   not decode.
+    /// * [`DbError::InvalidData`] if a stored `content_hash` is not 32 bytes.
+    /// * [`DbError::CoreError`] if a stored `truth_value` is outside `[0, 1]`.
+    #[instrument(skip(executor, viewer, ids), fields(n = ids.len()))]
+    pub async fn get_by_ids_with_labels<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Claim, Vec<String>)>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let sql = viewer.splice(
+            r#"
+            SELECT c.id, c.content, c.truth_value, c.agent_id, c.trace_id,
+                   c.created_at, c.updated_at,
+                   COALESCE(c.is_current, true) AS is_current, c.supersedes,
+                   c.labels, c.content_hash, c.signature,
+                   s.public_key AS signer_public_key
+            FROM claims c
+            LEFT JOIN agents s ON s.id = c.signer_id
+            WHERE c.id = ANY($1)
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, SingleClaimRowWithLabels>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+
+        rows.into_iter()
+            .map(|r| Ok((r.row.into_claim()?, r.labels)))
+            .collect()
+    }
+
     /// kNN search over `claims.embedding` (1536d) or `claims.embedding_3072`,
     /// restricted to paragraph-level (level=2) claims, optionally filtered by
     /// the paper that asserts the claim. Results are ordered by cosine

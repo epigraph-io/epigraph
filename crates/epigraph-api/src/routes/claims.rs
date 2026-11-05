@@ -1302,6 +1302,36 @@ pub async fn get_claim(
 
     drop(read);
 
+    // `trace_readable = true` keeps GET's wire unchanged: it still names the
+    // row's `trace_id` whatever that trace's own tenancy. `POST
+    // /api/v1/claims/batch-get` checks the trace against the viewer
+    // (`ReasoningTraceRepository::readable_ids`) and passes the answer here;
+    // doing the same on GET is a separate, wire-changing follow-up.
+    let response = claim_response_for_read(claim, labels, encryption, true);
+
+    // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
+    // so reaching this line means the claim is readable; the post-pass that
+    // used to overwrite `response.content` here could only ever downgrade a row
+    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
+    // disagreement with the `ok_or_else` 404 above is exactly the
+    // confirmation oracle PR-14 removes.
+    Ok(Json(response))
+}
+
+/// The `GET /api/v1/claims/:id` body for a claim the caller has already been
+/// allowed to read. Shared with `POST /api/v1/claims/batch-get` so the two
+/// cannot drift.
+///
+/// `trace_readable` is whether the caller may read the trace `claim.trace_id`
+/// names; when false the body's `trace_id` is null, the same answer as no
+/// trace.
+#[cfg(feature = "db")]
+pub(crate) fn claim_response_for_read(
+    claim: Claim,
+    labels: Vec<String>,
+    encryption: Option<epigraph_db::ClaimEncryptionRow>,
+    trace_readable: bool,
+) -> ClaimResponse {
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
 
@@ -1313,13 +1343,10 @@ pub async fn get_claim(
         response.group_id = Some(enc.group_id);
     }
 
-    // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
-    // so reaching this line means the claim is readable; the post-pass that
-    // used to overwrite `response.content` here could only ever downgrade a row
-    // the viewer had ALREADY been allowed to fetch, and its absence-vs-blanking
-    // disagreement with the `ok_or_else` 404 four lines up is exactly the
-    // confirmation oracle PR-14 removes.
-    Ok(Json(response))
+    if !trace_readable {
+        response.trace_id = None;
+    }
+    response
 }
 
 /// Get a claim by ID (placeholder - no database)
