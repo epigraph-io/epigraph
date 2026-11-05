@@ -107,6 +107,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/sweep_semantic_duplicates.rs",
     ),
     (
+        "sweep_retired_source_bbas",
+        Some(env!("CARGO_BIN_EXE_sweep_retired_source_bbas")),
+        "src/bin/sweep_retired_source_bbas.rs",
+    ),
+    (
         "unmark_duplicate",
         Some(env!("CARGO_BIN_EXE_unmark_duplicate")),
         "src/bin/unmark_duplicate.rs",

@@ -62,6 +62,13 @@ name = "supersede_belief_delta"
 path = "src/bin/supersede_belief_delta.rs"
 required-features = ["db"]
 
+# The retroactive K10(3) sweep (OD-10; rulings R-178(2), R-179): applies exactly
+# the rows supersede_belief_delta measures as k10_retro, with a snapshot undo.
+[[bin]]
+name = "sweep_retired_source_bbas"
+path = "src/bin/sweep_retired_source_bbas.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"
