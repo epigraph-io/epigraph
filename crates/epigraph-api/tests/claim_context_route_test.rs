@@ -865,7 +865,7 @@ async fn a_cursor_built_from_a_hidden_claim_reveals_nothing(pool: PgPool) {
     let v4 = common::seed_claim(&pool, "c9 v4").await;
     // Three claims at one created_at; by uuid order the middle one becomes
     // the hidden P3, so V2 sorts just below it and V3 just above.
-    let mut trio = vec![
+    let mut trio = [
         owned_claim(&pool, "c9 trio a", owner).await,
         owned_claim(&pool, "c9 trio b", owner).await,
         owned_claim(&pool, "c9 trio c", owner).await,
