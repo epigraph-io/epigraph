@@ -131,6 +131,25 @@ fn counts_line(prefix: &str, edges: usize, slots: usize, held: usize) -> String 
 /// Exit 3 when the outcome is unknown, else 1.
 struct Failure(i32, String);
 
+/// The exit code of a library error: 3 only when the COMMIT failed after the
+/// mint and its undo record were written (the outcome is unknown), else 1
+/// (refused or failed; nothing was written).
+fn exit_code(e: &MintError) -> i32 {
+    if matches!(e, MintError::CommitUnknown(_)) {
+        3
+    } else {
+        1
+    }
+}
+
+/// Whether the apply's undo record file is removed after `result`. Only an
+/// exit-1 failure removes it (nothing was written, so it records nothing).
+/// Success and exit 3 keep it: after a failed COMMIT the record is the only
+/// way to find and undo what may have landed.
+fn remove_record_after(result: &Result<(), Failure>) -> bool {
+    matches!(result, Err(Failure(1, _)))
+}
+
 impl From<String> for Failure {
     fn from(s: String) -> Self {
         Self(1, s)
@@ -175,7 +194,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             }
             let mut file = create_new(record)?;
             let result = apply(&cli, &expected, record, &mut file).await;
-            if matches!(&result, Err(Failure(1, _))) {
+            if remove_record_after(&result) {
                 drop(file);
                 let _ = std::fs::remove_file(record);
             }
@@ -245,10 +264,7 @@ async fn apply(
     let (conn, _) = session.split();
     let report = r131_factor_mint::apply(conn, expected, file, cli.statement_timeout_ms)
         .await
-        .map_err(|e| match e {
-            e @ MintError::CommitUnknown(_) => Failure(3, e.to_string()),
-            e => Failure(1, e.to_string()),
-        })?;
+        .map_err(|e| Failure(exit_code(&e), e.to_string()))?;
     println!(
         "r131 apply: minted {} factors (plan sha256 {}; undo record {})",
         report.minted,
@@ -306,5 +322,52 @@ async fn main() {
     if let Err(Failure(code, e)) = run(cli).await {
         eprintln!("Error: {e}");
         std::process::exit(code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_exit_1_failure_removes_the_undo_record() {
+        assert!(
+            remove_record_after(&Err(Failure(1, "refused".into()))),
+            "a refusal leaves no record behind"
+        );
+        assert!(
+            !remove_record_after(&Err(Failure(3, "commit failed".into()))),
+            "an unknown outcome keeps the record"
+        );
+        assert!(!remove_record_after(&Ok(())), "a mint keeps its record");
+    }
+
+    #[test]
+    fn only_a_failed_commit_exits_3() {
+        assert_eq!(
+            exit_code(&MintError::CommitUnknown(sqlx::Error::Protocol(
+                "connection lost".into()
+            ))),
+            3
+        );
+        for e in [
+            MintError::Db(sqlx::Error::Protocol("x".into())),
+            MintError::NotPrivileged,
+            MintError::Locked,
+            MintError::PlanDrift {
+                planned: "a".into(),
+                live: "b".into(),
+            },
+            MintError::MintMismatch {
+                slot: "s".into(),
+                got: vec![],
+            },
+            MintError::ReadBack("r".into()),
+            MintError::PostCheck("p".into()),
+            MintError::Invalid("i".into()),
+            MintError::Record(std::io::Error::other("disk full")),
+        ] {
+            assert_eq!(exit_code(&e), 1, "{e}");
+        }
     }
 }
