@@ -19,6 +19,7 @@ pub mod authorize_session;
 pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
+pub mod claim_context;
 pub mod claim_encryption;
 pub mod claim_role;
 pub mod claim_theme;
@@ -124,6 +125,10 @@ pub use claim::{
     DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
     RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
+};
+pub use claim_context::{
+    ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
+    ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
