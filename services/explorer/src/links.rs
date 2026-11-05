@@ -129,6 +129,18 @@ impl Links {
         self.path(&format!("/theme/{id}"))
     }
 
+    /// The Atlas map, `/atlas`.
+    pub fn atlas(&self) -> String {
+        self.path("/atlas")
+    }
+
+    /// An Atlas deep link to a claim: `/atlas#c-<32 hex>`. Claim ids are the
+    /// only durable map keys; there is deliberately no theme builder,
+    /// because themes are rebuilt with every clustering run.
+    pub fn atlas_claim(&self, id: Uuid) -> String {
+        format!("{}#c-{}", self.atlas(), id.simple())
+    }
+
     pub fn community(&self, id: Uuid) -> String {
         self.path(&format!("/community/{id}"))
     }
@@ -209,6 +221,34 @@ impl Links {
             Some(m) => format!("{p}?{}", query(&[("mode", m)])),
             None => p,
         }
+    }
+
+    /// `/bff/atlas/layout` (the client adds `?region=` and the rest).
+    pub fn bff_atlas_layout(&self) -> String {
+        self.path("/bff/atlas/layout")
+    }
+
+    /// `/bff/atlas/theme/`; the client appends `<id>/claims`.
+    pub fn bff_atlas_theme_claims_prefix(&self) -> String {
+        self.path("/bff/atlas/theme/")
+    }
+
+    /// `/bff/atlas/claim/`; the client appends the claim id.
+    pub fn bff_atlas_claim_prefix(&self) -> String {
+        self.path("/bff/atlas/claim/")
+    }
+
+    pub fn bff_atlas_links(&self) -> String {
+        self.path("/bff/atlas/links")
+    }
+
+    pub fn bff_atlas_search(&self) -> String {
+        self.path("/bff/atlas/search")
+    }
+
+    /// `/bff/atlas/resolve/`; the client appends `c-<id>`.
+    pub fn bff_atlas_resolve_prefix(&self) -> String {
+        self.path("/bff/atlas/resolve/")
     }
 
     // ---- auth, health, static -------------------------------------------
@@ -341,6 +381,30 @@ mod tests {
             l.absolute(&l.claim(i)),
             format!("https://explorer.example.com/explorer/claim/{i}")
         );
+    }
+
+    #[test]
+    fn atlas_builders_prefix_the_base_path() {
+        let i = id();
+        let simple = i.simple().to_string();
+        let l = Links::new("https://explorer.example.com", "/explorer");
+        assert_eq!(l.atlas(), "/explorer/atlas");
+        assert_eq!(l.atlas_claim(i), format!("/explorer/atlas#c-{simple}"));
+        assert_eq!(simple.len(), 32);
+        assert_eq!(l.bff_atlas_layout(), "/explorer/bff/atlas/layout");
+        assert_eq!(
+            l.bff_atlas_theme_claims_prefix(),
+            "/explorer/bff/atlas/theme/"
+        );
+        assert_eq!(l.bff_atlas_claim_prefix(), "/explorer/bff/atlas/claim/");
+        assert_eq!(l.bff_atlas_links(), "/explorer/bff/atlas/links");
+        assert_eq!(l.bff_atlas_search(), "/explorer/bff/atlas/search");
+        assert_eq!(l.bff_atlas_resolve_prefix(), "/explorer/bff/atlas/resolve/");
+
+        let root = Links::new("http://localhost:8096", "");
+        assert_eq!(root.atlas(), "/atlas");
+        assert_eq!(root.atlas_claim(i), format!("/atlas#c-{simple}"));
+        assert_eq!(root.bff_atlas_layout(), "/bff/atlas/layout");
     }
 
     #[test]

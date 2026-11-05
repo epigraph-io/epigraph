@@ -178,6 +178,26 @@ pub struct PlacementResponse {
     pub neighborhood_id: Option<Uuid>,
     #[serde(default)]
     pub run_completed_at: Option<DateTime<Utc>>,
+    /// The theme's place on the current Atlas layout run, or `null` when
+    /// there is no servable run or the theme is unplaced. Older kernels
+    /// omit the key.
+    #[serde(default)]
+    pub layout: Option<PlacementLayout>,
+}
+
+/// `PlacementResponse.layout`: a `shared` theme carries its public `x`/`y`;
+/// a `viewer`-placed one carries only its region.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PlacementLayout {
+    pub run_id: Uuid,
+    #[serde(default)]
+    pub region_id: Option<Uuid>,
+    #[serde(default)]
+    pub placement: String,
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
 }
 
 // ---- GET /api/v1/stats (plan §2.4) --------------------------------------------
@@ -412,6 +432,32 @@ mod tests {
         }))
         .unwrap();
         assert!(p.theme_id.is_none() && p.cluster_run_id.is_none());
+        assert!(p.layout.is_none(), "an older kernel omits layout");
+
+        // placement with the Atlas layout, and with `layout: null`.
+        let p: PlacementResponse = serde_json::from_value(json!({
+            "claim_id": "00000000-0000-0000-0000-000000000001",
+            "theme_id": "00000000-0000-0000-0000-000000000002",
+            "cluster_run_id": null, "cluster_id": null,
+            "layout": {"run_id": "00000000-0000-0000-0000-000000000003",
+                       "region_id": "00000000-0000-0000-0000-000000000004",
+                       "placement": "shared", "x": -398.0, "y": 120.5},
+            "neighborhood_id": null, "run_completed_at": null
+        }))
+        .unwrap();
+        let l = p.layout.unwrap();
+        assert_eq!(
+            (l.placement.as_str(), l.x, l.y),
+            ("shared", Some(-398.0), Some(120.5))
+        );
+        let p: PlacementResponse = serde_json::from_value(json!({
+            "claim_id": "00000000-0000-0000-0000-000000000001",
+            "theme_id": "00000000-0000-0000-0000-000000000002",
+            "cluster_run_id": null, "cluster_id": null, "layout": null,
+            "neighborhood_id": null, "run_completed_at": null
+        }))
+        .unwrap();
+        assert!(p.layout.is_none() && p.theme_id.is_some());
 
         // stats: every field, and `computed_at` as chrono renders it.
         let s: StatsResponse = serde_json::from_value(json!({

@@ -41,6 +41,7 @@ use crate::auth::{self, RequestAuth};
 use crate::config::Config;
 use crate::state::AppState;
 
+pub mod atlas;
 pub mod core;
 pub mod degraded;
 pub mod entities;

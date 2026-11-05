@@ -27,11 +27,12 @@ pub const MAX_REQUEST_BODY: usize = 64 * 1024;
 /// needs to stop restart-looping on a config typo.
 ///
 /// KEEP IN SYNC with the `.route(..)` / `.merge(..)` calls below and in
-/// `auth::routes`, `pages::{core,entities,graph}::routes` and
-/// `bff::{core,graph}::routes`. Adding a top-level route whose first segment
-/// is new means adding it here too.
+/// `auth::routes`, `pages::{core,entities,graph,atlas}::routes` and
+/// `bff::{core,graph,atlas}::routes`. Adding a top-level route whose first
+/// segment is new means adding it here too.
 pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
     "agent",
+    "atlas",
     "auth",
     "bff",
     "claim",
@@ -46,6 +47,8 @@ pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
 ];
 /// Sessions older than the upstream refresh-token lifetime are dead.
 pub const SESSION_MAX_AGE: chrono::Duration = chrono::Duration::days(30);
+/// Global bound on the per-viewer response cache, enforced by housekeeping.
+pub const RESPONSE_CACHE_MAX_ENTRIES: usize = 10_000;
 
 /// The whole app, ready to serve.
 ///
@@ -70,6 +73,8 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(pages::graph::routes())
         .merge(bff::core::routes())
         .merge(bff::graph::routes())
+        .merge(pages::atlas::routes())
+        .merge(bff::atlas::routes())
         .merge(extra);
 
     let base = state.config.base_path.clone();
@@ -162,6 +167,13 @@ fn top_level_segments() -> Vec<String> {
         "/bff/themes",
         "/bff/communities",
         "/bff/neighborhood/{id}",
+        "/atlas",
+        "/bff/atlas/layout",
+        "/bff/atlas/theme/{id}/claims",
+        "/bff/atlas/claim/{id}",
+        "/bff/atlas/links",
+        "/bff/atlas/search",
+        "/bff/atlas/resolve/{key}",
     ];
     let mut segments: Vec<String> = ROUTE_PATHS
         .iter()
@@ -183,8 +195,15 @@ pub fn spawn_housekeeping(state: AppState) -> tokio::task::JoinHandle<()> {
             let sessions = state.sessions.purge_older_than(SESSION_MAX_AGE);
             let flow = state.auth_flow.purge_expired();
             let cached = state.cache.purge_expired();
-            if sessions + flow + cached > 0 {
-                tracing::debug!(sessions, flow, cached, "housekeeping purged entries");
+            let evicted = state.cache.evict_oldest_beyond(RESPONSE_CACHE_MAX_ENTRIES);
+            if sessions + flow + cached + evicted > 0 {
+                tracing::debug!(
+                    sessions,
+                    flow,
+                    cached,
+                    evicted,
+                    "housekeeping purged entries"
+                );
             }
         }
     })

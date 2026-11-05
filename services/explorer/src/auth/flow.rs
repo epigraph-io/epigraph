@@ -222,6 +222,8 @@ mod tests {
             "/explorer/search?q=a%20b&mode=label",
             "/explorer/claim/x?return=%2F%2Fnot-a-path-in-the-query",
             "/explorer/claim/x#section",
+            "/explorer/atlas#c-0b9a5a4e5f434c4b9a523f0d1e2c7a10",
+            "/explorer/atlas#t-0b9a5a4e",
             "/explorer/authors",
         ] {
             assert_eq!(validate_return_to(&l, ok).as_deref(), Some(ok), "{ok}");

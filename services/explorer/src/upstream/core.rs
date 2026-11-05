@@ -21,6 +21,9 @@ use super::{Api, UpstreamError};
 /// Semantic search is silently capped at 100 upstream; the BFF caps every
 /// search surface at 50 (plan §3.5).
 pub const MAX_SEARCH_LIMIT: u32 = 50;
+/// The theme-pinned search's page cap (the kernel's `MAX_LIMIT`): the Atlas
+/// theme walk reads 100 claims a page.
+pub const MAX_THEME_SEARCH_LIMIT: u32 = 100;
 
 // ---- GET /api/v1/claims/:id/evidence (claims.rs:1057-1066) ------------------
 
@@ -152,8 +155,18 @@ pub struct ProvenanceStep {
 
 #[derive(Debug, Clone, Serialize)]
 struct SemanticSearchRequest<'q> {
-    query: &'q str,
+    /// Omitted (not blank) for `rank_by=theme_core`, which refuses a query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<&'q str>,
     limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    theme_id: Option<Uuid>,
+    /// `query` (the upstream default) or `theme_core`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rank_by: Option<&'q str>,
+    /// Opaque `o:<offset>`; `o:0` on the first page asks for a `next_cursor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<&'q str>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -165,6 +178,26 @@ pub struct SemanticSearchResponse {
     pub total: u64,
     #[serde(default)]
     pub query_time_ms: u64,
+    /// Present exactly when `theme_id` was sent (and the kernel honoured it).
+    #[serde(default)]
+    pub theme_scope: Option<ThemeScope>,
+    /// `o:<offset>` of the next page of a paged search.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    /// The byte budget dropped hits that no `next_cursor` carries.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The theme a pinned search ran in. `member_count` counts the members this
+/// viewer can read. There is no label: the kernel does not send one.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ThemeScope {
+    pub theme_id: Uuid,
+    #[serde(default)]
+    pub member_count: i64,
+    #[serde(default)]
+    pub rank_by: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -187,6 +220,9 @@ pub struct SemanticHit {
     pub claim_type: Option<String>,
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// The pinned theme on a theme-pinned flat search; otherwise absent.
+    #[serde(default)]
+    pub theme_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -352,17 +388,46 @@ impl Api<'_> {
     }
 
     /// `POST /api/v1/search/semantic`; `limit` is clamped to
-    /// `1..=MAX_SEARCH_LIMIT`. No offset exists upstream.
+    /// `1..=MAX_SEARCH_LIMIT`. Unpaged: no cursor is sent.
     pub async fn search_semantic(
         &self,
         query: &str,
         limit: u32,
     ) -> Result<SemanticSearchResponse, UpstreamError> {
         let body = SemanticSearchRequest {
-            query,
+            query: Some(query),
             limit: limit.clamp(1, MAX_SEARCH_LIMIT),
+            theme_id: None,
+            rank_by: None,
+            cursor: None,
         };
         self.post("/api/v1/search/semantic", &body).await
+    }
+
+    /// `POST /api/v1/search/semantic` with the theme filter and a cursor;
+    /// `limit` is clamped to `1..=MAX_THEME_SEARCH_LIMIT`.
+    ///
+    /// Scope check: with `theme_id`, a 200 without `theme_scope` is an
+    /// error. A kernel that predates the filter ignores the unknown field
+    /// and answers with global hits, which must never be shown under a
+    /// theme heading.
+    pub async fn search_semantic_in_theme(
+        &self,
+        theme_id: Option<Uuid>,
+        rank_by: &str,
+        query: Option<&str>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<SemanticSearchResponse, UpstreamError> {
+        let body = SemanticSearchRequest {
+            query,
+            limit: limit.clamp(1, MAX_THEME_SEARCH_LIMIT),
+            theme_id,
+            rank_by: Some(rank_by),
+            cursor,
+        };
+        let resp: SemanticSearchResponse = self.post("/api/v1/search/semantic", &body).await?;
+        check_theme_scope(theme_id, resp)
     }
 
     /// `GET /api/v1/claims/by-labels`: claims carrying ALL of the
@@ -404,6 +469,20 @@ impl Api<'_> {
     /// `GET /api/v1/graph/communities/overview` (needs a bearer).
     pub async fn landing_communities(&self) -> Result<CommunitiesOverview, UpstreamError> {
         self.get("/api/v1/graph/communities/overview").await
+    }
+}
+
+/// A theme-pinned answer must say it ran in that theme.
+pub fn check_theme_scope(
+    theme_id: Option<Uuid>,
+    resp: SemanticSearchResponse,
+) -> Result<SemanticSearchResponse, UpstreamError> {
+    match (theme_id, &resp.theme_scope) {
+        (Some(_), None) => Err(UpstreamError::Decode("upstream ignored theme_id".into())),
+        (Some(t), Some(s)) if s.theme_id != t => Err(UpstreamError::Decode(
+            "upstream answered for another theme".into(),
+        )),
+        _ => Ok(resp),
     }
 }
 

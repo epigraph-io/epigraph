@@ -502,7 +502,7 @@ pub fn communities_body(o: CommunitiesOverview, links: &Links) -> CommunitiesBod
 // ---- handlers ---------------------------------------------------------------------
 
 /// Graph JSON is per viewer: never let a shared or browser cache keep it.
-fn private_json<T: Serialize>(body: T) -> Response {
+pub(crate) fn private_json<T: Serialize>(body: T) -> Response {
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -512,7 +512,7 @@ fn private_json<T: Serialize>(body: T) -> Response {
 }
 
 /// A path id; a malformed one is simply "not found" (JSON 404).
-fn parse_id(raw: &str, what: &'static str) -> Result<Uuid, AppError> {
+pub(crate) fn parse_id(raw: &str, what: &'static str) -> Result<Uuid, AppError> {
     Uuid::parse_str(raw.trim()).map_err(|_| AppError::NotFound(what.into()))
 }
 
@@ -560,15 +560,27 @@ fn overview_key(what: &str, auth: &RequestAuth) -> String {
 }
 
 async fn themes(State(state): State<AppState>, user: SignedIn) -> Result<Response, AppError> {
+    let body = themes_body_cached(&state, &user).await?;
+    Ok(private_json(&*body))
+}
+
+/// The viewer's `/bff/themes` body: one per-viewer entry for 60 s, shared
+/// by `/bff/themes` and the Atlas theme directory. A failed fetch is never
+/// cached.
+pub(crate) async fn themes_body_cached(
+    state: &AppState,
+    user: &SignedIn,
+) -> Result<Arc<ThemesBody>, AppError> {
     let key = overview_key("themes", &user.auth);
     if let Some(hit) = state.cache.get::<ThemesBody>(&key) {
-        return Ok(private_json(&*hit));
+        return Ok(hit);
     }
-    let body = themes_body(user.api(&state).themes_overview().await?, &state.links);
-    state
-        .cache
-        .insert(key, Arc::new(body.clone()), OVERVIEW_TTL);
-    Ok(private_json(body))
+    let body = Arc::new(themes_body(
+        user.api(state).themes_overview().await?,
+        &state.links,
+    ));
+    state.cache.insert(key, Arc::clone(&body), OVERVIEW_TTL);
+    Ok(body)
 }
 
 async fn communities(State(state): State<AppState>, user: SignedIn) -> Result<Response, AppError> {
