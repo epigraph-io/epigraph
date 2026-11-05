@@ -2101,6 +2101,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every retire is refused (42501, loud) and nothing is written: fail
     // CLOSED.
     ("epigraph_retire_operator_link", 191),
+    // 198, the agent-lookup card's disclosed roles (find_agent / get_agent).
+    // Its read of the FORCEd `role_assignments` is admitted by
+    // `epigraph_definer_bypass()` (the owner), and it calls 123's
+    // maintenance-only `epigraph_live_role_assignment`. Under a non-member
+    // owner the read is filtered to the session principal's own rows (or the
+    // call fails 42501 on the maintenance-only function): fail CLOSED, fewer
+    // or no roles shown, never more.
+    ("epigraph_disclosed_role_assignments", 198),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2867,6 +2875,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_retire_operator_link",
             "public.epigraph_retire_operator_link(uuid, text, boolean)",
             false,
+        ),
+        // 198: the request path builds the agent-lookup card through it;
+        // without the grant find_agent / get_agent fail 42501.
+        (
+            "epigraph_disclosed_role_assignments",
+            "public.epigraph_disclosed_role_assignments(uuid[])",
+            true,
         ),
     ];
 
