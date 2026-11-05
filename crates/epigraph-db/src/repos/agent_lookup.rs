@@ -129,18 +129,6 @@ pub fn fold_sql(expr: &str) -> String {
     )
 }
 
-/// The profile-detail rule of [`crate::AgentRepository::get_public_profile`]
-/// over alias `a`, binding principal `$P`, groups `$G`, admin `$A`.
-fn profile_details_sql(principal_bind: usize, groups_bind: usize, admin_bind: usize) -> String {
-    format!(
-        "(${admin_bind}::bool OR a.profile_visibility = 'public' \
-           OR (${principal_bind}::uuid IS NOT NULL AND a.id = ${principal_bind}::uuid) \
-           OR EXISTS (SELECT 1 FROM group_memberships gm \
-                       WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
-                         AND gm.group_id = ANY(${groups_bind}::uuid[])))"
-    )
-}
-
 /// Strip the resolver prefix an ORCID or ROR id may be written with, in SQL.
 fn ident_sql(expr: &str) -> String {
     format!(
@@ -420,7 +408,11 @@ impl AgentLookupRepository {
              ), cand AS ( \
                  SELECT a.id, a.display_name, a.created_at, \
                         {fold_name} AS fname, \
-                        {details} AS details_ok, \
+                        ($4::bool OR a.profile_visibility = 'public' \
+                           OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
+                           OR EXISTS (SELECT 1 FROM group_memberships gm \
+                                       WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
+                                         AND gm.group_id = ANY($3::uuid[]))) AS details_ok, \
                         {ident_orcid} AS orcid_k, {ident_ror} AS ror_k \
                    FROM agents a \
              ), ranked AS ( \
@@ -451,7 +443,6 @@ impl AgentLookupRepository {
             fold_q = fold_sql("$1::text"),
             ident_q = ident_sql("$1::text"),
             fold_name = fold_sql("a.display_name"),
-            details = profile_details_sql(2, 3, 4),
             ident_orcid = ident_sql("a.orcid"),
             ident_ror = ident_sql("a.ror_id"),
         );
@@ -520,11 +511,14 @@ impl AgentLookupRepository {
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
-              CROSS JOIN LATERAL (SELECT COALESCE({details}, false) AS details_ok) d \
+              CROSS JOIN LATERAL (SELECT COALESCE(($4::bool OR a.profile_visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
+                     OR EXISTS (SELECT 1 FROM group_memberships gm \
+                                 WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
+                                   AND gm.group_id = ANY($3::uuid[]))), false) AS details_ok) d \
               CROSS JOIN LATERAL (SELECT public.epigraph_human_of(a.id, false) AS human) h \
               ORDER BY u.ord",
             d4 = d4_operator_gate("a.id", 2, 4),
-            details = profile_details_sql(2, 3, 4),
         );
         type Row = (
             Uuid,
