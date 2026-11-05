@@ -681,14 +681,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "gap_analysis",
         &["GapRepository::store_gap_analysis"],
     ),
-    // stamped: cluster-run metadata (untenanted) and the edges among nodes the
-    // viewer already read (F-edges-unfiltered owns their predicate).
+    // stamped: cluster-run metadata (untenanted; the run through the shared
+    // `ClusterRunRepository::latest` since the main merge at 51ed3eb9) and the
+    // edges among nodes the viewer already read (F-edges-unfiltered owns their
+    // predicate).
     (
         "graph.rs",
         "expand",
         &[
+            "ClusterRunRepository::latest",
             "fetch_subgraph_edges",
-            "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
@@ -721,11 +723,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // untenanted: the neighborhood id in the latest run.
+    // untenanted: the latest run (the shared `ClusterRunRepository::latest`,
+    // split out of the enclosing statement by the main merge at 51ed3eb9) and
+    // the neighborhood id in it.
     (
         "graph_neighborhood.rs",
         "expand",
-        &["sqlx::query_as(SELECT).fetch_optional"],
+        &[
+            "ClusterRunRepository::latest",
+            "sqlx::query_as(SELECT).fetch_optional",
+        ],
     ),
     // stamped: `groups`, `group_memberships` and `group_key_epochs` have row
     // security (077), and each route runs on ONE connection stamped with the
