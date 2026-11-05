@@ -163,9 +163,12 @@
 -- A successor with two parents on the level above has its copy chained
 -- through ONE of them (one `inherited_from` chain names one path): a parent
 -- that holds a detached row for the role, or was itself reached through one,
--- comes first, then the lowest id. Which one it is no longer decides whether
--- a detach reaches the successor: the derivation's walk up the lineage reads
--- every recorded parent (above).
+-- comes first, then the lowest id. Which one it is does not decide whether a
+-- detach reaches the successor while no identity on the way holds a live row
+-- made by name; once the detached parent is attached by name again (the
+-- documented restore), it does: a copy chained through its old copy stays
+-- out, one through the clean parent is in (the walk stops at the row made by
+-- name, above).
 -- The follow still copies into every GAP of every successor, a detached
 -- successor included: its copy restricts (166), and under the sticky rule
 -- grants it nothing. Skipping it would take the restriction away from that

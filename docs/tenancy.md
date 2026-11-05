@@ -1486,13 +1486,16 @@ registers the revert, so A is recorded as P's parent), and goes on to B and
 C; detaching the old A months later takes the group from P, B and C, the
 identity that runs now included. Before any detach, list the identities
 reachable DOWN `agent_succession` from the one you detach (registered
-reverts included), up to the first one holding a live attachment made by
-name: the detach takes the group from all of them. The identity that runs
-now is among them only if every revert on the way was registered (see
-"What the cut-off cannot see" below). The walk ignores when a succession
-was recorded and when a detach was made, so the answer for a past instant
-also changes after a later revert or detach (the same "at any time"
-reading as the sticky detach itself).
+reverts only), up to the first one holding a live attachment made by name:
+the detach takes AT LEAST these, plus any identity below a row made by name
+whose copy chains through the detached identity's old copy (the documented
+restore, above). Read each candidate's copy chain before relying on the
+list. The identity that runs now is among them only if every revert on the
+way was registered and every edit was registered with the identity that ran
+before it as its parent (see "What the cut-off cannot see" below). The walk
+ignores when a succession was recorded and when a detach was made, so the
+answer for a past instant also changes after a later revert or detach (the
+same "at any time" reading as the sticky detach itself).
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
@@ -1505,7 +1508,9 @@ The lineage walk reads only recorded successions. A copy written by hand
 for an identity with no recorded parent is judged by its copy chain alone
 (a copy held by a detached identity on that chain is still a dead hop).
 Copies written before migration 195 keep the chain they were written with;
-a detach reaches them through the lineage walk whatever chain they name.
+a detach reaches them through the lineage walk whatever chain they name, up
+to the first identity holding a live attachment made by name (below it, the
+chain they name decides, as above).
 
 WHAT THE CUT-OFF CANNOT SEE. The database learns of a revert only from the
 registration. A host that, on a revert, reuses an identity it registered

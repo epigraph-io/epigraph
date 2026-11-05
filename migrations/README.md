@@ -2468,8 +2468,10 @@ restart.
   `a792b630dd34b1ab8c36218b5cb698d1`, follow
   `f60c55756be189b751565de942d63a0a`). Rows already written are left as
   they are (the table is append-only): a copy the 166 follow flattened
-  keeps naming the attachment it came from, and a detach still reaches it
-  through the lineage walk (it no longer depends on the chain). Pinned by
+  keeps naming the attachment it came from, and a detach of an identity
+  in between still reaches it through the lineage walk, up to the first
+  identity holding a live row made by name (below that row its chain
+  decides). Pinned by
   `epigraph-db/tests/group_role_membership.rs` (the 195 sections),
   `role_attached_agents.rs::attaching_an_identity_attaches_a_shared_successor_and_flags_it_once`,
   `legacy_fleet_parent.rs` (`a_copy_onto_the_parents_own_predecessor_restricts`,
