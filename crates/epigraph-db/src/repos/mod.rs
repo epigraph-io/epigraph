@@ -14,6 +14,7 @@ pub mod agent_key;
 pub mod alternative_set;
 pub mod analysis;
 pub mod atom_axiom;
+pub mod authored_by;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
@@ -107,6 +108,10 @@ pub use agent_identity::{
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use authored_by::{
+    AuthorRef, AuthoredBy, AuthoredByRepository, PromptSnapshotAt, PromptSnapshotAudience,
+    PROMPT_SNAPSHOT_AUDIENCE,
+};
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
     carries_dedup_identity_key, reserved_edge_property_refusal, AdminClaimAction, AdminClaimWrite,
