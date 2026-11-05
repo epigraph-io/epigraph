@@ -111,7 +111,7 @@ pub use repos::{
     EventCursor, EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow,
     EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow,
     EvidenceRepository, EvidenceSearchResult, EvolveStepResult, ExperimentRepository,
-    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository,
+    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository, FlatRanking,
     FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
     GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
     GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,

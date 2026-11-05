@@ -394,8 +394,19 @@ impl ClaimThemeRepository {
     /// caller decides whether that is a 404 or a silent skip.
     /// `member_count` is viewer-filtered for the reason given on
     /// [`Self::list_summaries`]; the theme row itself is not a tenancy row.
-    pub async fn get_summary(
-        pool: &PgPool,
+    ///
+    /// Generic over [`sqlx::PgExecutor`] so a caller holding a viewer-stamped
+    /// connection (`routes/search.rs::semantic_search`'s theme pin) runs it on
+    /// that connection; `&PgPool` still satisfies the bound, so the MCP callers
+    /// compile unchanged. The same widening PR-29 gave
+    /// [`Self::find_similar_themes_at_dim`].
+    ///
+    /// `label` is derived from member content with no visibility filter (the
+    /// labelling script samples the members nearest the stored centroid), so a
+    /// caller that answers a viewer who may not read every member must not
+    /// return it; the REST theme pin reads only `member_count`.
+    pub async fn get_summary<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
     ) -> Result<Option<ThemeSummaryRow>, DbError> {
@@ -420,7 +431,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $2
         }
-        let row = q.fetch_optional(pool).await.map_err(DbError::from)?;
+        let row = q.fetch_optional(executor).await.map_err(DbError::from)?;
         Ok(row)
     }
 
@@ -680,6 +691,83 @@ impl ClaimThemeRepository {
             .bind(since);
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
+        }
+        let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
+
+        let results = rows
+            .iter()
+            .map(|row| {
+                let id: Uuid = row.get("id");
+                let content: String = row.get("content");
+                let similarity: f64 = row.get("similarity");
+                (id, content, similarity)
+            })
+            .collect();
+        Ok(results)
+    }
+
+    /// Candidates for a PINNED diverse request: one theme's members,
+    /// viewer-filtered, ranked by exact distance at `centroid_dim`.
+    ///
+    /// Exact because the member set is materialized before ordering: the
+    /// `members` CTE is `MATERIALIZED` and carries no `ORDER BY`, so no HNSW
+    /// scan (and its post-filter under-fill, which makes
+    /// [`Self::claims_in_themes_at_dim_since`] lossy for a large theme at 1536)
+    /// can serve it. `min_similarity` and `since` are applied in SQL, inside
+    /// the candidate set and above the `LIMIT`.
+    ///
+    /// Returns `(claim_id, content, similarity)` ordered by descending
+    /// similarity, ties broken by id. Reads no belief column. The column comes
+    /// from [`centroid_columns_for_dim`], the only path by which a name reaches
+    /// the `format!`-built SQL; any dim other than 1536 or 3072 is
+    /// `DbError::InvalidData`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claims_in_theme_exact_at_dim<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        theme_id: Uuid,
+        query_vec: &str,
+        limit: i32,
+        centroid_dim: u32,
+        since: Option<DateTime<Utc>>,
+        min_similarity: f64,
+    ) -> Result<Vec<(Uuid, String, f64)>, DbError> {
+        let (_, claim_col) =
+            centroid_columns_for_dim(centroid_dim).ok_or_else(|| DbError::InvalidData {
+                reason: format!("unsupported centroid_dim: {centroid_dim} (must be 1536 or 3072)"),
+            })?;
+
+        let sql = format!(
+            "WITH members AS MATERIALIZED ( \
+                 SELECT c.id, (c.{claim_col} <=> $2::vector) AS dist \
+                 FROM claims c \
+                 WHERE c.theme_id = $1 \
+                   AND c.{claim_col} IS NOT NULL \
+                   AND ($4::timestamptz IS NULL OR c.created_at >= $4::timestamptz) \
+                   /* {{VISIBILITY:c}} */ \
+             ), \
+             top AS ( \
+                 SELECT id, dist FROM members \
+                 WHERE 1 - dist >= $5 \
+                 ORDER BY dist, id \
+                 LIMIT $3 \
+             ) \
+             SELECT c.id, c.content, (1 - t.dist)::float8 AS similarity \
+             FROM top t JOIN claims c ON c.id = t.id \
+             WHERE c.{claim_col} IS NOT NULL /* {{VISIBILITY:c}} */ \
+             ORDER BY t.dist, t.id"
+        );
+        // Doubled braces above: a `format!` template. Both markers bind `$6`.
+        let sql = viewer.splice(&sql, 6);
+
+        let mut vq = sqlx::query(&sql)
+            .bind(theme_id) // $1
+            .bind(query_vec) // $2
+            .bind(limit) // $3
+            .bind(since) // $4
+            .bind(min_similarity); // $5
+        if let Some(g) = viewer.group_bind() {
+            vq = vq.bind(g); // $6
         }
         let rows = vq.fetch_all(executor).await.map_err(DbError::from)?;
 
