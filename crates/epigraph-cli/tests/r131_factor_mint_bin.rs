@@ -48,6 +48,14 @@ use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_r131_factor_mint");
 const REFUSAL: &str = "runs only on an explicitly configured MAINTENANCE_DATABASE_URL";
+/// `epigraph_db::pool::maintenance_verdict`'s REFUSAL arm (row security is
+/// on and the login is not in `epigraph_maintenance`), reached through
+/// `MaintenancePool::connect`. Both fragments are absent from its
+/// non-refusing arm and from the privileged log line.
+const APP_LOGIN_REFUSAL: [&str; 2] = [
+    "session_user is not a member of epigraph_maintenance",
+    "Refusing to run",
+];
 
 // ---------------------------------------------------------------- logins
 
@@ -437,6 +445,9 @@ async fn an_application_login_as_the_maintenance_dsn_is_refused(pool: PgPool) {
         Some(&logins.app.1),
     );
     assert_ne!(r.code, Some(0), "an app-login dry run ran: {}", r.stdout);
+    for text in APP_LOGIN_REFUSAL {
+        assert!(r.stderr.contains(text), "dry run: {}", r.stderr);
+    }
     assert!(
         !Path::new(&plan_out).exists(),
         "a refused dry run left its plan"
@@ -460,6 +471,9 @@ async fn an_application_login_as_the_maintenance_dsn_is_refused(pool: PgPool) {
         Some(&logins.app.1),
     );
     assert_ne!(r.code, Some(0), "an app-login apply ran: {}", r.stdout);
+    for text in APP_LOGIN_REFUSAL {
+        assert!(r.stderr.contains(text), "apply: {}", r.stderr);
+    }
     assert!(
         !Path::new(&record).exists(),
         "a refused apply left a record"
