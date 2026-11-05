@@ -108,7 +108,7 @@ async fn default_mode_reports_the_five_corpus_counts_and_the_belief_mode_report(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn detailed_mode_adds_the_six_extra_counts_beside_the_same_mode_report(pool: PgPool) {
+async fn detailed_mode_adds_the_extra_counts_beside_the_same_mode_report(pool: PgPool) {
     let server = build_test_server(pool.clone());
     let viewer = viewer_fixture::public_viewer(&pool).await;
 
@@ -131,6 +131,8 @@ async fn detailed_mode_adds_the_six_extra_counts_beside_the_same_mode_report(poo
             "challenges",
             "claims",
             "edges",
+            "edges_signed",
+            "edges_unsigned",
             "embeddings",
             "entities",
             "entity_mentions",
