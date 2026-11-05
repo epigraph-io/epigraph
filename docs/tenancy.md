@@ -1460,8 +1460,10 @@ holds a detached row or descends from one. So detaching the identity a job
 runs does NOT cut off an identity you attached by name: if the job reverts
 to the identity you attached (the chain root), it keeps the group through
 that attachment, and so do the identities registered from it afterwards.
-To take the group from a job altogether, detach the identity you attached
-by name too; every copy chained from it stops counting.
+To take the group from such a job, detach the identity you attached by name
+too; every copy chained from it stops counting. After a documented restore a
+job's identities can chain up to more than one row made by name: see "What
+the cut-off cannot see" below for the lever that holds then.
 
 A row made by name also ENDS THE WALK up the lineage, so below it the
 answer is no longer a function of the succession edges, detached rows and
@@ -1514,10 +1516,27 @@ read and write, even though the identity the job reverted FROM is
 detached. Nor is the identity that runs then recorded as the parent of the
 job's next one. So for the cut-off to reach a revert, the host must
 register it (the earlier identity's key again, naming the identity it
-reverts from as its parent; a repeat is a no-op). Whatever the host
-records, detaching the identity you attached BY NAME at the top of the
-job's copy chain takes the group from every identity whose copy chains
-from it, the reverted one included.
+reverts from as its parent; a repeat is a no-op). The same holds for the
+parent the host names on an edit or a revert: a host that picks it per
+model names that model's own last identity, so the job's edit or revert
+carried to another model is not below the identity you detached. The
+cut-off reaches the whole job only from a host that keys succession on the
+group's LANE: the lane's newest identity, whatever model, is the parent of
+every edit or revert, and a plain model switch with unchanged prompt bytes
+registers nothing.
+
+Until the host does that, detaching the identity at the top of the running
+identity's copy chain is NOT enough. The host can run any identity it
+still keeps for the group (several recent registrations, not only the one
+that ran last), and their copies can root at different rows made by name.
+After a documented restore the running identity holds its own row made by
+name, so detaching it leaves an earlier identity whose copy roots at an
+older row made by name in the group, read and write, when the job goes back
+to it unregistered. To cut a job off, detach EVERY live attachment made by
+name for the role that any identity the host may run for the group holds,
+or that any of their live copies chains up to (an older root can belong to
+an identity the host no longer keeps). A copy written by hand stays the
+limit stated above.
 
 #### Recipe: a role-private group for a scheduled job
 

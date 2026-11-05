@@ -2418,11 +2418,22 @@ restart.
   in when it names the row made by name (registered after the restore) or
   chains through a clean parent. The walk sees only recorded successions:
   a revert counts only when it is registered (the earlier identity's key
-  again, naming the one it reverts from as parent); a job that goes back
-  to an identity without that registration records no edge, and that
-  identity keeps the group through a clean old copy. Detaching the
-  identity attached by name at the top of the job's chain is the lever
-  that holds whatever was recorded. A detach also reaches the
+  again, naming the one it reverts from as parent), and a job's next
+  identity is below the one that ran only when registered with that one
+  as its parent; a job that goes back to an identity without that
+  registration records no edge, and that identity keeps the group through
+  a clean old copy, as does an edit or revert registered with another
+  parent than the identity the group's lane ran last (a host that keys
+  the parent per model). So the cut-off reaches the whole job only from a
+  host that keys succession on the group's lane (the lane's newest
+  identity, any model, is the parent of every edit or revert). Until
+  then, a detach cuts a job off only when EVERY live row made by name for
+  the role is detached that any identity the host may run for the group
+  holds or chains its live copies up to, not only the one at the top of
+  the running identity's chain: after a documented restore the running
+  identity holds its own row made by name, and an earlier identity whose
+  copy roots at an older one keeps the group when the job goes back to it
+  unregistered. A detach also reaches the
   identity that runs now when the operator detaches an OLD identity it
   descends from (a registered revert records a succession too), and the
   walk ignores when a succession or a detach was recorded, so an answer

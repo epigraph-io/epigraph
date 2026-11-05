@@ -89,11 +89,22 @@
 -- detached rows and rows made by name.
 -- The walk reads only the successions the registration recorded: a revert
 -- counts only when it is registered (the earlier identity's key again, naming
--- the identity it reverts from as parent). A job that goes back to an
--- identity without that registration records no edge, so that identity is
--- judged by the parents it was registered from before, and keeps its old
--- copy when they are clean. Detaching the identity attached by name at the
--- top of the job's chain cuts the job off whatever was recorded.
+-- the identity it reverts from as parent), and a job's next identity is below
+-- the one that ran only when it is registered with that one as its parent. A
+-- job that goes back to an identity without that registration records no
+-- edge, so that identity is judged by the parents it was registered from
+-- before, and keeps its old copy when they are clean; an edit or revert
+-- registered with a parent other than the identity the group's lane ran last
+-- (a host that keys the parent per model) is judged by that parent the same
+-- way. So the cut-off reaches the whole job only from a host that keys
+-- succession on the group's lane: the lane's newest identity, whatever model,
+-- is the parent of every edit or revert. Until then, a detach cuts a job off
+-- only when EVERY live row made by name for the role is detached that any
+-- identity the host may run for the group holds, or that any of their live
+-- copies chains up to, not only the one at the top of the running identity's
+-- chain: after a documented restore the running identity holds its own row
+-- made by name, and an earlier identity whose copy roots at an older one
+-- keeps the group, read and write, when the job goes back to it unregistered.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
 -- as a chain's root, even when its agent also holds a detached row, and an
@@ -102,9 +113,9 @@
 --     it by name;
 --   * a detach of the identity a job runs cuts off the job: its later
 --     identities (prompt edits) and an earlier identity it reverts to (one
---     that still holds a live copy; the revert registered, as above) are
---     out, however many registrations later, until the operator attaches
---     the identity that runs by name;
+--     that still holds a live copy), each registered with the identity that
+--     ran as its parent (above), are out, however many registrations later,
+--     until the operator attaches the identity that runs by name;
 --   * but an identity the operator attached by name keeps the group through
 --     that row, also when the job reverts to it: to cut such a job off,
 --     detach that identity too;
