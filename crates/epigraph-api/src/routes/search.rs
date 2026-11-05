@@ -64,8 +64,13 @@
 //! * **Byte budget**: every response is cut to about 2 MB. A paged flat
 //!   response resumes the cut at `next_cursor`; any other cut response says
 //!   `truncated: true`.
-//! * **Embedder down**: the deterministic mock vector goes through the same
-//!   pinned read, so the pin holds while the order is meaningless.
+//! * **Embedder down**: with no embedding service configured, the
+//!   deterministic mock vector goes through the same pinned read, so the pin
+//!   holds while the order is meaningless. A configured service that FAILS on
+//!   a request that can carry a cursor (`theme_id` or `cursor`, not
+//!   `diverse`) is 503 `ServiceUnavailable`: a mock-ranked page inside a walk
+//!   of the real ranking would skip and repeat rows unseen. Unpaged requests
+//!   keep the old mock fallback.
 //!
 //! # Caching
 //!
@@ -698,6 +703,34 @@ async fn generate_query_embedding_with_dim(
     generate_mock_embedding_with_dim(text, target_dim)
 }
 
+/// The 1536-d query embedding for a flat request that can carry a cursor.
+///
+/// Same as [`generate_query_embedding`] except in one case: a configured
+/// service whose dimension matches and whose call FAILS is a 503, not the mock
+/// fallback. A cursor is an offset into the real ranking; serving one page of
+/// a walk from the mock vector would rank that page by an unrelated order
+/// while its `next_cursor` continued the real one, so the walk would skip and
+/// repeat rows with nothing in the response to say so. The other mock cases
+/// (no service configured, or a service at another dimension) are the same on
+/// every page, so a walk over them stays consistent and they are unchanged.
+#[cfg(feature = "db")]
+async fn generate_walk_query_embedding(state: &AppState, text: &str) -> Result<Vec<f32>, ApiError> {
+    if let Some(ref embedding_service) = state.embedding_service {
+        if embedding_service.dimension() == EMBEDDING_DIM {
+            return embedding_service.generate_query(text).await.map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "Embedding service failed on a pageable search; refusing the mock fallback"
+                );
+                ApiError::ServiceUnavailable {
+                    service: "embedding".to_string(),
+                }
+            });
+        }
+    }
+    Ok(generate_query_embedding(state, text).await)
+}
+
 /// Format embedding vector as pgvector string literal
 ///
 /// Converts a Vec<f32> to the format "[0.1,0.2,0.3,...]" expected by pgvector.
@@ -933,9 +966,15 @@ pub async fn semantic_search(
         });
     }
     // Capped at MAX_LIMIT, and cut so a page never passes the search window
-    // (`offset < MAX_SEARCH_WINDOW`, so this is at least 1).
+    // (`offset < MAX_SEARCH_WINDOW`, so this is at least 1). `page_limit` is
+    // the size before the window cut: the flat read asks SQL for that many
+    // rows and drops the ones past the window in Rust, so the HNSW scan's
+    // `ef_search` (derived from the SQL limit) stays the same on the last
+    // page of a walk as on every page before it.
     #[allow(unused_variables)]
-    let limit = (limit.min(MAX_LIMIT) as usize).min((MAX_SEARCH_WINDOW - offset) as usize);
+    let page_limit = limit.min(MAX_LIMIT) as usize;
+    #[allow(unused_variables)]
+    let limit = page_limit.min((MAX_SEARCH_WINDOW - offset) as usize);
 
     // Validate min_similarity. An explicit value must lie in [0, 1]. Absent,
     // it is 0.0, except under `theme_core`, where it is -1.0 (cosine's lower
@@ -1522,10 +1561,19 @@ pub async fn semantic_search(
         //
         // `rank_by=theme_core` embeds nothing: it ranks by the theme core,
         // which the repo computes in SQL, so no embedding call is made.
+        //
+        // A request that can carry a cursor (`paged && !diverse`) must not be
+        // ranked by the mock when a configured service fails: its offset
+        // belongs to the real ranking, so a mock-ranked page would silently
+        // skip and repeat rows of the walk. It gets 503 instead (see
+        // `generate_walk_query_embedding`).
         let embedding_str: Option<String> = match rank_by {
             RankBy::ThemeCore => None,
             RankBy::Query => Some(match flat_query_vec {
                 Some(v) => v,
+                None if paged && !diverse => format_embedding_for_pgvector(
+                    &generate_walk_query_embedding(&state, query).await?,
+                ),
                 None => {
                     format_embedding_for_pgvector(&generate_query_embedding(&state, query).await)
                 }
@@ -1552,7 +1600,11 @@ pub async fn semantic_search(
         // predicate above every cut). With no embedding service this is the
         // deterministic mock vector through the same pinned read, so the pin
         // holds even when the ranking is meaningless.
-        let rows = epigraph_db::ClaimRepository::semantic_search_flat(
+        //
+        // SQL is asked for `page_limit` rows, not the window-cut `limit`, so
+        // the last page of a walk runs the same HNSW scan as the pages before
+        // it; the rows past the window are dropped here.
+        let mut rows = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
             ranking,
@@ -1561,7 +1613,7 @@ pub async fn semantic_search(
             request.created_after,
             request.created_before,
             request.agent_id,
-            limit as i64,
+            page_limit as i64,
             theme_filter,
             offset,
         )
@@ -1569,7 +1621,8 @@ pub async fn semantic_search(
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {e}"),
         })?;
-        let sql_rows = rows.len();
+        let full_page = rows.len() == page_limit;
+        rows.truncate(limit);
 
         // Step 3: Convert rows to response DTOs. Every pinned hit is in the
         // pinned theme by construction, so it says so.
@@ -1596,7 +1649,7 @@ pub async fn semantic_search(
         let (results, cut) = apply_byte_budget(results);
         let kept = results.len() as i64;
         let next_cursor =
-            (paged && !diverse && (cut || sql_rows == limit) && offset + kept < MAX_SEARCH_WINDOW)
+            (paged && !diverse && (cut || full_page) && offset + kept < MAX_SEARCH_WINDOW)
                 .then(|| encode_search_cursor(offset + kept));
         let truncated = cut && next_cursor.is_none();
 

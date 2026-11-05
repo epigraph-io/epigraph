@@ -69,6 +69,14 @@ fn hnsw_ef_search_for_pool(candidate_pool: i64) -> i64 {
     candidate_pool.clamp(40, 1000)
 }
 
+/// `hnsw.ef_search` for an unpinned [`ClaimRepository::semantic_search_flat`]
+/// page of `limit` rows. It takes no offset ON PURPOSE: every page of a cursor
+/// walk must run the same approximate scan, or `OFFSET` over a different scan
+/// can skip or repeat a row (see that fn's "Paging" section).
+fn flat_ef_search(limit: i64) -> i64 {
+    limit.clamp(40, 1000)
+}
+
 /// Cached Dempster–Shafer belief columns for a claim, as read by
 /// [`ClaimRepository::get_belief_columns`].
 ///
@@ -2785,8 +2793,9 @@ impl ClaimRepository {
     ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
     ///    until `LIMIT $7 + $9` matching rows are found, in exact distance
     ///    order.
-    ///  - `hnsw.ef_search = clamp(limit + offset, 40, 1000)`: the first batch
-    ///    already covers an unscoped page.
+    ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
+    ///    covers an unscoped first page. It deliberately does NOT depend on
+    ///    `offset` (see "Paging" below).
     ///
     /// The transaction is ROLLED BACK, not committed: on a caller's own
     /// transaction `begin()` opens a savepoint, and releasing it would carry the
@@ -2838,6 +2847,19 @@ impl ClaimRepository {
     /// order is total, `(distance, id)`, on both statement shapes. Unpinned, a
     /// tie group that straddles the inner `LIMIT $7 + $9` cut stays arbitrary,
     /// the same residual the hybrid recall leg records.
+    ///
+    /// Unpinned pages are prefixes of ONE approximate scan only while
+    /// `hnsw.ef_search` stays the same from page to page: an index access
+    /// method never sees the `LIMIT`, so with a fixed `ef_search` the
+    /// iterative scan emits the same stream and a deeper page just reads
+    /// further along it. A different `ef_search` is a different stream, and
+    /// `OFFSET` over a different stream can skip a row or repeat one. So
+    /// `ef_search` is derived from `limit` alone, never from `offset`, and a
+    /// walk with a constant `limit` reads one stream. Residuals: a caller that
+    /// changes `limit` mid-walk, index writes between pages, a planner that
+    /// switches away from the index at a deeper `LIMIT`, and a query
+    /// re-embedded differently on a later page can each still move a row
+    /// across a page boundary.
     ///
     /// # Exactness of the pinned path
     ///
@@ -3007,7 +3029,7 @@ impl ClaimRepository {
                 "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
                         set_config('hnsw.ef_search', $1, true)",
             )
-            .bind(limit.saturating_add(offset).clamp(40, 1000).to_string())
+            .bind(flat_ef_search(limit).to_string())
             .execute(&mut *tx)
             .await?;
         }

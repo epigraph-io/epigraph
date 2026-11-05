@@ -25,7 +25,7 @@ use axum::response::IntoResponse;
 use epigraph_api::errors::ApiError;
 use epigraph_api::routes::search::{SemanticSearchRequest, SemanticSearchResponse};
 use epigraph_api::state::AppState;
-use epigraph_embeddings::{EmbeddingService, MockProvider};
+use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
 use search_fixture::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -1179,13 +1179,248 @@ async fn window_cap_stops_cursor(pool: PgPool) {
     .expect("bulk insert");
     let state = split_state_with_embedder(&pool, embedder).await;
 
-    let out = search(&pool, state, agent, pinned(q, t, 100, Some("o:900".into())))
-        .await
-        .expect("o:900");
+    let out = search(
+        &pool,
+        state.clone(),
+        agent,
+        pinned(q, t, 100, Some("o:900".into())),
+    )
+    .await
+    .expect("o:900");
     assert_eq!(out.results.len(), 100);
     assert_eq!(out.theme_scope.as_ref().unwrap().member_count, 1005);
     assert!(
         out.next_cursor.is_none(),
         "offset 900 + 100 reaches the 1,000-row window: no next_cursor"
     );
+
+    // A page the window cuts short. SQL is asked for the full 100 (so an
+    // unpinned walk keeps one `ef_search` to the end), and the rows past the
+    // window are dropped in Rust: 50 rows, no cursor, not `truncated`.
+    let out = search(&pool, state, agent, pinned(q, t, 100, Some("o:950".into())))
+        .await
+        .expect("o:950");
+    assert_eq!(out.results.len(), 50, "the page stops at the window");
+    assert!(out.next_cursor.is_none(), "no cursor past the window");
+    assert!(!out.truncated, "a window cut is not a byte-budget cut");
+}
+
+// ── Review regression guards ──
+
+/// Theme core with no public member and members of TWO groups: the fallback
+/// mean must average only the viewer's own members. Each viewer's own member
+/// is then exactly the core (similarity 1). Were the fallback mean's
+/// visibility marker dropped, the superuser session here would average both
+/// members, and each viewer's similarity (cos 30 degrees, about 0.87) would
+/// encode where the other group's private embedding sits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_core_fallback_mean_spans_only_the_viewers_own_group(pool: PgPool) {
+    let embedder = mock_embedder();
+    let p = probe_vec(&embedder, "two group theme core").await;
+    let (m1, g1) = seed_agent_with_group(&pool, "tf-core2g-one").await;
+    let (m2, g2) = seed_agent_with_group(&pool, "tf-core2g-two").await;
+    let theme = bare_theme(&pool, "tf-core2g label").await;
+    let x1 = private_at(&pool, m1, g1, "tf-core2g one", &tilt(&p, 0.0), theme).await;
+    let x2 = private_at(&pool, m2, g2, "tf-core2g two", &tilt(&p, 60.0), theme).await;
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    for (who, mine, other) in [(m1, x1, x2), (m2, x2, x1)] {
+        let out = search(&pool, state.clone(), who, core(theme, 10, None))
+            .await
+            .expect("theme core on the viewer's own member");
+        assert_eq!(hit_ids(&out), vec![mine], "only the viewer's own member");
+        assert_eq!(out.theme_scope.as_ref().unwrap().member_count, 1);
+        let sim = out.results[0].similarity;
+        assert!(
+            (sim - 1.0).abs() < 1e-4,
+            "the fallback core is the mean of the viewer's own members only, so its \
+             one member sits exactly on it; got {sim}, which means another group's \
+             private embedding was averaged in"
+        );
+        assert!(!body(&out).contains(&other.to_string()));
+    }
+}
+
+/// An unpinned cursor walk, one row a page, with another group's claims
+/// nearest the probe. The stranger must get every claim it can read, one per
+/// page. Were the unpinned statement's inner visibility marker dropped, the
+/// hidden claims would take the inner `LIMIT` slots, the outer filter would
+/// empty the page, and the walk would stop early: a count of the hidden rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_cursor_walk_is_not_short_changed_by_another_groups_nearer_claims(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned two group walk";
+    let p = probe_vec(&embedder, q).await;
+    let (owner, group) = seed_agent_with_group(&pool, "tf-uw-owner").await;
+    let (stranger, _sg) = seed_agent_with_group(&pool, "tf-uw-stranger").await;
+    let mut hidden = Vec::new();
+    for i in 0..4 {
+        let id = seed_group_claim(&pool, owner, group, &format!("tf-uw hidden {i}")).await;
+        set_embedding(&pool, id, &tilt(&p, 0.5 * f64::from(i))).await;
+        hidden.push(id);
+    }
+    let mut public = Vec::new();
+    for i in 0..3 {
+        let id = seed_public_claim(&pool, owner, &format!("tf-uw public {i}")).await;
+        set_embedding(&pool, id, &tilt(&p, 10.0 + 10.0 * f64::from(i))).await;
+        public.push(id);
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+    let page = |cursor: Option<String>| SemanticSearchRequest {
+        query: q.to_string(),
+        limit: Some(1),
+        cursor: Some(cursor.unwrap_or_else(|| "o:0".to_string())),
+        ..Default::default()
+    };
+
+    let pages = walk(&pool, &state, stranger, page).await;
+    let seen: Vec<Uuid> = pages.iter().flat_map(hit_ids).collect();
+    assert_eq!(seen, public, "every public claim, nearest first, once each");
+    let cursors: Vec<String> = pages.iter().filter_map(|r| r.next_cursor.clone()).collect();
+    assert_eq!(
+        cursors,
+        vec!["o:1".to_string(), "o:2".to_string(), "o:3".to_string()],
+        "the cursor advances one visible row at a time"
+    );
+    for r in &pages {
+        let text = body(r);
+        for h in &hidden {
+            assert!(
+                !text.contains(&h.to_string()),
+                "a hidden claim leaked: {text}"
+            );
+        }
+    }
+
+    // Control: the owner's walk serves the hidden claims first.
+    let pages = walk(&pool, &state, owner, page).await;
+    let mine: Vec<Uuid> = pages.iter().flat_map(hit_ids).collect();
+    let mut expected = hidden.clone();
+    expected.extend(&public);
+    assert_eq!(mine, expected, "control: the owner sees its own claims");
+}
+
+/// Pinned diverse with a candidate pool smaller than the theme, and another
+/// group's members nearest the probe. The stranger's pool must fill from the
+/// members it can read. Were the exact-candidates statement's inner
+/// visibility marker dropped, the hidden members would take four of the six
+/// pool slots and the outer filter would leave two.
+#[sqlx::test(migrations = "../../migrations")]
+async fn pinned_diverse_pool_fills_from_visible_members_past_another_groups_nearer_ones(
+    pool: PgPool,
+) {
+    let embedder = mock_embedder();
+    let q = "pinned diverse two group pool";
+    let p = probe_vec(&embedder, q).await;
+    let (owner, group) = seed_agent_with_group(&pool, "tf-dp-owner").await;
+    let (stranger, _sg) = seed_agent_with_group(&pool, "tf-dp-stranger").await;
+    let t = bare_theme(&pool, "tf-dp T").await;
+    let mut hidden = HashSet::new();
+    for i in 0..4 {
+        let deg = f64::from(i);
+        hidden.insert(
+            private_at(
+                &pool,
+                owner,
+                group,
+                &format!("tf-dp hidden {i}"),
+                &tilt(&p, deg),
+                t,
+            )
+            .await,
+        );
+    }
+    let mut nearest_public = HashSet::new();
+    for i in 0..10 {
+        let deg = 20.0 + f64::from(i);
+        let id = public_at(
+            &pool,
+            owner,
+            &format!("tf-dp public {i}"),
+            &tilt(&p, deg),
+            t,
+        )
+        .await;
+        if i < 6 {
+            nearest_public.insert(id);
+        }
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+    let request = || {
+        let mut req = pinned_diverse(q, t);
+        req.candidate_pool = Some(6);
+        req
+    };
+
+    let out = search(&pool, state.clone(), stranger, request())
+        .await
+        .expect("stranger pinned diverse");
+    assert_eq!(out.centroid_dim_used, Some(1536), "the diverse branch ran");
+    let got: HashSet<Uuid> = hit_ids(&out).into_iter().collect();
+    assert_eq!(
+        got, nearest_public,
+        "a pool of 6 fills with the 6 nearest public members; another group's \
+         nearer members take no slot"
+    );
+    assert_eq!(out.theme_scope.as_ref().unwrap().member_count, 10);
+
+    // Control: the owner's pool of 6 holds its four nearer members.
+    let mine = search(&pool, state, owner, request())
+        .await
+        .expect("owner pinned diverse");
+    let got: HashSet<Uuid> = hit_ids(&mine).into_iter().collect();
+    assert!(
+        hidden.is_subset(&got),
+        "control: the owner's pool holds its own nearer members"
+    );
+}
+
+/// A request that can carry a cursor must not be served from the mock vector
+/// when a configured embedder fails: its offset belongs to the real ranking.
+/// It is 503. An unpaged request keeps the old mock fallback, and theme_core
+/// makes no embedding call, so neither is affected.
+#[sqlx::test(migrations = "../../migrations")]
+async fn paged_request_is_503_when_the_configured_embedder_fails(pool: PgPool) {
+    let p = probe_vec(&mock_embedder(), "embedder fails").await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-embed-fail").await;
+    let t = bare_theme(&pool, "tf-embed-fail T").await;
+    public_at(&pool, agent, "tf-ef one", &tilt(&p, 10.0), t).await;
+    public_at(&pool, agent, "tf-ef two", &tilt(&p, 20.0), t).await;
+    let failing = Arc::new(MockProvider::new(EmbeddingConfig::openai(DIM)).with_failures(1.0));
+    let state = split_state(&pool).await.with_embedding_service(failing);
+    let q = "embedder fails";
+
+    let unpinned_paged = SemanticSearchRequest {
+        query: q.to_string(),
+        limit: Some(10),
+        cursor: Some("o:0".to_string()),
+        ..Default::default()
+    };
+    for (name, req) in [
+        ("pinned, first page", pinned(q, t, 10, None)),
+        ("pinned, later page", pinned(q, t, 10, Some("o:1".into()))),
+        ("unpinned, paged", unpinned_paged),
+    ] {
+        let e = search(&pool, state.clone(), agent, req)
+            .await
+            .expect_err(name);
+        let (status, err) = error_parts(e).await;
+        assert_eq!(status, 503, "{name}: {err}");
+        assert_eq!(err["error"], "ServiceUnavailable", "{name}");
+    }
+
+    let unpaged = SemanticSearchRequest {
+        query: q.to_string(),
+        limit: Some(10),
+        ..Default::default()
+    };
+    let out = search(&pool, state.clone(), agent, unpaged)
+        .await
+        .expect("an unpaged request keeps the mock fallback");
+    assert!(out.next_cursor.is_none());
+
+    let out = search(&pool, state, agent, core(t, 10, None))
+        .await
+        .expect("theme_core makes no embedding call");
+    assert_eq!(out.results.len(), 2);
 }
