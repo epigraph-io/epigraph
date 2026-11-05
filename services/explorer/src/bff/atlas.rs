@@ -96,7 +96,10 @@ pub const ROUTE_BUDGET_FACTOR: f64 = 1.5;
 const PAGE_MAX: u32 = 200;
 const MAX_REL_TOKENS: usize = 12;
 const MAX_REL_CHARS: usize = 40;
-const MAX_CURSOR_CHARS: usize = 256;
+/// Long enough for U5's unplaced-theme cursor `lu1.<base64url label>.<hex>`:
+/// a 200-char label of 4-byte chars is 800 bytes, 1,067 base64url chars, so
+/// the whole token is at most 1,104.
+const MAX_CURSOR_CHARS: usize = 1200;
 const PAPER_TITLE_CHARS: usize = 300;
 const PAPER_DOI_CHARS: usize = 256;
 const ALGO_CHARS: usize = 64;
@@ -196,7 +199,7 @@ fn present(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// An opaque upstream cursor: `^[A-Za-z0-9._:-]{1,256}$`. Upstream owns its
+/// An opaque upstream cursor: `^[A-Za-z0-9._:-]{1,1200}$`. Upstream owns its
 /// meaning; the BFF only refuses what could not be one.
 pub fn opaque_cursor<'a>(raw: Option<&'a str>, what: &str) -> Result<Option<&'a str>, AppError> {
     match present(raw) {
@@ -1893,7 +1896,12 @@ async fn links(
         limit,
     };
     let (res, dir) = tokio::join!(api.graph_links(&q), theme_directory(&state, &user));
+    // U5 checks overlap before paging, so a first page is the only place an
+    // overlap 400 can surface. With `after`, a 400 means U5 refused the cursor.
     let g = res.map_err(|e| match e {
+        UpstreamError::Rejected { status: 400, .. } if after.is_some() => {
+            AppError::BadRequest(STALE_LINK.into())
+        }
         UpstreamError::Rejected { status: 400, .. } => AppError::BadRequest(OVERLAP.into()),
         other => atlas_id_err("link")(other),
     })?;
@@ -2206,8 +2214,12 @@ mod tests {
         for bad in ["x y", "a$b", "a/b", "a%2Fb", "é"] {
             assert!(opaque_cursor(Some(bad), "a").is_err(), "{bad}");
         }
-        assert!(opaque_cursor(Some(&"a".repeat(256)), "a").is_ok());
-        assert!(opaque_cursor(Some(&"a".repeat(257)), "a").is_err());
+        assert!(opaque_cursor(Some(&"a".repeat(1200)), "a").is_ok());
+        assert!(opaque_cursor(Some(&"a".repeat(1201)), "a").is_err());
+        // U5's unplaced cursor for a 200-char label of 4-byte chars.
+        let longest = format!("lu1.{}.{}", "A".repeat(1067), "0".repeat(32));
+        assert_eq!(longest.len(), 1104);
+        assert!(opaque_cursor(Some(&longest), "themes_after").is_ok());
 
         assert_eq!(parse_offset_cursor("o:0"), Some(0));
         assert_eq!(parse_offset_cursor("o:999"), Some(999));

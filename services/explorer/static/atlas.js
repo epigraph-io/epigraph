@@ -714,8 +714,14 @@
   async function loadRimMarks(theme) {
     const region = theme.parent;
     if (!region || !region.links) return;
+    // Theme-theme links are stored once with a < b, so the opened theme can be
+    // either end; a theme_region link always has the theme as a.
     const partners = region.links
-      .filter((l) => l.a === theme.id)
+      .map((l) => ({
+        total: l.total,
+        b: l.a === theme.id ? l.b : l.b === theme.id && l.kind !== 'theme_region' ? l.a : null,
+      }))
+      .filter((p) => p.b)
       .sort((x, y) => (y.total || 0) - (x.total || 0))
       .slice(0, RIM_PARTNERS);
     const signal = signalFor('rim');

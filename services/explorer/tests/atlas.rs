@@ -1524,8 +1524,7 @@ async fn links_group_by_relationship_strongest_first() {
         .and(query_param("to", T2))
         .and(query_param("after", "gl2.s.x"))
         .respond_with(ok(
-            json!({"total": 4, "items": [link_item(E4, "supports", C2, C3)],
-                                "next": null}),
+            json!({"items": [link_item(E4, "supports", C2, C3)], "next": null}),
         ))
         .mount(&app.upstream)
         .await;
@@ -1604,7 +1603,11 @@ async fn links_group_by_relationship_strongest_first() {
         .get_as(&format!("{base}?from={T}&to={T2}&after=gl2.s.x"), &sid)
         .await;
     let b = res.json();
-    assert_eq!(b["total"], 4, "total on every page");
+    assert_eq!(
+        b["total"],
+        Value::Null,
+        "U5 sends total on the first page only"
+    );
     assert_eq!(
         b["groups"][0]["count"],
         Value::Null,
@@ -1637,6 +1640,15 @@ async fn links_group_by_relationship_strongest_first() {
     let res = app.get_as(&format!("{base}?from={T}&to={R}"), &sid).await;
     assert_eq!(res.status, StatusCode::BAD_REQUEST);
     assert!(res.json()["message"].as_str().unwrap().contains("overlap"));
+
+    // A 400 on a later page is U5 refusing the cursor, not an overlap.
+    let res = app
+        .get_as(&format!("{base}?from={T}&to={R}&after=gl2.s.old"), &sid)
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+    let msg = res.json()["message"].as_str().unwrap().to_owned();
+    assert!(!msg.contains("overlap"), "{msg}");
+    assert!(msg.contains("no longer valid"), "{msg}");
 }
 
 // ---- search -----------------------------------------------------------------------
