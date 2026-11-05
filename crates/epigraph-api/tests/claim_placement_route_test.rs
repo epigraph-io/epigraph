@@ -173,6 +173,7 @@ async fn an_unclustered_claim_is_all_null(pool: PgPool) {
             "cluster_id": null,
             "neighborhood_id": null,
             "run_completed_at": null,
+            "layout": null,
         })
     );
 }
