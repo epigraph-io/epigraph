@@ -23,7 +23,8 @@
 //! equals (including re-applying an applied plan); a held mint lock; and the
 //! undo's compare-and-set (a factor changed or removed since the mint is kept
 //! or reported, and nothing it did not mint is deleted, while a column added
-//! to `factors` since, or another session time zone, does not block it). The
+//! to `factors` since, or a record rendered in another time zone, does not
+//! block it). The
 //! library's own privileged-session check is pinned on an application session
 //! directly (the binary's app-login refusal above is the maintenance pool's).
 //! BP only: no mass function and no claim column changes across an apply.
@@ -1168,7 +1169,7 @@ async fn the_library_refuses_an_application_session_before_any_write(pool: PgPoo
 enum SinceTheMint {
     /// A release adds a column to `factors`.
     ColumnAdded,
-    /// The undo's login renders timestamps in another zone.
+    /// The record's rows were rendered in another session time zone.
     TimeZone,
 }
 
@@ -1201,15 +1202,36 @@ async fn undo_still_matches(pool: PgPool, since: SinceTheMint) {
                 .expect("add a column");
         }
         SinceTheMint::TimeZone => {
-            // factors.created_at is timestamptz: its to_jsonb text follows
-            // the session's zone, so a text comparison would see a change.
-            sqlx::query(&format!(
-                "ALTER ROLE {} SET timezone = 'Pacific/Chatham'",
-                logins.maint.0
-            ))
-            .execute(&pool)
-            .await
-            .expect("set the login's time zone");
+            // factors.created_at is timestamptz, and its to_jsonb text
+            // follows the session's zone. sqlx sends TimeZone=UTC at every
+            // connect, which overrides a role's `SET timezone`, so the zone
+            // can differ only in the record: re-render each recorded row in
+            // another zone (the same instants, other text) and rewrite the
+            // record with it. A text compare would call every factor changed.
+            let mut conn = pool.acquire().await.expect("acquire");
+            sqlx::query("SET TIME ZONE 'Pacific/Chatham'")
+                .execute(&mut *conn)
+                .await
+                .expect("set the zone");
+            let mut factors = rec.factors.clone();
+            for f in &mut factors {
+                let text: String =
+                    sqlx::query_scalar("SELECT to_jsonb(f)::text FROM factors f WHERE id = $1")
+                        .bind(f.factor_id)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .expect("re-render the row");
+                assert_ne!(text, f.row, "PREMISE: the zone changes the row's text");
+                f.row = text;
+            }
+            sqlx::query("RESET TIME ZONE")
+                .execute(&mut *conn)
+                .await
+                .expect("reset the zone");
+            drop(conn);
+            std::fs::remove_file(&record).expect("remove the record");
+            let mut out = std::fs::File::create(&record).expect("rewrite the record");
+            write_record(&mut out, &rec.header, &factors).expect("write the record");
         }
     }
 
@@ -1242,7 +1264,7 @@ async fn undo_still_matches_after_a_factors_column_is_added(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn undo_still_matches_in_another_session_time_zone(pool: PgPool) {
+async fn undo_still_matches_a_record_rendered_in_another_time_zone(pool: PgPool) {
     undo_still_matches(pool, SinceTheMint::TimeZone).await;
 }
 
