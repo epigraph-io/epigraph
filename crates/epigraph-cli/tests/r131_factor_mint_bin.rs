@@ -1163,8 +1163,16 @@ async fn the_library_refuses_an_application_session_before_any_write(pool: PgPoo
     assert_eq!(factor_rows(&pool).await, minted, "a refused undo deleted");
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn undo_still_matches_after_a_factors_column_is_added_and_in_another_time_zone(pool: PgPool) {
+/// What changes between the mint and its undo, without changing a factor.
+#[derive(Clone, Copy)]
+enum SinceTheMint {
+    /// A release adds a column to `factors`.
+    ColumnAdded,
+    /// The undo's login renders timestamps in another zone.
+    TimeZone,
+}
+
+async fn undo_still_matches(pool: PgPool, since: SinceTheMint) {
     let logins = Logins::new(&pool).await;
     let _w = world(&pool).await;
     let dir = Dir::new();
@@ -1185,19 +1193,25 @@ async fn undo_still_matches_after_a_factors_column_is_added_and_in_another_time_
     .expect("record");
     assert!(!rec.factors.is_empty(), "PREMISE: the mint wrote factors");
 
-    // Since the mint: a release adds a column to `factors`, and the undo's
-    // login renders timestamps in another zone. Neither changes a factor.
-    sqlx::query("ALTER TABLE factors ADD COLUMN r131_probe integer")
-        .execute(&pool)
-        .await
-        .expect("add a column");
-    sqlx::query(&format!(
-        "ALTER ROLE {} SET timezone = 'Pacific/Chatham'",
-        logins.maint.0
-    ))
-    .execute(&pool)
-    .await
-    .expect("set the login's time zone");
+    match since {
+        SinceTheMint::ColumnAdded => {
+            sqlx::query("ALTER TABLE factors ADD COLUMN r131_probe integer")
+                .execute(&pool)
+                .await
+                .expect("add a column");
+        }
+        SinceTheMint::TimeZone => {
+            // factors.created_at is timestamptz: its to_jsonb text follows
+            // the session's zone, so a text comparison would see a change.
+            sqlx::query(&format!(
+                "ALTER ROLE {} SET timezone = 'Pacific/Chatham'",
+                logins.maint.0
+            ))
+            .execute(&pool)
+            .await
+            .expect("set the login's time zone");
+        }
+    }
 
     let r = run(
         &dir.0,
@@ -1220,4 +1234,14 @@ async fn undo_still_matches_after_a_factors_column_is_added_and_in_another_time_
         "the undo left a minted factor or deleted another"
     );
     logins.drop(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn undo_still_matches_after_a_factors_column_is_added(pool: PgPool) {
+    undo_still_matches(pool, SinceTheMint::ColumnAdded).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn undo_still_matches_in_another_session_time_zone(pool: PgPool) {
+    undo_still_matches(pool, SinceTheMint::TimeZone).await;
 }
