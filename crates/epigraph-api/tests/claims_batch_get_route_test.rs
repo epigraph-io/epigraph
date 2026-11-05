@@ -112,7 +112,7 @@ fn claim_ids(body: &Value) -> Vec<String> {
         .collect()
 }
 
-fn item<'a>(body: &'a Value, id: Uuid) -> &'a Value {
+fn item(body: &Value, id: Uuid) -> &Value {
     body["claims"]
         .as_array()
         .expect("claims array")

@@ -8,7 +8,7 @@ mod fixture;
 use std::collections::HashSet;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::ReasoningTraceRepository;
+use epigraph_db::{ReasoningTraceRepository, ScopedPool, SessionGucMode};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -65,8 +65,10 @@ async fn readable_ids_withholds_a_group_private_trace_on_a_public_claim(pool: Pg
         .expect("trace read");
     assert_eq!(got, HashSet::from([t_pub, t_priv]));
 
-    // The same answer on a viewer-stamped connection, where migration 077's
-    // policies also apply.
+    // The same answer through `read_as` on a viewer-stamped connection. This
+    // pool still authenticates as the `#[sqlx::test]` superuser, which bypasses
+    // RLS, so this arm checks the spliced predicate only; the app-role arm
+    // below is the one where migration 077's policies apply as well.
     let scoped = fixture::scoped_pool(&pool).await;
     let outsider_v = Viewer::resolve(&pool, outsider).await.expect("viewer");
     let mut read = scoped.read_as(&outsider_v).await.expect("read_as");
@@ -82,6 +84,31 @@ async fn readable_ids_withholds_a_group_private_trace_on_a_public_claim(pool: Pg
         .expect("trace read");
     read.commit().await.expect("finish the read");
     assert_eq!(got, HashSet::from([t_pub, t_priv]));
+
+    // The application role: every connection is downgraded to `epigraph_app`,
+    // so the RLS policies filter alongside the splice. The outsider still reads
+    // only the public trace, and the owner calibration shows the policies do
+    // not take away a trace the splice grants. Viewers were resolved on the
+    // superuser pool above (a downgraded unstamped session would resolve to an
+    // empty group set).
+    let app = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(&pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    for (who, viewer, want) in [
+        ("outsider", &outsider_v, HashSet::from([t_pub])),
+        ("owner", &owner_v, HashSet::from([t_pub, t_priv])),
+    ] {
+        let mut read = app.read_as(viewer).await.expect("app-role read_as");
+        let got = ReasoningTraceRepository::readable_ids(&mut *read, viewer, &ids)
+            .await
+            .expect("trace read as the app role");
+        read.commit().await.expect("finish the read");
+        assert_eq!(got, want, "{who} on the app role");
+    }
 
     // Empty input: an empty set, no statement.
     assert!(ReasoningTraceRepository::readable_ids(&pool, &owner_v, &[])
