@@ -535,6 +535,67 @@ async fn counts_are_computed_under_the_callers_viewer(pool: PgPool) {
     );
 }
 
+/// The counts' in-query predicate holds on its own: on a session row security
+/// does not filter (the superuser harness connection, stamped from the
+/// outsider's viewer), a group-private claim and edge still move no outsider
+/// count. On the application role, FORCEd row security filters the same rows
+/// a second time, so this is the test that pins the splice itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn counts_filter_in_query_even_where_row_security_does_not(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (author, _) = named(&pool, "Ada Fenwright").await;
+    let team = team_of(&pool, &[author]).await;
+    let claim = fixture::seed_group_claim(&pool, author, team, "a private finding").await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'agent', $2, 'claim', 'asserts') RETURNING id",
+    )
+    .bind(author)
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("edge");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(team)
+    .execute(&pool)
+    .await
+    .expect("force the edge private");
+
+    let superuser = fixture::scoped_pool(&pool).await;
+    let v = viewer(&pool, outsider).await;
+    let mut read = superuser.read_as(&v).await.expect("read_as");
+    let rls_bypassed: bool = sqlx::query_scalar(
+        "SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut *read)
+    .await
+    .expect("role");
+    assert!(
+        rls_bypassed,
+        "CALIBRATION: row security does not filter this session"
+    );
+    let card = AgentLookupRepository::card(&mut read, &v, author)
+        .await
+        .expect("card")
+        .expect("exists");
+    assert_eq!(card.counts.asserted_claims, 0, "{card:?}");
+
+    let member = viewer(&pool, author).await;
+    let mut read = superuser.read_as(&member).await.expect("read_as");
+    let card = AgentLookupRepository::card(&mut read, &member, author)
+        .await
+        .expect("card")
+        .expect("exists");
+    assert_eq!(
+        card.counts.asserted_claims, 1,
+        "CALIBRATION: the member counts it"
+    );
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn counts_are_capped(pool: PgPool) {
     let (asker, _) = named(&pool, "asker").await;
