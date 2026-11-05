@@ -286,7 +286,7 @@ async fn atlas_world(pool: &PgPool, with_t6: bool) -> World {
     }
 }
 
-fn region<'a>(body: &'a Value, id: Uuid) -> &'a Value {
+fn region(body: &Value, id: Uuid) -> &Value {
     body["regions"]
         .as_array()
         .expect("regions")
