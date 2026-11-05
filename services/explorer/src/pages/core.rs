@@ -155,7 +155,8 @@ fn stats_view(s: &StatsResponse) -> StatsView {
 }
 
 fn themes_list(t: &ThemesOverview, links: &crate::links::Links) -> OverviewList {
-    // Upstream already orders by claim_count DESC, label ASC.
+    // Upstream already orders by claim_count DESC, id ASC. One page (200) is
+    // enough for OVERVIEW_ITEMS; `total` is upstream's, over all pages.
     OverviewList {
         items: t
             .themes
@@ -167,7 +168,9 @@ fn themes_list(t: &ThemesOverview, links: &crate::links::Links) -> OverviewList 
                 detail: format!("{} claims", fmt_count(th.claim_count)),
             })
             .collect(),
-        total: t.themes.len(),
+        total: t
+            .total
+            .map_or(t.themes.len(), |n| usize::try_from(n).unwrap_or(usize::MAX)),
         note: None,
     }
 }

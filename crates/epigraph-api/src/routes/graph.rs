@@ -1,7 +1,7 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
 //!
-//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
 //!
 //! Conversion shard 7. `expand` is ONE register site whose alias was spent on
 //! FOUR statements, and all four now run on a viewer-stamped connection from
@@ -33,10 +33,17 @@
 //! stays open, and nothing further about it is recorded here — see
 //! `docs/tenancy/progress.json`.
 //!
-//! The other 3 sites — `overview`, `themes_overview`, `themes_expand` — are
-//! routed GETs that hold no `Viewer` at all. Their owner is
-//! `D-PR16-theme-cluster-viewer-scope`, an open entry that explicitly has no
-//! control.
+//! `themes_overview` (backlog 57917c13) runs on a [`AppState::read_as`]
+//! connection too, and is viewer-scoped by the spliced `claims` predicate in
+//! `ClaimThemeRepository::overview_page`: the per-theme count is of the
+//! current members the caller can read, and theme rows narrow to those with
+//! at least one such member. Its LABELS are not viewer-scoped: a stored label
+//! may be derived from members the caller cannot read (the label residual on
+//! `D-PR16-theme-cluster-viewer-scope`).
+//!
+//! The other 2 sites — `overview`, `themes_expand` — are routed GETs that hold
+//! no `Viewer` at all. Their owner is `D-PR16-theme-cluster-viewer-scope`, an
+//! open entry that explicitly has no control.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -633,29 +640,102 @@ async fn fetch_subgraph_edges(
     Ok((edges, filtered))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct ThemeOut {
     pub id: Uuid,
+    /// The stored theme label, cut to 200 characters. NOT viewer-scoped: for
+    /// a theme with members the caller cannot read, it may be derived from
+    /// their text (`scripts/label_themes_llm.py` samples members with no
+    /// visibility predicate). Residual recorded on
+    /// `D-PR16-theme-cluster-viewer-scope`.
     pub label: String,
-    pub claim_count: i32,
+    /// Current claims assigned to this theme that the CALLER can read. Live,
+    /// never the stored `claim_themes.claim_count` (backlog 57917c13).
+    pub claim_count: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ThemesOverviewResponse {
     pub themes: Vec<ThemeOut>,
+    /// Themes with at least one member the caller can read.
+    pub total: i64,
+    /// Pass back as `after`; `null` at the end.
+    pub next_cursor: Option<String>,
 }
 
+/// Query params of `GET /api/v1/graph/themes/overview`. Typed, so a
+/// malformed `limit` is the query extractor's 400.
+#[derive(Debug, Deserialize)]
+pub struct ThemesOverviewParams {
+    /// Page size, clamped to `1..=THEME_OVERVIEW_PAGE_MAX` (200, the default).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's `next_cursor`, unchanged. Empty = first page.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// `GET /api/v1/graph/themes/overview` — viewer-scoped, cursor-paged.
+///
+/// Which themes appear and their `claim_count` are per viewer (owner ruling
+/// A1): a theme is listed only when the caller can read at least one current
+/// member, and the count is of those members, ordered `claim_count DESC, id
+/// ASC`. These guarantees are THIS route's only; `themes_expand` and
+/// `/api/v1/themes/split-candidates` do not yet hold them. Labels are
+/// corpus-derived for mixed themes (see [`ThemeOut::label`]).
 pub async fn themes_overview(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    Query(params): Query<ThemesOverviewParams>,
 ) -> Result<Json<ThemesOverviewResponse>, (axum::http::StatusCode, String)> {
-    let pool: &PgPool = &state.db_pool;
-    let themes: Vec<ThemeOut> = sqlx::query_as::<_, ThemeOut>(
-        "SELECT id, label, claim_count FROM claim_themes ORDER BY claim_count DESC, label ASC",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
-    Ok(Json(ThemesOverviewResponse { themes }))
+    use axum::http::StatusCode;
+    use epigraph_db::repos::claim_theme::{ThemeOverviewCursor, THEME_OVERVIEW_PAGE_MAX};
+
+    let limit = params
+        .limit
+        .unwrap_or(THEME_OVERVIEW_PAGE_MAX)
+        .clamp(1, THEME_OVERVIEW_PAGE_MAX);
+    let after = match params.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(ThemeOverviewCursor::decode(token).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "malformed `after` cursor; pass back `next_cursor` of the previous page \
+                 unchanged"
+                    .to_string(),
+            )
+        })?),
+    };
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "themes_overview",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to acquire a scoped connection".to_string(),
+        )
+    })?;
+    let page = epigraph_db::ClaimThemeRepository::overview_page(&mut *read, &viewer, after, limit)
+        .await
+        .map_err(internal_db)?;
+
+    Ok(Json(ThemesOverviewResponse {
+        themes: page
+            .themes
+            .into_iter()
+            .map(|t| ThemeOut {
+                id: t.id,
+                label: t.label,
+                claim_count: t.member_count,
+            })
+            .collect(),
+        total: page.total,
+        next_cursor: page.next.map(|c| c.encode()),
+    }))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]

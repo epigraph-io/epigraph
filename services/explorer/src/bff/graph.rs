@@ -60,7 +60,9 @@ use crate::upstream::{truncate_chars, EgoNode, EgoResponse, DEFAULT_EGO_DEGREE, 
 pub const VISIBLE_NODE_CAP: usize = 150;
 /// Per-viewer cache lifetime of `/bff/themes` and `/bff/communities`.
 pub const OVERVIEW_TTL: Duration = Duration::from_secs(60);
-/// Most themes / supernodes an overview returns (upstream is unbounded).
+/// Most themes / supernodes an overview returns (themes: upstream pages at
+/// 200 and `/bff/themes` walks at most 3 pages; supernodes: upstream is
+/// unbounded).
 pub const OVERVIEW_ITEM_CAP: usize = 500;
 /// Most cluster edges an overview returns.
 pub const OVERVIEW_EDGE_CAP: usize = 2000;
@@ -402,8 +404,11 @@ pub fn canvas_from_neighborhood(
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ThemesBody {
     pub themes: Vec<ThemeItem>,
-    /// Themes upstream returned, before [`OVERVIEW_ITEM_CAP`].
+    /// Themes this viewer can read at least one member of: upstream's `total`
+    /// (all pages), or the count returned when upstream sends none.
     pub total: usize,
+    /// `true` when themes exist past what this body carries (the
+    /// [`OVERVIEW_ITEM_CAP`] cut, or upstream pages the walk did not read).
     pub truncated: bool,
 }
 
@@ -416,7 +421,11 @@ pub struct ThemeItem {
 }
 
 pub fn themes_body(o: ThemesOverview, links: &Links) -> ThemesBody {
-    let total = o.themes.len();
+    let delivered = o.themes.len().min(OVERVIEW_ITEM_CAP);
+    let total = o
+        .total
+        .map_or(o.themes.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
+    let truncated = o.next_cursor.is_some() || total > delivered;
     let themes = o
         .themes
         .into_iter()
@@ -431,7 +440,7 @@ pub fn themes_body(o: ThemesOverview, links: &Links) -> ThemesBody {
     ThemesBody {
         themes,
         total,
-        truncated: total > OVERVIEW_ITEM_CAP,
+        truncated,
     }
 }
 
@@ -564,7 +573,15 @@ async fn themes(State(state): State<AppState>, user: SignedIn) -> Result<Respons
     if let Some(hit) = state.cache.get::<ThemesBody>(&key) {
         return Ok(private_json(&*hit));
     }
-    let body = themes_body(user.api(&state).themes_overview().await?, &state.links);
+    // Walk upstream's 200-per-page overview (at most 3 pages) so a viewer who
+    // can read more than 200 themes does not lose the smallest from the
+    // canvas. The walked body is what is cached, per viewer.
+    let body = themes_body(
+        user.api(&state)
+            .themes_overview_upto(OVERVIEW_ITEM_CAP)
+            .await?,
+        &state.links,
+    );
     state
         .cache
         .insert(key, Arc::new(body.clone()), OVERVIEW_TTL);
@@ -848,6 +865,36 @@ mod tests {
         assert_eq!(body.total, OVERVIEW_ITEM_CAP + 3);
         assert!(body.truncated);
         assert_eq!(body.themes[0].href, links().theme(uuid(1)));
+
+        // themes_body_reports_upstream_total_and_truncation
+        let three: Vec<_> = (1..=3)
+            .map(|i| json!({"id": uuid(i), "label": format!("t{i}"), "claim_count": 1}))
+            .collect();
+        let body = themes_body(
+            serde_json::from_value(json!({
+                "themes": three, "total": 250, "next_cursor": "t1.1.ab"
+            }))
+            .unwrap(),
+            &links(),
+        );
+        assert_eq!(body.themes.len(), 3);
+        assert_eq!(body.total, 250, "upstream's total, not the page length");
+        assert!(body.truncated, "a pending cursor means more exists");
+
+        let body = themes_body(
+            serde_json::from_value(json!({ "themes": three })).unwrap(),
+            &links(),
+        );
+        assert_eq!(body.total, 3, "no upstream total: the count returned");
+        assert!(!body.truncated);
+
+        let body = themes_body(
+            serde_json::from_value(json!({ "themes": three, "total": 7, "next_cursor": null }))
+                .unwrap(),
+            &links(),
+        );
+        assert_eq!(body.total, 7);
+        assert!(body.truncated, "total above what was delivered");
 
         let body = communities_body(
             serde_json::from_value(json!({
