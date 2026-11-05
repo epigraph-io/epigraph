@@ -157,8 +157,9 @@ pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
-    ClaimPlacement, ClusterRunRepository, ClusterRunRow, EgoEdgeRow, EgoEdges, EgoEntity,
-    EgoRepository,
+    ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,
+    ContextEdgeRow, ContextEdgeTally, ContextPage, ContextPaperRow, EgoEdgeRow, EgoEdges,
+    EgoEntity, EgoRepository, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
 pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
 
