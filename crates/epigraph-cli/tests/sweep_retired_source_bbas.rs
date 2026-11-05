@@ -16,7 +16,8 @@
 //! * The undo puts every row back bit-identical and every cache back by
 //!   compare-and-set; a cache or key written since the sweep is left alone;
 //!   a dry-run undo writes nothing; a second undo finds everything as
-//!   recorded and writes nothing.
+//!   recorded and writes nothing. An undo that cannot re-insert a row exits 1
+//!   and keeps its report (the rows it did re-insert are committed).
 //! * Every guard refuses with nothing written, for the apply AND the undo: no
 //!   configured maintenance DSN, an unprivileged login (the dry run too), a
 //!   missing agent, an empty reason, a held replay lock, an existing output
@@ -1565,5 +1566,108 @@ async fn a_holder_the_measurement_cannot_predict_refuses_the_apply(pool: PgPool)
     let plan: serde_json::Value = serde_json::from_str(&r.stdout).expect("the plan is JSON");
     assert_eq!(plan["matches_expect"], true, "{plan}");
     assert_eq!(plan["rows"].as_array().map(Vec::len), Some(4), "{plan}");
+    l.drop(&pool).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undo_that_cannot_reinsert_a_row_exits_1_and_keeps_its_report(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (k0, _) = measure(&dir, "k0.json", &l);
+    let snap = dir.path("snap.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "PREMISE: the apply: {r}");
+
+    // `lonely`'s stored image now names a frame that does not exist, so its
+    // re-insert fails (foreign key) while its siblings' succeed.
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snap).unwrap()).unwrap();
+    let deleted = snapshot["deleted"].as_array_mut().unwrap();
+    let at = deleted
+        .iter()
+        .position(|d| d["holder_id"] == w.lonely.to_string())
+        .expect("lonely's deleted row");
+    let broken: Uuid = deleted[at]["id"].as_str().unwrap().parse().unwrap();
+    let siblings: Vec<Uuid> = deleted
+        .iter()
+        .filter(|d| d["holder_id"] != w.lonely.to_string())
+        .map(|d| d["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(siblings.len(), 2, "PREMISE");
+    let mut image: serde_json::Value =
+        serde_json::from_str(deleted[at]["row"].as_str().unwrap()).unwrap();
+    image["frame_id"] = serde_json::json!(Uuid::new_v4());
+    deleted[at]["row"] = serde_json::json!(image.to_string());
+    let edited = dir.path("snap-edited.json");
+    std::fs::write(&edited, snapshot.to_string()).unwrap();
+    let lonely_cache = cache(&pool, w.lonely).await;
+
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_args(&edited, Some(&agent), Some("undo test"), true)),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert_eq!(r.code, Some(1), "{r}");
+    assert!(r.says("could not be re-inserted"), "{r}");
+    let reports = undo_reports(&dir, &edited);
+    assert_eq!(
+        reports.len(),
+        1,
+        "the report of an undo whose rows were committed is gone: {r}"
+    );
+    let out: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&reports[0]).unwrap()).unwrap();
+    let failed = out["rows"]["failed"].as_array().expect("rows.failed");
+    assert_eq!(failed.len(), 1, "{out}");
+    assert_eq!(failed[0][0], broken.to_string(), "{out}");
+    assert!(
+        failed[0][1]
+            .as_str()
+            .is_some_and(|e| e.contains("mass_functions_frame_id_fkey")),
+        "the report keeps the row's error: {out}"
+    );
+    assert_eq!(
+        out["rows"]["restored"].as_array().map(Vec::len),
+        Some(2),
+        "{out}"
+    );
+    for id in &siblings {
+        assert!(
+            exists(&pool, *id).await,
+            "{id}: a sibling row did not come back"
+        );
+    }
+    assert!(!exists(&pool, broken).await);
+    assert_eq!(
+        out["caches_held_back"],
+        serde_json::json!([w.lonely.to_string()]),
+        "{out}"
+    );
+    assert_eq!(
+        cache(&pool, w.lonely).await,
+        lonely_cache,
+        "a holder whose row did not come back had its cache restored"
+    );
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'k10_retro.sweep_undone'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the undo's audit row (its rows were committed)");
+    assert_eq!(
+        details["rows_failed"],
+        serde_json::json!([broken.to_string()]),
+        "{details}"
+    );
     l.drop(&pool).await;
 }

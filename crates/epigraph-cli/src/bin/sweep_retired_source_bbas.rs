@@ -32,7 +32,11 @@
 //!   holders whose every row came back by compare-and-set (a cache written
 //!   since the sweep is reported and left alone). `--dry-run` runs every
 //!   statement and rolls back. The outcomes go to `--report` (default
-//!   `<snapshot>.undo-<UTC stamp>[-dry-run].json`, created new).
+//!   `<snapshot>.undo-<UTC stamp>[-dry-run].json`, created new), which is
+//!   kept once the rows' transaction has ended, whatever follows. Exit 1 when
+//!   a row could not be re-inserted or the cache step failed (the report then
+//!   names the rows' errors, or carries `caches_error`); the rows it did
+//!   re-insert stay committed.
 //!
 //! # Authority
 //!
@@ -56,7 +60,7 @@ use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use uuid::Uuid;
 
-use epigraph_cli::belief_cache::{plan_restore, restore_wave, RestoreOptions};
+use epigraph_cli::belief_cache::{plan_restore, restore_wave_with, RestoreOptions, RestoreReport};
 use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::k10_retro::{
     apply, compare_to_measurement, dry_run, expected_block, read_snapshot, restore_rows, Operator,
@@ -180,10 +184,11 @@ async fn main() {
     enforce_build_fold_or_exit(BIN, intent);
     let mut created = Vec::new();
     if let Err(e) = run(cli, writes, &mut created).await {
-        // Nothing this run created holds a committed write (an apply's
-        // snapshot is kept once its COMMIT succeeded, and nothing fails
-        // after it): remove them, so a re-run is not refused over an
-        // empty file.
+        // What is still listed here records no write (an apply's snapshot
+        // leaves the list once it is synced, before its COMMIT; an undo's
+        // report once its rows' transaction has ended, so a failure after
+        // that keeps the report): remove it, so a re-run is not refused over
+        // an empty file.
         for path in created {
             let _ = std::fs::remove_file(path);
         }
@@ -294,6 +299,10 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         )
         .await
         .context("restore the deleted rows")?;
+        // The rows' transaction has ended (committed, or with --dry-run rolled
+        // back): from here the report is the record of this undo and is
+        // written whatever happens next, so it is never removed.
+        created.clear();
         let whole = rows.holders_whole(&snap.deleted);
         let held_back: Vec<Uuid> = snap
             .caches
@@ -302,16 +311,27 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
             .filter(|id| !whole.contains(id))
             .collect();
         let plan = plan_restore(&snap.caches, Some(&whole));
-        let caches = restore_wave(
+        // Each committed batch is folded in as it lands, so a later batch's
+        // failure still leaves the earlier ones in the report.
+        let mut caches = RestoreReport {
+            not_in_wave: plan.not_in_wave.clone(),
+            ..RestoreReport::default()
+        };
+        let cache_error = restore_wave_with(
             maint.pool(),
             &plan,
             &RestoreOptions {
                 dry_run: cli.dry_run,
                 ..RestoreOptions::default()
             },
+            |batch| {
+                caches.append(batch.clone());
+                Ok(())
+            },
         )
         .await
-        .context("restore the holders' caches")?;
+        .err()
+        .map(|e| format!("{e:#}"));
         let mut cache_buckets = serde_json::Map::new();
         for (name, ids) in caches.buckets() {
             cache_buckets.insert(name.to_string(), serde_json::json!(ids));
@@ -325,8 +345,10 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
                 "rows": rows,
                 "caches": cache_buckets,
                 "caches_held_back": held_back,
+                "caches_error": cache_error,
             }),
-        )?;
+        )
+        .with_context(|| format!("write {}", out_path.display()))?;
         if cli.dry_run {
             println!("DRY RUN: every statement rolled back");
         }
@@ -344,6 +366,12 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         }
         println!("caches held back (a row not back): {}", held_back.len());
         println!("report: {}", out_path.display());
+        if let Some(e) = cache_error {
+            bail!(
+                "restore the holders' caches: {e}; the rows' outcomes and every cache batch \
+                 restored before the failure are in the report"
+            );
+        }
         if failed > 0 {
             bail!("{failed} row(s) could not be re-inserted; see the report");
         }
