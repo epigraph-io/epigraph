@@ -107,6 +107,7 @@ pub const ELEVATED_NON_GET_ALLOWLIST: &[(&str, &str)] = &[
     ("POST", "/api/v1/graph/query"),
     ("POST", "/api/v1/triples/query"),
     ("POST", "/api/v1/embeddings/neighborhood-density"),
+    ("POST", "/api/v1/claims/batch-get"),
 ];
 
 /// The one allowlisted non-GET route that WRITES while elevated: proposing an

@@ -45,6 +45,8 @@ pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
 pub mod claims;
+#[cfg(feature = "db")]
+pub mod claims_batch_get;
 pub mod claims_query;
 pub mod clusters;
 pub mod community;
@@ -815,6 +817,10 @@ pub fn create_router_with_extensions(
             get(claims::find_claims_needing_embeddings),
         )
         .route("/api/v1/claims/:id", get(claims::get_claim))
+        .route(
+            "/api/v1/claims/batch-get",
+            post(claims_batch_get::batch_get_claims),
+        )
         .route("/api/v1/query/rag", get(rag::rag_context))
         .route("/api/v1/search/evidence", get(rag::search_evidence))
         .route(
