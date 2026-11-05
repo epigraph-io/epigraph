@@ -47,6 +47,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 const BIN: &str = env!("CARGO_BIN_EXE_r131_factor_mint");
+/// The measurement binary whose `r131:` line the runbook compares.
+const DELTA_BIN: &str = env!("CARGO_BIN_EXE_supersede_belief_delta");
 const REFUSAL: &str = "runs only on an explicitly configured MAINTENANCE_DATABASE_URL";
 /// `epigraph_db::pool::maintenance_verdict`'s REFUSAL arm (row security is
 /// on and the login is not in `epigraph_maintenance`), reached through
@@ -119,7 +121,17 @@ impl Run {
 }
 
 fn run(dir: &Path, args: &[&str], database_url: &str, maintenance_url: Option<&str>) -> Run {
-    let mut cmd = Command::new(BIN);
+    run_bin(BIN, dir, args, database_url, maintenance_url)
+}
+
+fn run_bin(
+    bin: &str,
+    dir: &Path,
+    args: &[&str],
+    database_url: &str,
+    maintenance_url: Option<&str>,
+) -> Run {
+    let mut cmd = Command::new(bin);
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("DATABASE_URL", database_url)
@@ -193,6 +205,27 @@ async fn factorless(pool: &PgPool, s: Uuid, t: Uuid, rel: &str) -> Uuid {
     e
 }
 
+/// A factorless edge with a fixed id and a `created_at` `ago` before now, so
+/// a test can make the trigger's order (`created_at`, then id) disagree with
+/// id order.
+async fn factorless_at(pool: &PgPool, id: Uuid, ago: &str, s: Uuid, t: Uuid, rel: &str) -> Uuid {
+    let e: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (id, created_at, source_id, source_type, target_id, target_type, \
+                            relationship) \
+         VALUES ($1, now() - $2::interval, $3, 'claim', $4, 'claim', $5) RETURNING id",
+    )
+    .bind(id)
+    .bind(ago)
+    .bind(s)
+    .bind(t)
+    .bind(rel)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge");
+    strip(pool, e).await;
+    e
+}
+
 /// Factors on the `(type, pair)` slot of `a`, `b`, as (id, frame-less).
 async fn on_slot(pool: &PgPool, ft: &str, a: Uuid, b: Uuid) -> Vec<(Uuid, bool, Option<String>)> {
     sqlx::query_as(
@@ -236,8 +269,18 @@ async fn world(pool: &PgPool) -> World {
     let c = |tag: &'static str| viewer_fixture::seed_public_claim(pool, agent, tag);
 
     let (a, b) = (c("r131 a").await, c("r131 b").await);
-    let first = factorless(pool, a, b, "corroborates").await;
-    let second = factorless(pool, b, a, "corroborates").await;
+    // The EARLIER edge has the LARGER id: an order by id alone, or by
+    // created_at alone with the wrong tiebreak, picks the wrong winner.
+    let first = factorless_at(
+        pool,
+        Uuid::from_u128(u128::MAX),
+        "2 minutes",
+        a,
+        b,
+        "corroborates",
+    )
+    .await;
+    let second = factorless_at(pool, Uuid::from_u128(1), "1 minute", b, a, "corroborates").await;
 
     let (rc, rd) = (c("r131 c").await, c("r131 d").await);
     let refutes = factorless(pool, rc, rd, "refutes").await;
@@ -498,6 +541,29 @@ async fn the_dry_run_plans_exactly_the_measured_set_and_writes_nothing(pool: PgP
         "the dry run's counts are the measurement's: {}",
         r.stdout
     );
+    // The line the runbook compares is the measurement binary's, byte for
+    // byte.
+    let delta = run_bin(
+        DELTA_BIN,
+        &dir.0,
+        &["--json", &dir.path("delta.json"), "--items", "r131"],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    )
+    .ok();
+    let r131_line = |out: &str| {
+        out.lines()
+            .find(|l| l.starts_with("r131: "))
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        r131_line(&r.stdout),
+        r131_line(&delta.stdout),
+        "the dry run's r131 line is supersede_belief_delta's: {}\n{}",
+        r.stdout,
+        delta.stdout
+    );
+    assert!(r131_line(&r.stdout).is_some(), "{}", r.stdout);
     let plan = read_plan(&path);
 
     // The measurement's set, exactly.
