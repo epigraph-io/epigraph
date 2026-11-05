@@ -445,9 +445,13 @@ pub async fn search_agents(
     ViewerExtractor(viewer): ViewerExtractor,
     Query(params): Query<AgentSearchParams>,
 ) -> Result<Json<epigraph_db::FindAgentResult>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &[AGENT_SEARCH_SCOPE])?;
-    }
+    // Fail closed: no AuthContext is a 401, never a skipped scope check.
+    let Some(axum::Extension(auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "agent search requires authentication".into(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(&auth, &[AGENT_SEARCH_SCOPE])?;
     let query = epigraph_db::FindAgentQuery::new(
         &params.name,
         params.kind.as_deref(),
