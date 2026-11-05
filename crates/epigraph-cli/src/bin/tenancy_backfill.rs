@@ -1636,6 +1636,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refolds or vacates its cache, which is the defect the function closes.
     // The stake that makes the owner a control here.
     ("epigraph_claim_is_compound", 193),
+    // 200, the anchored passkey path's reader of an enrollment's act and its
+    // confirming passkey. Fails SILENTLY under a non-member owner: its reads of
+    // the FORCEd `passkey_enrollments`, `pending_admin_acts` and
+    // `person_authenticators` then admit no row, so every anchored enrollment
+    // falls back to the attested ceremony without an error.
+    ("epigraph_enrollment_anchor", 200),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2653,6 +2659,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_passkeys_for_act",
             "public.epigraph_passkeys_for_act(uuid)",
+            true,
+        ),
+        // 200: the anchored enrollment page's reader, app-callable like 124's
+        // ceremony reader.
+        (
+            "epigraph_enrollment_anchor",
+            "public.epigraph_enrollment_anchor(uuid)",
             true,
         ),
         (

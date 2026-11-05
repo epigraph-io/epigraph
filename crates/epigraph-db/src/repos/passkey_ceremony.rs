@@ -1,5 +1,7 @@
 //! The passkey enrollment ceremony's database half (migration 124): the three
-//! definers the application role may EXECUTE, each keyed by the enrollment id.
+//! definers the application role may EXECUTE, each keyed by the enrollment id,
+//! and migration 200's reader of an enrollment's anchor (the act it was
+//! opened on and the passkey that confirmed it).
 //!
 //! # Why this is not `PasskeyRepository`
 //!
@@ -62,6 +64,44 @@ pub struct VerifiedPasskey<'a> {
     pub backup_eligible: bool,
 }
 
+/// What migration 200's `epigraph_enrollment_anchor` returns for a live
+/// enrollment opened on an admin act: the act and the passkey that confirmed
+/// it, for the anchored path's check (`epigraph_passkey::Passkeys::check_anchor`,
+/// which decides; this row decides nothing).
+#[derive(Debug, Clone, FromRow)]
+pub struct EnrollmentAnchor {
+    /// The act the enrollment was opened on.
+    pub act_id: Uuid,
+    /// Its kind.
+    pub act_kind: String,
+    /// Its outcome (`confirmed` for any act an enrollment can be opened on).
+    pub act_outcome: Option<String>,
+    /// Its stored canonical args digest.
+    pub args_digest: Vec<u8>,
+    /// Its stored confirmation ceremony (`{"ceremony": ..., "nonce": ...}`).
+    pub act_challenge_state: Option<serde_json::Value>,
+    /// Its stored assertion evidence.
+    pub assertion_evidence: Option<serde_json::Value>,
+    /// The person the enrollment registers a passkey for.
+    pub enrollment_person: Uuid,
+    /// The passkey that confirmed the act.
+    pub anchor_id: Uuid,
+    /// Whose it is.
+    pub anchor_person: Uuid,
+    /// Its credential id.
+    pub anchor_credential_id: Vec<u8>,
+    /// Its stored credential.
+    pub anchor_passkey: serde_json::Value,
+    /// What its registration recorded: the AAGUID, ...
+    pub anchor_aaguid: Uuid,
+    /// ... the attestation format, ...
+    pub anchor_attestation_format: String,
+    /// ... and whether it may be synced.
+    pub anchor_backup_eligible: bool,
+    /// Whether it has been revoked since.
+    pub anchor_revoked: bool,
+}
+
 /// The ceremony half of migration 124's definers.
 pub struct PasskeyCeremony;
 
@@ -80,6 +120,31 @@ impl PasskeyCeremony {
         let row = sqlx::query_as::<_, CeremonyEnrollment>(
             "SELECT person_agent_id, reason, label, expires_at, challenge_state \
                FROM public.epigraph_enrollment_for_ceremony($1)",
+        )
+        .bind(enrollment)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// The anchor of the live enrollment `enrollment`, through migration
+    /// 200's `epigraph_enrollment_anchor`: `None` unless it is live and was
+    /// opened on an admin act whose confirming passkey exists (a first
+    /// passkey's maintenance enrollment has none). It enumerates nothing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the call fails (42883 before migration 200).
+    #[instrument(skip(conn))]
+    pub async fn anchor(
+        conn: &mut sqlx::PgConnection,
+        enrollment: Uuid,
+    ) -> Result<Option<EnrollmentAnchor>, DbError> {
+        let row = sqlx::query_as::<_, EnrollmentAnchor>(
+            "SELECT act_id, act_kind, act_outcome, args_digest, act_challenge_state, \
+                    assertion_evidence, enrollment_person, anchor_id, anchor_person, \
+                    anchor_credential_id, anchor_passkey, anchor_aaguid, \
+                    anchor_attestation_format, anchor_backup_eligible, anchor_revoked \
+               FROM public.epigraph_enrollment_anchor($1)",
         )
         .bind(enrollment)
         .fetch_optional(&mut *conn)

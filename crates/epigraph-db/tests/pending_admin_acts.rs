@@ -1903,3 +1903,279 @@ fn every_131_object_is_registered() {
         "the reader is missing from tenancy_backfill.rs's grant register"
     );
 }
+
+// =====================================================================
+// 200: THE ENROLLMENT ANCHOR (the anchored passkey path's reader)
+// =====================================================================
+
+/// The anchor row, as the API reads it (the JSON columns as presence flags).
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct AnchorRow {
+    act_id: Uuid,
+    act_kind: String,
+    act_outcome: Option<String>,
+    args_digest: Vec<u8>,
+    has_state: bool,
+    has_evidence: bool,
+    enrollment_person: Uuid,
+    anchor_id: Uuid,
+    anchor_person: Uuid,
+    anchor_credential_id: Vec<u8>,
+    anchor_attestation_format: String,
+    anchor_backup_eligible: bool,
+    anchor_revoked: bool,
+}
+
+/// `epigraph_enrollment_anchor(enrollment)` on an UNSTAMPED application
+/// session, as the anonymous enrollment page calls it.
+async fn anchor_of(pool: &PgPool, enrollment: Uuid) -> Vec<AnchorRow> {
+    as_app(pool, None, "", "", |mut conn| async move {
+        let rows = sqlx::query_as::<_, AnchorRow>(
+            "SELECT act_id, act_kind, act_outcome, args_digest, \
+                    act_challenge_state IS NOT NULL AS has_state, \
+                    assertion_evidence IS NOT NULL AS has_evidence, enrollment_person, anchor_id, \
+                    anchor_person, \
+                    anchor_credential_id, anchor_attestation_format, anchor_backup_eligible, \
+                    anchor_revoked \
+               FROM public.epigraph_enrollment_anchor($1)",
+        )
+        .bind(enrollment)
+        .fetch_all(&mut *conn)
+        .await
+        .expect("the anchor reader");
+        (conn, rows)
+    })
+    .await
+}
+
+/// A LATER passkey's enrollment, opened on `p`'s confirmed `passkey.register`
+/// act; `(act, enrollment)`.
+async fn anchored_enrollment(pool: &PgPool, p: &Elevated) -> (Uuid, Uuid) {
+    let act = confirmed(
+        pool,
+        p,
+        "passkey.register",
+        &format!(
+            "{{\"person\": \"{}\", \"label\": \"key 2\", \"reason\": \"a second key\"}}",
+            p.person
+        ),
+    )
+    .await;
+    let person = p.person;
+    let enrollment: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'a second key', 'key 2', $2)",
+        )
+        .bind(person)
+        .bind(act)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the act's enrollment");
+        (conn, e)
+    })
+    .await;
+    (act, enrollment)
+}
+
+/// The application role reads, for a live enrollment opened on an act, that
+/// act (a confirmed `passkey.register` act, its digest, ceremony state and
+/// evidence) and the passkey that confirmed it (the proposer's: its
+/// credential, recorded format and flags), and sees a later revocation of
+/// that passkey. Mutation: the reader joining the person's FIRST passkey
+/// instead of the act's confirming one (`k.person_agent_id =
+/// en.person_agent_id`) -> two rows once a second passkey exists.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anchor_is_the_act_and_the_passkey_that_confirmed_it(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (act, enrollment) = anchored_enrollment(&pool, &p).await;
+    let digest: Vec<u8> =
+        sqlx::query_scalar("SELECT args_digest FROM pending_admin_acts WHERE id = $1")
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("the digest");
+    let rows = anchor_of(&pool, enrollment).await;
+    assert_eq!(
+        rows,
+        vec![AnchorRow {
+            act_id: act,
+            act_kind: "passkey.register".to_string(),
+            act_outcome: Some("confirmed".to_string()),
+            args_digest: digest,
+            has_state: true,
+            has_evidence: true,
+            enrollment_person: p.person,
+            anchor_id: p.passkey,
+            anchor_person: p.person,
+            anchor_credential_id: p.cred.clone(),
+            anchor_attestation_format: "none".to_string(),
+            anchor_backup_eligible: false,
+            anchor_revoked: false,
+        }]
+    );
+
+    // A second passkey registered on that enrollment consumes it (no row),
+    // and a further act, confirmed by that SECOND passkey, anchors its
+    // enrollment on the second, not on the person's first.
+    let second_key = complete_enrollment(&pool, enrollment, 2).await;
+    assert!(anchor_of(&pool, enrollment).await.is_empty(), "consumed");
+    let second = Elevated {
+        passkey: second_key,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, later) = anchored_enrollment(&pool, &second).await;
+    let rows = anchor_of(&pool, later).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].anchor_id, second_key,
+        "the act's confirming passkey"
+    );
+    assert!(!rows[0].anchor_revoked, "live");
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost')",
+        &[Some(second_key)],
+    )
+    .await
+    .expect("revoke the second passkey");
+    assert!(
+        anchor_of(&pool, later).await[0].anchor_revoked,
+        "revoked is reported"
+    );
+}
+
+/// A first passkey's MAINTENANCE enrollment has no anchor, and neither has an
+/// unknown, consumed or expired one: the API then runs the attested ceremony.
+/// (The consumed case is pinned above.) Mutation: the expiry filter removed
+/// -> the expired enrollment answers a row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_a_live_act_enrollment_has_an_anchor(pool: PgPool) {
+    let (person, _) = human(&pool, "first").await;
+    let first: Uuid = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let e = sqlx::query_scalar(
+            "SELECT public.epigraph_create_passkey_enrollment($1, 'first key', 'key')",
+        )
+        .bind(person)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("enroll");
+        (conn, e)
+    })
+    .await;
+    assert!(anchor_of(&pool, first).await.is_empty(), "maintenance");
+    assert!(anchor_of(&pool, Uuid::new_v4()).await.is_empty(), "unknown");
+
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (_, live) = anchored_enrollment(&pool, &p).await;
+    assert_eq!(anchor_of(&pool, live).await.len(), 1, "CALIBRATION: live");
+    without_triggers(
+        &pool,
+        "UPDATE passkey_enrollments SET created_at = now() - interval '10 minutes', \
+                expires_at = now() - interval '1 second' WHERE id = $1",
+        live,
+    )
+    .await;
+    assert!(anchor_of(&pool, live).await.is_empty(), "expired");
+}
+
+/// The reader's catalog contract: SECURITY DEFINER owned by
+/// `epigraph_maintenance`, STABLE, path `pg_catalog, pg_temp`, EXECUTE-able by
+/// `epigraph_app` and not by PUBLIC. Mutation: the role-guarded GRANT to
+/// `epigraph_app` removed -> the app role cannot call it (and the anchored
+/// page 42501s).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_anchor_reader_is_a_maintenance_owned_app_callable_definer(pool: PgPool) {
+    let (definer, volatile, owner, config): (bool, String, String, Vec<String>) = sqlx::query_as(
+        "SELECT p.prosecdef, p.provolatile::text, p.proowner::regrole::text, \
+                coalesce(p.proconfig, '{}') \
+           FROM pg_proc p WHERE p.oid = 'public.epigraph_enrollment_anchor(uuid)'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the function");
+    assert!(definer);
+    assert_eq!(volatile, "s");
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    let (app, public): (bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('epigraph_app', \
+                    'public.epigraph_enrollment_anchor(uuid)', 'EXECUTE'), \
+                EXISTS (SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a \
+                         WHERE p.oid = 'public.epigraph_enrollment_anchor(uuid)'::regprocedure \
+                           AND a.grantee = 0 AND a.privilege_type = 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("privileges");
+    assert_eq!((app, public), (true, false));
+}
+
+fn undo_200() -> String {
+    std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/200-undo.sql"),
+    )
+    .expect("200-undo.sql")
+}
+
+/// `docs/runbooks/200-undo.sql` returns the catalog to 199's (the reader
+/// gone, no table touched); a second run changes nothing. Mutation: the
+/// undo's DROP removed -> the reader is left behind.
+#[sqlx::test(migrations = false)]
+async fn the_200_rollback_drops_only_the_reader(pool: PgPool) {
+    migrate(&pool, &up_to(199)).await;
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to(200)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 200 changed the catalog"
+    );
+    sqlx::raw_sql(&undo_200())
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+    let after = catalog(&pool).await;
+    assert_eq!(after, before, "the catalog is 199's after the undo");
+    sqlx::raw_sql(&undo_200())
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+}
+
+/// Migration 200's one SECURITY DEFINER is on `epigraph-tenancy-backfill
+/// verify`'s ownership list at 200 and on its grant register (app-callable),
+/// and `docs/runbooks/200-undo.sql` drops it. Mutation: the
+/// `("epigraph_enrollment_anchor", 200)` entry removed -> named here.
+#[test]
+fn every_200_object_is_registered() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let migration = read("migrations/200_enrollment_anchor.sql");
+    let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
+    let undo = undo_200();
+    let (definers, all) = functions_of(&migration);
+    assert_eq!(
+        (definers.as_slice(), all.as_slice()),
+        (
+            ["epigraph_enrollment_anchor".to_string()].as_slice(),
+            ["epigraph_enrollment_anchor".to_string()].as_slice()
+        ),
+        "CALIBRATION: 200 creates exactly one function, a SECURITY DEFINER"
+    );
+    assert!(
+        backfill.contains("(\"epigraph_enrollment_anchor\", 200)"),
+        "missing from tenancy_backfill.rs's ownership list at 200"
+    );
+    assert!(
+        backfill.contains("\"public.epigraph_enrollment_anchor(uuid)\""),
+        "missing from tenancy_backfill.rs's grant register"
+    );
+    assert!(
+        undo.contains("DROP FUNCTION IF EXISTS public.epigraph_enrollment_anchor(uuid);"),
+        "200-undo.sql does not drop it"
+    );
+}

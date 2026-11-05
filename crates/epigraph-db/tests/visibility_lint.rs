@@ -835,6 +835,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "passkey_ceremony.rs",
+        "anchor",
+        "READ of ONE enrollment's anchor by id through migration 200's app-callable SECURITY \
+         DEFINER `epigraph_enrollment_anchor`, for the anonymous enrollment page's anchored \
+         path: the act a live enrollment was opened on and the passkey that confirmed it, and \
+         only while the enrollment is live; it enumerates nothing. Authentication records \
+         about one principal, not corpus rows, and the page has no principal a Viewer could \
+         carry.",
+    ),
+    (
+        "passkey_ceremony.rs",
         "store_challenge",
         "WRITE through 124's app-callable definer `epigraph_set_passkey_enrollment_challenge` \
          (the ceremony state of one live enrollment, by id). The table's guard refuses a \
