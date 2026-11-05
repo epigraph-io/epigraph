@@ -679,11 +679,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "gap_analysis",
         &["GapRepository::store_gap_analysis"],
     ),
-    // stamped: cluster-run metadata (untenanted) and the edges among nodes the
-    // viewer already read (F-edges-unfiltered owns their predicate). The
-    // latest-run probe is the shared `ClusterRunRepository::latest` since the
-    // main merge (it was the first inline `fetch_optional`); `graph_cluster_runs`
-    // carries no tenancy columns, so it takes no viewer.
+    // stamped: cluster-run metadata (untenanted; the latest run now comes from
+    // `ClusterRunRepository::latest`, the lookup `/claims/:id/placement` shares)
+    // and the edges among nodes the viewer already read (F-edges-unfiltered owns
+    // their predicate).
     (
         "graph.rs",
         "expand",
@@ -703,8 +702,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
-    // untenanted: the latest run (`ClusterRunRepository::latest`, split out of
-    // the probe's subquery in the main merge) and the neighborhood id in it.
+    // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
+    // with `/claims/:id/placement`) and the neighborhood id in that run.
     (
         "graph_neighborhood.rs",
         "expand",
