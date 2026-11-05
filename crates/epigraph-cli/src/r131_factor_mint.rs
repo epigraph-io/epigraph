@@ -449,9 +449,11 @@ async fn apply_locked(
     // Compare-and-set on the whole plan: the operator reviewed THIS set.
     let live = plan(&mut tx).await?;
     if live != *expected {
+        // The sha256s tell two plans apart when a drift keeps every count
+        // (an edge withdrawn and another added on the same slot).
         return Err(MintError::PlanDrift {
-            planned: expected.summary(),
-            live: live.summary(),
+            planned: format!("{}, sha256 {}", expected.summary(), expected.sha256()),
+            live: format!("{}, sha256 {}", live.summary(), live.sha256()),
         });
     }
 
