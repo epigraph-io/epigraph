@@ -2035,13 +2035,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow."
+        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow. A workflow you cannot read returns no executions, exactly like an unknown id."
     )]
     async fn get_workflow_executions(
         &self,
         Parameters(params): Parameters<GetWorkflowExecutionsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflows::get_workflow_executions(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflows::get_workflow_executions(self, viewer, params).await
     }
 
     #[tool(
