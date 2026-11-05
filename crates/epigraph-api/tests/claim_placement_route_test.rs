@@ -173,6 +173,7 @@ async fn an_unclustered_claim_is_all_null(pool: PgPool) {
             "cluster_id": null,
             "neighborhood_id": null,
             "run_completed_at": null,
+            "layout": null,
         })
     );
 }
@@ -218,6 +219,7 @@ async fn a_clustered_claim_returns_ids_that_expand_accepts(pool: PgPool) {
             "claim_id",
             "cluster_id",
             "cluster_run_id",
+            "layout",
             "neighborhood_id",
             "run_completed_at",
             "theme_id",

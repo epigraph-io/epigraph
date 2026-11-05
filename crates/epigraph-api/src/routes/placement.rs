@@ -18,13 +18,21 @@
 //! theme or cluster id is a pointer into a view that renders that text, and the
 //! all-null-fields 200 this route used to return echoed the id back, which
 //! confirms the claim exists. The repo's `None` is now the whole answer.
+//!
+//! `layout` (Atlas P3a) resolves the claim's theme to its place in the latest
+//! servable Atlas layout run, so a deep link goes claim -> theme -> region ->
+//! position in one call: a shared position (`placement: "shared"`), or, for a
+//! theme with no public member, the region nearest the members THIS caller
+//! can read (`placement: "viewer"`, no `x`/`y`). `null` when the claim has no
+//! theme, there is no run, the run was invalidated by a narrowing, or the
+//! theme has no position for this caller.
 
 use axum::{
     extract::{Path, State},
     Json,
 };
 use chrono::{DateTime, Utc};
-use epigraph_db::ClusterRunRepository;
+use epigraph_db::{AtlasLayoutRepository, ClusterRunRepository};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -43,6 +51,18 @@ pub struct PlacementResponse {
     pub cluster_id: Option<Uuid>,
     pub neighborhood_id: Option<Uuid>,
     pub run_completed_at: Option<DateTime<Utc>>,
+    pub layout: Option<PlacementLayout>,
+}
+
+/// Where the claim's theme sits in the latest servable Atlas layout.
+#[derive(Debug, Serialize)]
+pub struct PlacementLayout {
+    pub run_id: Uuid,
+    pub region_id: Uuid,
+    /// `shared` or `viewer`.
+    pub placement: &'static str,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
 }
 
 /// `GET /api/v1/claims/:id/placement`
@@ -64,6 +84,12 @@ pub async fn claim_placement(
     })?;
 
     let placement = ClusterRunRepository::claim_placement(&mut read, &viewer, claim_id).await?;
+    let layout = match placement.as_ref().and_then(|p| p.theme_id) {
+        Some(theme_id) => {
+            AtlasLayoutRepository::placement_layout(&mut read, &viewer, theme_id).await?
+        }
+        None => None,
+    };
 
     crate::routes::finish_scoped_read(read, "claim_placement").await?;
 
@@ -79,5 +105,12 @@ pub async fn claim_placement(
         cluster_id: placement.cluster_id,
         neighborhood_id: placement.neighborhood_id,
         run_completed_at: placement.run_completed_at,
+        layout: layout.map(|l| PlacementLayout {
+            run_id: l.run_id,
+            region_id: l.region_id,
+            placement: l.placement.as_str(),
+            x: l.x,
+            y: l.y,
+        }),
     }))
 }
