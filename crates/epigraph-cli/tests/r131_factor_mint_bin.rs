@@ -1245,3 +1245,163 @@ async fn undo_still_matches_after_a_factors_column_is_added(pool: PgPool) {
 async fn undo_still_matches_in_another_session_time_zone(pool: PgPool) {
     undo_still_matches(pool, SinceTheMint::TimeZone).await;
 }
+
+// ------------------------------------------------- faults after a write
+
+/// A later slot's mint writes nothing (a BEFORE INSERT trigger drops its
+/// row) after the earlier slots' rows were inserted in the same
+/// transaction: the run refuses with exit 1, every slot rolls back, and the
+/// record file is removed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_rolls_back_every_slot_when_a_later_mint_writes_nothing(pool: PgPool) {
+    let logins = Logins::new(&pool).await;
+    let _w = world(&pool).await;
+    let dir = Dir::new();
+    let (r, plan_file) = dry_run(&dir, &logins, "plan.json");
+    r.ok();
+    let plan = read_plan(&plan_file);
+    assert!(
+        plan.slots.len() >= 2,
+        "PREMISE: earlier slots insert before the last one fails"
+    );
+    // Slots are minted in plan order; drop the last one's row. A sequence
+    // (never rolled back) counts the rows the trigger saw.
+    let last = plan.slots.last().expect("a slot").source_edge_id;
+    for sql in [
+        "CREATE SEQUENCE r131_rows_seen".to_string(),
+        "GRANT USAGE ON SEQUENCE r131_rows_seen TO PUBLIC".to_string(),
+        format!(
+            "CREATE FUNCTION r131_drop_last() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               PERFORM nextval('r131_rows_seen'); \
+               IF NEW.properties->>'source_edge_id' = '{last}' THEN RETURN NULL; END IF; \
+               RETURN NEW; \
+             END $$"
+        ),
+        "CREATE TRIGGER r131_drop_last BEFORE INSERT ON factors \
+         FOR EACH ROW EXECUTE FUNCTION r131_drop_last()"
+            .to_string(),
+    ] {
+        sqlx::query(&sql).execute(&pool).await.expect(&sql);
+    }
+    let before = factor_rows(&pool).await;
+    let ds_before = ds_state(&pool).await;
+    let record = dir.path("record.jsonl");
+
+    let r = run(
+        &dir.0,
+        &["--apply", "--plan", &plan_file, "--record", &record],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stderr, r.stdout);
+    assert!(r.stderr.contains("the mint of slot"), "{}", r.stderr);
+    let seen: i64 = sqlx::query_scalar("SELECT last_value FROM r131_rows_seen")
+        .fetch_one(&pool)
+        .await
+        .expect("rows seen");
+    assert_eq!(
+        usize::try_from(seen).expect("count"),
+        plan.slots.len(),
+        "PREMISE: every slot's INSERT ran inside the apply"
+    );
+    assert_eq!(
+        factor_rows(&pool).await,
+        before,
+        "an earlier slot's factor survived the refusal"
+    );
+    assert_eq!(
+        ds_state(&pool).await,
+        ds_before,
+        "the refusal wrote DS state"
+    );
+    assert!(
+        !Path::new(&record).exists(),
+        "an exit-1 apply left its record"
+    );
+    logins.drop(&pool).await;
+}
+
+/// The COMMIT itself fails (a deferred constraint trigger raises at COMMIT),
+/// after the mint and the undo record were written: exit 3, the record is
+/// KEPT and names every planned slot, nothing landed, and the undo dry run
+/// on the kept record reports every factor absent (the runbook's exit-3
+/// procedure).
+#[sqlx::test(migrations = "../../migrations")]
+async fn apply_exits_3_and_keeps_the_record_when_commit_fails(pool: PgPool) {
+    let logins = Logins::new(&pool).await;
+    let _w = world(&pool).await;
+    let dir = Dir::new();
+    let (r, plan_file) = dry_run(&dir, &logins, "plan.json");
+    r.ok();
+    let plan = read_plan(&plan_file);
+    assert!(
+        !plan.slots.is_empty(),
+        "PREMISE: there is something to mint"
+    );
+    for sql in [
+        "CREATE FUNCTION r131_refuse_commit() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'r131 fixture: the commit is refused'; END $$",
+        "CREATE CONSTRAINT TRIGGER r131_refuse_commit AFTER INSERT ON factors \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION r131_refuse_commit()",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    let before = factor_rows(&pool).await;
+    let ds_before = ds_state(&pool).await;
+    let record = dir.path("record.jsonl");
+
+    let r = run(
+        &dir.0,
+        &["--apply", "--plan", &plan_file, "--record", &record],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    );
+    assert_eq!(r.code, Some(3), "{}\n{}", r.stderr, r.stdout);
+    assert!(
+        r.stderr.contains("whether the mint landed is unknown"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        Path::new(&record).exists(),
+        "an exit-3 apply removed its record"
+    );
+    let rec = read_record(std::io::BufReader::new(
+        std::fs::File::open(&record).expect("open"),
+    ))
+    .expect("the kept record parses");
+    assert_eq!(rec.header.minted, plan.slots.len());
+    assert_eq!(rec.header.plan_sha256, plan.sha256());
+    assert_eq!(
+        rec.factors
+            .iter()
+            .map(|f| f.slot.clone())
+            .collect::<Vec<_>>(),
+        plan.slots
+            .iter()
+            .map(|s| s.slot.clone())
+            .collect::<Vec<_>>(),
+        "the record names every planned slot"
+    );
+    assert_eq!(factor_rows(&pool).await, before, "a failed COMMIT landed");
+    assert_eq!(ds_state(&pool).await, ds_before);
+
+    let r = run(
+        &dir.0,
+        &["--undo", &record],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    )
+    .ok();
+    assert!(
+        r.stdout.contains(&format!(
+            "r131 undo (dry run: rolled back): deleted=0 absent={} changed_since=0",
+            plan.slots.len()
+        )),
+        "{}",
+        r.stdout
+    );
+    assert_eq!(factor_rows(&pool).await, before);
+    logins.drop(&pool).await;
+}
