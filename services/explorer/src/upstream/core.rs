@@ -265,12 +265,20 @@ struct EvidenceSearchQuery<'q> {
 
 // ---- landing overviews (protected upstream routes) ---------------------------
 
-/// `GET /api/v1/graph/themes/overview` (graph.rs:389-407). Unpaginated;
-/// ordered `claim_count DESC, label ASC`.
+/// `GET /api/v1/graph/themes/overview` (graph.rs themes_overview): one page
+/// (200 at most) of the themes this viewer can read at least one member of,
+/// ordered `claim_count DESC, id ASC`. The landing list needs only the first.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ThemesOverview {
     #[serde(default)]
     pub themes: Vec<ThemeSummary>,
+    /// Themes this viewer can read at least one member of, over all pages.
+    /// `None` from an upstream that predates paging.
+    #[serde(default)]
+    pub total: Option<i64>,
+    /// The next page's `after`; `None` at the end.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -278,6 +286,7 @@ pub struct ThemeSummary {
     pub id: Uuid,
     #[serde(default)]
     pub label: String,
+    /// Current claims in this theme the viewer can read (live).
     #[serde(default)]
     pub claim_count: i64,
 }
@@ -514,5 +523,22 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(t.themes[0].claim_count, 40);
+        assert_eq!(
+            t.total, None,
+            "an upstream that predates paging still decodes"
+        );
+        assert_eq!(t.next_cursor, None);
+
+        let t: ThemesOverview = serde_json::from_value(json!({
+            "themes": [{"id": A, "label": "Thermodynamics", "claim_count": 40}],
+            "total": 250,
+            "next_cursor": "t1.40.000000000000000000000000000000a1"
+        }))
+        .unwrap();
+        assert_eq!(t.total, Some(250));
+        assert_eq!(
+            t.next_cursor.as_deref(),
+            Some("t1.40.000000000000000000000000000000a1")
+        );
     }
 }

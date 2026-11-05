@@ -1,6 +1,10 @@
 //! Integration tests for the `claim_themes` READ path
 //! (`ClaimThemeRepository::list_summaries` / `count_summaries` /
-//! `get_summary` / `find_by_label` / `member_claim_ids`).
+//! `get_summary` / `find_by_label` / `member_claim_ids` / `overview_page`).
+//!
+//! `overview_page` (backlog 57917c13) backs `GET /api/v1/graph/themes/overview`:
+//! live, viewer-scoped member counts, themes with no readable member absent,
+//! keyset-paged. Its arms are at the end of this file.
 //!
 //! Backlog `c40689c9-a6c0-4c90-adfb-cf52e8a6b917`: the theme layer had no
 //! reader, so "what topics does this graph cover" could only be answered by
@@ -25,8 +29,10 @@
 
 mod viewer_fixture;
 
+use epigraph_db::repos::{ThemeOverviewCursor, ThemeOverviewPage};
+use epigraph_db::visibility::Viewer;
 use epigraph_db::ClaimThemeRepository;
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
 async fn seed_agent(pool: &PgPool) -> Uuid {
@@ -289,4 +295,350 @@ async fn find_by_label_surfaces_duplicate_labels_instead_of_picking_one(pool: Pg
         .await
         .expect("find_by_label miss");
     assert!(none.is_empty(), "a miss is an empty Vec, not an error");
+}
+
+// ---- overview_page (backlog 57917c13) -----------------------------------------
+
+/// A CURRENT claim assigned to `theme_id`, private to `group`
+/// (`visibility = 'group'`), the shape of `viewer_fixture::seed_group_claim`
+/// plus the theme assignment.
+async fn seed_group_member(
+    pool: &PgPool,
+    agent: Uuid,
+    group: Uuid,
+    theme_id: Uuid,
+    content: &str,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current, \
+                             theme_id, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, $4, 0.7, true, $5, 'group', $6)",
+    )
+    .bind(id)
+    .bind(content)
+    .bind(hash_for(id))
+    .bind(agent)
+    .bind(theme_id)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("insert group-private member claim");
+    let got: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT visibility, owner_group_id FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read the private member back");
+    assert_eq!(
+        got,
+        ("group".to_string(), Some(group)),
+        "CALIBRATION: the member must land group-private, or every 'the outsider \
+         cannot see it' assertion below is vacuous"
+    );
+    id
+}
+
+/// `(id, member_count)` of a page, in page order.
+fn pairs(page: &ThemeOverviewPage) -> Vec<(Uuid, i64)> {
+    page.themes.iter().map(|t| (t.id, t.member_count)).collect()
+}
+
+/// `member_count DESC, id ASC`, the overview's order.
+fn overview_order(v: &mut [(Uuid, i64)]) {
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+}
+
+async fn overview(pool: &PgPool, viewer: &Viewer, limit: i64) -> ThemeOverviewPage {
+    ClaimThemeRepository::overview_page(pool, viewer, None, limit)
+        .await
+        .expect("overview_page")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_counts_live_current_members_not_the_stored_column(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let theme = seed_theme(&pool, "ov-live", 9999, None).await;
+    for i in 0..3 {
+        seed_member(&pool, agent, theme, &format!("ov live member {i}"), true).await;
+    }
+    seed_member(&pool, agent, theme, "ov retired member", false).await;
+    // An unthemed claim must not be counted anywhere.
+    let unthemed = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, agent_id, truth_value) \
+         VALUES ($1, 'ov unthemed', $2, $3, 0.7)",
+    )
+    .bind(unthemed)
+    .bind(hash_for(unthemed))
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("insert unthemed claim");
+
+    let page = overview(&pool, &viewer, 200).await;
+    assert_eq!(
+        pairs(&page),
+        vec![(theme, 3)],
+        "member_count is the live COUNT of CURRENT members, not the stored 9999 and \
+         not counting the retired member"
+    );
+    assert_eq!(page.themes[0].label, "ov-live");
+    assert_eq!(page.total, 1);
+    assert_eq!(page.next, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_omits_themes_with_no_readable_member(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let (owner, group) = viewer_fixture::seed_agent_with_group(&pool, "ov-omit").await;
+    let empty = seed_theme(&pool, "ov-empty", 40, None).await;
+    let private = seed_theme(&pool, "ov-private", 40, None).await;
+    let public = seed_theme(&pool, "ov-public", 0, None).await;
+    seed_group_member(&pool, owner, group, private, "ov private member").await;
+    seed_member(&pool, agent, public, "ov public member", true).await;
+
+    let page = overview(&pool, &viewer, 200).await;
+    let ids: Vec<Uuid> = page.themes.iter().map(|t| t.id).collect();
+    assert_eq!(
+        ids,
+        vec![public],
+        "a theme with no member (E) and one whose only member is private (P) are \
+         absent, not zero"
+    );
+    assert!(!ids.contains(&empty) && !ids.contains(&private));
+    assert_eq!(
+        page.total, 1,
+        "total counts only themes the viewer can read"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_counts_only_what_the_viewer_can_read(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "ov-member").await;
+    let (stranger, stranger_group) =
+        viewer_fixture::seed_agent_with_group(&pool, "ov-stranger").await;
+    assert_ne!(group, stranger_group, "two viewers in DIFFERENT groups");
+
+    let q = seed_theme(&pool, "ov-q", 50, None).await;
+    let p = seed_theme(&pool, "ov-p", 50, None).await;
+    seed_member(&pool, agent, q, "ov q public", true).await;
+    seed_group_member(&pool, member, group, q, "ov q private a").await;
+    seed_group_member(&pool, member, group, q, "ov q private b").await;
+    seed_group_member(&pool, member, group, p, "ov p private").await;
+
+    let member_viewer = Viewer::resolve(&pool, member).await.expect("resolve");
+    let stranger_viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
+
+    // Calibration: the member arm is not vacuous.
+    let seen = overview(&pool, &member_viewer, 200).await;
+    assert_eq!(pairs(&seen), vec![(q, 3), (p, 1)]);
+    assert_eq!(seen.total, 2);
+
+    let hidden = overview(&pool, &stranger_viewer, 200).await;
+    assert_eq!(
+        pairs(&hidden),
+        vec![(q, 1)],
+        "the outsider counts only Q's public member and never sees P"
+    );
+    assert_eq!(hidden.total, 1, "the outsider's total does not count P");
+    assert_eq!(hidden.next, None, "no cursor hints at a hidden row");
+
+    // With limit 1 the outsider's walk is still one page with no cursor.
+    let one = overview(&pool, &stranger_viewer, 1).await;
+    assert_eq!(pairs(&one), vec![(q, 1)]);
+    assert_eq!(one.next, None);
+    assert_eq!(one.total, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_keyset_walk_is_complete_and_disjoint(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let mut expected: Vec<(Uuid, i64)> = Vec::new();
+    for (i, n) in [3i64, 2, 2, 1, 1].into_iter().enumerate() {
+        let theme = seed_theme(&pool, &format!("ov-walk-{i}"), 0, None).await;
+        for k in 0..n {
+            seed_member(&pool, agent, theme, &format!("ov walk {i} {k}"), true).await;
+        }
+        expected.push((theme, n));
+    }
+    // Random v4 ids, so the tie order is a real test of the `id ASC`
+    // tiebreaker, not of insertion order.
+    overview_order(&mut expected);
+
+    let whole = overview(&pool, &viewer, 200).await;
+    assert_eq!(pairs(&whole), expected);
+    assert_eq!(whole.next, None);
+
+    let mut walked: Vec<(Uuid, i64)> = Vec::new();
+    let mut sizes = Vec::new();
+    let mut after: Option<ThemeOverviewCursor> = None;
+    for _ in 0..10 {
+        let page = ClaimThemeRepository::overview_page(&pool, &viewer, after, 2)
+            .await
+            .expect("overview_page");
+        assert_eq!(page.total, 5, "total is the same on every page");
+        sizes.push(page.themes.len());
+        walked.extend(pairs(&page));
+        match page.next {
+            Some(c) => {
+                assert_eq!(
+                    Some(c),
+                    page.themes.last().map(ThemeOverviewCursor::of),
+                    "next is the last row's position"
+                );
+                after = Some(c);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        sizes,
+        vec![2, 2, 1],
+        "next is None exactly on the last page"
+    );
+    assert_eq!(walked, expected, "the walk equals the single page");
+    let mut ids: Vec<Uuid> = walked.iter().map(|(id, _)| *id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 5, "no theme twice");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_past_the_end_keeps_total(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    for i in 0..2 {
+        let theme = seed_theme(&pool, &format!("ov-end-{i}"), 0, None).await;
+        seed_member(&pool, agent, theme, &format!("ov end {i}"), true).await;
+    }
+    let first = overview(&pool, &viewer, 200).await;
+    assert_eq!(first.total, 2);
+
+    let past = ClaimThemeRepository::overview_page(
+        &pool,
+        &viewer,
+        Some(ThemeOverviewCursor {
+            member_count: 1,
+            id: Uuid::max(),
+        }),
+        200,
+    )
+    .await
+    .expect("overview_page past the end");
+    assert!(past.themes.is_empty());
+    assert_eq!(past.next, None);
+    assert_eq!(past.total, first.total, "total is present on an empty page");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_never_exceeds_the_cap(pool: PgPool) {
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    for i in 0..205 {
+        let theme = seed_theme(&pool, &format!("ov-cap-{i:03}"), 0, None).await;
+        seed_member(&pool, agent, theme, &format!("ov cap {i}"), true).await;
+    }
+    let page = overview(&pool, &viewer, 10_000).await;
+    assert_eq!(page.themes.len(), 200, "limit is clamped to 200");
+    assert!(page.next.is_some(), "a cut page carries a cursor");
+    assert_eq!(page.total, 205);
+
+    let rest = ClaimThemeRepository::overview_page(&pool, &viewer, page.next, 10_000)
+        .await
+        .expect("second page");
+    assert_eq!(rest.themes.len(), 5);
+    assert_eq!(rest.next, None);
+
+    // A non-positive limit is clamped to 1, not an error.
+    let tiny = overview(&pool, &viewer, 0).await;
+    assert_eq!(tiny.themes.len(), 1);
+    assert!(tiny.next.is_some());
+}
+
+/// The POLICY half (mirror of `claims_query_scoped_read_policy.rs`): on a
+/// `read_as`-stamped connection downgraded to `epigraph_app`, the member's own
+/// private member is counted; on an UNSTAMPED downgraded connection the same
+/// call with the same viewer does not count it. Proves the GUC stamp and the
+/// in-query `$V` predicate agree, in both `SessionGucMode`s.
+async fn overview_policy_half(pool: PgPool, mode: epigraph_db::SessionGucMode) {
+    let agent = seed_agent(&pool).await;
+    let (member, group) =
+        viewer_fixture::seed_agent_with_group(&pool, &format!("ov-policy-{mode:?}")).await;
+    let public = seed_theme(&pool, "ov-policy-public", 0, None).await;
+    let private = seed_theme(&pool, "ov-policy-private", 0, None).await;
+    seed_member(&pool, agent, public, "ov policy public", true).await;
+    seed_group_member(&pool, member, group, private, "ov policy private").await;
+    // Resolve on the superuser pool, BEFORE any downgrade (see
+    // viewer_fixture::downgraded_pool's warning).
+    let viewer = Viewer::resolve(&pool, member).await.expect("resolve");
+
+    // Stamped arm.
+    let scoped = viewer_fixture::scoped_pool_with_mode(&pool, mode).await;
+    let mut r = scoped.read_as(&viewer).await.expect("read_as");
+    r.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade the stamped connection");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("epigraph_bypass()");
+    assert!(!bypass, "CALIBRATION: the stamped session must not bypass");
+    let stamped = ClaimThemeRepository::overview_page(&mut *r, &viewer, None, 200)
+        .await
+        .expect("the stamped read must serve");
+    r.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    r.commit().await.expect("commit");
+
+    // Unstamped arm: same function, same viewer, nothing stamped.
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade the unstamped connection");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epigraph_bypass()");
+    assert!(
+        !bypass,
+        "CALIBRATION: the unstamped session must not bypass"
+    );
+    let unstamped = ClaimThemeRepository::overview_page(&mut *conn, &viewer, None, 200)
+        .await
+        .expect("the unstamped read must not error");
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+
+    let mut want = vec![(public, 1), (private, 1)];
+    overview_order(&mut want);
+    assert_eq!(
+        pairs(&stamped),
+        want,
+        "COHERENCE ({mode:?}): the stamped read counts the member's own private member"
+    );
+    assert_eq!(stamped.total, 2);
+    assert_eq!(
+        pairs(&unstamped),
+        vec![(public, 1)],
+        "THE DIFFERENTIAL ({mode:?}): unstamped, the policy hides the private member \
+         the $V predicate admits"
+    );
+    assert_eq!(unstamped.total, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_policy_half_on_a_stamped_connection_in_session_mode(pool: PgPool) {
+    overview_policy_half(pool, epigraph_db::SessionGucMode::Session).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn overview_page_policy_half_on_a_stamped_connection_in_transaction_mode(pool: PgPool) {
+    overview_policy_half(pool, epigraph_db::SessionGucMode::Transaction).await;
 }

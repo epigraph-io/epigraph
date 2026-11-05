@@ -49,13 +49,28 @@ pub fn clamp_expand_budget(budget: Option<i64>) -> u32 {
     }
 }
 
-// ---- GET /api/v1/graph/themes/overview (graph.rs:389-407) -------------------
+// ---- GET /api/v1/graph/themes/overview (graph.rs themes_overview; viewer-scoped
+// live counts, cursor-paged, 200 per page) -------------------------------------
 
-/// Every theme, ordered `claim_count DESC, label ASC`. Unpaginated upstream.
+/// Upstream's page size and cap for the themes overview.
+pub const THEMES_PAGE_LIMIT: u32 = 200;
+/// Most upstream pages [`Api::themes_overview_upto`] reads:
+/// `OVERVIEW_ITEM_CAP.div_ceil(THEMES_PAGE_LIMIT)` = 500 / 200, rounded up.
+pub const THEMES_MAX_PAGES: usize = 3;
+
+/// One page of the themes this viewer can read at least one member of,
+/// ordered `claim_count DESC, id ASC`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ThemesOverview {
     #[serde(default)]
     pub themes: Vec<ThemeSummary>,
+    /// Themes this viewer can read at least one member of, over all pages.
+    /// `None` from an upstream that predates paging.
+    #[serde(default)]
+    pub total: Option<i64>,
+    /// Pass back as `after` for the next page; `None` at the end.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -63,7 +78,7 @@ pub struct ThemeSummary {
     pub id: Uuid,
     #[serde(default)]
     pub label: String,
-    /// Denormalised counter, refreshed only by a recompute.
+    /// Current claims in this theme the viewer can read (live).
     #[serde(default)]
     pub claim_count: i64,
 }
@@ -398,10 +413,62 @@ struct Mode {
     mode: NeighborhoodMode,
 }
 
+#[derive(Serialize)]
+struct ThemesPage<'a> {
+    limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<&'a str>,
+}
+
 impl Api<'_> {
-    /// `GET /api/v1/graph/themes/overview` (bearer required).
+    /// `GET /api/v1/graph/themes/overview` (bearer required): the first page.
     pub async fn themes_overview(&self) -> Result<ThemesOverview, UpstreamError> {
-        self.get("/api/v1/graph/themes/overview").await
+        self.themes_overview_page(None).await
+    }
+
+    /// One page of `GET /api/v1/graph/themes/overview?limit=200&after=`.
+    pub async fn themes_overview_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<ThemesOverview, UpstreamError> {
+        let q = ThemesPage {
+            limit: THEMES_PAGE_LIMIT,
+            after,
+        };
+        self.get_query("/api/v1/graph/themes/overview", &q).await
+    }
+
+    /// Walk the themes overview until `cap` themes are held or upstream has no
+    /// next page, reading at most [`THEMES_MAX_PAGES`] pages. A theme already
+    /// held is skipped (a count can move across a page boundary between
+    /// fetches). `total` is the first page's; `next_cursor` is `Some` when the
+    /// walk stopped with a page still pending (the "more exists" signal). An
+    /// error on any page fails the whole walk, so nothing partial is cached.
+    pub async fn themes_overview_upto(&self, cap: usize) -> Result<ThemesOverview, UpstreamError> {
+        let mut themes: Vec<ThemeSummary> = Vec::new();
+        let mut held = std::collections::HashSet::new();
+        let mut total = None;
+        let mut after: Option<String> = None;
+        for page_no in 0..THEMES_MAX_PAGES {
+            let page = self.themes_overview_page(after.as_deref()).await?;
+            if page_no == 0 {
+                total = page.total;
+            }
+            for t in page.themes {
+                if held.insert(t.id) {
+                    themes.push(t);
+                }
+            }
+            after = page.next_cursor;
+            if after.is_none() || themes.len() >= cap {
+                break;
+            }
+        }
+        Ok(ThemesOverview {
+            themes,
+            total,
+            next_cursor: after,
+        })
     }
 
     /// `GET /api/v1/graph/communities/overview` (bearer required).
@@ -456,6 +523,43 @@ mod tests {
     const T: &str = "00000000-0000-0000-0000-0000000000a1";
     const N1: &str = "00000000-0000-0000-0000-0000000000b1";
     const N2: &str = "00000000-0000-0000-0000-0000000000b2";
+
+    #[test]
+    fn themes_overview_decodes_paged_and_unpaged_bodies() {
+        let paged: ThemesOverview = serde_json::from_value(json!({
+            "themes": [{"id": T, "label": "Electrode double layers", "claim_count": 3230}],
+            "total": 187,
+            "next_cursor": "t1.3230.000000000000000000000000000000a1"
+        }))
+        .unwrap();
+        assert_eq!(paged.themes[0].claim_count, 3230);
+        assert_eq!(paged.total, Some(187));
+        assert_eq!(
+            paged.next_cursor.as_deref(),
+            Some("t1.3230.000000000000000000000000000000a1")
+        );
+
+        let end: ThemesOverview =
+            serde_json::from_value(json!({"themes": [], "total": 0, "next_cursor": null})).unwrap();
+        assert_eq!(end.total, Some(0));
+        assert_eq!(end.next_cursor, None);
+
+        // An upstream that predates paging still decodes.
+        let old: ThemesOverview = serde_json::from_value(json!({
+            "themes": [{"id": T, "label": "x", "claim_count": 4}]
+        }))
+        .unwrap();
+        assert_eq!(old.total, None);
+        assert_eq!(old.next_cursor, None);
+    }
+
+    #[test]
+    fn themes_max_pages_covers_the_bff_cap() {
+        assert_eq!(
+            THEMES_MAX_PAGES,
+            crate::bff::graph::OVERVIEW_ITEM_CAP.div_ceil(THEMES_PAGE_LIMIT as usize)
+        );
+    }
 
     #[test]
     fn budgets_clamp() {

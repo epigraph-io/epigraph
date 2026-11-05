@@ -2368,6 +2368,26 @@ restart.
   = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
   text)')` must print 117's md5 and one of the two paths.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **196**: public `idx_claims_theme_current_tenancy` (backlog 57917c13,
+  Atlas P3a). A `-- no-transaction` covering partial index, one `CREATE
+  INDEX CONCURRENTLY IF NOT EXISTS` statement: `claims (theme_id) INCLUDE
+  (visibility, owner_group_id) WHERE theme_id IS NOT NULL AND is_current`.
+  It serves `ClaimThemeRepository::overview_page`, the one `GROUP BY
+  theme_id` pass behind `GET /api/v1/graph/themes/overview`'s live,
+  viewer-scoped member counts: every column any qual on that pass reads is
+  in the index, so it can be an index-only scan on all-visible pages. The
+  predicate is the bare `is_current` (the column is NOT NULL) because
+  partial-index implication is proved syntactically. Registered in
+  `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked). No
+  function, policy, grant or data change. Undo: `DROP INDEX CONCURRENTLY IF
+  EXISTS public.idx_claims_theme_current_tenancy` (nothing names it). A
+  failed build leaves an INVALID index; drop it and re-run (see "Recovery"
+  below). Checked before claiming: `195` is held by an origin branch
+  (`195_role_detach_sticky_and_revert_restricts.sql`), `197` by a sibling
+  Atlas P3a unit; no migration on main or on any fetched origin branch
+  carries a `196` (`git log --all -- 'migrations/196*'` is empty). **Deploy order:** any; an older binary ignores the index. Build it
+  in a quiet window (see "Production window" below). **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
