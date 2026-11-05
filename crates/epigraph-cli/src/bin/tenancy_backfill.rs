@@ -1636,6 +1636,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // refolds or vacates its cache, which is the defect the function closes.
     // The stake that makes the owner a control here.
     ("epigraph_claim_is_compound", 193),
+    // 199 (backlog 48421526), the prompt snapshot an agent ran at a claim's
+    // `created_at`, behind 161's prompt-history gate, for the claim read's
+    // `authored_by` block. Its only table is the FORCEd
+    // `agent_prompt_snapshots`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no row and
+    // answers "no snapshot" to every caller, admitted or not (quiet, the stake
+    // that makes the owner a control here).
+    ("epigraph_agent_prompt_snapshot_at", 199),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2867,6 +2875,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_retire_operator_link",
             "public.epigraph_retire_operator_link(uuid, text, boolean)",
             false,
+        ),
+        // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
+        // calls it on the request DSN for `authored_by.prompt_snapshot`;
+        // without the grant every claim read is 42501.
+        (
+            "epigraph_agent_prompt_snapshot_at",
+            "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
+            true,
         ),
     ];
 

@@ -2368,6 +2368,30 @@ restart.
   = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[],
   text)')` must print 117's md5 and one of the two paths.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **199**: public `agent_prompt_snapshot_at` (backlog 48421526, a claim's
+  provenance) — `public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz,
+  boolean) RETURNS TABLE (snapshot_id, model, prompt_hash, started_at)`,
+  SECURITY DEFINER, owned by `epigraph_maintenance`, STABLE, PL/pgSQL, `SET
+  search_path = pg_catalog, pg_temp` (172's form). The prompt snapshot an
+  agent was running at an instant: per snapshot row the latest recorded start
+  at or before it (`last_seen`, else `first_seen`), the latest such start
+  winning. Gated by 161's prompt-history gate (its `v_admin` text, pinned
+  equal by `epigraph-db/tests/prompt_snapshot_at_definer.rs`, plus
+  `epigraph_human_of(agent, false)` against the session principal): a
+  refused caller gets ZERO rows, never AID06. `p_open = true` skips the gate;
+  the request server passes it from the one constant
+  `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` (default gated), and only for a
+  claim the caller already read. Returns no file content. EXECUTE revoked
+  from PUBLIC, granted to `epigraph_app` and `epigraph_maintenance`
+  (role-guarded); registered at 199 in `tenancy_backfill.rs`
+  `DEFERRED_DEFINER_FUNCTIONS` and in its app-grant check. Undo in the file
+  header (a `DROP FUNCTION`, only after rolling the binary back). Slots 195
+  (open PR) and 196-198 (reserved elsewhere) are skipped; checked before
+  claiming: no migration on main, open PR, origin branch or local worktree
+  carries a `199`. **Deploy order:** apply BEFORE a binary whose claim read
+  calls it serves (without it every `GET /api/v1/claims/:id` and MCP
+  `get_claim` errors 42883); an older binary ignores it. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
