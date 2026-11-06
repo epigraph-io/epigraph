@@ -398,8 +398,9 @@ For the others, anything else is off.
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | unset | The passkey relying party. Both unset → passkeys off, and the ceremonies answer 503. A partial or malformed configuration → exit 1. The RP id is effectively permanent: a passkey registered under one never asserts under another. |
 | `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to: `packed` and `tpm` attestation by a listed model. Both or neither; required unless `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` is set. |
-| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential; any other format chaining to them is refused. Usable alone or with the allowlist. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
-| `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` | off | On: a person's LATER passkey, enrolled on a confirmed `passkey.register` act, may carry no attestation (a synced passkey, e.g. a password manager's), when the act was confirmed by one of that person's live hardware-attested passkeys. A first passkey is always attested. Served on an armed database. Needs migration 200. Section 10, as above. |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` | unset | A local copy of Google's attestation status list (the JSON at `https://android.googleapis.com/attestation/status`), refreshed by an operator job; the API never fetches it. REQUIRED with `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (either without the other → exit 1, as is a file that is unreadable or not a status list). Re-read at every Android enrollment and anchor use; a listed certificate anywhere in the chain refuses, and a file older than 48 hours (by modification time) refuses every Android enrollment and anchor. Section 10, as above. |
+| `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` | off | On: a person's LATER passkey, enrolled on a confirmed `passkey.register` act, may carry no attestation (a synced passkey, e.g. a password manager's), when the act was confirmed by one of that person's live passkeys that is hardware-attested under the CURRENT configuration, as is every passkey that authorized it. A first passkey is always attested. Served on an armed database. Needs migration 200. Section 10, as above. |
 | `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding, and with either setting above (exit 1). |
 | `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT` | on | `off` is the emergency valve for operator binding: it relieves `OPL01` only (section 9). |
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
@@ -2540,6 +2541,12 @@ human then enrolls again.
 
 ### Android hardware keys and a synced second passkey (migration 200) — settings, cost, operator steps, rollback
 
+**The rule, on an armed database.**
+- A person's first passkey is always hardware-attested.
+- A passkey anchors a later unattested passkey only if it is hardware-attested
+  AND still trusted under the configuration the API runs at that moment.
+- A synced passkey never anchors, directly or through any chain of acts.
+
 **Why.** `webauthn-rs` checks an authenticator model (AAGUID) only for
 `packed` and `tpm` attestation. An Android phone's hardware-backed key
 attests in the `android-key` format, which names no model, so it verifies
@@ -2552,13 +2559,69 @@ limits the aaguids allowed, but this device does not have an aaguid".
 from the allowlist. A registration is checked against the allowlist first,
 unchanged. Only when the allowlist refuses it is it checked against the
 Android roots alone. A registration that verifies that way is accepted only
-when all three hold:
+when all of these hold:
 - the format is `android-key`;
-- the credential is device-bound;
-- the user is verified.
+- the credential is device-bound and the user is verified;
+- the attestation itself puts the key in hardware. The leaf certificate's
+  KeyDescription must give both `attestationSecurityLevel` and
+  `keyMintSecurityLevel` as TrustedEnvironment (1) or StrongBox (2). The
+  key's `purpose` (SIGN) and `origin` (GENERATED) must be in the
+  hardware-enforced list.
+  - The library accepts security level 0 (Software), so this check is the
+    API's.
+  - Google also publishes a software attestation root. Its statements say
+    Software, and they are refused.
+  - The pinned library refuses StrongBox (level 2) outright, so a
+    StrongBox-only key cannot register until the library parses it.
+- only the leaf carries a KeyDescription. A chain with a second one, which
+  would be an attacker's certificate extending a genuine chain, is refused;
+- no certificate of the chain, the root included, is on the attestation
+  status list (next item).
 
-It is recorded with format `android-key` and the nil AAGUID. A `packed`
-certificate chaining to a Google root is refused.
+The passkey is recorded with format `android-key` and the nil AAGUID. A
+`packed` certificate chaining to a Google root is refused.
+
+**`EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`** is REQUIRED with the Android
+roots. It is a local copy of Google's attestation status list:
+- the URL is <https://android.googleapis.com/attestation/status>;
+- the format is `{"entries": {"<serial, lowercase hex>": {"status":
+  "REVOKED"|"SUSPENDED", ...}}}`.
+
+Google lists the serial numbers of attestation certificates it has revoked or
+suspended, for example leaked device keys. The library loads no CRL and no
+status list, so the API reads this file itself. It never fetches it, and no
+request reaches the network.
+
+The policy:
+- **At boot.** The roots without the file, or a file that is unreadable or
+  is not a status list, are a boot error (exit 1). The file alone, without
+  the roots, is also a boot error.
+- **At every use.** The file is re-read at every Android enrollment and at
+  every use of an Android passkey as an anchor. A refreshed file takes
+  effect without a restart.
+- **Any listed serial refuses.** A certificate of the chain listed with any
+  status (`REVOKED` or `SUSPENDED`) refuses the enrollment or the anchor.
+- **Older than 48 hours refuses (fail closed).** The age is the file's
+  modification time. A file older than that refuses every Android enrollment
+  and every Android anchor until it is refreshed. A file dated more than 5
+  minutes in the future is refused too. Android passkeys still ASSERT
+  (elevate) while the file is stale.
+
+Fetching and refreshing the file is an operator job outside the API. Run it
+at least daily, for example from a systemd timer, as a user that can write
+the file's directory:
+
+```bash
+STATUS=/path/readable/by/the/api/android-attestation-status.json
+curl -fsS --max-time 30 -o "$STATUS.tmp" https://android.googleapis.com/attestation/status \
+  && jq -e '.entries | type == "object"' "$STATUS.tmp" >/dev/null \
+  && mv -f "$STATUS.tmp" "$STATUS"
+```
+
+The `mv` replaces the file atomically, so a partial download is never read.
+Never use `curl -R`, `cp -a` or `rsync -t` for this step. Each keeps an older
+modification time, and a file that looks stale refuses every Android anchor
+even though its content is new.
 
 **`EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`** (default off) lets a
 person add a passkey that carries no attestation, such as a password
@@ -2570,14 +2633,29 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   software flag stays refused there.
 - **A later passkey may be unattested.** It comes from a confirmed
   `passkey.register` act. Its enrollment takes the anchored path when the
-  passkey that confirmed the act is all of the following:
-  - the same person's;
-  - live;
-  - HARDWARE-ATTESTED: device-bound, and either `packed`/`tpm` naming its
-    model, or `android-key`.
+  passkey that confirmed the act (the anchor) passes all of these checks:
+  - it is the same person's;
+  - it is live;
+  - it is HARDWARE-ATTESTED UNDER THE CONFIGURATION THE API RUNS NOW. The
+    API re-verifies the certificate chain stored with the anchor's
+    credential against today's roots, never the columns its registration
+    wrote:
+    - `packed`/`tpm`: an allowlist root that still admits its model;
+    - `android-key`: an Android root, plus the TEE/StrongBox rule and the
+      status list above.
+
+    The row's recorded format, AAGUID and backup-eligible flag must also
+    agree with that credential. Certificate validity periods are checked as
+    at registration, so an anchor whose chain has expired anchors nothing.
+  - every passkey on its LINEAGE passes the same check. The lineage is the
+    passkey that confirmed the act the anchor was itself enrolled on, then
+    that passkey's own confirmer, and so on, back to the person's first,
+    maintenance-enrolled passkey. A lineage that does not reach the first
+    passkey within 32 steps anchors nothing. A revoked passkey on the lineage
+    is still checked; being revoked does not disqualify it.
 - **The confirmation is re-verified.** The API re-verifies the act's
   recorded confirmation before taking the anchored path: the act's own
-  challenge, the passkey's stored public key and the credential. The
+  challenge, the anchor's stored public key and the credential. The
   database cannot verify a signature, so a confirmation written with
   fabricated evidence anchors nothing.
 - **Which path a ceremony takes.** The decision is made from the database
@@ -2585,7 +2663,8 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   state. An anchored ceremony asks for no attestation and accepts only
   `none`. Its passkey is recorded as `none` (usually backup-eligible), so it
   never anchors a further one. Otherwise the act's enrollment is attested,
-  exactly as with the setting off.
+  exactly as with the setting off. The API log says why an anchor was
+  refused (`refusal=` and `reason=`).
 - **Every later passkey takes it.** With the setting on and a valid anchor,
   a later passkey is registered on the anchored path even when it is a
   hardware key, and is then recorded as `none`: it can never anchor. To add
@@ -2594,47 +2673,98 @@ manager's synced passkey. It is anchored by a passkey they already hold:
 - **The response says which act anchored it.** The enrollment finish
   answers `anchored_by` with that act's id; it is `null` on the attested
   path.
+- **No completion on a revoked anchor.** Migration 200's insert guard records
+  a passkey enrolled on an act only while the passkey that confirmed the act
+  is live. It reads that passkey under a share lock, so a revoke and a
+  completion that race are serialised. This applies to every act enrollment,
+  attested ones included.
+- **Revoking an anchor revokes what it anchored.** `revoke-passkey` on a
+  passkey also revokes, in the same transaction, every live `none` passkey
+  enrolled on an act it confirmed. On an armed database those are exactly
+  the passkeys it anchored. They are stamped with the same login and the
+  reason `anchor <id> revoked: <reason>`. An attested passkey enrolled on
+  such an act stays live: it stands on its own attestation.
+
+**What remains, exactly.**
+- **The anchor confirms an act, not a credential.** The anchor's
+  confirmation commits to "register a passkey for this person, with this
+  label and reason". It does not commit to WHICH credential. Whoever first
+  opens the 15-minute `/elevate/enroll/<id>` link registers their own key.
+  That can be the maintenance-DSN holder who opened the enrollment, or anyone
+  the link reaches. On the attested path they would need an allowlisted or
+  Android hardware key. On the anchored path they need no hardware at all.
+  The remaining guarantee:
+  - an anchored passkey is registered only for the act's person;
+  - only on an act that person confirmed with a live hardware-attested
+    passkey;
+  - only within 15 minutes of the enrollment's opening;
+  - only once per act.
+
+  Hand the link only to the person, on the device that will hold the
+  passkey. Check `list-passkeys` after each anchored enrollment.
+- **Chains of acts.** A synced passkey can still confirm a `passkey.register`
+  act. That act's enrollment runs the ATTESTED ceremony, so only a genuine
+  hardware key registers on it. That hardware key never anchors, because
+  its lineage holds the synced passkey. So the password-manager account
+  cannot mint an anchor, through any number of acts.
+- **Not re-checked at use:** that the anchor's stored certificate attests
+  the anchor's own key. The attestation signature that bound them is not
+  stored. It was verified at registration by the API, the only writer of the
+  row besides the maintenance DSN.
 
 **The accepted cost.** Once a synced passkey is registered, an elevation (and
 every admin-act confirmation) is only as strong as the password-manager
 account that holds it: whoever controls that account can elevate as the
 person. Revoking the synced passkey (`epigraph-operator revoke-passkey`)
-ends that, and ends any elevation it confirmed.
+ends that, and ends any elevation it confirmed. So does revoking its anchor.
 
 **Operator steps.**
 
-1. **Migrate 200** (`epigraph-migrate`, migration DSN). It adds one
-   function, the enrollment page's reader of an act enrollment's anchor;
-   nothing existing changes. Then deploy `epigraph-tenancy-backfill` from the
-   same commit; `verify` checks the reader's owner and its grant to
-   `epigraph_app`.
-2. **The Android roots.** Write Google's hardware attestation root
+1. **Migrate 200** (`epigraph-migrate`, migration DSN). It adds the
+   enrollment page's reader of an act enrollment's anchor and its lineage,
+   the act-confirmer insert guard and the anchored-revoke cascade; no
+   earlier body is re-stated. Then deploy `epigraph-tenancy-backfill` from
+   the same commit; `verify` checks the three functions' owner and the
+   reader's grant to `epigraph_app`. The guard and the cascade apply
+   whatever the settings say.
+2. **The status list.** Install the refresh job above, run it once, and
+   check that the file exists and is fresh. Set
+   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` to it.
+3. **The Android roots.** Write Google's hardware attestation root
    certificates to a PEM file the API unit can read (one or more
    `-----BEGIN CERTIFICATE-----` blocks). Google publishes them in the
-   Android key attestation documentation. Set
-   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` to it. If an earlier
-   configuration allowlisted Android (a Google root in
+   Android key attestation documentation, and as a JSON array at
+   <https://android.googleapis.com/attestation/root>. Do NOT include Google's
+   software attestation root. Set `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` to
+   that file.
+   **The CA-file overlap hazard.** An earlier configuration may have
+   allowlisted Android: a Google root in
    `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` with an Android AAGUID in
-   `EPIGRAPH_WEBAUTHN_AAGUIDS`), remove that root and that AAGUID IN THE SAME
+   `EPIGRAPH_WEBAUTHN_AAGUIDS`. Remove that root and that AAGUID IN THE SAME
    CHANGE: a root in both files stops the server at boot (exit 1). Keep the
    allowlist for security keys, or unset BOTH of its variables when no
    security-key model remains, to accept Android keys only.
-3. **The anchored setting** (only if a synced second passkey is wanted): set
+4. **The anchored setting** (only if a synced second passkey is wanted): set
    `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY=1`.
-4. **Restart the API.** The boot line `passkey relying party configured`
+5. **Restart the API.** The boot line `passkey relying party configured`
    shows `software_attestation=false` and `synced_anchored=true|false`. A
    configuration error exits 1 with the variable named.
-5. **First passkey**, on the phone: `epigraph-operator passkey-enroll
+6. **First passkey**, on the phone: `epigraph-operator passkey-enroll
    --person <agent> --reason <text> [--label <device>] --apply`, then open
    the printed `/elevate/enroll/<id>` path on the phone. `list-passkeys`
-   shows it as `android-key`. A first passkey must be device-bound: a synced
-   passkey offered by the phone (its password manager's) is refused with
-   "not truly bound to hardware" or "this one is backup-eligible", whatever
-   either setting says; choose the device's own key. About one Android key
-   in 64 is refused by the WebAuthn library with "The COSEKey contains
-   invalid ECDSA X/Y coordinate data" (a coordinate with a leading zero
-   byte); a retry creates a new key and passes.
-6. **Second (synced) passkey.**
+   shows it as `android-key`.
+   - A first passkey must be device-bound. A synced passkey offered by the
+     phone (its password manager's) is refused with "not truly bound to
+     hardware" or "this one is backup-eligible", whatever either setting
+     says. Choose the device's own key.
+   - A phone whose attestation is software-level is refused with "not
+     attested as hardware-backed". So is one with a certificate on the
+     status list ("is REVOKED" / "is SUSPENDED"). A stale status file
+     refuses with "older than the 48h maximum".
+   - About one Android key in 64 is refused by the WebAuthn library with
+     "The COSEKey contains invalid ECDSA X/Y coordinate data" (a coordinate
+     with a leading zero byte). A retry creates a new key and passes.
+7. **Second (synced) passkey.**
    1. Elevate with the phone.
    2. Propose `passkey.register` with
       `{"person": <agent>, "label": <name>, "reason": <text>}`
@@ -2643,17 +2773,26 @@ ends that, and ends any elevation it confirmed.
       synced passkey anchors nothing).
    4. Run `epigraph-operator passkey-enroll --person <agent> --reason
       <same text> --label <same name> --act <id> --apply`.
-   5. Open the printed path in the browser where the password manager runs.
+   5. Open the printed path, yourself, in the browser where the password
+      manager runs.
    The finish answers `anchored_by`. If the enrollment ran the attested
-   ceremony instead, the API log says why (`refusal=`).
+   ceremony instead, the API log says why (`refusal=`, `reason=`).
 
-**Rollback.** Unset `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` and
-restart; later passkeys are attested again. A synced passkey registered
-meanwhile stays live until `revoke-passkey`. Then, if wanted,
-`docs/runbooks/200-undo.sql` on the migration DSN drops the reader (only
-after no unit runs with the setting on). Unsetting
-`EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` stops new Android enrollments only;
-registered Android passkeys keep asserting.
+**Rollback.**
+- **The anchored setting.** Unset `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`
+  and restart; later passkeys are attested again. A synced passkey registered
+  meanwhile stays live until `revoke-passkey` on it or on its anchor.
+- **The Android roots.** Unsetting `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE`
+  (and with it `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`) stops new Android
+  enrollments. It also stops every Android passkey ANCHORING, at once,
+  because anchors are re-verified against the current roots. Registered
+  Android passkeys keep asserting. The same holds for an AAGUID removed from
+  the allowlist or a root replaced. Synced passkeys already anchored stay
+  live; revoke them, or their anchors, to remove them.
+- **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
+  only after no unit runs with the anchored setting on. It drops the reader,
+  the insert guard and the cascade. After the undo, revoking an anchor no
+  longer revokes what it anchored.
 
 ### Elevation tickets and sessions (migration 125) — deploy order and rollback
 
@@ -3425,7 +3564,7 @@ maintenance-CLI acts. The rollback is `disarm-admin-scopes --reason TEXT
 
 **Undo order.** Disarm first (if armed). Roll back the binaries, newest
 first. Then run the undo scripts in reverse: `200-undo.sql` (if 200 is
-applied; its reader reads 124's and 130's tables), `132-undo.sql`, `131-undo.sql`,
+applied; its reader and triggers read 124's and 130's tables), `132-undo.sql`, `131-undo.sql`,
 `130-undo.sql`, `129-undo.sql` (after `169-undo.sql`, if 169 is applied),
 `128-undo.sql`, `127-undo.sql` (which archives the log into
 `security_events` first), `126-undo.sql`, `125-undo.sql`, `124-undo.sql`.
