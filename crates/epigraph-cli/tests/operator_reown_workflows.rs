@@ -114,6 +114,8 @@ struct Fx {
     w_f: Uuid,
     w_p: Uuid,
     w_g: Uuid,
+    w_d0: Uuid,
+    w_d1: Uuid,
     t: Uuid,
     p: Uuid,
     s1: Uuid,
@@ -326,6 +328,9 @@ async fn seed(pool: &PgPool) -> Fx {
     let w_f = workflow(&mut c, "foreign", 0, None, other_team, "public").await;
     let w_p = workflow(&mut c, "private", 0, None, src, "group").await;
     let w_g = workflow(&mut c, "gamma", 0, None, other_team, "public").await;
+    // `delta`: generation 0 the target's already, generation 1 SRC's.
+    let w_d0 = workflow(&mut c, "delta", 0, None, target, "public").await;
+    let w_d1 = workflow(&mut c, "delta", 1, Some(w_d0), src, "public").await;
 
     let t = claim(&mut c, ingest, src, "public", 0, "alpha thesis").await;
     let p = claim(&mut c, ingest, src, "public", 1, "alpha phase").await;
@@ -476,6 +481,8 @@ async fn seed(pool: &PgPool) -> Fx {
         w_f,
         w_p,
         w_g,
+        w_d0,
+        w_d1,
         t,
         p,
         s1,
@@ -594,7 +601,9 @@ fn names_file(dir: &Path, names: &[&str]) -> PathBuf {
     p
 }
 
-const LISTED: &[&str] = &["alpha", "beta", "foreign", "private", "missing", "alpha"];
+const LISTED: &[&str] = &[
+    "alpha", "beta", "foreign", "private", "missing", "delta", "alpha",
+];
 
 async fn apply(pool: &PgPool, fx: &Fx, dir: &Path, manifest: &Path) -> Run {
     let names = names_file(dir, LISTED);
@@ -701,6 +710,7 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
         ("foreign", "owned by"),
         ("private", "visibility"),
         ("missing", "no workflow row"),
+        ("delta", "partly the target's"),
     ] {
         assert!(
             r.stdout
@@ -766,6 +776,11 @@ async fn apply_moves_only_the_source_groups_rows_and_keeps_visibility(pool: PgPo
     assert_eq!(
         tenancy(&pool, "workflows", fx.w_g).await,
         (fx.other_team, "public".into())
+    );
+    assert_eq!(
+        tenancy(&pool, "workflows", fx.w_d1).await,
+        (fx.src, "public".into()),
+        "a lineage partly the target's already is held whole"
     );
     for c in [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb] {
         assert_eq!(tenancy(&pool, "claims", c).await, moved, "claim {c}");
@@ -871,7 +886,15 @@ async fn apply_requires_the_dry_runs_count_a_ruling_and_a_reason(pool: PgPool) {
 // Refusals of the groups
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn refused_target(pool: &PgPool, fx: &Fx, target: Uuid, from: Option<Uuid>) -> Run {
+/// Run with `target` (and `--from-group`), as a DRY RUN when `apply` is
+/// false (so no `--confirm-count` can be what refuses it), else as an apply.
+async fn refused_target(
+    pool: &PgPool,
+    fx: &Fx,
+    target: Uuid,
+    from: Option<Uuid>,
+    apply: bool,
+) -> Run {
     let dir = scratch_dir();
     let names = names_file(&dir, LISTED);
     let manifest = dir.join("m.jsonl");
@@ -886,14 +909,20 @@ async fn refused_target(pool: &PgPool, fx: &Fx, target: Uuid, from: Option<Uuid>
         fx.operator.to_string(),
         "--manifest-out".into(),
         manifest.to_str().unwrap().into(),
-        "--apply".into(),
-        "--confirm-count".into(),
-        "3".into(),
-        "--ruling".into(),
-        RULING.into(),
-        "--reason".into(),
-        "r".into(),
     ];
+    if apply {
+        for a in [
+            "--apply",
+            "--confirm-count",
+            "3",
+            "--ruling",
+            RULING,
+            "--reason",
+            "r",
+        ] {
+            args.push(a.into());
+        }
+    }
     if let Some(g) = from {
         args.push("--from-group".into());
         args.push(g.to_string());
@@ -914,25 +943,43 @@ async fn refused_target(pool: &PgPool, fx: &Fx, target: Uuid, from: Option<Uuid>
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_target_the_operator_does_not_administer_is_refused(pool: PgPool) {
     let fx = seed(&pool).await;
-    let r = refused_target(&pool, &fx, fx.not_admin_team, None).await;
-    assert_eq!(r.code, 1, "{}", r.show());
-    assert!(r.stderr.contains("not a live admin"), "{}", r.show());
+    for apply in [false, true] {
+        let r = refused_target(&pool, &fx, fx.not_admin_team, None, apply).await;
+        assert_eq!(r.code, 1, "apply={apply}: {}", r.show());
+        assert!(
+            r.stderr.contains("not a live admin"),
+            "apply={apply}: {}",
+            r.show()
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_personal_target_is_refused_even_to_its_admin(pool: PgPool) {
     let fx = seed(&pool).await;
-    let r = refused_target(&pool, &fx, fx.stranger_group, None).await;
-    assert_eq!(r.code, 1, "{}", r.show());
-    assert!(r.stderr.contains("not a team group"), "{}", r.show());
+    for apply in [false, true] {
+        let r = refused_target(&pool, &fx, fx.stranger_group, None, apply).await;
+        assert_eq!(r.code, 1, "apply={apply}: {}", r.show());
+        assert!(
+            r.stderr.contains("not a team group"),
+            "apply={apply}: {}",
+            r.show()
+        );
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_source_group_the_operator_does_not_administer_is_refused(pool: PgPool) {
     let fx = seed(&pool).await;
-    let r = refused_target(&pool, &fx, fx.target, Some(fx.other_team)).await;
-    assert_eq!(r.code, 1, "{}", r.show());
-    assert!(r.stderr.contains("--from-group"), "{}", r.show());
+    for apply in [false, true] {
+        let r = refused_target(&pool, &fx, fx.target, Some(fx.other_team), apply).await;
+        assert_eq!(r.code, 1, "apply={apply}: {}", r.show());
+        assert!(
+            r.stderr.contains("--from-group"),
+            "apply={apply}: {}",
+            r.show()
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -27,7 +27,10 @@
 //!   A lineage with a generation that is not public, or that a third group
 //!   owns, is HELD whole (moving part of a lineage would split its plan across
 //!   owners; moving a private row changes who reads it). A lineage whose rows
-//!   are all the target's already counts as done.
+//!   are all the target's already counts as done; one that is PART the
+//!   target's and part the source's is HELD (its manifest would record only
+//!   the source's part, and the reversal, which refuses a lineage row it did
+//!   not move, could then never restore it).
 //! * `claims`: the plan claims, i.e. the target of every `executes` edge from
 //!   any of those rows (thesis, phases, steps, operation atoms; retracted
 //!   edges count too, as migration 183's backfill counts them), plus every
@@ -64,7 +67,9 @@
 //!     it `('public', world)`, owned by no group. It is not the source's, so it
 //!     does not move, and its public visibility already serves every reader.
 //!     `workflows.parent_id` is a column of the moving row, not a separate row.
-//!     The dry run counts these.
+//!     A claim-to-claim plan edge written BEFORE migration 120 is world-owned
+//!     too (legacy, administrative) and stays for the same reason. The dry run
+//!     counts both, separately.
 //!
 //!   The trigger does not rewrite any of these on its own: since migration 120
 //!   a public-to-public owner change of an endpoint leaves every public edge
@@ -303,8 +308,19 @@ pub struct EdgeRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineageHold {
     NotFound,
-    OwnedElsewhere { generation: i32, owner: Uuid },
-    NotPublic { generation: i32, visibility: String },
+    OwnedElsewhere {
+        generation: i32,
+        owner: Uuid,
+    },
+    NotPublic {
+        generation: i32,
+        visibility: String,
+    },
+    /// Some generations are the target's already and some the source's.
+    PartlyMoved {
+        source_gens: Vec<i32>,
+        target_gens: Vec<i32>,
+    },
 }
 
 impl fmt::Display for LineageHold {
@@ -324,6 +340,15 @@ impl fmt::Display for LineageHold {
                 "generation {generation} has visibility {visibility}, not public; a re-own keeps \
                  visibility and moving a private plan changes who reads it, so the whole lineage \
                  stays"
+            ),
+            Self::PartlyMoved {
+                source_gens,
+                target_gens,
+            } => write!(
+                f,
+                "partly the target's already (generations {target_gens:?}) and partly the \
+                 source's ({source_gens:?}); a lineage moves whole, and a run that moved only \
+                 part of it could not be reversed exactly, so it stays"
             ),
         }
     }
@@ -535,9 +560,24 @@ pub async fn plan(
                 None
             }
         });
+        let at = |g: Uuid| -> Vec<i32> {
+            gens.iter()
+                .filter(|w| w.tenancy.owner == g)
+                .map(|w| w.generation)
+                .collect()
+        };
+        let (source_gens, target_gens) = (at(source), at(target));
         if let Some(h) = bad {
             out.held.push((name.clone(), h));
-        } else if gens.iter().all(|w| w.tenancy.owner == target) {
+        } else if !source_gens.is_empty() && !target_gens.is_empty() {
+            out.held.push((
+                name.clone(),
+                LineageHold::PartlyMoved {
+                    source_gens,
+                    target_gens,
+                },
+            ));
+        } else if source_gens.is_empty() {
             out.already.push(name.clone());
         } else {
             eligible.insert(name.clone(), gens.clone());
@@ -820,8 +860,16 @@ pub async fn plan(
         let plan_rel = PLAN_RELATIONSHIPS.contains(&e.relationship.as_str());
         let why: Option<&'static str> = if e.tenancy.owner == target {
             Some("already the target's")
-        } else if e.tenancy.owner == WORLD {
+        } else if e.tenancy.owner == WORLD
+            && !(matches!(e.source.1.as_str(), "claim" | "evidence")
+                && matches!(e.target.1.as_str(), "claim" | "evidence"))
+        {
             Some("structural: world-owned (a workflow, agent or paper endpoint)")
+        } else if e.tenancy.owner == WORLD {
+            Some(
+                "legacy world-owned claim-to-claim edge (written before writer ownership, \
+                 migration 120): no group's, stays administrative",
+            )
         } else if e.tenancy.owner != source {
             Some("owned by another group")
         } else if e.tenancy.visibility != PUBLIC || e.tenancy.co_owner.is_some() {
