@@ -2204,6 +2204,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "match_candidate.rs",
+        "promote_if_pending_conn",
+        "WRITE. The conditional flip of one `match_candidates` row (no tenancy columns to filter \
+         on) and the matcher edge between the two claims the flipped row names (`RETURNING`), \
+         on the CALLER's connection. That is the point of the form: the edge's owner is \
+         derived from its claims by migration 070's trigger, so the caller passes a transaction \
+         stamped from the deciding agent and `edges_tenancy`'s WITH CHECK decides admission. \
+         The caller's viewer-filtered `are_all_current` guard runs on the same transaction.",
+    ),
+    (
+        "match_candidate.rs",
         "current_decision",
         "READ of one `match_candidates` row's status and verdict, a table with no tenancy \
          columns to filter on, after a conditional decide matched no row (refusal message; lost \
