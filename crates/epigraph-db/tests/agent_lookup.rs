@@ -186,6 +186,91 @@ async fn seed_role(pool: &PgPool, key: &str, elevates: bool) {
     .expect("platform role");
 }
 
+/// `agent`'s (first) human OAuth client.
+async fn human_client_of(pool: &PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \
+          ORDER BY created_at LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client")
+}
+
+async fn set_client_status(pool: &PgPool, client: Uuid, status: &str) {
+    sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+        .bind(client)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("client status -> {status}: {e}"));
+}
+
+/// Revoke `human`'s registration through the real maintenance definer.
+async fn revoke_registration(pool: &PgPool, human: Uuid) {
+    let revoked: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, 'test revoke')",
+        )
+        .bind(human)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke registration");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the registration was live");
+}
+
+/// A fresh named agent bound to `operator` by a migration-149 client
+/// allowance (a service client on the maintenance-only registry). Returns
+/// `(agent, client)`.
+async fn allowance_bound(pool: &PgPool, operator: Uuid, name: &str) -> (Uuid, Uuid) {
+    let (agent, _) = named(pool, name).await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'lookup allowance fixture', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("lookup-allowance-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    let allowed: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT allowed_now FROM public.epigraph_allow_author_binding_client($1, $2, $3)",
+        )
+        .bind(client)
+        .bind(operator)
+        .bind("lookup test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("allow the client for the operator");
+        (conn, r)
+    })
+    .await;
+    assert!(allowed, "CALIBRATION: the allowance is in force");
+    (agent, client)
+}
+
+/// `epigraph_human_of(agent, false)`, read on the harness connection.
+async fn human_of(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT public.epigraph_human_of($1, false)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("epigraph_human_of")
+}
+
+/// Whole card JSON, nothing stripped: for before/after comparisons of the
+/// SAME agents.
+fn whole(cards: &[AgentCard]) -> serde_json::Value {
+    serde_json::to_value(cards).expect("serialize cards")
+}
+
 async fn grant(pool: &PgPool, role: &str, holder: Uuid) -> Uuid {
     sqlx::query_scalar(
         "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
@@ -369,51 +454,188 @@ async fn kind_is_derived_from_evidence_not_agent_type(pool: PgPool) {
 // ---------------------------------------------------------------------------
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_hidden_operator_link_is_indistinguishable_from_none(pool: PgPool) {
+async fn the_operator_human_is_shown_to_every_reader(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named_human(&pool, "Talia Brennick").await;
     let (linked, _) = named(&pool, "helper-bot").await;
     let (unlinked, _) = named(&pool, "helper-bot").await;
     link(&pool, linked, human).await;
-
-    let out = cards_as(&pool, outsider, &[linked, unlinked]).await;
     assert_eq!(
-        shape(&out[0]),
-        shape(&out[1]),
-        "an outsider cannot tell the link"
+        human_of(&pool, linked).await,
+        Some(human),
+        "CALIBRATION: the card names the binding epigraph_human_of names"
     );
-    assert!(out[0].operator_human.is_none());
-    assert_eq!(out[0].kind, AgentKind::Unknown);
 
-    // The linked human passes the D4 gate: it sees itself named, and the kind.
-    let mine = card_as(&pool, human, linked).await;
-    assert_eq!(mine.operator_human.as_ref().map(|h| h.id), Some(human));
-    assert_eq!(
-        mine.operator_human
-            .as_ref()
-            .and_then(|h| h.display_name.as_deref()),
-        Some("Talia Brennick")
-    );
-    assert_eq!(mine.kind, AgentKind::LlmAgent);
-    assert!(mine.kind_evidence.contains(&"bound_to_visible_human"));
+    // Every reader: an outsider, the agent itself, the human.
+    for who in [outsider, linked, human] {
+        let c = card_as(&pool, who, linked).await;
+        let h = c.operator_human.as_ref().expect("operator_human shown");
+        assert_eq!(h.id, human);
+        assert_eq!(h.display_name.as_deref(), Some("Talia Brennick"));
+        assert_eq!(c.kind, AgentKind::LlmAgent);
+        assert!(c.kind_evidence.contains(&"bound_to_visible_human"));
+    }
+    // An unbound look-alike shows none; a human is never its own operator.
+    assert!(card_as(&pool, outsider, unlinked)
+        .await
+        .operator_human
+        .is_none());
+    assert!(card_as(&pool, outsider, human)
+        .await
+        .operator_human
+        .is_none());
 
-    // The agent itself is not its human: D4 does not admit it.
-    let itself = card_as(&pool, linked, linked).await;
-    assert!(itself.operator_human.is_none());
-
-    // find_agent: same differential, through the search path.
+    // find_agent: the same field through the search path.
     let r = find_as(&pool, outsider, "helper-bot", None, None, None).await;
-    assert_eq!(r.results.len(), 2);
-    let a = serde_json::to_value(&r.results[0]).unwrap();
-    let b = serde_json::to_value(&r.results[1]).unwrap();
-    let strip = |mut v: serde_json::Value| {
-        let o = v.as_object_mut().unwrap();
-        o.remove("id");
-        o.remove("display_name");
-        o.remove("created_at");
-        v
+    let hit = r
+        .results
+        .iter()
+        .find(|h| h.card.id == linked)
+        .expect("listed");
+    assert_eq!(hit.card.operator_human.as_ref().map(|h| h.id), Some(human));
+}
+
+/// The operator human is read from the binding RECORD, so no client or
+/// registration event moves it: an outsider's whole card for each agent is
+/// byte-identical before and after every event, while each event is shown
+/// (CALIBRATION) to move `epigraph_human_of`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operator_human_does_not_move_with_client_or_registration_status(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (h1, _) = named_human(&pool, "Ren Okafor").await;
+    let (linked, _) = named(&pool, "relay-bot").await;
+    link(&pool, linked, h1).await;
+    let (h2, _) = named_human(&pool, "Ilse Marrow").await;
+    let (allowed, allowed_client) = allowance_bound(&pool, h2, "scribe-service").await;
+    // A registered human that is also linked as an agent (123 calls it an
+    // operated agent): link first, then register.
+    let (o3, _) = named_human(&pool, "Bram Tolliver").await;
+    let (dual, _) = named(&pool, "dual-principal").await;
+    link(&pool, dual, o3).await;
+    fixture::make_human_operator(&pool, dual).await;
+
+    // Where both agree, the card equals epigraph_human_of.
+    assert_eq!(human_of(&pool, linked).await, Some(h1));
+    assert_eq!(human_of(&pool, allowed).await, Some(h2));
+
+    let ids = [linked, allowed, dual, h1, h2, o3];
+    let before = whole(&cards_as(&pool, outsider, &ids).await);
+    let shown = |v: &serde_json::Value, i: usize| v[i]["operator_human"]["id"].clone();
+    assert_eq!(shown(&before, 0), serde_json::json!(h1.to_string()));
+    assert_eq!(shown(&before, 1), serde_json::json!(h2.to_string()));
+    assert_eq!(shown(&before, 2), serde_json::json!(o3.to_string()));
+
+    let check = |label: &'static str| {
+        let pool = pool.clone();
+        let before = before.clone();
+        async move {
+            let now = whole(&cards_as(&pool, outsider, &ids).await);
+            assert_eq!(now, before, "{label}: the outsider's cards moved");
+        }
     };
-    assert_eq!(strip(a), strip(b));
+
+    // 1. The allowlisted agent's own client suspended.
+    set_client_status(&pool, allowed_client, "suspended").await;
+    assert_eq!(human_of(&pool, allowed).await, None, "CALIBRATION 1");
+    check("allowlisted client suspended").await;
+    set_client_status(&pool, allowed_client, "active").await;
+
+    // 2. The allowlist operator's human client suspended.
+    let h2_client = human_client_of(&pool, h2).await;
+    set_client_status(&pool, h2_client, "suspended").await;
+    assert_eq!(human_of(&pool, allowed).await, None, "CALIBRATION 2");
+    check("operator's human client suspended").await;
+    set_client_status(&pool, h2_client, "active").await;
+
+    // 3. The registered-and-linked principal's own human client suspended.
+    assert_eq!(human_of(&pool, dual).await, Some(dual), "CALIBRATION 3a");
+    let dual_client = human_client_of(&pool, dual).await;
+    set_client_status(&pool, dual_client, "suspended").await;
+    assert_eq!(human_of(&pool, dual).await, Some(o3), "CALIBRATION 3b");
+    check("linked human's client suspended").await;
+    set_client_status(&pool, dual_client, "active").await;
+
+    // 4. A second live client added to the allowlisted agent.
+    let second: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'second client', 'service', ARRAY['claims:read'], 'active', $2, \
+                 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("lookup-second-{}", Uuid::new_v4()))
+    .bind(allowed)
+    .fetch_one(&pool)
+    .await
+    .expect("second client");
+    assert_eq!(human_of(&pool, allowed).await, None, "CALIBRATION 4");
+    check("second client added").await;
+    set_client_status(&pool, second, "revoked").await;
+
+    // 5. Both operators' registrations revoked.
+    revoke_registration(&pool, h1).await;
+    revoke_registration(&pool, h2).await;
+    assert_eq!(human_of(&pool, allowed).await, None, "CALIBRATION 5");
+    check("operators' registrations revoked").await;
+
+    // 6. The allowlisted client revoked.
+    set_client_status(&pool, allowed_client, "revoked").await;
+    check("allowlisted client revoked").await;
+}
+
+/// An operated agent learns nothing about its human that an outsider does
+/// not: its human is on every reader's card of the agent, and the human's
+/// own card reads to the agent exactly as it reads to an outsider (no
+/// registration status, so `kind=human` finds nobody for either).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_sees_its_human_exactly_as_an_outsider_does(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (h1, _) = named_human(&pool, "Sable Voss").await;
+    let (h2, _) = named_human(&pool, "Sable Voss").await;
+    let (bot, _) = named(&pool, "voss-bot").await;
+    link(&pool, bot, h1).await;
+
+    for q in ["sable voss", "sa"] {
+        let as_bot = find_as(&pool, bot, q, Some("human"), None, Some(25)).await;
+        let as_out = find_as(&pool, outsider, q, Some("human"), None, Some(25)).await;
+        assert_eq!(ids(&as_bot), ids(&as_out), "{q}");
+        assert!(ids(&as_bot).is_empty(), "{q}: {:?}", ids(&as_bot));
+    }
+    assert_eq!(
+        whole(&cards_as(&pool, bot, &[h1, h2]).await),
+        whole(&cards_as(&pool, outsider, &[h1, h2]).await),
+        "the agent's view of the humans is the outsider's"
+    );
+    // What it may know, it reads on its own card, as everyone does.
+    let own = card_as(&pool, bot, bot).await;
+    assert_eq!(own.operator_human.map(|h| h.id), Some(h1));
+    // The human itself still sees its own registration.
+    assert_eq!(card_as(&pool, h1, h1).await.kind, AgentKind::Human);
+}
+
+/// A document-ingest author node that is linked to its human (a legacy
+/// author, migration 122) is an ingest author, not an LLM agent, for every
+/// reader, now that every reader sees the binding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_linked_ingest_author_node_reads_as_an_ingest_author(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (human, _) = named_human(&pool, "Corin Vale").await;
+    let (_, key) = epigraph_crypto::did_key::did_key_for_author(None, "Corin Vale");
+    let author = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, display_name) VALUES ($1, $2, 'Corin Vale')")
+        .bind(author)
+        .bind(key.as_slice())
+        .execute(&pool)
+        .await
+        .expect("ingest author");
+    link(&pool, author, human).await;
+
+    for who in [outsider, human] {
+        let c = card_as(&pool, who, author).await;
+        assert_eq!(c.kind, AgentKind::IngestAuthor, "{c:?}");
+        assert!(c.kind_evidence.contains(&"name_derived_key"));
+        assert!(c.kind_evidence.contains(&"bound_to_visible_human"));
+        assert_eq!(c.operator_human.map(|h| h.id), Some(human));
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -454,15 +676,12 @@ async fn human_operator_status_is_shown_only_to_those_who_may_know_it(pool: PgPo
         AgentKind::Human,
         "itself"
     );
+    // Its own agent reads the human's card exactly as an outsider does: the
+    // agent learns its human from its OWN card's operator_human (shown to
+    // every reader), never registration status from the human's.
     let via_agent = card_as(&pool, agent_of_human, human).await;
-    assert_eq!(
-        via_agent.kind,
-        AgentKind::Human,
-        "its own agent knows its human"
-    );
-    assert!(via_agent
-        .kind_evidence
-        .contains(&"registered_human_operator"));
+    assert_eq!(shape(&via_agent), shape(&out[0]));
+    assert_eq!(via_agent.kind, AgentKind::Unknown);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -745,6 +964,114 @@ async fn roles_show_disclosed_assignments_and_never_the_admin_roster(pool: PgPoo
         ids(&r).is_empty(),
         "the role filter is no roster oracle either"
     );
+}
+
+/// The auditor roster (`role:auditor`: elevates = false, reads_audit = true)
+/// is not disclosed: the reads-audit half of 198's filter, on its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_auditor_roster_is_not_disclosed(pool: PgPool) {
+    let (elevates, reads_audit): (bool, bool) = sqlx::query_as(
+        "SELECT elevates, reads_audit FROM platform_roles WHERE key = 'role:auditor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("123 seeds role:auditor");
+    assert!(
+        !elevates && reads_audit,
+        "CALIBRATION: only the reads_audit half of the filter covers this role"
+    );
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (auditor, _) = named_human(&pool, "Noor Castell").await;
+    let (plain, _) = named_human(&pool, "Noor Castell").await;
+    grant(&pool, "role:auditor", auditor).await;
+
+    let out = cards_as(&pool, outsider, &[auditor, plain]).await;
+    assert_eq!(
+        shape(&out[0]),
+        shape(&out[1]),
+        "an outsider cannot tell the auditor"
+    );
+    assert!(out[0].roles.is_empty());
+    let r = find_as(&pool, outsider, "noor castell", None, Some("auditor"), None).await;
+    assert!(ids(&r).is_empty(), "the role filter is no auditor oracle");
+
+    // The holder sees its own.
+    let own = card_as(&pool, auditor, auditor).await;
+    assert!(
+        own.roles.iter().any(|r| r.role == "role:auditor"),
+        "{own:?}"
+    );
+}
+
+/// A disclosed role is decided by the assignment window alone, as the public
+/// projection shows it, so no client or registration event moves an
+/// outsider's card (`kind` included).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disclosed_role_does_not_move_with_client_or_registration_status(pool: PgPool) {
+    seed_role(&pool, "role:test-members", false).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (member, _) = named_human(&pool, "Juno Marsh").await;
+    grant(&pool, "role:test-members", member).await;
+
+    let before = whole(&cards_as(&pool, outsider, &[member]).await);
+    assert_eq!(before[0]["kind"], "human");
+    assert_eq!(before[0]["roles"][0]["role"], "role:test-members");
+
+    let is_human = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>("SELECT public.epigraph_is_human_operator($1)")
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("is_human_operator")
+    };
+    let client = human_client_of(&pool, member).await;
+    set_client_status(&pool, client, "suspended").await;
+    assert!(!is_human(pool.clone()).await, "CALIBRATION: suspended");
+    assert_eq!(
+        whole(&cards_as(&pool, outsider, &[member]).await),
+        before,
+        "client suspended"
+    );
+    set_client_status(&pool, client, "active").await;
+
+    revoke_registration(&pool, member).await;
+    assert!(!is_human(pool.clone()).await, "CALIBRATION: deregistered");
+    assert_eq!(
+        whole(&cards_as(&pool, outsider, &[member]).await),
+        before,
+        "registration revoked"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn punctuation_and_identifier_spelling_fold(pool: PgPool) {
+    let (asker, _) = named(&pool, "asker").await;
+    let (jp, _) = named(&pool, "Jean-Pierre Dubois").await;
+    let (ob, _) = named(&pool, "Aine O'Brien").await;
+    let (orc, _) = named(&pool, "Hale Mercer").await;
+    sqlx::query("UPDATE agents SET orcid = '0000-0002-0000-000X' WHERE id = $1")
+        .bind(orc)
+        .execute(&pool)
+        .await
+        .expect("public orcid");
+
+    for (q, want, tier) in [
+        ("jean pierre dubois", jp, MatchTier::Exact),
+        ("Jean–Pierre Dubois", jp, MatchTier::Exact),
+        ("pierre", jp, MatchTier::Prefix),
+        ("Aine O’Brien", ob, MatchTier::Exact),
+        ("aine obrien", ob, MatchTier::Exact),
+        ("000000020000000x", orc, MatchTier::Orcid),
+        ("0000-0002-0000-000x", orc, MatchTier::Orcid),
+        ("orcid.org/0000-0002-0000-000X", orc, MatchTier::Orcid),
+    ] {
+        let r = find_as(&pool, asker, q, None, None, None).await;
+        let top = r
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("{q:?} found nothing"));
+        assert_eq!((top.card.id, top.tier), (want, tier), "{q:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

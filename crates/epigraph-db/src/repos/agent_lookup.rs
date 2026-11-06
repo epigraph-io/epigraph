@@ -21,22 +21,28 @@
 //!   caller is the agent, or shares a live group with it; or an admin). A
 //!   private ORCID never matches, so it is not an oracle. `properties`
 //!   (`full_name`, `email`, `affiliations`) is never matched and never
-//!   returned; no contact field is ever searched.
-//! * `operator_human` (the human the agent acts for, migration 149's
-//!   `epigraph_human_of(agent, false)`): only through the prompt-history gate
-//!   (design D4, migration 161): the caller IS that human, or the caller is
-//!   an admin (a bypass or elevated viewer). [`D4_OPERATOR_GATE_SQL`] is that
-//!   gate, in one place, for every surface that shows an agent's human or its
-//!   prompt state. (It omits 161's unarmed-scopes `epigraph_is_instance_admin`
-//!   arm, so it admits a subset of what 161 admits: never more.)
+//!   returned. `display_name` is matched as written, so a display name that
+//!   is itself an email address matches like any other name (every
+//!   `display_name` is already public through `GET /api/v1/agents`).
+//! * `operator_human` (the human the agent acts for): shown to EVERY reader,
+//!   by design: who an agent acts for is public, like the claims it files.
+//!   It is read from the binding RECORD (`operator_binding_sql`: the
+//!   agent's operator link, else its client allowance), never inferred from
+//!   an `OPERATED_BY` edge, which any edge writer can add, and never from
+//!   client or registration status, which would let a reader watch a
+//!   suspension. The agent's model, prompt snapshot and prompt text are NOT
+//!   on the card; they stay behind the prompt-history gate
+//!   ([`D4_OPERATOR_GATE_SQL`]).
 //! * `kind`: derived from EVIDENCE, never from `agents.agent_type` alone
 //!   (the legacy create path defaulted every row to `'human'`). Each evidence
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
 //!   falls through, so an agent whose only evidence is hidden reads exactly as
 //!   one with no evidence (`unknown`). See [`AgentKind`].
-//! * `roles`: migration 198's `epigraph_disclosed_role_assignments`, the live
-//!   assignments of NON-elevating roles (publicly projected by design, 165),
-//!   plus the caller's own assignments of any role.
+//! * `roles`: migration 198's `epigraph_disclosed_role_assignments`: for any
+//!   agent, the assignments of roles that neither elevate nor read the audit
+//!   trail whose window is open now (exactly what 123's public projection
+//!   shows, and decided by the window alone, so client or registration
+//!   status never moves it), plus the caller's own assignments of any role.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
 //!   number. Capped at [`COUNT_CAP`] so a fleet agent with 10^5 claims cannot
@@ -90,10 +96,14 @@ pub const COUNT_CAP: i64 = 10_000;
 /// the admin bit ([`Viewer::bypass_bind`]: a bypass or elevated viewer) at
 /// `$A`. True when the caller is the human `epigraph_human_of({agent}, false)`
 /// names, or an admin. A NULL principal (an unstamped or anonymous caller)
-/// is never admitted.
+/// is never admitted. It omits 161's unarmed-scopes
+/// `epigraph_is_instance_admin` arm, so it admits a subset of what 161
+/// admits: never more.
 ///
-/// Every surface that shows an agent's operator-linked human or its prompt
-/// state goes through this text, so the surfaces cannot drift apart.
+/// It gates an agent's PROMPT STATE (model, prompt snapshot, prompt text),
+/// never the agent's human: the human is shown to every reader (the card's
+/// `operator_human`). The card itself shows no prompt state and does not use
+/// this gate; it is the shared text for a surface that does.
 pub const D4_OPERATOR_GATE_SQL: &str = "($A::bool OR ($P::uuid IS NOT NULL \
      AND public.epigraph_human_of({agent}, false) = $P::uuid))";
 
@@ -106,17 +116,26 @@ pub fn d4_operator_gate(agent_expr: &str, principal_bind: usize, admin_bind: usi
         .replace("$A", &format!("${admin_bind}"))
 }
 
-/// The accent- and case-folding of a text expression, in SQL.
+/// The accent-, case- and punctuation-folding of a text expression, in SQL.
 ///
 /// NFD-decompose, drop the combining marks (U+0300..U+036F), spell out the
 /// letters that do not decompose (`ß` → `ss`, `æ` → `ae`, `ø` → `o`, `ł` →
-/// `l`, ...), lower-case (last, so it only ever lower-cases ASCII letters,
-/// which every collation does, a `C` one included), and collapse whitespace.
-/// Built-in functions only: no `unaccent`.
+/// `l`, ...), drop apostrophes (`O'Brien`, `O’Brien` and `OBrien` fold
+/// alike), turn hyphens, dashes, periods and commas into spaces
+/// (`Jean-Pierre` folds as `jean pierre`, so each part is a word for the
+/// prefix tier), lower-case, and collapse whitespace. Built-in functions
+/// only: no `unaccent`.
+///
+/// `lower()` follows the database's collation: under a libc or ICU UTF-8
+/// collation it folds Greek, Cyrillic and other cased scripts too; under the
+/// `C` collation it folds ASCII only, so non-Latin names then match
+/// case-sensitively. The query and the stored name always fold on the same
+/// database, so the two sides never fold differently.
 #[must_use]
 pub fn fold_sql(expr: &str) -> String {
     format!(
         "pg_catalog.btrim(pg_catalog.regexp_replace(pg_catalog.lower(\
+           pg_catalog.regexp_replace(pg_catalog.regexp_replace(\
            pg_catalog.translate(\
              pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(\
              pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(\
@@ -124,16 +143,55 @@ pub fn fold_sql(expr: &str) -> String {
                                          '[\\u0300-\\u036f]', '', 'g'), \
              'ß', 'ss'), 'ẞ', 'SS'), 'æ', 'ae'), 'Æ', 'AE'), 'œ', 'oe'), 'Œ', 'OE'), \
              'þ', 'th'), 'Þ', 'TH'), \
-             'øØłŁđĐħĦŧŦıðÐ', 'oOlLdDhHtTidD')), \
+             'øØłŁđĐħĦŧŦıðÐ', 'oOlLdDhHtTidD'), \
+           '[''’ʼ]', '', 'g'), \
+           '[‐‑‒–—―.,-]', ' ', 'g')), \
          '\\s+', ' ', 'g'))"
     )
 }
 
-/// Strip the resolver prefix an ORCID or ROR id may be written with, in SQL.
+/// Strip the resolver prefix a ROR id may be written with, in SQL.
 fn ident_sql(expr: &str) -> String {
     format!(
         "pg_catalog.lower(pg_catalog.btrim(pg_catalog.regexp_replace(pg_catalog.btrim({expr}), \
            '^https?://(www\\.)?(orcid\\.org|ror\\.org)/', '', 'i')))"
+    )
+}
+
+/// An ORCID iD's 16-character key, in SQL, or NULL when `expr` is not one:
+/// the resolver prefix (with or without a scheme) and every separator are
+/// dropped and the check character upper-cased, so `0000-0002-0000-000x`,
+/// `000000020000000X` and `https://orcid.org/0000-0002-0000-000X` are one key.
+fn orcid_sql(expr: &str) -> String {
+    let norm = format!(
+        "pg_catalog.upper(pg_catalog.regexp_replace(pg_catalog.regexp_replace(\
+           pg_catalog.btrim({expr}), '^(https?://)?(www\\.)?orcid\\.org/', '', 'i'), \
+           '[^0-9A-Za-z]', '', 'g'))"
+    );
+    format!("(CASE WHEN {norm} ~ '^[0-9]{{15}}[0-9X]$' THEN {norm} END)")
+}
+
+/// The human an agent acts for, in SQL, read from the binding RECORD so that
+/// no client or registration event moves it (it is shown to every reader):
+/// the agent's operator link in any state (107's
+/// `epigraph_operator_of_author`, retired links included, as
+/// `epigraph_human_of(agent, false)` reads them), else the operator its
+/// unrevoked migration-149 client allowance names.
+///
+/// It equals `epigraph_human_of(agent, false)` for every bound agent while
+/// that binding is in force. It differs only where `epigraph_human_of`
+/// consults client or registration STATUS, which a reader must not be able
+/// to watch: an allowance whose client (or whose operator's human client) is
+/// not active, or that a second client of the agent suspends, still names
+/// its operator; and a registered human that is also linked as an agent (an
+/// operated agent, migration 123) names its link operator whether or not its
+/// own client is active. Never inferred from an `OPERATED_BY` edge, which
+/// any edge writer can add. NULL for an unbound agent.
+fn operator_binding_sql(agent: &str) -> String {
+    format!(
+        "COALESCE((SELECT o.operator_id FROM public.epigraph_operator_of_author({agent}) o), \
+                  (SELECT r.operator_id FROM public.author_binding_clients r \
+                    WHERE r.agent_id = {agent} AND r.revoked_at IS NULL))"
     )
 }
 
@@ -191,11 +249,13 @@ pub enum AgentKind {
     /// A registered system identity (migration 148's `system_agents`).
     System,
     /// A registered human operator (migration 122's `human_operators`), shown
-    /// to the human itself, its own agents, admins, and to every caller when
-    /// the human holds a disclosed role (only registered humans hold roles).
+    /// to the human itself and admins (registration status is never shown to
+    /// anyone else, the human's own agents included), and to every caller
+    /// when the human holds a disclosed role (only registered humans are
+    /// granted roles; the window, not the current status, decides).
     Human,
-    /// An agent with an LLM model on its (visible) profile, or bound to a
-    /// human the caller may see (D4).
+    /// An agent with an LLM model on its (visible) profile, or, failing a
+    /// derived author key, an agent bound to a human (`operator_human`).
     LlmAgent,
     /// An author node the document ingest created: its key is the
     /// deterministic name- (or ORCID-) derived key of `did_key_for_author`,
@@ -275,7 +335,8 @@ pub struct AgentCard {
     pub roles: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
-    /// The human this agent acts for, when the caller passes the D4 gate.
+    /// The human this agent acts for (its binding record), shown to every
+    /// reader; `None` for an unbound agent and for a human itself.
     pub operator_human: Option<AgentRef>,
     pub created_at: DateTime<Utc>,
     pub counts: CardCounts,
@@ -413,9 +474,9 @@ impl AgentLookupRepository {
     ) -> Result<Vec<AgentNameMatch>, DbError> {
         let sql = format!(
             "WITH q AS ( \
-                 SELECT {fold_q} AS f, {ident_q} AS ident \
+                 SELECT {fold_q} AS f, {ident_q} AS ident, {orcid_q} AS orcid_q \
              ), q2 AS ( \
-                 SELECT f, ident, \
+                 SELECT f, ident, orcid_q, \
                         pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(f, '\\', '\\\\'), \
                                            '%', '\\%'), '_', '\\_') AS f_like \
                    FROM q \
@@ -432,7 +493,7 @@ impl AgentLookupRepository {
              ), ranked AS ( \
                  SELECT c.id, c.display_name, c.created_at, \
                         CASE \
-                          WHEN c.details_ok AND q2.ident <> '' AND c.orcid_k = q2.ident THEN 'orcid' \
+                          WHEN c.details_ok AND c.orcid_k = q2.orcid_q THEN 'orcid' \
                           WHEN c.details_ok AND q2.ident <> '' AND c.ror_k = q2.ident THEN 'ror' \
                           WHEN c.fname = q2.f THEN 'exact' \
                           WHEN c.fname LIKE q2.f_like || '%' \
@@ -442,8 +503,8 @@ impl AgentLookupRepository {
                         COALESCE(similarity(c.fname, q2.f), 0)::float8 AS score \
                    FROM cand c, q2 \
                   WHERE q2.f <> '' AND ( \
-                        (c.details_ok AND q2.ident <> '' \
-                          AND (c.orcid_k = q2.ident OR c.ror_k = q2.ident)) \
+                        (c.details_ok AND (c.orcid_k = q2.orcid_q \
+                                            OR (q2.ident <> '' AND c.ror_k = q2.ident))) \
                      OR c.fname = q2.f \
                      OR c.fname LIKE q2.f_like || '%' \
                      OR c.fname LIKE '% ' || q2.f_like || '%' \
@@ -456,8 +517,9 @@ impl AgentLookupRepository {
               LIMIT $6",
             fold_q = fold_sql("$1::text"),
             ident_q = ident_sql("$1::text"),
+            orcid_q = orcid_sql("$1::text"),
             fold_name = fold_sql("a.display_name"),
-            ident_orcid = ident_sql("a.orcid"),
+            ident_orcid = orcid_sql("a.orcid"),
             ident_ror = ident_sql("a.ror_id"),
         );
         type MatchRow = (Uuid, Option<String>, DateTime<Utc>, String, f64);
@@ -528,12 +590,9 @@ impl AgentLookupRepository {
                     COALESCE(d.details_ok AND a.properties ? 'llm_model', false) AS llm_model_visible, \
                     CASE WHEN d.details_ok THEN a.orcid END AS orcid, \
                     CASE WHEN d.details_ok THEN a.ror_id END AS ror_id, \
-                    COALESCE(($4::bool OR ($2::uuid IS NOT NULL \
-                         AND (a.id = $2::uuid \
-                              OR public.epigraph_human_of($2::uuid, false) = a.id))) \
+                    COALESCE(($4::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
                       AND public.epigraph_is_human_operator(a.id), false) AS human_visible, \
-                    CASE WHEN {d4} AND h.human IS DISTINCT FROM a.id THEN h.human END \
-                        AS operator_human, \
+                    CASE WHEN h.human IS DISTINCT FROM a.id THEN h.human END AS operator_human, \
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
@@ -542,9 +601,9 @@ impl AgentLookupRepository {
                      OR EXISTS (SELECT 1 FROM group_memberships gm \
                                  WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
                                    AND gm.group_id = ANY($3::uuid[]))), false) AS details_ok) d \
-              CROSS JOIN LATERAL (SELECT public.epigraph_human_of(a.id, false) AS human) h \
+              CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
-            d4 = d4_operator_gate("a.id", 2, 4),
+            binding = operator_binding_sql("a.id"),
         );
         type Row = (
             Uuid,
@@ -993,10 +1052,14 @@ fn kind_from_evidence(evidence: &[&str]) -> AgentKind {
         AgentKind::System
     } else if has("registered_human_operator") || has("holds_disclosed_role") {
         AgentKind::Human
-    } else if has("llm_model_on_profile") || has("bound_to_visible_human") {
+    } else if has("llm_model_on_profile") {
         AgentKind::LlmAgent
     } else if has("name_derived_key") || has("orcid_derived_key") {
+        // An ingest author node bound to its human (a legacy author) is
+        // still an ingest author: the binding says whose it is, not what.
         AgentKind::IngestAuthor
+    } else if has("bound_to_visible_human") {
+        AgentKind::LlmAgent
     } else {
         AgentKind::Unknown
     }
@@ -1013,8 +1076,18 @@ mod tests {
             kind_from_evidence(&["name_derived_key"]),
             AgentKind::IngestAuthor
         );
+        // A legacy author node bound to its human is still an ingest author;
+        // only a model on its profile makes it an LLM agent.
         assert_eq!(
             kind_from_evidence(&["bound_to_visible_human", "name_derived_key"]),
+            AgentKind::IngestAuthor
+        );
+        assert_eq!(
+            kind_from_evidence(&["llm_model_on_profile", "orcid_derived_key"]),
+            AgentKind::LlmAgent
+        );
+        assert_eq!(
+            kind_from_evidence(&["bound_to_visible_human"]),
             AgentKind::LlmAgent
         );
         assert_eq!(

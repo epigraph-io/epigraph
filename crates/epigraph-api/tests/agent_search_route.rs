@@ -95,46 +95,62 @@ fn strip(mut v: Value) -> Value {
 const READ: &[&str] = &["claims:read"];
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_route_serves_the_callers_view_and_hides_the_link_from_an_outsider(pool: PgPool) {
+async fn the_route_serves_the_callers_view_with_the_operator_human_for_every_reader(pool: PgPool) {
     let state = app_role_state(&pool).await;
     let outsider = named(&pool, "outsider").await;
     let human = named(&pool, "Talia Brennick").await;
     viewer_fixture::make_human_operator(&pool, human).await;
     let linked = named(&pool, "helper-bot").await;
-    let unlinked = named(&pool, "helper-bot").await;
+    let (with_note, note_group) = viewer_fixture::seed_agent_with_group(&pool, "helper-bot").await;
+    sqlx::query("UPDATE agents SET display_name = 'helper-bot' WHERE id = $1")
+        .bind(with_note)
+        .execute(&pool)
+        .await
+        .expect("name");
+    let without = named(&pool, "helper-bot").await;
     link(&pool, linked, human).await;
+    // A claim private to its author's own group.
+    viewer_fixture::seed_group_claim(&pool, with_note, note_group, "a private note").await;
 
     let uri = "/api/v1/agents/search?name=Helper-Bot";
+    let card_of = |body: &Value, id: Uuid| {
+        body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|r| r["id"] == id.to_string())
+            .unwrap_or_else(|| panic!("{id} listed: {body}"))
+            .clone()
+    };
     let (status, body) = get(&state, Some((outsider, READ)), uri).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let results = body["results"].as_array().expect("results");
-    assert_eq!(results.len(), 2, "{body}");
-    let ids: Vec<&str> = results.iter().map(|r| r["id"].as_str().unwrap()).collect();
-    assert!(
-        ids.contains(&linked.to_string().as_str()) && ids.contains(&unlinked.to_string().as_str())
-    );
-    assert_eq!(
-        strip(results[0].clone()),
-        strip(results[1].clone()),
-        "an outsider cannot tell the linked agent from the unlinked one"
-    );
-    assert_eq!(results[0]["tier"], "exact");
-    assert_eq!(results[0]["kind"], "unknown");
-    assert!(results[0]["operator_human"].is_null());
+    assert_eq!(body["results"].as_array().map(Vec::len), Some(3), "{body}");
+    assert_eq!(card_of(&body, linked)["tier"], "exact");
 
-    // The linked human is admitted by the D4 gate.
-    let (status, body) = get(&state, Some((human, READ)), uri).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let mine = body["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|r| r["id"] == linked.to_string())
-        .expect("linked agent listed")
-        .clone();
-    assert_eq!(mine["operator_human"]["id"], human.to_string());
-    assert_eq!(mine["operator_human"]["display_name"], "Talia Brennick");
-    assert_eq!(mine["kind"], "llm_agent");
+    // Every reader, the outsider included, sees the linked agent's human.
+    for who in [outsider, human] {
+        let (status, body) = get(&state, Some((who, READ)), uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let c = card_of(&body, linked);
+        assert_eq!(c["operator_human"]["id"], human.to_string(), "{c}");
+        assert_eq!(c["operator_human"]["display_name"], "Talia Brennick");
+        assert_eq!(c["kind"], "llm_agent");
+    }
+
+    // A private claim changes nothing the outsider receives.
+    assert_eq!(
+        strip(card_of(&body, with_note)),
+        strip(card_of(&body, without)),
+        "an outsider cannot tell the private claim"
+    );
+    assert_eq!(card_of(&body, without)["kind"], "unknown");
+    assert!(card_of(&body, without)["operator_human"].is_null());
+    let (_, mine) = get(&state, Some((with_note, READ)), uri).await;
+    assert_eq!(
+        card_of(&mine, with_note)["counts"]["asserted_claims"],
+        1,
+        "CALIBRATION: the author counts its own claim"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

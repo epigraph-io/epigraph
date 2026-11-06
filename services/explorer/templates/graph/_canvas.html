@@ -1,0 +1,39 @@
+<div class="graph" hidden data-graph-source="{{ canvas.source }}" data-graph-center="{{ canvas.center }}" data-node-cap="{{ canvas.node_cap }}" data-fallback-href="{{ canvas.fallback_href }}">
+  <div class="graph__toolbar">
+    <p class="graph__status small" data-role="status" role="status">Loading the graph…</p>
+    <button type="button" class="button-quiet graph__fit" data-role="fit">Fit to view</button>
+  </div>
+  <div class="graph__body">
+    <div class="graph__stage">
+      <svg class="graph__svg" data-role="svg" role="group" aria-label="{{ canvas.label }}"></svg>
+    </div>
+    <aside class="graph__panel card" aria-labelledby="graph-panel-title">
+      <h2 class="graph__panel-title" id="graph-panel-title" data-role="p-title">Select a node</h2>
+      <p class="graph__panel-type small muted" data-role="p-type">Click a node, or Tab to one, to see its details here.</p>
+      <p class="graph__panel-content" data-role="p-content" hidden></p>
+      <dl class="meta small graph__panel-meta" data-role="p-meta" hidden></dl>
+      <ul class="labels" data-role="p-labels" hidden></ul>
+      <div class="graph__actions">
+        <a class="button" data-role="p-open" hidden>Open page</a>
+        <button type="button" class="button-quiet" data-role="p-expand" hidden>Expand</button>
+        <a class="button-quiet" data-role="p-graph" hidden>Graph from here</a>
+      </div>
+      <p class="graph__panel-status small muted" data-role="p-status" aria-live="polite"></p>
+    </aside>
+  </div>
+  <p class="notice notice--warn small graph__cap" data-role="cap-notice" hidden></p>
+  <div class="graph__legend small muted">
+    <span class="graph__key"><span class="graph__swatch graph__swatch--support"></span>supports</span>
+    <span class="graph__key"><span class="graph__swatch graph__swatch--refute"></span>refutes</span>
+    <span class="graph__key"><span class="graph__swatch graph__swatch--structural"></span>structural</span>
+    <span class="graph__key"><span class="graph__ramp"></span>stronger colour = higher belief; grey = hidden or unknown</span>
+  </div>
+  <details class="graph__help small">
+    <summary>Using the graph</summary>
+    <ul>
+      <li>Click a node to see its details; double-click it, or press <kbd>E</kbd>, to load its neighbours.</li>
+      <li>Drag a node to move it; drag the background to pan; scroll to zoom.</li>
+      <li>Press <kbd>Tab</kbd> to move between nodes and <kbd>Enter</kbd> to open the selected node's page.</li>
+    </ul>
+  </details>
+</div>

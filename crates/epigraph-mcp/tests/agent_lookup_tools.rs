@@ -4,9 +4,10 @@
 //! these tests pin what is the tools' own: that they read as the CALLER on an
 //! application-role connection (the server's `ScopedPool` is downgraded to
 //! `epigraph_app`, so no gate is satisfied by a privileged session), that
-//! `get_agent` names the agent that filed a claim, that a hidden link or a
-//! private claim changes nothing an outsider receives, and that both tools
-//! are mapped to a scope. All names are invented.
+//! `get_agent` names the agent that filed a claim, that every reader sees an
+//! agent's operator human through both tools, that a private claim changes
+//! nothing an outsider receives, and that both tools are mapped to a scope.
+//! All names are invented.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -122,13 +123,12 @@ async fn get_agent_names_the_agent_that_filed_a_claim(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_outsider_cannot_tell_a_hidden_link_or_a_private_claim(pool: PgPool) {
+async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
     let server = app_server(&pool).await;
     let (outsider, _) = named(&pool, "outsider").await;
-    let (human, human_group) = named(&pool, "Talia Brennick").await;
+    let (human, _) = named(&pool, "Talia Brennick").await;
     fixture::make_human_operator(&pool, human).await;
     let (linked, _) = named(&pool, "helper-bot").await;
-    let (unlinked, _) = named(&pool, "helper-bot").await;
     let mut conn = pool.acquire().await.expect("acquire");
     assert!(
         AgentRepository::link_operator(&mut conn, linked, human)
@@ -137,8 +137,29 @@ async fn an_outsider_cannot_tell_a_hidden_link_or_a_private_claim(pool: PgPool) 
             .link_live
     );
     drop(conn);
-    // A claim private to the human's group, authored by the linked agent.
-    fixture::seed_group_claim(&pool, linked, human_group, "a private note").await;
+
+    for who in [outsider, linked, human] {
+        let card = get(&server, &pool, who, linked).await;
+        assert_eq!(card["operator_human"]["id"], human.to_string(), "{card}");
+        assert_eq!(card["operator_human"]["display_name"], "Talia Brennick");
+        assert_eq!(card["kind"], "llm_agent");
+        let r = find(&server, &pool, who, "helper-bot").await;
+        assert_eq!(
+            r["results"][0]["operator_human"]["id"],
+            human.to_string(),
+            "{r}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_outsider_cannot_tell_a_private_claim(pool: PgPool) {
+    let server = app_server(&pool).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (with_note, group) = named(&pool, "helper-bot").await;
+    let (without, _) = named(&pool, "helper-bot").await;
+    // A claim private to the author's own group.
+    fixture::seed_group_claim(&pool, with_note, group, "a private note").await;
 
     let r = find(&server, &pool, outsider, "helper-bot").await;
     let results = r["results"].as_array().expect("results");
@@ -148,16 +169,13 @@ async fn an_outsider_cannot_tell_a_hidden_link_or_a_private_claim(pool: PgPool) 
         strip(results[1].clone()),
         "nothing an outsider receives tells the two apart"
     );
-    let a = get(&server, &pool, outsider, linked).await;
-    let b = get(&server, &pool, outsider, unlinked).await;
+    let a = get(&server, &pool, outsider, with_note).await;
+    let b = get(&server, &pool, outsider, without).await;
     assert_eq!(strip(a), strip(b), "get_agent: same");
 
-    // The linked human (a member of the claim's group and the agent's human):
-    // the link, the kind and the private claim are all visible.
-    let mine = get(&server, &pool, human, linked).await;
-    assert_eq!(mine["operator_human"]["id"], human.to_string(), "{mine}");
-    assert_eq!(mine["kind"], "llm_agent");
-    assert_eq!(mine["counts"]["asserted_claims"], 1);
+    // The author reads its own private claim.
+    let mine = get(&server, &pool, with_note, with_note).await;
+    assert_eq!(mine["counts"]["asserted_claims"], 1, "{mine}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

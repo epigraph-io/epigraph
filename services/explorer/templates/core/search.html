@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}{% if outcome.query.is_empty() %}Search{% else %}{{ outcome.query }} · Search{% endif %} · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}<link rel="stylesheet" href="{{ ctx.static_url("core.css") }}">{% endblock %}
+
+{% block content %}
+<h1>Search</h1>
+<form class="search-panel" method="get" action="{{ ctx.search_url() }}" role="search" aria-label="Search the knowledge graph">
+  <div class="search-panel__row">
+    <label class="visually-hidden" for="search-q">Search for</label>
+    <input id="search-q" type="search" name="q" value="{{ outcome.query }}" placeholder="Search claims, labels or evidence" autocomplete="off">
+    <button type="submit">Search</button>
+  </div>
+  <fieldset class="search-modes">
+    <legend class="small muted">Search by</legend>
+    {%- for m in modes %}
+    <label class="search-modes__option"><input type="radio" name="mode" value="{{ m.as_str() }}"{% if m.as_str() == outcome.mode.as_str() %} checked{% endif %}> {{ m.title() }}</label>
+    {%- endfor %}
+  </fieldset>
+  <p class="small muted search-panel__hint">Labels: separate several with commas; a claim must carry all of them.</p>
+</form>
+
+{%- if let Some(problem) = outcome.problem %}
+<p class="notice notice--warn">{{ problem }}</p>
+{%- endif %}
+
+{%- if let Some(results) = outcome.results %}
+<section class="section search-results" aria-labelledby="results-title">
+  <h2 id="results-title" class="section__title">Results <span class="muted small">{{ outcome.mode.title() }}{% if outcome.paging_supported %} · page {{ outcome.page }}{% endif %}</span></h2>
+  {%- match results %}
+  {%- when Degraded::Available { data } %}
+  {%- if data.is_empty() %}
+  <p class="muted">No results for “{{ outcome.query }}”{% if outcome.page > 1 %} on this page{% endif %}.</p>
+  {%- else %}
+  <ol class="results">
+    {%- for h in data %}
+    <li class="result result--{{ h.kind }}">
+      <p class="result__text"><a href="{{ h.claim_url }}">{{ h.text }}</a></p>
+      <p class="result__meta small muted">
+        {%- if h.similarity.is_some() %}<span class="result__score">{{ h.similarity_display() }} match</span>{% endif %}
+        {%- if h.truth_value.is_some() %} <span>truth {{ h.truth_display() }}</span>{% endif %}
+        {%- if let Some(i) = h.interval_display() %} <span>belief {{ i }}</span>{% endif %}
+        {%- if let Some(t) = h.evidence_type %} <span class="label">{{ t }}</span>{% endif %}
+        {%- if let Some(u) = h.evidence_url %} <a href="{{ u }}">Evidence details</a>{% endif %}
+        {%- if h.is_current == Some(false) %} <span class="result__superseded">superseded</span>{% endif %}
+        {%- if let Some(d) = h.created %} <span>{{ d }}</span>{% endif %}
+      </p>
+      {%- if !h.labels.is_empty() %}
+      <ul class="labels result__labels" aria-label="Labels">
+        {%- for l in h.labels %}
+        <li class="label">{{ l }}</li>
+        {%- endfor %}
+      </ul>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ol>
+  {%- endif %}
+  {%- if !outcome.paging_supported %}
+  <p class="small muted">This mode returns only the best matches (up to {{ outcome.limit }}); the EpiGraph API cannot page further.</p>
+  {%- endif %}
+  {%- if outcome.prev_url.is_some() || outcome.next_url.is_some() %}
+  <nav class="pager" aria-label="Result pages">
+    {%- if let Some(u) = outcome.prev_url %}<a class="button-quiet button" href="{{ u }}" rel="prev">← Previous page</a>{% endif %}
+    {%- if let Some(u) = outcome.next_url %}<a class="button-quiet button" href="{{ u }}" rel="next">Next page →</a>{% endif %}
+  </nav>
+  {%- endif %}
+  {%- when Degraded::Unavailable { reason } %}
+  <p class="section-unavailable">Search failed. {{ reason }}</p>
+  {%- endmatch %}
+</section>
+{%- endif %}
+{% endblock %}

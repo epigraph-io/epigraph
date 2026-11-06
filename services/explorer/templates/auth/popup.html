@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex">
+<title>{{ title }} · {{ ctx.product_name() }}</title>
+<link rel="stylesheet" href="{{ ctx.static_url("app.css") }}">
+<link rel="stylesheet" href="{{ ctx.static_url("auth.css") }}">
+<script src="{{ ctx.static_url("embed.js") }}" defer></script>
+</head>
+<body>
+<main id="main" class="auth-popup">
+  <section class="auth-page" id="epx-auth-popup" aria-labelledby="popup-title"
+           data-status="{{ status }}"
+           {%- if let Some(code) = handoff %} data-handoff="{{ code }}"{% endif %}
+           data-message="{{ message }}">
+    <h1 id="popup-title">{{ title }}</h1>
+    <p class="lead">{{ message }}</p>
+    <p id="epx-auth-popup-note" class="notice notice--warn" hidden></p>
+  </section>
+</main>
+</body>
+</html>

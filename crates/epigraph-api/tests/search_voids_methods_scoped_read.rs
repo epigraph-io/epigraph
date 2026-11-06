@@ -94,156 +94,25 @@
 //! `epigraph-db/tests/search_voids_methods_scoped_read_policy.rs`, on both
 //! `SessionGucMode` arms. Neither file is sufficient alone.
 
+mod search_fixture;
 mod viewer_fixture;
 
 use axum::extract::{Path, Query, State};
 use epigraph_api::errors::ApiError;
 use epigraph_api::middleware::bearer::ViewerExtractor;
 use epigraph_api::routes::methods::get_method;
-use epigraph_api::routes::search::{
-    semantic_search, SemanticSearchRequest, SemanticSearchResponse,
-};
 use epigraph_api::routes::voids::{
     detect_voids, embedding_density, DensityQuery, DetectVoidsRequest,
 };
-use epigraph_api::state::{ApiConfig, AppState};
-use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+use search_fixture::*;
 use sqlx::PgPool;
-use std::sync::Arc;
 use uuid::Uuid;
-use viewer_fixture::{downgraded_pool, scoped_pool, seed_agent_with_group, seed_group_claim};
+use viewer_fixture::{downgraded_pool, seed_agent_with_group, seed_group_claim};
 
-/// The dimension every seeded vector and every mock embedding in this file uses.
-///
-/// It must equal `routes/search.rs::EMBEDDING_DIM` and the `claims.embedding`
-/// column width, or `generate_query_embedding` silently discards the configured
-/// service and falls back to its private deterministic mock — which the test
-/// cannot call, so every seeded vector would be uncorrelated with the probe and
-/// the arms would pass or fail for reasons unrelated to tenancy.
-const DIM: usize = 1536;
-
-// ── The instrument ──
-
-/// An `AppState` whose `scoped` pool is stamped-but-superuser and whose raw
-/// `db_pool` is filtered-but-unstamped.
-///
-/// The asymmetry is the instrument: a converted site reads through `scoped` and
-/// works; the same site reverted to `&state.db_pool` reads through a session the
-/// RLS policies filter, with no `epigraph.group_ids` to admit the viewer's own
-/// group, and loses the rows.
-async fn split_state(pool: &PgPool) -> AppState {
-    let raw = downgraded_pool(pool, "epigraph_app").await;
-    let scoped = scoped_pool(pool).await;
-
-    let mut state = AppState::with_db(raw, ApiConfig::default());
-    state.scoped = Some(scoped);
-
-    // CALIBRATION: the two arms must really be different sessions, or every
-    // assertion below is about one pool wearing two names.
-    assert!(
-        state.scoped.is_some(),
-        "CALIBRATION: AppState.scoped must be populated, or read_as refuses and \
-         the handler cannot serve at all"
-    );
-    let raw_user: String = sqlx::query_scalar("SELECT current_user")
-        .fetch_one(&state.db_pool)
-        .await
-        .expect("current_user on the raw pool");
-    assert_eq!(
-        raw_user, "epigraph_app",
-        "CALIBRATION: AppState.db_pool must be DOWNGRADED, or reverting a converted \
-         site to it is invisible and the mutation proof is vacuous"
-    );
-    let scoped_user: String = sqlx::query_scalar("SELECT current_user")
-        .fetch_one(state.scoped.as_ref().expect("scoped").inner())
-        .await
-        .expect("current_user on the scoped pool");
-    assert_ne!(
-        scoped_user, raw_user,
-        "CALIBRATION: the scoped and raw arms must not be the same session — that \
-         sameness is exactly what makes with_scoped_pool useless as a conversion fixture"
-    );
-
-    state
-}
-
-/// A deterministic 1536d embedding service, and the same provider the test can
-/// query itself.
-///
-/// Both `voids.rs` handlers return `InternalError` at
-/// `state.embedding_service()` BEFORE any SQL runs, so without this they are
-/// untestable and the shard would prove two thirds of itself. `search.rs` does
-/// not require one, but gets it anyway: with a service whose `dimension()`
-/// matches the target dim, `generate_query_embedding` takes the service branch,
-/// so the test can compute the EXACT probe vector the handler will use and seed
-/// a claim at cosine similarity ~1.0. Hand-writing a vector and hoping would
-/// leave the arms' outcome dependent on the sign of a dot product.
-///
-/// `MockProvider` does not override `EmbeddingService::generate_query`, whose
-/// default delegates to `generate`, so the vector this returns for a string is
-/// the one both handlers compute for it.
-fn mock_embedder() -> Arc<MockProvider> {
-    Arc::new(MockProvider::new(EmbeddingConfig::openai(DIM)))
-}
-
-async fn split_state_with_embedder(pool: &PgPool, embedder: Arc<MockProvider>) -> AppState {
-    split_state(pool).await.with_embedding_service(embedder)
-}
-
-fn pgvec(v: &[f32]) -> String {
-    format!(
-        "[{}]",
-        v.iter().map(f32::to_string).collect::<Vec<_>>().join(",")
-    )
-}
-
-/// The exact vector the handlers will compute for `text`.
-async fn probe(embedder: &Arc<MockProvider>, text: &str) -> String {
-    pgvec(&embedder.generate(text).await.expect("mock embed"))
-}
+// The instrument (`split_state`), the mock embedder and the search helpers
+// live in `search_fixture/mod.rs`, shared with `search_theme_filter.rs`.
 
 // ── File-local seeding ──
-
-/// Give a seeded claim an `embedding`, so the vector-ranked reads can find it.
-///
-/// **This is now a one-line delegation, and the comment it replaces explains
-/// why it was not one before:** the body used to be file-local "because both
-/// copies of `viewer_fixture.rs` are byte-identical and
-/// `F-PR28-viewer-fixture-duplication` is open", i.e. adding a helper to the
-/// fixture meant adding it twice by hand. There is exactly one copy of the
-/// fixture now, so that reason is spent and the helper lives there.
-async fn set_embedding(pool: &PgPool, claim: Uuid, vec: &str) {
-    viewer_fixture::set_claim_embedding(pool, claim, vec).await;
-}
-
-/// A `claim_themes` row with a 1536d centroid, and the claims attached to it.
-async fn seed_theme(pool: &PgPool, label: &str, centroid: &str) -> Uuid {
-    let theme: Uuid = sqlx::query_scalar(
-        "INSERT INTO claim_themes (label, description) VALUES ($1, $2) RETURNING id",
-    )
-    .bind(label)
-    .bind("PR-29 scoped-read fixture theme")
-    .fetch_one(pool)
-    .await
-    .expect("insert theme");
-
-    sqlx::query("UPDATE claim_themes SET centroid = $2::vector WHERE id = $1")
-        .bind(theme)
-        .bind(centroid)
-        .execute(pool)
-        .await
-        .expect("set centroid");
-    theme
-}
-
-async fn attach_theme(pool: &PgPool, claim: Uuid, theme: Uuid) {
-    sqlx::query("UPDATE claims SET theme_id = $2 WHERE id = $1")
-        .bind(claim)
-        .bind(theme)
-        .execute(pool)
-        .await
-        .expect("attach theme");
-}
 
 async fn seed_method(pool: &PgPool, name: &str, source_claims: &[Uuid]) -> Uuid {
     let id = Uuid::new_v4();
@@ -259,49 +128,6 @@ async fn seed_method(pool: &PgPool, name: &str, source_claims: &[Uuid]) -> Uuid 
     .await
     .expect("insert method");
     id
-}
-
-/// Resolved on the SUPERUSER pool, never the downgraded one: `Viewer::resolve`
-/// reads `group_memberships`, and on a filtered unstamped session it resolves to
-/// an EMPTY group set — which would satisfy every "a stranger is absent"
-/// assertion here for entirely the wrong reason.
-async fn viewer_for(pool: &PgPool, agent: Uuid) -> epigraph_db::visibility::Viewer {
-    epigraph_db::visibility::Viewer::resolve(pool, agent)
-        .await
-        .expect("resolve")
-}
-
-fn search_request(query: &str, diverse: bool) -> SemanticSearchRequest {
-    SemanticSearchRequest {
-        query: query.to_string(),
-        limit: Some(20),
-        min_similarity: None,
-        claim_type: None,
-        created_after: None,
-        created_before: None,
-        agent_id: None,
-        diverse: Some(diverse),
-        max_themes: Some(5),
-        diversity_weight: Some(0.5),
-        centroid_dim: None,
-        candidate_pool: None,
-    }
-}
-
-async fn search(
-    pool: &PgPool,
-    state: AppState,
-    agent: Uuid,
-    request: SemanticSearchRequest,
-) -> Result<SemanticSearchResponse, ApiError> {
-    let viewer = viewer_for(pool, agent).await;
-    semantic_search(ViewerExtractor(viewer), State(state), axum::Json(request))
-        .await
-        .map(|j| j.0)
-}
-
-fn hit_ids(r: &SemanticSearchResponse) -> Vec<Uuid> {
-    r.results.iter().map(|h| h.claim_id).collect()
 }
 
 // ── search.rs ──
