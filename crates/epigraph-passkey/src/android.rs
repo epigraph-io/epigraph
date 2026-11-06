@@ -18,7 +18,10 @@
 //!   attestation certificates at <https://android.googleapis.com/attestation/status>.
 //!   The library loads no CRL and no status list, so this crate reads an
 //!   operator-refreshed local copy ([`StatusList`]): every certificate of the
-//!   chain, the root included, must be absent from it, and a copy older than
+//!   chain, the root included, must be absent from it (looked up by its serial
+//!   in lowercase hex AND in decimal: the published list keys its 64-bit
+//!   serials in decimal and its 128-bit ones in hex, measured 2026-11-06:
+//!   981 of 1,771 entries were 17-20 decimal digits), and a copy older than
 //!   [`ANDROID_KEY_STATUS_MAX_AGE`] refuses every Android enrollment and
 //!   anchor (fail closed). Nothing here reaches the network.
 //!
@@ -88,9 +91,19 @@ fn normalized_key(key: &str) -> Option<String> {
     })
 }
 
-/// A local copy of Google's attestation status list: `{"entries": {<serial
-/// in lowercase hex>: {"status": "REVOKED" | "SUSPENDED", ...}}}`. Every
-/// listed serial is NOT in good standing, whatever its status says.
+/// A serial number's big-endian bytes in decimal, the other form the
+/// published list keys serials in.
+#[must_use]
+pub fn serial_decimal(raw: &[u8]) -> String {
+    x509_parser::num_bigint::BigUint::from_bytes_be(raw).to_str_radix(10)
+}
+
+/// A local copy of Google's attestation status list: `{"entries": {<serial>:
+/// {"status": "REVOKED" | "SUSPENDED", ...}}}`. Google's schema documents the
+/// key as the serial in lowercase hex; the published list also keys serials
+/// in decimal, so a certificate is looked up in both forms
+/// ([`Self::status_of_serial`]). Every listed serial is NOT in good standing,
+/// whatever its status says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusList {
     entries: BTreeMap<String, String>,
@@ -160,6 +173,21 @@ impl StatusList {
     #[must_use]
     pub fn status_of(&self, serial: &str) -> Option<&str> {
         self.entries.get(serial).map(String::as_str)
+    }
+
+    /// The listed form and status of the certificate whose serial number has
+    /// the big-endian bytes `raw`, looked up as hex and as decimal; `None`
+    /// when neither is listed. (A decimal string is also a hex string, so a
+    /// certificate whose decimal serial equals another's hex key is refused
+    /// too: fail closed, and vanishingly rare.)
+    #[must_use]
+    pub fn status_of_serial(&self, raw: &[u8]) -> Option<(String, &str)> {
+        [serial_hex(raw), serial_decimal(raw)]
+            .into_iter()
+            .find_map(|form| {
+                let key = normalized_key(&form)?;
+                self.status_of(&key).map(|status| (form, status))
+            })
     }
 }
 
@@ -264,19 +292,19 @@ pub fn parse_key_description(value: &[u8]) -> Result<KeyDescription, String> {
 }
 
 /// What a certificate chain (`x5c` order, leaf first, DER) says: every
-/// certificate's serial number ([`serial_hex`]) and the leaf's
+/// certificate's serial number (big-endian bytes) and the leaf's
 /// KeyDescription.
 ///
 /// # Errors
 /// A certificate does not parse, the leaf carries no KeyDescription, or a
 /// certificate other than the leaf carries one.
-pub fn inspect_chain(chain: &[Vec<u8>]) -> Result<(Vec<String>, KeyDescription), String> {
+pub fn inspect_chain(chain: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, KeyDescription), String> {
     let mut serials = Vec::with_capacity(chain.len());
     let mut leaf_description = None;
     for (index, der) in chain.iter().enumerate() {
         let (_, cert) = x509_parser::parse_x509_certificate(der)
             .map_err(|e| format!("attestation certificate {index} does not parse: {e}"))?;
-        serials.push(serial_hex(cert.raw_serial()));
+        serials.push(cert.raw_serial().to_vec());
         let mut found = cert
             .iter_extensions()
             .filter(|ext| ext.oid.to_id_string() == KEY_DESCRIPTION_OID);
@@ -355,6 +383,24 @@ mod tests {
         assert_eq!(list.status_of("a1b2"), Some("REVOKED"));
         assert_eq!(list.status_of("c8"), Some("SUSPENDED"));
         assert_eq!(list.status_of("c9"), None);
+        // The decimal form: 0x8b1a2c3d4e5f6071 = 10023372562485960817.
+        let raw = [0x8b, 0x1a, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
+        assert_eq!(serial_decimal(&raw), "10023372562485960817");
+        let decimal =
+            StatusList::parse(br#"{"entries": {"10023372562485960817": {"status": "REVOKED"}}}"#)
+                .unwrap();
+        assert_eq!(
+            decimal.status_of_serial(&raw),
+            Some(("10023372562485960817".to_string(), "REVOKED"))
+        );
+        let hex =
+            StatusList::parse(br#"{"entries": {"8b1a2c3d4e5f6071": {"status": "SUSPENDED"}}}"#)
+                .unwrap();
+        assert_eq!(
+            hex.status_of_serial(&raw),
+            Some(("8b1a2c3d4e5f6071".to_string(), "SUSPENDED"))
+        );
+        assert_eq!(list.status_of_serial(&raw), None);
     }
 
     /// A list that is not Google's format is an error, never an empty list

@@ -875,6 +875,11 @@ pub mod android_status {
     pub const REVOKED_SERIAL: [u8; 8] = [0x2c, 0x8c, 0xdd, 0xdf, 0xd5, 0xe0, 0x3b, 0xfc];
     /// The SUSPENDED serial of [`GOOGLE_EXAMPLE`], as certificate bytes.
     pub const SUSPENDED_SERIAL: [u8; 8] = [0xc8, 0x96, 0x6f, 0xcb, 0x2f, 0xbb, 0x0d, 0x7a];
+    /// Serial `8b1a2c3d4e5f6071` REVOKED, keyed in decimal.
+    pub const DECIMAL_SERIAL_LIST: &str =
+        include_str!("../fixtures/android-key-status/decimal-serial.json");
+    /// The REVOKED serial of [`DECIMAL_SERIAL_LIST`], as certificate bytes.
+    pub const DECIMAL_SERIAL: [u8; 8] = [0x8b, 0x1a, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
     /// The REVOKED serial of [`LEADING_ZERO`], as certificate bytes.
     pub const LEADING_ZERO_SERIAL: [u8; 8] = [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
 

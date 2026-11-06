@@ -299,11 +299,13 @@ async fn a_key_description_outside_the_leaf_is_refused() {
 /// Every certificate of the chain is checked against the status list at
 /// registration: a REVOKED leaf, a SUSPENDED intermediate (Google's
 /// example list, verbatim), a leaf whose serial starts with a zero nibble
-/// (keyed without it), and the root itself are each refused. CALIBRATION:
+/// (keyed without it), a leaf keyed in DECIMAL (as the published list keys
+/// its 64-bit serials), and the root itself are each refused. CALIBRATION:
 /// the same chains under the empty list register.
 /// Mutations: the status loop skipped -> all register; the root's serial
 /// not added -> the root case registers; `serial_hex` keeping byte padding
-/// -> the leading-zero case registers.
+/// -> the leading-zero case registers; the decimal lookup dropped -> the
+/// decimal case registers.
 #[tokio::test]
 async fn a_listed_certificate_anywhere_in_the_chain_refuses_the_registration() {
     let google = TestAttestation::new("Android");
@@ -335,6 +337,15 @@ async fn a_listed_certificate_anywhere_in_the_chain_refuses_the_registration() {
                 ..AndroidKeyOpts::default()
             },
             "a1b2c3d4e5f6071 is REVOKED",
+        ),
+        (
+            "leaf keyed in decimal",
+            android_status::DECIMAL_SERIAL_LIST,
+            AndroidKeyOpts {
+                leaf_serial: Some(android_status::DECIMAL_SERIAL.to_vec()),
+                ..AndroidKeyOpts::default()
+            },
+            "10023372562485960817 is REVOKED",
         ),
     ];
     for (label, list, opts, expected) in cases {
@@ -606,6 +617,31 @@ async fn the_rows_columns_must_agree_with_the_stored_credential() {
             "{label}"
         );
     }
+}
+
+/// An Android key's leaf certificate is issued FOR the credential's key: a
+/// stored credential whose public key is another key than the one its
+/// stored chain certifies is not hardware-attested, though the chain itself
+/// verifies. CALIBRATION: the true credential is. Mutation: the key
+/// comparison in `android_key_trusted` removed -> the swapped one passes.
+#[tokio::test]
+async fn an_android_chain_attests_only_the_key_it_certifies() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), true);
+    let (_, a) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let (_, b) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let (a, b) = (a.unwrap(), b.unwrap());
+    rp.hardware_attested(&a.passkey, "android-key", Uuid::nil(), false)
+        .expect("CALIBRATION");
+    let mut swapped = a.passkey.clone();
+    swapped["cred"]["cred"] = b.passkey["cred"]["cred"].clone();
+    let why = rp
+        .hardware_attested(&swapped, "android-key", Uuid::nil(), false)
+        .unwrap_err();
+    assert!(
+        why.contains("does not attest this credential's key"),
+        "{why}"
+    );
 }
 
 // =====================================================================
