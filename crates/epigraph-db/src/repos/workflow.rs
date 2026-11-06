@@ -2163,6 +2163,27 @@ impl WorkflowRepository {
         .await
     }
 
+    /// The distinct `canonical_name`s of the `workflows` rows `ids` that the
+    /// connection's stamp reads, sorted. A cascade deprecation asks
+    /// [`Self::name_has_hidden_rows_conn`] of each, so a generation of the
+    /// lineage the caller cannot read refuses the cascade instead of being
+    /// skipped by [`Self::lineage_descendants`].
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn canonical_names_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT canonical_name FROM workflows WHERE id = ANY($1) \
+              ORDER BY canonical_name",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await
+    }
+
     /// Lock, `FOR UPDATE` and in id order, every `workflows` row that shares a
     /// `canonical_name` with any of `ids` (U017; backlog fe874d2a).
     ///

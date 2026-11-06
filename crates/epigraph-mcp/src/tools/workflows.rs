@@ -1733,6 +1733,31 @@ async fn deprecate_hierarchical_workflow(
                 targets.push(d);
             }
         }
+        // The descendants are read on the CALLER's stamp, where a generation
+        // private to a group the caller is not in is invisible: the cascade
+        // would deprecate the part it sees and report success. Refused
+        // instead, nothing written, when any generation of a target's name is
+        // hidden from the caller (migration 202's check, as every workflow
+        // write asks it). A wholly hidden fork under another name (a private
+        // variant of a visible parent, named differently) is not seen by this
+        // check and is not part of the cascade: it belongs to a group the
+        // caller cannot read, whose members deprecate it.
+        let names = WorkflowRepository::canonical_names_of(&mut *tx, &targets)
+            .await
+            .map_err(internal_error)?;
+        for name in &names {
+            if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, name)
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(invalid_params(format!(
+                    "{TOOL}: cascade refused: the lineage '{name}' has generations this caller \
+                     cannot read, so a cascade would deprecate only part of it. Deprecate the \
+                     rows you can read without cascade, or ask a member of the group that owns \
+                     the rest. Nothing was written."
+                )));
+            }
+        }
     }
 
     // AUTHORITY, THEN THE LOCK, THEN AUTHORITY AGAIN (security review of U017:
