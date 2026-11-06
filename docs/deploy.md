@@ -2607,10 +2607,17 @@ The policy:
 - **Any listed serial refuses.** A certificate of the chain listed with any
   status (`REVOKED` or `SUSPENDED`) refuses the enrollment or the anchor.
 - **Older than 48 hours refuses (fail closed).** The age is the file's
-  modification time. A file older than that refuses every Android enrollment
-  and every Android anchor until it is refreshed. A file dated more than 5
-  minutes in the future is refused too. Android passkeys still ASSERT
-  (elevate) while the file is stale.
+  modification time. A file older than that refuses, until it is refreshed:
+  - every Android enrollment;
+  - every Android anchor;
+  - every OTHER anchor whose lineage holds an Android passkey, a security key
+    included, even when that Android passkey is revoked (a person whose first
+    passkey was a phone, for example). The API logs those as
+    `refusal=lineage_not_attested`, and their enrollments fall back to the
+    attested ceremony, which refuses a synced passkey at the finish.
+
+  A file dated more than 5 minutes in the future is refused the same way.
+  Android passkeys still ASSERT (elevate) while the file is stale.
 
 Fetching and refreshing the file is an operator job outside the API. A job
 that fails leaves the old file in place, and nothing in the API refuses until
@@ -2945,11 +2952,19 @@ which revokes it.
   meanwhile stays live until `revoke-passkey` on it or on its anchor.
 - **The Android roots.** Unsetting `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE`
   (and with it `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`) stops new Android
-  enrollments. It also stops every Android passkey ANCHORING, at once,
-  because anchors are re-verified against the current roots. Registered
-  Android passkeys keep asserting. The same holds for an AAGUID removed from
-  the allowlist or a root replaced. Synced passkeys already anchored stay
-  live; revoke them, or their anchors, to remove them.
+  enrollments. It also stops, at once, because anchors and their lineages are
+  re-verified against the current roots:
+  - every Android passkey ANCHORING;
+  - every other anchor whose LINEAGE holds an Android passkey, revoked or
+    not: for example a security key enrolled on an act a phone confirmed, or
+    any later key of a person whose first passkey was a phone. The API logs
+    them as `refusal=lineage_not_attested`, and their enrollments run the
+    attested ceremony instead.
+
+  Registered Android passkeys keep asserting. The same holds for an AAGUID
+  removed from the allowlist or a root replaced: every anchor whose own chain
+  or lineage depends on it stops anchoring. Synced passkeys already anchored
+  stay live; revoke them, or their anchors, to remove them.
 - **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
   only after no unit runs with the anchored setting on. It drops the reader,
   the insert guard and the cascade. After the undo, revoking an anchor no
