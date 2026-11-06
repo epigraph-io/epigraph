@@ -20,15 +20,20 @@
 //!   the stored state allowed;
 //! * whether a registration may carry no attestation (the anchored path) is
 //!   decided here ([`Passkeys::check_anchor`]) from the caller's
-//!   [`ActAnchor`]: rows only the API (after verifying a ceremony) or the
-//!   maintenance DSN writes. The confirmation is re-verified against the
-//!   anchor's key, and the anchor's own attestation (its stored certificate
-//!   chain, and for an Android key that the leaf certifies the credential's
-//!   key) is re-verified against the roots THIS process trusts now, as is
-//!   every passkey on its lineage. What is not re-verified: that a stored
-//!   `packed` / `tpm` chain was the one that attested the stored key (its
-//!   attestation signature is not kept; the API checked it at
-//!   registration). The stored state only has to agree;
+//!   [`ActAnchor`]: rows written by the API's ceremony, by a holder of the
+//!   request DSN with a live enrollment id (who can call 124's
+//!   `epigraph_complete_passkey_enrollment` directly, and so can already
+//!   plant any key on that enrollment), or by the maintenance DSN. The
+//!   confirmation is re-verified against the anchor's key, and the anchor's
+//!   own attestation (its stored certificate chain, and for an Android key
+//!   that the leaf certifies the credential's key) is re-verified against
+//!   the roots THIS process trusts now, as is every passkey on its lineage.
+//!   What is not re-verified: that a stored `packed` / `tpm` chain was the
+//!   one that attested the stored key (its attestation signature is not
+//!   kept), so a row planted through that completion function with a
+//!   genuine, public model chain beside the planter's own key passes
+//!   ([`Passkeys::hardware_attested`] says what that allows). The stored
+//!   state only has to agree;
 //! * user verification is checked on the registered credential and on every
 //!   assertion here, whatever policy the stored state names (operator ruling
 //!   D5: a passkey with user verification);
@@ -634,8 +639,8 @@ impl Passkeys {
     /// options carry one).
     ///
     /// The caller takes the anchored path only when [`Self::check_anchor`]
-    /// admits the enrollment's [`ActAnchor`] (rows only the API or the
-    /// maintenance DSN writes, re-verified there);
+    /// admits the enrollment's [`ActAnchor`] (re-verified there: see
+    /// [`ActAnchor`] for who can write those rows);
     /// [`Self::finish_anchored_registration`] checks it again.
     ///
     /// # Errors
@@ -911,9 +916,25 @@ impl Passkeys {
     /// For `android-key` the leaf certificate is issued FOR the credential's
     /// key, so the two must be the same key. For `packed` / `tpm` the
     /// certificate is the authenticator model's, and what bound it to this
-    /// credential (the attestation signature) is not stored: that binding
-    /// was checked at registration, by the API, which is the only writer of
-    /// the row besides the maintenance DSN, and is NOT re-checked here.
+    /// credential (the attestation signature) is not stored, so that binding
+    /// is NOT re-checked here. The API's ceremony checked it when it wrote
+    /// the row, but the row has two other writers: the maintenance DSN, and a
+    /// holder of the request DSN with a live enrollment id, who can call
+    /// 124's `epigraph_complete_passkey_enrollment` directly with a key, a
+    /// stored credential and columns of their choosing. Such a holder can
+    /// store a genuine, public `packed` / `tpm` model chain beside their own
+    /// key, and this check passes it. What that allows, beyond what the
+    /// holder can already do (plant any key on that enrollment, which then
+    /// elevates as the person): the row anchors later passkeys (on acts it
+    /// confirms, each opened by the operator's `passkey-enroll --act`),
+    /// counts as hardware on a lineage (its genuine chain also passes the
+    /// validity window), and, recorded as non-`none`, is not revoked with its
+    /// anchor by migration 200's cascade. An `android-key` row cannot be
+    /// planted this way: its leaf must certify the credential's key, which
+    /// must then assert. Re-deriving the columns in the database would not
+    /// close it (the stored credential is as freely chosen as the columns,
+    /// and this check already demands they agree); storing the attestation
+    /// statement and re-verifying its signature here would, and is not done.
     ///
     /// # Errors
     /// Why not, in words, for the log.
@@ -1326,9 +1347,10 @@ impl Verifier {
 
 /// What the anchored path knows of an enrollment's `passkey.register` act and
 /// the passkey that confirmed it (migration 200's
-/// `epigraph_enrollment_anchor`). Rows only the API (after verifying a
-/// ceremony) or the maintenance DSN writes; a request-DSN holder with a live
-/// enrollment can call 124's completion definer with values of its choosing.
+/// `epigraph_enrollment_anchor`). Rows written by the API's ceremony, the
+/// maintenance DSN, or a request-DSN holder with a live enrollment id, who
+/// can call 124's `epigraph_complete_passkey_enrollment` with values of its
+/// choosing.
 /// So [`Passkeys::check_anchor`] re-verifies the confirmation, and the
 /// anchor's and every ancestor's stored attestation against the CURRENT
 /// configuration ([`Passkeys::hardware_attested`], which says what it does

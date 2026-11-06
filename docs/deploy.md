@@ -2869,10 +2869,32 @@ manager's synced passkey. It is anchored by a passkey they already hold:
 - **Not re-checked at use, for `packed`/`tpm`:** that the anchor's stored
   certificate chain was the one that attested its stored key. That
   certificate is the authenticator model's, and the attestation signature
-  that bound it to the key is not stored. It was verified at registration by
-  the API, the only writer of the row besides the maintenance DSN. For
-  `android-key` the leaf is issued for the credential's key, and the API
-  checks at every use that the two are the same key.
+  that bound it to the key is not stored. The API's ceremony verified it when
+  it wrote the row, but the row has other writers:
+  - the maintenance DSN;
+  - a holder of the REQUEST DSN with a live enrollment id. They can call
+    124's `epigraph_complete_passkey_enrollment` directly, with a key, a
+    stored credential and the format, AAGUID and backup-eligible columns of
+    their choosing.
+
+  Such a holder can already plant any key on that enrollment, and it elevates
+  as the person (the enrollment-link threat above). What a planted `packed`
+  or `tpm` row adds, when it pairs a genuine, public model certificate chain
+  with the planter's own key:
+  - it passes the anchor check, so it anchors later passkeys (on acts it
+    confirms, each opened by the operator's `passkey-enroll --act`);
+  - it counts as hardware on a lineage (its genuine chain also passes the
+    validity window);
+  - recorded as non-`none`, it is NOT revoked with its anchor. The cascade
+    deliberately spares attested rows, including a backup hardware key.
+
+  An `android-key` row cannot be planted this way: its leaf certificate must
+  certify the credential's key, which must then assert, and the API checks
+  both at every use. Re-deriving the columns in the database would not close
+  it, because the stored credential is as freely chosen as the columns, and
+  the API already demands that they agree. Storing the attestation statement
+  and re-verifying its signature at use would close it; that is not done.
+  Hand enrollment links only to their person, and check `list-passkeys`.
 
 **The accepted cost.** Once a synced passkey is registered, an elevation (and
 every admin-act confirmation) is only as strong as the password-manager
