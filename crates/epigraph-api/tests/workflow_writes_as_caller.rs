@@ -1906,14 +1906,17 @@ async fn a_cascade_deprecation_refuses_a_lineage_with_hidden_generations(pool: P
     assert_ne!(row_text(&pool, g0).await, g0_before);
 }
 
-/// A member of a team through BOTH a role binding and a direct roster row
-/// has ONE team group, and an undeclared write lands there.
+/// A member of a team through BOTH a role binding (writer) and a direct
+/// roster row (admin) has ONE team group, and an undeclared write lands
+/// there. The two memberships are different `(group, role)` rows, so only the
+/// team-group read's DISTINCT keeps them one group; counted twice, the caller
+/// would have "two" team groups and fall back to its personal group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_member_by_role_and_by_roster_row_has_one_team_group(pool: PgPool) {
     let w = world(&pool).await;
     let (both, _) = fixture::seed_human_operator(&pool, "acme-both-shapes").await;
     grant_role(&pool, both).await;
-    add_roster_row(&pool, w.alpha, both, "writer").await;
+    add_roster_row(&pool, w.alpha, both, "admin").await;
     let rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM group_memberships \
           WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
