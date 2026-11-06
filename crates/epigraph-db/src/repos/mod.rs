@@ -193,7 +193,10 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
-pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
+pub use paper::{
+    AssertedClaimRow, PaperAuthorEdge, PaperRepository, PaperRow, AUTHORED_EXPLICIT_KEY,
+    AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+};
 pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,

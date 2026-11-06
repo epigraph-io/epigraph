@@ -444,6 +444,183 @@ impl PaperRepository {
             })
             .collect()
     }
+
+    /// The in-force `authored` edges into `paper_id` that `viewer` may read,
+    /// one per (agent, edge), by `position` then age: who a document ingest
+    /// finds already attached when it attaches its own authors (backlog
+    /// 94cc12db). Runs on the ingest's own author-stamped connection, so row
+    /// security answers as well as the spliced predicate.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn author_edges_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+    ) -> Result<Vec<PaperAuthorEdge>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT e.id, e.source_id, \
+                        CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+                             THEN (e.properties ->> 'position')::bigint END, \
+                        COALESCE(e.properties ->> '{explicit}' = 'true', false), \
+                        e.properties ->> '{name}' \
+                   FROM edges e \
+                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
+                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
+                    AND {in_force} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                  ORDER BY 3 NULLS LAST, e.created_at, e.id",
+                explicit = AUTHORED_EXPLICIT_KEY,
+                name = AUTHORED_NAME_KEY,
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+            ),
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, Option<i64>, bool, Option<String>)>(&sql)
+            .bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(
+                |(edge_id, agent_id, position, explicit, author_name)| PaperAuthorEdge {
+                    edge_id,
+                    agent_id,
+                    position,
+                    explicit,
+                    author_name,
+                },
+            )
+            .collect())
+    }
+
+    /// Take `agent_id` off `paper_id` as an author: retract its in-force
+    /// `authored` edge into the paper and its in-force `asserts` edges onto
+    /// the claims THIS paper asserts, except a claim that another paper the
+    /// agent still authors also asserts (that attribution is not this
+    /// paper's to remove). Retraction, not deletion: the rows survive with
+    /// `valid_to` closed, and the document walk's
+    /// `create_if_absent_including_retracted` writes never revive them.
+    ///
+    /// What a document ingest does when an explicit `agent_id` replaces the
+    /// name-derived node an earlier ingest of the same document attached
+    /// (backlog 94cc12db). Agent-to-claim and agent-to-paper edges carry no
+    /// factor and no BBA (`edges_auto_factor` and the DS auto-wire both
+    /// require claim endpoints), so nothing derived is left behind.
+    ///
+    /// Returns `(authored, asserts)` retracted.
+    ///
+    /// # Errors
+    /// `DbError::WriteRefused` (and the statement changes nothing the caller
+    /// can rely on: run it in a transaction and roll back) when an edge this
+    /// session can read was not closed: migration 117's owner-scoped UPDATE
+    /// matches no row it refuses and reports success, so the count tells.
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn retract_author_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        paper_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<(u64, u64), DbError> {
+        let in_force =
+            |alias: &str| crate::repos::edge::EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
+        let sql = viewer.splice(
+            &format!(
+                "WITH mine AS ( \
+                     SELECT e.id, e.relationship FROM edges e \
+                      WHERE e.source_id = $1 AND e.source_type = 'agent' \
+                        AND e.target_id = $2 AND e.target_type = 'paper' \
+                        AND e.relationship = 'authored' AND {e} \
+                        /* {{EDGE_VISIBILITY:e}} */ \
+                     UNION ALL \
+                     SELECT a.id, a.relationship FROM edges a \
+                      WHERE a.source_id = $1 AND a.source_type = 'agent' \
+                        AND a.target_type = 'claim' AND a.relationship = 'asserts' AND {a} \
+                        /* {{EDGE_VISIBILITY:a}} */ \
+                        AND EXISTS (SELECT 1 FROM edges pc \
+                                     WHERE pc.source_id = $2 AND pc.source_type = 'paper' \
+                                       AND pc.relationship = 'asserts' \
+                                       AND pc.target_id = a.target_id \
+                                       AND pc.target_type = 'claim' AND {pc}) \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM edges oa \
+                              JOIN edges oc ON oc.source_id = oa.target_id \
+                                           AND oc.source_type = 'paper' \
+                                           AND oc.relationship = 'asserts' \
+                                           AND oc.target_id = a.target_id \
+                                           AND oc.target_type = 'claim' AND {oc} \
+                             WHERE oa.source_id = $1 AND oa.source_type = 'agent' \
+                               AND oa.relationship = 'authored' AND oa.target_type = 'paper' \
+                               AND oa.target_id <> $2 AND {oa}) \
+                 ), done AS ( \
+                     UPDATE edges SET valid_to = now() \
+                      WHERE id IN (SELECT id FROM mine) \
+                     RETURNING id, relationship \
+                 ) \
+                 SELECT (SELECT count(*) FROM mine), \
+                        (SELECT count(*) FROM done WHERE relationship = 'authored'), \
+                        (SELECT count(*) FROM done WHERE relationship = 'asserts')",
+                e = in_force("e"),
+                a = in_force("a"),
+                pc = in_force("pc"),
+                oc = in_force("oc"),
+                oa = in_force("oa"),
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql)
+            .bind(agent_id)
+            .bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let (seen, authored, asserts) = q.fetch_one(&mut *conn).await?;
+        if authored + asserts < seen {
+            return Err(DbError::WriteRefused {
+                entity: "edge".to_string(),
+                id: agent_id,
+                action: "retract this author's edges on the paper".to_string(),
+            });
+        }
+        Ok((
+            u64::try_from(authored).unwrap_or(0),
+            u64::try_from(asserts).unwrap_or(0),
+        ))
+    }
+}
+
+/// Property on an `authored` edge a document ingest wrote for an explicit
+/// `source.authors[].agent_id` (backlog 94cc12db): `true`. Name-derived
+/// author edges never carry it.
+pub const AUTHORED_EXPLICIT_KEY: &str = "explicit_agent_id";
+/// Property on an explicit `authored` edge: the author's name as the
+/// extraction spelled it, so a later name-only ingest of the same document
+/// finds the explicit author instead of attaching the name-derived node too.
+pub const AUTHORED_NAME_KEY: &str = "author_name";
+/// Property on an explicit `authored` edge naming an agent the ingester
+/// neither is nor operates: `true` while the attribution is the ingester's
+/// word alone, until the named person countersigns. Such an author gets no
+/// `asserts` edge, and the agent card's `authored_papers` does not count it.
+pub const AUTHORED_PENDING_KEY: &str = "pending_countersign";
+/// Property on a pending explicit `authored` edge: the agent that ingested
+/// the document, which is the one asserting the authorship.
+pub const AUTHORED_INGESTED_BY_KEY: &str = "ingested_by";
+
+/// One in-force `authored` edge into a paper
+/// ([`PaperRepository::author_edges_conn`]).
+#[derive(Debug, Clone)]
+pub struct PaperAuthorEdge {
+    pub edge_id: Uuid,
+    pub agent_id: Uuid,
+    /// `properties.position`, when it is a non-negative integer.
+    pub position: Option<i64>,
+    /// Written for an explicit `agent_id` ([`AUTHORED_EXPLICIT_KEY`]).
+    pub explicit: bool,
+    /// The extraction's spelling, on an explicit edge ([`AUTHORED_NAME_KEY`]).
+    pub author_name: Option<String>,
 }
 
 /// Minimal claim shape returned by [`PaperRepository::list_asserted_claims`].
