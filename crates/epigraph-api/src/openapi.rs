@@ -17,8 +17,8 @@ use crate::routes::admin::{
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
-    AuthorRefView, AuthoredByView, ClaimResponse, PatchClaimRequest, PromptSnapshotView,
-    UpdateLabelsRequest, UpdateLabelsResponse,
+    AuthorRefView, AuthoredByView, ClaimResponse, FilerView, PaperAuthorView, PaperAuthorshipView,
+    PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest, UpdateLabelsResponse,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -138,6 +138,10 @@ use workflow_schema_stubs::{
             AuthoredByView,
             AuthorRefView,
             PromptSnapshotView,
+            FilerView,
+            PaperAuthorshipView,
+            PaperRefView,
+            PaperAuthorView,
             UpdateLabelsRequest,
             UpdateLabelsResponse,
             EvolveStepRequest,
@@ -402,12 +406,15 @@ async fn unmark_duplicate_doc() {}
 /// Read one claim (doc stub)
 ///
 /// A claim the caller may not read is 404, exactly as an id with no claim.
-/// The response carries `authored_by`: `agent` for every reader; `human`,
-/// the human operator the agent is bound to (never inferred from an
-/// `OPERATED_BY` edge), for every reader; `prompt_snapshot` only to the audience
-/// `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names (the agent's linked human and
-/// admins, the prompt-history gate; or every reader of the claim). A part the
-/// caller may not see is `null`, exactly as a part that does not exist.
+/// The response carries `authored_by`, tagged by `source`. `agent`: `agent`
+/// (the filer) and `human` (the human operator it is bound to, never
+/// inferred from an `OPERATED_BY` edge) for every reader, and
+/// `prompt_snapshot` only for the agent's linked human and admins (the
+/// prompt-history gate). `literature`, when the caller can read a document's
+/// `asserts` edge to the claim: `papers` (each document and its authors, the
+/// claim's primary authors) and `ingested_by` (the filer, with the same three
+/// parts). A part the caller may not see is `null`, exactly as a part that
+/// does not exist.
 #[utoipa::path(
     get,
     path = "/api/v1/claims/{id}",

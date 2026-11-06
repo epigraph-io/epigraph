@@ -105,6 +105,7 @@ async fn get_claim_names_the_agent_the_human_and_the_snapshot_by_audience(pool: 
 
     let mine = read(&server, &pool, operator, claim).await;
     let block = &mine["authored_by"];
+    assert_eq!(block["source"], json!("agent"), "{mine}");
     assert_eq!(block["agent"]["id"], json!(agent), "{mine}");
     assert_eq!(block["human"]["id"], json!(operator), "{mine}");
     assert_eq!(
@@ -116,7 +117,10 @@ async fn get_claim_names_the_agent_the_human_and_the_snapshot_by_audience(pool: 
 
     let theirs = read(&server, &pool, stranger, claim).await;
     let theirs = &theirs["authored_by"];
-    assert_eq!(theirs["human"], block["human"], "every reader sees the human");
+    assert_eq!(
+        theirs["human"], block["human"],
+        "every reader sees the human"
+    );
     match PROMPT_SNAPSHOT_AUDIENCE {
         PromptSnapshotAudience::OperatorAndAdmins => assert_eq!(
             theirs["prompt_snapshot"],

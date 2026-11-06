@@ -76,9 +76,11 @@ async fn authored_by(
 ) -> AuthoredBy {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
     let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    // No claim row: no document asserts it, so the block is the agent's.
     let out = AuthoredByRepository::for_claim(
         &mut read,
         &viewer,
+        Uuid::new_v4(),
         agent,
         Utc::now() + Duration::seconds(5),
         audience,
@@ -98,7 +100,9 @@ async fn human_seen(pool: &PgPool, scoped: &ScopedPool, caller: Uuid, agent: Uui
         PromptSnapshotAudience::OperatorAndAdmins,
     )
     .await
+    .filer()
     .human
+    .as_ref()
     .map(|h| h.id)
 }
 
@@ -193,6 +197,8 @@ async fn the_human_is_the_binding_for_every_reader(pool: PgPool) {
         PromptSnapshotAudience::OperatorAndAdmins,
     )
     .await;
+    assert!(matches!(seen, AuthoredBy::Agent(_)), "{seen:?}");
+    let seen = seen.filer();
     assert_eq!(
         seen.agent,
         AuthorRef {
@@ -367,13 +373,16 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
     let gated = PromptSnapshotAudience::OperatorAndAdmins;
     let mine = authored_by(&pool, &scoped, operator, agent, gated)
         .await
+        .filer()
         .prompt_snapshot
+        .clone()
         .expect("the agent's human sees the snapshot");
     assert_eq!(mine.model, "model-fixture");
     assert_eq!(mine.prompt_hash.len(), 64);
     assert_eq!(
         authored_by(&pool, &scoped, custodian, agent, gated)
             .await
+            .filer()
             .prompt_snapshot
             .as_ref(),
         Some(&mine),
@@ -382,6 +391,7 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
     assert_eq!(
         authored_by(&pool, &scoped, stranger, agent, gated)
             .await
+            .filer()
             .prompt_snapshot,
         None,
         "gated: a stranger does not"
@@ -391,6 +401,7 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
     assert_eq!(
         authored_by(&pool, &scoped, stranger, agent, open)
             .await
+            .filer()
             .prompt_snapshot,
         Some(mine),
         "open: every reader sees it"
@@ -402,6 +413,7 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
             .await
             .expect("read"),
         &Viewer::resolve(&pool, operator).await.expect("resolve"),
+        Uuid::new_v4(),
         agent,
         Utc::now() - Duration::days(1),
         gated,
@@ -409,7 +421,460 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
     .await
     .expect("authored_by");
     assert_eq!(
-        before.prompt_snapshot, None,
+        before.filer().prompt_snapshot,
+        None,
         "a claim filed before the first registration has no snapshot"
+    );
+}
+
+// ── Literature: a document's authors first, the filer apart ────────────────
+
+/// An author node: a bare agent row named `name` (no group, no human).
+async fn author_node(pool: &PgPool, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let pk: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query("INSERT INTO agents (id, public_key, display_name) VALUES ($1, $2, $3)")
+        .bind(id)
+        .bind(&pk)
+        .bind(name)
+        .execute(pool)
+        .await
+        .expect("seed an author node");
+    id
+}
+
+/// A document row, created `age_days` days ago (its listing order).
+async fn paper(pool: &PgPool, doi: &str, title: &str, age_days: i64) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, created_at) VALUES ($1, $2, now() - make_interval(days => $3::int)) \
+         RETURNING id",
+    )
+    .bind(doi)
+    .bind(title)
+    .bind(i32::try_from(age_days).expect("small"))
+    .fetch_one(pool)
+    .await
+    .expect("seed a paper")
+}
+
+/// An edge whose tenancy the endpoint trigger stamps (public endpoints give a
+/// public edge).
+async fn edge(
+    pool: &PgPool,
+    (source, source_type): (Uuid, &str),
+    (target, target_type): (Uuid, &str),
+    relationship: &str,
+    properties: Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(source)
+    .bind(source_type)
+    .bind(target)
+    .bind(target_type)
+    .bind(relationship)
+    .bind(properties)
+    .fetch_one(pool)
+    .await
+    .expect("seed an edge")
+}
+
+/// Force an edge private to `group` (the trigger fires only on endpoint
+/// changes, so this UPDATE sticks).
+async fn private_to(pool: &PgPool, edge: Uuid, group: Uuid) {
+    let n = sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(edge)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("make the edge group-private")
+    .rows_affected();
+    assert_eq!(n, 1);
+}
+
+async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) -> Uuid {
+    edge(
+        pool,
+        (paper, "paper"),
+        (claim, "claim"),
+        "asserts",
+        json!({}),
+    )
+    .await
+}
+
+async fn authored(pool: &PgPool, author: Uuid, paper: Uuid, properties: Value) -> Uuid {
+    edge(
+        pool,
+        (author, "agent"),
+        (paper, "paper"),
+        "authored",
+        properties,
+    )
+    .await
+}
+
+/// The block of the real claim `claim`, filed by `agent`, as `caller` sees it.
+async fn claim_block(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    caller: Uuid,
+    claim: Uuid,
+    agent: Uuid,
+) -> AuthoredBy {
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
+    let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    let out = AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        claim,
+        agent,
+        Utc::now() + Duration::seconds(5),
+        PromptSnapshotAudience::OperatorAndAdmins,
+    )
+    .await
+    .expect("authored_by");
+    read.commit().await.expect("finish");
+    out
+}
+
+fn papers_of(block: &AuthoredBy) -> &[epigraph_db::PaperAuthorship] {
+    match block {
+        AuthoredBy::Literature { papers, .. } => papers,
+        AuthoredBy::Agent(_) => panic!("expected a literature block: {block:?}"),
+    }
+}
+
+/// A claim a document asserts names the document's authors, ordered by the
+/// `authored` edge's position (a shared position by agent id, a missing one
+/// last) with role and affiliations, and the agent that filed the claim
+/// apart as `ingested_by`, with its human. Agent-to-claim `asserts` edges are
+/// not authors.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_literature_claim_names_the_document_authors_first_and_the_ingester_apart(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (operator, _) = human(&pool, "Operator Fixture").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
+    named(&pool, ingester, "ingest-fixture").await;
+    link(&pool, ingester, operator).await;
+    let claim = fixture::seed_public_claim(&pool, ingester, "a literature fixture claim").await;
+    let doc = paper(&pool, "10.0000/fixture.one", "Fixture Paper One", 1).await;
+    asserts(&pool, doc, claim).await;
+
+    let third = author_node(&pool, "Third Author").await;
+    let first_a = author_node(&pool, "First Author").await;
+    let first_b = author_node(&pool, "Also First").await;
+    let second = author_node(&pool, "Second Author").await;
+    let unplaced = author_node(&pool, "Unplaced Author").await;
+    authored(
+        &pool,
+        third,
+        doc,
+        json!({"position": 2, "role": "corresponding", "affiliations": ["Lab A", null, "Lab B"]}),
+    )
+    .await;
+    authored(
+        &pool,
+        first_a,
+        doc,
+        json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    authored(&pool, first_b, doc, json!({"position": 0, "role": 7})).await;
+    authored(
+        &pool,
+        second,
+        doc,
+        json!({"position": 1, "affiliations": "Lab C"}),
+    )
+    .await;
+    authored(&pool, unplaced, doc, json!({"position": "x"})).await;
+    let claim_asserter = author_node(&pool, "Claim Asserter").await;
+    edge(
+        &pool,
+        (claim_asserter, "agent"),
+        (claim, "claim"),
+        "asserts",
+        json!({}),
+    )
+    .await;
+
+    let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
+    let AuthoredBy::Literature {
+        papers,
+        papers_truncated,
+        ingested_by,
+    } = &block
+    else {
+        panic!("a claim a readable document asserts is literature: {block:?}");
+    };
+    assert!(!papers_truncated);
+    assert_eq!(papers.len(), 1, "{block:?}");
+    let p = &papers[0];
+    assert_eq!(p.paper.id, doc);
+    assert_eq!(p.paper.doi, "10.0000/fixture.one");
+    assert_eq!(p.paper.title.as_deref(), Some("Fixture Paper One"));
+    assert!(!p.authors_truncated);
+    let (lo, hi) = if first_a < first_b {
+        (first_a, first_b)
+    } else {
+        (first_b, first_a)
+    };
+    let order: Vec<Uuid> = p.authors.iter().map(|a| a.id).collect();
+    assert_eq!(
+        order,
+        vec![lo, hi, second, third, unplaced],
+        "by position, a shared position by id, a missing one last; never the claim asserter"
+    );
+    let by_id = |id: Uuid| p.authors.iter().find(|a| a.id == id).expect("listed");
+    let t = by_id(third);
+    assert_eq!(t.display_name.as_deref(), Some("Third Author"));
+    assert_eq!(t.position, Some(2));
+    assert_eq!(t.role.as_deref(), Some("corresponding"));
+    assert_eq!(
+        t.affiliations,
+        vec!["Lab A".to_string(), "Lab B".to_string()]
+    );
+    assert_eq!(by_id(first_a).role.as_deref(), Some("author"));
+    assert_eq!(by_id(first_b).role, None, "a non-string role is not shown");
+    assert!(by_id(second).affiliations.is_empty(), "a non-array is none");
+    assert_eq!(by_id(unplaced).position, None);
+
+    assert_eq!(ingested_by.agent.id, ingester);
+    assert_eq!(
+        ingested_by.human.as_ref().map(|h| h.id),
+        Some(operator),
+        "the ingesting human is shown apart, to every reader"
+    );
+    assert_eq!(
+        ingested_by,
+        authored_by(
+            &pool,
+            &scoped,
+            stranger,
+            ingester,
+            PromptSnapshotAudience::OperatorAndAdmins
+        )
+        .await
+        .filer(),
+        "ingested_by is the same filer block the agent shape carries"
+    );
+
+    let wire = serde_json::to_value(&block).expect("serialize");
+    assert_eq!(wire["source"], json!("literature"));
+    assert!(
+        wire.get("agent").is_none(),
+        "the filer is not primary: {wire}"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            authored_by(
+                &pool,
+                &scoped,
+                stranger,
+                ingester,
+                PromptSnapshotAudience::OperatorAndAdmins
+            )
+            .await
+        )
+        .expect("serialize")["source"],
+        json!("agent")
+    );
+}
+
+/// A document whose `asserts` edge the caller cannot read, or whose edge is
+/// retracted, is no document: the caller gets the agent block, byte for byte
+/// the block of a claim no document asserts. An `authored` edge the caller
+/// cannot read is no author.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "member").await;
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
+    let plain = fixture::seed_public_claim(&pool, ingester, "no document asserts this").await;
+
+    // A document whose asserts edge is private to the member's group.
+    let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
+    let hidden_doc = paper(&pool, "10.0000/fixture.hidden", "Hidden Paper", 1).await;
+    let e = asserts(&pool, hidden_doc, hidden_claim).await;
+    private_to(&pool, e, group).await;
+    let writer = author_node(&pool, "Hidden Author").await;
+    authored(&pool, writer, hidden_doc, json!({"position": 0})).await;
+
+    assert_eq!(
+        papers_of(&claim_block(&pool, &scoped, member, hidden_claim, ingester).await)[0]
+            .paper
+            .id,
+        hidden_doc,
+        "CONTROL: a member of the edge's group sees the document"
+    );
+    let as_json = |b: AuthoredBy| serde_json::to_value(b).expect("serialize");
+    let none = as_json(claim_block(&pool, &scoped, stranger, plain, ingester).await);
+    assert_eq!(none["source"], json!("agent"), "CALIBRATION: {none}");
+    assert_eq!(
+        as_json(claim_block(&pool, &scoped, stranger, hidden_claim, ingester).await),
+        none,
+        "a hidden asserts edge reads exactly as no document"
+    );
+
+    // A retracted asserts edge.
+    let retracted_claim = fixture::seed_public_claim(&pool, ingester, "once asserted").await;
+    let old_doc = paper(&pool, "10.0000/fixture.retracted", "Retracted Paper", 1).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            valid_from, valid_to) \
+         VALUES ($1, 'paper', $2, 'claim', 'asserts', now() - interval '2 hours', \
+                 now() - interval '1 hour')",
+    )
+    .bind(old_doc)
+    .bind(retracted_claim)
+    .execute(&pool)
+    .await
+    .expect("a retracted asserts edge");
+    assert_eq!(
+        as_json(claim_block(&pool, &scoped, member, retracted_claim, ingester).await),
+        as_json(claim_block(&pool, &scoped, member, plain, ingester).await),
+        "a retracted asserts edge is no document"
+    );
+
+    // A public document with one public and one group-private author edge.
+    let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
+    let open_doc = paper(&pool, "10.0000/fixture.open", "Open Paper", 1).await;
+    asserts(&pool, open_doc, open_claim).await;
+    let shown = author_node(&pool, "Shown Author").await;
+    let kept = author_node(&pool, "Kept Author").await;
+    authored(&pool, shown, open_doc, json!({"position": 1})).await;
+    let k = authored(&pool, kept, open_doc, json!({"position": 0})).await;
+    private_to(&pool, k, group).await;
+    let ids =
+        |b: &AuthoredBy| -> Vec<Uuid> { papers_of(b)[0].authors.iter().map(|a| a.id).collect() };
+    assert_eq!(
+        ids(&claim_block(&pool, &scoped, member, open_claim, ingester).await),
+        vec![kept, shown],
+        "CONTROL: the member reads both author edges"
+    );
+    assert_eq!(
+        ids(&claim_block(&pool, &scoped, stranger, open_claim, ingester).await),
+        vec![shown],
+        "a hidden authored edge is no author"
+    );
+}
+
+/// Converged claims collect documents: every readable one is listed, oldest
+/// document row first, at most `MAX_PAPERS`, and each lists at most
+/// `MAX_PAPER_AUTHORS` authors; both caps say when they cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn several_documents_are_listed_oldest_first_and_capped(pool: PgPool) {
+    use epigraph_db::authored_by::{MAX_PAPERS, MAX_PAPER_AUTHORS};
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
+    let claim = fixture::seed_public_claim(&pool, ingester, "a converged claim").await;
+
+    let mut docs = Vec::new();
+    for i in 0..=MAX_PAPERS {
+        // Oldest first: i = 0 is the oldest.
+        let d = paper(
+            &pool,
+            &format!("10.0000/fixture.many.{i}"),
+            &format!("Paper {i}"),
+            100 - i,
+        )
+        .await;
+        asserts(&pool, d, claim).await;
+        docs.push(d);
+    }
+    for i in 0..=MAX_PAPER_AUTHORS {
+        let a = author_node(&pool, &format!("Author {i}")).await;
+        authored(&pool, a, docs[0], json!({"position": i})).await;
+    }
+    let solo = author_node(&pool, "Solo Author").await;
+    authored(&pool, solo, docs[1], json!({"position": 0})).await;
+
+    let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
+    let AuthoredBy::Literature {
+        papers,
+        papers_truncated,
+        ..
+    } = &block
+    else {
+        panic!("{block:?}");
+    };
+    assert!(papers_truncated, "one more document than the cap");
+    let listed: Vec<Uuid> = papers.iter().map(|p| p.paper.id).collect();
+    assert_eq!(
+        listed,
+        docs[..usize::try_from(MAX_PAPERS).expect("small")].to_vec(),
+        "the oldest documents, oldest first"
+    );
+    assert_eq!(
+        papers[0].authors.len(),
+        usize::try_from(MAX_PAPER_AUTHORS).expect("small")
+    );
+    assert!(papers[0].authors_truncated);
+    assert_eq!(papers[0].authors[0].position, Some(0));
+    assert_eq!(
+        papers[1].authors.iter().map(|a| a.id).collect::<Vec<_>>(),
+        vec![solo]
+    );
+    assert!(!papers[1].authors_truncated);
+    assert!(papers[2].authors.is_empty());
+}
+
+/// The same two hidden edges, read on a SUPERUSER scoped connection, where
+/// row security filters nothing: only the in-query viewer predicates decide.
+/// On the application role the `edges` policy re-filters, so the test above
+/// stays green without them; this one does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: PgPool) {
+    let superuser = fixture::scoped_pool(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "member").await;
+    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
+
+    let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
+    let hidden_doc = paper(&pool, "10.0000/fixture.su.hidden", "Hidden Paper", 1).await;
+    let e = asserts(&pool, hidden_doc, hidden_claim).await;
+    private_to(&pool, e, group).await;
+
+    let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
+    let open_doc = paper(&pool, "10.0000/fixture.su.open", "Open Paper", 1).await;
+    asserts(&pool, open_doc, open_claim).await;
+    let shown = author_node(&pool, "Shown Author").await;
+    let kept = author_node(&pool, "Kept Author").await;
+    authored(&pool, shown, open_doc, json!({"position": 1})).await;
+    let k = authored(&pool, kept, open_doc, json!({"position": 0})).await;
+    private_to(&pool, k, group).await;
+
+    assert!(
+        matches!(
+            claim_block(&pool, &superuser, member, hidden_claim, ingester).await,
+            AuthoredBy::Literature { .. }
+        ),
+        "CONTROL: the member's viewer admits the edge"
+    );
+    assert!(
+        matches!(
+            claim_block(&pool, &superuser, stranger, hidden_claim, ingester).await,
+            AuthoredBy::Agent(_)
+        ),
+        "the asserts-edge predicate is in the query"
+    );
+    let block = claim_block(&pool, &superuser, stranger, open_claim, ingester).await;
+    assert_eq!(
+        papers_of(&block)[0]
+            .authors
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        vec![shown],
+        "the authored-edge predicate is in the query"
     );
 }

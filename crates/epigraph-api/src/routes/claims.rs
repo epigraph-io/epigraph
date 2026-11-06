@@ -234,26 +234,82 @@ pub struct ClaimResponse {
     pub authored_by: Option<AuthoredByView>,
 }
 
-/// A claim's `authored_by` block (`epigraph_db::authored_by`): the agent that
-/// filed it, the human it acts for, and the prompt snapshot it was running.
-/// A part the caller may not see is `null`, exactly as a part that does not
-/// exist (an agent bound to no human, no snapshot recorded).
+/// A claim's `authored_by` block (`epigraph_db::authored_by`), tagged by
+/// `source`. `agent`: the agent stated the claim itself. `literature`: the
+/// caller can read an in-force `paper -asserts-> claim` edge, so the
+/// documents' authors are the claim's authors and the agent that filed the
+/// claim row is shown apart as `ingested_by`. A caller who cannot read any
+/// such edge gets the `agent` block. A part the caller may not see is `null`,
+/// exactly as a part that does not exist (no snapshot recorded).
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
-pub struct AuthoredByView {
-    /// The agent that filed the claim (`agent_id`), for every reader.
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum AuthoredByView {
+    /// The agent stated the claim itself.
+    Agent {
+        /// The agent that filed the claim (`agent_id`), for every reader.
+        agent: AuthorRefView,
+        /// The human operator the agent is bound to (migration 149's
+        /// `epigraph_human_of`, any link state), for every reader. Read from
+        /// the binding only, never from an `OPERATED_BY` edge. `null` when the
+        /// agent is bound to no human, and on a registered human's own claim
+        /// (bound to itself, which is not an operator).
+        human: Option<AuthorRefView>,
+        /// The prompt snapshot the agent was running at the claim's
+        /// `created_at`, shown only to the agent's linked human and to admins
+        /// (the prompt-history gate); otherwise `null`.
+        prompt_snapshot: Option<PromptSnapshotView>,
+    },
+    /// Documents assert the claim.
+    Literature {
+        /// The asserting documents the caller can see (at most 10, oldest
+        /// first), each with its authors: the claim's primary authors.
+        papers: Vec<PaperAuthorshipView>,
+        /// More than 10 readable asserting documents exist.
+        papers_truncated: bool,
+        /// The agent that filed the claim row (for a claim a document ingest
+        /// created, its ingester), with its human and prompt snapshot under
+        /// the same rules as the `agent` block.
+        ingested_by: FilerView,
+    },
+}
+
+/// The agent that filed a claim row, with its human and prompt snapshot.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct FilerView {
     pub agent: AuthorRefView,
-    /// The human operator the agent is bound to (migration 149's
-    /// `epigraph_human_of`, any link state), for every reader. Read from the
-    /// binding only, never from an `OPERATED_BY` edge. `null` when the agent
-    /// is bound to no human, and on a registered human's own claim (bound to
-    /// itself, which is not an operator).
     pub human: Option<AuthorRefView>,
-    /// The prompt snapshot the agent was running at the claim's `created_at`.
-    /// Shown to the audience `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names
-    /// (`OperatorAndAdmins`: the agent's linked human and admins, the
-    /// prompt-history gate; `ClaimReaders`: every reader of the claim);
-    /// otherwise `null`.
     pub prompt_snapshot: Option<PromptSnapshotView>,
+}
+
+/// A document that asserts the claim, and its authors.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorshipView {
+    pub paper: PaperRefView,
+    /// The authors from the document's readable, in-force `authored` edges
+    /// (at most 50), ordered by `position` (missing last), then id.
+    pub authors: Vec<PaperAuthorView>,
+    /// More than 50 readable authors exist.
+    pub authors_truncated: bool,
+}
+
+/// A document node.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperRefView {
+    pub id: Uuid,
+    /// The document key (a DOI, or another document key).
+    pub doi: String,
+    pub title: Option<String>,
+}
+
+/// One author of a document, from its `authored` edge.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq, utoipa::ToSchema)]
+pub struct PaperAuthorView {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    /// The extraction's author index; positions are not unique.
+    pub position: Option<i64>,
+    pub role: Option<String>,
+    pub affiliations: Vec<String>,
 }
 
 /// One agent: the two fields `GET /api/v1/agents/:id` names.
@@ -279,21 +335,67 @@ pub struct PromptSnapshotView {
 }
 
 #[cfg(feature = "db")]
-impl From<epigraph_db::AuthoredBy> for AuthoredByView {
-    fn from(b: epigraph_db::AuthoredBy) -> Self {
+impl From<epigraph_db::Filer> for FilerView {
+    fn from(f: epigraph_db::Filer) -> Self {
         let author = |a: epigraph_db::AuthorRef| AuthorRefView {
             id: a.id,
             display_name: a.display_name,
         };
         Self {
-            agent: author(b.agent),
-            human: b.human.map(author),
-            prompt_snapshot: b.prompt_snapshot.map(|p| PromptSnapshotView {
+            agent: author(f.agent),
+            human: f.human.map(author),
+            prompt_snapshot: f.prompt_snapshot.map(|p| PromptSnapshotView {
                 snapshot_id: p.snapshot_id,
                 model: p.model,
                 prompt_hash: p.prompt_hash,
                 started_at: p.started_at,
             }),
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<epigraph_db::AuthoredBy> for AuthoredByView {
+    fn from(b: epigraph_db::AuthoredBy) -> Self {
+        match b {
+            epigraph_db::AuthoredBy::Agent(f) => {
+                let f = FilerView::from(f);
+                Self::Agent {
+                    agent: f.agent,
+                    human: f.human,
+                    prompt_snapshot: f.prompt_snapshot,
+                }
+            }
+            epigraph_db::AuthoredBy::Literature {
+                papers,
+                papers_truncated,
+                ingested_by,
+            } => Self::Literature {
+                papers: papers
+                    .into_iter()
+                    .map(|p| PaperAuthorshipView {
+                        paper: PaperRefView {
+                            id: p.paper.id,
+                            doi: p.paper.doi,
+                            title: p.paper.title,
+                        },
+                        authors: p
+                            .authors
+                            .into_iter()
+                            .map(|a| PaperAuthorView {
+                                id: a.id,
+                                display_name: a.display_name,
+                                position: a.position,
+                                role: a.role,
+                                affiliations: a.affiliations,
+                            })
+                            .collect(),
+                        authors_truncated: p.authors_truncated,
+                    })
+                    .collect(),
+                papers_truncated,
+                ingested_by: ingested_by.into(),
+            },
         }
     }
 }
@@ -1370,13 +1472,15 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
-    // Who filed it, on the same stamped connection: the human from the
-    // agent's binding, the prompt snapshot through the audience
+    // Who wrote it, on the same stamped connection: the asserting documents'
+    // authors under this caller's edge visibility, the filer's human from its
+    // binding, the prompt snapshot through the audience
     // `PROMPT_SNAPSHOT_AUDIENCE` names (default: the prompt-history gate).
     // Only reached for a claim the caller has just read.
     let authored_by = epigraph_db::AuthoredByRepository::for_claim(
         &mut read,
         &viewer,
+        claim.id.as_uuid(),
         claim.agent_id.as_uuid(),
         claim.created_at,
         epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,

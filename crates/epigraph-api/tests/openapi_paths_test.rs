@@ -148,7 +148,15 @@ async fn openapi_documents_in_scope_paths() {
         "GET /api/v1/claims/{{id}} body should be ClaimResponse, got {get_ok}"
     );
     let schemas = &doc["components"]["schemas"];
-    for name in ["AuthoredByView", "AuthorRefView", "PromptSnapshotView"] {
+    for name in [
+        "AuthoredByView",
+        "AuthorRefView",
+        "PromptSnapshotView",
+        "FilerView",
+        "PaperAuthorshipView",
+        "PaperRefView",
+        "PaperAuthorView",
+    ] {
         assert!(
             schemas[name].is_object(),
             "components.schemas missing {name}"

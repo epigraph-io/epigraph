@@ -1100,6 +1100,7 @@ pub async fn get_claim(
             let block = epigraph_db::AuthoredByRepository::for_claim(
                 &mut read,
                 viewer,
+                claim.id.as_uuid(),
                 claim.agent_id.as_uuid(),
                 claim.created_at,
                 epigraph_db::PROMPT_SNAPSHOT_AUDIENCE,

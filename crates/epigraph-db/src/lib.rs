@@ -93,8 +93,8 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
-    authored_by, AuthorRef, AuthoredBy, AuthoredByRepository, PromptSnapshotAt,
-    PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
+    authored_by, AuthorRef, AuthoredBy, AuthoredByRepository, Filer, PaperAuthor, PaperAuthorship,
+    PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
