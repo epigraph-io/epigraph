@@ -148,7 +148,7 @@ pub use repos::{
 pub use repos::{
     ingest_only_edge_refusal, is_agent_attribution, ClaimIngestRecord, ClaimIngestRepository,
     ClaimIngests, AGENT_ATTRIBUTION_REFUSAL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
-    INGEST_ONLY_REFUSAL, INGEST_RECORD_RELATIONSHIP,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{

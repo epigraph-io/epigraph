@@ -272,3 +272,106 @@ async fn the_ingest_only_relationships_are_refused_for_every_caller(pool: PgPool
         "CONTROL: the author's own asserts: {status} {body}"
     );
 }
+
+/// `PATCH /api/v1/edges/:id` as `caller` with `edges:write`.
+async fn patch_edge(state: &AppState, caller: Uuid, id: Uuid, body: Value) -> (StatusCode, Value) {
+    let token = common::mint_token_with_agent(&["edges:write"], caller);
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri(format!("/api/v1/edges/{id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = create_router(state.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The ingest record on a GROUP-PRIVATE claim takes the claim's tenancy, so
+/// it is owned by that group and its writers may patch it. They still cannot
+/// turn a convergence into a creation or rewrite who ingested it: both keys
+/// are reserved for the ingest (400, nothing changed). CONTROL: the same
+/// writer patches another property of the same record, so the refusal is the
+/// keys', not a missing write right.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_writer_cannot_rewrite_its_claims_ingest_record(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "edge-record-member").await;
+    let (other, _) = viewer_fixture::seed_agent_with_group(&pool, "edge-record-other").await;
+    let claim = viewer_fixture::seed_group_claim(&pool, member, group, "a group's claim").await;
+    let doc = paper(&pool, "10.9999/ingest-record-patch").await;
+    let record = {
+        let mut conn = pool.acquire().await.expect("conn");
+        epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
+            &mut conn, None, doc, "paper", claim, "claim", "asserts", None, None, None,
+        )
+        .await
+        .expect("asserts");
+        assert!(epigraph_db::ClaimIngestRepository::record_signed_conn(
+            &mut conn,
+            None,
+            doc,
+            claim,
+            other,
+            false,
+            "ingest_document",
+            "test-pipeline",
+        )
+        .await
+        .expect("record"));
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
+               AND relationship = 'ingested_claim'",
+        )
+        .bind(doc)
+        .bind(claim)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("record id")
+    };
+    let props = || async {
+        sqlx::query_as::<_, (Uuid, Value)>(
+            "SELECT owner_group_id, properties FROM edges WHERE id = $1",
+        )
+        .bind(record)
+        .fetch_one(&pool)
+        .await
+        .expect("record row")
+    };
+    let (owner, before) = props().await;
+    assert_eq!(owner, group, "CALIBRATION: the record is the group's");
+
+    for forged in [
+        json!({"created_claim": true}),
+        json!({"ingested_by": member.to_string()}),
+    ] {
+        let (status, body) =
+            patch_edge(&state, member, record, json!({"properties": forged})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{forged}: {body}");
+        assert!(body.to_string().contains("reserved"), "{body}");
+        assert_eq!(props().await.1, before, "{forged}: nothing changed");
+    }
+
+    let (status, body) = patch_edge(
+        &state,
+        member,
+        record,
+        json!({"properties": {"note": "curated"}}),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "CONTROL: the group's writer may patch the record otherwise: {status} {body}"
+    );
+    let (_, after) = props().await;
+    assert_eq!(after["created_claim"], false, "{after}");
+    assert_eq!(after["ingested_by"], other.to_string(), "{after}");
+}

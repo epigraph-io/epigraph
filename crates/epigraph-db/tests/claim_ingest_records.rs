@@ -13,8 +13,9 @@
 //!   the edge);
 //! * a group-private assertion's record is invisible to an outsider, visible
 //!   to a member (the edges' own tenancy, set by the insert trigger);
-//! * the creator is the `created_claim` record; a re-run writes no second
-//!   record and never turns a convergence into a creation.
+//! * the creator is the `created_claim` record whose ingester is the claim's
+//!   filer (a "creation" by anyone else reads as a convergence); a re-run
+//!   writes no second record and never turns a convergence into a creation.
 //!
 //! All names are invented.
 
@@ -103,19 +104,25 @@ async fn a_record_counts_only_with_its_papers_readable_in_force_assertion(pool: 
     asserts(&pool, p3, claim).await;
     let stray = paper(&pool, "10.9999/record-read-stray").await;
     assert!(record(&pool, stray, claim, other, false).await);
+    // A record claiming creation for an ingester that is not the claim's
+    // filer: the walk files every claim it creates, so it is a convergence.
+    let p4 = paper(&pool, "10.9999/record-read-4").await;
+    asserts(&pool, p4, claim).await;
+    assert!(record(&pool, p4, claim, other, true).await);
 
     let (records, creator) = read(&pool, &public, claim).await;
     assert_eq!(
         records,
-        vec![(p1, filer, true), (p2, other, false)],
-        "only records backed by their own paper's assertion; an assertion alone is no ingest"
+        vec![(p1, filer, true), (p2, other, false), (p4, other, false)],
+        "only records backed by their own paper's assertion; an assertion alone is no ingest; \
+         a creation by someone other than the filer is no creation"
     );
     assert_eq!(creator, Some(p1));
 
     // A re-run writes nothing, and a later "creation" claim for the same
     // (paper, claim, ingester) is not recorded over the convergence.
     assert!(!record(&pool, p2, claim, other, true).await, "dedup");
-    assert_eq!(read(&pool, &public, claim).await.0.len(), 2);
+    assert_eq!(read(&pool, &public, claim).await.0.len(), 3);
 
     // The creating paper's assertion retracted: its record goes with it.
     sqlx::query(
@@ -130,10 +137,10 @@ async fn a_record_counts_only_with_its_papers_readable_in_force_assertion(pool: 
     let (records, creator) = read(&pool, &public, claim).await;
     assert_eq!(
         records,
-        vec![(p2, other, false)],
+        vec![(p2, other, false), (p4, other, false)],
         "retracted assertion, no record"
     );
-    assert_eq!(creator, None, "no readable creator");
+    assert_eq!(creator, None, "no readable creator, and no stand-in");
 }
 
 /// A document ingested into a group: the claim, its assertion and its record

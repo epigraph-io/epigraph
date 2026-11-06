@@ -41,7 +41,9 @@
 //! A record counts only while the SAME paper's `asserts` edge onto the claim
 //! is in force and readable by the caller: a record without its assertion
 //! (the assertion retracted, or hidden from this caller) is not listed.
-//! `creator` is the record with `created_claim: true`, when there is one. A
+//! `creator` is the record with `created_claim: true` whose `ingested_by` is
+//! the claim's filer (`claims.agent_id`; the walk files every claim it
+//! creates), when there is one. A
 //! claim with no creator record was not created by a document ingest that
 //! recorded it (a directly filed claim, or one ingested before this record
 //! existed): its filer is its author, and every listed paper corroborates.
@@ -63,6 +65,14 @@ pub const INGESTED_BY_PROPERTY: &str = "ingested_by";
 /// Record property: `true` only on the ingest that created the claim.
 pub const CREATED_CLAIM_PROPERTY: &str = "created_claim";
 
+/// The refusal for an application edge write whose `properties` carry
+/// [`INGESTED_BY_PROPERTY`] or [`CREATED_CLAIM_PROPERTY`]
+/// (`crate::reserved_edge_property_refusal`).
+pub const INGEST_RECORD_KEYS_RESERVED: &str =
+    "properties.ingested_by and properties.created_claim are reserved for the document \
+     ingest's own records (which ingest created a claim, who ingested a document); \
+     nothing was written";
+
 /// Most claims one [`ClaimIngestRepository::for_claims`] call reads.
 pub const FOR_CLAIMS_CAP: usize = 200;
 /// Most records listed per claim (oldest first).
@@ -77,7 +87,8 @@ pub struct ClaimIngestRecord {
     /// `recorded_at` by whoever shows it).
     pub ingested_by: Uuid,
     /// This ingest created the claim (its document's authors are the
-    /// claim's primary authors); `false`: it converged on an existing claim.
+    /// claim's primary authors): the record says so AND names the claim's
+    /// filer as its ingester. `false`: it converged on an existing claim.
     pub created_claim: bool,
     /// When the record was written (the ingest's transaction time).
     pub recorded_at: DateTime<Utc>,
@@ -193,13 +204,15 @@ impl ClaimIngestRepository {
                         k.recorded_at, k.total \
                    FROM (SELECT r.target_id AS claim_id, r.source_id AS paper_id, \
                                 (r.properties ->> '{by}')::uuid AS ingested_by, \
-                                COALESCE(r.properties ->> '{created}' = 'true', false) \
+                                (COALESCE(r.properties ->> '{created}' = 'true', false) \
+                                 AND c.agent_id = (r.properties ->> '{by}')::uuid) \
                                     AS created_claim, \
                                 r.created_at AS recorded_at, \
                                 row_number() OVER (PARTITION BY r.target_id \
                                                    ORDER BY r.created_at, r.id) AS n, \
                                 count(*) OVER (PARTITION BY r.target_id) AS total \
                            FROM edges r \
+                           JOIN claims c ON c.id = r.target_id \
                           WHERE r.target_id = ANY($1::uuid[]) AND r.target_type = 'claim' \
                             AND r.source_type = 'paper' \
                             AND r.relationship = '{rel}' \
@@ -212,7 +225,8 @@ impl ClaimIngestRepository {
                                    AND a.target_id = r.target_id AND a.target_type = 'claim' \
                                    AND a.relationship = 'asserts' AND {in_force_a} \
                                    /* {{EDGE_VISIBILITY:a}} */) \
-                            /* {{EDGE_VISIBILITY:r}} */) k \
+                            /* {{EDGE_VISIBILITY:r}} */ \
+                            /* {{VISIBILITY:c}} */) k \
                   WHERE k.n <= $2 OR k.created_claim \
                   ORDER BY k.claim_id, k.recorded_at, k.paper_id",
                 by = INGESTED_BY_PROPERTY,
@@ -337,6 +351,18 @@ mod tests {
         ] {
             assert!(ingest_only_edge_refusal(s, t, r).is_none(), "{s} {r} {t}");
         }
+        for key in [INGESTED_BY_PROPERTY, CREATED_CLAIM_PROPERTY] {
+            assert_eq!(
+                crate::reserved_edge_property_refusal(&serde_json::json!({ key: true })),
+                Some(INGEST_RECORD_KEYS_RESERVED),
+                "{key} is reserved for generic writers"
+            );
+            assert!(crate::RESERVED_EDGE_PROPERTIES.contains(&key), "{key}");
+        }
+        assert_eq!(
+            crate::reserved_edge_property_refusal(&serde_json::json!({ "note": 1 })),
+            None
+        );
         assert!(is_agent_attribution("agent", "Asserts"));
         assert!(is_agent_attribution("agent", "AUTHORED"));
         assert!(!is_agent_attribution("paper", "asserts"));

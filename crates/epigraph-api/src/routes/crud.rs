@@ -1094,7 +1094,7 @@ pub struct PromoteStagedEdgesRequest {
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
 /// Refuses (400, nothing written) when a selected row's `properties` carry
 /// a reserved key (`epigraph_db::RESERVED_EDGE_PROPERTIES`: `dedup`,
-/// `supersede_act`), or when a selected row's relationship is `supersedes` in
+/// `supersede_act`, `ingested_by`, `created_claim`), or when a selected row's relationship is `supersedes` in
 /// any spelling (supersede SPEC K12a, ruling R-132: the lineage edge is the
 /// supersession act's, `crate::routes::edges::SUPERSEDES_ACT_ONLY`), or when a
 /// selected row is the document ingest's own provenance (a paper's `asserts`,
@@ -1279,9 +1279,10 @@ pub async fn promote_staged_edges(
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
             reason: format!(
-                "{} {} (staged edges carrying a reserved key: {})",
+                "{} {} {} (staged edges carrying a reserved key: {})",
                 epigraph_db::DEDUP_IDENTITY_KEY_RESERVED,
                 epigraph_db::SUPERSEDE_ACT_KEY_RESERVED,
+                epigraph_db::INGEST_RECORD_KEYS_RESERVED,
                 ids.join(", ")
             ),
         });
