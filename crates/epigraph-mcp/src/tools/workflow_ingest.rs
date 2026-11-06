@@ -237,6 +237,28 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     .map_err(|e| {
         crate::errors::internal_error_logged("workflow ingest: could not record authorship", e)
     })?;
+    // A walk that WROTE under a row that already existed: the row showed this
+    // caller no plan (no `executes` edge it can see, e.g. a row the
+    // pre-transaction ingest left behind), so the executor did not short-circuit
+    // and attached the caller's claims and edges to it. That is a write to an
+    // existing workflow, and it needs the same authority as any other: checked
+    // here, on the same transaction, so a refusal rolls the whole walk back.
+    if let (Some(existing), false) = (anchors.existing, result.already_ingested) {
+        if !grants.iter().any(|(anchor, _)| *anchor == existing) {
+            let grant = crate::tools::workflow_authority::require_workflow_authority(
+                server,
+                &mut tx,
+                auth,
+                caller,
+                existing,
+                "workflow_ingest",
+                &not_found,
+            )
+            .await?;
+            admin_write |= grant.is_admin();
+            grants.push((existing, grant));
+        }
+    }
     // Recorded only when THIS call created the row: a re-ingest of an existing
     // (possibly pre-H-b, unrecorded) workflow must not make its caller the owner.
     let submitter = inherited.unwrap_or(Some(caller.agent_id()));
@@ -322,9 +344,18 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
     // best-effort: a DS failure must not roll back a workflow that landed. Inside
     // it the per-entry work is SAVEPOINT-wrapped by `auto_wire_ds_batch` and
     // `auto_wire_edge_if_epistemic`, so one bad entry does not abort the rest.
-    match crate::claim_helper::begin_caller_workflow_tx(server, caller, "workflow_ingest_ds").await
-    {
-        Ok(mut ds_tx) => {
+    // A short-circuited re-ingest created nothing to wire, and begins nothing.
+    let ds_tx = if result.already_ingested {
+        None
+    } else {
+        Some(
+            crate::claim_helper::begin_caller_workflow_tx(server, caller, "workflow_ingest_ds")
+                .await,
+        )
+    };
+    match ds_tx {
+        None => {}
+        Some(Ok(mut ds_tx)) => {
             wire_ds_after_ingest(&mut ds_tx, viewer, &plan, &result).await;
             if let Err(e) = ds_tx.commit().await {
                 tracing::warn!(
@@ -334,7 +365,7 @@ pub(crate) async fn execute_workflow_ingest_with_inserted(
                 );
             }
         }
-        Err(e) => tracing::warn!(
+        Some(Err(e)) => tracing::warn!(
             workflow_id = %result.workflow_id,
             "workflow ds wiring skipped: {}. The ingest is stored and intact",
             e.message
@@ -630,6 +661,20 @@ pub(crate) async fn store_workflow_goal_embedding(
     }
 }
 
+/// The `workflows` row whose goal embedding an ingest entry point may store:
+/// the row this call WROTE (created, or attached its plan to under the
+/// authority gate), never one a re-ingest short-circuited on. A re-ingest of
+/// an existing `(canonical_name, generation)` used to embed the REQUEST's goal
+/// and store it on the existing row, so any caller that could read a public
+/// workflow could re-rank it in every caller's `find_workflow_hierarchical`
+/// without writing its group or passing the lineage authority gate.
+pub(crate) fn goal_embedding_target(response: &IngestWorkflowResponse) -> Option<uuid::Uuid> {
+    if response.already_ingested {
+        return None;
+    }
+    uuid::Uuid::parse_str(&response.workflow_id).ok()
+}
+
 /// MCP tool: ingest a `WorkflowExtraction` JSON.
 ///
 /// `tenancy`: see [`execute_workflow_ingest_with_inserted`]'s declared group.
@@ -675,7 +720,8 @@ pub async fn do_ingest_workflow(
 
     // Also embed the workflows-table goal for semantic find_workflow_hierarchical.
     // Best-effort: workflow is still findable via ILIKE fallback if this errors.
-    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+    // Only for a row this call WROTE ([`goal_embedding_target`]).
+    if let Some(wf_id) = goal_embedding_target(&response) {
         match server.embedder.generate(&extraction.source.goal).await {
             Ok(qvec) => {
                 store_workflow_goal_embedding(server, caller, wf_id, &qvec).await;
@@ -894,7 +940,10 @@ pub async fn improve_workflow_hierarchy(
     // invisible to find_hierarchical_by_embedding's WHERE goal_embedding IS NOT NULL
     // filter — the embedding search silently surfaces the last-embedded generation
     // instead of the latest one. Mirrors the identical block in do_ingest_workflow.
-    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+    if let Some(wf_id) = (!response.already_ingested)
+        .then(|| uuid::Uuid::parse_str(&response.workflow_id).ok())
+        .flatten()
+    {
         match server.embedder.generate(&goal).await {
             Ok(qvec) => {
                 store_workflow_goal_embedding(server, caller, wf_id, &qvec).await;

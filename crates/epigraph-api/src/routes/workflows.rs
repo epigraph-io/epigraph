@@ -382,6 +382,8 @@ pub async fn store_workflow(
     .await
     .map_err(workflow_ingest_error)?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    let mut decision = decision;
+    gate_planless_existing_row(&mut tx, None, &viewer, &result, &mut decision).await?;
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
@@ -397,11 +399,21 @@ pub async fn store_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state, &viewer, &result).await;
+    // A short-circuited re-ingest wrote nothing, and nothing follows it: no
+    // DS wiring, no embedding, above all no goal embedding on a row the caller
+    // may have no authority over.
+    if !result.already_ingested {
+        auto_wire_inserted_edges(&state, &viewer, &result).await;
+    }
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
-    if let Some(embedder) = state.embedding_service() {
+    let embedder = if result.already_ingested {
+        None
+    } else {
+        state.embedding_service()
+    };
+    if let Some(embedder) = embedder {
         let wf_id = result.workflow_id;
         embed_inserted_workflow_claims(
             &state,
@@ -412,8 +424,8 @@ pub async fn store_workflow(
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // never into a row the caller cannot read (backlog c831df4a).
-        if caller_reads_row {
+        // only for the row this call wrote (see the gate on `embedder` above).
+        {
             match embedder.generate(&request.goal).await {
                 Ok(qvec) => {
                     store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec).await;
@@ -2371,6 +2383,8 @@ pub async fn ingest_workflow(
     .await
     .map_err(workflow_ingest_error)?;
     let created: Vec<Uuid> = result.inserted.iter().map(|(id, _)| *id).collect();
+    let mut decision = decision;
+    gate_planless_existing_row(&mut tx, auth, &viewer, &result, &mut decision).await?;
     record_api_authorship(&mut tx, viewer.principal(), &created, "workflow_ingest").await?;
     record_workflow_submitter(
         &mut tx,
@@ -2386,12 +2400,17 @@ pub async fn ingest_workflow(
         message: format!("workflow ingest: could not commit: {e}"),
     })?;
 
-    auto_wire_inserted_edges(&state, &viewer, &result).await;
+    // A short-circuited re-ingest wrote nothing, and nothing follows it: no
+    // DS wiring, no embedding, above all no goal embedding on a row the caller
+    // may have no authority over.
+    if !result.already_ingested {
+        auto_wire_inserted_edges(&state, &viewer, &result).await;
+    }
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Failures warn and continue.
     // `embed: false` (OD-6) sends no text to the embedder at all.
-    let embedder = if embed.unwrap_or(true) {
+    let embedder = if embed.unwrap_or(true) && !result.already_ingested {
         state.embedding_service()
     } else {
         None
@@ -2407,8 +2426,8 @@ pub async fn ingest_workflow(
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
-        // never into a row the caller cannot read (backlog c831df4a).
-        if caller_reads_row {
+        // only for the row this call wrote (see the gate on `embedder` above).
+        {
             match embedder.generate(&extraction.source.goal).await {
                 Ok(qvec) => {
                     store_workflow_goal_embedding(
@@ -3404,6 +3423,48 @@ async fn workflow_ingest_submitter(
         grants,
         anchors,
     })
+}
+
+/// A walk that WROTE under a row that already existed (`decision.creating` is
+/// false, yet the executor did not short-circuit): the row showed the caller
+/// no plan (no `executes` edge it can see, e.g. a row the pre-transaction
+/// ingest left behind), so its claims and edges were attached to it. That is a
+/// write to an existing workflow and needs the same authority as any other,
+/// checked on the same transaction before commit, so a refusal rolls the walk
+/// back. The grant joins `decision`, whose provenance rows record it.
+#[cfg(feature = "db")]
+async fn gate_planless_existing_row(
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&crate::middleware::bearer::AuthContext>,
+    viewer: &epigraph_db::Viewer,
+    result: &epigraph_ingest_executor::WorkflowIngestExecutionResult,
+    decision: &mut ApiIngestDecision,
+) -> Result<(), ApiError> {
+    let Some(existing) = decision.anchors.existing else {
+        return Ok(());
+    };
+    if result.already_ingested || decision.grants.iter().any(|(a, _)| *a == existing) {
+        return Ok(());
+    }
+    let not_found = || ApiError::Forbidden {
+        reason: format!(
+            "workflow_ingest: canonical_name '{}' (generation {}) names a workflow this caller \
+             cannot read. Nothing was written.",
+            result.canonical_name, result.generation
+        ),
+    };
+    let grant = workflow_authority(
+        conn,
+        auth,
+        viewer,
+        viewer.principal(),
+        existing,
+        &not_found,
+    )
+    .await?;
+    decision.admin |= grant.is_admin();
+    decision.grants.push((existing, grant));
+    Ok(())
 }
 
 /// Record the submitter [`workflow_ingest_submitter`] decided, once, and the

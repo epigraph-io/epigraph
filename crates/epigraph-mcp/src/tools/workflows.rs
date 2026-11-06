@@ -432,7 +432,7 @@ pub async fn store_workflow(
     // Also embed the workflow goal into workflows.goal_embedding for
     // embedding-first find_workflow_hierarchical. Omitted from the original
     // store_workflow; do_ingest_workflow embeds it correctly.
-    if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
+    if let Some(wf_id) = crate::tools::workflow_ingest::goal_embedding_target(&response) {
         match server.embedder.generate(&params.goal).await {
             Ok(qvec) => {
                 let caller = server.write_identity(auth, viewer).await?;
