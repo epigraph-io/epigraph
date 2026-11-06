@@ -649,7 +649,14 @@ pub async fn run(
         // or refused whole (see `reown_workflows`'s module doc).
         if super::reown_workflows::is_reown_workflows_manifest(m) {
             if !super::reown_workflows::reverse_manifest(
-                conn, path, m, &specs, &unkeyed, opts, &mut report, out,
+                conn,
+                path,
+                m,
+                &specs,
+                &unkeyed,
+                opts,
+                &mut report,
+                out,
             )
             .await?
             {

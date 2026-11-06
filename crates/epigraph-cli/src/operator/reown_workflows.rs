@@ -334,10 +334,20 @@ impl fmt::Display for LineageHold {
 pub enum Left {
     NotFound,
     Shared(Vec<String>),
-    NotSourceOwned { owner: Uuid },
-    NotPublic { visibility: String },
-    ForeignRow { table: String, id: String, state: String },
-    EdgeEndpointNotPublic { edge: Uuid },
+    NotSourceOwned {
+        owner: Uuid,
+    },
+    NotPublic {
+        visibility: String,
+    },
+    ForeignRow {
+        table: String,
+        id: String,
+        state: String,
+    },
+    EdgeEndpointNotPublic {
+        edge: Uuid,
+    },
 }
 
 impl fmt::Display for Left {
@@ -403,7 +413,14 @@ impl Component {
             .rows
             .iter()
             .chain(self.kept_rows.iter())
-            .map(|(k, a)| (k.clone(), a.tenancy.clone(), a.writer_owned, a.claims.clone()))
+            .map(|(k, a)| {
+                (
+                    k.clone(),
+                    a.tenancy.clone(),
+                    a.writer_owned,
+                    a.claims.clone(),
+                )
+            })
             .collect();
         let mut wf = self.workflows.clone();
         wf.sort();
@@ -411,7 +428,10 @@ impl Component {
         edges.sort();
         let mut kept: Vec<_> = self.edges_kept.clone();
         kept.sort();
-        format!("{:?}", (&self.lineages, wf, claims, left, already, rows, edges, kept))
+        format!(
+            "{:?}",
+            (&self.lineages, wf, claims, left, already, rows, edges, kept)
+        )
     }
 
     fn claim_ids(&self) -> Vec<Uuid> {
@@ -573,7 +593,10 @@ pub async fn plan(
             }
         }
         for m in members {
-            claim_lineages.entry(*m).or_default().extend(ls.iter().cloned());
+            claim_lineages
+                .entry(*m)
+                .or_default()
+                .extend(ls.iter().cloned());
         }
     }
     let all_claims: Vec<Uuid> = claim_lineages.keys().copied().collect();
@@ -643,7 +666,11 @@ pub async fn plan(
         );
     }
     // A step lineage with a shared member is shared whole.
-    let shared_steps: BTreeSet<Uuid> = shared.keys().filter_map(|c| step_of.get(c)).copied().collect();
+    let shared_steps: BTreeSet<Uuid> = shared
+        .keys()
+        .filter_map(|c| step_of.get(c))
+        .copied()
+        .collect();
     for l in &shared_steps {
         for m in &step_members[l] {
             if !shared.contains_key(m) {
@@ -756,14 +783,14 @@ pub async fn plan(
         }
     }
 
-    let inside = |id: &Uuid| {
-        wf_lineage.contains_key(id) || candidates.contains(id) || already.contains(id)
-    };
+    let inside =
+        |id: &Uuid| wf_lineage.contains_key(id) || candidates.contains(id) || already.contains(id);
     let lineage_of = |id: &Uuid| -> Option<String> {
-        wf_lineage
-            .get(id)
-            .cloned()
-            .or_else(|| claim_lineages.get(id).and_then(|s| s.iter().next().cloned()))
+        wf_lineage.get(id).cloned().or_else(|| {
+            claim_lineages
+                .get(id)
+                .and_then(|s| s.iter().next().cloned())
+        })
     };
     // Rows shared by two plans' claims join their components.
     for a in attached.values() {
@@ -1023,7 +1050,9 @@ async fn app_readable_wf_edges(
             .fetch_one(&mut *conn)
             .await?;
         if bypass {
-            bail!("epigraph_app reports epigraph_bypass() = true; the readability check is vacuous");
+            bail!(
+                "epigraph_app reports epigraph_bypass() = true; the readability check is vacuous"
+            );
         }
         let mut out = BTreeSet::new();
         let w: Vec<String> =
@@ -1099,7 +1128,14 @@ fn spec_of<'a>(specs: &'a [TableSpec], table: &str) -> &'a TableSpec {
 fn prior_records(c: &Component, specs: &[TableSpec]) -> Vec<Record> {
     let mut out = Vec::new();
     for w in &c.workflows {
-        out.push(rec("workflows", json!(w.id.to_string()), &w.tenancy, w.id, false, false));
+        out.push(rec(
+            "workflows",
+            json!(w.id.to_string()),
+            &w.tenancy,
+            w.id,
+            false,
+            false,
+        ));
     }
     for cl in &c.claims {
         let t = Tenancy {
@@ -1107,7 +1143,14 @@ fn prior_records(c: &Component, specs: &[TableSpec]) -> Vec<Record> {
             visibility: cl.visibility.clone(),
             co_owner: None,
         };
-        out.push(rec("claims", json!(cl.id.to_string()), &t, cl.id, false, false));
+        out.push(rec(
+            "claims",
+            json!(cl.id.to_string()),
+            &t,
+            cl.id,
+            false,
+            false,
+        ));
     }
     for a in c.rows.values() {
         out.push(rec(
@@ -1120,7 +1163,14 @@ fn prior_records(c: &Component, specs: &[TableSpec]) -> Vec<Record> {
         ));
     }
     for e in &c.edges {
-        out.push(rec("edges", json!(e.id.to_string()), &e.tenancy, Uuid::nil(), false, true));
+        out.push(rec(
+            "edges",
+            json!(e.id.to_string()),
+            &e.tenancy,
+            Uuid::nil(),
+            false,
+            true,
+        ));
     }
     out
 }
@@ -1310,7 +1360,9 @@ pub async fn run_batch(
         ("edges", n_edges, edge_ids.len()),
     ] {
         if usize::try_from(n).ok() != Some(want) {
-            v.push(format!("UPDATE {what} moved {n} row(s), the batch planned {want}"));
+            v.push(format!(
+                "UPDATE {what} moved {n} row(s), the batch planned {want}"
+            ));
         }
     }
     for id in &wf_ids {
@@ -1320,7 +1372,10 @@ pub async fn run_batch(
     }
     for c in &claims_after {
         if c.owner != ctx.target || c.visibility != PUBLIC {
-            v.push(format!("claim {} ended as ({}, {})", c.id, c.owner, c.visibility));
+            v.push(format!(
+                "claim {} ended as ({}, {})",
+                c.id, c.owner, c.visibility
+            ));
         }
     }
     let mut rows_moved: BTreeMap<String, usize> = BTreeMap::new();
@@ -1337,7 +1392,10 @@ pub async fn run_batch(
     }
     for (k, a) in &kept_rows {
         if attached_after.get(k).map(|b| &b.tenancy) != Some(&a.tenancy) {
-            v.push(format!("writer-owned {} {} changed; it must stay its writer's", k.0, k.1));
+            v.push(format!(
+                "writer-owned {} {} changed; it must stay its writer's",
+                k.0, k.1
+            ));
         }
     }
     for k in attached_after.keys() {
@@ -1412,10 +1470,24 @@ pub async fn run_batch(
     // ---- post records, fsynced before the caller commits ----
     let mut post = Vec::new();
     for id in &wf_ids {
-        post.push(rec("workflows", json!(id.to_string()), &moved, *id, true, false));
+        post.push(rec(
+            "workflows",
+            json!(id.to_string()),
+            &moved,
+            *id,
+            true,
+            false,
+        ));
     }
     for id in &claim_ids {
-        post.push(rec("claims", json!(id.to_string()), &moved, *id, true, false));
+        post.push(rec(
+            "claims",
+            json!(id.to_string()),
+            &moved,
+            *id,
+            true,
+            false,
+        ));
     }
     for (k, a) in &rows {
         post.push(rec(
@@ -1428,7 +1500,14 @@ pub async fn run_batch(
         ));
     }
     for id in &edge_ids {
-        post.push(rec("edges", json!(id.to_string()), &moved, Uuid::nil(), true, true));
+        post.push(rec(
+            "edges",
+            json!(id.to_string()),
+            &moved,
+            Uuid::nil(),
+            true,
+            true,
+        ));
     }
     sink.record_post(&post)?;
     out.workflows_moved = wf_ids.len();
@@ -1461,7 +1540,10 @@ fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
         writeln!(out, "HELD-LINEAGE\t{n}\t{h}")?;
     }
     for n in &p.already {
-        writeln!(out, "ALREADY-LINEAGE\t{n}\tevery generation is the target's")?;
+        writeln!(
+            out,
+            "ALREADY-LINEAGE\t{n}\tevery generation is the target's"
+        )?;
     }
     let mut eligible_rows = 0usize;
     let mut claims = 0usize;
@@ -1498,10 +1580,16 @@ fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
     }
     writeln!(out, "CLAIMS-MOVE\t{claims}")?;
     for (t, n) in &rows {
-        writeln!(out, "ROWS-MOVE\t{t}\t{n}\t(the cascade carries them with their claim)")?;
+        writeln!(
+            out,
+            "ROWS-MOVE\t{t}\t{n}\t(the cascade carries them with their claim)"
+        )?;
     }
     for (t, n) in &kept_rows {
-        writeln!(out, "ROWS-KEPT\t{t}\t{n}\t(writer-owned: they stay their writer's)")?;
+        writeln!(
+            out,
+            "ROWS-KEPT\t{t}\t{n}\t(writer-owned: they stay their writer's)"
+        )?;
     }
     for (r, n) in &edges {
         writeln!(out, "EDGES-MOVE\t{r}\t{n}")?;
@@ -1648,7 +1736,8 @@ pub async fn run(
     let total = batches.len();
     for (i, batch) in batches.iter().enumerate() {
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        let audit = (opts.apply && !report.audit_written).then_some((&audit_details, opts.operator));
+        let audit =
+            (opts.apply && !report.audit_written).then_some((&audit_details, opts.operator));
         let r = run_batch(&mut tx, &ctx, batch, &mut sink, audit).await;
         let ok = r.is_ok();
         let wrote = matches!(&r, Ok(b) if b.workflows_moved + b.claims_moved + b.edges_moved > 0);
@@ -1674,7 +1763,11 @@ pub async fn run(
                     b.workflows_moved,
                     b.claims_moved,
                     b.edges_moved,
-                    if opts.apply { "" } else { " (rolled back: dry run)" }
+                    if opts.apply {
+                        ""
+                    } else {
+                        " (rolled back: dry run)"
+                    }
                 )?;
                 report.held_under_lock.extend(b.held);
             }
@@ -1776,11 +1869,11 @@ pub async fn reverse_manifest(
     let mut post: BTreeMap<RowKey, Record> = BTreeMap::new();
     for r in &m.records {
         let pk = match r.table.as_str() {
-            "workflows" | "claims" | "edges" => r
-                .id
-                .as_str()
-                .ok_or_else(|| anyhow!("{}: {} id is not a string", path.display(), r.table))?
-                .to_string(),
+            "workflows" | "claims" | "edges" => {
+                r.id.as_str()
+                    .ok_or_else(|| anyhow!("{}: {} id is not a string", path.display(), r.table))?
+                    .to_string()
+            }
             t => tables::spec(&specs, t)
                 .ok_or_else(|| {
                     anyhow!(
@@ -1864,7 +1957,10 @@ pub async fn reverse_manifest(
         }
         Ok(RevOutcome::Already(n)) => {
             tx.rollback().await?;
-            writeln!(out, "  every moved row ({n}) is already on its recorded prior state")?;
+            writeln!(
+                out,
+                "  every moved row ({n}) is already on its recorded prior state"
+            )?;
             report.already += claim_ids.len();
             Ok(true)
         }
@@ -1878,7 +1974,11 @@ pub async fn reverse_manifest(
                 writeln!(
                     out,
                     "  {t}: {n} row(s) restored to the recorded prior{}",
-                    if opts.apply { "" } else { " (dry run: rolled back)" }
+                    if opts.apply {
+                        ""
+                    } else {
+                        " (dry run: rolled back)"
+                    }
                 )?;
                 if t == "claims" {
                     report.claims_restored += n;
@@ -1906,7 +2006,7 @@ enum RevOutcome {
 fn same(r: &Record, t: &Tenancy) -> bool {
     r.owner_group_id == t.owner
         && r.visibility == t.visibility
-        && r.co_owner_group_id.map_or(true, |co| co == t.co_owner)
+        && r.co_owner_group_id.is_none_or(|co| co == t.co_owner)
 }
 
 fn payload(recs: &[&Record]) -> Value {
@@ -1923,7 +2023,11 @@ fn payload(recs: &[&Record]) -> Value {
     )
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 async fn reverse_tx(
     conn: &mut PgConnection,
     specs: &[TableSpec],
@@ -1990,7 +2094,10 @@ async fn reverse_tx(
     let mut already = 0usize;
     for (k, p) in post {
         let Some(pr) = prior.get(k) else {
-            held.push((Uuid::nil(), format!("{} {}: a post record with no prior", k.0, k.1)));
+            held.push((
+                Uuid::nil(),
+                format!("{} {}: a post record with no prior", k.0, k.1),
+            ));
             continue;
         };
         let anchor = Uuid::parse_str(&k.1).unwrap_or(pr.claim_id);
@@ -2016,12 +2123,11 @@ async fn reverse_tx(
         }
     }
     // A lineage this run moved that has gained a workflow row it did not move.
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT canonical_name FROM workflows WHERE id = ANY($1)",
-    )
-    .bind(wf_ids)
-    .fetch_all(&mut *conn)
-    .await?;
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT canonical_name FROM workflows WHERE id = ANY($1)")
+            .bind(wf_ids)
+            .fetch_all(&mut *conn)
+            .await?;
     for (id, name, generation) in sqlx::query_as::<_, (Uuid, String, i32)>(
         "SELECT id, canonical_name, generation FROM workflows \
           WHERE canonical_name = ANY($1) AND id <> ALL($2) ORDER BY canonical_name, generation",
@@ -2161,7 +2267,9 @@ async fn reverse_tx(
         ("edges", n_edges, r_edges.len()),
     ] {
         if usize::try_from(n).ok() != Some(want) {
-            v.push(format!("restoring {what} wrote {n} row(s), {want} were due"));
+            v.push(format!(
+                "restoring {what} wrote {n} row(s), {want} were due"
+            ));
         }
     }
     for (k, pr) in prior.iter().filter(|(k, _)| post.contains_key(*k)) {

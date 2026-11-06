@@ -305,7 +305,8 @@ async fn seed(pool: &PgPool) -> Fx {
 
     let target = team_group(pool, "target team", operator, "admin").await;
     let other_team = team_group(pool, "other team", other_admin, "admin").await;
-    let not_admin_team = team_group(pool, "a team the operator only writes", operator, "writer").await;
+    let not_admin_team =
+        team_group(pool, "a team the operator only writes", operator, "writer").await;
     // The operator ADMINISTERS the stranger's personal group: so a refusal of
     // it as a target can only come from its kind, not from the admin check.
     sqlx::query(
@@ -329,8 +330,16 @@ async fn seed(pool: &PgPool) -> Fx {
     let t = claim(&mut c, ingest, src, "public", 0, "alpha thesis").await;
     let p = claim(&mut c, ingest, src, "public", 1, "alpha phase").await;
     let step_lineage = Uuid::new_v4();
-    let s1 = claim_in_lineage(&mut c, ingest, src, "public", 2, "alpha step one", Some(step_lineage))
-        .await;
+    let s1 = claim_in_lineage(
+        &mut c,
+        ingest,
+        src,
+        "public",
+        2,
+        "alpha step one",
+        Some(step_lineage),
+    )
+    .await;
     // S1's evolved successor (evolve_step): executed by no workflow, reached
     // through its step lineage.
     let s1n = claim_in_lineage(
@@ -347,12 +356,28 @@ async fn seed(pool: &PgPool) -> Fx {
     let s3 = claim(&mut c, ingest, src, "public", 2, "alpha step three (gen 1)").await;
     let a1 = claim(&mut c, ingest, src, "public", 3, "alpha atom").await;
     let x = claim(&mut c, ingest, src, "public", 2, "a step two plans share").await;
-    let z = claim(&mut c, ingest, other_team, "public", 2, "another team's step").await;
+    let z = claim(
+        &mut c,
+        ingest,
+        other_team,
+        "public",
+        2,
+        "another team's step",
+    )
+    .await;
     let tb = claim(&mut c, ingest, src, "public", 0, "beta thesis").await;
     let fc = claim(&mut c, ingest, other_team, "public", 0, "foreign thesis").await;
     let pc = claim(&mut c, ingest, src, "group", 0, "private thesis").await;
     let gc = claim(&mut c, ingest, other_team, "public", 0, "gamma thesis").await;
-    let y = claim(&mut c, ingest, src, "public", 0, "an unrelated claim of the operator").await;
+    let y = claim(
+        &mut c,
+        ingest,
+        src,
+        "public",
+        0,
+        "an unrelated claim of the operator",
+    )
+    .await;
 
     let mut structural = Vec::new();
     for (w, cl) in [
@@ -493,7 +518,11 @@ const SNAPSHOT_TABLES: &[&str] = &[
 async fn snapshot(pool: &PgPool) -> BTreeMap<String, Vec<String>> {
     let mut out = BTreeMap::new();
     for t in SNAPSHOT_TABLES {
-        let strip = if *t == "claims" { " - 'updated_at'" } else { "" };
+        let strip = if *t == "claims" {
+            " - 'updated_at'"
+        } else {
+            ""
+        };
         let rows: Vec<String> = sqlx::query_scalar(&format!(
             "SELECT (to_jsonb(x){strip})::text FROM {t} x ORDER BY 1"
         ))
@@ -652,7 +681,12 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
     )
     .await;
     assert_eq!(r.code, 0, "{}", r.show());
-    assert_eq!(snapshot(&pool).await, before, "a dry run wrote: {}", r.show());
+    assert_eq!(
+        snapshot(&pool).await,
+        before,
+        "a dry run wrote: {}",
+        r.show()
+    );
     assert_eq!(
         security_events(&pool, "operator.workflows_reowned").await,
         audits
@@ -677,10 +711,9 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
         );
     }
     assert!(
-        r.stdout
-            .lines()
-            .any(|l| l.starts_with("LEFT-CLAIM\t") && l.contains(&fx.x.to_string())
-                && l.contains("SHARED")),
+        r.stdout.lines().any(|l| l.starts_with("LEFT-CLAIM\t")
+            && l.contains(&fx.x.to_string())
+            && l.contains("SHARED")),
         "the shared step must be reported and left: {}",
         r.show()
     );
@@ -867,7 +900,12 @@ async fn refused_target(pool: &PgPool, fx: &Fx, target: Uuid, from: Option<Uuid>
     }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     let r = run_op(pool, &a).await;
-    assert_eq!(snapshot(pool).await, before, "a refused run wrote: {}", r.show());
+    assert_eq!(
+        snapshot(pool).await,
+        before,
+        "a refused run wrote: {}",
+        r.show()
+    );
     assert!(!manifest.exists(), "a refused run wrote a manifest");
     std::fs::remove_dir_all(&dir).ok();
     r
