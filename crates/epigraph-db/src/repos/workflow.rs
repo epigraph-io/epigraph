@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use futures::future::try_join_all;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -894,6 +893,30 @@ impl WorkflowRepository {
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<ResolvedStep>, DbError> {
+        // `ConnectionFailed`, as `LineageRepository::get_lineage` maps its
+        // acquire: pool exhaustion is not a failing query.
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+        Self::resolve_steps_to_heads_conn(&mut conn, viewer, workflow_id).await
+    }
+
+    /// [`Self::resolve_steps_to_heads`] on a caller-supplied connection: the
+    /// shape a request reaches through `ScopedPool::read_as`, so every read
+    /// runs under the viewer's own session GUCs and row security agrees with
+    /// the in-query predicates. The pool form delegates here, so the
+    /// statements exist once. One connection serves one statement at a time,
+    /// so the per-step head lookups run in sequence (the pool form used to
+    /// run them concurrently on separate checkouts).
+    ///
+    /// # Errors
+    /// As [`Self::resolve_steps_to_heads`].
+    pub async fn resolve_steps_to_heads_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+    ) -> Result<Vec<ResolvedStep>, DbError> {
         // Pull all level=2 step claims under this workflow with their
         // step_lineage_id, in PLAN ORDER: the `plan_index` order below, then
         // reordered by the `step_follows` chain (`in_chain_order`, ruling R-38).
@@ -923,21 +946,22 @@ impl WorkflowRepository {
             sq = sq.bind(g);
         }
         let step_rows: Vec<(Uuid, Option<Uuid>)> =
-            sq.fetch_all(pool).await.map_err(DbError::from)?;
+            sq.fetch_all(&mut *conn).await.map_err(DbError::from)?;
         // Plan order is the `step_follows` chain (ruling R-38): `add_step`
         // leaves a middle insert unindexed, so `plan_index` alone lists it last.
-        let step_rows = in_chain_order(pool, viewer, step_rows, |r| r.0)
+        let step_rows = in_chain_order(&mut *conn, viewer, step_rows, |r| r.0)
             .await
             .map_err(DbError::from)?;
 
-        let head_futures = step_rows.iter().map(|(_, step_lineage_id)| async move {
-            if let Some(lineage_id) = *step_lineage_id {
-                ClaimRepository::latest_in_lineage(pool, viewer, lineage_id).await
-            } else {
-                Ok(Vec::new())
-            }
-        });
-        let heads_per_step: Vec<Vec<LineageHead>> = try_join_all(head_futures).await?;
+        let mut heads_per_step: Vec<Vec<LineageHead>> = Vec::with_capacity(step_rows.len());
+        for (_, step_lineage_id) in &step_rows {
+            heads_per_step.push(match *step_lineage_id {
+                Some(lineage_id) => {
+                    ClaimRepository::latest_in_lineage(&mut *conn, viewer, lineage_id).await?
+                }
+                None => Vec::new(),
+            });
+        }
 
         let resolved = step_rows
             .into_iter()
