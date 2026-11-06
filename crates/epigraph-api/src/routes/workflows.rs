@@ -3478,6 +3478,28 @@ async fn record_workflow_submitter(
 }
 
 /// POST /api/v1/workflows/steps - add a step to a hierarchical workflow.
+/// The ONE principal a step route checks and writes as: the workflow
+/// authority gate reads the token's `agent_id`, and the write is stamped from
+/// (and the step authored by) the request viewer's principal. They are the
+/// same agent for every ordinary token; a request where they differ is
+/// refused rather than letting the gate admit one agent while another writes.
+#[cfg(feature = "db")]
+fn same_step_principal(
+    auth: &crate::middleware::bearer::AuthContext,
+    viewer: &epigraph_db::Viewer,
+    route: &'static str,
+) -> Result<Uuid, ApiError> {
+    match (auth.agent_id, viewer.principal()) {
+        (Some(token), Some(principal)) if token == principal => Ok(principal),
+        _ => Err(ApiError::Forbidden {
+            reason: format!(
+                "{route}: the token's agent and the request's principal must be one agent to \
+                 write a workflow step. Nothing was written."
+            ),
+        }),
+    }
+}
+
 #[cfg(feature = "db")]
 pub async fn add_step(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -3490,12 +3512,8 @@ pub async fn add_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    let author = same_step_principal(&auth, &viewer, "add_step")?;
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/steps").await?;
-    // The step is authored by the principal the transaction is stamped with
-    // (the viewer's); `begin_caller_workflow_tx` refused a viewer with none.
-    let author = viewer.principal().ok_or_else(|| ApiError::Forbidden {
-        reason: "add_step: no agent principal to write as. Nothing was written.".into(),
-    })?;
     let authority =
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
     let r = epigraph_ingest_executor::add_step(
@@ -3569,6 +3587,7 @@ pub async fn delete_step(
     })?;
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
+    same_step_principal(&auth, &viewer, "delete_step")?;
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows/steps/delete").await?;
     let authority =
         require_api_workflow_authority(&mut tx, &auth, &viewer, &req.canonical_name).await?;
