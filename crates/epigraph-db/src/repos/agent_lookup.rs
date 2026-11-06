@@ -758,55 +758,70 @@ impl AgentLookupRepository {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let reserved: Vec<Vec<u8>> = crate::repos::system_agent::SystemAgentRole::ALL
-            .iter()
-            .map(|r| r.legacy_public_key().to_vec())
-            .collect();
+        // A system role's legacy key is unique in `agents`, so at most one row
+        // per role can hold one: fetch that many extra and drop them below
+        // (`is_reserved_author_key`), keeping `limit` and the total exact.
+        let slack =
+            i64::try_from(crate::repos::system_agent::SystemAgentRole::ALL.len()).unwrap_or(1);
         let sql = format!(
             "WITH q AS ( \
                  SELECT u.ord, {fold_q} AS f, u.attached \
                    FROM unnest($1::text[], $2::uuid[]) WITH ORDINALITY AS u(name, attached, ord) \
              ), c AS ( \
-                 SELECT a.id, a.display_name, a.created_at, {fold_name} AS fname \
+                 SELECT a.id, a.display_name, a.created_at, a.public_key, {fold_name} AS fname \
                    FROM agents a \
                   WHERE a.agent_type <> 'role' \
-                    AND a.public_key <> ALL($3::bytea[]) \
                     AND NOT EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
              ), m AS ( \
-                 SELECT q.ord, c.id, c.display_name, c.created_at, \
+                 SELECT q.ord, c.id, c.display_name, c.created_at, c.public_key, \
                         pg_catalog.row_number() OVER (PARTITION BY q.ord \
                                                       ORDER BY c.created_at, c.id) AS rn, \
                         pg_catalog.count(*) OVER (PARTITION BY q.ord) AS n \
                    FROM q JOIN c ON c.fname = q.f \
                   WHERE q.f <> '' AND c.id <> q.attached \
              ) \
-             SELECT ord, id, display_name, created_at, n FROM m \
-              WHERE rn <= $4 ORDER BY ord, rn",
+             SELECT ord, id, display_name, created_at, public_key, n FROM m \
+              WHERE rn <= $3 + $4 ORDER BY ord, rn",
             fold_q = fold_sql("u.name"),
             fold_name = fold_sql("a.display_name"),
         );
-        type Row = (i64, Uuid, Option<String>, DateTime<Utc>, i64);
+        type Row = (i64, Uuid, Option<String>, DateTime<Utc>, Vec<u8>, i64);
+        let limit = limit.max(1);
         let rows: Vec<Row> = sqlx::query_as(&sql)
             .bind(names)
             .bind(attached)
-            .bind(&reserved)
-            .bind(limit.max(1))
+            .bind(limit)
+            .bind(slack)
             .fetch_all(&mut *conn)
             .await?;
+        let keep = usize::try_from(limit).unwrap_or(usize::MAX);
         let mut out: Vec<(Vec<AgentNameMatch>, i64)> =
             (0..names.len()).map(|_| (Vec::new(), 0)).collect();
-        for (ord, agent_id, display_name, created_at, n) in rows {
-            let Some(slot) = usize::try_from(ord - 1).ok().and_then(|i| out.get_mut(i)) else {
+        let mut counted = vec![false; names.len()];
+        for (ord, agent_id, display_name, created_at, public_key, n) in rows {
+            let Some(i) = usize::try_from(ord - 1).ok().filter(|i| *i < out.len()) else {
                 continue;
             };
-            slot.0.push(AgentNameMatch {
-                agent_id,
-                display_name,
-                tier: MatchTier::Exact,
-                score: 1.0,
-                created_at,
-            });
-            slot.1 = n;
+            let slot = &mut out[i];
+            if !counted[i] {
+                counted[i] = true;
+                slot.1 = n;
+            }
+            if <[u8; 32]>::try_from(public_key.as_slice())
+                .is_ok_and(|k| crate::is_reserved_author_key(&k))
+            {
+                slot.1 -= 1;
+                continue;
+            }
+            if slot.0.len() < keep {
+                slot.0.push(AgentNameMatch {
+                    agent_id,
+                    display_name,
+                    tier: MatchTier::Exact,
+                    score: 1.0,
+                    created_at,
+                });
+            }
         }
         Ok(out)
     }
