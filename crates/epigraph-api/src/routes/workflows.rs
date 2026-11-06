@@ -2286,7 +2286,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content; or a source.authors[].agent_id: the shared AuthorEntry schema lists it for document ingest, but workflow authors are resolved by name only and an agent_id is refused"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write, or a declared group the caller or the ingest system agent does not write"),
         (status = 500),

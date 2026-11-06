@@ -33,8 +33,9 @@ pub struct AuthorEntry {
     ///   agents as `candidates` (`status: "ambiguous"`) so the caller can
     ///   re-ingest with an explicit `agent_id`.
     ///
-    /// Workflow ingest refuses an `agent_id` (workflow authors are always
-    /// name-derived).
+    /// Workflow ingest (MCP `ingest_workflow`, `POST /api/v1/workflows/ingest`)
+    /// shares this schema but REFUSES an `agent_id` (invalid params / HTTP
+    /// 400): workflow authors are always name-derived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
