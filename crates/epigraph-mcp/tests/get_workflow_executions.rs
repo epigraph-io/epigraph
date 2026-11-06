@@ -3,6 +3,9 @@
 //! evolution (GEPA) proposer consumes. Mirrors the server-construction harness
 //! in `recompute_beliefs_test.rs`.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use epigraph_crypto::AgentSigner;
 use epigraph_db::{BehavioralExecutionRepository, BehavioralExecutionRow};
 use epigraph_mcp::types::GetWorkflowExecutionsParams;
@@ -51,6 +54,7 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone());
     let agent = insert_agent(&pool, "gwe-agent").await;
     let wf = insert_claim(&pool, agent, "gwe-workflow-root").await;
@@ -78,6 +82,7 @@ async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
 
     let out = tools::workflows::get_workflow_executions(
         &server,
+        &viewer,
         GetWorkflowExecutionsParams {
             workflow_id: wf.to_string(),
             limit: Some(10),
@@ -102,6 +107,7 @@ async fn get_workflow_executions_returns_recent_rows(pool: PgPool) {
     // (that would be a confusing false negative for the proposer).
     let bad = tools::workflows::get_workflow_executions(
         &server,
+        &viewer,
         GetWorkflowExecutionsParams {
             workflow_id: "not-a-uuid".into(),
             limit: None,
