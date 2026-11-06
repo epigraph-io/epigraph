@@ -181,6 +181,7 @@ async fn main() {
                 rp_id = %rp.config().rp_id,
                 origin = %rp.config().origin,
                 software_attestation = rp.config().allows_software_attestation(),
+                synced_anchored = rp.allows_synced_anchored(),
                 "passkey relying party configured"
             );
             Some(Arc::new(rp))

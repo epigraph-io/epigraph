@@ -44,6 +44,9 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
+#[path = "../../epigraph-passkey/tests/support/soft_authenticator.rs"]
+mod support;
+
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -504,4 +507,82 @@ async fn the_server_refuses_software_attestation_on_an_armed_database(pool: PgPo
         }
         Outcome::PastTheCheck { log } => panic!("CONTROL: OQ-7 must refuse:\n{log}"),
     }
+
+    // 5. Armed, the ANCHORED setting on with Android key roots and no
+    //    software flag: the software flag's refusal does NOT run (the
+    //    anchored setting is served on an armed database); this privileged
+    //    DSN still earns OQ-7's, which is the DSN's, not the setting's.
+    let roots = std::env::temp_dir().join(format!(
+        "privileged-dsn-android-roots-{}.pem",
+        std::process::id()
+    ));
+    std::fs::write(&roots, support::TestAttestation::new("Android").root_pem())
+        .expect("roots file");
+    let roots = roots.to_string_lossy().to_string();
+    let url = db_url.clone();
+    let anchored_roots = roots.clone();
+    match tokio::task::spawn_blocking(move || {
+        run_server_with(
+            &url,
+            false,
+            &[
+                ("EPIGRAPH_WEBAUTHN_RP_ID", "auth.example.com"),
+                ("EPIGRAPH_WEBAUTHN_ORIGIN", "https://auth.example.com"),
+                (
+                    "EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE",
+                    anchored_roots.as_str(),
+                ),
+                ("EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY", "1"),
+            ],
+        )
+    })
+    .await
+    .expect("join")
+    {
+        Outcome::Exited { code, log } => {
+            let plain = strip_ansi(&log);
+            assert_eq!(code, Some(1), "a failing exit:\n{log}");
+            assert!(
+                plain.contains("software_attestation=false")
+                    && plain.contains("synced_anchored=true"),
+                "the server read the anchored, attested policy:\n{log}"
+            );
+            assert!(log.contains(REFUSAL), "OQ-7 refuses the DSN:\n{log}");
+            assert!(
+                !log.contains(SOFTWARE_REFUSAL),
+                "the anchored setting is not the software flag:\n{log}"
+            );
+        }
+        Outcome::PastTheCheck { log } => panic!("OQ-7 must refuse the privileged DSN:\n{log}"),
+    }
+
+    // 6. The anchored setting WITH the software flag is a configuration
+    //    error at boot, before any database check.
+    let url = db_url.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut env = SOFTWARE_ENV.to_vec();
+        env.push(("EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY", "1"));
+        run_server_with(&url, false, &env)
+    })
+    .await
+    .expect("join")
+    {
+        Outcome::Exited { code, log } => {
+            assert_eq!(code, Some(1), "a failing exit:\n{log}");
+            assert!(
+                log.contains(
+                    "does not combine with EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY"
+                ),
+                "the configuration error names both:\n{log}"
+            );
+            assert!(
+                !log.contains(SOFTWARE_REFUSAL) && !log.contains(REFUSAL),
+                "{log}"
+            );
+        }
+        Outcome::PastTheCheck { log } => {
+            panic!("the anchored setting with the software flag must not boot:\n{log}")
+        }
+    }
+    let _ = std::fs::remove_file(&roots);
 }
