@@ -2842,10 +2842,12 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
             reason: format!("workflow ingest: {e}"),
         },
         // The plan's (canonical_name, generation) is held by a `workflows` row
-        // the ingest cannot read (migration 183): the payload conflicts with a
-        // row outside the caller's view. 409, not a 500 that reads as
-        // transient and invites a retry.
-        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => {
+        // the ingest cannot read (migration 183), or the lineage it writes has
+        // generations the caller cannot read (migration 202): the payload
+        // conflicts with rows outside the caller's view. 409, not a 500 that
+        // reads as transient and invites a retry.
+        e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }) => {
             ApiError::Conflict {
                 reason: format!("workflow ingest: {e}"),
             }

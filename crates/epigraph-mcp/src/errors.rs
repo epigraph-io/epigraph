@@ -330,9 +330,12 @@ pub fn executor_caller_error(
             data: None,
         },
         // The plan's (canonical_name, generation) is held by a `workflows` row
-        // the ingest cannot read (migration 183): a caller conflict, so an
-        // agent reads the reason instead of a logged internal error.
-        e @ epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. } => McpError {
+        // the ingest cannot read (migration 183), or the lineage it writes has
+        // generations the caller cannot read (migration 202): a caller
+        // conflict, so an agent reads the reason instead of a logged internal
+        // error.
+        e @ (epigraph_ingest_executor::IngestExecutorError::WorkflowOutsideView { .. }
+        | epigraph_ingest_executor::IngestExecutorError::LineageOutsideView { .. }) => McpError {
             code: ErrorCode::INVALID_REQUEST,
             message: Cow::from(format!("{context}: {e}")),
             data: None,

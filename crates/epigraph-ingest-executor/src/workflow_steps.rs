@@ -132,6 +132,24 @@ pub enum StepOpError {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Refuse a step edit on a lineage with rows the session cannot read
+/// (migration 202), answered as an unknown name (backlog c831df4a: never the
+/// hidden row's id). The write runs on the CALLER's stamp, where the latest
+/// generation it can read may not be the lineage's head: editing that stale
+/// generation would change a plan the members no longer run, where the system
+/// agent's stamp used to find the real head and the authority gate refused.
+async fn refuse_hidden_lineage(
+    conn: &mut sqlx::PgConnection,
+    canonical_name: &str,
+) -> Result<(), StepOpError> {
+    if epigraph_db::WorkflowRepository::name_has_hidden_rows_conn(&mut *conn, canonical_name)
+        .await?
+    {
+        return Err(StepOpError::WorkflowNotFound(canonical_name.to_string()));
+    }
+    Ok(())
+}
+
 /// Find the latest-generation workflow row for a `canonical_name`.
 pub async fn find_workflow_head(
     conn: &mut sqlx::PgConnection,
@@ -349,6 +367,7 @@ pub async fn add_step(
     if step_text.trim().is_empty() {
         return Err(StepOpError::Invalid("step_text must not be empty".into()));
     }
+    refuse_hidden_lineage(&mut *conn, canonical_name).await?;
     let (workflow_id, _generation) = find_workflow_head(&mut *conn, canonical_name).await?;
     // Before the plan is read: a concurrent add_step on this workflow waits
     // here, so the two cannot both take the same next `plan_index`.
@@ -629,6 +648,7 @@ pub async fn delete_step(
     canonical_name: &str,
     step_lineage_id: Uuid,
 ) -> Result<DeleteStepResult, StepOpError> {
+    refuse_hidden_lineage(&mut *conn, canonical_name).await?;
     let (workflow_id, _generation) = find_workflow_head(&mut *conn, canonical_name).await?;
 
     let claim_id: Option<Uuid> = sqlx::query_scalar(

@@ -971,3 +971,122 @@ async fn a_new_generation_outside_the_lineages_group_follows_the_callers_order(p
     let (v, owner, _, parent) = workflow_row(&pool, g1).await;
     assert_eq!((v.as_str(), owner, parent), ("public", w.dr_g, Some(g0)));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A caller-chosen group is checked LIVE, inside the write's own transaction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The caller's viewer is resolved, its transaction stamped from it, and THEN
+/// its team membership ends. The stamp still carries the group (row security
+/// would admit the rows), so only the in-transaction live check stands
+/// between the stale viewer and a write into a group the caller no longer
+/// writes: a declared ingest into it is refused with nothing written, and an
+/// undeclared one no longer picks it as the caller's team group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPool) {
+    let w = world(&pool).await;
+    let scoped = app_scoped(&pool).await;
+    let stale = epigraph_db::visibility::Viewer::resolve(&pool, w.rb)
+        .await
+        .expect("resolve");
+    assert!(stale.writable_groups().contains(&w.alpha), "PREMISE: the viewer writes alpha");
+    end_role(&pool, w.rb_role).await;
+    assert!(!writes(&pool, w.rb, w.alpha).await, "PREMISE: rb no longer writes alpha");
+
+    let ingest = |name: &'static str| {
+        let extraction: epigraph_ingest::workflow::WorkflowExtraction =
+            serde_json::from_value(extraction(name, 0, 1)).expect("extraction");
+        let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
+        (extraction, plan)
+    };
+
+    let before = row_counts(&pool).await;
+    let (x, plan) = ingest("acme-live-declared");
+    let mut tx = scoped.begin_as(&stale).await.expect("stamp from the stale viewer");
+    let refused = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+        &mut tx,
+        &plan,
+        &x,
+        &stale,
+        Some(w.alpha),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(epigraph_ingest_executor::IngestExecutorError::CallerNotGroupWriter { caller, group })
+                if caller == w.rb && group == w.alpha
+        ),
+        "a declared group the caller no longer writes is refused live: {refused:?}"
+    );
+    drop(tx);
+    assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
+
+    let (x, plan) = ingest("acme-live-undeclared");
+    let mut tx = scoped.begin_as(&stale).await.expect("stamp from the stale viewer");
+    let out = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
+        &mut tx, &plan, &x, &stale, None,
+    )
+    .await
+    .expect("an undeclared ingest still lands");
+    tx.commit().await.expect("commit");
+    let (v, owner, ..) = workflow_row(&pool, out.workflow_id).await;
+    assert_eq!(
+        (v.as_str(), owner),
+        ("public", w.rb_g),
+        "the ended team membership is not picked as the caller's team group"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A lineage with generations the caller cannot read is never written
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Workflow writes run on the caller's stamp, where a generation private to a
+/// group the caller is not in is invisible. The caller below SUBMITTED the
+/// lineage's visible public head, so the authority gate admits it over that
+/// head; only migration 202's check knows a later, hidden generation exists.
+/// Without it the caller would mint a public generation every member then
+/// resolves as the head, add a step to a stale generation, or ingest a
+/// "child" of the hidden lineage with its parent link silently dropped.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lineage_with_a_generation_the_caller_cannot_read_is_never_written(pool: PgPool) {
+    let w = world(&pool).await;
+    let name = "acme-hidden-head";
+    let mcp = Via::McpHttp(&w.mcp, w.rb);
+    via_ok(mcp.ingest(&extraction(name, 0, 1), None).await);
+    via_ok(mcp.ingest(&extraction(name, 1, 1), Some(w.alpha)).await);
+    end_role(&pool, w.rb_role).await;
+    assert!(!writes(&pool, w.rb, w.alpha).await, "PREMISE: rb left alpha");
+
+    let before = row_counts(&pool).await;
+    for via in [Via::McpHttp(&w.mcp, w.rb), Via::Rest(&w.router, w.rb)] {
+        let refused = via.ingest(&extraction(name, 2, 1), None).await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("cannot read")),
+            "a generation over a hidden head is refused: {refused:?}"
+        );
+        let mut child = extraction("acme-hidden-head-child", 2, 1);
+        child["source"]["parent_canonical_name"] = json!(name);
+        let refused = via.ingest(&child, None).await;
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("cannot read")),
+            "a child naming a hidden parent is refused, never stored parentless: {refused:?}"
+        );
+        let refused = via.add_step(name, "acme step on a stale generation").await;
+        assert!(refused.is_err(), "a step edit on the stale visible generation: {refused:?}");
+    }
+    assert_eq!(row_counts(&pool).await, before, "nothing was written");
+    assert_eq!(workflow_named(&pool, name, 2).await, None);
+
+    // CALIBRATION: back in alpha, the same caller extends the same lineage
+    // (the new generation inherits the private head's group).
+    grant_role(&pool, w.rb).await;
+    let out = via_ok(
+        Via::Rest(&w.router, w.rb)
+            .ingest(&extraction(name, 2, 1), None)
+            .await,
+    );
+    let (v, owner, ..) = workflow_row(&pool, uuid_of(&out["workflow_id"])).await;
+    assert_eq!((v.as_str(), owner), ("group", w.alpha));
+}

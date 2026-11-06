@@ -105,6 +105,16 @@ pub enum IngestExecutorError {
     },
 
     /// Plan structure violated an executor invariant.
+    /// A caller-authored workflow write names a lineage (its own
+    /// `canonical_name`, or the `parent_canonical_name` it extends) that has
+    /// rows the caller cannot read (migration 202). Extending it would mint a
+    /// generation every member would then resolve as the lineage's head.
+    #[error(
+        "workflow lineage {canonical_name:?} has generations this caller cannot read, so it may \
+         not write to it. Nothing was written"
+    )]
+    LineageOutsideView { canonical_name: String },
+
     #[error("plan inconsistency: {0}")]
     PlanInconsistency(String),
 

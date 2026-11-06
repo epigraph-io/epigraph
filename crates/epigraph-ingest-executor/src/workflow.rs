@@ -540,6 +540,22 @@ async fn execute_plan(
         ),
         None => None,
     };
+    // A caller writes only to a lineage it can read IN FULL (migration 202):
+    // on its own stamp a generation private to a group it is not in looks
+    // absent, so without this a non-member could mint the next generation of
+    // a hidden lineage, or link a hidden parent as none. Checked before any
+    // anchor is read, for the name and for the parent it names.
+    if caller_agent.is_some() {
+        for name in std::iter::once(extraction.source.canonical_name.as_str())
+            .chain(extraction.source.parent_canonical_name.as_deref())
+        {
+            if WorkflowRepository::name_has_hidden_rows_conn(&mut *conn, name).await? {
+                return Err(IngestExecutorError::LineageOutsideView {
+                    canonical_name: name.to_string(),
+                });
+            }
+        }
+    }
     let inherited = inherited_generation_tenancy(&mut *conn, extraction).await?;
     // A NEW generation of a group lineage inherits its predecessor's group
     // when it declares none (ruling R-98 Q6(a), backlog 630af617; 074's
