@@ -1857,6 +1857,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Returns workflow ids only, never content.",
     ),
     (
+        "agent_lookup.rs",
+        "disclosed_roles",
+        "READ through migration 198's `epigraph_disclosed_role_assignments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_assignments` (FORCE RLS, holder \
+         only). The function decides in its body, on the SESSION: non-elevating roles for any \
+         agent (a subset of 123's public projection), any role of the session principal itself, \
+         everything on a privileged session. No tenancy columns; nothing for a Viewer to add.",
+    ),
+    (
         "system_agent.rs",
         "lookup",
         "READ of migration 148's `system_agents` row for one role, with \
