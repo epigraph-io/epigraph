@@ -22,10 +22,12 @@
 //!   privatization act; see [`restrict`]). `reown-reverse` reverses its
 //!   manifest exactly.
 //! * `reown-workflows` — move listed workflow lineages (every generation, the
-//!   plan claims they execute, the rows those carry, and the source-owned plan
-//!   edges) out of a source group into a TEAM group the operator administers,
-//!   keeping every row's visibility (see [`reown_workflows`]). `reown-reverse`
-//!   reverses its manifest exactly, or refuses it whole.
+//!   plan claims they execute, the rows those carry, and their plan edges) out
+//!   of a source group into a TEAM group the operator administers, keeping
+//!   every row's visibility or narrowing it to the team; or narrow them in
+//!   place within their owner group (see [`reown_workflows`]). `reown-reverse`
+//!   reverses its manifest exactly, or refuses it whole when the plan changed
+//!   or grew since.
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!

@@ -792,19 +792,28 @@ enum Command {
         sample: usize,
     },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
-    /// execute, the rows those carry, and the source-owned plan edges) out of
-    /// the source group into a TEAM group, keeping every row's visibility.
-    /// Only `('public', source)` rows move. Reversed exactly by `reown-reverse
-    /// --manifest`.
+    /// execute, the rows those carry, and their plan edges) out of the source
+    /// group into a TEAM group, keeping every row's visibility
+    /// (`--visibility keep`) or narrowing it to the team (`--visibility
+    /// group`); or, with `--target-group` equal to the source and
+    /// `--visibility group`, narrow them IN PLACE within the source group.
+    /// Only `('public', source)` rows change. Reversed exactly by
+    /// `reown-reverse --manifest`.
     ReownWorkflows {
         /// One `workflows.canonical_name` per line (`#` comments and blank
         /// lines ignored); only these lineages are ever touched.
         #[arg(long)]
         canonical_names_file: PathBuf,
         /// The team group the lineages move into: active, `kind = 'team'`, and
-        /// `--operator` is a live admin of it.
+        /// `--operator` is a live admin of it. Or the source group itself, for
+        /// an in-place narrowing (needs `--visibility group`).
         #[arg(long)]
         target_group: Uuid,
+        /// `keep`: every moved row stays public. `group`: every moved row
+        /// becomes group-visible to the target (an audited narrowing that
+        /// bumps the atlas layout epoch; re-run `atlas_layout --apply` after).
+        #[arg(long, default_value = "keep")]
+        visibility: String,
         /// The operator (a person's agent id) the act is attributed to.
         #[arg(long)]
         operator: Uuid,
@@ -1073,6 +1082,7 @@ async fn main_inner() -> anyhow::Result<i32> {
     let reown_wf_opts = if let Command::ReownWorkflows {
         canonical_names_file,
         target_group,
+        visibility,
         operator: op,
         from_group,
         manifest_out,
@@ -1094,6 +1104,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             confirm_count: *confirm_count,
             ruling: ruling.clone(),
             reason: reason.clone(),
+            visibility: reown_workflows::Visibility::parse(visibility)?,
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
         };
