@@ -22,6 +22,7 @@ pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
 pub mod claim_context;
+pub mod claim_ingest;
 pub mod claim_encryption;
 pub mod claim_role;
 pub mod claim_theme;
@@ -143,6 +144,10 @@ pub use claim::{
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_ingest::{
+    ClaimIngestRecord, ClaimIngestRepository, ClaimIngests, CREATED_CLAIM_PROPERTY,
+    INGESTED_BY_PROPERTY, INGEST_RECORD_RELATIONSHIP,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

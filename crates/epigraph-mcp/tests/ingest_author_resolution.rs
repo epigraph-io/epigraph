@@ -47,7 +47,7 @@ use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::{
     FindAgentParams, GetAgentParams, IngestDocumentInlineParams, IngestDocumentParams,
-    IngestDocumentSpineParams, IngestWorkflowParams, QueryPaperParams,
+    IngestDocumentSpineParams, IngestWorkflowParams, QueryPaperParams, SubmitClaimParams,
 };
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -1399,4 +1399,147 @@ async fn query_paper_lists_only_in_force_authors_in_position_order_and_marks_the
     assert_eq!(authors[1]["position"], 1, "{listed}");
     assert_eq!(authors[1]["pending_countersign"], false, "{listed}");
     assert!(authors[1]["ingested_by"].is_null(), "{listed}");
+}
+
+/// `(paper doi, ingested_by, created_claim)` of every `ingested_claim`
+/// record on `claim`, sorted.
+async fn ingest_records(pool: &PgPool, claim: Uuid) -> Vec<(String, Uuid, bool)> {
+    let mut rows: Vec<(String, Uuid, bool)> = sqlx::query_as(
+        "SELECT p.doi, (r.properties ->> 'ingested_by')::uuid, \
+                COALESCE((r.properties ->> 'created_claim')::boolean, false) \
+           FROM edges r JOIN papers p ON p.id = r.source_id \
+          WHERE r.target_id = $1 AND r.target_type = 'claim' AND r.source_type = 'paper' \
+            AND r.relationship = 'ingested_claim'",
+    )
+    .bind(claim)
+    .fetch_all(pool)
+    .await
+    .expect("ingest records");
+    rows.sort();
+    rows
+}
+
+/// The claim the paper keyed `doi` asserts whose content is `content`.
+async fn claim_of(pool: &PgPool, doi: &str, content: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT c.id FROM claims c JOIN edges pc ON pc.target_id = c.id \
+           JOIN papers p ON p.id = pc.source_id \
+          WHERE p.doi = $1 AND pc.relationship = 'asserts' AND c.content = $2",
+    )
+    .bind(doi)
+    .bind(content)
+    .fetch_one(pool)
+    .await
+    .expect("the paper asserts the claim")
+}
+
+/// What decides a literature claim's primary authors is recorded when the
+/// claim is CREATED, never inferred later: every document walk writes one
+/// `paper -ingested_claim-> claim` record per (paper, claim, ingester), with
+/// `created_claim: true` only on the ingest that created the claim. A second
+/// document converging on the claim, the same document re-ingested by
+/// another ingester, and a document repeating a claim someone filed directly
+/// each add a `created_claim: false` record, and a re-run adds nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ingest_records_which_paper_created_each_claim_and_every_later_ingester(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let (a_id, b_id) = (
+        a.server_agent_id().await.expect("a"),
+        b.server_agent_id().await.expect("b"),
+    );
+    assert_ne!(a_id, b_id, "CALIBRATION: two ingesters");
+    let viewer = fixture::public_viewer(&pool).await;
+    let (d1, d2, d3) = (
+        "10.9999/ingest-record-1",
+        "10.9999/ingest-record-2",
+        "10.9999/ingest-record-3",
+    );
+    let shared = "Shared atom of the ingest-record documents.";
+    let author = json!([{"name": "Ingrid Solvang"}]);
+    let doc1 = || doc_with_atoms(d1, author.clone(), &[shared, "Only in record one."]);
+
+    ingest_wait(&a, &pool, doc1()).await;
+    let x = claim_of(&pool, d1, shared).await;
+    let only1 = claim_of(&pool, d1, "Only in record one.").await;
+    for c in [x, only1] {
+        assert_eq!(
+            ingest_records(&pool, c).await,
+            vec![(d1.to_string(), a_id, true)],
+            "the creating ingest is recorded at creation"
+        );
+    }
+
+    ingest_wait(
+        &b,
+        &pool,
+        doc_with_atoms(d2, author.clone(), &[shared, "Only in record two."]),
+    )
+    .await;
+    assert_eq!(
+        ingest_records(&pool, x).await,
+        vec![(d1.to_string(), a_id, true), (d2.to_string(), b_id, false)],
+        "a converging document is recorded, never as the creator"
+    );
+    let only2 = claim_of(&pool, d2, "Only in record two.").await;
+    assert_eq!(
+        ingest_records(&pool, only2).await,
+        vec![(d2.to_string(), b_id, true)]
+    );
+
+    // The same document, re-ingested by another ingester.
+    tools::ingestion::do_ingest_document(&b, &viewer, &doc1(), None)
+        .await
+        .expect("b re-ingests the first document");
+    assert_eq!(
+        ingest_records(&pool, only1).await,
+        vec![(d1.to_string(), a_id, true), (d1.to_string(), b_id, false)],
+        "every later ingester of the same document is recorded"
+    );
+    // A re-run by the same ingester adds nothing.
+    tools::ingestion::do_ingest_document(&a, &viewer, &doc1(), None)
+        .await
+        .expect("a re-runs");
+    assert_eq!(
+        ingest_records(&pool, x).await.len(),
+        3,
+        "no duplicate record"
+    );
+
+    // A claim someone filed DIRECTLY, later repeated by a document.
+    let stated = "Directly stated before any document repeated it.";
+    tools::claims::submit_claim(
+        &a,
+        &viewer,
+        SubmitClaimParams {
+            content: stated.into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: "ev".into(),
+            evidence_type: "logical".into(),
+            confidence: 0.8,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+            novelty_threshold: None,
+        },
+        None,
+    )
+    .await
+    .expect("a files the claim directly");
+    ingest_wait(&b, &pool, doc_with_atoms(d3, author.clone(), &[stated])).await;
+    let direct = claim_of(&pool, d3, stated).await;
+    let filer: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(direct)
+        .fetch_one(&pool)
+        .await
+        .expect("filer");
+    assert_eq!(
+        filer, a_id,
+        "CALIBRATION: the document converged on a's claim"
+    );
+    assert_eq!(
+        ingest_records(&pool, direct).await,
+        vec![(d3.to_string(), b_id, false)],
+        "a document repeating a directly filed claim never becomes its creator"
+    );
 }

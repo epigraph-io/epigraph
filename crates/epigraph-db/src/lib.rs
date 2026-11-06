@@ -144,6 +144,10 @@ pub use repos::{
     RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
 };
+pub use repos::{
+    ClaimIngestRecord, ClaimIngestRepository, ClaimIngests, CREATED_CLAIM_PROPERTY,
+    INGESTED_BY_PROPERTY, INGEST_RECORD_RELATIONSHIP,
+};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,

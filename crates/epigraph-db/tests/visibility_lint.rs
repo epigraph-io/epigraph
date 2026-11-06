@@ -2286,6 +2286,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authorised by edges_tenancy's WITH CHECK.",
     ),
     (
+        "claim_ingest.rs",
+        "record_conn",
+        "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \
+         the claim, and every later one), on the ingest's own transaction, deduplicated on \
+         (paper, claim, properties->>'ingested_by'). Its dedup probe on edges is the same \
+         VISIBILITY-EXEMPT write-path read as create_processed_by_stamp_if_absent_conn (it \
+         must see an existing record whoever asks, or a re-run writes a duplicate); the INSERT \
+         goes through EdgeRepository::create_signed_conn and is authorised by edges_tenancy's \
+         WITH CHECK.",
+    ),
+    (
         "edge.rs",
         "create_processed_by_stamp_if_absent_conn",
         "WRITE. The paper -processed_by-> agent pipeline stamp on the ingest's own transaction, \
