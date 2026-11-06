@@ -478,7 +478,6 @@ async fn the_operator_deletes_a_step_with_provenance(pool: PgPool) {
     assert_eq!(rows.len(), 1, "{rows:?}");
     // The session that wrote the soft delete is the acting operator's own
     // stamp (workflow writes are made as the caller).
-    let _ = author_of(&pool, &step).await;
     assert_provenance(
         &rows[0],
         h,
@@ -491,6 +490,7 @@ async fn the_operator_deletes_a_step_with_provenance(pool: PgPool) {
         &auth,
     );
     assert_eq!(rows[0].1["write"]["step_lineage_id"], lineage.to_string());
+    assert_eq!(rows[0].1["write"]["step_claim_id"], step.as_str());
 }
 
 /// A NEW GENERATION by the submitter: the new row inherits the submitter, and

@@ -669,7 +669,6 @@ async fn writes(pool: &PgPool, agent: Uuid, group: Uuid) -> bool {
 struct World {
     router: axum::Router,
     mcp: epigraph_mcp::server::EpiGraphMcpFull,
-    op: Uuid,
     op_g: Uuid,
     system: Uuid,
     alpha: Uuid,
@@ -763,7 +762,6 @@ async fn world(pool: &PgPool) -> World {
     World {
         router: router(pool).await,
         mcp,
-        op,
         op_g,
         system,
         alpha,
@@ -993,7 +991,6 @@ async fn the_operators_linked_agent_writes_where_the_system_agent_did_but_as_its
         .expect("soft-delete a system-authored step");
     assert_eq!(deleted, legacy_steps[0].0);
     assert!((truth(&pool, deleted).await - 0.05).abs() < 1e-9);
-    let _ = (w.op, w.rb_g, w.dr_g, w.dr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

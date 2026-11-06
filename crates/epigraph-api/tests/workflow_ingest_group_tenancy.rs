@@ -1211,7 +1211,6 @@ async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the
     let seeded = stdio_ingest(&w.c_server, mcp_params(owner.clone(), Some(w.g)))
         .await
         .expect("the curator seeds a g-private atom");
-    let seeded_plan = plan_tenancy(&pool, uuid_of(&seeded["workflow_id"])).await;
     let atom: Uuid = sqlx::query_scalar(
         "SELECT c.id FROM edges e JOIN claims c ON c.id = e.target_id \
           WHERE e.source_id = $1 AND e.relationship = 'executes' \
@@ -1260,7 +1259,6 @@ async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the
             && !refused.contains(&seeded["workflow_id"].as_str().unwrap_or("-").to_string()),
         "the refusal names neither g nor the hidden workflow: {refused}"
     );
-    let _ = &seeded_plan;
     assert_eq!(
         row_counts(&pool).await,
         before,
@@ -1621,18 +1619,6 @@ async fn executes_count(pool: &PgPool, workflow_id: Uuid) -> i64 {
     .expect("count executes edges")
 }
 
-/// `out` without the keys that name the request itself (`workflow_id`,
-/// `canonical_name`) or list the caller's own planned ids (`reused_items`):
-/// what is left is the part of the answer that could describe the plan.
-fn plan_answer(out: &Value) -> Value {
-    let mut out = out.clone();
-    let obj = out.as_object_mut().expect("a JSON object");
-    for key in ["workflow_id", "canonical_name", "reused_items"] {
-        obj.remove(key);
-    }
-    out
-}
-
 /// A re-ingest of an existing `(canonical_name, generation)` is answered with
 /// `already_ingested: true` and the existing plan's `executes` count. That
 /// count is the CALLER's view of the plan, never the ingest stamp's: the
@@ -1706,7 +1692,6 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
              (declared {declared_group:?}): {answers:?}"
         );
     }
-    let _ = plan_answer;
 
     // c is a member of g: each plan's true size.
     for (body, size) in [&small, &large].into_iter().zip(&true_sizes) {

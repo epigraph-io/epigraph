@@ -3955,14 +3955,26 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        provision_personal_group(pool, auth.agent_id.expect("a principal")).await;
         auth
     }
 
+    /// Provision `agent`'s personal group through the real definer, as every
+    /// production agent has one (the MCP server's own agent at boot, an OAuth
+    /// agent at provisioning). Workflow writes are made as the caller, and a
+    /// caller with no live writable group is refused before anything is
+    /// written, so a fixture writer needs one.
+    async fn provision_personal_group(pool: &PgPool, agent: Uuid) {
+        let mut conn = pool.acquire().await.unwrap();
+        epigraph_db::AgentRepository::ensure_personal_group(&mut conn, agent)
+            .await
+            .expect("provision the fixture agent's personal group");
+    }
+
     /// `POST /api/v1/workflows/ingest` now REFUSES rather than falling back to
-    /// `state.db_pool`: the rows the executor writes are owned by the
-    /// `workflow-ingest-system` agent's personal group, and a connection that
-    /// cannot be stamped with that group's write authority is not one this
-    /// handler will write on. So the router needs a state carrying a
+    /// `state.db_pool`: the rows the executor writes are the CALLER's, owned by
+    /// a group it writes, and a connection that cannot be stamped with the
+    /// caller's write authority is not one this handler will write on. So the router needs a state carrying a
     /// `ScopedPool`; `AppState::with_db` leaves `scoped: None` and the handler
     /// answers 500 with "this server was not built from a ScopedPool", which is
     /// the conversion working rather than an inconvenience to route around.
@@ -4984,6 +4996,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        provision_personal_group(&pool, admin_agent).await;
         sqlx::query(
             "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
                                         granted_scopes, status, agent_id) \
@@ -5025,7 +5038,10 @@ mod tests {
         use axum::routing::post;
         let state = scoped_test_state(&pool).await;
         let ingester = registered_auth(&pool).await;
-        let stranger = test_auth();
+        // A registered agent with its own group: the step routes write as the
+        // caller, so a principal with no writable group at all is refused
+        // before the gate; this one reaches the gate, which is what is pinned.
+        let stranger = registered_auth(&pool).await;
         let router_as = |auth: crate::middleware::bearer::AuthContext| {
             axum::Router::new()
                 .route("/api/v1/workflows/ingest", post(ingest_workflow))
@@ -5162,6 +5178,18 @@ mod tests {
         let mut admin = test_auth();
         admin.scopes.push(CLAIMS_ADMIN.to_string());
         let admin_agent = admin.agent_id.unwrap();
+        // A registered agent with its own group from the start, so the
+        // grantless call below reaches the gate (the step routes write as the
+        // caller and refuse a principal with no writable group first).
+        sqlx::query(
+            "INSERT INTO agents (id, public_key, display_name) \
+             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
+        )
+        .bind(admin_agent)
+        .execute(&pool)
+        .await
+        .unwrap();
+        provision_personal_group(&pool, admin_agent).await;
         let audits_sql = "SELECT count(*) FROM security_events \
                           WHERE event_type = 'workflows.admin_write' AND agent_id = $1";
 
@@ -5199,14 +5227,6 @@ mod tests {
             .unwrap();
         assert_eq!(audits, 0, "grantless admin: nothing audited");
 
-        sqlx::query(
-            "INSERT INTO agents (id, public_key, display_name) \
-             VALUES ($1, decode(md5(random()::text) || md5(random()::text), 'hex'), 'u005 http admin')",
-        )
-        .bind(admin_agent)
-        .execute(&pool)
-        .await
-        .unwrap();
         sqlx::query(
             "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
                                         granted_scopes, status, agent_id) \
@@ -5271,6 +5291,7 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        provision_personal_group(pool, agent).await;
         (agent, client)
     }
 
