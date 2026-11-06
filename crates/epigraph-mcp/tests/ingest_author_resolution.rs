@@ -286,6 +286,88 @@ async fn an_absent_agent_id_never_attaches_a_same_named_existing_agent(pool: PgP
     assert_eq!(asserts_edges(&pool, human).await, 0, "never picked");
 }
 
+/// A name shared by more agents than the report lists: the oldest ten, and
+/// `candidates_truncated`. Same-named system identities and role nodes are
+/// never candidates (neither can author); an accent-folded spelling is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_never(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Wren Halvorsen";
+    let mut humans = Vec::new();
+    for _ in 0..11 {
+        humans.push(human_named(&pool, name).await);
+    }
+    let folded = human_named(&pool, "WREN HÄLVORSEN").await; // the 12th other
+    let (system, _) = fixture::seed_agent_with_group(&pool, "author-system-same-name").await;
+    assert!(fixture::register_system_agent(&pool, system).await);
+    let role: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE agent_type = 'role' LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .expect("a role node");
+    for id in [system, role] {
+        sqlx::query("UPDATE agents SET display_name = $2 WHERE id = $1")
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .expect("same name");
+    }
+
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc("10.9999/author-many", json!([{"name": name}])),
+    )
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["status"], "ambiguous", "{json}");
+    assert_eq!(
+        report["candidates_truncated"], true,
+        "12 others, 10 listed: {json}"
+    );
+    let listed: Vec<Uuid> = report["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| {
+            c["agent_id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .expect("id")
+        })
+        .collect();
+    assert_eq!(listed.len(), 10, "{json}");
+    assert_eq!(listed, humans[..10].to_vec(), "oldest first: {json}");
+    for never in [system, role] {
+        assert!(!listed.contains(&never), "{never} listed: {json}");
+    }
+    for id in humans.iter().chain([&folded]) {
+        assert_eq!(asserts_edges(&pool, *id).await, 0, "never picked");
+    }
+
+    // Case- and accent-folded: an unaccented spelling lists the accented
+    // holder, and still never picks it.
+    let accented = human_named(&pool, "Søren Ølgaard-Núñez").await;
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            "10.9999/author-folded",
+            json!([{"name": "soren olgaard-nunez"}]),
+        ),
+    )
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["status"], "ambiguous", "{json}");
+    assert_eq!(
+        report["candidates"][0]["agent_id"],
+        accented.to_string(),
+        "{json}"
+    );
+    assert!(report.get("candidates_truncated").is_none(), "{json}");
+    assert_eq!(asserts_edges(&pool, accented).await, 0, "never picked");
+}
+
 /// The default path is the old one: the same id `did_key_for_author` always
 /// produced, `created` the first time and `matched` after.
 #[sqlx::test(migrations = "../../migrations")]

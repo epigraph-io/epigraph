@@ -1153,7 +1153,6 @@ pub async fn do_ingest_document(
     // system-identity skips and the per-author report: `tools::ingest_authors`.
     let resolved = crate::tools::ingest_authors::resolve_document_authors(
         &mut tx,
-        viewer,
         authors,
         "ingest_document",
         &paper_title,
@@ -2126,7 +2125,6 @@ pub async fn do_ingest_document_spine(
     // system-identity skips and the per-author report: `tools::ingest_authors`.
     let resolved = crate::tools::ingest_authors::resolve_document_authors(
         &mut tx,
-        viewer,
         authors,
         "ingest_document_spine",
         &paper_title,

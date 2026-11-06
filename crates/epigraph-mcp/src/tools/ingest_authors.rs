@@ -115,7 +115,6 @@ pub(crate) async fn check_explicit_author_ids(
 /// gets one [`ResolvedAuthor`].
 pub(crate) async fn resolve_document_authors(
     conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
     authors: &[AuthorEntry],
     tool_name: &'static str,
     paper_title: &str,
@@ -200,29 +199,8 @@ pub(crate) async fn resolve_document_authors(
                 .map_err(internal_error)?;
             (created.id.into(), false)
         };
-        let (matches, candidates_truncated) = AgentLookupRepository::exact_name_candidates(
-            conn,
-            viewer,
-            &author.name,
-            agent_uuid,
-            AUTHOR_CANDIDATE_LIMIT,
-        )
-        .await
-        .map_err(internal_error)?;
-        let candidates: Vec<AuthorCandidate> = matches
-            .into_iter()
-            .map(|m| AuthorCandidate {
-                agent_id: m.agent_id.to_string(),
-                display_name: m.display_name,
-                tier: m.tier,
-                created_at: m.created_at,
-            })
-            .collect();
-        let status = match (candidates.is_empty() && !candidates_truncated, existed) {
-            (true, true) => "matched",
-            (true, false) => "created",
-            (false, _) => "ambiguous",
-        };
+        // The report is filled in below, once the whole list is resolved:
+        // one candidates statement per document, not one per author.
         out.push(ResolvedAuthor {
             idx,
             agent_id: agent_uuid,
@@ -230,17 +208,58 @@ pub(crate) async fn resolve_document_authors(
                 agent_id: agent_uuid.to_string(),
                 name: author.name.clone(),
                 position: idx,
-                status,
+                status: if existed { "matched" } else { "created" },
                 action: if existed {
                     "reused_name_key"
                 } else {
                     "created_name_key"
                 },
                 display_name: None,
-                candidates,
-                candidates_truncated,
+                candidates: Vec::new(),
+                candidates_truncated: false,
             },
         });
+    }
+    // Other agents with each name-derived author's (folded) name: listed,
+    // never chosen. An explicit author has no candidates.
+    let pending: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.report.status != "explicit")
+        .map(|(i, _)| i)
+        .collect();
+    if !pending.is_empty() {
+        let names: Vec<String> = pending
+            .iter()
+            .map(|&i| out[i].report.name.clone())
+            .collect();
+        let attached: Vec<Uuid> = pending.iter().map(|&i| out[i].agent_id).collect();
+        let found = AgentLookupRepository::exact_name_candidates(
+            conn,
+            &names,
+            &attached,
+            i64::try_from(AUTHOR_CANDIDATE_LIMIT).unwrap_or(10),
+        )
+        .await
+        .map_err(internal_error)?;
+        for (&i, (matches, total)) in pending.iter().zip(found) {
+            if matches.is_empty() {
+                continue;
+            }
+            let report = &mut out[i].report;
+            report.status = "ambiguous";
+            report.candidates_truncated =
+                usize::try_from(total).map_or(true, |t| t > matches.len());
+            report.candidates = matches
+                .into_iter()
+                .map(|m| AuthorCandidate {
+                    agent_id: m.agent_id.to_string(),
+                    display_name: m.display_name,
+                    tier: m.tier,
+                    created_at: m.created_at,
+                })
+                .collect();
+        }
     }
     Ok(out)
 }

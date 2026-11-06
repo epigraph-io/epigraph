@@ -724,49 +724,91 @@ impl AgentLookupRepository {
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
-    /// The agents OTHER than `attached` whose folded name equals `name`'s
-    /// (the matcher's `exact` tier), excluding registered system identities
-    /// and role nodes (neither can be named as an author), oldest first, at
-    /// most `limit`; and whether more exist.
+    /// For each `(name, attached)` pair, the agents OTHER than `attached`
+    /// whose folded name equals the folded `name` (the matcher's `exact` tier,
+    /// [`fold_sql`] on both sides, exactly as [`Self::match_by_name`] folds),
+    /// excluding registered system identities, holders of a system role's
+    /// legacy key and role nodes (none can author), oldest first, at most
+    /// `limit` per pair; and how many there are in all (so the caller knows
+    /// when the list is cut).
     ///
     /// What the document ingest reports as an author's `candidates` when it
     /// attaches the name-derived node and will not choose among the others.
-    /// The matches carry only public fields (id, `display_name`, tier,
-    /// `created_at`); the ORCID / ROR tiers never apply (`exact` only).
+    /// One statement for the whole author list, so the folded name of each
+    /// agent is computed once per document rather than once per author
+    /// (MEASURED, 7,600 agents, debug build: a 50-author document spent ~12 s
+    /// in a per-author matcher call). The matches carry only public fields
+    /// (id, `display_name`, `created_at`); the ORCID / ROR tiers never apply,
+    /// so nothing here depends on the caller's viewer.
     ///
     /// # Errors
-    /// As [`Self::match_by_name`] and [`Self::author_nodes`].
+    /// `DbError::InvalidData` when `names` and `attached` differ in length;
+    /// `DbError::QueryFailed` if the read fails.
     pub async fn exact_name_candidates(
         conn: &mut PgConnection,
-        viewer: &Viewer,
-        name: &str,
-        attached: Uuid,
-        limit: usize,
-    ) -> Result<(Vec<AgentNameMatch>, bool), DbError> {
-        // Exact sorts first, so the pool holds every exact match unless it
-        // is full and still exact at its last row (then more may exist).
-        let pool = Self::match_by_name(conn, viewer, name, CANDIDATE_POOL).await?;
-        let more_beyond_pool = pool.len() >= usize::try_from(CANDIDATE_POOL).unwrap_or(200)
-            && pool.last().is_some_and(|m| m.tier == MatchTier::Exact);
-        let exact: Vec<AgentNameMatch> = pool
-            .into_iter()
-            .filter(|m| m.tier == MatchTier::Exact && m.agent_id != attached)
+        names: &[String],
+        attached: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<(Vec<AgentNameMatch>, i64)>, DbError> {
+        if names.len() != attached.len() {
+            return Err(DbError::InvalidData {
+                reason: "one attached id per name".to_string(),
+            });
+        }
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reserved: Vec<Vec<u8>> = crate::repos::system_agent::SystemAgentRole::ALL
+            .iter()
+            .map(|r| r.legacy_public_key().to_vec())
             .collect();
-        let ids: Vec<Uuid> = exact.iter().map(|m| m.agent_id).collect();
-        let excluded: std::collections::HashSet<Uuid> = Self::author_nodes(conn, &ids)
-            .await?
-            .into_iter()
-            .filter(|n| n.is_role_node || n.is_registered_system || n.has_reserved_key)
-            .map(|n| n.id)
-            .collect();
-        let mut kept: Vec<AgentNameMatch> = exact
-            .into_iter()
-            .filter(|m| !excluded.contains(&m.agent_id))
-            .collect();
-        // `match_by_name` ranks exact ties by score (1.0 for all), then oldest.
-        let truncated = more_beyond_pool || kept.len() > limit;
-        kept.truncate(limit);
-        Ok((kept, truncated))
+        let sql = format!(
+            "WITH q AS ( \
+                 SELECT u.ord, {fold_q} AS f, u.attached \
+                   FROM unnest($1::text[], $2::uuid[]) WITH ORDINALITY AS u(name, attached, ord) \
+             ), c AS ( \
+                 SELECT a.id, a.display_name, a.created_at, {fold_name} AS fname \
+                   FROM agents a \
+                  WHERE a.agent_type <> 'role' \
+                    AND a.public_key <> ALL($3::bytea[]) \
+                    AND NOT EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
+             ), m AS ( \
+                 SELECT q.ord, c.id, c.display_name, c.created_at, \
+                        pg_catalog.row_number() OVER (PARTITION BY q.ord \
+                                                      ORDER BY c.created_at, c.id) AS rn, \
+                        pg_catalog.count(*) OVER (PARTITION BY q.ord) AS n \
+                   FROM q JOIN c ON c.fname = q.f \
+                  WHERE q.f <> '' AND c.id <> q.attached \
+             ) \
+             SELECT ord, id, display_name, created_at, n FROM m \
+              WHERE rn <= $4 ORDER BY ord, rn",
+            fold_q = fold_sql("u.name"),
+            fold_name = fold_sql("a.display_name"),
+        );
+        type Row = (i64, Uuid, Option<String>, DateTime<Utc>, i64);
+        let rows: Vec<Row> = sqlx::query_as(&sql)
+            .bind(names)
+            .bind(attached)
+            .bind(&reserved)
+            .bind(limit.max(1))
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut out: Vec<(Vec<AgentNameMatch>, i64)> =
+            (0..names.len()).map(|_| (Vec::new(), 0)).collect();
+        for (ord, agent_id, display_name, created_at, n) in rows {
+            let Some(slot) = usize::try_from(ord - 1).ok().and_then(|i| out.get_mut(i)) else {
+                continue;
+            };
+            slot.0.push(AgentNameMatch {
+                agent_id,
+                display_name,
+                tier: MatchTier::Exact,
+                score: 1.0,
+                created_at,
+            });
+            slot.1 = n;
+        }
+        Ok(out)
     }
 
     /// `find_agent`: rank name matches, card them, filter, cut to the limit.
