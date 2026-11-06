@@ -24,15 +24,16 @@
 //!   returned. `display_name` is matched as written, so a display name that
 //!   is itself an email address matches like any other name (every
 //!   `display_name` is already public through `GET /api/v1/agents`).
-//! * `operator_human` (the human the agent acts for): shown to EVERY reader,
-//!   by design: who an agent acts for is public, like the claims it files.
-//!   It is read from the binding RECORD (`operator_binding_sql`: the
-//!   agent's operator link, else its client allowance), never inferred from
-//!   an `OPERATED_BY` edge, which any edge writer can add, and never from
-//!   client or registration status, which would let a reader watch a
-//!   suspension. The agent's model, prompt snapshot and prompt text are NOT
-//!   on the card; they stay behind the prompt-history gate
-//!   ([`D4_OPERATOR_GATE_SQL`]).
+//! * `operator_human` (the human the agent is currently bound to): shown to
+//!   EVERY reader, by design: who an agent acts for is public, like the
+//!   claims it files. It is read from the binding RECORD
+//!   (`operator_binding_sql`: the agent's LIVE operator link, else its
+//!   unrevoked client allowance); a retired link or a revoked allowance
+//!   names nobody. Never inferred from an `OPERATED_BY` edge, which any edge
+//!   writer can add, and never from client, registration or membership
+//!   status, which would let a reader watch a suspension. The agent's model,
+//!   prompt snapshot and prompt text are NOT on the card; they stay behind
+//!   the prompt-history gate ([`D4_OPERATOR_GATE_SQL`]).
 //! * `kind`: derived from EVIDENCE, never from `agents.agent_type` alone
 //!   (the legacy create path defaulted every row to `'human'`). Each evidence
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
@@ -171,27 +172,38 @@ fn orcid_sql(expr: &str) -> String {
     format!("(CASE WHEN {norm} ~ '^[0-9]{{15}}[0-9X]$' THEN {norm} END)")
 }
 
-/// The human an agent acts for, in SQL, read from the binding RECORD so that
-/// no client or registration event moves it (it is shown to every reader):
-/// the agent's operator link in any state (107's
-/// `epigraph_operator_of_author`, retired links included, as
-/// `epigraph_human_of(agent, false)` reads them), else the operator its
-/// unrevoked migration-149 client allowance names.
+/// The human an agent is CURRENTLY bound to, in SQL, read from the binding
+/// RECORD alone so that no client, registration or membership event moves it
+/// (it is shown to every reader): when the agent has an operator link (107's
+/// `epigraph_operator_of_author`), that link's operator while the link is
+/// live, and nobody once it is retired; when it has no link, the operator its
+/// unrevoked migration-149 client allowance names. NULL for an unbound agent.
 ///
-/// It equals `epigraph_human_of(agent, false)` for every bound agent while
-/// that binding is in force. It differs only where `epigraph_human_of`
-/// consults client or registration STATUS, which a reader must not be able
-/// to watch: an allowance whose client (or whose operator's human client) is
-/// not active, or that a second client of the agent suspends, still names
-/// its operator; and a registered human that is also linked as an agent (an
-/// operated agent, migration 123) names its link operator whether or not its
-/// own client is active. Never inferred from an `OPERATED_BY` edge, which
-/// any edge writer can add. NULL for an unbound agent.
+/// This is `epigraph_human_of(agent, true)`'s structure with every status arm
+/// left out: a linked agent is bound by its link alone and never falls back
+/// to an allowance row (149's allowance arm requires the agent to hold no
+/// link), and a retired link names nobody (the operator still owns the
+/// agent's past claims, 107 section 7, but the agent never acts for it
+/// again). It differs from that function in two ways, both on purpose:
+///
+/// * STATUS is never read, so a reader cannot watch a suspension: an
+///   allowance whose client (or whose operator's human client) is not
+///   active, that a second client of the agent suspends, or whose operator's
+///   registration was revoked still names its operator until the allowance
+///   itself is revoked; a live link names its operator whatever the
+///   membership or registration state.
+/// * STRUCTURE: a registered human that is also linked as an agent (an
+///   operated agent, migration 123) names its link operator, where
+///   `epigraph_human_of` names the principal itself.
+///
+/// Never inferred from an `OPERATED_BY` edge, which any edge writer can add.
 fn operator_binding_sql(agent: &str) -> String {
     format!(
-        "COALESCE((SELECT o.operator_id FROM public.epigraph_operator_of_author({agent}) o), \
-                  (SELECT r.operator_id FROM public.author_binding_clients r \
-                    WHERE r.agent_id = {agent} AND r.revoked_at IS NULL))"
+        "CASE WHEN EXISTS (SELECT 1 FROM public.epigraph_operator_of_author({agent})) \
+              THEN (SELECT o.operator_id FROM public.epigraph_operator_of_author({agent}) o \
+                     WHERE NOT o.retired) \
+              ELSE (SELECT r.operator_id FROM public.author_binding_clients r \
+                     WHERE r.agent_id = {agent} AND r.revoked_at IS NULL) END"
     )
 }
 
@@ -255,7 +267,8 @@ pub enum AgentKind {
     /// granted roles; the window, not the current status, decides).
     Human,
     /// An agent with an LLM model on its (visible) profile, or, failing a
-    /// derived author key, an agent bound to a human (`operator_human`).
+    /// derived author key, an agent currently bound to a human
+    /// (`operator_human`).
     LlmAgent,
     /// An author node the document ingest created: its key is the
     /// deterministic name- (or ORCID-) derived key of `did_key_for_author`,
@@ -292,7 +305,7 @@ impl AgentKind {
     }
 }
 
-/// An agent the card names (the operator-linked human).
+/// An agent the card names (the human an agent is bound to).
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRef {
     pub id: Uuid,
@@ -335,8 +348,10 @@ pub struct AgentCard {
     pub roles: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
-    /// The human this agent acts for (its binding record), shown to every
-    /// reader; `None` for an unbound agent and for a human itself.
+    /// The human this agent is currently bound to (its live operator link,
+    /// else its unrevoked client allowance), shown to every reader; `None`
+    /// for an unbound agent, a retired link, a revoked allowance and a human
+    /// itself.
     pub operator_human: Option<AgentRef>,
     pub created_at: DateTime<Utc>,
     pub counts: CardCounts,
@@ -616,7 +631,7 @@ impl AgentLookupRepository {
         // 2. Disclosed roles (migration 198), for every carded agent at once.
         let roles = Self::disclosed_roles(conn, &ids).await?;
 
-        // 3. The operator-linked humans' names (agents are public).
+        // 3. The bound humans' names (agents are public).
         let humans: Vec<Uuid> = rows.iter().filter_map(|r| r.10).collect();
         let human_names: HashMap<Uuid, Option<String>> = if humans.is_empty() {
             HashMap::new()

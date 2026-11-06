@@ -1123,3 +1123,182 @@ async fn migration_198_refuses_more_than_200_agents(pool: PgPool) {
         .expect("200 ids accepted");
     assert!(ok.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The agent's human is its CURRENT live binding only
+// ---------------------------------------------------------------------------
+
+/// Retire `agent`'s live link through 191's maintenance verb, revoking its
+/// writer row in the same call (the verb's zero-authority precondition).
+async fn retire_link(pool: &PgPool, agent: Uuid) {
+    let outcome: String = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: String = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'lookup test retire', \
+                                                                     true)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("retire the link");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(outcome, "retired", "CALIBRATION: the link was live");
+}
+
+/// `epigraph_human_of(agent, true)`: the binding in force, links' retired bit
+/// honoured. Read on the harness connection.
+async fn live_human_of(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT public.epigraph_human_of($1, true)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("epigraph_human_of live")
+}
+
+/// A retired operator link is no longer the agent's human: the operator owns
+/// the agent's past claims, but the agent never acts for it again (107
+/// section 7), so the card must not present that human as the current one.
+/// Every reader's card of the retired agent then reads exactly like an
+/// unbound look-alike's, while the binding RECORD still names the operator
+/// (CALIBRATION: the retire is the only thing that changed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_link_is_not_shown_as_the_agents_human(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (human, _) = named_human(&pool, "Maren Quillfeather").await;
+    let (bot, _) = named(&pool, "quill-bot").await;
+    let (lookalike, _) = named(&pool, "quill-bot").await;
+    link(&pool, bot, human).await;
+    for who in [outsider, bot, human] {
+        assert_eq!(
+            card_as(&pool, who, bot)
+                .await
+                .operator_human
+                .map(|h| h.id),
+            Some(human),
+            "CALIBRATION: a live link is shown"
+        );
+    }
+
+    retire_link(&pool, bot).await;
+    assert_eq!(
+        human_of(&pool, bot).await,
+        Some(human),
+        "CALIBRATION: the link record still names the operator"
+    );
+    assert_eq!(
+        live_human_of(&pool, bot).await,
+        None,
+        "CALIBRATION: no binding is in force"
+    );
+
+    for who in [outsider, bot, human] {
+        let c = card_as(&pool, who, bot).await;
+        assert!(
+            c.operator_human.is_none(),
+            "a retired link is shown as the current human to {who}: {c:?}"
+        );
+        assert!(
+            !c.kind_evidence.contains(&"bound_to_visible_human"),
+            "{c:?}"
+        );
+    }
+    let out = cards_as(&pool, outsider, &[bot, lookalike]).await;
+    assert_eq!(
+        shape(&out[0]),
+        shape(&out[1]),
+        "a retired agent reads as an unbound one"
+    );
+
+    // A link RECORDED retired (107's link-retired path) is never shown either.
+    let (old_bot, _) = named(&pool, "quill-bot-legacy").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let rl = epigraph_db::AgentRepository::link_retired_agent(&mut conn, old_bot, human)
+        .await
+        .expect("record a retired link");
+    assert!(rl.link_retired, "CALIBRATION: recorded retired");
+    drop(conn);
+    assert_eq!(human_of(&pool, old_bot).await, Some(human), "CALIBRATION");
+    assert!(card_as(&pool, outsider, old_bot)
+        .await
+        .operator_human
+        .is_none());
+
+    // find_agent goes through the same card.
+    let r = find_as(&pool, outsider, "quill-bot", None, None, Some(25)).await;
+    for hit in &r.results {
+        assert!(hit.card.operator_human.is_none(), "{:?}", hit.card);
+    }
+}
+
+/// A revoked binding is no binding: a revoked client allowance names nobody,
+/// and an agent whose (retired) link record exists never falls back to an
+/// allowance row, exactly as `epigraph_human_of` never consults the
+/// allowance for a linked agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_binding_is_not_shown_and_a_retired_link_never_falls_back(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (h_allow, _) = named_human(&pool, "Ottoline Fairweather").await;
+    let (h_link, _) = named_human(&pool, "Caspian Thornbury").await;
+
+    // 1. An allowance revoked through 149's maintenance verb.
+    let (revoked_agent, revoked_client) =
+        allowance_bound(&pool, h_allow, "ledger-service").await;
+    assert_eq!(
+        card_as(&pool, outsider, revoked_agent)
+            .await
+            .operator_human
+            .map(|h| h.id),
+        Some(h_allow),
+        "CALIBRATION: an allowance in force is shown"
+    );
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, \
+                                                                              'lookup test')",
+        )
+        .bind(revoked_client)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke the allowance");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the allowance was live");
+    assert!(card_as(&pool, outsider, revoked_agent)
+        .await
+        .operator_human
+        .is_none());
+
+    // 2. An allowance whose agent was later linked (its client revoked first,
+    //    which 149 requires), and then that link retired: the allowance row
+    //    is still unrevoked, but a linked agent is bound by its link alone.
+    let (agent, client) = allowance_bound(&pool, h_allow, "archive-service").await;
+    set_client_status(&pool, client, "revoked").await;
+    link(&pool, agent, h_link).await;
+    assert_eq!(
+        card_as(&pool, outsider, agent)
+            .await
+            .operator_human
+            .map(|h| h.id),
+        Some(h_link),
+        "CALIBRATION: the link, not the allowance, binds a linked agent"
+    );
+    let unrevoked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM author_binding_clients WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("allowance rows");
+    assert_eq!(unrevoked, 1, "CALIBRATION: the allowance row is unrevoked");
+    retire_link(&pool, agent).await;
+    assert_eq!(live_human_of(&pool, agent).await, None, "CALIBRATION");
+    assert!(
+        card_as(&pool, outsider, agent)
+            .await
+            .operator_human
+            .is_none(),
+        "a retired link fell back to the allowance"
+    );
+}
