@@ -156,8 +156,8 @@ pub use repos::{
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{
-    PaperAuthorEdge, AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY,
-    AUTHORED_PENDING_KEY,
+    PaperAuthorEdge, PaperAuthorListing, AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY,
+    AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
 };
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};

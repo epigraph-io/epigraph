@@ -294,8 +294,18 @@ impl PaperRepository {
         Ok(row.count)
     }
 
-    /// List the authors of a paper as `(agent_id, display_name)` pairs,
-    /// resolved via `agent -authored-> paper` edges.
+    /// The paper's authors as a reader sees them: every in-force
+    /// `agent -authored-> paper` edge `viewer` may read, in the extraction's
+    /// order (`properties.position`, then age), each with what the edge
+    /// records. A RETRACTED authorship (an author the operator CLI replaced)
+    /// is not listed. An authorship an ingester asserted for someone it
+    /// neither is nor operates is listed with `pending_countersign: true` and
+    /// the ingester ([`AUTHORED_PENDING_KEY`], [`AUTHORED_INGESTED_BY_KEY`]),
+    /// never as a plain author: the same predicate the agent card counts by
+    /// ([`crate::agent_lookup::authorship_pending_sql`]).
+    ///
+    /// `query_paper`'s author list, and the reader a claim's literature
+    /// authorship should list a paper's authors with.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -304,30 +314,68 @@ impl PaperRepository {
         executor: E,
         viewer: &crate::visibility::Viewer,
         paper_id: Uuid,
-    ) -> Result<Vec<(Uuid, Option<String>)>, DbError> {
-        // MACRO SITE — static three-bind spelling.
-        let rows = sqlx::query!(
-            r#"
-            SELECT a.id AS "id!", a.display_name
-            FROM edges e
-            JOIN agents a ON a.id = e.source_id
-            WHERE e.target_id = $1
-              AND e.target_type = 'paper'
-              AND e.source_type = 'agent'
-              AND e.relationship = 'authored'
-              AND ($2::bool OR e.visibility = 'public'
-                   OR (e.owner_group_id = ANY($3::uuid[])
-                       AND (e.co_owner_group_id IS NULL
-                            OR e.co_owner_group_id = ANY($3::uuid[]))))
-            ORDER BY a.display_name NULLS LAST, a.id
-            "#,
-            paper_id,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-        Ok(rows.into_iter().map(|r| (r.id, r.display_name)).collect())
+    ) -> Result<Vec<PaperAuthorListing>, DbError> {
+        let sql = viewer.splice(
+            &format!(
+                "SELECT a.id, a.display_name, \
+                        CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+                             THEN (e.properties ->> 'position')::bigint END, \
+                        COALESCE(e.properties ->> 'role', 'author'), \
+                        CASE WHEN jsonb_typeof(e.properties -> 'affiliations') = 'array' \
+                             THEN e.properties -> 'affiliations' ELSE '[]'::jsonb END, \
+                        {pending}, \
+                        CASE WHEN {pending} \
+                             THEN e.properties ->> '{ingested_by}' END \
+                   FROM edges e \
+                   JOIN agents a ON a.id = e.source_id \
+                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
+                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
+                    AND {in_force} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                  ORDER BY 3 NULLS LAST, e.created_at, e.id",
+                pending = crate::agent_lookup::authorship_pending_sql("e"),
+                ingested_by = AUTHORED_INGESTED_BY_KEY,
+                in_force = crate::repos::edge::EDGE_IN_FORCE,
+            ),
+            2,
+        );
+        type Row = (
+            Uuid,
+            Option<String>,
+            Option<i64>,
+            String,
+            serde_json::Value,
+            bool,
+            Option<String>,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(
+                |(agent_id, display_name, position, role, affiliations, pending, by)| {
+                    PaperAuthorListing {
+                        agent_id,
+                        display_name,
+                        position,
+                        role,
+                        affiliations: affiliations
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        pending_countersign: pending,
+                        ingested_by: by.and_then(|s| s.parse().ok()),
+                    }
+                },
+            )
+            .collect())
     }
 
     /// List claim summaries asserted by this paper — one page of `limit` rows
@@ -618,10 +666,13 @@ pub const AUTHORED_NAME_KEY: &str = "author_name";
 /// neither is nor operates: `true` while the attribution is the ingester's
 /// word alone, until the named person countersigns. Such an author gets no
 /// `asserts` edge, and the agent card's `authored_papers` does not count it.
-pub const AUTHORED_PENDING_KEY: &str = "pending_countersign";
+/// The same key the card reads
+/// ([`crate::agent_lookup::AUTHORSHIP_PENDING_PROPERTY`]): one spelling.
+pub const AUTHORED_PENDING_KEY: &str = crate::agent_lookup::AUTHORSHIP_PENDING_PROPERTY;
 /// Property on a pending explicit `authored` edge: the agent that ingested
-/// the document, which is the one asserting the authorship.
-pub const AUTHORED_INGESTED_BY_KEY: &str = "ingested_by";
+/// the document, which is the one asserting the authorship
+/// ([`crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY`]).
+pub const AUTHORED_INGESTED_BY_KEY: &str = crate::agent_lookup::AUTHORSHIP_INGESTED_BY_PROPERTY;
 
 /// One in-force `authored` edge into a paper
 /// ([`PaperRepository::author_edges_conn`]).
@@ -635,6 +686,27 @@ pub struct PaperAuthorEdge {
     pub explicit: bool,
     /// The extraction's spelling, on an explicit edge ([`AUTHORED_NAME_KEY`]).
     pub author_name: Option<String>,
+}
+
+/// One author of a paper as [`PaperRepository::list_authors`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaperAuthorListing {
+    pub agent_id: Uuid,
+    pub display_name: Option<String>,
+    /// `properties.position` (the extraction's index), when it is a
+    /// non-negative integer.
+    pub position: Option<i64>,
+    /// `properties.role`, `"author"` when absent.
+    pub role: String,
+    /// `properties.affiliations` (strings only).
+    pub affiliations: Vec<String>,
+    /// The authorship is an ingester's word, awaiting the person's
+    /// countersignature ([`AUTHORED_PENDING_KEY`]): show it as pending,
+    /// never as a plain author.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the ingester that asserted it
+    /// ([`AUTHORED_INGESTED_BY_KEY`]); `None` otherwise.
+    pub ingested_by: Option<Uuid>,
 }
 
 /// Minimal claim shape returned by [`PaperRepository::list_asserted_claims`].

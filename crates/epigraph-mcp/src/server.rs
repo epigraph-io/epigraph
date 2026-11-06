@@ -1965,7 +1965,9 @@ impl EpiGraphMcpFull {
 
     // ── Paper Queries (3 tools) ──
 
-    #[tool(description = "Look up a paper by its DOI, returning title, authors, and claims.")]
+    #[tool(
+        description = "Look up a paper by its DOI, returning title, authors, and claims. authors[] lists only authorships in force (an author the operator replaced is gone), in the document's author order: {agent_id, name, position, pending_countersign, ingested_by}. pending_countersign=true marks an author an ingester named without being or operating them: the ingester's word (ingested_by names it), not the person's authorship."
+    )]
     async fn query_paper(
         &self,
         Parameters(params): Parameters<QueryPaperParams>,

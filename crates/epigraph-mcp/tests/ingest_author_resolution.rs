@@ -47,7 +47,7 @@ use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::{
     FindAgentParams, GetAgentParams, IngestDocumentInlineParams, IngestDocumentParams,
-    IngestDocumentSpineParams, IngestWorkflowParams,
+    IngestDocumentSpineParams, IngestWorkflowParams, QueryPaperParams,
 };
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -1264,4 +1264,88 @@ async fn workflow_ingest_refuses_an_author_agent_id(pool: PgPool) {
     .await
     .expect("CONTROL: a name-only author ingests");
     assert_eq!(workflows_named(&pool, "author-wf-control").await, 1);
+}
+
+/// `query_paper(doi)` as a public viewer on `server`.
+async fn query_paper(server: &EpiGraphMcpFull, pool: &PgPool, doi: &str) -> Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let r = tools::paper_queries::query_paper(
+        server,
+        &viewer,
+        QueryPaperParams {
+            doi: doi.to_string(),
+            limit: None,
+            offset: None,
+        },
+    )
+    .await
+    .expect("query_paper");
+    text(&r)
+}
+
+/// The paper's author listing (`query_paper`) honours what the ingest
+/// records: a RETRACTED author (here the name-derived node the operator CLI
+/// replaced) is not listed, an author an ingester named without speaking for
+/// them is listed as PENDING with the ingester, and the list is in the
+/// extraction's position order, not alphabetical.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_lists_only_in_force_authors_in_position_order_and_marks_the_pending(
+    pool: PgPool,
+) {
+    let server = privileged_server(&pool);
+    let reader = app_role_server(&pool).await;
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
+    let (first, second) = ("Thaddeus Wimbrel", "Abelard Quint");
+    let human = human_named(&pool, first).await;
+    let doi = "10.9999/author-listing";
+    let core = |extraction: DocumentExtraction| {
+        let (server, viewer) = (&server, &viewer);
+        async move {
+            text(
+                &tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
+                    .await
+                    .expect("the core ingests"),
+            )
+        }
+    };
+    core(doc(doi, json!([{"name": first}, {"name": second}]))).await;
+    let replaced = name_key_node(&pool, first).await.expect("name-key node");
+    let kept = name_key_node(&pool, second).await.expect("name-key node");
+    let json = core(doc(
+        doi,
+        json!([{"name": first, "agent_id": human.to_string()}, {"name": second}]),
+    ))
+    .await;
+    assert_eq!(
+        json["authors"][0]["replaced"]["agent_id"],
+        replaced.to_string(),
+        "{json}"
+    );
+    assert_eq!(
+        (
+            authored_edges(&pool, replaced, doi).await,
+            authored_in_force(&pool, replaced, doi).await
+        ),
+        (1, 0),
+        "CALIBRATION: the replaced author's edge survives, retracted"
+    );
+    let ingester = server.server_agent_id().await.expect("server agent");
+
+    let listed = query_paper(&reader, &pool, doi).await;
+    let authors = listed["authors"].as_array().expect("authors");
+    let ids: Vec<&str> = authors
+        .iter()
+        .map(|a| a["agent_id"].as_str().expect("agent_id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![human.to_string(), kept.to_string()],
+        "in force only, in position order: {listed}"
+    );
+    assert_eq!(authors[0]["position"], 0, "{listed}");
+    assert_eq!(authors[0]["pending_countersign"], true, "{listed}");
+    assert_eq!(authors[0]["ingested_by"], ingester.to_string(), "{listed}");
+    assert_eq!(authors[1]["position"], 1, "{listed}");
+    assert_eq!(authors[1]["pending_countersign"], false, "{listed}");
+    assert!(authors[1]["ingested_by"].is_null(), "{listed}");
 }

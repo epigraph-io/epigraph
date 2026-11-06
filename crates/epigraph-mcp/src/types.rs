@@ -1939,10 +1939,22 @@ pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     }
 }
 
+/// One author of a paper as `query_paper` lists it: only authorships in
+/// force, in the extraction's order (`position`). An authorship an ingester
+/// named without speaking for the person (`pending_countersign`) is listed
+/// as PENDING, with the ingester that asserted it (`ingested_by`), never as a
+/// plain author.
 #[derive(Debug, Serialize)]
 pub struct AuthorResponse {
     pub agent_id: String,
     pub name: String,
+    /// The author's index in the document's author list, when recorded.
+    pub position: Option<i64>,
+    /// The ingester's word, not yet countersigned by the person.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the agent that ingested the document and
+    /// named this author; `null` otherwise.
+    pub ingested_by: Option<String>,
 }
 
 /// One author of an ingested document, as the walk resolved it (backlog
