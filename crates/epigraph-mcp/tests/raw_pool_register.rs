@@ -775,15 +775,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         READ_PENDING,
     ),
     (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "assess_workflow_promotion",
-        3,
-        "READ_PENDING for the variant-parent lookup \
-         (WorkflowRepository::immediate_variant_parent, viewer-filtered over claims and edges); \
-         the two success_stats reads are NO_ROW_SECURITY (behavioral_executions carries no \
-         tenancy). Convert the first onto the caller's read.",
-    ),
-    (
         "epigraph-mcp/src/tools/workflow_hierarchical.rs",
         "find_workflow_hierarchical",
         3,
@@ -813,12 +804,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/matching.rs",
         "retire_match_candidate",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/workflows.rs",
-        "get_workflow_executions",
         1,
         NO_ROW_SECURITY,
     ),
@@ -932,7 +917,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 215;
+const HIGH_WATER: usize = 211;
 
 // ===========================================================================
 // The scanner.
