@@ -21,6 +21,11 @@
 //!   them, into a target group with `visibility = 'group'` (the audited admin
 //!   privatization act; see [`restrict`]). `reown-reverse` reverses its
 //!   manifest exactly.
+//! * `reown-workflows` — move listed workflow lineages (every generation, the
+//!   plan claims they execute, the rows those carry, and the source-owned plan
+//!   edges) out of a source group into a TEAM group the operator administers,
+//!   keeping every row's visibility (see [`reown_workflows`]). `reown-reverse`
+//!   reverses its manifest exactly, or refuses it whole.
 //!
 //! And the operator-binding commands (migration 122; see [`bind`]):
 //!
@@ -170,6 +175,7 @@ pub mod manifest;
 pub mod passkey;
 pub mod reown;
 pub mod reown_linked;
+pub mod reown_workflows;
 pub mod restrict;
 pub mod retire_link;
 pub mod reverse;

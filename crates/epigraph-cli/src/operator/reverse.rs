@@ -628,7 +628,10 @@ pub async fn run(
     // before the re-own it followed.
     let mut resolved = Vec::with_capacity(ordered.len());
     for (p, m) in &ordered {
-        if super::hide::is_hide_manifest(m) || super::restrict::is_restrict_manifest(m) {
+        if super::hide::is_hide_manifest(m)
+            || super::restrict::is_restrict_manifest(m)
+            || super::reown_workflows::is_reown_workflows_manifest(m)
+        {
             resolved.push((p, None, m));
         } else {
             resolved.push((p, Some(resolve(m, &specs)?), m));
@@ -642,6 +645,18 @@ pub async fn run(
     )?;
     let mut report = Report::default();
     'manifests: for (path, res, m) in &resolved {
+        // A reown-workflows manifest is restored whole, in one transaction,
+        // or refused whole (see `reown_workflows`'s module doc).
+        if super::reown_workflows::is_reown_workflows_manifest(m) {
+            if !super::reown_workflows::reverse_manifest(
+                conn, path, m, &specs, &unkeyed, opts, &mut report, out,
+            )
+            .await?
+            {
+                break 'manifests;
+            }
+            continue;
+        }
         // A restrict manifest (`restrict-claims --apply`) restores visibility
         // too; its own batches (see `restrict`'s module doc).
         if super::restrict::is_restrict_manifest(m) {
