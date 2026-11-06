@@ -592,9 +592,16 @@ impl Passkeys {
         serde_json::to_value(&pk).map_err(|e| malformed("credential", e))
     }
 
-    /// Start registering a LATER passkey on the anchored path: a plain
-    /// passkey registration (no attestation asked, a synced credential
-    /// allowed, user verification required), stored as an `anchored` state.
+    /// Start registering a LATER passkey on the anchored path: a passkey
+    /// registration that ASKS for attestation (`direct`) but needs none (a
+    /// synced credential allowed, user verification required), stored as an
+    /// `anchored` state. Asking matters: a browser strips the attestation of
+    /// a hardware key to `none` when the relying party asks for none, and a
+    /// hardware key whose attestation is trusted is recorded attested
+    /// ([`Self::finish_anchored_registration`]), so it stands on its own and
+    /// is not revoked with its anchor. Synced passkeys answer `none` either
+    /// way. No `attestationFormats` hint is given (the attested ceremony's
+    /// options carry one).
     ///
     /// The caller takes the anchored path only when [`Self::check_anchor`]
     /// admits the enrollment's [`ActAnchor`] (rows only the API or the
@@ -625,25 +632,48 @@ impl Passkeys {
             "kind": KIND_ANCHORED,
             "library": serde_json::to_value(&state).map_err(|e| malformed("state", e))?,
         });
-        Ok((
-            serde_json::to_value(&ccr).map_err(|e| malformed("options", e))?,
-            RegistrationState(state),
-        ))
+        let mut options = serde_json::to_value(&ccr).map_err(|e| malformed("options", e))?;
+        // The library's passkey options ask for `none`; the finish never
+        // reads the preference, so asking for more changes only what the
+        // browser passes through.
+        match options.pointer_mut("/publicKey/attestation") {
+            Some(preference) => *preference = Value::from("direct"),
+            None => return Err(PasskeyError::State("no attestation preference".into())),
+        }
+        Ok((options, RegistrationState(state)))
     }
 
     /// Finish a registration on the anchored path: `anchor` must admit it
-    /// ([`Self::check_anchor`], re-run here), the state must have been
-    /// started as an anchored one, and the response must carry NO
-    /// attestation statement (`none`): this path verifies none, so a
-    /// statement here would be recorded as if it had been, and could anchor
-    /// a further passkey. The passkey is recorded as `none` with the nil
-    /// AAGUID; [`Self::hardware_attested`] never admits it as an anchor, and
-    /// [`Self::check_anchor`] refuses any anchor whose lineage contains it.
+    /// ([`Self::check_anchor`], re-run here) and the state must have been
+    /// started as an anchored one. What is recorded depends on the response's
+    /// attestation (the library has verified its signature over this
+    /// credential, and chained it to nothing):
+    ///
+    /// * `none` (a synced passkey; a hardware key whose user declined to share
+    ///   its model): recorded `none` with the nil AAGUID. It holds only
+    ///   through its anchor: [`Self::hardware_attested`] never admits it as an
+    ///   anchor, [`Self::check_anchor`] refuses any anchor whose lineage holds
+    ///   it, and migration 200's cascade revokes it with its anchor.
+    /// * a statement that is hardware-attested under THIS configuration now
+    ///   ([`Self::hardware_attested`]: an allowlisted model's chain, or an
+    ///   Android key under the Android roots, rules and status list; device
+    ///   bound): recorded as attested (its format and model), exactly as the
+    ///   attested ceremony would record it. It stands on its own: it is not
+    ///   revoked with its anchor, and it may anchor in turn (P779R-3: a backup
+    ///   hardware key enrolled with the setting on).
+    /// * any other statement (self attestation, an unlisted model, an
+    ///   unconfigured root, a synced credential with a statement): its
+    ///   attestation is DROPPED and the passkey recorded `none`, as a browser
+    ///   would have recorded it had the relying party asked for none (WebAuthn
+    ///   lets a relying party treat an untrusted attestation as none). It is
+    ///   then the first case. A statement is never recorded unless it is
+    ///   trusted here, so it cannot anchor unverified.
     ///
     /// # Errors
     /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
-    /// [`PasskeyError::State`], [`PasskeyError::AttestationRefused`] (an
-    /// attestation statement), or the library's refusal.
+    /// [`PasskeyError::State`], or the library's refusal (which comes before
+    /// any of the above: a statement the library cannot verify at all is
+    /// refused, not dropped).
     pub fn finish_anchored_registration(
         &self,
         response: &Value,
@@ -668,14 +698,38 @@ impl Passkeys {
             .map_err(|e| refused(&e))?;
         let registered =
             registered_from(serde_json::to_value(&pk).map_err(|e| malformed("credential", e))?)?;
-        if registered.attestation_format != "none" {
-            return Err(PasskeyError::AttestationRefused(format!(
-                "an anchored passkey is registered without attestation, and this response \
-                 carries a `{}` statement this path does not verify",
-                registered.attestation_format
-            )));
+        if registered.attestation_format == "none" {
+            return Ok(registered);
         }
-        Ok(registered)
+        match self.hardware_attested(
+            &registered.passkey,
+            &registered.attestation_format,
+            registered.aaguid,
+            registered.backup_eligible,
+        ) {
+            Ok(()) => {
+                tracing::info!(
+                    target: "passkey.anchor",
+                    act = %anchor.act_id,
+                    format = %registered.attestation_format,
+                    aaguid = %registered.aaguid,
+                    "an anchored enrollment registered a hardware-attested passkey; it is \
+                     recorded attested and stands on its own"
+                );
+                Ok(registered)
+            }
+            Err(why) => {
+                tracing::info!(
+                    target: "passkey.anchor",
+                    act = %anchor.act_id,
+                    format = %registered.attestation_format,
+                    reason = %why,
+                    "an anchored enrollment's attestation is not trusted here; it is dropped and \
+                     the passkey recorded `none`"
+                );
+                registered_from(without_attestation(registered.passkey)?)
+            }
+        }
     }
 
     /// Whether `anchor` admits an anchored registration: its act is a
@@ -1541,6 +1595,26 @@ pub fn evidence_challenge(evidence: &Value) -> Result<Vec<u8>, PasskeyError> {
     URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|e| malformed("evidence challenge", e))
+}
+
+/// A library-serialized credential (`{"cred": {...}}`) with its attestation
+/// dropped: the attestation, its metadata and its format replaced by what the
+/// library records for a `none` registration. The key, credential id,
+/// counter, flags and everything else are untouched.
+fn without_attestation(mut passkey: Value) -> Result<Value, PasskeyError> {
+    let cred = passkey
+        .get_mut("cred")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| malformed("credential", "no cred"))?;
+    cred.insert(
+        "attestation".into(),
+        serde_json::json!({"data": "None", "metadata": "None"}),
+    );
+    cred.insert("attestation_format".into(), Value::from("none"));
+    // Still a credential the library reads (it is asserted with later).
+    serde_json::from_value::<Passkey>(passkey.clone())
+        .map_err(|e| malformed("credential without its attestation", e))?;
+    Ok(passkey)
 }
 
 /// The row columns of a library-serialized credential (`{"cred": {...}}`).

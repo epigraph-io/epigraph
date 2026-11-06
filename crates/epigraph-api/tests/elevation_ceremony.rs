@@ -3490,6 +3490,15 @@ async fn the_act_ceremony_fails_closed_unconfigured_and_on_an_unknown_act(pool: 
 // passkey.register act confirmed by the same person's attested passkey
 // =====================================================================
 
+/// Whether an enrollment challenge's options are the ANCHORED ceremony's.
+/// Both ceremonies ask for `direct` attestation (the anchored one so that a
+/// browser passes a hardware key's statement through); only the attested
+/// ceremony's options carry an `attestationFormats` hint.
+fn anchored_options(options: &Value) -> bool {
+    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    options["publicKey"].get("attestationFormats").is_none()
+}
+
 /// The authenticator model no allowlist names (a password manager's).
 const SYNCED_MODEL: Uuid = Uuid::from_u128(0xcb69_481e_8ff7_4039_93ec_0a27_29a1_54a8);
 
@@ -3633,8 +3642,8 @@ async fn passkey_rows(pool: &PgPool, person: Uuid) -> Vec<(String, bool)> {
 
 /// The anchored path end to end, through the real router: P's FIRST passkey
 /// is an attested hardware key; P's `passkey.register` act, confirmed with
-/// it, opens an enrollment whose challenge asks for NO attestation, and a
-/// synced passkey (`none`, backup-eligible) registers on it, recorded as
+/// it, opens an enrollment whose challenge is the anchored one (attestation
+/// asked for, not needed), and a synced passkey (`none`, backup-eligible) registers on it, recorded as
 /// such and answering which act anchored it. That synced passkey then
 /// anchors nothing: a further act confirmed WITH IT opens an enrollment that
 /// is attested again, and another synced passkey is refused there. The
@@ -3655,7 +3664,7 @@ async fn a_synced_passkey_registers_on_an_act_confirmed_by_an_attested_one(pool:
     let id = act_enrollment(&pool, p.person, act).await;
     let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
-    assert_eq!(options["publicKey"]["attestation"], "none", "{options}");
+    assert!(anchored_options(&options), "{options}");
     assert_eq!(
         status,
         StatusCode::OK,
@@ -3674,8 +3683,8 @@ async fn a_synced_passkey_registers_on_an_act_confirmed_by_an_attested_one(pool:
     let id2 = act_enrollment(&pool, p.person, act2).await;
     let mut another = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id2, &mut another, Value::clone).await;
-    assert_eq!(
-        options["publicKey"]["attestation"], "direct",
+    assert!(
+        !anchored_options(&options),
         "the attested ceremony: {options}"
     );
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -3700,9 +3709,10 @@ async fn a_synced_passkey_registers_on_an_act_confirmed_by_an_attested_one(pool:
 /// on it, but its lineage holds the synced passkey, so the enrollment runs
 /// the attested ceremony and another synced passkey is refused. CALIBRATION:
 /// a hardware key registered on an act confirmed by the FIRST passkey (by a
-/// server with the setting off: with it on, that enrollment would take the
-/// anchored path, which records only unattested passkeys) does anchor a
-/// synced passkey.
+/// server with the setting off, the attested ceremony; with it on the
+/// anchored ceremony records it attested too, which
+/// `a_backup_hardware_key_on_the_anchored_path_is_attested_and_outlives_its_anchor`
+/// covers) does anchor a synced passkey.
 ///
 /// Mutation: `check_anchor`'s lineage loop removed -> the second synced
 /// passkey registers (the PR head's behaviour).
@@ -3725,7 +3735,7 @@ async fn a_synced_passkey_anchors_nothing_through_a_chain_of_acts(pool: PgPool) 
     let id = act_enrollment(&pool, p.person, act).await;
     let mut laundered = SoftAuthenticator::new(MODEL).hardware();
     let (options, (status, body)) = enroll_on(&s, id, &mut laundered, |x| att.rewrap(x)).await;
-    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert!(!anchored_options(&options), "{options}");
     assert_eq!(
         status,
         StatusCode::OK,
@@ -3737,17 +3747,15 @@ async fn a_synced_passkey_anchors_nothing_through_a_chain_of_acts(pool: PgPool) 
     let id = act_enrollment(&pool, p.person, act).await;
     let mut second_synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut second_synced, Value::clone).await;
-    assert_eq!(
-        options["publicKey"]["attestation"], "direct",
+    assert!(
+        !anchored_options(&options),
         "the lineage holds a synced passkey, so the ceremony is attested: {options}"
     );
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "registration_refused", "{body}");
 
-    // CALIBRATION: a hardware key authorized by the FIRST passkey anchors.
-    // With the setting on, an enrollment the first passkey anchors accepts
-    // only an unattested passkey, so the second hardware key is enrolled by a
-    // server with the setting off.
+    // CALIBRATION: a hardware key authorized by the FIRST passkey anchors
+    // (enrolled here by a server with the setting off, the attested ceremony).
     let s_off = spawn(&pool, Some(anchored_rp(&att, false))).await;
     let act = register_act(&s, &p, &token, &mut first).await;
     let id = act_enrollment(&pool, p.person, act).await;
@@ -3758,7 +3766,7 @@ async fn a_synced_passkey_anchors_nothing_through_a_chain_of_acts(pool: PgPool) 
     let id = act_enrollment(&pool, p.person, act).await;
     let mut third_synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut third_synced, Value::clone).await;
-    assert_eq!(options["publicKey"]["attestation"], "none", "{options}");
+    assert!(anchored_options(&options), "{options}");
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
@@ -3770,8 +3778,8 @@ async fn a_synced_passkey_anchors_nothing_through_a_chain_of_acts(pool: PgPool) 
 /// still registers there.
 ///
 /// Mutation: the challenge choosing the anchored ceremony from the setting
-/// alone (not from the enrollment's anchor) -> the challenge asks for no
-/// attestation, and the finish refuses the state instead
+/// alone (not from the enrollment's anchor) -> the challenge's options are
+/// the anchored ones, and the finish refuses the state instead
 /// (`ceremony_state_unusable`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_first_passkey_is_attested_with_the_anchored_setting_on(pool: PgPool) {
@@ -3782,7 +3790,7 @@ async fn a_first_passkey_is_attested_with_the_anchored_setting_on(pool: PgPool) 
     let id = maintenance_enrollment(&pool, q.person).await;
     let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
-    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert!(!anchored_options(&options), "{options}");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "registration_refused", "{body}");
     let mut hw_none = SoftAuthenticator::new(MODEL).hardware();
@@ -3917,7 +3925,7 @@ async fn a_forged_act_confirmation_anchors_nothing(pool: PgPool) {
     let id = act_enrollment(&pool, p.person, act).await;
     let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
-    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert!(!anchored_options(&options), "{options}");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(passkey_rows(&pool, p.person).await.len(), 1);
 }
@@ -3943,7 +3951,7 @@ async fn with_the_setting_off_a_later_passkey_is_attested(pool: PgPool) {
     let id = act_enrollment(&pool, p.person, act).await;
     let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
     let (options, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
-    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert!(!anchored_options(&options), "{options}");
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "registration_refused", "{body}");
 
@@ -3957,6 +3965,110 @@ async fn with_the_setting_off_a_later_passkey_is_attested(pool: PgPool) {
         passkey_rows(&pool, p.person).await,
         vec![("packed".to_string(), false), ("packed".to_string(), false)]
     );
+}
+
+/// P779R-3: with the setting ON, a BACKUP HARDWARE KEY enrolled on an act the
+/// first passkey confirmed runs the anchored ceremony and is recorded
+/// ATTESTED (its attestation is trusted now, so it is kept; `anchored_by`
+/// null), beside a synced passkey recorded `none` on another of that
+/// passkey's acts. Revoking the first passkey (a lost phone) revokes the
+/// synced passkey with it (migration 200's cascade) and EXCLUDES the backup,
+/// which stays live; and the backup still anchors a new synced passkey with
+/// the revoked first passkey on its lineage (P779R-1: being revoked does not
+/// break a lineage).
+///
+/// Red line (df4c5cdf): the backup's attested response was refused on the
+/// anchored path (`registration_refused`), and one sent as `none` was
+/// recorded `none` and revoked with the phone. Mutation: the anchored finish
+/// dropping every statement -> the backup is recorded `none` and the cascade
+/// revokes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_backup_hardware_key_on_the_anchored_path_is_attested_and_outlives_its_anchor(
+    pool: PgPool,
+) {
+    let att = TestAttestation::new("Allowlisted");
+    let s = spawn(&pool, Some(anchored_rp(&att, true))).await;
+    let (p, mut phone) = attested_holder(&pool, &s, &att, "backup").await;
+    let phone_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM person_authenticators WHERE person_agent_id = $1")
+            .bind(p.person)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let token = elevated_token_device_bound(&s, &pool, &p).await;
+
+    // A synced passkey on one of the phone's acts ...
+    let act = register_act(&s, &p, &token, &mut phone).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
+    let (options, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
+    assert!(anchored_options(&options), "{options}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["anchored_by"], act.to_string(), "{body}");
+
+    // ... and a backup hardware key on another, through the same ANCHORED
+    // ceremony: recorded attested.
+    let act = register_act(&s, &p, &token, &mut phone).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut backup = SoftAuthenticator::new(MODEL).hardware();
+    let (options, (status, body)) = enroll_on(&s, id, &mut backup, |x| att.rewrap(x)).await;
+    assert!(
+        anchored_options(&options),
+        "the anchored ceremony: {options}"
+    );
+    assert_eq!(status, StatusCode::OK, "the backup registers: {body}");
+    assert_eq!(body["attestation_format"], "packed", "{body}");
+    assert_eq!(
+        body["anchored_by"],
+        Value::Null,
+        "it needs no anchor: {body}"
+    );
+
+    // The phone is lost: `revoke-passkey` on it.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT public.epigraph_revoke_passkey($1, 'phone lost')")
+            .bind(phone_id)
+            .execute(&mut *conn)
+            .await
+            .expect("revoke the phone");
+        (conn, ())
+    })
+    .await;
+    let after: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT attestation_format, revoked_at IS NULL FROM person_authenticators \
+          WHERE person_agent_id = $1 ORDER BY created_at, id",
+    )
+    .bind(p.person)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after,
+        vec![
+            ("packed".to_string(), false),
+            ("none".to_string(), false),
+            ("packed".to_string(), true),
+        ],
+        "the phone and the synced passkey it anchored are revoked; the backup is live"
+    );
+
+    // The backup anchors a new synced passkey; its lineage holds the revoked
+    // phone. (A new refresh family: the phone's elevation ended with it.)
+    let p2 = Person {
+        family: family(&pool, p.client).await,
+        ..p.clone()
+    };
+    let token = elevated_token_device_bound(&s, &pool, &p2).await;
+    let act = register_act(&s, &p2, &token, &mut backup).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut replacement = SoftAuthenticator::new(SYNCED_MODEL);
+    let (options, (status, body)) = enroll_on(&s, id, &mut replacement, Value::clone).await;
+    assert!(
+        anchored_options(&options),
+        "the backup anchors, the revoked phone on its lineage: {options}"
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["anchored_by"], act.to_string(), "{body}");
 }
 
 /// An ANDROID hardware key enrolls end to end through the router under an

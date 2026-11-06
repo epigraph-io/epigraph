@@ -17,7 +17,11 @@
 //! (`epigraph_passkey::Passkeys::check_anchor` over migration 200's reader,
 //! which re-verifies the recorded confirmation, and the anchor's and its
 //! lineage's stored attestation against the roots configured NOW): a plain
-//! registration with no attestation, so a synced passkey can register.
+//! registration that asks for attestation but needs none, so a synced passkey
+//! can register (recorded `none`, answering `anchored_by`), and a hardware key
+//! whose attestation is trusted now is recorded attested and stands on its own
+//! (`anchored_by` null; an untrusted statement is dropped and the passkey
+//! recorded `none`).
 //! Migration 200's insert guard refuses the completion if the anchor was
 //! revoked meanwhile, and its cascade revokes the passkey with its anchor. The path is decided from
 //! those rows at the challenge AND again at the finish, never from the stored
@@ -476,6 +480,12 @@ pub async fn enroll_finish(
             return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
         }
     };
+    // The act a passkey holds through: an anchored ceremony's passkey recorded
+    // `none`. One recorded attested there needs no anchor.
+    let anchored_by = anchor
+        .as_ref()
+        .filter(|_| registered.attestation_format == "none")
+        .map(|a| a.act_id);
     let mut conn = match state.db_pool.acquire().await {
         Ok(c) => c,
         Err(err) => return internal("acquire", &err),
@@ -497,6 +507,7 @@ pub async fn enroll_finish(
                 aaguid = %registered.aaguid,
                 format = %registered.attestation_format,
                 anchored = anchor.is_some(),
+                anchored_by = ?anchored_by,
                 "passkey registered"
             );
             harden(
@@ -506,7 +517,10 @@ pub async fn enroll_finish(
                         "passkey_id": passkey_id,
                         "aaguid": registered.aaguid,
                         "attestation_format": registered.attestation_format,
-                        "anchored_by": anchor.as_ref().map(|a| a.act_id),
+                        // Only a passkey that holds through its anchor: one
+                        // recorded attested on the anchored path stands on
+                        // its own attestation.
+                        "anchored_by": anchored_by,
                     })),
                 )
                     .into_response(),

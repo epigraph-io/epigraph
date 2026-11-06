@@ -928,10 +928,13 @@ async fn confirmed_anchor(
 /// with `none` attestation, registers when its act was confirmed by the same
 /// person's hardware-attested passkey, and is recorded as `none`,
 /// backup-eligible, with the nil AAGUID, so it can never anchor in turn.
-/// The anchored challenge asks for no attestation and allows a synced
-/// credential. Mutation: `finish_anchored_registration` finishing as an
-/// attested registration -> refused (the CALIBRATION that the path is what
-/// admits it).
+/// The anchored challenge ASKS for attestation (`direct`, so a browser passes
+/// a hardware key's statement through rather than stripping it to `none`),
+/// gives no `attestationFormats` hint (the attested challenge's options carry
+/// one, which is how a caller tells the two apart), and allows a synced
+/// credential. Red line (df4c5cdf): the anchored options asked for `none`.
+/// Mutation: `finish_anchored_registration` finishing as an attested
+/// registration -> refused (the CALIBRATION that the path is what admits it).
 #[tokio::test]
 async fn a_later_unattested_passkey_anchored_by_an_attested_one_registers() {
     let vendor = TestAttestation::new("Allowlisted");
@@ -944,7 +947,16 @@ async fn a_later_unattested_passkey_anchored_by_an_attested_one_registers() {
     let (options, state) = rp
         .start_anchored_registration(person, "operator", "Operator")
         .expect("anchored start");
-    assert_eq!(options["publicKey"]["attestation"], "none", "{options}");
+    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert!(
+        options["publicKey"].get("attestationFormats").is_none(),
+        "{options}"
+    );
+    let (attested_options, _) = start(&rp);
+    assert!(
+        attested_options["publicKey"]["attestationFormats"].is_array(),
+        "CALIBRATION: the attested options carry the hint: {attested_options}"
+    );
     let mut synced = SoftAuthenticator::new(OTHER_MODEL);
     let response = synced
         .register(ORIGIN, options, ClientUv::AsRequested)
@@ -1125,34 +1137,123 @@ async fn the_recorded_confirmation_is_reverified() {
     assert_eq!(rp.check_anchor(&grant), Err(AnchorRefusal::NotARegisterAct));
 }
 
-/// The anchored path verifies NO attestation, so it accepts none: a
-/// response carrying a statement (a packed one with a certificate, or self
-/// attestation) is refused rather than recorded as if it were verified, which
-/// would let it anchor a further passkey. Mutation: the `none`-only check
-/// removed -> the packed response is recorded `packed` with its model.
+/// The anchored path records a statement only when it is TRUSTED here
+/// (P779R-3), and drops any other, so nothing unverified can anchor:
+///
+/// * an allowlisted model's `packed` chain (a backup hardware key): recorded
+///   `packed` with its model, hardware-attested now, so it stands on its own
+///   and may anchor in turn;
+/// * self attestation, a chain from a root nobody configured, and an
+///   allowlisted root's chain for a model not on the allowlist: the
+///   attestation is dropped and the passkey recorded `none` with the nil
+///   AAGUID, its stored attestation exactly a genuine `none` registration's,
+///   and never hardware-attested. Such a passkey still asserts.
+///
+/// Red line (df4c5cdf): every statement was refused (`AttestationRefused`,
+/// "without attestation"). Mutation: the `hardware_attested` gate in
+/// `finish_anchored_registration` replaced by `Ok(())` -> the unconfigured
+/// root's and the unlisted model's chains are recorded `packed`.
 #[tokio::test]
-async fn the_anchored_path_refuses_an_attestation_statement() {
+async fn the_anchored_path_records_a_trusted_attestation_and_drops_any_other() {
     let vendor = TestAttestation::new("Allowlisted");
+    let nobody = TestAttestation::new("Nobody");
     let rp = attested(Some((&vendor, &[MODEL])), None, true);
     let person = Uuid::new_v4();
     let (mut first, reg) = attested_passkey(&rp, &vendor).await;
     let anchor = confirmed_anchor(&rp, &mut first, &reg, person).await;
-    for statement in ["x5c", "self"] {
-        let (options, state) = rp
-            .start_anchored_registration(person, "operator", "Operator")
-            .unwrap();
-        let mut auth = SoftAuthenticator::new(MODEL).hardware();
-        let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
-        let response = if statement == "x5c" {
-            vendor.rewrap(&created)
+    let anchored = |model: Uuid| {
+        let rp = &rp;
+        async move {
+            let (options, state) = rp
+                .start_anchored_registration(person, "operator", "Operator")
+                .unwrap();
+            let mut auth = SoftAuthenticator::new(model).hardware();
+            let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+            (auth, created, state)
+        }
+    };
+
+    // CALIBRATION: what a genuine `none` registration stores.
+    let (_, created, state) = anchored(MODEL).await;
+    let genuine_none = rp
+        .finish_anchored_registration(&created, &state, &anchor)
+        .expect("a device-bound none registers");
+    assert_eq!(genuine_none.attestation_format, "none");
+
+    // A trusted statement: recorded attested.
+    let (mut backup, created, state) = anchored(MODEL).await;
+    let attested_backup = rp
+        .finish_anchored_registration(&vendor.rewrap(&created), &state, &anchor)
+        .expect("a trusted hardware key registers");
+    assert_eq!(
+        (
+            attested_backup.attestation_format.as_str(),
+            attested_backup.aaguid,
+            attested_backup.backup_eligible
+        ),
+        ("packed", MODEL, false)
+    );
+    rp.hardware_attested(
+        &attested_backup.passkey,
+        &attested_backup.attestation_format,
+        attested_backup.aaguid,
+        attested_backup.backup_eligible,
+    )
+    .expect("it is hardware-attested, so it may anchor");
+    let its_anchor = confirmed_anchor(&rp, &mut backup, &attested_backup, person).await;
+    assert_eq!(rp.check_anchor(&its_anchor), Ok(()), "it anchors in turn");
+
+    // Untrusted statements: dropped, recorded `none`.
+    for label in ["self", "unconfigured root", "model not allowlisted"] {
+        let (mut auth, created, state) = if label == "model not allowlisted" {
+            anchored(OTHER_MODEL).await
         } else {
-            auth.self_attest(&created)
+            anchored(MODEL).await
         };
-        let why = policy_refusal(
-            rp.finish_anchored_registration(&response, &state, &anchor)
-                .unwrap_err(),
+        let response = match label {
+            "self" => auth.self_attest(&created),
+            "unconfigured root" => nobody.rewrap(&created),
+            _ => vendor.rewrap(&created),
+        };
+        let dropped = rp
+            .finish_anchored_registration(&response, &state, &anchor)
+            .unwrap_or_else(|e| panic!("{label}: registers without its attestation: {e}"));
+        assert_eq!(
+            (dropped.attestation_format.as_str(), dropped.aaguid),
+            ("none", Uuid::nil()),
+            "{label}"
         );
-        assert!(why.contains("without attestation"), "{statement}: {why}");
+        assert_eq!(
+            (
+                &dropped.passkey["cred"]["attestation"],
+                &dropped.passkey["cred"]["attestation_format"]
+            ),
+            (
+                &genuine_none.passkey["cred"]["attestation"],
+                &genuine_none.passkey["cred"]["attestation_format"]
+            ),
+            "{label}: stored exactly as a none registration"
+        );
+        assert!(
+            rp.hardware_attested(
+                &dropped.passkey,
+                "none",
+                Uuid::nil(),
+                dropped.backup_eligible
+            )
+            .is_err(),
+            "{label}"
+        );
+        // It still asserts with the key it registered.
+        let stored = StoredPasskey {
+            passkey: dropped.passkey.clone(),
+            sign_count: 0,
+        };
+        let (options, state) = rp
+            .start_authentication(std::slice::from_ref(&stored), None)
+            .unwrap();
+        rp.finish_authentication(&auth.authenticate(ORIGIN, options).await, &state)
+            .unwrap_or_else(|e| panic!("{label}: asserts: {e}"));
     }
 }
 

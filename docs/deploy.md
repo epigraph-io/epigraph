@@ -2700,19 +2700,43 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   fabricated evidence anchors nothing.
 - **Which path a ceremony takes.** The decision is made from the database
   rows at both the challenge and the finish, never from the stored ceremony
-  state. An anchored ceremony asks for no attestation and accepts only
-  `none`. Its passkey is recorded as `none` (usually backup-eligible), so it
-  never anchors a further one. Otherwise the act's enrollment is attested,
-  exactly as with the setting off. The API log says why an anchor was
-  refused (`refusal=` and `reason=`).
-- **Every later passkey takes it.** With the setting on and a valid anchor,
-  a later passkey is registered on the anchored path even when it is a
-  hardware key, and is then recorded as `none`: it can never anchor. To add
-  a backup hardware key that can anchor (for a lost phone), enroll it with
-  the setting OFF.
+  state. Otherwise the act's enrollment is attested, exactly as with the
+  setting off. The API log says why an anchor was refused (`refusal=` and
+  `reason=`).
+- **What the anchored ceremony records.** It ASKS for attestation
+  (`direct`; a browser would otherwise strip a hardware key's statement) but
+  needs none, and records the passkey one of two ways:
+  - **`none`** for a synced passkey, or for any key whose attestation is not
+    trusted under the configuration the API runs now: self attestation, a
+    model not on the allowlist, a root that is not configured. Such an
+    attestation is dropped, as a browser drops it when asked for none. The
+    passkey holds only through its anchor: it never anchors a further one,
+    and it is revoked with its anchor.
+  - **Attested** for a hardware key whose attestation IS trusted now (an
+    allowlisted model, or an Android key under the Android roots, rules and
+    status list). It is recorded exactly as the attested ceremony would
+    record it (its format and model), stands on its own, may anchor in turn,
+    and is NOT revoked with its anchor.
+
+  So a backup hardware key for a lost phone can be enrolled with the setting
+  on. Check `list-passkeys` afterwards: it must show the backup's format
+  (`packed`, `tpm` or `android-key`), not `none`. A backup recorded `none`
+  (its user declined the browser's prompt to share the key's make and model,
+  or its model is not allowlisted) is revoked with the phone; enroll it again
+  and allow the prompt, or enroll it with the setting off, which refuses an
+  untrusted key outright.
+  - A statement the WebAuthn library cannot verify at all is refused before
+    this choice is made, as on the attested path: a StrongBox-level Android
+    key, an unsupported format, and the one-in-64 Android key with a leading
+    zero byte in a coordinate (retry). Before this change the browser
+    stripped those to `none`.
+  - The anchored ceremony does not ask the authenticator to enforce the
+    credential protection policy as the attested one does. User verification
+    is still required at registration and at every assertion.
 - **The response says which act anchored it.** The enrollment finish
-  answers `anchored_by` with that act's id; it is `null` on the attested
-  path.
+  answers `anchored_by` with that act's id for a passkey recorded `none` on
+  the anchored path. It is `null` on the attested path and for a passkey the
+  anchored path recorded attested.
 - **No completion on a revoked anchor.** Migration 200's insert guard records
   a passkey enrolled on an act only while the passkey that confirmed the act
   is live. It reads that passkey under a share lock, so a revoke and a
@@ -2723,7 +2747,9 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   enrolled on an act it confirmed. On an armed database those are exactly
   the passkeys it anchored. They are stamped with the same login and the
   reason `anchor <id> revoked: <reason>`. An attested passkey enrolled on
-  such an act stays live: it stands on its own attestation.
+  such an act stays live: it stands on its own attestation. That includes a
+  backup hardware key the anchored ceremony recorded attested, and excludes
+  one it recorded `none` (see above).
 
 **What remains, exactly.**
 - **The anchor confirms an act, not a credential.** The anchor's
