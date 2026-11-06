@@ -21,7 +21,9 @@
 //!   caller is the agent, or shares a live group with it; or an admin). A
 //!   private ORCID never matches, so it is not an oracle. `properties`
 //!   (`full_name`, `email`, `affiliations`) is never matched and never
-//!   returned; no contact field is ever searched.
+//!   returned. `display_name` is matched as written, so a display name that
+//!   is itself an email address matches like any other name (every
+//!   `display_name` is already public through `GET /api/v1/agents`).
 //! * `operator_human` (the human the agent acts for): shown to EVERY reader,
 //!   by design: who an agent acts for is public, like the claims it files.
 //!   It is read from the binding RECORD (`operator_binding_sql`: the
