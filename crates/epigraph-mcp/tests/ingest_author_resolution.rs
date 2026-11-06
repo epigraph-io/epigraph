@@ -924,7 +924,8 @@ async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reing
 ) {
     let server = privileged_server(&pool);
     let reader = app_role_server(&pool).await;
-    let viewer = fixture::public_viewer(&pool).await;
+    // The CLI's maintenance viewer is a bypass viewer; hold its pool.
+    let (_maintenance, viewer) = fixture::bypass(&pool).await;
     let name = "Ysolde Marchetti";
     let human = human_named(&pool, name).await;
     let (doi1, doi2) = ("10.9999/author-replace-1", "10.9999/author-replace-2");

@@ -514,10 +514,13 @@ impl PaperRepository {
     /// Returns `(authored, asserts)` retracted.
     ///
     /// # Errors
-    /// `DbError::WriteRefused` (and the statement changes nothing the caller
-    /// can rely on: run it in a transaction and roll back) when an edge this
-    /// session can read was not closed: migration 117's owner-scoped UPDATE
-    /// matches no row it refuses and reports success, so the count tells.
+    /// `DbError::WriteRefused` (run it in a transaction and roll back: some
+    /// edges may have closed) when an edge this session can read was not
+    /// closed: the spliced writable predicate, and 117's owner-scoped UPDATE
+    /// under it, skip a row the session may not write without an error, so
+    /// the count tells. An agent's edges are `('public', world)` (migration
+    /// 120), so on an application session that is the answer; a privileged
+    /// (bypass) session retracts them.
     /// `DbError::QueryFailed` if the statement fails.
     pub async fn retract_author_conn(
         conn: &mut sqlx::PgConnection,
@@ -527,42 +530,36 @@ impl PaperRepository {
     ) -> Result<(u64, u64), DbError> {
         let in_force =
             |alias: &str| crate::repos::edge::EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
-        let sql = viewer.splice(
+        // 1. What the session can SEE of this author on this paper (read
+        //    predicate). The write below is gated separately: one statement
+        //    cannot carry both marker spellings.
+        let read = viewer.splice(
             &format!(
-                "WITH mine AS ( \
-                     SELECT e.id, e.relationship FROM edges e \
-                      WHERE e.source_id = $1 AND e.source_type = 'agent' \
-                        AND e.target_id = $2 AND e.target_type = 'paper' \
-                        AND e.relationship = 'authored' AND {e} \
-                        /* {{EDGE_VISIBILITY:e}} */ \
-                     UNION ALL \
-                     SELECT a.id, a.relationship FROM edges a \
-                      WHERE a.source_id = $1 AND a.source_type = 'agent' \
-                        AND a.target_type = 'claim' AND a.relationship = 'asserts' AND {a} \
-                        /* {{EDGE_VISIBILITY:a}} */ \
-                        AND EXISTS (SELECT 1 FROM edges pc \
-                                     WHERE pc.source_id = $2 AND pc.source_type = 'paper' \
-                                       AND pc.relationship = 'asserts' \
-                                       AND pc.target_id = a.target_id \
-                                       AND pc.target_type = 'claim' AND {pc}) \
-                        AND NOT EXISTS ( \
-                            SELECT 1 FROM edges oa \
-                              JOIN edges oc ON oc.source_id = oa.target_id \
-                                           AND oc.source_type = 'paper' \
-                                           AND oc.relationship = 'asserts' \
-                                           AND oc.target_id = a.target_id \
-                                           AND oc.target_type = 'claim' AND {oc} \
-                             WHERE oa.source_id = $1 AND oa.source_type = 'agent' \
-                               AND oa.relationship = 'authored' AND oa.target_type = 'paper' \
-                               AND oa.target_id <> $2 AND {oa}) \
-                 ), done AS ( \
-                     UPDATE edges SET valid_to = now() \
-                      WHERE id IN (SELECT id FROM mine) \
-                     RETURNING id, relationship \
-                 ) \
-                 SELECT (SELECT count(*) FROM mine), \
-                        (SELECT count(*) FROM done WHERE relationship = 'authored'), \
-                        (SELECT count(*) FROM done WHERE relationship = 'asserts')",
+                "SELECT e.id FROM edges e \
+                  WHERE e.source_id = $1 AND e.source_type = 'agent' \
+                    AND e.target_id = $2 AND e.target_type = 'paper' \
+                    AND e.relationship = 'authored' AND {e} \
+                    /* {{EDGE_VISIBILITY:e}} */ \
+                 UNION ALL \
+                 SELECT a.id FROM edges a \
+                  WHERE a.source_id = $1 AND a.source_type = 'agent' \
+                    AND a.target_type = 'claim' AND a.relationship = 'asserts' AND {a} \
+                    /* {{EDGE_VISIBILITY:a}} */ \
+                    AND EXISTS (SELECT 1 FROM edges pc \
+                                 WHERE pc.source_id = $2 AND pc.source_type = 'paper' \
+                                   AND pc.relationship = 'asserts' \
+                                   AND pc.target_id = a.target_id \
+                                   AND pc.target_type = 'claim' AND {pc}) \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM edges oa \
+                          JOIN edges oc ON oc.source_id = oa.target_id \
+                                       AND oc.source_type = 'paper' \
+                                       AND oc.relationship = 'asserts' \
+                                       AND oc.target_id = a.target_id \
+                                       AND oc.target_type = 'claim' AND {oc} \
+                         WHERE oa.source_id = $1 AND oa.source_type = 'agent' \
+                           AND oa.relationship = 'authored' AND oa.target_type = 'paper' \
+                           AND oa.target_id <> $2 AND {oa})",
                 e = in_force("e"),
                 a = in_force("a"),
                 pc = in_force("pc"),
@@ -571,23 +568,40 @@ impl PaperRepository {
             ),
             3,
         );
-        let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql)
+        let mut q = sqlx::query_scalar::<_, Uuid>(&read)
             .bind(agent_id)
             .bind(paper_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let (seen, authored, asserts) = q.fetch_one(&mut *conn).await?;
-        if authored + asserts < seen {
+        let seen: Vec<Uuid> = q.fetch_all(&mut *conn).await?;
+        if seen.is_empty() {
+            return Ok((0, 0));
+        }
+        // 2. Retract them, gated by the session's WRITABLE set (and row
+        //    security under it).
+        let write = viewer.splice_write(
+            "UPDATE edges AS e SET valid_to = now() \
+              WHERE e.id = ANY($1::uuid[]) /* {WRITABLE:e} */ \
+             RETURNING e.relationship",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&write).bind(&seen);
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        let done: Vec<String> = q.fetch_all(&mut *conn).await?;
+        if done.len() < seen.len() {
             return Err(DbError::WriteRefused {
                 entity: "edge".to_string(),
                 id: agent_id,
                 action: "retract this author's edges on the paper".to_string(),
             });
         }
+        let authored = done.iter().filter(|r| r.as_str() == "authored").count();
         Ok((
             u64::try_from(authored).unwrap_or(0),
-            u64::try_from(asserts).unwrap_or(0),
+            u64::try_from(done.len() - authored).unwrap_or(0),
         ))
     }
 }
