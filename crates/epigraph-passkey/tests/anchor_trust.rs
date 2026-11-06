@@ -1003,3 +1003,153 @@ async fn an_ancestor_is_held_to_its_certificates_validity_when_it_confirmed() {
         assert_eq!(rp.check_anchor(&by_packed), expected, "packed: {label}");
     }
 }
+
+// =====================================================================
+// P779M-1: on the anchored path, an Android key whose standing cannot be
+// checked is refused, not silently recorded `none`
+// =====================================================================
+
+/// A packed first passkey registered under `vendor` (the anchor of the
+/// anchored registrations below: its trust does not read the status list).
+async fn packed_first(
+    rp: &Passkeys,
+    vendor: &TestAttestation,
+) -> (SoftAuthenticator, RegisteredPasskey) {
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut key = SoftAuthenticator::new(MODEL).hardware();
+    let created = key.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let reg = rp
+        .finish_registration(&vendor.rewrap(&created), &state)
+        .expect("the packed first passkey registers");
+    (key, reg)
+}
+
+/// An anchored registration of a device-bound Android key whose certificates
+/// are as `opts` describes, chained to `google`, under a relying party with
+/// both roots and the status list `status` (removed after the relying party
+/// is built when `remove` is set). The anchor is a packed first passkey, so
+/// the anchor check itself never reads the status list.
+async fn anchored_android(
+    vendor: &TestAttestation,
+    google: &TestAttestation,
+    status: PathBuf,
+    remove: bool,
+    opts: &AndroidKeyOpts,
+) -> Result<RegisteredPasskey, PasskeyError> {
+    let rp = attested_with(
+        Some((vendor, &[MODEL])),
+        Some(google),
+        Some(status.clone()),
+        true,
+    );
+    if remove {
+        std::fs::remove_file(&status).unwrap();
+    }
+    let person = Uuid::new_v4();
+    let (mut first, first_reg) = packed_first(&rp, vendor).await;
+    let anchor = confirmed_anchor(&rp, &mut first, &first_reg, person).await;
+    assert_eq!(
+        rp.check_anchor(&anchor),
+        Ok(()),
+        "CALIBRATION: the packed anchor admits"
+    );
+    let (options, state) = rp.start_anchored_registration(person, "op", "Op").unwrap();
+    let mut phone = SoftAuthenticator::new(MODEL).hardware();
+    let created = phone.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let response = google.android_key_with(&phone, &created, true, opts);
+    rp.finish_anchored_registration(&response, &state, &anchor)
+}
+
+/// On the ANCHORED path, a genuine TEE Android key under a trusted root whose
+/// standing cannot be checked (the status list older than 48 hours, or
+/// missing) is REFUSED, naming the list and the remedy, exactly as the
+/// attested path refuses it; it is never recorded `none`. Only that changes:
+/// an untrusted statement (a software-level key) under the same stale list
+/// is still dropped to `none`, as is a listed certificate under a fresh list.
+/// CALIBRATION: under a fresh list the same key is recorded `android-key`.
+/// Red line (3ad5ff92): the stale and missing cases returned
+/// `Ok(("none", nil))`. Mutation: the status-unknown arm of the anchored
+/// finish dropping instead of refusing -> both cases record `none`.
+#[tokio::test]
+async fn an_android_key_whose_standing_cannot_be_checked_is_refused_on_the_anchored_path() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let hour = Duration::from_secs(3600);
+    let genuine = AndroidKeyOpts::default();
+
+    let fresh = anchored_android(
+        &vendor,
+        &google,
+        android_status::file(android_status::EMPTY, Duration::ZERO),
+        false,
+        &genuine,
+    )
+    .await
+    .expect("CALIBRATION: a fresh list records the key");
+    assert_eq!(
+        fresh.attestation_format, "android-key",
+        "CALIBRATION: recorded attested"
+    );
+
+    let stale = anchored_android(
+        &vendor,
+        &google,
+        android_status::file(android_status::EMPTY, 49 * hour),
+        false,
+        &genuine,
+    )
+    .await;
+    let why = policy_refusal(stale);
+    assert!(
+        why.contains("older than the 48h maximum") && why.contains("refresh"),
+        "names the stale list and the remedy: {why}"
+    );
+
+    let missing = anchored_android(
+        &vendor,
+        &google,
+        android_status::fresh_empty(),
+        true,
+        &genuine,
+    )
+    .await;
+    let why = policy_refusal(missing);
+    assert!(
+        why.contains("cannot be read") && why.contains("refresh"),
+        "names the missing list and the remedy: {why}"
+    );
+
+    // Untrusted statements are still dropped to `none`, stale list or not.
+    let software = AndroidKeyOpts {
+        attestation_level: 0,
+        keymaster_level: 0,
+        in_software_list: true,
+        ..AndroidKeyOpts::default()
+    };
+    let dropped = anchored_android(
+        &vendor,
+        &google,
+        android_status::file(android_status::EMPTY, 49 * hour),
+        false,
+        &software,
+    )
+    .await
+    .expect("a software-level key under a stale list is dropped, not refused");
+    assert_eq!(
+        (dropped.attestation_format.as_str(), dropped.aaguid),
+        ("none", Uuid::nil())
+    );
+    let listed = anchored_android(
+        &vendor,
+        &google,
+        android_status::file(android_status::GOOGLE_EXAMPLE, Duration::ZERO),
+        false,
+        &AndroidKeyOpts {
+            leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+            ..AndroidKeyOpts::default()
+        },
+    )
+    .await
+    .expect("a listed certificate under a fresh list is dropped, not refused");
+    assert_eq!(listed.attestation_format, "none");
+}

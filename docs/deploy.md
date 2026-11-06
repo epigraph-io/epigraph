@@ -2608,7 +2608,12 @@ The policy:
   status (`REVOKED` or `SUSPENDED`) refuses the enrollment or the anchor.
 - **Older than 48 hours refuses (fail closed).** The age is the file's
   modification time. A file older than that refuses, until it is refreshed:
-  - every Android enrollment;
+  - every Android enrollment, on BOTH ceremonies. The anchored ceremony
+    refuses an Android key whose chain, hardware rules and device binding
+    pass but whose standing cannot be checked; it does NOT record it `none`.
+    The refusal names the list and says to refresh it, and the API logs it
+    at WARN (`passkey.anchor`, "its attestation status list cannot be
+    checked");
   - every Android anchor;
   - every OTHER anchor whose lineage holds an Android passkey, a security key
     included, even when that Android passkey is revoked (a person whose first
@@ -2616,8 +2621,9 @@ The policy:
     `refusal=lineage_not_attested`, and their enrollments fall back to the
     attested ceremony, which refuses a synced passkey at the finish.
 
-  A file dated more than 5 minutes in the future is refused the same way.
-  Android passkeys still ASSERT (elevate) while the file is stale.
+  A missing or unreadable file, and one dated more than 5 minutes in the
+  future, are refused the same way. Android passkeys still ASSERT (elevate)
+  while the file is stale.
 
 Fetching and refreshing the file is an operator job outside the API. A job
 that fails leaves the old file in place, and nothing in the API refuses until
@@ -2798,18 +2804,27 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   `reason=`).
 - **What the anchored ceremony records.** It ASKS for attestation
   (`direct`; a browser would otherwise strip a hardware key's statement) but
-  needs none, and records the passkey one of two ways:
+  needs none, and records the passkey one of two ways, or refuses it:
   - **`none`** for a synced passkey, or for any key whose attestation is not
     trusted under the configuration the API runs now: self attestation, a
-    model not on the allowlist, a root that is not configured. Such an
-    attestation is dropped, as a browser drops it when asked for none. The
-    passkey holds only through its anchor: it never anchors a further one,
-    and it is revoked with its anchor.
+    model not on the allowlist, a root that is not configured, or an Android
+    key that fails the Android rules (a software-level key, `purpose` or
+    `origin` only software-enforced, a KeyDescription outside the leaf, a
+    backup-eligible credential) or has a certificate on a CURRENT status
+    list. Such an attestation is dropped, as a browser drops it when asked
+    for none, and logged at INFO. The passkey holds only through its anchor:
+    it never anchors a further one, and it is revoked with its anchor.
   - **Attested** for a hardware key whose attestation IS trusted now (an
     allowlisted model, or an Android key under the Android roots, rules and
     status list). It is recorded exactly as the attested ceremony would
     record it (its format and model), stands on its own, may anchor in turn,
     and is NOT revoked with its anchor.
+  - **Refused** for an Android key whose chain is trusted but whose standing
+    cannot be checked, because the status list is older than 48 hours,
+    missing, unreadable or malformed. It is not recorded `none` (that would
+    hide the outage and give a backup that dies with its anchor). Refresh the
+    list, then retry the enrollment link within its 15 minutes; after that,
+    propose and confirm a new `passkey.register` act.
 
   So a backup hardware key for a lost phone can be enrolled with the setting
   on. Check `list-passkeys` afterwards: it must show the backup's format
@@ -2950,7 +2965,9 @@ which revokes it.
    - A phone whose attestation is software-level is refused with "not
      attested as hardware-backed". So is one with a certificate on the
      status list ("is REVOKED" / "is SUSPENDED"). A stale status file
-     refuses with "older than the 48h maximum".
+     refuses with "older than the 48h maximum", a missing one with "cannot
+     be read"; both add "refused until the operator refreshes it". The same
+     holds for an Android backup on the anchored ceremony.
    - About one Android key in 64 is refused by the WebAuthn library with
      "The COSEKey contains invalid ECDSA X/Y coordinate data" (a coordinate
      with a leading zero byte). A retry creates a new key and passes.

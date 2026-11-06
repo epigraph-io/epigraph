@@ -101,8 +101,10 @@ pub enum PasskeyError {
     #[error("ceremony state: {0}")]
     State(String),
     /// The library verified the attestation, and this crate's policy refused
-    /// it (an attestation under an Android root that is not a device-bound
-    /// `android-key` one; an attestation statement on the anchored path).
+    /// it (an attestation under an Android root that is not a device-bound,
+    /// hardware-level `android-key` one in good standing; on either ceremony,
+    /// an Android key whose standing cannot be checked because the status
+    /// list is stale, missing or unreadable).
     #[error("the attestation was refused: {0}")]
     AttestationRefused(String),
     /// The anchored path's anchor does not admit this registration.
@@ -696,19 +698,30 @@ impl Passkeys {
     ///   attested ceremony would record it. It stands on its own: it is not
     ///   revoked with its anchor, and it may anchor in turn (P779R-3: a backup
     ///   hardware key enrolled with the setting on).
+    /// * an `android-key` statement that passes every check under the Android
+    ///   roots (leaf certifies the key, chain, validity, hardware rules, device
+    ///   bound) but whose STANDING cannot be checked, because the status list
+    ///   is older than 48 hours, missing, unreadable or malformed: REFUSED
+    ///   ([`PasskeyError::AttestationRefused`], naming the list and the
+    ///   remedy, logged at WARN), exactly as the attested ceremony refuses it
+    ///   (P779M-1). Recording it `none` would hide the outage and hand the
+    ///   person a backup that dies with its anchor.
     /// * any other statement (self attestation, an unlisted model, an
-    ///   unconfigured root, a synced credential with a statement): its
-    ///   attestation is DROPPED and the passkey recorded `none`, as a browser
-    ///   would have recorded it had the relying party asked for none (WebAuthn
-    ///   lets a relying party treat an untrusted attestation as none). It is
-    ///   then the first case. A statement is never recorded unless it is
-    ///   trusted here, so it cannot anchor unverified.
+    ///   unconfigured root, a synced credential with a statement, an Android
+    ///   key that fails the hardware rules or has a certificate on a current
+    ///   status list): its attestation is DROPPED and the passkey recorded
+    ///   `none`, as a browser would have recorded it had the relying party
+    ///   asked for none (WebAuthn lets a relying party treat an untrusted
+    ///   attestation as none). It is then the first case. A statement is
+    ///   never recorded unless it is trusted here, so it cannot anchor
+    ///   unverified.
     ///
     /// # Errors
     /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
-    /// [`PasskeyError::State`], or the library's refusal (which comes before
-    /// any of the above: a statement the library cannot verify at all is
-    /// refused, not dropped).
+    /// [`PasskeyError::State`], [`PasskeyError::AttestationRefused`] (an
+    /// Android key whose standing cannot be checked), or the library's
+    /// refusal (which comes before any of the above: a statement the library
+    /// cannot verify at all is refused, not dropped).
     pub fn finish_anchored_registration(
         &self,
         response: &Value,
@@ -736,11 +749,12 @@ impl Passkeys {
         if registered.attestation_format == "none" {
             return Ok(registered);
         }
-        match self.hardware_attested(
+        match self.hardware_trust(
             &registered.passkey,
             &registered.attestation_format,
             registered.aaguid,
             registered.backup_eligible,
+            CertificateTime::Now,
         ) {
             Ok(()) => {
                 tracing::info!(
@@ -753,7 +767,21 @@ impl Passkeys {
                 );
                 Ok(registered)
             }
-            Err(why) => {
+            Err(Distrust::StatusUnknown(why)) => {
+                // A trusted Android chain whose standing cannot be checked:
+                // refused, visibly, as the attested ceremony refuses it
+                // (never recorded `none`, which would hide the outage).
+                tracing::warn!(
+                    target: "passkey.anchor",
+                    act = %anchor.act_id,
+                    format = %registered.attestation_format,
+                    reason = %why,
+                    "an anchored enrollment's Android key is refused: its attestation status \
+                     list cannot be checked; refresh the list and retry"
+                );
+                Err(PasskeyError::AttestationRefused(why))
+            }
+            Err(Distrust::Untrusted(why)) => {
                 tracing::info!(
                     target: "passkey.anchor",
                     act = %anchor.act_id,
@@ -980,6 +1008,43 @@ impl Passkeys {
         backup_eligible: bool,
         at: CertificateTime,
     ) -> Result<(), String> {
+        self.hardware_trust(passkey, attestation_format, aaguid, backup_eligible, at)
+            .map_err(Distrust::into_reason)
+    }
+
+    /// [`Self::hardware_attested_at`], telling a statement that is not
+    /// trusted apart from an Android key that passed every other check but
+    /// whose standing cannot be checked ([`Distrust::StatusUnknown`]: the
+    /// status list is stale, missing or unreadable).
+    fn hardware_trust(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+        aaguid: Uuid,
+        backup_eligible: bool,
+        at: CertificateTime,
+    ) -> Result<(), Distrust> {
+        match self
+            .hardware_trust_but_android(passkey, attestation_format, aaguid, backup_eligible, at)
+            .map_err(Distrust::Untrusted)?
+        {
+            None => Ok(()),
+            Some((cred, attestation)) => self.android_key_trusted(&cred, &attestation, at),
+        }
+    }
+
+    /// Every check of [`Self::hardware_trust`] but the Android one: `Ok(None)`
+    /// when a `packed` / `tpm` statement is trusted, `Ok(Some(..))` with the
+    /// credential and its attestation when an `android-key` one is still to
+    /// be checked ([`Self::android_key_trusted`]).
+    fn hardware_trust_but_android(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+        aaguid: Uuid,
+        backup_eligible: bool,
+        at: CertificateTime,
+    ) -> Result<Option<(Value, ParsedAttestation)>, String> {
         let cred = passkey
             .get("cred")
             .ok_or_else(|| "the stored credential has no `cred`".to_string())?;
@@ -1023,9 +1088,9 @@ impl Passkeys {
                 if !ca.blanket_allow() && !ca.aaguids().contains_key(&aaguid) {
                     return Err(format!("its model {aaguid} is no longer on the allowlist"));
                 }
-                chain_valid_at(&attestation.data, ca, at)
+                chain_valid_at(&attestation.data, ca, at).map(|()| None)
             }
-            "android-key" => self.android_key_trusted(cred, &attestation, at),
+            "android-key" => Ok(Some((cred.clone(), attestation))),
             other => Err(format!("a `{other}` attestation is not hardware-attested")),
         }
     }
@@ -1035,13 +1100,28 @@ impl Passkeys {
     /// attestation: the leaf certificate's key is the credential's, the chain
     /// reaches an Android key root, the KeyDescription's hardware rules
     /// ([`android::hardware_rules`]) hold, no certificate is on the status
-    /// list, and every certificate was valid at `at`.
+    /// list, and every certificate was valid at `at`. The status list is read
+    /// LAST, so [`Distrust::StatusUnknown`] means every other check passed.
     fn android_key_trusted(
         &self,
         cred: &Value,
         attestation: &ParsedAttestation,
         at: CertificateTime,
-    ) -> Result<(), String> {
+    ) -> Result<(), Distrust> {
+        let serials = self
+            .android_key_chain(cred, attestation, at)
+            .map_err(Distrust::Untrusted)?;
+        self.android_key_standing(&serials)
+    }
+
+    /// Every check of [`Self::android_key_trusted`] but the status list: the
+    /// serials of the chain's certificates and its root, to look up there.
+    fn android_key_chain(
+        &self,
+        cred: &Value,
+        attestation: &ParsedAttestation,
+        at: CertificateTime,
+    ) -> Result<Vec<Vec<u8>>, String> {
         let cas = self
             .android_cas
             .as_ref()
@@ -1083,16 +1163,36 @@ impl Passkeys {
         let (_, root) = x509_parser::parse_x509_certificate(&root)
             .map_err(|e| format!("the root does not parse: {e}"))?;
         serials.push(root.raw_serial().to_vec());
-        let path = self
-            .android_status_file
-            .as_deref()
-            .ok_or_else(|| format!("no {} is configured", config::ENV_ANDROID_KEY_STATUS_FILE))?;
-        let list = android::StatusList::load(path, std::time::SystemTime::now())?;
-        for serial in &serials {
+        Ok(serials)
+    }
+
+    /// No certificate of `serials` is on today's status list. A list that
+    /// cannot be read now (missing, unreadable, older than 48 hours, dated in
+    /// the future, malformed) is [`Distrust::StatusUnknown`], naming the
+    /// list and the operator's remedy; a listed certificate is
+    /// [`Distrust::Untrusted`].
+    fn android_key_standing(&self, serials: &[Vec<u8>]) -> Result<(), Distrust> {
+        let unknown = |why: String| {
+            Distrust::StatusUnknown(format!(
+                "{why}; an Android key's standing cannot be checked without a current Android \
+                 attestation status list, so it is refused until the operator refreshes it ({}, \
+                 docs/deploy.md section 10)",
+                config::ENV_ANDROID_KEY_STATUS_FILE
+            ))
+        };
+        let path = self.android_status_file.as_deref().ok_or_else(|| {
+            unknown(format!(
+                "no {} is configured",
+                config::ENV_ANDROID_KEY_STATUS_FILE
+            ))
+        })?;
+        let list =
+            android::StatusList::load(path, std::time::SystemTime::now()).map_err(unknown)?;
+        for serial in serials {
             if let Some((listed, status)) = list.status_of_serial(serial) {
-                return Err(format!(
+                return Err(Distrust::Untrusted(format!(
                     "attestation certificate {listed} is {status} on the attestation status list"
-                ));
+                )));
             }
         }
         Ok(())
@@ -1131,7 +1231,7 @@ impl Passkeys {
             .ok_or_else(|| malformed("credential", "no attestation"))
             .and_then(|a| serde_json::from_value(a).map_err(|e| malformed("attestation", e)))?;
         self.android_key_trusted(cred, &attestation, CertificateTime::Now)
-            .map_err(PasskeyError::AttestationRefused)
+            .map_err(|d| PasskeyError::AttestationRefused(d.into_reason()))
     }
 
     fn passkey_of(stored: &StoredPasskey, counter: u32) -> Result<Passkey, PasskeyError> {
@@ -1510,6 +1610,25 @@ impl AnchorRefusal {
             Self::AssertionDoesNotVerify => "assertion_does_not_verify",
             Self::CredentialMismatch => "credential_mismatch",
             Self::BackupEligibilityChanged => "backup_eligibility_changed",
+        }
+    }
+}
+
+/// Why a stored attestation is not hardware-attested now
+/// ([`Passkeys::hardware_attested_at`]).
+#[derive(Debug)]
+enum Distrust {
+    /// The statement is not trusted under this configuration.
+    Untrusted(String),
+    /// An Android key that passed every other check, whose standing cannot be
+    /// checked: the status list is stale, missing, unreadable or malformed.
+    StatusUnknown(String),
+}
+
+impl Distrust {
+    fn into_reason(self) -> String {
+        match self {
+            Self::Untrusted(why) | Self::StatusUnknown(why) => why,
         }
     }
 }
