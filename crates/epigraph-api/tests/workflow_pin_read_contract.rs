@@ -1142,15 +1142,16 @@ async fn plan_owners(pool: &PgPool, name: &str) -> Vec<Uuid> {
 /// * NOT a curator linked to the first human over REST: the REST ingest
 ///   refuses an operated agent's token. Over stdio it publishes, into the
 ///   first human's group;
-/// * NOT a curator linked to a SECOND human, on either transport: the REST
-///   ingest refuses its token as an operated agent's, and over stdio the
-///   caller check refuses it `OPL02` (it must belong to the system agent's
-///   human); it writes nothing on either. This is the nearest shipped shape of "a
-///   curator re-linked to a second human": the re-link itself is refused.
+/// * a curator linked to a SECOND human: the REST ingest refuses its token as
+///   an operated agent's; over stdio it publishes AS ITSELF into the SECOND
+///   human's group, never the first's. (Workflow writes are made as the
+///   caller; this used to be an `OPL02` refusal, because every write went
+///   through the system agent linked to the first human.) The re-link of a
+///   curator to a second human is still refused.
 #[sqlx::test(migrations = "../../migrations")]
-async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
+async fn armed_publishing_is_bound_to_each_callers_own_human(pool: PgPool) {
     let (o1, og1) = fixture::seed_human_operator(&pool, "workflow-plan-o1").await;
-    let (o2, _) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
+    let (o2, og2) = fixture::seed_human_operator(&pool, "workflow-plan-o2").await;
     let system = {
         let mut conn = pool.acquire().await.expect("acquire");
         epigraph_ingest_executor::get_or_create_system_agent(&mut conn)
@@ -1222,7 +1223,7 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
     assert_relink_refused(&pool, first_curator, o2).await;
 
     // The second human's curator: refused by the REST ingest as an operated
-    // agent, OPL02 over stdio, nothing written on either.
+    // agent; over stdio it publishes as itself, into the second human's group.
     let (s, b) = api
         .post(
             "/api/v1/workflows/ingest",
@@ -1232,11 +1233,14 @@ async fn armed_publishing_is_bound_to_the_system_agents_human(pool: PgPool) {
         .await;
     assert_operated_refusal(s, &b, "a curator of another human over REST");
     assert_eq!(workflows_named(&pool, "acme-armed-second-http").await, 0);
-    let refused = stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
+    stdio_ingest(&second_server, &small_extraction("acme-armed-second", 1))
         .await
-        .expect_err("a curator of another human must not publish through the system agent");
-    assert!(refused.contains("OPL02"), "{refused}");
-    assert_eq!(workflows_named(&pool, "acme-armed-second").await, 0);
+        .expect("a curator of another human publishes as itself");
+    assert_eq!(
+        plan_owners(&pool, "acme-armed-second").await,
+        vec![og2],
+        "into its own human's group, never the first human's"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

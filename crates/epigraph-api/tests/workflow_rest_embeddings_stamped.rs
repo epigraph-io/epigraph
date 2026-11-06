@@ -2,9 +2,10 @@
 //! The REST workflow writers' post-commit embeddings, on the APPLICATION ROLE.
 //!
 //! `POST /api/v1/workflows` (`store_workflow`) and `POST /api/v1/workflows/ingest`
-//! (`ingest_workflow`) write their claims on a transaction stamped with the
-//! workflow-ingest system agent's viewer, so every row is that agent's and is
-//! owned by its personal group. Each claim is then embedded best-effort after
+//! (`ingest_workflow`) write their claims AS THE CALLER, on a transaction
+//! stamped with the caller's own viewer (they used to be the workflow-ingest
+//! system agent's), so every row is the caller's and is owned by a group it
+//! writes. Each claim is then embedded best-effort after
 //! the commit, and a failed embed only logs a WARN: the request still answers
 //! 200. When that embed ran on the unstamped `state.db_pool`, row security on
 //! `claims` refused the `UPDATE` for every claim, so the route returned 200 and
@@ -27,9 +28,10 @@
 //! 1. At origin/main 934aa332, the embed `UPDATE` ran on `state.db_pool` in both
 //!    handlers. Both arms then failed on the claim-embedding assertion: every
 //!    claim was left with `embedding IS NULL`.
-//! 2. With the store stamped from the CALLER's viewer instead of the system
-//!    agent's, both arms fail the same way. The `{WRITABLE:c}` splice renders
-//!    the caller's groups, and no system-owned row satisfies it.
+//! 2. (When the rows were the system agent's) with the store stamped from the
+//!    caller's viewer instead of the system agent's, both arms failed the same
+//!    way. Now the rows ARE the caller's, so the store is stamped from the
+//!    caller, the identity that wrote them.
 
 mod viewer_fixture;
 
@@ -132,32 +134,32 @@ async fn goal_embedding_present(pool: &PgPool, workflow_id: Uuid) -> bool {
         .expect("read back the workflow row")
 }
 
-/// `(claims authored by `system`, of those how many have embedding IS NULL)`.
-/// Each `sqlx::test` runs in a fresh database and the system agent is created
-/// at the start of the arm, so the system agent's claims are exactly the set
-/// this request wrote, whatever kinds the executor plans.
-async fn system_claim_counts(pool: &PgPool, system: Uuid) -> (i64, i64) {
+/// `(claims authored by `author`, of those how many have embedding IS NULL)`.
+/// Each `sqlx::test` runs in a fresh database and the caller is created at the
+/// start of the arm, so the caller's claims are exactly the set this request
+/// wrote, whatever kinds the executor plans.
+async fn system_claim_counts(pool: &PgPool, author: Uuid) -> (i64, i64) {
     sqlx::query_as(
         "SELECT count(*), count(*) FILTER (WHERE embedding IS NULL) FROM claims \
           WHERE agent_id = $1",
     )
-    .bind(system)
+    .bind(author)
     .fetch_one(pool)
     .await
-    .expect("count the system agent's claims")
+    .expect("count the author's claims")
 }
 
-/// Asserts that every claim the request wrote is the system agent's and carries
+/// Asserts that every claim the request wrote is the caller's and carries
 /// a vector, and that the workflow row carries a goal embedding. The claim and
 /// goal checks have separate messages, so a red run shows which write was lost.
 ///
 /// Two claim checks: the hand-listed `contents` (named, so a red run says which
-/// claim lost its vector), and the WHOLE write set (every claim the system agent
+/// claim lost its vector), and the WHOLE write set (every claim the caller
 /// authored, which must number `claims_ingested`). The whole-set check covers
 /// claim kinds the list does not name, such as `store_workflow`'s phase summary.
 async fn assert_all_embedded(
     pool: &PgPool,
-    system: Uuid,
+    author: Uuid,
     workflow_id: Uuid,
     contents: &[String],
     claims_ingested: u64,
@@ -171,8 +173,8 @@ async fn assert_all_embedded(
     );
     for (content, agent, _) in &rows {
         assert_eq!(
-            *agent, system,
-            "{route}: claim {content:?} is authored by the workflow-ingest system agent"
+            *agent, author,
+            "{route}: claim {content:?} is authored by the caller"
         );
     }
     let missing: Vec<&String> = rows
@@ -185,11 +187,11 @@ async fn assert_all_embedded(
         "{route}: every claim the request wrote must carry an embedding after a 200; \
          these have embedding IS NULL: {missing:?}"
     );
-    let (written, unembedded) = system_claim_counts(pool, system).await;
+    let (written, unembedded) = system_claim_counts(pool, author).await;
     assert_eq!(
         u64::try_from(written).expect("non-negative count"),
         claims_ingested,
-        "{route}: the system agent's claims are exactly the {claims_ingested} the request wrote"
+        "{route}: the caller's claims are exactly the {claims_ingested} the request wrote"
     );
     assert_eq!(
         unembedded, 0,
@@ -207,7 +209,8 @@ async fn assert_all_embedded(
 /// vector after the call.
 #[sqlx::test(migrations = "../../migrations")]
 async fn rest_store_workflow_embeds_every_claim_it_writes(pool: PgPool) {
-    let system = system_agent_registered(&pool).await;
+    // Registered, as on a live instance; the routes no longer write as it.
+    let _system = system_agent_registered(&pool).await;
     let (caller, _) = seed_agent_with_group(&pool, "caller").await;
     let state = app_role_state_with_embedder(&pool).await;
 
@@ -245,7 +248,7 @@ async fn rest_store_workflow_embeds_every_claim_it_writes(pool: PgPool) {
     contents.push(goal);
     assert_all_embedded(
         &pool,
-        system,
+        caller,
         workflow_id,
         &contents,
         claims_ingested,
@@ -258,7 +261,8 @@ async fn rest_store_workflow_embeds_every_claim_it_writes(pool: PgPool) {
 /// carry a vector after the call.
 #[sqlx::test(migrations = "../../migrations")]
 async fn rest_ingest_workflow_embeds_every_claim_it_writes(pool: PgPool) {
-    let system = system_agent_registered(&pool).await;
+    // Registered, as on a live instance; the routes no longer write as it.
+    let _system = system_agent_registered(&pool).await;
     let (caller, _) = seed_agent_with_group(&pool, "caller").await;
     let state = app_role_state_with_embedder(&pool).await;
 
@@ -324,7 +328,7 @@ async fn rest_ingest_workflow_embeds_every_claim_it_writes(pool: PgPool) {
     contents.push(phase);
     assert_all_embedded(
         &pool,
-        system,
+        caller,
         workflow_id,
         &contents,
         claims_ingested,
