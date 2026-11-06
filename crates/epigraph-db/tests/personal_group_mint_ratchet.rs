@@ -58,10 +58,10 @@
 //!     (`SessionFactory` shares the cell), pinned by `server.rs`'s
 //!     `session_factory_tests`. The outcome (no revival, no ingest) is pinned
 //!     by `epigraph-mcp/tests/per_session_agent_resolution.rs`.
-//!   - `create_claim_idempotent`, `IngestTx::owner_decl` and the two
-//!     `begin_system_ingest_stamped_tx` (MCP `claim_helper.rs`, API
-//!     `routes/workflows.rs`) wrap a watched call and are called from many
-//!     tools. The watched call inside each is registered, and every path
+//!   - `create_claim_idempotent` and `IngestTx::owner_decl` wrap a watched
+//!     call and are called from many tools. (The two
+//!     `begin_system_ingest_stamped_tx` wrappers were removed when workflow
+//!     writes moved to the caller.) The watched call inside each is registered, and every path
 //!     through them ends in migration 105's definer.
 //!
 //!   A NEW wrapper — a function that calls one of these and is then called
@@ -178,24 +178,28 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "default_decl_for_author",
         1,
         "`require_caller_write_authority` (migration 122, review SEC-3): the SYSTEM agent's \
-         declaration, on the transaction `begin_system_ingest_stamped_tx` stamped from that \
-         agent's own viewer after `system_agent_write_authority` proved its personal group \
-         live and writable, so the definer answers with that group and mints nothing. The same \
-         call the executor makes next.",
+         declaration, for a caller of the system-authored path, on a transaction stamped from \
+         that agent's own viewer after `system_agent_write_authority` proved its personal group \
+         live and writable, so the definer answers with that group and mints nothing. No \
+         request path calls it since workflow writes are made as the caller.",
     ),
     (
         "epigraph-ingest-executor/src/workflow.rs",
         "default_decl_for_author",
         1,
-        "Workflow ingest's one declaration for the whole plan, on the connection its caller \
-         passes (stamped from the system agent's viewer on the MCP path). Definer answer.",
+        "Workflow ingest's one declaration for the whole plan on the caller-less \
+         (system-authored) entry point, on the connection its caller passes (stamped from the \
+         system agent's viewer). Definer answer. Caller-authored ingests declare through \
+         `owner.rs`.",
     ),
     (
-        "epigraph-ingest-executor/src/workflow_steps.rs",
+        "epigraph-ingest-executor/src/owner.rs",
         "default_decl_for_author",
         1,
-        "`add_step`'s declaration for the system agent, on the connection its caller passes \
-         (`step_ops.rs`, `routes/workflows.rs`). Definer answer, whatever that connection's stamp.",
+        "`resolve_caller_owner`'s last arm (workflow writes made as the caller: ingest and \
+         add_step): the CALLER's own declaration, on the transaction stamped from the caller's \
+         own viewer, exactly as every other claim the caller submits. Definer answer: a revoked \
+         or reader membership is refused, never revived (migration 105).",
     ),
     (
         "epigraph-mcp/src/server.rs",
@@ -232,17 +236,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         "Workflow ingest's system-agent declaration, on the unstamped pool. Definer answer, so \
          the pool's blindness no longer matters.",
-    ),
-    (
-        "epigraph-mcp/src/tools/workflow_ingest.rs",
-        "system_agent_write_authority",
-        2,
-        "Migration 183: `store_workflow_goal_embedding` (the post-commit goal embed of the \
-         ingest, store_workflow and improve_workflow_hierarchy paths, after the plan walk's own \
-         system-agent-stamped transaction committed) and `lineage_max_generation` \
-         (improve_workflow_hierarchy's numbering read, ahead of the plan walk that resolves the \
-         same agent). Same preflight as the walk; a refusal there refuses the call or stores no \
-         vector.",
     ),
     (
         "epigraph-api/src/oauth/token.rs",
@@ -293,25 +286,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "default_decl_for_author_pool",
         1,
         "Policies route, system agent's declaration on `state.db_pool`. Definer answer.",
-    ),
-    (
-        "epigraph-mcp/src/claim_helper.rs",
-        "system_agent_write_authority",
-        1,
-        "`begin_system_ingest_stamped_tx` (store_workflow, workflow ingest, add_step, \
-         delete_step). The preflight's own mint runs only for an agent with no row of any state; \
-         a revoked or reader system agent is refused (AgentCreation -> INTERNAL_ERROR, #498's \
-         choice: the system agent's membership is operator configuration, not the caller's).",
-    ),
-    (
-        "epigraph-api/src/routes/workflows.rs",
-        "system_agent_write_authority",
-        3,
-        "API `begin_system_ingest_stamped_tx` (both `/workflows/ingest` handlers, add_step), \
-         `embed_inserted_workflow_claims` (the same two handlers' post-commit embed, backlog \
-         5ce88457) and `store_workflow_goal_embedding` (their post-commit goal embed, migration \
-         183), which run only after that transaction committed, so the agent already resolved \
-         once in the request. Same preflight; a refusal there logs and stores no vector.",
     ),
     (
         "epigraph-cli/src/bin/hypothesis.rs",

@@ -3,11 +3,12 @@
 //!
 //! # The measurement that bounds this module
 //!
-//! Every write a workflow mutation makes is authored by, and stamped from,
-//! the registered workflow-ingest system agent
-//! (`claim_helper::begin_system_ingest_stamped_tx`),
-//! and before batch H-b nothing on that path asked whether the CALLER had any
-//! authority over the workflow it named: any `claims:write` caller could
+//! Every write a workflow mutation makes used to be authored by, and stamped
+//! from, the registered workflow-ingest system agent, and before batch H-b
+//! nothing on that path asked whether the CALLER had any authority over the
+//! workflow it named (since workflow writes moved to the caller, the rows are
+//! authored by and stamped from the caller itself,
+//! `claim_helper::begin_caller_workflow_tx`; this gate is unchanged): any `claims:write` caller could
 //! `add_step` / `delete_step` on any workflow (the e2e `delete_step` arm drove a
 //! step's truth to 0.05 with no relation between caller and workflow).
 //!
@@ -79,9 +80,9 @@
 //!   the human it acted for (`operator`, on the operator arm), the
 //!   `submitter`, the tool (`action`), the `workflow_id`, the token
 //!   (`client_id`, `token_jti`) and the tool's own facts (`write`). The row is
-//!   attributed to the session principal, the system agent, because 077's
-//!   `security_events_append` admits no other attribution on that stamp; the
-//!   actor is `acting_agent`. A new generation records one row per anchor it
+//!   attributed to the session principal (077's `security_events_append`
+//!   admits no other attribution), which is now the caller itself; the actor
+//!   is `acting_agent`. A new generation records one row per anchor it
 //!   was checked against, naming the anchor and the row it created. A stdio
 //!   write records the same `workflows.caller_write` row with
 //!   `"transport": "stdio"` and no token (`client_id` / `token_jti` null).
@@ -89,9 +90,9 @@
 //!   mutation CREATES gets an `AUTHORED` edge (agent -> claim) from the ACTING
 //!   agent (the caller over HTTP, this server's pinned agent on stdio), on the
 //!   write's own transaction
-//!   (`epigraph_ingest_executor::record_caller_authorship`). The claims stay
-//!   authored and stamped by the system ingest agent (`claims.agent_id`); the
-//!   edge is what connects the agent that wrote them to them. Only claims the
+//!   (`epigraph_ingest_executor::record_caller_authorship`). The claims are
+//!   authored by that same acting agent (`claims.agent_id`) since workflow
+//!   writes moved to the caller; the edge is the graph form of it. Only claims the
 //!   call CREATED get one: a reused claim (a step already present, an
 //!   operation atom shared with another workflow or a document, a re-ingest)
 //!   keeps the edge of the agent that created it. The edge is idempotent, its
@@ -130,9 +131,10 @@
 //!   not-found answer, with no id, no submitter and no arm. Only the answer
 //!   changes: the arms admit exactly whom they admitted before.
 //!
-//! The system-agent stamp is unchanged for the rows these writes make: the
-//! caller is recorded in the provenance row, not by re-authoring the rows,
-//! which would move them out of the system agent's group.
+//! Writing as the caller adds the database's own check on top of these arms:
+//! the rows land in a group the caller writes (`epigraph_ingest_executor::owner`)
+//! and row security refuses a write into one it does not, so every arm, the
+//! audited admin arm included, now also needs write access to the rows' group.
 
 use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -534,9 +536,10 @@ pub(crate) async fn audit_admin_workflow_write(
         "submitter": submitter,
         "write": details,
     });
-    // Migration 112's definer, not an INSERT: this transaction is stamped from
-    // the system agent, and `security_events_append` admits an attributed row
-    // only for the session principal (measured: the INSERT was refused).
+    // Migration 112's definer, not an INSERT: the audit row is written with
+    // the definer's own guarantees (the token's live grant re-checked) on
+    // whatever stamp the write runs on; it used to be the system agent's, where
+    // `security_events_append` refused an INSERT attributed to the caller.
     epigraph_db::SecurityEventRepository::admin_audit_write(
         &mut *conn,
         token.client_id,
@@ -593,9 +596,9 @@ pub(crate) async fn record_workflow_write(
 /// (`SecurityEventRepository::workflow_caller_write`), recording the arm, the
 /// acting agent, the human it acted for (`operator`: the caller itself on the
 /// operator arm, null on the submitter arm), the submitter, the tool, the
-/// workflow and the token. The rows the write makes stay authored and stamped
-/// by the system agent; this row records who acted, and the `AUTHORED` edges
-/// who wrote the claims it created. `transport` says which transport carried
+/// workflow and the token. The rows the write makes are authored and stamped
+/// by the caller; this row records under which arm it acted, and the
+/// `AUTHORED` edges which claims it created. `transport` says which transport carried
 /// the call; a stdio row has no token (`client_id` / `token_jti` null). A
 /// no-op for an admin grant (the admin arm has its own row).
 ///
