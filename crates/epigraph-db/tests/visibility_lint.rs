@@ -812,6 +812,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "passkey.rs",
+        "revoke_compromised",
+        "WRITE through migration 200's maintenance-only `epigraph_revoke_passkey_compromised`: \
+         the revoke stamp on one person's passkey and every passkey enrolled through it, \
+         authentication records with no tenancy columns.",
+    ),
+    (
+        "passkey.rs",
         "get",
         "READ of one `person_authenticators` row by id for the maintenance CLI. No tenancy \
          columns; 124's FORCEd policy shows an application connection no row at all.",

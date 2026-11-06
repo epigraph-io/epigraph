@@ -1648,6 +1648,11 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // revoked anchor leaves the passkeys it anchored live).
     ("epigraph_person_authenticators_guard_act_confirmer", 200),
     ("epigraph_person_authenticators_revoke_anchored", 200),
+    // 200's compromised revoke (`revoke-passkey --compromised`) fails LOUD
+    // under a non-member owner: it reads no passkey and refuses (ELV04).
+    // 200 also re-states 124's `epigraph_person_authenticators_audit` (the
+    // revoke's `mode`), which stays registered at 124.
+    ("epigraph_revoke_passkey_compromised", 200),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2676,11 +2681,17 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             true,
         ),
         // 200: the anchored enrollment page's reader, app-callable like 124's
-        // ceremony reader.
+        // ceremony reader; the compromised revoke is a maintenance act like
+        // 124's revoke, which the request DSN must never call.
         (
             "epigraph_enrollment_anchor",
             "public.epigraph_enrollment_anchor(uuid)",
             true,
+        ),
+        (
+            "epigraph_revoke_passkey_compromised",
+            "public.epigraph_revoke_passkey_compromised(uuid, text)",
+            false,
         ),
         (
             "epigraph_confirm_admin_act",

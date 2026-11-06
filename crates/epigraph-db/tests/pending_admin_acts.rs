@@ -2118,9 +2118,10 @@ fn undo_200() -> String {
     .expect("200-undo.sql")
 }
 
-/// `docs/runbooks/200-undo.sql` returns the catalog to 199's (the reader,
-/// both triggers and their functions gone, no table touched; `catalog`
-/// includes triggers); a second run changes nothing. Mutation: either
+/// `docs/runbooks/200-undo.sql` returns the catalog to 199's (the reader, the
+/// compromised revoke, both triggers and their functions gone, 124's audit
+/// body restored byte for byte, no table touched; `catalog` includes
+/// triggers and each function's body md5); a second run changes nothing. Mutation: either
 /// trigger's DROP removed -> the trigger is left behind.
 #[sqlx::test(migrations = false)]
 async fn the_200_rollback_drops_only_what_200_created(pool: PgPool) {
@@ -2145,10 +2146,12 @@ async fn the_200_rollback_drops_only_what_200_created(pool: PgPool) {
     assert_eq!(catalog(&pool).await, before, "idempotent");
 }
 
-/// Migration 200's three SECURITY DEFINERs are on `epigraph-tenancy-backfill
-/// verify`'s ownership list at 200, the reader on its grant register
-/// (app-callable), and `docs/runbooks/200-undo.sql` drops them and both
-/// triggers. Mutation: the `("epigraph_person_authenticators_revoke_anchored",
+/// Migration 200's four NEW SECURITY DEFINERs are on `epigraph-tenancy-backfill
+/// verify`'s ownership list at 200, the reader (app-callable) and the
+/// compromised revoke (not) on its grant register, and
+/// `docs/runbooks/200-undo.sql` drops them and both triggers; the one 124 body
+/// 200 re-states (the passkey audit) stays on the list at 124 and the undo
+/// restores it. Mutation: the `("epigraph_person_authenticators_revoke_anchored",
 /// 200)` entry removed -> named here.
 #[test]
 fn every_200_object_is_registered() {
@@ -2160,18 +2163,33 @@ fn every_200_object_is_registered() {
     let backfill = read("crates/epigraph-cli/src/bin/tenancy_backfill.rs");
     let undo = undo_200();
     let (definers, all) = functions_of(&migration);
+    let restated = "epigraph_person_authenticators_audit";
     let expected: Vec<String> = [
         "epigraph_enrollment_anchor",
         "epigraph_person_authenticators_guard_act_confirmer",
         "epigraph_person_authenticators_revoke_anchored",
+        "epigraph_revoke_passkey_compromised",
     ]
     .iter()
     .map(ToString::to_string)
     .collect();
+    let mut every = expected.clone();
+    every.push(restated.to_string());
+    every.sort();
     assert_eq!(
         (definers.as_slice(), all.as_slice()),
-        (expected.as_slice(), expected.as_slice()),
-        "CALIBRATION: 200 creates exactly three functions, each a SECURITY DEFINER"
+        (every.as_slice(), every.as_slice()),
+        "CALIBRATION: 200 creates four functions and re-states one 124 body, each a SECURITY \
+         DEFINER"
+    );
+    assert!(
+        backfill.contains(&format!("(\"{restated}\", 124)")),
+        "{restated} stays on tenancy_backfill.rs's ownership list at 124"
+    );
+    assert!(
+        undo.contains(&format!("CREATE OR REPLACE FUNCTION public.{restated}()"))
+            && !undo.contains(&format!("DROP FUNCTION IF EXISTS public.{restated}(")),
+        "200-undo.sql restores {restated}, never drops it"
     );
     for name in &expected {
         assert!(
@@ -2192,10 +2210,15 @@ fn every_200_object_is_registered() {
             "200-undo.sql does not drop the trigger {trigger}"
         );
     }
-    assert!(
-        backfill.contains("\"public.epigraph_enrollment_anchor(uuid)\""),
-        "missing from tenancy_backfill.rs's grant register"
-    );
+    for signature in [
+        "public.epigraph_enrollment_anchor(uuid)",
+        "public.epigraph_revoke_passkey_compromised(uuid, text)",
+    ] {
+        assert!(
+            backfill.contains(&format!("\"{signature}\"")),
+            "{signature} is missing from tenancy_backfill.rs's grant register"
+        );
+    }
     assert!(
         undo.contains("DROP FUNCTION IF EXISTS public.epigraph_enrollment_anchor(uuid);"),
         "200-undo.sql does not drop it"
@@ -2705,4 +2728,368 @@ async fn the_200_triggers_are_maintenance_owned_definers(pool: PgPool) {
             "person_authenticators_guard_insert_act_confirmer".to_string()
         ]
     );
+}
+
+// =====================================================================
+// 200: THE COMPROMISED REVOKE (P779M-5)
+// =====================================================================
+
+/// `epigraph_revoke_passkey_compromised(passkey, reason)` on a maintenance
+/// session: `(passkey, lineage depth, revoked by this call)` for the passkey
+/// and every passkey whose anchor lineage passes through it.
+async fn revoke_compromised(
+    pool: &PgPool,
+    passkey: Uuid,
+    reason: &'static str,
+) -> Result<Vec<(Uuid, i32, bool)>, sqlx::Error> {
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT revoked_id, lineage_depth, revoked_now \
+               FROM public.epigraph_revoke_passkey_compromised($1, $2)",
+        )
+        .bind(passkey)
+        .bind(reason)
+        .fetch_all(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+}
+
+/// The `mode` of each passkey's `platform.passkey_revoked` audit row (`None`
+/// when it has none; absent when it was never revoked).
+async fn revoke_modes(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, Option<String>)> {
+    sqlx::query_as(
+        "SELECT (details->>'authenticator_id')::uuid, details->>'mode' FROM security_events \
+          WHERE event_type = 'platform.passkey_revoked' \
+            AND (details->>'authenticator_id')::uuid = ANY($1) \
+          ORDER BY created_at, id",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .expect("the revoke audit rows")
+}
+
+async fn session_end(pool: &PgPool, session: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+        .bind(session)
+        .fetch_one(pool)
+        .await
+        .expect("the session")
+}
+
+/// A phone, the passkeys enrolled through it, and a bystander:
+/// * `phone`: the person's first passkey;
+/// * `backup`: ATTESTED (`packed`), enrolled on an act the phone confirmed;
+/// * `synced`: `none`, enrolled on another act the phone confirmed;
+/// * `grandchild`: attested, enrolled on an act the BACKUP confirmed;
+/// * `great`: attested, enrolled on an act the grandchild confirmed;
+/// * `bystander` and `bystander_backup`: another person's first passkey and
+///   its attested backup;
+/// * `planted`: a third person's ATTESTED passkey whose enrollment was
+///   rewritten (every trigger off) onto an act the PHONE confirmed. The
+///   guards make that impossible (an act enrollment is the act proposer's own,
+///   and a proposer's act is confirmed only by the proposer's passkey); it
+///   stands for "another person's passkey under the phone's acts".
+struct Family {
+    p: Elevated,
+    backup: Uuid,
+    synced: Uuid,
+    grandchild: Uuid,
+    great: Uuid,
+    bystander: Uuid,
+    bystander_backup: Uuid,
+    planted: Uuid,
+}
+
+async fn phone_family(pool: &PgPool) -> Family {
+    let p = elevated_custodian(pool, "phone owner", 1).await;
+    let (_, e_backup) = anchored_enrollment(pool, &p).await;
+    let backup = try_complete(pool, e_backup, 2, "packed").await.unwrap();
+    let (_, e_synced) = anchored_enrollment(pool, &p).await;
+    let synced = try_complete(pool, e_synced, 3, "none").await.unwrap();
+    let via_backup = Elevated {
+        passkey: backup,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e_grand) = anchored_enrollment(pool, &via_backup).await;
+    let grandchild = try_complete(pool, e_grand, 4, "packed").await.unwrap();
+    let via_grand = Elevated {
+        passkey: grandchild,
+        cred: credential(4),
+        ..p.clone()
+    };
+    let (_, e_great) = anchored_enrollment(pool, &via_grand).await;
+    let great = try_complete(pool, e_great, 5, "packed").await.unwrap();
+
+    let q = elevated_custodian(pool, "bystander", 6).await;
+    let (_, e_q) = anchored_enrollment(pool, &q).await;
+    let bystander_backup = try_complete(pool, e_q, 7, "packed").await.unwrap();
+
+    let r = elevated_custodian(pool, "planted", 8).await;
+    let (phone_act, _) = anchored_enrollment(pool, &p).await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "UPDATE public.passkey_enrollments en SET created_via = 'confirmed_act', act_id = $2 \
+           FROM public.person_authenticators k WHERE k.id = $1 AND en.id = k.enrollment_id",
+    )
+    .bind(r.passkey)
+    .bind(phone_act)
+    .execute(&mut *tx)
+    .await
+    .expect("plant the enrollment on the phone's act");
+    sqlx::query(
+        "UPDATE public.person_authenticators SET attestation_format = 'packed', \
+                aaguid = '2fc0579f-8113-47ea-b116-bb5a8db9202a' WHERE id = $1",
+    )
+    .bind(r.passkey)
+    .execute(&mut *tx)
+    .await
+    .expect("record it attested");
+    tx.commit().await.expect("commit");
+    let under_phone: Option<Uuid> = sqlx::query_scalar(
+        "SELECT a.authenticator_id FROM person_authenticators k \
+           JOIN passkey_enrollments en ON en.id = k.enrollment_id \
+           JOIN pending_admin_acts a ON a.id = en.act_id WHERE k.id = $1",
+    )
+    .bind(r.passkey)
+    .fetch_one(pool)
+    .await
+    .expect("the planted row");
+    assert_eq!(
+        under_phone,
+        Some(p.passkey),
+        "CALIBRATION: the planted passkey hangs off an act the phone confirmed"
+    );
+    Family {
+        p,
+        backup,
+        synced,
+        grandchild,
+        great,
+        bystander: q.passkey,
+        bystander_backup,
+        planted: r.passkey,
+    }
+}
+
+/// A COMPROMISED revoke of the phone revokes the phone AND every passkey whose
+/// anchor lineage passes through it, attested ones included (the backup, its
+/// grandchild, the synced passkey and the great-grandchild), in one call, each
+/// audited `mode = compromised`, and ends their elevations. It never touches
+/// another person's passkeys: the bystander and its backup stay live, and so
+/// does the planted third person's passkey hanging off the phone's act.
+/// Red line (3ad5ff92): the function does not exist (42883). Mutations: the
+/// recursion's person filter dropped -> the planted passkey is revoked; the
+/// recursion stopped at depth 1 -> the grandchild and great-grandchild stay
+/// live; the audit's mode read dropped -> mode is `lost`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compromised_revoke_takes_out_every_passkey_on_the_phones_lineage(pool: PgPool) {
+    let f = phone_family(&pool).await;
+    let backup_session = elevate_with(&pool, f.p.person, credential(2)).await;
+    let bystander_person: Uuid =
+        sqlx::query_scalar("SELECT person_agent_id FROM person_authenticators WHERE id = $1")
+            .bind(f.bystander)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let bystander_session = elevate_with(&pool, bystander_person, credential(6)).await;
+
+    let mut got = revoke_compromised(&pool, f.p.passkey, "phone stolen")
+        .await
+        .expect("the compromised revoke");
+    got.sort();
+    let mut want = vec![
+        (f.p.passkey, 0, true),
+        (f.backup, 1, true),
+        (f.synced, 1, true),
+        (f.grandchild, 2, true),
+        (f.great, 3, true),
+    ];
+    want.sort();
+    assert_eq!(got, want, "the phone and every passkey on its lineage");
+
+    let (by, reason) = revoked(&pool, f.p.passkey).await.expect("the phone");
+    assert_eq!(
+        (by.as_str(), reason.as_str()),
+        ("epigraph_maintenance", "phone stolen")
+    );
+    for d in [f.backup, f.synced, f.grandchild, f.great] {
+        let (_, reason) = revoked(&pool, d)
+            .await
+            .unwrap_or_else(|| panic!("{d} is revoked"));
+        assert_eq!(
+            reason,
+            format!("compromised anchor {} (lineage): phone stolen", f.p.passkey),
+            "{d}"
+        );
+    }
+    for live in [f.bystander, f.bystander_backup, f.planted] {
+        assert!(
+            revoked(&pool, live).await.is_none(),
+            "another person's passkey {live} stays live"
+        );
+    }
+    let modes = revoke_modes(
+        &pool,
+        &[f.p.passkey, f.backup, f.synced, f.grandchild, f.great],
+    )
+    .await;
+    assert_eq!(modes.len(), 5, "one audit row each: {modes:?}");
+    assert!(
+        modes
+            .iter()
+            .all(|(_, m)| m.as_deref() == Some("compromised")),
+        "{modes:?}"
+    );
+    assert_eq!(
+        session_end(&pool, backup_session).await.as_deref(),
+        Some("passkey_revoked"),
+        "the attested backup's elevation ends with it"
+    );
+    assert_eq!(
+        session_end(&pool, bystander_session).await,
+        None,
+        "the bystander's elevation is untouched"
+    );
+}
+
+/// The default (LOST) revoke keeps its behaviour: the phone and the `none`
+/// passkey it anchored go, audited `mode = lost`; the attested backup and
+/// everything enrolled through it stay live. The grandchild is then revoked
+/// as lost too (the great-grandchild, attested, stays live). If the phone
+/// later turns out to be stolen, a COMPROMISED revoke of the already-revoked
+/// phone sweeps what is left on its lineage, walking THROUGH the revoked
+/// grandchild to the great-grandchild; revoked passkeys are not revoked
+/// again (a revoke is final). Audited `compromised`. CALIBRATION: the lost
+/// revokes left the backup and the great-grandchild live. Mutations: the
+/// recursion seeded only by a live passkey -> nothing is swept; the
+/// recursion's step taking only live passkeys -> the great-grandchild stays
+/// live.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lost_revoke_keeps_the_backup_and_a_later_compromised_revoke_sweeps_it(pool: PgPool) {
+    let f = phone_family(&pool).await;
+    assert_eq!(
+        maint(
+            &pool,
+            "SELECT public.epigraph_revoke_passkey($1, 'phone lost')",
+            &[Some(f.p.passkey)],
+        )
+        .await
+        .expect("the lost revoke"),
+        1
+    );
+    assert!(revoked(&pool, f.synced).await.is_some(), "the cascade");
+    for live in [f.backup, f.grandchild, f.great, f.bystander, f.planted] {
+        assert!(
+            revoked(&pool, live).await.is_none(),
+            "CALIBRATION: a lost revoke leaves {live} live"
+        );
+    }
+    assert_eq!(
+        revoke_modes(&pool, &[f.p.passkey, f.synced]).await,
+        vec![
+            (f.p.passkey, Some("lost".to_string())),
+            (f.synced, Some("lost".to_string()))
+        ],
+        "the lost revoke and its cascade are audited `lost`"
+    );
+    maint(
+        &pool,
+        "SELECT public.epigraph_revoke_passkey($1, 'lost too')",
+        &[Some(f.grandchild)],
+    )
+    .await
+    .expect("the grandchild's lost revoke");
+    assert!(
+        revoked(&pool, f.great).await.is_none(),
+        "CALIBRATION: an attested great-grandchild outlives a lost revoke"
+    );
+
+    let mut got = revoke_compromised(&pool, f.p.passkey, "it was stolen after all")
+        .await
+        .expect("a compromised revoke of a revoked passkey");
+    got.sort();
+    let mut want = vec![
+        (f.p.passkey, 0, false),
+        (f.backup, 1, true),
+        (f.synced, 1, false),
+        (f.grandchild, 2, false),
+        (f.great, 3, true),
+    ];
+    want.sort();
+    assert_eq!(got, want);
+    for d in [f.backup, f.great] {
+        assert!(revoked(&pool, d).await.is_some(), "{d} swept");
+    }
+    for live in [f.bystander, f.bystander_backup, f.planted] {
+        assert!(revoked(&pool, live).await.is_none(), "{live} stays live");
+    }
+    let (_, reason) = revoked(&pool, f.p.passkey).await.unwrap();
+    assert_eq!(reason, "phone lost", "a revoked passkey is final");
+    assert_eq!(
+        revoke_modes(&pool, &[f.backup, f.great])
+            .await
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>(),
+        vec![Some("compromised".to_string()); 2]
+    );
+}
+
+/// The compromised revoke is a maintenance act: the application role cannot
+/// call it (42501), an unknown passkey or an empty reason is refused with
+/// nothing revoked, and its catalog contract is 200's (a definer owned by
+/// `epigraph_maintenance` on `pg_catalog, pg_temp`, EXECUTE-able by neither
+/// PUBLIC nor `epigraph_app`). Mutation: the REVOKE from `epigraph_app`
+/// dropped -> the app call succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compromised_revoke_is_a_maintenance_only_definer(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let id = p.passkey;
+    let r: Result<Vec<(Uuid,)>, sqlx::Error> = as_app(&pool, None, "", "", |mut conn| async move {
+        let r = sqlx::query_as(
+            "SELECT revoked_id FROM public.epigraph_revoke_passkey_compromised($1, 'x')",
+        )
+        .bind(id)
+        .fetch_all(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await;
+    assert_code(&r, "42501", "the application role");
+    assert_code(
+        &revoke_compromised(&pool, Uuid::new_v4(), "x").await,
+        "ELV04",
+        "an unknown passkey",
+    );
+    assert_code(
+        &revoke_compromised(&pool, id, "  ").await,
+        "22004",
+        "an empty reason",
+    );
+    assert!(revoked(&pool, id).await.is_none(), "nothing revoked");
+
+    let (definer, owner, config, app, public): (bool, String, Vec<String>, bool, bool) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, p.proowner::regrole::text, coalesce(p.proconfig, '{}'), \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                    EXISTS (SELECT 1 FROM aclexplode(p.proacl) a \
+                             WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE') \
+               FROM pg_proc p \
+              WHERE p.oid = 'public.epigraph_revoke_passkey_compromised(uuid, text)'::regprocedure",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("the function");
+    assert!(definer);
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    assert_eq!((app, public), (false, false));
 }

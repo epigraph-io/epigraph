@@ -2519,6 +2519,8 @@ that runs the WebAuthn ceremony is deployed with a relying party configured
    human opens it under the public base URL, on the device that holds the
    authenticator. `list-passkeys` shows the result. For a lost device:
    `revoke-passkey --id <passkey> --reason <text> --apply` (audited; final).
+   For a stolen or otherwise suspect device, add `--compromised` (migration
+   200; "Two revoke modes" in that section).
 
 The default attestation policy requires a verified attestation that chains
 to a CA in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE`, from an authenticator
@@ -2857,7 +2859,42 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   reason `anchor <id> revoked: <reason>`. An attested passkey enrolled on
   such an act stays live: it stands on its own attestation. That includes a
   backup hardware key the anchored ceremony recorded attested, and excludes
-  one it recorded `none` (see above).
+  one it recorded `none` (see above). This is the default, LOST-device mode.
+- **Two revoke modes: lost or compromised.** Every `platform.passkey_revoked`
+  audit row records which one revoked it, as `mode` (`lost` or
+  `compromised`).
+  - **Lost** (the default: `revoke-passkey --id <passkey> --reason <text>
+    --apply`). Use it when the device is gone but nobody else can use it: it
+    was lost, broken, or wiped. It revokes the passkey and the `none`
+    passkeys it anchored, as above. Attested keys enrolled on acts it
+    confirmed stay live, so the person keeps working with them.
+    *Example:* a phone falls into a lake. Revoke it as lost. The person's
+    backup security key, enrolled on an act the phone confirmed, keeps
+    elevating, and confirms the `passkey.register` act for the next phone.
+  - **Compromised** (`revoke-passkey --id <passkey> --reason <text>
+    --compromised --apply`). Use it when someone else may have used the
+    device or its passkey: stolen, unlocked out of the person's sight, or
+    otherwise suspect. Whoever held it could have confirmed the
+    `passkey.register` acts that enrolled further keys. It revokes the
+    passkey and every passkey whose anchor lineage passes through it: each
+    passkey enrolled on an act it confirmed, each enrolled on an act one of
+    those confirmed, and so on, attested ones included. It never touches
+    another person's passkeys. Every elevation any of them confirmed ends
+    (`passkey_revoked`), and every unexecuted act they confirmed is voided,
+    as for any revoke. It prints one line per passkey reached (`depth=` 0
+    for the passkey named) and, without `--apply`, rolls everything back.
+    It also works on a passkey already revoked: revoked passkeys are walked
+    through, not revoked again, and anything still live below them is
+    revoked. Afterwards the person enrolls a replacement on a
+    `passkey.register` act confirmed with a passkey still live (one not
+    enrolled through the compromised one), or, if none is left, through
+    `passkey-enroll` without `--act` (the bootstrap).
+    *Example:* a phone is stolen while unlocked. Revoke it as compromised.
+    The backup security key enrolled on the phone's act is revoked too,
+    because the thief could have enrolled it, and so is any key enrolled
+    through that one. If the phone was first revoked as lost and only
+    later found to be stolen, run the compromised revoke on it then: it
+    sweeps what the lost revoke left.
 
 **What remains, exactly.**
 - **The anchor confirms an act, not a credential.** The anchor's
@@ -2922,11 +2959,13 @@ which revokes it.
 
 1. **Migrate 200** (`epigraph-migrate`, migration DSN). It adds the
    enrollment page's reader of an act enrollment's anchor and its lineage,
-   the act-confirmer insert guard and the anchored-revoke cascade; no
-   earlier body is re-stated. Then deploy `epigraph-tenancy-backfill` from
-   the same commit; `verify` checks the three functions' owner and the
-   reader's grant to `epigraph_app`. The guard and the cascade apply
-   whatever the settings say.
+   the act-confirmer insert guard, the anchored-revoke cascade and the
+   compromised revoke. It re-states ONE earlier body: 124's passkey audit
+   trigger function, whose revoke rows gain `mode`. Then deploy
+   `epigraph-tenancy-backfill` and `epigraph-operator` from the same commit;
+   `verify` checks the four functions' owner, the reader's grant to
+   `epigraph_app` and that `epigraph_app` cannot call the compromised
+   revoke. The guard and the cascade apply whatever the settings say.
 2. **The status list.** Install the refresh job and its timer with the
    `OnFailure=` alert, and the age check under your monitoring (both above).
    Run the job once, then run the age check: it must print `android
@@ -3005,9 +3044,11 @@ which revokes it.
   or lineage depends on it stops anchoring. Synced passkeys already anchored
   stay live; revoke them, or their anchors, to remove them.
 - **Migration 200.** Run `docs/runbooks/200-undo.sql` on the migration DSN,
-  only after no unit runs with the anchored setting on. It drops the reader,
-  the insert guard and the cascade. After the undo, revoking an anchor no
-  longer revokes what it anchored.
+  only after no unit runs with the anchored setting on and `epigraph-operator`
+  is rolled back to a build without `--compromised`. It drops the reader, the
+  insert guard, the cascade and the compromised revoke, and restores 124's
+  audit body (later revoke rows carry no `mode`). After the undo, revoking
+  an anchor no longer revokes what it anchored.
 
 ### Elevation tickets and sessions (migration 125) — deploy order and rollback
 
@@ -3551,7 +3592,8 @@ minutes), other arguments, or another actor. A dry run spends nothing.
 
 **The break-glass.** `epigraph-operator revoke-passkey` (audited) of a lost
 or suspect passkey lifts the requirement for its holder, and voids every
-unexecuted act it confirmed. Proposing an act needs a LIVE elevation, and no
+unexecuted act it confirmed. For a suspect passkey use `--compromised`
+(migration 200), which also revokes every passkey enrolled through it. Proposing an act needs a LIVE elevation, and no
 elevation is live until migration 132 opens the recorder gate. The act API
 that proposes and confirms is migration 131. Until both are deployed, a
 custodian who holds a passkey makes these writes only after revoking it.
