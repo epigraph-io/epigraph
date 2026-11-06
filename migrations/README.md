@@ -2424,16 +2424,25 @@ restart.
   registration records no edge, and that identity keeps the group through
   a clean old copy, as does an edit or revert registered with another
   parent than the identity the group's lane ran last (a host that keys
-  the parent per model). So the cut-off reaches the whole job only from a
-  host that keys succession on the group's lane (the lane's newest
-  identity, any model, is the parent of every edit or revert). Until
-  then, a detach cuts a job off only when EVERY live row made by name for
-  the role is detached that any identity the host may run for the group
-  holds or chains its live copies up to, not only the one at the top of
-  the running identity's chain: after a documented restore the running
-  identity holds its own row made by name, and an earlier identity whose
-  copy roots at an older one keeps the group when the job goes back to it
-  unregistered. A detach also reaches the
+  the parent per model). So a detach of the identity a job runs reaches
+  the job's later edits and reverts only from a host that keys succession
+  on the group's lane (the lane's newest identity, any model, is the
+  parent of every edit or revert), and even then never an identity that
+  holds a live row made by name: that row is never judged and ends the
+  walk, so a job keeps the group by going back to ANY identity it can run
+  that holds one, its revert registered or not (after a documented
+  restore, a revert to an older identity attached by name, registered
+  with the detached, restored one as parent, stays in, and so does the
+  next edit from it). That is permanent, whatever the host records. What
+  cuts a job off under any host: detach EVERY live row made by name for
+  the role that any identity the host may run for the group holds (any
+  model, any kind of run), and every live row made by name that any of
+  their live copies chains up to; a copy counts only through a live row
+  made by name at its chain's root, so none of them is admitted again
+  until the operator attaches one by name. A lane-keyed host adds only
+  that a detach of an identity the job ran also takes every identity it
+  registers below that one afterwards that holds no live row made by
+  name. A detach also reaches the
   identity that runs now when the operator detaches an OLD identity it
   descends from (a registered revert records a succession too), and the
   walk ignores when a succession or a detach was recorded, so an answer

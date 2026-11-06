@@ -4036,12 +4036,15 @@ async fn a_successor_of_a_detached_and_a_clean_parent_runs_through_the_detached_
 // a restored identity (detached, then attached by name again) is out when its
 // copy runs through the old, detached copy and in when it names the row made
 // by name (`below_an_identity_attached_by_name_the_copy_chain_decides`).
-// A row made by name keeps counting: a revert to the identity the operator
-// attached by name keeps the group through that row. And the walk sees only
-// registered successions: after a documented restore, detaching the restored
-// identity alone leaves an earlier identity whose copy roots at an older row
-// made by name in, when the job goes back to it unregistered; detaching every
-// such row cuts it off
+// A row made by name keeps counting, whatever the host records: a revert to
+// an identity the operator attached by name keeps the group through that row,
+// registered or not, and so does the job's next edit from it; detaching that
+// row cuts them off
+// (`after_a_restore_a_registered_revert_to_an_identity_attached_by_name_stays_in_until_its_row_is_detached`).
+// And the walk sees only registered successions: after a documented restore,
+// detaching the restored identity alone leaves an earlier identity whose copy
+// roots at an older row made by name in, when the job goes back to it
+// unregistered; detaching every such row cuts it off
 // (`after_a_restore_detaching_the_restored_identity_alone_leaves_an_unregistered_revert_in`).
 // =====================================================================
 

@@ -1458,12 +1458,13 @@ the group through its copies as before.
 An attachment made BY NAME always counts, even for an identity that also
 holds a detached row or descends from one. So detaching the identity a job
 runs does NOT cut off an identity you attached by name: if the job reverts
-to the identity you attached (the chain root), it keeps the group through
-that attachment, and so do the identities registered from it afterwards.
-To take the group from such a job, detach the identity you attached by name
-too; every copy chained from it stops counting. After a documented restore a
-job's identities can chain up to more than one row made by name: see "What
-the cut-off cannot see" below for the lever that holds then.
+to an identity you attached by name, it keeps the group through that
+attachment, its revert registered or not and whatever the host records,
+and so do the identities registered from it afterwards. So a job keeps the
+group while ANY identity it can run holds a live attachment made by name
+(after a documented restore there can be several): to take the group from
+it, detach every such attachment, as "Cutting a job off" below says. That
+is permanent, not a gap a host can close.
 
 A row made by name also ENDS THE WALK up the lineage, so below it the
 answer is no longer a function of the succession edges, detached rows and
@@ -1524,24 +1525,48 @@ register it (the earlier identity's key again, naming the identity it
 reverts from as its parent; a repeat is a no-op). The same holds for the
 parent the host names on an edit or a revert: a host that picks it per
 model names that model's own last identity, so the job's edit or revert
-carried to another model is not below the identity you detached. The
-cut-off reaches the whole job only from a host that keys succession on the
-group's LANE: the lane's newest identity, whatever model, is the parent of
-every edit or revert, and a plain model switch with unchanged prompt bytes
-registers nothing.
+carried to another model is not below the identity you detached. A detach
+reaches the job's later edits and reverts only from a host that keys
+succession on the group's LANE: the lane's newest identity, whatever model,
+is the parent of every edit or revert, and a plain model switch with
+unchanged prompt bytes registers nothing. Even then it never reaches an
+identity that holds a live attachment made by name (below).
 
-Until the host does that, detaching the identity at the top of the running
-identity's copy chain is NOT enough. The host can run any identity it
-still keeps for the group (several recent registrations, not only the one
-that ran last), and their copies can root at different rows made by name.
-After a documented restore the running identity holds its own row made by
-name, so detaching it leaves an earlier identity whose copy roots at an
-older row made by name in the group, read and write, when the job goes back
-to it unregistered. To cut a job off, detach EVERY live attachment made by
-name for the role that any identity the host may run for the group holds,
-or that any of their live copies chains up to (an older root can belong to
-an identity the host no longer keeps). A copy written by hand stays the
-limit stated above.
+CUTTING A JOB OFF. What the database enforces: a succession copy counts
+only through a live attachment made by name at the root of its chain, and
+an attachment made by name always counts, is never judged, and ends the
+walk up the lineage. So, whatever the host records, a job keeps the group
+by going back to ANY identity it can run that holds a live attachment made
+by name, and the job's next edit from there copies that attachment. The
+host can run any identity whose prompt bytes the job can put back, not only
+recent ones. After a documented restore the running identity A holds its
+own attachment made by name, and detaching it leaves an earlier identity Q
+attached by name in the group, read and write, when the job goes back to
+Q, its revert registered below A or not; an earlier identity P whose copy
+roots at Q's attachment stays in too when the job goes back to it
+unregistered. To cut a job off, whatever the host records, detach EVERY
+live attachment made by name for the role that any identity the host may
+run for the group holds (any model, any kind of run; every identity with a
+prompt snapshot in the group's folder is one), and every live attachment
+made by name that any of their live copies chains up to (a copy counts only
+when its root's agent runs in the copy holder's folder, so these are in the
+same set; read each chain to check). Then no copy any of them holds has a
+live root, and nothing registered from them later inherits one: the job
+stays out until you attach one of its identities by name again.
+
+What a host that keys succession on the group's lane adds: a detach of an
+identity the job ran also takes every identity the host registers below it
+afterwards, edits and reverts at any model, that holds no live attachment
+made by name. It never takes one that does, so the attachments made by name
+above still have to be detached. Which identity to detach so that the job's
+later identities are all below it depends on how the host records a plain
+model switch: an identity with the same prompt bytes at another model that
+the job ran before the one you detach is above it, not below. Limits: an
+attachment made by name is not tied to a folder, so an identity attached by
+name in another group's folder whose model and prompt files are identical
+to ones this job can put back keeps the group when the job runs it, and is
+not found from this folder until it registers here; a copy written by hand
+stays the limit stated above.
 
 #### Recipe: a role-private group for a scheduled job
 

@@ -96,15 +96,27 @@
 -- before, and keeps its old copy when they are clean; an edit or revert
 -- registered with a parent other than the identity the group's lane ran last
 -- (a host that keys the parent per model) is judged by that parent the same
--- way. So the cut-off reaches the whole job only from a host that keys
--- succession on the group's lane: the lane's newest identity, whatever model,
--- is the parent of every edit or revert. Until then, a detach cuts a job off
--- only when EVERY live row made by name for the role is detached that any
--- identity the host may run for the group holds, or that any of their live
--- copies chains up to, not only the one at the top of the running identity's
--- chain: after a documented restore the running identity holds its own row
--- made by name, and an earlier identity whose copy roots at an older one
--- keeps the group, read and write, when the job goes back to it unregistered.
+-- way. So a detach of the identity a job runs reaches the job's later edits
+-- and reverts only from a host that keys succession on the group's lane: the
+-- lane's newest identity, whatever model, is the parent of every edit or
+-- revert. Even then it never reaches an identity that holds a live row made
+-- by name. That row is never judged and ends the walk, so a job keeps the
+-- group by going back to ANY identity it can run that holds one, its revert
+-- registered or not, and the job's next edit from there copies that row.
+-- After a documented restore (Q attached by name; P, A succeed it; A
+-- restored by name, then detached), a revert to Q registered with A as its
+-- parent leaves Q in, read and write, and so is the next edit from Q. This
+-- is permanent: no host record changes it.
+-- WHAT CUTS A JOB OFF, whatever the host records: detach EVERY live row made
+-- by name for the role that any identity the host may run for the group
+-- holds (any model, any kind of run), and every live row made by name that
+-- any of their live copies chains up to. A copy counts only through a live
+-- row made by name at the root of its chain, so then none of those
+-- identities is admitted, nor anything registered from them later, until
+-- the operator attaches one by name again. What a host that keys succession
+-- on the group's lane adds: a detach of an identity the job ran also takes
+-- every identity the host registers below it afterwards, edits and reverts
+-- at any model, that holds no live row made by name.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
 -- as a chain's root, even when its agent also holds a detached row, and an
@@ -117,8 +129,8 @@
 --     ran as its parent (above), are out, however many registrations later,
 --     until the operator attaches the identity that runs by name;
 --   * but an identity the operator attached by name keeps the group through
---     that row, also when the job reverts to it: to cut such a job off,
---     detach that identity too;
+--     that row, also when the job reverts to it, registered or not: to cut
+--     such a job off, detach every row made by name it can reach (above);
 --   * the documented restore still works: detach the running identity's
 --     stale copy, attach it by name; it and its later successors (copies
 --     whose root is that direct row) are members again;
