@@ -434,8 +434,9 @@ pub const AGENT_SEARCH_SCOPE: &str = "claims:read";
 /// where the caller may see it), ranked exact > prefix > similar, each result
 /// carrying the card that tells near-duplicates apart: kind (derived from
 /// evidence the caller may see), the roles it may see, the human the agent
-/// acts for (shown to every reader), created_at, and counts of
-/// authored papers and asserted claims computed under the caller's viewer.
+/// is currently bound to (shown to every reader; none once its link is
+/// retired), created_at, and counts of authored papers (countersigned, and
+/// pending apart) and asserted claims computed under the caller's viewer.
 /// The same code and viewer rules serve MCP `find_agent`
 /// (`epigraph_db::AgentLookupRepository::find`). Requires authentication.
 #[cfg(feature = "db")]

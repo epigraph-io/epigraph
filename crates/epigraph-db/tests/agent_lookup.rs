@@ -1123,3 +1123,463 @@ async fn migration_198_refuses_more_than_200_agents(pool: PgPool) {
         .expect("200 ids accepted");
     assert!(ok.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The agent's human is its CURRENT live binding only
+// ---------------------------------------------------------------------------
+
+/// Retire `agent`'s live link through 191's maintenance verb, revoking its
+/// writer row in the same call (the verb's zero-authority precondition).
+async fn retire_link(pool: &PgPool, agent: Uuid) {
+    let outcome: String = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: String = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'lookup test retire', \
+                                                                     true)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("retire the link");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(outcome, "retired", "CALIBRATION: the link was live");
+}
+
+/// `epigraph_human_of(agent, true)`: the binding in force, links' retired bit
+/// honoured. Read on the harness connection.
+async fn live_human_of(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT public.epigraph_human_of($1, true)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("epigraph_human_of live")
+}
+
+/// A retired operator link is no longer the agent's human: the operator owns
+/// the agent's past claims, but the agent never acts for it again (107
+/// section 7), so the card must not present that human as the current one.
+/// Every reader's card of the retired agent then reads exactly like an
+/// unbound look-alike's, while the binding RECORD still names the operator
+/// (CALIBRATION: the retire is the only thing that changed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retired_link_is_not_shown_as_the_agents_human(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (human, _) = named_human(&pool, "Maren Quillfeather").await;
+    let (bot, _) = named(&pool, "quill-bot").await;
+    let (lookalike, _) = named(&pool, "quill-bot").await;
+    link(&pool, bot, human).await;
+    for who in [outsider, bot, human] {
+        assert_eq!(
+            card_as(&pool, who, bot).await.operator_human.map(|h| h.id),
+            Some(human),
+            "CALIBRATION: a live link is shown"
+        );
+    }
+
+    retire_link(&pool, bot).await;
+    assert_eq!(
+        human_of(&pool, bot).await,
+        Some(human),
+        "CALIBRATION: the link record still names the operator"
+    );
+    assert_eq!(
+        live_human_of(&pool, bot).await,
+        None,
+        "CALIBRATION: no binding is in force"
+    );
+
+    for who in [outsider, bot, human] {
+        let c = card_as(&pool, who, bot).await;
+        assert!(
+            c.operator_human.is_none(),
+            "a retired link is shown as the current human to {who}: {c:?}"
+        );
+        assert!(
+            !c.kind_evidence.contains(&"bound_to_visible_human"),
+            "{c:?}"
+        );
+    }
+    let out = cards_as(&pool, outsider, &[bot, lookalike]).await;
+    assert_eq!(
+        shape(&out[0]),
+        shape(&out[1]),
+        "a retired agent reads as an unbound one"
+    );
+
+    // A link RECORDED retired (107's link-retired path) is never shown either.
+    let (old_bot, _) = named(&pool, "quill-bot-legacy").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    let rl = epigraph_db::AgentRepository::link_retired_agent(&mut conn, old_bot, human)
+        .await
+        .expect("record a retired link");
+    assert!(rl.link_retired, "CALIBRATION: recorded retired");
+    drop(conn);
+    assert_eq!(human_of(&pool, old_bot).await, Some(human), "CALIBRATION");
+    assert!(card_as(&pool, outsider, old_bot)
+        .await
+        .operator_human
+        .is_none());
+
+    // find_agent goes through the same card.
+    let r = find_as(&pool, outsider, "quill-bot", None, None, Some(25)).await;
+    for hit in &r.results {
+        assert!(hit.card.operator_human.is_none(), "{:?}", hit.card);
+    }
+}
+
+/// A revoked binding is no binding: a revoked client allowance names nobody,
+/// and an agent whose (retired) link record exists never falls back to an
+/// allowance row, exactly as `epigraph_human_of` never consults the
+/// allowance for a linked agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_binding_is_not_shown_and_a_retired_link_never_falls_back(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (h_allow, _) = named_human(&pool, "Ottoline Fairweather").await;
+    let (h_link, _) = named_human(&pool, "Caspian Thornbury").await;
+
+    // 1. An allowance revoked through 149's maintenance verb.
+    let (revoked_agent, revoked_client) = allowance_bound(&pool, h_allow, "ledger-service").await;
+    assert_eq!(
+        card_as(&pool, outsider, revoked_agent)
+            .await
+            .operator_human
+            .map(|h| h.id),
+        Some(h_allow),
+        "CALIBRATION: an allowance in force is shown"
+    );
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, \
+                                                                              'lookup test')",
+        )
+        .bind(revoked_client)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke the allowance");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the allowance was live");
+    assert!(card_as(&pool, outsider, revoked_agent)
+        .await
+        .operator_human
+        .is_none());
+
+    // 2. An allowance whose agent was later linked (its client revoked first,
+    //    which 149 requires), and then that link retired: the allowance row
+    //    is still unrevoked, but a linked agent is bound by its link alone.
+    let (agent, client) = allowance_bound(&pool, h_allow, "archive-service").await;
+    set_client_status(&pool, client, "revoked").await;
+    link(&pool, agent, h_link).await;
+    assert_eq!(
+        card_as(&pool, outsider, agent)
+            .await
+            .operator_human
+            .map(|h| h.id),
+        Some(h_link),
+        "CALIBRATION: the link, not the allowance, binds a linked agent"
+    );
+    let unrevoked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM author_binding_clients WHERE agent_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("allowance rows");
+    assert_eq!(unrevoked, 1, "CALIBRATION: the allowance row is unrevoked");
+    retire_link(&pool, agent).await;
+    assert_eq!(live_human_of(&pool, agent).await, None, "CALIBRATION");
+    assert!(
+        card_as(&pool, outsider, agent)
+            .await
+            .operator_human
+            .is_none(),
+        "a retired link fell back to the allowance"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Counts trust only attributions the ingest path wrote
+// ---------------------------------------------------------------------------
+
+/// A paper row, as the document ingest creates one.
+async fn paper(pool: &PgPool, doi: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'A Fixture Paper')")
+        .bind(id)
+        .bind(doi)
+        .execute(pool)
+        .await
+        .expect("paper");
+    id
+}
+
+/// An edge written by `writer` on an `epigraph_app` transaction stamped with
+/// `writer`'s viewer: the repository call both the document ingest's walk and
+/// `POST /api/v1/edges` make. Agent and paper endpoints land
+/// `('public', world)` (migration 120), readable by everyone.
+async fn edge_as(
+    pool: &PgPool,
+    writer: Uuid,
+    src: (Uuid, &str),
+    tgt: (Uuid, &str),
+    rel: &str,
+    props: Option<serde_json::Value>,
+) -> Uuid {
+    let scoped = app_pool(pool).await;
+    let v = viewer(pool, writer).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let id = epigraph_db::EdgeRepository::create(
+        &mut *tx, src.0, src.1, tgt.0, tgt.1, rel, props, None, None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{rel} edge as {writer}: {e}"));
+    tx.commit().await.expect("commit");
+    let vis: (String, Uuid) =
+        sqlx::query_as("SELECT visibility::text, owner_group_id FROM edges WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("edge row");
+    assert_eq!(vis.0, "public", "CALIBRATION: the edge is world-readable");
+    id
+}
+
+/// What one document ingest writes for one author and one claim: the
+/// author's `authored -> paper`, the paper's `asserts -> claim`, and the
+/// author's `asserts -> claim`.
+async fn ingest_attribution(
+    pool: &PgPool,
+    ingester: Uuid,
+    author: Uuid,
+    paper_id: Uuid,
+    claim: Uuid,
+    authored_props: serde_json::Value,
+) {
+    edge_as(
+        pool,
+        ingester,
+        (author, "agent"),
+        (paper_id, "paper"),
+        "authored",
+        Some(authored_props),
+    )
+    .await;
+    edge_as(
+        pool,
+        ingester,
+        (paper_id, "paper"),
+        (claim, "claim"),
+        "asserts",
+        None,
+    )
+    .await;
+    edge_as(
+        pool,
+        ingester,
+        (author, "agent"),
+        (claim, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+}
+
+fn counts_json(card: &AgentCard) -> serde_json::Value {
+    serde_json::to_value(card.counts).expect("serialize counts")
+}
+
+/// The control: a document ingest's attribution counts, for every reader.
+/// And the forgery: a stranger's own `agent -asserts-> claim` edge naming a
+/// registered human, onto a claim it can read (its own, or one a paper
+/// asserts that the human never authored), moves no reader's count of that
+/// human. Only an attribution backed by a countersigned, in-force authorship
+/// of a paper asserting the claim is the agent's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_asserts_edge_moves_no_count(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (human, _) = named_human(&pool, "Perrin Galloway").await;
+    let (lookalike, _) = named(&pool, "Perrin Galloway").await;
+    let (author, _) = named(&pool, "Wilhelmina Strand").await;
+
+    // Control: an ingested paper's author.
+    let p = paper(&pool, "10.9999/lookup.trust.1").await;
+    let c = fixture::seed_public_claim(&pool, ingester, "an ingested finding").await;
+    ingest_attribution(
+        &pool,
+        ingester,
+        author,
+        p,
+        c,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    for who in [outsider, author, human] {
+        let k = card_as(&pool, who, author).await.counts;
+        assert_eq!(
+            (k.authored_papers, k.asserted_claims),
+            (1, 1),
+            "CALIBRATION: an ingest attribution counts for {who}"
+        );
+    }
+
+    // Forgery 1: onto the stranger's own claim (no paper at all).
+    let own = fixture::seed_public_claim(&pool, stranger, "a stranger's finding").await;
+    edge_as(
+        &pool,
+        stranger,
+        (human, "agent"),
+        (own, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    // Forgery 2: onto a claim a real paper asserts, which the human did not
+    // author.
+    edge_as(
+        &pool,
+        stranger,
+        (human, "agent"),
+        (c, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'asserts'",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .expect("forged edges");
+    assert_eq!(forged, 2, "CALIBRATION: both forged edges were written");
+
+    for who in [outsider, human, stranger] {
+        let out = cards_as(&pool, who, &[human, lookalike]).await;
+        assert_eq!(
+            counts_json(&out[0]),
+            counts_json(&out[1]),
+            "a stranger's asserts edge moved {who}'s count of the human"
+        );
+        assert_eq!(out[0].counts.asserted_claims, 0, "{:?}", out[0]);
+    }
+}
+
+/// An `authored` edge an ingester wrote naming someone it neither is nor
+/// operates (the pending-countersign mark) is the ingester's word, not the
+/// person's: it is reported apart as `pending_authored_papers`, never in
+/// `authored_papers`, and it backs no `asserted_claims` (a stranger who
+/// names a human on a paper and then writes the human's `asserts` onto that
+/// paper's claim moves nothing).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pending_authorship_is_reported_apart_and_backs_no_claim(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (human, _) = named_human(&pool, "Isolde Varrick").await;
+
+    let p = paper(&pool, "10.9999/lookup.pending.1").await;
+    let c = fixture::seed_public_claim(&pool, stranger, "a named-author finding").await;
+    ingest_attribution(
+        &pool,
+        stranger,
+        human,
+        p,
+        c,
+        serde_json::json!({
+            "position": 0,
+            "role": "author",
+            "explicit_agent_id": true,
+            "author_name": "Isolde Varrick",
+            "pending_countersign": true,
+            "ingested_by": stranger.to_string(),
+        }),
+    )
+    .await;
+
+    for who in [outsider, human, stranger] {
+        let card = card_as(&pool, who, human).await;
+        let k = counts_json(&card);
+        assert_eq!(k["authored_papers"], 0, "{who}: {k}");
+        assert_eq!(k["pending_authored_papers"], 1, "{who}: {k}");
+        assert_eq!(k["asserted_claims"], 0, "{who}: {k}");
+    }
+
+    // A countersigned authorship of the same shape counts (the control).
+    let (author, _) = named(&pool, "Isolde Varrick").await;
+    let p2 = paper(&pool, "10.9999/lookup.pending.2").await;
+    let c2 = fixture::seed_public_claim(&pool, stranger, "a name-derived finding").await;
+    ingest_attribution(
+        &pool,
+        stranger,
+        author,
+        p2,
+        c2,
+        serde_json::json!({"position": 0, "role": "author", "pending_countersign": false}),
+    )
+    .await;
+    let k = counts_json(&card_as(&pool, outsider, author).await);
+    assert_eq!(k["authored_papers"], 1, "{k}");
+    assert_eq!(k["pending_authored_papers"], 0, "{k}");
+    assert_eq!(k["asserted_claims"], 1, "{k}");
+}
+
+/// A retracted edge (an in-force window that has closed: the operator
+/// ingest's replacement, or any retract) counts nowhere: neither the
+/// authorship nor an attribution that only the retracted authorship backs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn retracted_authorships_and_attributions_do_not_count(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (author, _) = named(&pool, "Ambrose Kettering").await;
+    let kept = paper(&pool, "10.9999/lookup.retract.1").await;
+    let gone = paper(&pool, "10.9999/lookup.retract.2").await;
+    let c_kept = fixture::seed_public_claim(&pool, ingester, "a kept finding").await;
+    let c_gone = fixture::seed_public_claim(&pool, ingester, "a retracted finding").await;
+    let props = serde_json::json!({"position": 0, "role": "author"});
+    ingest_attribution(&pool, ingester, author, kept, c_kept, props.clone()).await;
+    ingest_attribution(&pool, ingester, author, gone, c_gone, props).await;
+    let k = card_as(&pool, outsider, author).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.asserted_claims),
+        (2, 2),
+        "CALIBRATION"
+    );
+
+    // Retract the second paper's authorship only (the privileged replacement
+    // closes edges by valid_to; no application session can).
+    sqlx::query(
+        "UPDATE edges SET valid_to = now() - interval '1 second' \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'authored'",
+    )
+    .bind(author)
+    .bind(gone)
+    .execute(&pool)
+    .await
+    .expect("retract the authorship");
+    let k = card_as(&pool, outsider, author).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.asserted_claims),
+        (1, 1),
+        "a retracted authorship still counts: {k:?}"
+    );
+
+    // And a retracted attribution edge, its authorship in force.
+    sqlx::query(
+        "UPDATE edges SET valid_to = now() - interval '1 second' \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'asserts'",
+    )
+    .bind(author)
+    .bind(c_kept)
+    .execute(&pool)
+    .await
+    .expect("retract the attribution");
+    let k = card_as(&pool, outsider, author).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.asserted_claims),
+        (1, 0),
+        "a retracted attribution still counts: {k:?}"
+    );
+}

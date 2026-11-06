@@ -402,8 +402,12 @@ async fn unmark_duplicate_doc() {}
 /// `trigram`. The body is `{results: [...], candidates_truncated}`; each result
 /// is an agent card (`id`, `display_name`, `kind`, `kind_evidence`, `roles`,
 /// `orcid`, `ror_id`, `operator_human`, `created_at`, `counts`) plus `tier`
-/// and `score`. `operator_human` (the human the agent acts for) is shown to
-/// every reader; every other field is computed under the caller's viewer.
+/// and `score`. `operator_human` (the human the agent is currently bound
+/// to: its live operator link, else its unrevoked client allowance; null
+/// once the link is retired) is shown to every reader; every other field is
+/// computed under the caller's viewer. `counts` holds `authored_papers`,
+/// `pending_authored_papers` (named by an ingester, not countersigned) and
+/// `asserted_claims`, over in-force edges the document ingest wrote.
 /// Same code as MCP `find_agent`. Scope `claims:read`.
 #[utoipa::path(
     get,
