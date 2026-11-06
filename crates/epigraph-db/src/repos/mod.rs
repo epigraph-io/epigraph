@@ -23,6 +23,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_ingest;
 pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
@@ -102,6 +103,7 @@ pub use admin_scope_enforcement::{
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
+    SpeaksFor,
 };
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
@@ -112,7 +114,7 @@ pub use agent_identity::{
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use agent_lookup::{
     AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
-    CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+    AuthorNode, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
 };
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
@@ -143,6 +145,11 @@ pub use claim::{
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_ingest::{
+    ingest_only_edge_refusal, is_agent_attribution, ClaimIngestRecord, ClaimIngestRepository,
+    ClaimIngests, AGENT_ATTRIBUTION_REFUSAL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
@@ -193,7 +200,10 @@ pub use method::{
     MethodCapability, MethodEvidenceStrength, MethodFailureModes, MethodForCapability,
     MethodRecord, MethodRepository, MethodSearchResult, MethodSourcePaper, MethodUsageExample,
 };
-pub use paper::{AssertedClaimRow, PaperRepository, PaperRow};
+pub use paper::{
+    AssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperRepository, PaperRow,
+    AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+};
 pub use perspective::PerspectiveRepository;
 pub use political::{
     AgentClaimProfileRow, CoalitionRow, EvidenceTypeCount, PoliticalRepository,

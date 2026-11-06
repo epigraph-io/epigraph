@@ -685,6 +685,11 @@ pub struct NeighborhoodResponse {
 /// - source_type and target_type must be valid entity types
 /// - relationship must be from the allowed set; `supersedes`, in any
 ///   spelling, is refused by name ([`SUPERSEDES_ACT_ONLY`])
+/// - the document ingest's own provenance (a paper's `asserts`, `authored`
+///   into a paper, `ingested_claim`), in any spelling, is refused by name
+///   (`epigraph_db::INGEST_ONLY_REFUSAL`, 400)
+/// - `asserts` / `AUTHORED` from an `agent` source only from that agent or
+///   the human operating it through a live binding (403 otherwise)
 #[cfg(feature = "db")]
 pub async fn create_edge(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -750,6 +755,21 @@ pub async fn create_edge(
             reason: SUPERSEDES_ACT_ONLY.to_string(),
         });
     }
+    // The document ingest's own provenance, by name and in any spelling: a
+    // paper's `asserts` onto a claim, any `authored` edge into a paper, and
+    // the ingest record. Readers take these as what an ingest wrote (who the
+    // paper's authors are, which document created a claim), so a generic
+    // writer never writes them, whoever it is.
+    if let Some(reason) = epigraph_db::ingest_only_edge_refusal(
+        &request.source_type,
+        &request.target_type,
+        &request.relationship,
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: reason.to_string(),
+        });
+    }
     if !is_valid_relationship(&request.relationship) {
         return Err(ApiError::ValidationError {
             field: "relationship".to_string(),
@@ -790,6 +810,28 @@ pub async fn create_edge(
             entity: request.target_type.clone(),
             id: request.target_id.to_string(),
         });
+    }
+
+    // An `asserts` or `AUTHORED` edge FROM an agent puts words in that agent's
+    // mouth, and an agent's edge lands world-owned, so neither the agent nor
+    // the writer could take it back. Only the agent itself, or the human
+    // operating it through a live binding, may write one: the rule the
+    // document ingest applies to its explicit authors
+    // (`AgentRepository::speaks_for`). No admin arm.
+    if epigraph_db::is_agent_attribution(&request.source_type, &request.relationship) {
+        let speaks = match auth.agent_id {
+            Some(caller) => {
+                epigraph_db::AgentRepository::speaks_for(&mut *tx, caller, &[request.source_id])
+                    .await?
+                    .contains_key(&request.source_id)
+            }
+            None => false,
+        };
+        if !speaks {
+            return Err(ApiError::Forbidden {
+                reason: epigraph_db::AGENT_ATTRIBUTION_REFUSAL.to_string(),
+            });
+        }
     }
 
     // Branch on if_not_exists: drainer / outbox callers opt in to

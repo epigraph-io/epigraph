@@ -496,11 +496,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write on a transaction stamped with the caller's viewer: the endpoint
     // existence checks run on it, and the edge trigger and WITH CHECK decide
-    // the write.
+    // the write. `AgentRepository::speaks_for` is an authority check, not a
+    // read of tenant content: is the caller the agent an asserts/AUTHORED
+    // edge comes from, or its human through a live binding (migration 149's
+    // binding records, identity data every session reads).
     (
         "edges.rs",
         "create_edge",
         &[
+            "AgentRepository::speaks_for",
             "EdgeRepository::create_if_not_exists_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_symmetric_if_absent_row_signed_conn",

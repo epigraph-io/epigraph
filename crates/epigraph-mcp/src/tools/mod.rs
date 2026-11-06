@@ -16,6 +16,7 @@ pub mod embeddings;
 pub mod events;
 pub mod evolve_step;
 pub mod graph;
+pub mod ingest_authors;
 pub mod ingestion;
 pub mod label_dedup;
 pub mod lens;

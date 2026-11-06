@@ -1094,9 +1094,13 @@ pub struct PromoteStagedEdgesRequest {
 /// Copies approved edges from edges_staging to edges, then marks them as 'promoted'.
 /// Refuses (400, nothing written) when a selected row's `properties` carry
 /// a reserved key (`epigraph_db::RESERVED_EDGE_PROPERTIES`: `dedup`,
-/// `supersede_act`), or when a selected row's relationship is `supersedes` in
+/// `supersede_act`, `ingested_by`, `created_claim`), or when a selected row's relationship is `supersedes` in
 /// any spelling (supersede SPEC K12a, ruling R-132: the lineage edge is the
-/// supersession act's, `crate::routes::edges::SUPERSEDES_ACT_ONLY`).
+/// supersession act's, `crate::routes::edges::SUPERSEDES_ACT_ONLY`), or when a
+/// selected row is the document ingest's own provenance (a paper's `asserts`,
+/// `authored` into a paper, `ingested_claim`) or an agent-sourced `asserts` /
+/// `authored` edge (`epigraph_db::INGEST_ONLY_REFUSAL`): a staged row has no
+/// author who could speak for the agent.
 #[cfg(feature = "db")]
 pub async fn promote_staged_edges(
     State(state): State<AppState>,
@@ -1126,18 +1130,17 @@ pub async fn promote_staged_edges(
     // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
     // lower-case canonical spelling, as every edge writer stores it (backlog
     // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
-    let (promoted_count, reserved, lineage): (i64, Vec<Uuid>, Vec<Uuid>) = if let Some(ref ids) =
-        request.edge_ids
-    {
-        if ids.is_empty() {
-            return Err(ApiError::ValidationError {
-                field: "edge_ids".to_string(),
-                reason: "edge_ids array must not be empty when provided".to_string(),
-            });
-        }
+    let (promoted_count, reserved, lineage, provenance): (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>) =
+        if let Some(ref ids) = request.edge_ids {
+            if ids.is_empty() {
+                return Err(ApiError::ValidationError {
+                    field: "edge_ids".to_string(),
+                    reason: "edge_ids array must not be empty when provided".to_string(),
+                });
+            }
 
-        // Promote specific IDs (must be 'approved')
-        sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>)>(
+            // Promote specific IDs (must be 'approved')
+            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
             "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
@@ -1150,10 +1153,18 @@ pub async fn promote_staged_edges(
             lineage AS (
                 SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
             ),
+            provenance AS (
+                SELECT id FROM selected
+                 WHERE lower(relationship) = 'ingested_claim'
+                    OR (lower(relationship) = 'asserts' AND source_type IN ('paper', 'agent'))
+                    OR (lower(relationship) = 'authored'
+                        AND (target_type = 'paper' OR source_type = 'agent'))
+            ),
             to_promote AS (
                 SELECT * FROM selected
                 WHERE NOT EXISTS (SELECT 1 FROM reserved)
                   AND NOT EXISTS (SELECT 1 FROM lineage)
+                  AND NOT EXISTS (SELECT 1 FROM provenance)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1172,7 +1183,8 @@ pub async fn promote_staged_edges(
             )
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[])",
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])",
         )
         .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(ids)
@@ -1182,9 +1194,9 @@ pub async fn promote_staged_edges(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to promote staged edges: {e}"),
         })?
-    } else {
-        // Promote all approved
-        sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>)>(
+        } else {
+            // Promote all approved
+            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
             "WITH selected AS (
                 SELECT id, source_id, source_type, target_id, target_type,
                        relationship, properties
@@ -1197,10 +1209,18 @@ pub async fn promote_staged_edges(
             lineage AS (
                 SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
             ),
+            provenance AS (
+                SELECT id FROM selected
+                 WHERE lower(relationship) = 'ingested_claim'
+                    OR (lower(relationship) = 'asserts' AND source_type IN ('paper', 'agent'))
+                    OR (lower(relationship) = 'authored'
+                        AND (target_type = 'paper' OR source_type = 'agent'))
+            ),
             to_promote AS (
                 SELECT * FROM selected
                 WHERE NOT EXISTS (SELECT 1 FROM reserved)
                   AND NOT EXISTS (SELECT 1 FROM lineage)
+                  AND NOT EXISTS (SELECT 1 FROM provenance)
             ),
             inserted AS (
                 INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
@@ -1219,7 +1239,8 @@ pub async fn promote_staged_edges(
             )
             SELECT (SELECT COUNT(*) FROM to_promote),
                    COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[])",
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
+                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])",
         )
         .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
         .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
@@ -1228,8 +1249,20 @@ pub async fn promote_staged_edges(
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to promote staged edges: {e}"),
         })?
-    };
+        };
 
+    if !provenance.is_empty() {
+        let ids: Vec<String> = provenance.iter().map(Uuid::to_string).collect();
+        return Err(ApiError::ValidationError {
+            field: "relationship".to_string(),
+            reason: format!(
+                "{} A staged row has no author to speak for an agent either, so an \
+                 agent-sourced asserts or authored edge is not promoted (staged edges: {})",
+                epigraph_db::INGEST_ONLY_REFUSAL,
+                ids.join(", ")
+            ),
+        });
+    }
     if !lineage.is_empty() {
         let ids: Vec<String> = lineage.iter().map(Uuid::to_string).collect();
         return Err(ApiError::ValidationError {
@@ -1246,9 +1279,10 @@ pub async fn promote_staged_edges(
         return Err(ApiError::ValidationError {
             field: "properties".to_string(),
             reason: format!(
-                "{} {} (staged edges carrying a reserved key: {})",
+                "{} {} {} (staged edges carrying a reserved key: {})",
                 epigraph_db::DEDUP_IDENTITY_KEY_RESERVED,
                 epigraph_db::SUPERSEDE_ACT_KEY_RESERVED,
+                epigraph_db::INGEST_RECORD_KEYS_RESERVED,
                 ids.join(", ")
             ),
         });

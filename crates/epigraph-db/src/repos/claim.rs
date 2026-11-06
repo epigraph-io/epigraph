@@ -1090,9 +1090,17 @@ pub const SUPERSEDE_ACT_KEY_RESERVED: &str =
      writes (supersede_claim, custodial-supersede); nothing was written";
 
 /// The edge `properties` keys only an act writes:
-/// [`DUPLICATE_IDENTITY_PROPERTY`] and [`SUPERSEDE_ACT_PROPERTY`].
-pub const RESERVED_EDGE_PROPERTIES: &[&str] =
-    &[DUPLICATE_IDENTITY_PROPERTY, SUPERSEDE_ACT_PROPERTY];
+/// [`DUPLICATE_IDENTITY_PROPERTY`], [`SUPERSEDE_ACT_PROPERTY`], and the
+/// document ingest record's [`crate::INGESTED_BY_PROPERTY`] and
+/// [`crate::CREATED_CLAIM_PROPERTY`] (an ingest record on a group-private
+/// claim is owned by that group, whose writers could otherwise patch a
+/// convergence into a creation, or rewrite who ingested it).
+pub const RESERVED_EDGE_PROPERTIES: &[&str] = &[
+    DUPLICATE_IDENTITY_PROPERTY,
+    SUPERSEDE_ACT_PROPERTY,
+    crate::repos::claim_ingest::INGESTED_BY_PROPERTY,
+    crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY,
+];
 
 /// The refusal for an application edge write whose `properties` carry a key
 /// of [`RESERVED_EDGE_PROPERTIES`], or `None` when it carries none.
@@ -1102,6 +1110,14 @@ pub fn reserved_edge_property_refusal(properties: &serde_json::Value) -> Option<
         Some(DEDUP_IDENTITY_KEY_RESERVED)
     } else if properties.get(SUPERSEDE_ACT_PROPERTY).is_some() {
         Some(SUPERSEDE_ACT_KEY_RESERVED)
+    } else if properties
+        .get(crate::repos::claim_ingest::INGESTED_BY_PROPERTY)
+        .is_some()
+        || properties
+            .get(crate::repos::claim_ingest::CREATED_CLAIM_PROPERTY)
+            .is_some()
+    {
+        Some(crate::repos::claim_ingest::INGEST_RECORD_KEYS_RESERVED)
     } else {
         None
     }

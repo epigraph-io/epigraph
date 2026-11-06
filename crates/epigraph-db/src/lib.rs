@@ -86,6 +86,7 @@ pub use refusal_codes::{
 };
 pub use repos::system_agent::is_reserved_author_key;
 pub use repos::ElevatedAccess;
+pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
@@ -94,7 +95,7 @@ pub use repos::{
 };
 pub use repos::{
     agent_lookup, AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef,
-    AgentSearchHit, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+    AgentSearchHit, AuthorNode, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
 };
 pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
@@ -144,6 +145,11 @@ pub use repos::{
     RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
 };
+pub use repos::{
+    ingest_only_edge_refusal, is_agent_attribution, ClaimIngestRecord, ClaimIngestRepository,
+    ClaimIngests, AGENT_ATTRIBUTION_REFUSAL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_KEYS_RESERVED, INGEST_RECORD_RELATIONSHIP,
+};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
@@ -155,6 +161,10 @@ pub use repos::{
 };
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
+pub use repos::{
+    PaperAuthorEdge, PaperAuthorListing, AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY,
+    AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
+};
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
