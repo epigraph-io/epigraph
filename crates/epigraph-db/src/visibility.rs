@@ -599,6 +599,52 @@ impl Viewer {
     /// viewer from `Scoped` fields, so the unrestricted arm is unreachable by
     /// construction and not by a check that could be relaxed later.
     ///
+    /// This viewer plus ONE team it may write only through its live human
+    /// (owner decision D-V3, migration 200), for the author-stamped transaction
+    /// of a single team write.
+    ///
+    /// The grant is a [`crate::repos::TeamWriteGrant`], which only
+    /// `ClaimRepository::resolve_write_decl` mints, from migration 200's
+    /// `epigraph_writable_teams` answering `via = 'operator'`. That is the same
+    /// rule the claims trigger's writer scope applies
+    /// (`epigraph_require_writer_scope` -> `epigraph_operator_writes_group`).
+    /// So the stamp then agrees with the trigger. Without it, 077's `WITH CHECK`
+    /// would refuse a write the trigger admits.
+    ///
+    /// The team is added to BOTH the read set and the writable set: the
+    /// claim's `INSERT ... RETURNING` and the derived rows' reads must see the
+    /// row the transaction just wrote.
+    ///
+    /// `None` unless this is a plain scoped viewer of the grant's own agent.
+    /// An elevated viewer cannot write, and a bypass viewer has no principal.
+    #[must_use]
+    pub fn with_team_write_grant(&self, grant: &crate::repos::TeamWriteGrant) -> Option<Viewer> {
+        match &self.shape {
+            ViewerShape::Scoped {
+                principal,
+                group_ids,
+                writable,
+            } if *principal == grant.agent => {
+                let mut group_ids = group_ids.clone();
+                let mut writable = writable.clone();
+                group_ids.push(grant.group);
+                writable.push(grant.group);
+                group_ids.sort_unstable();
+                group_ids.dedup();
+                writable.sort_unstable();
+                writable.dedup();
+                Some(Viewer {
+                    shape: ViewerShape::Scoped {
+                        principal: *principal,
+                        group_ids,
+                        writable,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Callers must fail CLOSED on `None` — refuse the work — rather than
     /// substituting any other viewer.
     #[must_use]

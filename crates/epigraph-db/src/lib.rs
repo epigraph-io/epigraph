@@ -150,6 +150,9 @@ pub use repos::{
     Redemption, TicketMode, TicketPasskey,
 };
 pub use repos::{CeremonyEnrollment, PasskeyCeremony, VerifiedPasskey};
+pub use repos::{
+    ChoiceResolution, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome, WriteTenancyReport,
+};
 pub use repos::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};

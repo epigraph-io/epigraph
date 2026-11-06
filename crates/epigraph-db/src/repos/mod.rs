@@ -23,6 +23,7 @@ pub mod claim_encryption;
 pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
+pub mod claim_visibility;
 pub mod community;
 pub mod compound_valuation;
 pub mod conflict_density;
@@ -129,6 +130,9 @@ pub use claim_theme::{
     ThemeMemberRow, ThemeSummaryRow,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
+pub use claim_visibility::{
+    ChoiceResolution, ResolvedWriteDecl, TeamWriteGrant, VisibilityActOutcome, WriteTenancyReport,
+};
 pub use community::{CommunityRepository, MembershipOutcome};
 pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
 pub use context::ContextRepository;
