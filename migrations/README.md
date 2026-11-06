@@ -2441,8 +2441,9 @@ restart.
   that holds an UN-DETACHED row made by name in ANY window (a
   future-dated row is not live yet, but opens with no operator act); the
   verb detaches every un-detached row the identity holds for the role.
-  List on a maintenance session (`role_agents` is FORCE RLS; any other
-  session reads no row, so an empty answer there means nothing). A copy
+  List on a maintenance session (`role_agents` is FORCE RLS, so an app or
+  read-only session reads no row of it; an empty answer anywhere else
+  means nothing). A copy
   counts only through a live row made by name at its chain's root, so
   none of them is admitted again, nor anything registered from them
   later, until the operator attaches one by name. A binding in

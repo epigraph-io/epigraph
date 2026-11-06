@@ -107,25 +107,25 @@
 -- restored by name, then detached), a revert to Q registered with A as its
 -- parent leaves Q in, read and write, and so is the next edit from Q. This
 -- is permanent: no host record changes it.
--- WHAT CUTS A JOB OFF, whatever the host records, for EVERY role the group
--- is bound to in attached_agents mode: list every identity the host may run
--- for the group (any model, any kind of run) and the identity at the root of
+-- WHAT CUTS A JOB OFF, whatever the host records, for EVERY role the group is
+-- bound to in attached_agents mode: list every identity the host may run for
+-- the group (any model, any kind of run) and the identity at the root of
 -- every un-detached copy they hold, and call 166's detach verb on each that
 -- holds an UN-DETACHED row made by name in ANY window (a future-dated row is
 -- not live yet, but opens with no operator act); the verb detaches every
 -- un-detached row the identity holds for the role. List on a maintenance
--- session: `role_agents` is FORCE RLS, and any other session reads no row,
--- so an empty answer there means nothing. A copy counts only through a live
--- row made by name at the root of its chain, so then none of those
--- identities is admitted, nor anything registered from them later, until
--- the operator attaches one by name again. A binding in registered_agents
--- mode admits the job through its operator's role assignment, which no
--- detach reaches. What a host that keys succession on the group's lane
--- adds: a detach of an identity the job ran also takes every identity the
--- host registers below it afterwards, edits and reverts at any model, that
--- holds no live row made by name. Never pick for this an identity the host
--- also runs for another kind of run or another group: the detach takes it
--- out there too.
+-- session: `role_agents` is FORCE RLS, so an app or read-only session reads
+-- no row of it, and an empty answer anywhere else means nothing. A copy
+-- counts only through a live row made by name at the root of its chain, so
+-- then none of those identities is admitted, nor anything registered from
+-- them later, until the operator attaches one by name again. A binding in
+-- registered_agents mode admits the job through its operator's role
+-- assignment, which no detach reaches. What a host that keys succession on
+-- the group's lane adds: a detach of an identity the job ran also takes every
+-- identity the host registers below it afterwards, edits and reverts at any
+-- model, that holds no live row made by name. Never pick for this an identity
+-- the host also runs for another kind of run or another group: the detach
+-- takes it out there too.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
 -- as a chain's root, even when its agent also holds a detached row, and an

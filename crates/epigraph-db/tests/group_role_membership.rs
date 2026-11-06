@@ -4887,8 +4887,9 @@ async fn derived_rows_at(pool: &PgPool, agent: Uuid, group: Uuid, secs: i32) -> 
 }
 
 /// STEP A of the cut-off, as `docs/tenancy.md` ("Cutting a job off") states
-/// it, run on a MAINTENANCE session (`role_agents` is FORCE RLS: any other
-/// session reads no row, so its empty answer means nothing). Returns the
+/// it, run on a MAINTENANCE session (`role_agents` is FORCE RLS: an app
+/// session reads no row of it, so an empty answer anywhere else means
+/// nothing). Returns the
 /// `(role, identity)` pairs it called 166's detach verb on; the verb detaches
 /// EVERY un-detached row the identity holds for the role, made by name or
 /// copied, in any window, a future-dated one included.

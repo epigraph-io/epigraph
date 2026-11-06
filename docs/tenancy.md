@@ -1560,8 +1560,9 @@ in the same set; read each chain to check). Call
 UN-DETACHED attachment made by name, in ANY window: one dated to open
 later is not live yet, but it opens with no act of yours. The verb
 detaches every un-detached row the identity holds for the role. Make the
-list on a maintenance session: `role_agents` is FORCE RLS, so any other
-session reads no row of it, and an empty answer there means nothing. Then
+list on a maintenance session: `role_agents` is FORCE RLS, so an app or
+read-only session reads no row of it, and an empty answer anywhere else
+means nothing. Then
 no copy any of them holds has a live root, and nothing registered from
 them later inherits one: the job stays out until you attach one of its
 identities by name again. A binding in `registered_agents` mode is out of
