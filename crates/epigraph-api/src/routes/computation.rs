@@ -752,23 +752,16 @@ async fn bp_seed_rows(
     )>,
     ApiError,
 > {
-    let rows =
-        epigraph_db::MassFunctionRepository::get_for_claims(&state.db_pool, viewer, claim_ids)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to load mass functions: {e}"),
-            })?;
-    let mut read = state.read_as(viewer).await.map_err(|e| {
-        tracing::error!(
-            target: "tenancy.scoped_read",
-            error = %e,
-            handler = "propagate_beliefs",
-            "could not acquire a viewer-stamped connection"
-        );
-        ApiError::InternalError {
-            message: "Failed to acquire a scoped connection".to_string(),
-        }
-    })?;
+    // The BBA load shares the stamped connection with the source reads below.
+    // It ran on `state.db_pool`, where `mass_functions`' FORCEd policy saw an
+    // unstamped `epigraph_app` session and returned only public rows, so a
+    // member's BP run silently left out the BBAs of its own group's claims.
+    let mut read = crate::routes::open_scoped_read(state, viewer, "propagate_beliefs").await?;
+    let rows = epigraph_db::MassFunctionRepository::get_for_claims(&mut *read, viewer, claim_ids)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load mass functions: {e}"),
+        })?;
     let rows = if apply {
         epigraph_engine::derivation_scope::retain_for_cache(&mut read, rows).await?
     } else {

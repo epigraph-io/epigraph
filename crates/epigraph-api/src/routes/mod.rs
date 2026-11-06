@@ -239,6 +239,32 @@ pub(crate) async fn finish_scoped_read(
     })
 }
 
+/// Open a viewer-stamped read for `handler`: the acquire half of
+/// [`finish_scoped_read`], with the same error shape.
+///
+/// `AppState::read_as`'s refusal reason is internal design prose aimed at
+/// whoever built the `AppState`, so it goes to the operator's log and the
+/// client gets an opaque 500. Converted handlers before this one spelled the
+/// mapping out inline; it is the same twelve lines in each.
+#[cfg(feature = "db")]
+pub(crate) async fn open_scoped_read<'a>(
+    state: &'a AppState,
+    viewer: &epigraph_db::visibility::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'a>, crate::errors::ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        crate::errors::ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })
+}
+
 // `crate::metrics` is deliberately NOT imported here. `/metrics` was removed
 // from both router variants in PR-03 and is served only by the internal
 // listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
