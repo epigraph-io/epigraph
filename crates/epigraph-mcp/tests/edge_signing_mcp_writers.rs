@@ -113,6 +113,8 @@ async fn submit(server: &EpiGraphMcpFull, pool: &PgPool, content: &str) -> Uuid 
             reasoning: Some("because".into()),
             labels: vec![],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -142,6 +144,8 @@ async fn submit_claim_and_memorize_attest_their_verb_edges(pool: PgPool) {
             confidence: None,
             tags: None,
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -541,6 +545,8 @@ async fn a_callers_edges_are_signed_by_the_server_not_the_caller(pool: PgPool) {
                 reasoning: Some("because".into()),
                 labels: vec![],
                 novelty_threshold: Some(0.0),
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             Some(&token),
         )

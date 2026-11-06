@@ -113,6 +113,8 @@ fn submit_params(
         reasoning: None,
         labels: vec![],
         novelty_threshold,
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -239,6 +241,8 @@ async fn memorize_distinct_content_inserts_normally_when_embedder_unavailable() 
         confidence: Some(0.7),
         tags: None,
         novelty_threshold: Some(0.05),
+        visibility: Some("public".to_string()),
+        group_id: None,
     };
     tools::memory::memorize(&server, &viewer, params, None)
         .await

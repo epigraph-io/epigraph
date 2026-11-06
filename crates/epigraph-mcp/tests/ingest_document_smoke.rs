@@ -752,6 +752,8 @@ async fn inline_param_ingests_full_hierarchy(pool: PgPool) {
     let params = IngestDocumentInlineParams {
         extraction,
         wait: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     };
 
     let result = ingest_document_inline(&server, &viewer, params, None)
@@ -894,6 +896,8 @@ async fn inline_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: PgPo
         IngestDocumentInlineParams {
             extraction,
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -924,6 +928,8 @@ async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: P
         IngestDocumentParams {
             file_path: path.display().to_string(),
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -974,6 +980,8 @@ async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
         IngestDocumentInlineParams {
             extraction,
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -1016,6 +1024,8 @@ async fn inline_wait_mode_returns_the_walk_result(pool: PgPool) {
         IngestDocumentInlineParams {
             extraction,
             wait: Some(true),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

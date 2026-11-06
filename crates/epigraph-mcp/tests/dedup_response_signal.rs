@@ -32,6 +32,8 @@ fn submit(content: &str, evidence: &str, labels: &[&str]) -> SubmitClaimParams {
         reasoning: Some("g11 reasoning".into()),
         labels: labels.iter().map(|s| (*s).to_string()).collect(),
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -192,6 +194,8 @@ async fn memorize_reports_a_content_hash_hit(pool: PgPool) {
                 confidence: Some(0.7),
                 tags: Some(vec!["g11-m1".into()]),
                 novelty_threshold: None,
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             None,
         )
@@ -209,6 +213,8 @@ async fn memorize_reports_a_content_hash_hit(pool: PgPool) {
                 confidence: Some(0.9),
                 tags: Some(vec!["g11-m2".into()]),
                 novelty_threshold: None,
+                visibility: Some("public".to_string()),
+                group_id: None,
             },
             None,
         )
@@ -249,8 +255,8 @@ async fn batch_submit_claims_reports_dedup_per_entry(pool: PgPool) {
     let params: epigraph_mcp::types::BatchSubmitClaimsParams =
         serde_json::from_value(serde_json::json!({
             "claims": [
-                {"content": content, "evidence_data": "one", "evidence_type": "logical"},
-                {"content": content, "evidence_data": "two", "evidence_type": "logical"},
+                {"content": content, "visibility": "public", "evidence_data": "one", "evidence_type": "logical"},
+                {"content": content, "visibility": "public", "evidence_data": "two", "evidence_type": "logical"},
             ]
         }))
         .unwrap();
@@ -284,12 +290,12 @@ async fn batch_dedup_lists_only_inputs_the_entry_supplied(pool: PgPool) {
     let params: epigraph_mcp::types::BatchSubmitClaimsParams =
         serde_json::from_value(serde_json::json!({
             "claims": [
-                {"content": omitted, "evidence_data": "one", "evidence_type": "logical"},
-                {"content": omitted, "evidence_data": "two", "evidence_type": "logical",
+                {"content": omitted, "visibility": "public", "evidence_data": "one", "evidence_type": "logical"},
+                {"content": omitted, "visibility": "public", "evidence_data": "two", "evidence_type": "logical",
                  "labels": ["g11-review"]},
-                {"content": supplied, "evidence_data": "one", "evidence_type": "logical",
+                {"content": supplied, "visibility": "public", "evidence_data": "one", "evidence_type": "logical",
                  "methodology": "deductive_logic", "confidence": 0.7},
-                {"content": supplied, "evidence_data": "two", "evidence_type": "logical",
+                {"content": supplied, "visibility": "public", "evidence_data": "two", "evidence_type": "logical",
                  "methodology": "deductive_logic", "confidence": 0.7},
             ]
         }))

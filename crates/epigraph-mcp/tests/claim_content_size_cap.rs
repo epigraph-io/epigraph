@@ -56,6 +56,8 @@ fn submit_params(content: &str) -> epigraph_mcp::types::SubmitClaimParams {
         reasoning: None,
         labels: vec![],
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -70,6 +72,8 @@ fn batch_entry(content: &str) -> epigraph_mcp::types::BatchClaimEntry {
         evidence_type: "logical".into(),
         confidence: Some(0.6),
         labels: vec![],
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -226,6 +230,8 @@ async fn memorize_rejects_content_over_64k_and_writes_no_claim(pool: PgPool) {
             confidence: Some(0.7),
             tags: None,
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

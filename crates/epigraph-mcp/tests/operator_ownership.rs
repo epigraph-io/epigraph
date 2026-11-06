@@ -434,6 +434,8 @@ async fn submit_claim_from_an_operated_agent_is_owned_by_the_operator(pool: PgPo
             reasoning: Some("operator ownership".to_string()),
             labels: Vec::new(),
             novelty_threshold: Some(0.0),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
