@@ -1466,9 +1466,10 @@ to an identity you attached by name, it keeps the group through that
 attachment, its revert registered or not and whatever the host records,
 and so do the identities registered from it afterwards. So a job keeps the
 group while ANY identity it can run holds a live attachment made by name
-(after a documented restore there can be several): to take the group from
-it, detach every such attachment, as "Cutting a job off" below says. That
-is permanent, not a gap a host can close.
+(after a documented restore there can be several), and an attachment made
+by name dated to open later admits it then: to take the group from it,
+detach every such attachment, as "Cutting a job off" below says. That is
+permanent, not a gap a host can close.
 
 A row made by name also ENDS THE WALK up the lineage, so below it the
 answer is no longer a function of the succession edges, detached rows and
@@ -1548,15 +1549,24 @@ own attachment made by name, and detaching it leaves an earlier identity Q
 attached by name in the group, read and write, when the job goes back to
 Q, its revert registered below A or not; an earlier identity P whose copy
 roots at Q's attachment stays in too when the job goes back to it
-unregistered. To cut a job off, whatever the host records, detach EVERY
-live attachment made by name for the role that any identity the host may
-run for the group holds (any model, any kind of run; every identity with a
-prompt snapshot in the group's folder is one), and every live attachment
-made by name that any of their live copies chains up to (a copy counts only
-when its root's agent runs in the copy holder's folder, so these are in the
-same set; read each chain to check). Then no copy any of them holds has a
-live root, and nothing registered from them later inherits one: the job
-stays out until you attach one of its identities by name again.
+unregistered. To cut a job off, whatever the host records, do this for
+EVERY role the group is bound to in `attached_agents` mode. List every
+identity the host may run for the group (any model, any kind of run; every
+identity with a prompt snapshot in the group's folder is one) and the
+identity at the root of every un-detached copy they hold (a copy counts
+only when its root's agent runs in the copy holder's folder, so these are
+in the same set; read each chain to check). Call
+`epigraph_detach_agent_from_role` on each of them that holds an
+UN-DETACHED attachment made by name, in ANY window: one dated to open
+later is not live yet, but it opens with no act of yours. The verb
+detaches every un-detached row the identity holds for the role. Make the
+list on a maintenance session: `role_agents` is FORCE RLS, so any other
+session reads no row of it, and an empty answer there means nothing. Then
+no copy any of them holds has a live root, and nothing registered from
+them later inherits one: the job stays out until you attach one of its
+identities by name again. A binding in `registered_agents` mode is out of
+reach of all this: it admits the job through its operator's role
+assignment, which no detach touches.
 
 What a host that keys succession on the group's lane adds: a detach of an
 identity the job ran also takes every identity the host registers below it

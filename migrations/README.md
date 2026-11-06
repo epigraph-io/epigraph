@@ -2434,13 +2434,21 @@ restart.
   restore, a revert to an older identity attached by name, registered
   with the detached, restored one as parent, stays in, and so does the
   next edit from it). That is permanent, whatever the host records. What
-  cuts a job off under any host: detach EVERY live row made by name for
-  the role that any identity the host may run for the group holds (any
-  model, any kind of run), and every live row made by name that any of
-  their live copies chains up to; a copy counts only through a live row
-  made by name at its chain's root, so none of them is admitted again
-  until the operator attaches one by name. A lane-keyed host adds only
-  that a detach of an identity the job ran also takes every identity it
+  cuts a job off under any host, for EVERY role the group is bound to in
+  attached_agents mode: list every identity the host may run for the
+  group (any model, any kind of run) and the identity at the root of
+  every un-detached copy they hold, and call 166's detach verb on each
+  that holds an UN-DETACHED row made by name in ANY window (a
+  future-dated row is not live yet, but opens with no operator act); the
+  verb detaches every un-detached row the identity holds for the role.
+  List on a maintenance session (`role_agents` is FORCE RLS; any other
+  session reads no row, so an empty answer there means nothing). A copy
+  counts only through a live row made by name at its chain's root, so
+  none of them is admitted again, nor anything registered from them
+  later, until the operator attaches one by name. A binding in
+  registered_agents mode admits the job through its operator's role
+  assignment, which no detach reaches. A lane-keyed host adds only that
+  a detach of an identity the job ran also takes every identity it
   registers below that one afterwards that holds no live row made by
   name. A detach also reaches the
   identity that runs now when the operator detaches an OLD identity it
