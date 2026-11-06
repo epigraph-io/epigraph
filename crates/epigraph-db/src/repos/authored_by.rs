@@ -229,24 +229,7 @@ impl AuthoredByRepository {
         audience: PromptSnapshotAudience,
     ) -> Result<AuthoredBy, DbError> {
         let conn: &mut sqlx::PgConnection = read;
-        let filer = Self::filer(conn, agent_id, created_at, audience).await?;
-        let (papers, papers_truncated) = Self::asserting_papers(conn, viewer, claim_id).await?;
-        if papers.is_empty() {
-            return Ok(AuthoredBy::Agent(filer));
-        }
-        Ok(AuthoredBy::Literature {
-            papers,
-            papers_truncated,
-            ingested_by: filer,
-        })
-    }
 
-    async fn filer(
-        conn: &mut sqlx::PgConnection,
-        agent_id: Uuid,
-        created_at: DateTime<Utc>,
-        audience: PromptSnapshotAudience,
-    ) -> Result<Filer, DbError> {
         // The human: the agent's binding, for every reader. Never an edge.
         // A binding to the agent itself (a registered human operator) is not
         // an operator and is not shown.
@@ -286,7 +269,7 @@ impl AuthoredByRepository {
             },
         );
 
-        Ok(Filer {
+        let filer = Filer {
             agent: AuthorRef {
                 id: agent_id,
                 display_name: name_of(agent_id),
@@ -296,17 +279,10 @@ impl AuthoredByRepository {
                 display_name: name_of(id),
             }),
             prompt_snapshot,
-        })
-    }
+        };
 
-    /// The documents with a readable, in-force `asserts` edge to the claim
-    /// (at most [`MAX_PAPERS`]), each with its readable authors, and whether
-    /// more documents exist.
-    async fn asserting_papers(
-        conn: &mut sqlx::PgConnection,
-        viewer: &Viewer,
-        claim_id: Uuid,
-    ) -> Result<(Vec<PaperAuthorship>, bool), DbError> {
+        // The documents with a readable, in-force `asserts` edge to the claim
+        // (at most `MAX_PAPERS`, one more read to tell a cut).
         let sql = viewer.splice(
             "SELECT p.id, p.doi, p.title \
                FROM papers p \
@@ -329,10 +305,25 @@ impl AuthoredByRepository {
         }
         let mut rows = q.fetch_all(&mut *conn).await?;
         if rows.is_empty() {
-            return Ok((Vec::new(), false));
+            return Ok(AuthoredBy::Agent(filer));
         }
-        let truncated = rows.len() > usize::try_from(MAX_PAPERS).unwrap_or(usize::MAX);
+        let papers_truncated = rows.len() > usize::try_from(MAX_PAPERS).unwrap_or(usize::MAX);
         rows.truncate(usize::try_from(MAX_PAPERS).unwrap_or(usize::MAX));
+        Ok(AuthoredBy::Literature {
+            papers: Self::paper_authors(conn, viewer, rows).await?,
+            papers_truncated,
+            ingested_by: filer,
+        })
+    }
+
+    /// The authors of the listed documents `rows` (`(id, doi, title)`), from
+    /// the in-force `authored` edges `viewer` can read, at most
+    /// [`MAX_PAPER_AUTHORS`] per document.
+    async fn paper_authors(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        rows: Vec<(Uuid, String, Option<String>)>,
+    ) -> Result<Vec<PaperAuthorship>, DbError> {
         let ids: Vec<Uuid> = rows.iter().map(|(id, _, _)| *id).collect();
 
         // Every listed document's authors in one read, ranked per document.
@@ -401,6 +392,6 @@ impl AuthoredByRepository {
                 }
             })
             .collect();
-        Ok((papers, truncated))
+        Ok(papers)
     }
 }
