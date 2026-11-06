@@ -1642,6 +1642,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // `person_authenticators` then admit no row, so every anchored enrollment
     // falls back to the attested ceremony without an error.
     ("epigraph_enrollment_anchor", 200),
+    // 200's act-confirmer insert guard fails LOUD under a non-member owner (it
+    // reads no confirming passkey and refuses every act enrollment, ELV04);
+    // its anchored-revoke cascade fails SILENTLY (it finds no dependant, so a
+    // revoked anchor leaves the passkeys it anchored live).
+    ("epigraph_person_authenticators_guard_act_confirmer", 200),
+    ("epigraph_person_authenticators_revoke_anchored", 200),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the

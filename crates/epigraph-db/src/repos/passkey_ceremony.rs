@@ -100,6 +100,14 @@ pub struct EnrollmentAnchor {
     pub anchor_backup_eligible: bool,
     /// Whether it has been revoked since.
     pub anchor_revoked: bool,
+    /// The passkeys that authorized it, nearest first, up to the person's
+    /// maintenance-enrolled passkey: a JSON array of `{passkey_id, passkey,
+    /// aaguid, attestation_format, backup_eligible}`
+    /// (`epigraph_passkey::LineagePasskey::list_from_json`).
+    pub anchor_lineage: serde_json::Value,
+    /// Whether the lineage reaches a maintenance-enrolled passkey (the reader
+    /// walks at most 32 steps).
+    pub anchor_lineage_complete: bool,
 }
 
 /// The ceremony half of migration 124's definers.
@@ -143,7 +151,8 @@ impl PasskeyCeremony {
             "SELECT act_id, act_kind, act_outcome, args_digest, act_challenge_state, \
                     assertion_evidence, enrollment_person, anchor_id, anchor_person, \
                     anchor_credential_id, anchor_passkey, anchor_aaguid, \
-                    anchor_attestation_format, anchor_backup_eligible, anchor_revoked \
+                    anchor_attestation_format, anchor_backup_eligible, anchor_revoked, \
+                    anchor_lineage, anchor_lineage_complete \
                FROM public.epigraph_enrollment_anchor($1)",
         )
         .bind(enrollment)
