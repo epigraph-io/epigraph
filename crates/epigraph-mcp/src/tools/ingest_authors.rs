@@ -71,6 +71,7 @@ use crate::types::{AuthorCandidate, IngestAuthorReport, ReplacedAuthor};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{
     AgentLookupRepository, AgentRepository, AuthorNode, DbError, PaperAuthorEdge, PaperRepository,
+    SpeaksFor,
 };
 use epigraph_ingest::common::schema::AuthorEntry;
 
@@ -150,25 +151,24 @@ fn name_key(name: &str) -> [u8; 32] {
 }
 
 /// Which of `agents` the ingester `writer` speaks for, and how: the agent is
-/// `writer` itself, or `writer` is the human it acts for (migration 149's
-/// `epigraph_human_of(agent, true)`: only a binding in force confers it).
+/// `writer` itself, or `writer` is the human it acts for through a binding in
+/// force ([`AgentRepository::speaks_for`], the rule `POST /api/v1/edges`
+/// applies to an agent-sourced `asserts` too).
 async fn attributions(
     conn: &mut sqlx::PgConnection,
     writer: Uuid,
     agents: &[Uuid],
 ) -> Result<HashMap<Uuid, &'static str>, McpError> {
-    let humans = AgentRepository::humans_of(&mut *conn, agents, true)
+    let how = AgentRepository::speaks_for(&mut *conn, writer, agents)
         .await
         .map_err(internal_error)?;
     Ok(agents
         .iter()
         .map(|a| {
-            let how = if *a == writer {
-                ATTRIBUTION_CALLER
-            } else if humans.get(a) == Some(&writer) {
-                ATTRIBUTION_OPERATED
-            } else {
-                ATTRIBUTION_PENDING
+            let how = match how.get(a) {
+                Some(SpeaksFor::Itself) => ATTRIBUTION_CALLER,
+                Some(SpeaksFor::Operator) => ATTRIBUTION_OPERATED,
+                None => ATTRIBUTION_PENDING,
             };
             (*a, how)
         })

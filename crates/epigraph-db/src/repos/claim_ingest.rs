@@ -32,7 +32,9 @@
 //! elevation arms already cover `edges`. Its endpoints never include the
 //! ingester, so a public record names no private paper.
 //!
-//! Only the document walk writes it.
+//! Only the walk writes it: `POST /api/v1/edges` and the staged-edge promote
+//! refuse [`INGEST_RECORD_RELATIONSHIP`] (with `paper -asserts->` and
+//! `authored -> paper`), and no MCP tool writes an arbitrary relationship.
 //!
 //! # The read contract ([`ClaimIngestRepository::for_claims`])
 //!
@@ -268,3 +270,76 @@ impl ClaimIngestRepository {
     }
 }
 
+/// The relationships a generic edge writer (`POST /api/v1/edges`, the
+/// staged-edge promote) may never write, because readers trust them as the
+/// document ingest's own record: the paper's `asserts` onto a claim, any
+/// `authored` edge into a paper, and [`INGEST_RECORD_RELATIONSHIP`].
+/// Matched case-insensitively. Returns the refusal text, or `None`.
+#[must_use]
+pub fn ingest_only_edge_refusal(
+    source_type: &str,
+    target_type: &str,
+    relationship: &str,
+) -> Option<&'static str> {
+    let rel = relationship.to_ascii_lowercase();
+    let ingest_only = rel == INGEST_RECORD_RELATIONSHIP
+        || (rel == "asserts" && source_type == "paper")
+        || (rel == "authored" && target_type == "paper");
+    ingest_only.then_some(INGEST_ONLY_REFUSAL)
+}
+
+/// The refusal [`ingest_only_edge_refusal`] answers.
+pub const INGEST_ONLY_REFUSAL: &str =
+    "a paper's asserts edge onto a claim, an authored edge into a paper and the \
+     ingested_claim record are written only by the document ingest \
+     (ingest_document / ingest_document_spine), which records who ingested the \
+     document; nothing was written";
+
+/// An edge that attributes words or authorship TO an agent: `asserts` or
+/// `authored` (any case) with an `agent` source. A generic writer accepts it
+/// only from that agent itself or the human operating it
+/// ([`crate::AgentRepository::speaks_for`]).
+#[must_use]
+pub fn is_agent_attribution(source_type: &str, relationship: &str) -> bool {
+    source_type == "agent"
+        && (relationship.eq_ignore_ascii_case("asserts")
+            || relationship.eq_ignore_ascii_case("authored"))
+}
+
+/// The refusal for an agent attribution the caller does not speak for.
+pub const AGENT_ATTRIBUTION_REFUSAL: &str =
+    "an asserts or AUTHORED edge from an agent may be written only by that agent \
+     itself or by the human who operates it through a live binding; nothing was \
+     written";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ingest_only_relationships_are_matched_in_any_case_and_nothing_else() {
+        for (s, t, r) in [
+            ("paper", "claim", "asserts"),
+            ("paper", "claim", "ASSERTS"),
+            ("paper", "claim", "ingested_claim"),
+            ("agent", "claim", "Ingested_Claim"),
+            ("agent", "paper", "authored"),
+            ("agent", "paper", "AUTHORED"),
+            ("claim", "paper", "authored"),
+        ] {
+            assert!(ingest_only_edge_refusal(s, t, r).is_some(), "{s} {r} {t}");
+        }
+        for (s, t, r) in [
+            ("agent", "claim", "asserts"),
+            ("agent", "claim", "AUTHORED"),
+            ("claim", "claim", "supports"),
+            ("paper", "agent", "processed_by"),
+        ] {
+            assert!(ingest_only_edge_refusal(s, t, r).is_none(), "{s} {r} {t}");
+        }
+        assert!(is_agent_attribution("agent", "Asserts"));
+        assert!(is_agent_attribution("agent", "AUTHORED"));
+        assert!(!is_agent_attribution("paper", "asserts"));
+        assert!(!is_agent_attribution("agent", "supports"));
+    }
+}

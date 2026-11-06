@@ -22,8 +22,8 @@ pub mod behavioral_execution;
 pub mod challenge;
 pub mod claim;
 pub mod claim_context;
-pub mod claim_ingest;
 pub mod claim_encryption;
+pub mod claim_ingest;
 pub mod claim_role;
 pub mod claim_theme;
 pub mod claim_version;
@@ -103,6 +103,7 @@ pub use admin_scope_enforcement::{
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
+    SpeaksFor,
 };
 pub use agent::{DelegationLive, RunTokens, RUN_TOKENS_ENV};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
@@ -146,8 +147,9 @@ pub use claim_context::{
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
 pub use claim_ingest::{
-    ClaimIngestRecord, ClaimIngestRepository, ClaimIngests, CREATED_CLAIM_PROPERTY,
-    INGESTED_BY_PROPERTY, INGEST_RECORD_RELATIONSHIP,
+    ingest_only_edge_refusal, is_agent_attribution, ClaimIngestRecord, ClaimIngestRepository,
+    ClaimIngests, AGENT_ATTRIBUTION_REFUSAL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY,
+    INGEST_ONLY_REFUSAL, INGEST_RECORD_RELATIONSHIP,
 };
 pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,

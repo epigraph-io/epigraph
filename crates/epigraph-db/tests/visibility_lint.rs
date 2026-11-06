@@ -2775,6 +2775,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `agents` and the binding tables are identity data, not tenant content.",
     ),
     (
+        "agent.rs",
+        "speaks_for",
+        "READ, no SQL of its own: `humans_of(agents, live)` (above) plus an id comparison, \
+         answering whether a writer IS an agent or operates it through a live binding (the \
+         authority rule for an agent-sourced asserts/authored edge). Identity data, not \
+         tenant content.",
+    ),
+    (
         "derivation_scope.rs",
         "cache_admissible",
         "READ that answers, for BBA rows the caller already read, which may enter THEIR \
