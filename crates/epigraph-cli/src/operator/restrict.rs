@@ -512,7 +512,10 @@ fn describe_unenforced(r: &BTreeMap<String, Vec<String>>) -> String {
 }
 
 /// Pinned evidence among `ids` (migration 110).
-async fn pinned_of(conn: &mut PgConnection, ids: &[Uuid]) -> anyhow::Result<BTreeSet<String>> {
+pub(super) async fn pinned_of(
+    conn: &mut PgConnection,
+    ids: &[Uuid],
+) -> anyhow::Result<BTreeSet<String>> {
     if ids.is_empty() {
         return Ok(BTreeSet::new());
     }

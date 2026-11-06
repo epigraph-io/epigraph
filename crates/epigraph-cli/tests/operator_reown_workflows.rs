@@ -2107,7 +2107,9 @@ async fn catch_up_narrows_a_public_generation_ingested_after_an_in_place_narrowi
 /// A step executed by a listed lineage AND by a source-owned public lineage
 /// left off the list is shared, so this run never narrows it. Narrowing the
 /// two lineages in separate runs would leave it public for good, so the dry
-/// run names the split for the operator to rule on.
+/// run names the split for the operator to rule on. A step sharing a
+/// fragment with a shared step stays with it, reported SHARED (the cascade
+/// would narrow the fragment for both).
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPool) {
     let fx = seed(&pool).await;
@@ -2115,6 +2117,35 @@ async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPo
         let mut m = pool.acquire().await.expect("acquire");
         let w = workflow(&mut m, "epsilon", 0, None, fx.src, "public").await;
         edge(&mut m, (w, "workflow"), (fx.s2, "claim"), "executes").await;
+    }
+    let hsource: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
+    )
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed harvester source");
+    let frag: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
+                                          visibility) \
+         VALUES ($1, $2, 'fragment of step three and the shared step', $3, 'public') \
+         RETURNING id",
+    )
+    .bind(hsource)
+    .bind(h32(Uuid::new_v4()))
+    .bind(fx.src)
+    .fetch_one(&pool)
+    .await
+    .expect("seed fragment");
+    for cl in [fx.s3, fx.x] {
+        sqlx::query(
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+        )
+        .bind(cl)
+        .bind(frag)
+        .execute(&pool)
+        .await
+        .expect("seed provenance");
     }
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
@@ -2132,6 +2163,15 @@ async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPo
     assert!(
         !line_with(&r.stdout, "SHARED-SPLIT\t", &[&fx.x.to_string()]),
         "X is shared with another team's lineage, not split: {}",
+        r.show()
+    );
+    assert!(
+        line_with(
+            &r.stdout,
+            "LEFT-CLAIM\t",
+            &[&fx.s3.to_string(), "SHARED", &frag.to_string()]
+        ),
+        "a step sharing a fragment with a shared step stays with it: {}",
         r.show()
     );
     std::fs::remove_dir_all(&dir).ok();
