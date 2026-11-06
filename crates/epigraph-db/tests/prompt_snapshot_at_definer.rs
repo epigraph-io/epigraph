@@ -391,3 +391,40 @@ async fn the_active_snapshot_is_the_latest_start_at_or_before_the_instant(pool: 
         assert_eq!(got.first().copied(), want, "at {at}");
     }
 }
+
+/// THE KNOWN LIMIT, PINNED: an identity running in two groups at once has one
+/// row per group folder, and nothing on a claim names the folder it ran in
+/// (a group folder maps to no tenancy group), so the latest start wins
+/// whichever group filed the claim. An agent that started in `main` (t1) and
+/// then in `side` (t2) is placed in `side` at t3, and back in `main` only
+/// once `main` records a later start (t4). Changing this needs a recorded
+/// folder on the claim, not a different ordering here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identity_in_two_groups_is_placed_at_its_latest_start(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "two-groups").await;
+    let t0 = DateTime::from_timestamp_micros((Utc::now() - Duration::days(10)).timestamp_micros())
+        .expect("a valid instant");
+    let t = |n: i64| t0 + Duration::hours(n);
+    let main = snapshot_row(&pool, agent, "main", t(1), t(1)).await;
+    let side = snapshot_row(&pool, agent, "side", t(2), t(2)).await;
+    assert_eq!(
+        at_as(&pool, None, agent, t(3), true).await,
+        vec![(side, t(2))],
+        "the latest start wins across groups"
+    );
+    sqlx::query("UPDATE agent_prompt_snapshots SET last_seen = $2 WHERE id = $1")
+        .bind(main)
+        .bind(t(4))
+        .execute(&pool)
+        .await
+        .expect("main records a later start");
+    assert_eq!(
+        at_as(&pool, None, agent, t(5), true).await,
+        vec![(main, t(4))]
+    );
+    assert_eq!(
+        at_as(&pool, None, agent, t(3), true).await,
+        vec![(side, t(2))],
+        "an instant before main's later start is unchanged"
+    );
+}

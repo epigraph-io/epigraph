@@ -28,10 +28,12 @@
 //!   the snapshot (161, design D4) the agent was running at the claim's
 //!   `created_at`, read through migration 199's
 //!   `epigraph_agent_prompt_snapshot_at`, whose gate is 161's prompt-history
-//!   gate: the agent's linked human (any link state) and admins. Who else may
-//!   see it is the owner's pending call, and it is ONE constant:
-//!   [`PROMPT_SNAPSHOT_AUDIENCE`]. Prompt TEXT is never part of this block; it
-//!   stays behind `GET /api/v1/agents/:id/prompt-history/blobs/:hash`.
+//!   gate: the agent's linked human (any link state) and admins. That is the
+//!   owner's ruled audience (the model and snapshot stay behind the
+//!   prompt-history gate, while the agent and its human are shown to every
+//!   reader), set in ONE constant: [`PROMPT_SNAPSHOT_AUDIENCE`]. Prompt TEXT
+//!   is never part of this block; it stays behind
+//!   `GET /api/v1/agents/:id/prompt-history/blobs/:hash`.
 //!
 //! # Who is the author: the agent, or a document's authors
 //!
@@ -100,13 +102,12 @@ impl PromptSnapshotAudience {
 }
 
 /// THE OWNER'S CALL, IN ONE PLACE: who sees a claim's prompt snapshot.
-/// Proposed: every reader of the claim
-/// ([`PromptSnapshotAudience::ClaimReaders`]), prompt text staying gated.
-/// The conservative setting, shipped while the call is pending, is
-/// [`PromptSnapshotAudience::OperatorAndAdmins`] (the prompt-text gate).
-/// Changing the value below is the whole change: the REST and MCP claim
-/// tests read it and assert whichever setting is live, and the repo tests
-/// drive both settings explicitly.
+/// RULED: [`PromptSnapshotAudience::OperatorAndAdmins`]. The model, prompt
+/// hash and snapshot stay behind the prompt-history gate (design D4), the
+/// same audience as the prompt text; the agent and its human are shown to
+/// every reader regardless of this setting. The value below is the whole
+/// switch: the REST and MCP claim tests read it and assert whichever setting
+/// is live, and the repo tests drive both settings explicitly.
 pub const PROMPT_SNAPSHOT_AUDIENCE: PromptSnapshotAudience =
     PromptSnapshotAudience::OperatorAndAdmins;
 

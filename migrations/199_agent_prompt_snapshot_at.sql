@@ -41,12 +41,11 @@
 -- never registered a snapshot, so the two cannot be told apart.
 --
 -- `p_open = true` skips the gate: the snapshot is returned to any caller. It
--- exists for the owner's pending call on who may see a claim's model and
--- prompt hash (proposed: every reader of the claim). The request server
--- passes it from ONE constant, `epigraph_db::authored_by::
--- PROMPT_SNAPSHOT_AUDIENCE` (the gated audience when this was written); the
--- server calls this function only for a claim the caller has already read
--- under its viewer.
+-- exists so the audience for a claim's model and prompt hash is ONE switch on
+-- the request server, `epigraph_db::authored_by::PROMPT_SNAPSHOT_AUDIENCE`.
+-- The owner ruled the gated audience (the model and snapshot stay behind the
+-- prompt-history gate), so the server passes `false`; the server calls this
+-- function only for a claim the caller has already read under its viewer.
 --
 -- WHY A CALLER-CHOSEN `p_open` ADDS NO CAPABILITY. The gate reads the
 -- session principal, `epigraph.principal_id`, which any session on the
@@ -71,7 +70,11 @@
 -- starts between a row's `first_seen` and `last_seen` are not recorded, so a
 -- state that recurred more than once is placed at its first or its latest
 -- start only; and an identity that runs in several groups at once has one
--- row per group, of which the latest start wins.
+-- row per group folder, of which the latest start wins. A claim records no
+-- group folder (a folder maps to no tenancy group), so the claim's own group
+-- cannot pick the row; the admitted audience may read every folder's rows
+-- through 161's prompt history anyway. Both limits are pinned by
+-- `epigraph-db/tests/prompt_snapshot_at_definer.rs`.
 --
 -- WHAT IT REVEALS. To an admitted caller: one snapshot id, the model, the
 -- identity prompt hash and one start time for (agent, instant). The model and
