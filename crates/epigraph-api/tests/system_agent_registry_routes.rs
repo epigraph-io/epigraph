@@ -285,7 +285,10 @@ async fn rest_add_step_on_an_armed_unregistered_database_needs_no_system_agent(p
     .await;
     let (status, body) = body_text(r.into_response()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert!(!body.contains("system_agents"), "no registry refusal: {body}");
+    assert!(
+        !body.contains("system_agents"),
+        "no registry refusal: {body}"
+    );
     assert_eq!(count(&pool, "claims").await, claims);
     assert_eq!(count(&pool, "agents").await, agents);
 }

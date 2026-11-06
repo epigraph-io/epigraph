@@ -381,7 +381,10 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
     );
     assert_names_nothing_hidden(&w, "REST re-ingest", &out.to_string());
     let m = mcp_ingest(&w, w.outsider, extraction(&w.name, 0)).await;
-    assert!(m.is_err(), "the MCP re-ingest by a non-member is refused: {m:?}");
+    assert!(
+        m.is_err(),
+        "the MCP re-ingest by a non-member is refused: {m:?}"
+    );
     assert_names_nothing_hidden(&w, "MCP re-ingest", &text_of(&m));
 
     // A new generation of the hidden lineage: refused, naming nothing hidden.
@@ -607,7 +610,10 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
     .fetch_all(&pool)
     .await
     .expect("events");
-    assert!(events.is_empty(), "a refused store emits no event: {events:?}");
+    assert!(
+        events.is_empty(),
+        "a refused store emits no event: {events:?}"
+    );
 
     let auth = auth_for(w.outsider);
     let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(&auth))
@@ -619,7 +625,10 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
         epigraph_mcp::tools::workflows::store_workflow(&w.server, &viewer, params, Some(&auth))
             .await,
     );
-    assert!(m.is_err(), "the MCP store_workflow by a non-member is refused: {m:?}");
+    assert!(
+        m.is_err(),
+        "the MCP store_workflow by a non-member is refused: {m:?}"
+    );
     assert_names_nothing_hidden(&w, "MCP store_workflow", &text_of(&m));
 
     // The member's answers carry the id.
@@ -863,7 +872,10 @@ async fn delete_step_over_a_hidden_workflow_is_masked_and_admits_only_writers_of
     );
     assert_names_nothing_hidden(&w, "REST delete_step (live admin)", &out.to_string());
     let m = mcp_delete_step(&w, &admin_auth(client, admin), &w.name, added[0]).await;
-    assert!(m.is_err(), "an admin outside the group is refused over MCP: {m:?}");
+    assert!(
+        m.is_err(),
+        "an admin outside the group is refused over MCP: {m:?}"
+    );
     assert_names_nothing_hidden(&w, "MCP delete_step (live admin)", &text_of(&m));
     assert_eq!(lineage_truths(&pool, first).await, truths_first);
     assert_eq!(lineage_truths(&pool, added[0]).await, truths_added);

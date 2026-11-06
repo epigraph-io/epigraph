@@ -1138,11 +1138,7 @@ async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPoo
     }
     for (id, v, o) in &gen1_plan {
         if carried.contains(id) {
-            assert_eq!(
-                (v.as_str(), *o),
-                ("public", w.g),
-                "{id} is not re-tenanted"
-            );
+            assert_eq!((v.as_str(), *o), ("public", w.g), "{id} is not re-tenanted");
         } else {
             assert_eq!(
                 (v.as_str(), *o),
@@ -1694,8 +1690,10 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
     // carrying nothing of the private plan (no id, no size).
     for declared_group in [None, Some(w.og)] {
         let mut answers = Vec::new();
-        for (body, name) in [(&small, "acme-plan-size-small"), (&large, "acme-plan-size-large")]
-        {
+        for (body, name) in [
+            (&small, "acme-plan-size-small"),
+            (&large, "acme-plan-size-large"),
+        ] {
             let refused = stdio_ingest(&w.f_server, mcp_params(body.clone(), declared_group))
                 .await
                 .expect_err("a non-member's re-ingest of a hidden lineage is refused");
@@ -2084,7 +2082,11 @@ async fn a_non_writer_cannot_add_a_step_to_a_group_plan(pool: PgPool) {
     // A non-member cannot read the plan on its own stamp, so it is answered as
     // an unknown name (404, backlog c831df4a), never with the plan's id.
     let (s, b) = rest_add(token(w.h2, WRITE_SCOPES), "acme stranger rest step").await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "REST: a non-member is refused: {b}");
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "REST: a non-member is refused: {b}"
+    );
     assert!(!b.to_string().contains(&wf.to_string()), "{b}");
     assert_eq!(
         executes_count(&pool, wf).await,

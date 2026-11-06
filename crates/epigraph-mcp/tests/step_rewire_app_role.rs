@@ -592,7 +592,10 @@ async fn two_callers_chain_edges_are_owned_by_whichever_caller_wrote_them(pool: 
     let first_group = personal_group_of(&pool, first_agent).await;
     let second_group = personal_group_of(&pool, second_agent).await;
     let world = fixture::world_group(&pool).await;
-    for (step, author, group) in [(a, first_agent, first_group), (b, second_agent, second_group)] {
+    for (step, author, group) in [
+        (a, first_agent, first_group),
+        (b, second_agent, second_group),
+    ] {
         let claim_author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
             .bind(step)
             .fetch_one(&pool)

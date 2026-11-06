@@ -416,8 +416,7 @@ pub async fn store_workflow(
         if caller_reads_row {
             match embedder.generate(&request.goal).await {
                 Ok(qvec) => {
-                    store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec)
-                        .await;
+                    store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec).await;
                 }
                 Err(e) => {
                     tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed for workflow goal");
@@ -2630,10 +2629,7 @@ async fn embed_inserted_workflow_claims(
     let mut stored = 0usize;
     for (claim_id, pgvec) in &vectors {
         match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
-            &mut tx,
-            viewer,
-            *claim_id,
-            pgvec,
+            &mut tx, viewer, *claim_id, pgvec,
         )
         .await
         {

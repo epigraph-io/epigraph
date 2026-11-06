@@ -130,7 +130,11 @@ async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMc
 }
 
 /// The stdio server's own agent, created by its first viewer resolution.
-async fn stdio_agent(pool: &PgPool, server: &epigraph_mcp::server::EpiGraphMcpFull, seed: u8) -> Uuid {
+async fn stdio_agent(
+    pool: &PgPool,
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    seed: u8,
+) -> Uuid {
     epigraph_mcp::tools::viewer::request_viewer(server, None)
         .await
         .expect("the stdio viewer");
@@ -161,7 +165,11 @@ fn http_auth(agent: Uuid) -> epigraph_auth::AuthContext {
 }
 
 fn tool_json(out: &rmcp::model::CallToolResult) -> Value {
-    assert_ne!(out.is_error, Some(true), "the tool reported an error: {out:?}");
+    assert_ne!(
+        out.is_error,
+        Some(true),
+        "the tool reported an error: {out:?}"
+    );
     let text = out
         .content
         .first()
@@ -288,14 +296,10 @@ impl Via<'_> {
                     step_text: text.to_string(),
                     position: None,
                 };
-                let out = epigraph_mcp::tools::step_ops::add_step(
-                    server,
-                    &viewer,
-                    params,
-                    auth.as_ref(),
-                )
-                .await
-                .map_err(|e| e.message.to_string())?;
+                let out =
+                    epigraph_mcp::tools::step_ops::add_step(server, &viewer, params, auth.as_ref())
+                        .await
+                        .map_err(|e| e.message.to_string())?;
                 tool_json(&out)
             }
             Via::Rest(router, agent) => {
@@ -478,14 +482,21 @@ async fn assert_written_as(
     what: &str,
 ) -> Vec<Uuid> {
     let (v, o, submitter, _) = workflow_row(pool, wf).await;
-    assert_eq!((v.as_str(), o), (visibility, owner), "{what}: the workflow row's tenancy");
+    assert_eq!(
+        (v.as_str(), o),
+        (visibility, owner),
+        "{what}: the workflow row's tenancy"
+    );
     assert_eq!(
         submitter,
         Some(author.to_string()),
         "{what}: the row records the caller as its submitter"
     );
     let plan = plan(pool, wf).await;
-    assert!(plan.len() >= 3, "{what}: a phase, steps and atoms: {plan:?}");
+    assert!(
+        plan.len() >= 3,
+        "{what}: a phase, steps and atoms: {plan:?}"
+    );
     for (id, _, agent, v, o) in &plan {
         assert_eq!(
             *agent, author,
@@ -624,11 +635,12 @@ async fn grant_role(pool: &PgPool, holder: Uuid) -> Uuid {
 
 async fn end_role(pool: &PgPool, assignment: Uuid) {
     as_maintenance(pool, move |mut conn| async move {
-        let ended: bool = sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'test')")
-            .bind(assignment)
-            .fetch_one(&mut *conn)
-            .await
-            .expect("end the role");
+        let ended: bool =
+            sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, 'test')")
+                .bind(assignment)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("end the role");
         assert!(ended, "the assignment ends");
         (conn, ())
     })
@@ -716,10 +728,19 @@ async fn world(pool: &PgPool) -> World {
     arm(pool).await;
 
     // The premises the tests rely on.
-    assert!(writes(pool, rb, alpha).await, "PREMISE: rb writes alpha (role binding)");
-    assert!(writes(pool, dr, alpha).await, "PREMISE: dr writes alpha (roster row)");
+    assert!(
+        writes(pool, rb, alpha).await,
+        "PREMISE: rb writes alpha (role binding)"
+    );
+    assert!(
+        writes(pool, dr, alpha).await,
+        "PREMISE: dr writes alpha (roster row)"
+    );
     for who in [rb, dr] {
-        assert!(!writes(pool, who, beta).await, "PREMISE: {who} does not write beta");
+        assert!(
+            !writes(pool, who, beta).await,
+            "PREMISE: {who} does not write beta"
+        );
     }
     let rb_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
@@ -729,9 +750,15 @@ async fn world(pool: &PgPool) -> World {
     .fetch_one(pool)
     .await
     .expect("rb's rows");
-    assert_eq!(rb_rows, 0, "PREMISE: rb's alpha membership is the binding alone");
+    assert_eq!(
+        rb_rows, 0,
+        "PREMISE: rb's alpha membership is the binding alone"
+    );
     assert!(!writes(pool, c, alpha).await && !writes(pool, c, beta).await);
-    assert!(writes(pool, c, op_g).await, "PREMISE: the linked agent writes op's group");
+    assert!(
+        writes(pool, c, op_g).await,
+        "PREMISE: the linked agent writes op's group"
+    );
 
     World {
         router: router(pool).await,
@@ -788,13 +815,19 @@ async fn team_writer_cycle(pool: &PgPool, w: &World, via: Via<'_>, caller: Uuid,
         (caller, "public".to_string(), w.alpha),
         "{tag}: the added step is the caller's, in alpha"
     );
-    assert!(authored_by(pool, caller, added).await, "{tag}: AUTHORED edge on the added step");
+    assert!(
+        authored_by(pool, caller, added).await,
+        "{tag}: AUTHORED edge on the added step"
+    );
     let deleted = via
         .delete_step(&name, lineage)
         .await
         .unwrap_or_else(|e| panic!("{tag}: the submitter deletes a step: {e}"));
     assert_eq!(deleted, added);
-    assert!((truth(pool, added).await - 0.05).abs() < 1e-9, "{tag}: soft-deleted");
+    assert!(
+        (truth(pool, added).await - 0.05).abs() < 1e-9,
+        "{tag}: soft-deleted"
+    );
 
     // 4. A declared tenancy the caller writes: ('group', alpha).
     let name = format!("acme-{tag}-declared");
@@ -802,14 +835,29 @@ async fn team_writer_cycle(pool: &PgPool, w: &World, via: Via<'_>, caller: Uuid,
         .ingest(&extraction(&name, 0, 1), Some(w.alpha))
         .await
         .unwrap_or_else(|e| panic!("{tag}: a declared ingest into alpha: {e}"));
-    assert_written_as(pool, uuid_of(&out["workflow_id"]), caller, "group", w.alpha, tag).await;
+    assert_written_as(
+        pool,
+        uuid_of(&out["workflow_id"]),
+        caller,
+        "group",
+        w.alpha,
+        tag,
+    )
+    .await;
 
     // 5. A declared group the caller does NOT write: refused, nothing written.
     let name = format!("acme-{tag}-refused");
     let before = row_counts(pool).await;
     let refused = via.ingest(&extraction(&name, 0, 1), Some(w.beta)).await;
-    assert!(refused.is_err(), "{tag}: a group the caller does not write is refused: {refused:?}");
-    assert_eq!(row_counts(pool).await, before, "{tag}: the refusal wrote nothing");
+    assert!(
+        refused.is_err(),
+        "{tag}: a group the caller does not write is refused: {refused:?}"
+    );
+    assert_eq!(
+        row_counts(pool).await,
+        before,
+        "{tag}: the refusal wrote nothing"
+    );
     assert_eq!(workflow_named(pool, &name, 0).await, None);
 }
 
@@ -846,8 +894,14 @@ async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_work
     let w = world(&pool).await;
     // The operator's own workflow, ingested by its linked agent.
     let name = "acme-operator-owned";
-    via_ok(Via::McpStdio(&w.c_server).ingest(&extraction(name, 0, 2), None).await);
-    let wf = workflow_named(&pool, name, 0).await.expect("the operator's workflow");
+    via_ok(
+        Via::McpStdio(&w.c_server)
+            .ingest(&extraction(name, 0, 2), None)
+            .await,
+    );
+    let wf = workflow_named(&pool, name, 0)
+        .await
+        .expect("the operator's workflow");
     let steps: Vec<Uuid> = plan(&pool, wf)
         .await
         .into_iter()
@@ -857,11 +911,21 @@ async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_work
     for via in [Via::McpHttp(&w.mcp, w.rb), Via::Rest(&w.router, w.rb)] {
         let before = row_counts(&pool).await;
         assert!(via.add_step(name, "acme intruding step").await.is_err());
-        assert!(via.evolve(steps[0], "acme intruding revision").await.is_err());
+        assert!(via
+            .evolve(steps[0], "acme intruding revision")
+            .await
+            .is_err());
         let lineage = step_lineage(&pool, steps[0]).await;
         assert!(via.delete_step(name, lineage).await.is_err());
-        assert!(via.add_step(LEGACY, "acme intruding legacy step").await.is_err());
-        assert_eq!(row_counts(&pool).await, before, "the refusals wrote nothing");
+        assert!(via
+            .add_step(LEGACY, "acme intruding legacy step")
+            .await
+            .is_err());
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "the refusals wrote nothing"
+        );
     }
 }
 
@@ -883,14 +947,23 @@ async fn the_operators_linked_agent_writes_where_the_system_agent_did_but_as_its
     let via = Via::McpStdio(&w.c_server);
     let name = "acme-operator-path";
     let out = via_ok(via.ingest(&extraction(name, 0, 2), None).await);
-    let steps =
-        assert_written_as(&pool, uuid_of(&out["workflow_id"]), w.c, "public", w.op_g, "operator")
-            .await;
+    let steps = assert_written_as(
+        &pool,
+        uuid_of(&out["workflow_id"]),
+        w.c,
+        "public",
+        w.op_g,
+        "operator",
+    )
+    .await;
     let evolved = via
         .evolve(steps[1], "acme operator path step 1, revised")
         .await
         .expect("the operator's agent evolves its step");
-    assert_eq!(claim_row(&pool, evolved).await, (w.c, "public".into(), w.op_g));
+    assert_eq!(
+        claim_row(&pool, evolved).await,
+        (w.c, "public".into(), w.op_g)
+    );
 
     // The legacy, system-authored workflow: add a step, then delete one of
     // the steps the SYSTEM agent wrote.
@@ -909,7 +982,10 @@ async fn the_operators_linked_agent_writes_where_the_system_agent_did_but_as_its
         .add_step(LEGACY, "acme legacy appended step")
         .await
         .expect("add a step to the legacy workflow");
-    assert_eq!(claim_row(&pool, added).await, (w.c, "public".into(), w.op_g));
+    assert_eq!(
+        claim_row(&pool, added).await,
+        (w.c, "public".into(), w.op_g)
+    );
     let lineage = step_lineage(&pool, legacy_steps[0].0).await;
     let deleted = via
         .delete_step(LEGACY, lineage)
@@ -932,18 +1008,33 @@ async fn a_new_generation_outside_the_lineages_group_follows_the_callers_order(p
     let via = Via::McpHttp(&w.mcp, w.rb);
     let public_name = "acme-generations-public";
     let private_name = "acme-generations-private";
-    let g0 = uuid_of(&via_ok(via.ingest(&extraction(public_name, 0, 1), None).await)["workflow_id"]);
+    let g0 =
+        uuid_of(&via_ok(via.ingest(&extraction(public_name, 0, 1), None).await)["workflow_id"]);
     assert_eq!(workflow_row(&pool, g0).await.1, w.alpha, "gen 0 in alpha");
-    via_ok(via.ingest(&extraction(private_name, 0, 1), Some(w.alpha)).await);
+    via_ok(
+        via.ingest(&extraction(private_name, 0, 1), Some(w.alpha))
+            .await,
+    );
 
     end_role(&pool, w.rb_role).await;
-    assert!(!writes(&pool, w.rb, w.alpha).await, "PREMISE: rb no longer writes alpha");
+    assert!(
+        !writes(&pool, w.rb, w.alpha).await,
+        "PREMISE: rb no longer writes alpha"
+    );
 
     let out = via_ok(via.ingest(&extraction(public_name, 1, 1), None).await);
     let g1 = uuid_of(&out["workflow_id"]);
     let (v, owner, submitter, parent) = workflow_row(&pool, g1).await;
-    assert_eq!((v.as_str(), owner), ("public", w.rb_g), "gen 1 in the caller's own group");
-    assert_eq!(submitter, Some(w.rb.to_string()), "the lineage's submitter is inherited");
+    assert_eq!(
+        (v.as_str(), owner),
+        ("public", w.rb_g),
+        "gen 1 in the caller's own group"
+    );
+    assert_eq!(
+        submitter,
+        Some(w.rb.to_string()),
+        "the lineage's submitter is inherited"
+    );
     assert_eq!(parent, Some(g0), "the parent link is kept");
     let variant_of: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM edges WHERE source_id = $1 AND target_id = $2 \
@@ -958,7 +1049,10 @@ async fn a_new_generation_outside_the_lineages_group_follows_the_callers_order(p
 
     let before = row_counts(&pool).await;
     let refused = via.ingest(&extraction(private_name, 1, 1), None).await;
-    assert!(refused.is_err(), "a private lineage the caller no longer writes: {refused:?}");
+    assert!(
+        refused.is_err(),
+        "a private lineage the caller no longer writes: {refused:?}"
+    );
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(workflow_named(&pool, private_name, 1).await, None);
 
@@ -989,9 +1083,15 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
     let stale = epigraph_db::visibility::Viewer::resolve(&pool, w.rb)
         .await
         .expect("resolve");
-    assert!(stale.writable_groups().contains(&w.alpha), "PREMISE: the viewer writes alpha");
+    assert!(
+        stale.writable_groups().contains(&w.alpha),
+        "PREMISE: the viewer writes alpha"
+    );
     end_role(&pool, w.rb_role).await;
-    assert!(!writes(&pool, w.rb, w.alpha).await, "PREMISE: rb no longer writes alpha");
+    assert!(
+        !writes(&pool, w.rb, w.alpha).await,
+        "PREMISE: rb no longer writes alpha"
+    );
 
     let ingest = |name: &'static str| {
         let extraction: epigraph_ingest::workflow::WorkflowExtraction =
@@ -1002,7 +1102,10 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
 
     let before = row_counts(&pool).await;
     let (x, plan) = ingest("acme-live-declared");
-    let mut tx = scoped.begin_as(&stale).await.expect("stamp from the stale viewer");
+    let mut tx = scoped
+        .begin_as(&stale)
+        .await
+        .expect("stamp from the stale viewer");
     let refused = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
         &mut tx,
         &plan,
@@ -1023,7 +1126,10 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
 
     let (x, plan) = ingest("acme-live-undeclared");
-    let mut tx = scoped.begin_as(&stale).await.expect("stamp from the stale viewer");
+    let mut tx = scoped
+        .begin_as(&stale)
+        .await
+        .expect("stamp from the stale viewer");
     let out = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
         &mut tx, &plan, &x, &stale, None,
     )
@@ -1057,7 +1163,10 @@ async fn a_lineage_with_a_generation_the_caller_cannot_read_is_never_written(poo
     via_ok(mcp.ingest(&extraction(name, 0, 1), None).await);
     via_ok(mcp.ingest(&extraction(name, 1, 1), Some(w.alpha)).await);
     end_role(&pool, w.rb_role).await;
-    assert!(!writes(&pool, w.rb, w.alpha).await, "PREMISE: rb left alpha");
+    assert!(
+        !writes(&pool, w.rb, w.alpha).await,
+        "PREMISE: rb left alpha"
+    );
 
     let before = row_counts(&pool).await;
     for via in [Via::McpHttp(&w.mcp, w.rb), Via::Rest(&w.router, w.rb)] {
@@ -1074,7 +1183,10 @@ async fn a_lineage_with_a_generation_the_caller_cannot_read_is_never_written(poo
             "a child naming a hidden parent is refused, never stored parentless: {refused:?}"
         );
         let refused = via.add_step(name, "acme step on a stale generation").await;
-        assert!(refused.is_err(), "a step edit on the stale visible generation: {refused:?}");
+        assert!(
+            refused.is_err(),
+            "a step edit on the stale visible generation: {refused:?}"
+        );
     }
     assert_eq!(row_counts(&pool).await, before, "nothing was written");
     assert_eq!(workflow_named(&pool, name, 2).await, None);
