@@ -421,16 +421,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "admin_cascade::record_deferral",
         ],
     ),
-    (
-        "cross_source.rs",
-        "get_cross_source_matches",
-        &["MatchCandidateRepo::new"],
-    ),
-    (
-        "cross_source.rs",
-        "list_candidates",
-        &["MatchCandidateRepo::new"],
-    ),
+    // `get_cross_source_matches` and `list_candidates` are gone from this
+    // table: both read through `MatchCandidateRepo::*_conn` on their stamped
+    // connection now, so neither constructs a repo over the raw pool.
     // gated: the frame and (since backlog 4815dcf7) the claim are read through
     // the viewer before the binding is written.
     (

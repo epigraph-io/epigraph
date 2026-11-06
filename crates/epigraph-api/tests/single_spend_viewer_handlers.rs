@@ -483,7 +483,10 @@ async fn seed_probe(pool: &PgPool, agent: Uuid, group: Option<Uuid>, probe: &str
 }
 
 async fn run_as(pool: &PgPool, viewer: Viewer, query: String) -> BTreeSet<Uuid> {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(pool).await,
+        ApiConfig::default(),
+    );
     let Json(out) = execute_graph_query(
         ViewerExtractor(viewer),
         State(state),
