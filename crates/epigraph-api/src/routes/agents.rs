@@ -433,8 +433,8 @@ pub const AGENT_SEARCH_SCOPE: &str = "claims:read";
 /// Case-insensitive, accent-folded name match (plus exact ORCID / ROR id
 /// where the caller may see it), ranked exact > prefix > similar, each result
 /// carrying the card that tells near-duplicates apart: kind (derived from
-/// evidence the caller may see), the roles it may see, the operator-linked
-/// human only through the prompt-history (D4) gate, created_at, and counts of
+/// evidence the caller may see), the roles it may see, the human the agent
+/// acts for (shown to every reader), created_at, and counts of
 /// authored papers and asserted claims computed under the caller's viewer.
 /// The same code and viewer rules serve MCP `find_agent`
 /// (`epigraph_db::AgentLookupRepository::find`). Requires authentication.

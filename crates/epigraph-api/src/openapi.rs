@@ -402,8 +402,9 @@ async fn unmark_duplicate_doc() {}
 /// `trigram`. The body is `{results: [...], candidates_truncated}`; each result
 /// is an agent card (`id`, `display_name`, `kind`, `kind_evidence`, `roles`,
 /// `orcid`, `ror_id`, `operator_human`, `created_at`, `counts`) plus `tier`
-/// and `score`, every field computed under the caller's viewer. Same code as
-/// MCP `find_agent`. Scope `claims:read`.
+/// and `score`. `operator_human` (the human the agent acts for) is shown to
+/// every reader; every other field is computed under the caller's viewer.
+/// Same code as MCP `find_agent`. Scope `claims:read`.
 #[utoipa::path(
     get,
     path = "/api/v1/agents/search",

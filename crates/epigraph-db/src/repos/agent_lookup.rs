@@ -22,13 +22,15 @@
 //!   private ORCID never matches, so it is not an oracle. `properties`
 //!   (`full_name`, `email`, `affiliations`) is never matched and never
 //!   returned; no contact field is ever searched.
-//! * `operator_human` (the human the agent acts for, migration 149's
-//!   `epigraph_human_of(agent, false)`): only through the prompt-history gate
-//!   (design D4, migration 161): the caller IS that human, or the caller is
-//!   an admin (a bypass or elevated viewer). [`D4_OPERATOR_GATE_SQL`] is that
-//!   gate, in one place, for every surface that shows an agent's human or its
-//!   prompt state. (It omits 161's unarmed-scopes `epigraph_is_instance_admin`
-//!   arm, so it admits a subset of what 161 admits: never more.)
+//! * `operator_human` (the human the agent acts for): shown to EVERY reader,
+//!   by design: who an agent acts for is public, like the claims it files.
+//!   It is read from the binding RECORD (`operator_binding_sql`: the
+//!   agent's operator link, else its client allowance), never inferred from
+//!   an `OPERATED_BY` edge, which any edge writer can add, and never from
+//!   client or registration status, which would let a reader watch a
+//!   suspension. The agent's model, prompt snapshot and prompt text are NOT
+//!   on the card; they stay behind the prompt-history gate
+//!   ([`D4_OPERATOR_GATE_SQL`]).
 //! * `kind`: derived from EVIDENCE, never from `agents.agent_type` alone
 //!   (the legacy create path defaulted every row to `'human'`). Each evidence
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
@@ -92,10 +94,14 @@ pub const COUNT_CAP: i64 = 10_000;
 /// the admin bit ([`Viewer::bypass_bind`]: a bypass or elevated viewer) at
 /// `$A`. True when the caller is the human `epigraph_human_of({agent}, false)`
 /// names, or an admin. A NULL principal (an unstamped or anonymous caller)
-/// is never admitted.
+/// is never admitted. It omits 161's unarmed-scopes
+/// `epigraph_is_instance_admin` arm, so it admits a subset of what 161
+/// admits: never more.
 ///
-/// Every surface that shows an agent's operator-linked human or its prompt
-/// state goes through this text, so the surfaces cannot drift apart.
+/// It gates an agent's PROMPT STATE (model, prompt snapshot, prompt text),
+/// never the agent's human: the human is shown to every reader (the card's
+/// `operator_human`). The card itself shows no prompt state and does not use
+/// this gate; it is the shared text for a surface that does.
 pub const D4_OPERATOR_GATE_SQL: &str = "($A::bool OR ($P::uuid IS NOT NULL \
      AND public.epigraph_human_of({agent}, false) = $P::uuid))";
 
@@ -136,6 +142,30 @@ fn ident_sql(expr: &str) -> String {
     format!(
         "pg_catalog.lower(pg_catalog.btrim(pg_catalog.regexp_replace(pg_catalog.btrim({expr}), \
            '^https?://(www\\.)?(orcid\\.org|ror\\.org)/', '', 'i')))"
+    )
+}
+
+/// The human an agent acts for, in SQL, read from the binding RECORD so that
+/// no client or registration event moves it (it is shown to every reader):
+/// the agent's operator link in any state (107's
+/// `epigraph_operator_of_author`, retired links included, as
+/// `epigraph_human_of(agent, false)` reads them), else the operator its
+/// unrevoked migration-149 client allowance names.
+///
+/// It equals `epigraph_human_of(agent, false)` for every bound agent while
+/// that binding is in force. It differs only where `epigraph_human_of`
+/// consults client or registration STATUS, which a reader must not be able
+/// to watch: an allowance whose client (or whose operator's human client) is
+/// not active, or that a second client of the agent suspends, still names
+/// its operator; and a registered human that is also linked as an agent (an
+/// operated agent, migration 123) names its link operator whether or not its
+/// own client is active. Never inferred from an `OPERATED_BY` edge, which
+/// any edge writer can add. NULL for an unbound agent.
+fn operator_binding_sql(agent: &str) -> String {
+    format!(
+        "COALESCE((SELECT o.operator_id FROM public.epigraph_operator_of_author({agent}) o), \
+                  (SELECT r.operator_id FROM public.author_binding_clients r \
+                    WHERE r.agent_id = {agent} AND r.revoked_at IS NULL))"
     )
 }
 
@@ -193,11 +223,13 @@ pub enum AgentKind {
     /// A registered system identity (migration 148's `system_agents`).
     System,
     /// A registered human operator (migration 122's `human_operators`), shown
-    /// to the human itself, its own agents, admins, and to every caller when
-    /// the human holds a disclosed role (only registered humans hold roles).
+    /// to the human itself and admins (registration status is never shown to
+    /// anyone else, the human's own agents included), and to every caller
+    /// when the human holds a disclosed role (only registered humans are
+    /// granted roles; the window, not the current status, decides).
     Human,
-    /// An agent with an LLM model on its (visible) profile, or bound to a
-    /// human the caller may see (D4).
+    /// An agent with an LLM model on its (visible) profile, or, failing a
+    /// derived author key, an agent bound to a human (`operator_human`).
     LlmAgent,
     /// An author node the document ingest created: its key is the
     /// deterministic name- (or ORCID-) derived key of `did_key_for_author`,
@@ -277,7 +309,8 @@ pub struct AgentCard {
     pub roles: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
-    /// The human this agent acts for, when the caller passes the D4 gate.
+    /// The human this agent acts for (its binding record), shown to every
+    /// reader; `None` for an unbound agent and for a human itself.
     pub operator_human: Option<AgentRef>,
     pub created_at: DateTime<Utc>,
     pub counts: CardCounts,
@@ -516,12 +549,9 @@ impl AgentLookupRepository {
                     COALESCE(d.details_ok AND a.properties ? 'llm_model', false) AS llm_model_visible, \
                     CASE WHEN d.details_ok THEN a.orcid END AS orcid, \
                     CASE WHEN d.details_ok THEN a.ror_id END AS ror_id, \
-                    COALESCE(($4::bool OR ($2::uuid IS NOT NULL \
-                         AND (a.id = $2::uuid \
-                              OR public.epigraph_human_of($2::uuid, false) = a.id))) \
+                    COALESCE(($4::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
                       AND public.epigraph_is_human_operator(a.id), false) AS human_visible, \
-                    CASE WHEN {d4} AND h.human IS DISTINCT FROM a.id THEN h.human END \
-                        AS operator_human, \
+                    CASE WHEN h.human IS DISTINCT FROM a.id THEN h.human END AS operator_human, \
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
@@ -530,9 +560,9 @@ impl AgentLookupRepository {
                      OR EXISTS (SELECT 1 FROM group_memberships gm \
                                  WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
                                    AND gm.group_id = ANY($3::uuid[]))), false) AS details_ok) d \
-              CROSS JOIN LATERAL (SELECT public.epigraph_human_of(a.id, false) AS human) h \
+              CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
-            d4 = d4_operator_gate("a.id", 2, 4),
+            binding = operator_binding_sql("a.id"),
         );
         type Row = (
             Uuid,
@@ -828,10 +858,14 @@ fn kind_from_evidence(evidence: &[&str]) -> AgentKind {
         AgentKind::System
     } else if has("registered_human_operator") || has("holds_disclosed_role") {
         AgentKind::Human
-    } else if has("llm_model_on_profile") || has("bound_to_visible_human") {
+    } else if has("llm_model_on_profile") {
         AgentKind::LlmAgent
     } else if has("name_derived_key") || has("orcid_derived_key") {
+        // An ingest author node bound to its human (a legacy author) is
+        // still an ingest author: the binding says whose it is, not what.
         AgentKind::IngestAuthor
+    } else if has("bound_to_visible_human") {
+        AgentKind::LlmAgent
     } else {
         AgentKind::Unknown
     }
@@ -848,8 +882,18 @@ mod tests {
             kind_from_evidence(&["name_derived_key"]),
             AgentKind::IngestAuthor
         );
+        // A legacy author node bound to its human is still an ingest author;
+        // only a model on its profile makes it an LLM agent.
         assert_eq!(
             kind_from_evidence(&["bound_to_visible_human", "name_derived_key"]),
+            AgentKind::IngestAuthor
+        );
+        assert_eq!(
+            kind_from_evidence(&["llm_model_on_profile", "orcid_derived_key"]),
+            AgentKind::LlmAgent
+        );
+        assert_eq!(
+            kind_from_evidence(&["bound_to_visible_human"]),
             AgentKind::LlmAgent
         );
         assert_eq!(
