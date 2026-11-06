@@ -228,8 +228,9 @@ pub struct ClaimResponse {
     /// the create handler; omitted from non-create responses (GET/PATCH/list).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_created: bool,
-    /// Who filed the claim, as the caller may see it. Present on
-    /// `GET /api/v1/claims/:id` only; omitted from every other claim response.
+    /// Who wrote the claim, as the caller may see it. Present on
+    /// `GET /api/v1/claims/:id` only; omitted from every other claim response,
+    /// `POST /api/v1/claims/batch-get` items included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authored_by: Option<AuthoredByView>,
 }
