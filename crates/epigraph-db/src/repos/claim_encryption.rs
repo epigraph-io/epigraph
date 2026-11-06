@@ -127,6 +127,48 @@ impl ClaimEncryptionRepository {
         Ok(row)
     }
 
+    /// Seal records for many claims, viewer-filtered through the parent claim.
+    ///
+    /// Unlike [`Self::get_by_claim_id_conn`] this takes a Viewer: that
+    /// function's exemption in `visibility_lint.rs` (`CONN_WITHOUT_VIEWER`)
+    /// holds only for callers that ran a gated fetch first, and says a new
+    /// caller must give it a Viewer instead of inheriting the entry. The join
+    /// to `claims` under the marker is that viewer, so a seal record (and its
+    /// `group_id`) is never returned for a claim the viewer cannot read.
+    ///
+    /// `claim_encryption` is keyed by `claim_id` (migration 060), so the map is
+    /// one-to-one. Empty input returns an empty map without a query.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(conn, viewer, claim_ids), fields(n = claim_ids.len()))]
+    pub async fn get_by_claim_ids_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, ClaimEncryptionRow>, DbError> {
+        if claim_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT ce.claim_id, ce.group_id, ce.epoch, ce.privacy_tier,
+                   ce.encrypted_content, ce.encrypted_labels, ce.created_at
+            FROM claim_encryption ce
+            JOIN claims c ON c.id = ce.claim_id
+            WHERE ce.claim_id = ANY($1)
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ClaimEncryptionRow>(&sql).bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(&mut *conn).await?;
+        Ok(rows.into_iter().map(|r| (r.claim_id, r)).collect())
+    }
+
     /// Get all encrypted claims for a group
     ///
     /// # Errors

@@ -738,16 +738,24 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// disjoint files (`routes/submit.rs` + `routes/claims.rs` vs `routes/workflows.rs`),
 /// so the merged count is 226 - 3 - 1.
 ///
-/// 222 -> 212 (HTTP public-only reads, 2026-11-05). Production builds
-/// `AppState.db_pool` as `scoped.inner()` on the `epigraph_app` login, so every
-/// raw-pool read of a FORCEd table there is public-only: the MCP defect of the
-/// same day, on the REST surface. The read-only, viewer-holding handlers moved
-/// onto `AppState::read_as`: `routes/graph_query.rs` 1 -> 0 (key deleted),
-/// `routes/computation.rs` 6 -> 5, `routes/experiments.rs` 8 -> 4 and
-/// `routes/cross_source.rs` 6 -> 2. Pinned on the production pool shape by
-/// `epigraph-api/tests/http_public_only_reads.rs`. Read off this test's own
-/// failure on the converted tree.
-const HIGH_WATER: usize = 212;
+/// 222 -> 221 (backlog 57917c13, 2026-11-04): `themes_overview` holds a
+/// `Viewer` and runs its one read, `ClaimThemeRepository::overview_page`, on
+/// the caller's stamped read (`routes/graph.rs` 3 -> 2), confirmed by
+/// `the_scanner_is_not_vacuous` passing on the converted tree. No file reached
+/// zero.
+///
+/// 221 -> 211 (HTTP public-only reads, 2026-11-05). Production builds
+/// `AppState.db_pool` as `scoped.inner()` on the `epigraph_app` login, and an
+/// unstamped `epigraph_app` session there sees 49,407 of 498,171 claims, the
+/// public ones: the MCP defect of the same day, on the REST surface. The
+/// read-only, viewer-holding handlers moved onto `AppState::read_as`:
+/// `routes/graph_query.rs` 1 -> 0 (key deleted), `routes/computation.rs`
+/// 6 -> 5, `routes/experiments.rs` 8 -> 4 and `routes/cross_source.rs` 6 -> 2.
+/// Pinned on the production pool shape by
+/// `epigraph-api/tests/http_public_only_reads.rs`. The files are disjoint from
+/// the entry above, so the merged count is 221 - 10, confirmed by this test on
+/// the merged tree.
+const HIGH_WATER: usize = 211;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -990,10 +998,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `fetch_subgraph_edges`, whose signature changed to `&mut PgConnection` in
     // place — it has exactly one caller workspace-wide, so no pool-shaped
     // wrapper was created and this file leaves the `&PgPool`-PARAMETER blind
-    // spot enumerated in the Known limits above. The three that remain
-    // (`overview`, `themes_overview`, `themes_expand`) are routed GETs that hold
-    // NO `Viewer`; their owner is `D-PR16-theme-cluster-viewer-scope`.
-    ("routes/graph.rs", 3),
+    // spot enumerated in the Known limits above. 3 -> 2 (backlog 57917c13):
+    // `themes_overview` now holds a `Viewer` and reads through
+    // `AppState::read_as` and the viewer-spliced
+    // `ClaimThemeRepository::overview_page`. The two that remain (`overview`,
+    // `themes_expand`) are routed GETs that hold NO `Viewer`; their owner is
+    // `D-PR16-theme-cluster-viewer-scope`.
+    ("routes/graph.rs", 2),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see
