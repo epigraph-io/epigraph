@@ -2109,6 +2109,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // every retire is refused (42501, loud) and nothing is written: fail
     // CLOSED.
     ("epigraph_retire_operator_link", 191),
+    // 197 (Atlas P3a), the layout epoch bump fired by the claims and edges
+    // narrowing triggers. It reads no tenanted table. Under a non-member owner
+    // it fails CLOSED: such an owner holds no UPDATE on `atlas_layout_epoch`
+    // (only `epigraph_maintenance` does), so every UPDATE that turns a public
+    // claim or edge non-public errors 42501 with nothing written (loud). Under
+    // the migration runner's superuser it keeps working with more authority
+    // than intended, which only this check reports.
+    ("epigraph_atlas_layout_narrowed", 197),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

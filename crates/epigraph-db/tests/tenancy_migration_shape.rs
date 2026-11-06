@@ -42,6 +42,12 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
     // discovers them by reading the first bytes of every `.sql` in the
     // directory rather than by number.
     ("073_idx_edges_co_owner.sql", "idx_edges_co_owner"),
+    // Backlog 57917c13: the covering partial index the themes overview's
+    // per-theme readable-member count scans.
+    (
+        "196_idx_claims_theme_current_tenancy.sql",
+        "idx_claims_theme_current_tenancy",
+    ),
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -380,7 +386,7 @@ fn no_transaction_files_contain_exactly_one_statement() {
     assert_eq!(
         checked,
         INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len(),
-        "expected exactly {} `-- no-transaction` migrations (063-066, 073, 126); found \
+        "expected exactly {} `-- no-transaction` migrations (063-066, 073, 126, 196); found \
          {checked}. Adding one is fine — add it to INDEX_MIGRATIONS so its index validity \
          is checked too, or to POLICY_ARM_MIGRATIONS if it has that shape.",
         INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len()
