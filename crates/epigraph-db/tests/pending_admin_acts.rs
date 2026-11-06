@@ -2361,12 +2361,61 @@ async fn an_act_enrollment_completes_only_while_its_confirmer_is_live(pool: PgPo
         .expect("CALIBRATION: a live confirmer completes");
 }
 
+/// An elevation of `person` confirmed by the passkey with credential `cred`,
+/// on a fresh refresh family; its session id.
+async fn elevate_with(pool: &PgPool, person: Uuid, cred: Vec<u8>) -> Uuid {
+    let client: Uuid = sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human'",
+    )
+    .bind(person)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client");
+    let fam = family(pool, client).await;
+    let ticket: Uuid = as_app(pool, Some(person), "", "", |mut conn| async move {
+        let t: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_create_elevation_ticket($1, $2, 'connector', 'cascade', \
+                                                           NULL)",
+        )
+        .bind(client)
+        .bind(fam)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("a ticket");
+        sqlx::query(
+            "SELECT public.epigraph_set_elevation_ticket_challenge($1, '{\"st\": 1}'::jsonb)",
+        )
+        .bind(t)
+        .execute(&mut *conn)
+        .await
+        .expect("the ticket's challenge");
+        (conn, t)
+    })
+    .await;
+    as_app(pool, None, "", "", |mut conn| async move {
+        let (outcome, session): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT outcome, session_id FROM public.epigraph_confirm_elevation($1, $2, 0, \
+                    false, '{\"ev\": 1}'::jsonb)",
+        )
+        .bind(ticket)
+        .bind(cred)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("confirm the elevation");
+        assert_eq!(outcome, "confirmed", "CALIBRATION: the elevation confirms");
+        (conn, session.expect("a session"))
+    })
+    .await
+}
+
 /// Revoking a passkey revokes, in the same transaction, every live `none`
 /// passkey enrolled on an act it confirmed (the passkeys it anchored), with
-/// the revoke's login and a reason naming the anchor; an ATTESTED passkey
-/// enrolled on another of its acts, and another person's passkey, stay live.
+/// the revoke's login and a reason naming the anchor, and so ends the
+/// elevations the anchored passkey confirmed (`passkey_revoked`, through
+/// 125's end trigger on the cascaded row); an ATTESTED passkey enrolled on
+/// another of its acts, and another person's passkey, stay live.
 /// Mutation: the cascade trigger dropped -> the anchored passkey stays live
-/// (the PR head's behaviour, P779-5).
+/// and its session elevated (the PR head's behaviour, P779-5).
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_an_anchor_revokes_the_unattested_passkeys_it_anchored(pool: PgPool) {
     let p = elevated_custodian(&pool, "custodian", 1).await;
@@ -2375,6 +2424,7 @@ async fn revoking_an_anchor_revokes_the_unattested_passkeys_it_anchored(pool: Pg
     let synced = try_complete(&pool, e_synced, 2, "none").await.unwrap();
     let hardware = try_complete(&pool, e_hardware, 3, "packed").await.unwrap();
     let q = elevated_custodian(&pool, "bystander", 4).await;
+    let synced_session = elevate_with(&pool, p.person, credential(2)).await;
 
     assert_eq!(
         maint(
@@ -2398,6 +2448,17 @@ async fn revoking_an_anchor_revokes_the_unattested_passkeys_it_anchored(pool: Pg
     assert!(
         revoked(&pool, q.passkey).await.is_none(),
         "another person's"
+    );
+    let ended: Option<String> =
+        sqlx::query_scalar("SELECT ended_reason FROM elevation_sessions WHERE id = $1")
+            .bind(synced_session)
+            .fetch_one(&pool)
+            .await
+            .expect("the session");
+    assert_eq!(
+        ended.as_deref(),
+        Some("passkey_revoked"),
+        "the anchored passkey's elevation ends with it"
     );
 }
 
