@@ -1857,6 +1857,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Returns workflow ids only, never content.",
     ),
     (
+        "agent_lookup.rs",
+        "disclosed_roles",
+        "READ through migration 198's `epigraph_disclosed_role_assignments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_assignments` (FORCE RLS, holder \
+         only). The function decides in its body, on the SESSION: non-elevating roles for any \
+         agent (a subset of 123's public projection), any role of the session principal itself, \
+         everything on a privileged session. No tenancy columns; nothing for a Viewer to add.",
+    ),
+    (
         "system_agent.rs",
         "lookup",
         "READ of migration 148's `system_agents` row for one role, with \
@@ -2192,6 +2201,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "retract_candidate_edges",
         "WRITE. The cascade's statements, unchecked; called only on a privileged session, \
          after its caller verified the privilege.",
+    ),
+    (
+        "match_candidate.rs",
+        "promote_if_pending_conn",
+        "WRITE. The conditional flip of one `match_candidates` row (no tenancy columns to filter \
+         on) and the matcher edge between the two claims the flipped row names (`RETURNING`), \
+         on the CALLER's connection. That is the point of the form: the edge's owner is \
+         derived from its claims by migration 070's trigger, so the caller passes a transaction \
+         stamped from the deciding agent and `edges_tenancy`'s WITH CHECK decides admission. \
+         The caller's viewer-filtered `are_all_current` guard runs on the same transaction.",
     ),
     (
         "match_candidate.rs",

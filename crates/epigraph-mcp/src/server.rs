@@ -1400,6 +1400,32 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Find a person, an LLM agent or a system identity by NAME (or by exact ORCID / ROR id). Case-, accent- and punctuation-folded (Jean-Pierre = jean pierre, O'Brien = OBrien); an ORCID matches with or without hyphens or the orcid.org prefix; ranked orcid/ror > exact > prefix (of the name or one of its words) > similar (trigram), then oldest first. Display names collide (many agents share a name), so each result carries what tells them apart: id, display_name, kind (human / llm_agent / system / role / ingest_author / unknown, derived from evidence you may see: a registered human (shown to that human, admins, and everyone when it holds a disclosed role), an LLM model on a visible profile, a binding to a human, the system registry, the document ingest's name-derived author key), kind_evidence, roles (open assignments of non-elevating, non-audit roles, plus your own), orcid / ror_id (when the profile is visible to you), operator_human (the human the agent acts for, {id, display_name}, shown to every reader; read from the agent's binding record, never from an OPERATED_BY edge; the agent's model and prompt are not on the card), created_at, and counts (authored_papers, asserted_claims: claims it authored or an ingest attributed to it; computed only over what you can read, capped at 10000 with capped=true), plus tier and score. kind and role filters apply before the limit; candidates_truncated=true means more than 200 agents matched, so narrow the name. Matches display_name as written (a display_name that is an email address matches like any name); never searches properties or contact fields (full_name, email, affiliations). Same rules as GET /api/v1/agents/search."
+    )]
+    async fn find_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::FindAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::find_agent(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Look up one agent by id (for example the agent_id of a claim, to name who filed it). Returns the same card as find_agent: id, display_name, kind and kind_evidence, roles, orcid / ror_id (visible profiles only), operator_human (the human it acts for, shown to every reader), created_at and counts computed over what you can read. An id with no agent is an invalid_params error (agent <id> not found), as get_claim reports a missing claim."
+    )]
+    async fn get_agent(
+        &self,
+        Parameters(params): Parameters<crate::types::GetAgentParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::agent_lookup::get_agent(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Retrieve a single epistemic claim by its UUID, including full epistemic state and `source_urls`: the URLs of the evidence attached to it (empty when none)."
     )]
     async fn get_claim(
@@ -2035,13 +2061,16 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow."
+        description = "List a workflow's most recent behavioral executions, newest first: per-run success, quality, tool_pattern, deviation_count and step_beliefs (per-step deviation_reason), plus a window success-rate. Read-only telemetry for analysing or evolving a workflow. A workflow you cannot read returns no executions, exactly like an unknown id."
     )]
     async fn get_workflow_executions(
         &self,
         Parameters(params): Parameters<GetWorkflowExecutionsParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<CallToolResult, McpError> {
-        tools::workflows::get_workflow_executions(self, params).await
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflows::get_workflow_executions(self, viewer, params).await
     }
 
     #[tool(

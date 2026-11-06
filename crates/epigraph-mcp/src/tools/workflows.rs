@@ -73,16 +73,26 @@ impl<'a> CallerRead<'a> {
 /// This is the telemetry the workflow-evolution proposer reads before
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
+///
+/// Read as the CALLER (`CallerRead`). `behavioral_executions` has no row
+/// security of its own, so the repo admits a run only when its workflow (a
+/// `workflows` row or a flat workflow claim) is one `viewer` reads: a workflow
+/// private to a group the caller is not in answers exactly like an unknown id,
+/// with no rows, and its `goal_text` / `step_beliefs` never leave the database.
 pub async fn get_workflow_executions(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     params: GetWorkflowExecutionsParams,
 ) -> Result<CallToolResult, McpError> {
     let workflow_id = parse_uuid(params.workflow_id.trim())?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
-    let rows = BehavioralExecutionRepository::recent_executions(&server.pool, workflow_id, limit)
-        .await
-        .map_err(internal_error)?;
+    let mut read = CallerRead::open(server, viewer).await?;
+    let rows =
+        BehavioralExecutionRepository::recent_executions(read.conn(), viewer, workflow_id, limit)
+            .await
+            .map_err(internal_error)?;
+    read.close().await?;
 
     let returned = rows.len();
     let successes = rows.iter().filter(|r| r.success).count();
@@ -186,6 +196,12 @@ impl PromotionAssessment {
 /// Resolve the variant's immediate parent, pull both sides' (successes, total)
 /// over the SAME window (mixing windows would be apples-to-oranges), and apply
 /// the Wilson gate. A lineage root yields `verdict: None`.
+///
+/// Every read runs as the CALLER (`CallerRead`). On the plain application
+/// pool row security admits public edges only, so a group's own private
+/// variant looked like a lineage root to its members; and the run counts come
+/// from `behavioral_executions`, which has no row security, so they are
+/// counted only for a workflow `viewer` reads.
 async fn assess_workflow_promotion(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -197,36 +213,39 @@ async fn assess_workflow_promotion(
     };
     let config = WorkflowPromotionConfig::default();
 
-    let parent_id = WorkflowRepository::immediate_variant_parent(&server.pool, viewer, variant_id)
+    let mut read = CallerRead::open(server, viewer).await?;
+    let parent_id = WorkflowRepository::immediate_variant_parent(read.conn(), viewer, variant_id)
         .await
         .map_err(|e| internal_error(e.to_string()))?;
 
-    let variant = BehavioralExecutionRepository::success_stats(&server.pool, variant_id, window)
-        .await
-        .map_err(internal_error)?;
+    let variant =
+        BehavioralExecutionRepository::success_stats(read.conn(), viewer, variant_id, window)
+            .await
+            .map_err(internal_error)?;
 
-    let (parent, verdict) = match parent_id {
-        None => ((0, 0), None),
-        Some(pid) => {
-            let parent = BehavioralExecutionRepository::success_stats(&server.pool, pid, window)
-                .await
-                .map_err(internal_error)?;
-            let parent_rate = if parent.1 <= 0 {
-                0.0
-            } else {
-                parent.0 as f64 / parent.1 as f64
-            };
-            let v = gate(
-                &WorkflowSampleStats {
-                    successes: variant.0,
-                    total: variant.1,
-                },
-                parent_rate,
-                &config,
-            );
-            (parent, Some(v))
-        }
+    let parent = match parent_id {
+        None => (0, 0),
+        Some(pid) => BehavioralExecutionRepository::success_stats(read.conn(), viewer, pid, window)
+            .await
+            .map_err(internal_error)?,
     };
+    read.close().await?;
+
+    let verdict = parent_id.map(|_| {
+        let parent_rate = if parent.1 <= 0 {
+            0.0
+        } else {
+            parent.0 as f64 / parent.1 as f64
+        };
+        gate(
+            &WorkflowSampleStats {
+                successes: variant.0,
+                total: variant.1,
+            },
+            parent_rate,
+            &config,
+        )
+    });
 
     Ok(PromotionAssessment {
         variant_id,

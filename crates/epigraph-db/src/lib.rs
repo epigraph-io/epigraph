@@ -93,6 +93,10 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
+    agent_lookup, AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef,
+    AgentSearchHit, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+};
+pub use repos::{
     carries_dedup_identity_key, reserved_edge_property_refusal, ActivityRepository,
     AdminClaimAction, AdminClaimWrite, AdminToken, AgentKeyRepository, AgentKeyRow,
     AgentPublicProfile, AgentRepository, AlternativePairRow, AlternativeSetRepository,

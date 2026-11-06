@@ -62,6 +62,27 @@ name = "supersede_belief_delta"
 path = "src/bin/supersede_belief_delta.rs"
 required-features = ["db"]
 
+# Ruling R-131 (backlog 5094766c): the apply tool of the factor mint
+# `supersede_belief_delta --items r131` measures. Dry run (a plan file) unless
+# --apply; the apply writes a compare-and-set undo record.
+[[bin]]
+name = "r131_factor_mint"
+path = "src/bin/r131_factor_mint.rs"
+required-features = ["db"]
+
+# Spawns the `db`-gated binary above.
+[[test]]
+name = "r131_factor_mint_bin"
+path = "tests/r131_factor_mint_bin.rs"
+required-features = ["db"]
+
+# The retroactive K10(3) sweep (OD-10; rulings R-178(2), R-179): applies exactly
+# the rows supersede_belief_delta measures as k10_retro, with a snapshot undo.
+[[bin]]
+name = "sweep_retired_source_bbas"
+path = "src/bin/sweep_retired_source_bbas.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "ingest_literature"
 path = "src/bin/ingest_literature.rs"

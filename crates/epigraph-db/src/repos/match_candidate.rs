@@ -329,8 +329,36 @@ impl MatchCandidateRepo {
         relationship: &str,
         properties: serde_json::Value,
     ) -> Result<DecideOutcome, DbError> {
-        use sqlx::Acquire;
         let mut conn = self.pool.acquire().await?;
+        Self::promote_if_pending_conn(&mut conn, id, by, read_verdict, relationship, properties)
+            .await
+    }
+
+    /// [`Self::promote_if_pending`] on a connection the caller owns, which may
+    /// already be inside a transaction (the flip and the edge then run in a
+    /// SAVEPOINT of it, and the caller's COMMIT is what lands them).
+    ///
+    /// # Why a connection form exists
+    ///
+    /// The matcher edge is a tenancy row: migration 070's trigger derives its
+    /// owner from the two claims it joins, so an edge touching a group-private
+    /// claim is owned by that group and `edges_tenancy`'s `WITH CHECK` admits it
+    /// only on a session stamped with a writer of that group. On the pool form's
+    /// plain checkout (an unstamped application session in production) that
+    /// promote is refused. A request path passes its author-stamped transaction
+    /// here instead (`epigraph-mcp` `tools/matching.rs::decide_match_candidate`).
+    ///
+    /// # Errors
+    /// As [`Self::promote_if_pending`].
+    pub async fn promote_if_pending_conn(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        by: Option<Uuid>,
+        read_verdict: Option<&str>,
+        relationship: &str,
+        properties: serde_json::Value,
+    ) -> Result<DecideOutcome, DbError> {
+        use sqlx::Acquire;
         let mut tx = conn.begin().await?;
         let pair: Option<(Uuid, Uuid)> = sqlx::query_as(
             "UPDATE match_candidates
@@ -346,7 +374,7 @@ impl MatchCandidateRepo {
         .await?;
         let Some((claim_a, claim_b)) = pair else {
             drop(tx);
-            let (status, verdict) = current_decision(&mut conn, id).await?;
+            let (status, verdict) = current_decision(&mut *conn, id).await?;
             if status == "pending" {
                 return Ok(DecideOutcome::VerdictChanged { verdict });
             }
@@ -495,6 +523,20 @@ impl MatchCandidateRepo {
         status: Option<&str>,
         limit: i64,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
+        Self::list_conn(&self.pool, viewer, status, limit).await
+    }
+
+    /// [`Self::list`] on a caller-supplied executor, so an HTTP handler can run
+    /// it on its viewer-stamped connection (`AppState::read_as`). The repo's
+    /// own pool is unstamped: under FORCEd row security on the application
+    /// role, the joins to `claims` admit public claims only, and every
+    /// candidate naming one of the viewer's own group-private claims vanishes.
+    pub async fn list_conn<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        status: Option<&str>,
+        limit: i64,
+    ) -> sqlx::Result<Vec<MatchCandidateRow>> {
         match status {
             Some(s) => {
                 let sql = viewer.splice(
@@ -510,7 +552,7 @@ impl MatchCandidateRepo {
                 if let Some(g) = viewer.group_bind() {
                     q = q.bind(g);
                 }
-                q.fetch_all(&self.pool).await
+                q.fetch_all(executor).await
             }
             None => {
                 let sql = viewer.splice(
@@ -526,7 +568,7 @@ impl MatchCandidateRepo {
                 if let Some(g) = viewer.group_bind() {
                     q = q.bind(g);
                 }
-                q.fetch_all(&self.pool).await
+                q.fetch_all(executor).await
             }
         }
     }
@@ -537,6 +579,16 @@ impl MatchCandidateRepo {
     /// Same both-sides-visible rule as [`Self::list`]; see its doc.
     pub async fn list_for_claim(
         &self,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Vec<MatchCandidateRow>> {
+        Self::list_for_claim_conn(&self.pool, viewer, claim_id).await
+    }
+
+    /// [`Self::list_for_claim`] on a caller-supplied executor; see
+    /// [`Self::list_conn`] for why.
+    pub async fn list_for_claim_conn<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<MatchCandidateRow>> {
@@ -553,7 +605,7 @@ impl MatchCandidateRepo {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(&self.pool).await
+        q.fetch_all(executor).await
     }
 
     /// Cross-source **sweep coverage** for one claim: the value of
@@ -631,6 +683,16 @@ impl MatchCandidateRepo {
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
     ) -> sqlx::Result<Vec<(Uuid, Uuid, Uuid, serde_json::Value)>> {
+        Self::corroborates_edges_for_claim_conn(&self.pool, viewer, claim_id).await
+    }
+
+    /// [`Self::corroborates_edges_for_claim`] on a caller-supplied executor;
+    /// see [`Self::list_conn`] for why.
+    pub async fn corroborates_edges_for_claim_conn<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> sqlx::Result<Vec<(Uuid, Uuid, Uuid, serde_json::Value)>> {
         let sql = viewer.splice(
             "SELECT e.id, e.source_id, e.target_id, e.properties
              FROM edges e
@@ -645,7 +707,7 @@ impl MatchCandidateRepo {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        q.fetch_all(&self.pool).await
+        q.fetch_all(executor).await
     }
 }
 

@@ -45,8 +45,11 @@
 //! gate, so there is nothing to bypass on that transport.
 
 use epigraph_db::{ClaimRepository, NearestClaimHit};
-use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::errors::{internal_error, McpError};
+use crate::server::EpiGraphMcpFull;
+use crate::tools::workflows::CallerRead;
 
 /// Number of ANN neighbors fetched per the backlog plan's SQL sketch
 /// (`... ORDER BY dist LIMIT 5`). Only the closest is used for the gate
@@ -180,8 +183,19 @@ pub fn classify(nearest: &[NearestClaimHit], novelty_threshold: f64) -> GateDeci
 /// suppression ([`effective_threshold`]). They are a required argument so that
 /// a new gated write path has to pass its real labels: never `&[]` as a
 /// placeholder.
+///
+/// # The neighbour lookup runs as the CALLER
+///
+/// It runs on a read stamped from `viewer` (`CallerRead`), opened AFTER the
+/// embedding round trip so no pooled connection is held across it. It used to
+/// run on `server.pool`, an unstamped application session in production,
+/// where FORCEd row security admits public rows only: a caller's own
+/// group-private near-duplicate was invisible, so the gate inserted a second
+/// copy of it, while another agent's PUBLIC paraphrase stayed visible and
+/// could still suppress the submission. The in-query predicate already named
+/// the caller's groups; the session's policy dropped them.
 pub async fn decide(
-    pool: &PgPool,
+    server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn epigraph_embeddings::EmbeddingService,
     content: &str,
@@ -190,16 +204,90 @@ pub async fn decide(
 ) -> Option<(GateDecision, String)> {
     let vector = embedder.generate(content).await.ok()?;
     let pgvec = crate::embed::format_pgvector(&vector);
-    let nearest = match ClaimRepository::nearest_by_embedding(pool, viewer, &pgvec, NEAREST_K).await
-    {
-        Ok(hits) => hits,
+    let mut read = match CallerRead::open(server, viewer).await {
+        Ok(read) => read,
         Err(e) => {
-            tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
+            tracing::warn!("novelty gate: could not open the caller's read: {e:?}");
             return None;
         }
     };
+    let nearest =
+        match ClaimRepository::nearest_by_embedding(read.conn(), viewer, &pgvec, NEAREST_K).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!("novelty gate: nearest_by_embedding failed: {e}");
+                return None;
+            }
+        };
+    if let Err(e) = read.close().await {
+        tracing::warn!("novelty gate: closing the caller's read failed: {e:?}");
+    }
     let threshold = effective_threshold(novelty_threshold, labels);
     Some((classify(&nearest, threshold), pgvec))
+}
+
+/// `true` when `agent_id` already authored a claim with `content_hash` that
+/// `viewer` can read: the exact-resubmit probe `submit_claim` and `memorize`
+/// run before the novelty gate, so an exact resubmit takes
+/// `create_claim_idempotent`'s dedup path without an embedding call.
+///
+/// On a read stamped from `viewer`. It used to run on `server.pool`, where
+/// row security admits public rows only, so a resubmit of the caller's own
+/// GROUP-PRIVATE claim missed the probe: the submission paid for an embedding,
+/// and the gate could then answer with a different claim (a public
+/// paraphrase) instead of the caller's own row.
+///
+/// # Errors
+/// An internal error when the read cannot be opened or the query fails.
+pub async fn exact_resubmit_probe(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    content_hash: &[u8],
+    agent_id: Uuid,
+) -> Result<bool, McpError> {
+    let mut read = CallerRead::open(server, viewer).await?;
+    let found = ClaimRepository::find_by_content_hash_and_agent(
+        read.conn(),
+        viewer,
+        content_hash,
+        agent_id,
+    )
+    .await
+    .map_err(internal_error)?
+    .is_some();
+    read.close().await?;
+    Ok(found)
+}
+
+/// Read back the claim a [`GateDecision::ReturnExisting`] named, as the
+/// caller, for the dedup response.
+///
+/// On the caller's stamped read for the same reason as [`decide`]: the gate
+/// now finds the caller's group-private neighbours, and a read-back on the
+/// unstamped pool would report such a neighbour as vanished.
+///
+/// # Errors
+/// An internal error when the read fails or the claim is not readable.
+pub async fn read_back_existing(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    existing_id: Uuid,
+) -> Result<epigraph_core::Claim, McpError> {
+    let mut read = CallerRead::open(server, viewer).await?;
+    let existing = ClaimRepository::get_by_id(
+        read.conn(),
+        viewer,
+        epigraph_core::ClaimId::from_uuid(existing_id),
+    )
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        crate::errors::internal_error_text(format!(
+            "novelty gate: nearest claim {existing_id} vanished before read-back"
+        ))
+    })?;
+    read.close().await?;
+    Ok(existing)
 }
 
 #[cfg(test)]
@@ -329,6 +417,15 @@ mod tests {
             .into()
     }
 
+    /// A server over the test pool (a superuser, no `ScopedPool`): `decide`'s
+    /// caller read takes `CallerRead`'s plain arm, as these tests always have.
+    /// The application-role behaviour is `tests/dedup_probes_app_role.rs`'s.
+    fn server_over(pool: &sqlx::PgPool) -> EpiGraphMcpFull {
+        let signer = epigraph_crypto::AgentSigner::from_bytes(&[0x42u8; 32]).expect("signer");
+        let embedder = crate::embed::McpEmbedder::new(pool.clone(), None);
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false)
+    }
+
     fn distinct_hash(tag: u8) -> [u8; 32] {
         let mut h = [0u8; 32];
         h[0] = tag;
@@ -364,7 +461,7 @@ mod tests {
         .expect("seed neighbor claim");
 
         let (decision, _pgvec) = decide(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
@@ -415,7 +512,7 @@ mod tests {
         .expect("seed neighbor claim");
 
         let (decision, _pgvec) = decide(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
@@ -443,7 +540,7 @@ mod tests {
         let embedder = MockProvider::new(EmbeddingConfig::openai(1536));
 
         let (decision, _pgvec) = decide(
-            &pool,
+            &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())
                 .await
                 .expect("resolve viewer"),
