@@ -722,6 +722,42 @@ impl GroupMembershipRepository {
         .await?)
     }
 
+    /// The TEAM groups `agent_id` writes right now, on `conn`: every group of
+    /// a live `writer` / `admin` membership (direct, or derived from a role
+    /// binding: the same live-membership definer [`Self::list_live_for_agent`]
+    /// reads) whose `kind` is not `personal`, `world` or `seed`, and whose
+    /// status is `active`. Sorted, distinct.
+    ///
+    /// The excluded kinds are the ones migration 165 refuses to bind a role
+    /// to: a personal group is one principal's own, and the world and seed
+    /// groups are memberless sentinels. What is left (`team`, `community`) is
+    /// a group shared by people, which is what "the caller's team group"
+    /// means for a workflow write's owner group.
+    ///
+    /// The `groups` row is read on `conn`'s own stamp, so on a session stamped
+    /// from `agent_id`'s viewer a group is counted only while it is both live
+    /// now (the definer) and in the stamp (row security on `groups`): a
+    /// membership revoked since the stamp, or granted after it, is not.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn live_team_writer_groups_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT m.group_id FROM public.epigraph_live_memberships($1) m \
+               JOIN public.groups g ON g.id = m.group_id \
+              WHERE m.role IN ('admin', 'writer') \
+                AND g.kind NOT IN ('personal', 'world', 'seed') \
+                AND g.status = 'active' \
+              ORDER BY m.group_id",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *conn)
+        .await?)
+    }
+
     /// How many REVOKED membership rows `agent_id` holds, read through the
     /// policy's OWN-ROW arm.
     ///
