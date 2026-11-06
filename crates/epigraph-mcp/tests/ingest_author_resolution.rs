@@ -518,13 +518,13 @@ async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_nev
 
     // And the other way round: the EXTRACTION is accented, the stored name is
     // not. Folding the query side is what finds it.
-    let plain = human_named(&pool, "zoe angstrom").await;
+    let plain = human_named(&pool, "zoe alvendrup").await;
     let json = ingest_wait(
         &server,
         &pool,
         doc(
             "10.9999/author-folded-query",
-            json!([{"name": "Zoë Ångström"}]),
+            json!([{"name": "Zoë Ålvendrup"}]),
         ),
     )
     .await;
