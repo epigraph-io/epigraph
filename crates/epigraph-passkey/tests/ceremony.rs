@@ -11,12 +11,14 @@ mod support;
 use std::collections::BTreeSet;
 
 use epigraph_passkey::{
-    act_challenge, is_hardware_attested, AaguidAllowlist, ActAnchor, AnchorRefusal,
-    AttestationPolicy, AttestedPolicy, PasskeyConfig, PasskeyError, Passkeys, RegistrationState,
-    RelyingParty, StoredPasskey, Verifier, ACT_NONCE_LEN,
+    act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
+    PasskeyConfig, PasskeyError, Passkeys, RegistrationState, RelyingParty, StoredPasskey,
+    Verifier, ACT_NONCE_LEN,
 };
 use serde_json::Value;
-use support::{hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID};
+use support::{
+    android_status, hardware_bound, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
+};
 use uuid::Uuid;
 
 /// The authenticator model every allowlist test admits.
@@ -659,6 +661,7 @@ fn attested(
                 aaguids: models.iter().copied().collect(),
             }),
             android_key_ca_pem: android.map(TestAttestation::root_pem),
+            android_key_status_file: android.map(|_| android_status::fresh_empty()),
             allow_synced_anchored: anchored,
         }),
     })
@@ -705,11 +708,13 @@ async fn an_android_key_attestation_verifies_under_a_blanket_android_root() {
     assert_eq!(reg.aaguid, Uuid::nil());
     assert!(reg.user_verified);
     assert!(!reg.backup_eligible);
-    assert!(is_hardware_attested(
+    rp.hardware_attested(
+        &reg.passkey,
         &reg.attestation_format,
         reg.aaguid,
-        reg.backup_eligible
-    ));
+        reg.backup_eligible,
+    )
+    .expect("and is hardware-attested under this configuration");
 
     let per_model = allowlist(&google, &[OTHER_MODEL]);
     let (options, state) = start(&per_model);
@@ -843,6 +848,7 @@ async fn none_is_refused_under_the_android_roots_and_a_shared_root_is_refused() 
                 aaguids: [MODEL].into_iter().collect::<BTreeSet<_>>(),
             }),
             android_key_ca_pem: Some(google.root_pem()),
+            android_key_status_file: Some(android_status::fresh_empty()),
             allow_synced_anchored: false,
         }),
     });
@@ -913,6 +919,8 @@ async fn confirmed_anchor(
         anchor_attestation_format: reg.attestation_format.clone(),
         anchor_backup_eligible: reg.backup_eligible,
         anchor_revoked: false,
+        anchor_lineage: vec![],
+        anchor_lineage_complete: true,
     }
 }
 
@@ -947,11 +955,14 @@ async fn a_later_unattested_passkey_anchored_by_an_attested_one_registers() {
     assert_eq!(later.attestation_format, "none");
     assert_eq!(later.aaguid, Uuid::nil());
     assert!(later.backup_eligible && later.user_verified);
-    assert!(!is_hardware_attested(
-        &later.attestation_format,
-        later.aaguid,
-        later.backup_eligible
-    ));
+    assert!(rp
+        .hardware_attested(
+            &later.passkey,
+            &later.attestation_format,
+            later.aaguid,
+            later.backup_eligible
+        )
+        .is_err());
 
     // CALIBRATION: the same kind of response on the attested path is refused.
     let (options, state) = start(&rp);
@@ -994,8 +1005,10 @@ async fn a_first_passkey_with_none_is_refused_with_the_anchored_setting_on() {
 /// nothing: a synced passkey (BE set) and an unattested device-bound one
 /// (`none`, BE clear) are both refused `anchor_not_attested`, and so is a
 /// self-attested `packed` one (the nil AAGUID). Their confirmations are
-/// genuine. Mutation: `is_hardware_attested` answering true -> the
-/// device-bound `none` anchor admits it.
+/// genuine. Mutation: `Passkeys::hardware_attested` answering Ok -> the
+/// device-bound `none` anchor admits it. (A software-era `packed` passkey
+/// WITH a certificate chain is `anchor_trust.rs`'s
+/// `a_software_era_passkey_with_a_self_made_chain_anchors_nothing`.)
 #[tokio::test]
 async fn a_confirmation_by_an_unattested_passkey_anchors_nothing() {
     let vendor = TestAttestation::new("Allowlisted");
@@ -1174,30 +1187,43 @@ async fn the_anchored_path_is_off_unless_configured() {
     assert_eq!(state.to_json()["kind"], "attested");
 }
 
-/// What counts as hardware-attested, from what a registration recorded.
-/// Mutations: the backup-eligible clause dropped -> the synced packed row
-/// passes; the AAGUID clause dropped -> self-attested packed passes;
-/// `android-key` left out -> the Android key fails.
-#[test]
-fn hardware_attested_is_device_bound_and_names_its_attestation() {
-    let model = MODEL;
-    let nil = Uuid::nil();
-    for (format, aaguid, be, expected) in [
-        ("packed", model, false, true),
-        ("tpm", model, false, true),
-        ("android-key", nil, false, true),
-        ("packed", model, true, false),
-        ("android-key", nil, true, false),
-        ("packed", nil, false, false),
-        ("none", nil, false, false),
-        ("none", model, false, false),
-        ("fido-u2f", model, false, false),
-        ("apple", nil, false, false),
+/// What counts as hardware-attested is decided from the STORED credential
+/// under the configuration running now, never from the columns alone: the
+/// columns that read "hardware" for every shape (`packed` + a model, `tpm`
+/// + a model, `android-key`, device-bound) are refused when the credential
+/// behind them is a software one, and a genuine attested credential is
+/// refused under the software policy (which configures no roots). The
+/// genuine cases are `anchor_trust.rs`'s. Mutation: `hardware_attested`
+/// deciding from its three column arguments (the PR head's
+/// `is_hardware_attested`) -> every columns-only case passes.
+#[tokio::test]
+async fn hardware_attested_is_decided_from_the_credential_not_the_columns() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let rp = attested(Some((&vendor, &[MODEL])), Some(&google), true);
+    let soft = software();
+    let (options, state) = start(&soft);
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let unattested = soft
+        .finish_registration(&created, &state)
+        .expect("a device-bound none passkey");
+    for (format, aaguid) in [
+        ("packed", MODEL),
+        ("tpm", MODEL),
+        ("android-key", Uuid::nil()),
+        ("none", Uuid::nil()),
     ] {
-        assert_eq!(
-            is_hardware_attested(format, aaguid, be),
-            expected,
-            "{format} {aaguid} be={be}"
+        assert!(
+            rp.hardware_attested(&unattested.passkey, format, aaguid, false)
+                .is_err(),
+            "{format}"
         );
     }
+    let (_, genuine) = attested_passkey(&rp, &vendor).await;
+    rp.hardware_attested(&genuine.passkey, "packed", MODEL, false)
+        .expect("CALIBRATION: genuine");
+    assert!(soft
+        .hardware_attested(&genuine.passkey, "packed", MODEL, false)
+        .is_err());
 }

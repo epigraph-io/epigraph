@@ -519,8 +519,12 @@ async fn the_server_refuses_software_attestation_on_an_armed_database(pool: PgPo
     std::fs::write(&roots, support::TestAttestation::new("Android").root_pem())
         .expect("roots file");
     let roots = roots.to_string_lossy().to_string();
+    let status = support::android_status::fresh_empty()
+        .to_string_lossy()
+        .to_string();
     let url = db_url.clone();
     let anchored_roots = roots.clone();
+    let anchored_status = status.clone();
     match tokio::task::spawn_blocking(move || {
         run_server_with(
             &url,
@@ -531,6 +535,10 @@ async fn the_server_refuses_software_attestation_on_an_armed_database(pool: PgPo
                 (
                     "EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE",
                     anchored_roots.as_str(),
+                ),
+                (
+                    "EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE",
+                    anchored_status.as_str(),
                 ),
                 ("EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY", "1"),
             ],
@@ -584,5 +592,39 @@ async fn the_server_refuses_software_attestation_on_an_armed_database(pool: PgPo
             panic!("the anchored setting with the software flag must not boot:\n{log}")
         }
     }
+
+    // 7. Armed, the Android key roots WITHOUT the attestation status list
+    //    (P779-2): a configuration error at boot, exit 1, naming the missing
+    //    file, before any database check. Mutation: `from_lookup` accepting
+    //    the roots alone -> the server reads the policy and reaches OQ-7.
+    let url = db_url.clone();
+    let bare_roots = roots.clone();
+    match tokio::task::spawn_blocking(move || {
+        run_server_with(
+            &url,
+            false,
+            &[
+                ("EPIGRAPH_WEBAUTHN_RP_ID", "auth.example.com"),
+                ("EPIGRAPH_WEBAUTHN_ORIGIN", "https://auth.example.com"),
+                ("EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE", bare_roots.as_str()),
+            ],
+        )
+    })
+    .await
+    .expect("join")
+    {
+        Outcome::Exited { code, log } => {
+            assert_eq!(code, Some(1), "a failing exit:\n{log}");
+            assert!(
+                log.contains("needs EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE"),
+                "the configuration error names the status list:\n{log}"
+            );
+            assert!(!log.contains(REFUSAL), "before any database check:\n{log}");
+        }
+        Outcome::PastTheCheck { log } => {
+            panic!("the Android roots without the status list must not boot:\n{log}")
+        }
+    }
     let _ = std::fs::remove_file(&roots);
+    let _ = std::fs::remove_file(&status);
 }

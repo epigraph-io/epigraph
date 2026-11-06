@@ -40,11 +40,19 @@
 //!   AAGUID only for `packed` and `tpm` attestation, so an Android key can
 //!   only ever verify under a blanket root; any other format verified under
 //!   one of these roots is refused. Usable alone or beside the allowlist.
+//!   Only a key the attestation itself places in a TEE or StrongBox is
+//!   accepted, and [`ENV_ANDROID_KEY_STATUS_FILE`] is REQUIRED with it: a
+//!   local copy of Google's attestation status list, checked against every
+//!   certificate of the chain at every enrollment and every anchor use, and
+//!   refusing both once it is older than
+//!   [`crate::android::ANDROID_KEY_STATUS_MAX_AGE`] (`crate::android`).
 //! * [`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`]: a LATER passkey (one enrolled on a
 //!   confirmed `passkey.register` admin act) may carry no attestation, so a
 //!   synced passkey (a password manager's) can be registered, when the act
-//!   was confirmed by one of the same person's live, HARDWARE-ATTESTED
-//!   passkeys ([`crate::is_hardware_attested`]). A person's FIRST passkey is
+//!   was confirmed by one of the same person's live passkeys that is
+//!   HARDWARE-ATTESTED under the configuration running NOW, and so is every
+//!   passkey that authorized it back to the person's first
+//!   ([`crate::Passkeys::check_anchor`]). A person's FIRST passkey is
 //!   attested whatever this says, so it is served on an armed database: it
 //!   never lets a maintenance-DSN holder plant a first key. The accepted
 //!   cost: once a synced passkey is registered, an elevation is as strong as
@@ -53,6 +61,7 @@
 //! Neither combines with [`ENV_ALLOW_SOFTWARE_ATTESTATION`].
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use url::Url;
 use uuid::Uuid;
@@ -81,6 +90,12 @@ pub const ENV_ALLOW_SOFTWARE_ATTESTATION: &str = "EPIGRAPH_WEBAUTHN_ALLOW_SOFTWA
 /// they attest, for the `android-key` format only (module docs).
 pub const ENV_ANDROID_KEY_CA_FILE: &str = "EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE";
 
+/// A local copy of Google's Android attestation status list (the JSON
+/// published at <https://android.googleapis.com/attestation/status>),
+/// REQUIRED with [`ENV_ANDROID_KEY_CA_FILE`] (module docs). Re-read at every
+/// use; the operator refreshes it, the server never fetches it.
+pub const ENV_ANDROID_KEY_STATUS_FILE: &str = "EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE";
+
 /// Opt-in (default off): a later passkey, enrolled on a `passkey.register`
 /// act confirmed by a hardware-attested passkey of the same person, may carry
 /// no attestation (module docs).
@@ -95,6 +110,7 @@ pub const ALL_ENV: &[&str] = &[
     ENV_ATTESTATION_CA_FILE,
     ENV_ALLOW_SOFTWARE_ATTESTATION,
     ENV_ANDROID_KEY_CA_FILE,
+    ENV_ANDROID_KEY_STATUS_FILE,
     ENV_ALLOW_SYNCED_ANCHORED_PASSKEY,
 ];
 
@@ -138,6 +154,9 @@ pub struct AttestedPolicy {
     pub allowlist: Option<AaguidAllowlist>,
     /// [`ENV_ANDROID_KEY_CA_FILE`]'s roots (PEM, one or more certificates).
     pub android_key_ca_pem: Option<Vec<u8>>,
+    /// [`ENV_ANDROID_KEY_STATUS_FILE`]: required with `android_key_ca_pem`
+    /// ([`crate::Passkeys::new`] refuses the roots without it).
+    pub android_key_status_file: Option<PathBuf>,
     /// [`ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`].
     pub allow_synced_anchored: bool,
 }
@@ -208,6 +227,25 @@ pub enum ConfigError {
     /// [`ENV_ANDROID_KEY_CA_FILE`] could not be read or holds no certificate.
     #[error("{ENV_ANDROID_KEY_CA_FILE}: {0}")]
     AndroidKeyCaFile(String),
+    /// [`ENV_ANDROID_KEY_CA_FILE`] is set without
+    /// [`ENV_ANDROID_KEY_STATUS_FILE`].
+    #[error(
+        "{ENV_ANDROID_KEY_CA_FILE} needs {ENV_ANDROID_KEY_STATUS_FILE}: a local copy of Google's \
+         attestation status list (https://android.googleapis.com/attestation/status), refreshed \
+         by the operator; without it no revoked attestation key could ever be refused"
+    )]
+    AndroidKeyStatusMissing,
+    /// [`ENV_ANDROID_KEY_STATUS_FILE`] is set without
+    /// [`ENV_ANDROID_KEY_CA_FILE`].
+    #[error(
+        "{ENV_ANDROID_KEY_STATUS_FILE} is set without {ENV_ANDROID_KEY_CA_FILE}; it is read only \
+         for Android key attestations"
+    )]
+    AndroidKeyStatusWithoutRoots,
+    /// [`ENV_ANDROID_KEY_STATUS_FILE`] could not be read or is not a status
+    /// list.
+    #[error("{ENV_ANDROID_KEY_STATUS_FILE}: {0}")]
+    AndroidKeyStatusFile(String),
     /// An entry of [`ENV_AAGUIDS`] is not a UUID, or is the nil UUID.
     #[error("{ENV_AAGUIDS}: {0:?} is not an authenticator AAGUID")]
     Aaguid(String),
@@ -257,8 +295,10 @@ impl PasskeyConfig {
     }
 
     /// Read the configuration through `get` (a variable's value; empty counts
-    /// as unset) and `read_file` (the CA file). `Ok(None)` when passkeys are
-    /// not configured at all.
+    /// as unset) and `read_file` (the CA files and the status list, which is
+    /// parsed here so a malformed one is a boot error; its AGE is checked at
+    /// each use, not here). `Ok(None)` when passkeys are not configured at
+    /// all.
     ///
     /// # Errors
     /// [`ConfigError`]: a partial configuration, a malformed value, or an
@@ -303,6 +343,7 @@ impl PasskeyConfig {
         let aaguids = val(ENV_AAGUIDS);
         let ca_file = val(ENV_ATTESTATION_CA_FILE);
         let android_file = val(ENV_ANDROID_KEY_CA_FILE);
+        let status_file = val(ENV_ANDROID_KEY_STATUS_FILE);
         let anchored = match val(ENV_ALLOW_SYNCED_ANCHORED_PASSKEY) {
             Some(raw) => parse_bool(&raw).ok_or(ConfigError::AnchoredFlag(raw))?,
             None => false,
@@ -315,11 +356,17 @@ impl PasskeyConfig {
             if android_file.is_some() {
                 return Err(ConfigError::SoftwareWith(ENV_ANDROID_KEY_CA_FILE));
             }
+            if status_file.is_some() {
+                return Err(ConfigError::SoftwareWith(ENV_ANDROID_KEY_STATUS_FILE));
+            }
             if anchored {
                 return Err(ConfigError::SoftwareWith(ENV_ALLOW_SYNCED_ANCHORED_PASSKEY));
             }
             AttestationPolicy::SoftwareAllowed
         } else if android_file.is_none() && !anchored {
+            if status_file.is_some() {
+                return Err(ConfigError::AndroidKeyStatusWithoutRoots);
+            }
             // Neither new setting: exactly the policy (and the refusals) of
             // before they existed.
             let (ca_pem, aaguids) = read_allowlist(aaguids, ca_file, &read_file)?;
@@ -348,9 +395,24 @@ impl PasskeyConfig {
                 }
                 None => None,
             };
+            let android_key_status_file = match (&android_key_ca_pem, status_file) {
+                (Some(_), Some(path)) => {
+                    let path = path.trim().to_string();
+                    let bytes = read_file(&path).map_err(|e| {
+                        ConfigError::AndroidKeyStatusFile(format!("cannot read {path}: {e}"))
+                    })?;
+                    crate::android::StatusList::parse(&bytes)
+                        .map_err(|e| ConfigError::AndroidKeyStatusFile(format!("{path}: {e}")))?;
+                    Some(PathBuf::from(path))
+                }
+                (Some(_), None) => return Err(ConfigError::AndroidKeyStatusMissing),
+                (None, Some(_)) => return Err(ConfigError::AndroidKeyStatusWithoutRoots),
+                (None, None) => None,
+            };
             AttestationPolicy::Attested(AttestedPolicy {
                 allowlist,
                 android_key_ca_pem,
+                android_key_status_file,
                 allow_synced_anchored: anchored,
             })
         };
@@ -508,6 +570,8 @@ mod tests {
             |p| {
                 if p == "/ca.pem" || p == "/android.pem" {
                     Ok(CA.as_bytes().to_vec())
+                } else if p == "/status.json" {
+                    Ok(br#"{"entries": {}}"#.to_vec())
                 } else if p == "/empty.pem" {
                     Ok(b"not a certificate".to_vec())
                 } else {
@@ -713,12 +777,14 @@ mod tests {
     fn android_key_roots_stand_alone_or_beside_the_allowlist() {
         let mut alone = full()[..2].to_vec();
         alone.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        alone.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
         let cfg = read(&alone).unwrap().unwrap();
         assert_eq!(
             cfg.policy,
             AttestationPolicy::Attested(AttestedPolicy {
                 allowlist: None,
                 android_key_ca_pem: Some(CA.as_bytes().to_vec()),
+                android_key_status_file: Some(PathBuf::from("/status.json")),
                 allow_synced_anchored: false,
             })
         );
@@ -727,6 +793,7 @@ mod tests {
 
         let mut both = full();
         both.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        both.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
         match read(&both).unwrap().unwrap().policy {
             AttestationPolicy::Attested(p) => {
                 let list = p.allowlist.expect("the allowlist is kept");
@@ -758,6 +825,7 @@ mod tests {
         assert_eq!(read(&bare), Err(ConfigError::AllowlistMissing(ENV_AAGUIDS)));
         let mut android = bare.clone();
         android.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        android.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
         assert!(read(&android).unwrap().unwrap().allows_synced_anchored());
     }
 
@@ -774,6 +842,7 @@ mod tests {
     fn the_new_settings_refuse_partial_or_conflicting_configurations() {
         let mut half = full()[..3].to_vec();
         half.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        half.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
         assert_eq!(
             read(&half),
             Err(ConfigError::AllowlistMissing(ENV_ATTESTATION_CA_FILE))
@@ -781,6 +850,7 @@ mod tests {
         let mut half = full();
         half.remove(2);
         half.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        half.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
         assert_eq!(read(&half), Err(ConfigError::AllowlistMissing(ENV_AAGUIDS)));
         for path in ["/missing.pem", "/empty.pem"] {
             let mut v = full()[..2].to_vec();
@@ -792,6 +862,7 @@ mod tests {
         }
         for (var, value) in [
             (ENV_ANDROID_KEY_CA_FILE, "/android.pem"),
+            (ENV_ANDROID_KEY_STATUS_FILE, "/status.json"),
             (ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "1"),
         ] {
             let mut v = full()[..2].to_vec();
@@ -811,6 +882,47 @@ mod tests {
             read(&v).unwrap().unwrap().policy,
             AttestationPolicy::SoftwareAllowed
         );
+    }
+
+    /// The Android roots REQUIRE the status list, which is read and parsed
+    /// at boot (a missing or malformed file is a boot error, never "no entry
+    /// revoked"), and the status list alone is refused. Mutations: the
+    /// `(Some(_), None)` arm accepting the roots alone -> the first case
+    /// answers Ok; the parse skipped -> the malformed file answers Ok.
+    #[test]
+    fn the_android_roots_require_the_status_list() {
+        let mut roots = full()[..2].to_vec();
+        roots.push((ENV_ANDROID_KEY_CA_FILE, "/android.pem"));
+        assert_eq!(read(&roots), Err(ConfigError::AndroidKeyStatusMissing));
+        for path in ["/missing.json", "/empty.pem"] {
+            let mut v = roots.clone();
+            v.push((ENV_ANDROID_KEY_STATUS_FILE, path));
+            assert!(
+                matches!(read(&v), Err(ConfigError::AndroidKeyStatusFile(_))),
+                "{path}: {:?}",
+                read(&v)
+            );
+        }
+        let mut ok = roots.clone();
+        ok.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
+        assert!(read(&ok).is_ok());
+        for alone in [full(), full()[..2].to_vec()] {
+            let mut v = alone;
+            v.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
+            v.push((ENV_ALLOW_SYNCED_ANCHORED_PASSKEY, "0"));
+            let got = read(&v);
+            assert!(
+                matches!(
+                    got,
+                    Err(ConfigError::AndroidKeyStatusWithoutRoots)
+                        | Err(ConfigError::AllowlistMissing(_))
+                ),
+                "{got:?}"
+            );
+        }
+        let mut v = full();
+        v.push((ENV_ANDROID_KEY_STATUS_FILE, "/status.json"));
+        assert_eq!(read(&v), Err(ConfigError::AndroidKeyStatusWithoutRoots));
     }
 
     #[test]

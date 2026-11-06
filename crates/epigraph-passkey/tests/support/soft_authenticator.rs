@@ -512,35 +512,93 @@ fn der(tag: &[u8], content: &[u8]) -> Vec<u8> {
     out
 }
 
+/// What an `android-key` statement's certificates say ([`TestAttestation::android_key_with`]).
+/// The default is a genuine TEE key: both security levels 1 (TEE), `purpose`
+/// and `origin` in the TEE-enforced list, the leaf issued by the root
+/// directly, random serials.
+#[derive(Clone, Debug)]
+pub struct AndroidKeyOpts {
+    /// `attestationSecurityLevel`: 0 Software, 1 TrustedEnvironment,
+    /// 2 StrongBox.
+    pub attestation_level: u8,
+    /// `keyMintSecurityLevel` (`keymasterSecurityLevel`), same values.
+    pub keymaster_level: u8,
+    /// `purpose` and `origin` in the SOFTWARE-enforced list instead of the
+    /// TEE-enforced one.
+    pub in_software_list: bool,
+    /// The leaf issued by an intermediate (a batch certificate) that the root
+    /// issued, with both in `x5c`, as a real device's chain is.
+    pub intermediate: bool,
+    /// The intermediate carries a KeyDescription too (an attacker extending a
+    /// genuine chain with a certificate of their own; only the first
+    /// occurrence counts, and this crate refuses a second one).
+    pub key_description_on_intermediate: bool,
+    /// The leaf's serial number (big-endian magnitude); random when `None`.
+    pub leaf_serial: Option<Vec<u8>>,
+    /// The intermediate's serial number; random when `None`.
+    pub intermediate_serial: Option<Vec<u8>>,
+}
+
+impl Default for AndroidKeyOpts {
+    fn default() -> Self {
+        Self {
+            attestation_level: 1,
+            keymaster_level: 1,
+            in_software_list: false,
+            intermediate: false,
+            key_description_on_intermediate: false,
+            leaf_serial: None,
+            intermediate_serial: None,
+        }
+    }
+}
+
 /// The Android key attestation extension's value (`KeyDescription`, Android
-/// Keystore schema), as `webauthn-rs-core` 0.5.5 parses it: version 3,
-/// attestation and keymaster security level 1 (TEE; the parser knows only 0
-/// and 1), the attestation challenge, an empty unique id, an empty
-/// software-enforced list, and a TEE-enforced list holding `purpose` [1] =
-/// {SIGN (2)} and `origin` [702] = GENERATED (0), with no `allApplications`
-/// [600] (WebAuthn §8.4.1: the key is scoped to the RP id).
-fn android_key_description(challenge: &[u8]) -> Vec<u8> {
-    let tee = [
+/// Keystore schema), as `webauthn-rs-core` 0.5.5 parses it: version 3, the
+/// attestation and keymaster security levels of `opts`, the attestation
+/// challenge, an empty unique id, and the two authorization lists, one empty
+/// and one holding `purpose` [1] = {SIGN (2)} and `origin` [702] =
+/// GENERATED (0) (the TEE-enforced one unless `opts.in_software_list`), with
+/// no `allApplications` [600] (WebAuthn §8.4.1: the key is scoped to the RP
+/// id).
+fn android_key_description(challenge: &[u8], opts: &AndroidKeyOpts) -> Vec<u8> {
+    let enforced = [
         // [1] EXPLICIT SET OF INTEGER { 2 }
         der(&[0xA1], &der(&[0x31], &der(&[0x02], &[0x02]))),
         // [702] EXPLICIT INTEGER 0: high tag number form, 702 = 5 * 128 + 62.
         der(&[0xBF, 0x85, 0x3E], &der(&[0x02], &[0x00])),
     ]
     .concat();
+    let (software, tee) = if opts.in_software_list {
+        (der(&[0x30], &enforced), der(&[0x30], &[]))
+    } else {
+        (der(&[0x30], &[]), der(&[0x30], &enforced))
+    };
     der(
         &[0x30],
         &[
             der(&[0x02], &[0x03]),
-            der(&[0x0A], &[0x01]),
+            der(&[0x0A], &[opts.attestation_level]),
             der(&[0x02], &[0x04]),
-            der(&[0x0A], &[0x01]),
+            der(&[0x0A], &[opts.keymaster_level]),
             der(&[0x04], challenge),
             der(&[0x04], &[]),
-            der(&[0x30], &[]),
-            der(&[0x30], &tee),
+            software,
+            tee,
         ]
         .concat(),
     )
+}
+
+/// A serial number: `fixed` (big-endian magnitude), or 64 random bits.
+fn serial_of(fixed: Option<&[u8]>) -> openssl::asn1::Asn1Integer {
+    match fixed {
+        Some(bytes) => BigNum::from_slice(bytes)
+            .expect("bn")
+            .to_asn1_integer()
+            .expect("serial"),
+        None => serial(),
+    }
 }
 
 fn serial() -> openssl::asn1::Asn1Integer {
@@ -624,13 +682,26 @@ impl TestAttestation {
     /// the credential key. `device_bound` clears BE and BS before signing (a
     /// hardware-backed Android key); otherwise the flags stay as `auth` set
     /// them (a backup-eligible credential, which the relying party must
-    /// refuse).
+    /// refuse). A genuine TEE key: [`Self::android_key_with`] with the
+    /// default [`AndroidKeyOpts`].
     #[must_use]
     pub fn android_key(
         &self,
         auth: &SoftAuthenticator,
         registration: &Value,
         device_bound: bool,
+    ) -> Value {
+        self.android_key_with(auth, registration, device_bound, &AndroidKeyOpts::default())
+    }
+
+    /// [`Self::android_key`], with the certificates `opts` describes.
+    #[must_use]
+    pub fn android_key_with(
+        &self,
+        auth: &SoftAuthenticator,
+        registration: &Value,
+        device_bound: bool,
+        opts: &AndroidKeyOpts,
     ) -> Value {
         let cred_key = auth.key_of(registration);
         let mut auth_data = auth_data_of(registration);
@@ -642,6 +713,47 @@ impl TestAttestation {
             "clientDataJSON",
         );
         let client_data_hash = sha256(&cdj);
+        let key_description = android_key_description(&client_data_hash, opts);
+        let oid = Asn1Object::from_str("1.3.6.1.4.1.11129.2.1.17").expect("oid");
+
+        // The issuer of the leaf: the root, or an intermediate the root
+        // issued (a batch attestation certificate).
+        let intermediate = opts.intermediate.then(|| {
+            let key = p256();
+            let mut name = X509NameBuilder::new().expect("name");
+            name.append_entry_by_text("CN", "Android Keystore Batch")
+                .expect("cn");
+            let name = name.build();
+            let mut b = X509Builder::new().expect("builder");
+            b.set_version(2).expect("v3");
+            b.set_serial_number(&serial_of(opts.intermediate_serial.as_deref()))
+                .expect("serial");
+            b.set_subject_name(&name).expect("subject");
+            b.set_issuer_name(self.root.subject_name()).expect("issuer");
+            b.set_pubkey(&key).expect("pubkey");
+            b.set_not_before(&Asn1Time::from_unix(now_unix() - 86_400).expect("t"))
+                .expect("nb");
+            b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
+                .expect("na");
+            b.append_extension(BasicConstraints::new().critical().ca().build().expect("bc"))
+                .expect("bc");
+            b.append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .build()
+                    .expect("ku"),
+            )
+            .expect("ku");
+            if opts.key_description_on_intermediate {
+                let value = Asn1OctetString::new_from_bytes(&key_description).expect("octets");
+                b.append_extension(X509Extension::new_from_der(&oid, false, &value).expect("ext"))
+                    .expect("android key extension");
+            }
+            b.sign(&self.root_key, MessageDigest::sha256())
+                .expect("sign intermediate");
+            (b.build(), key)
+        });
 
         let mut name = X509NameBuilder::new().expect("name");
         name.append_entry_by_text("CN", "Android Keystore Key")
@@ -649,34 +761,60 @@ impl TestAttestation {
         let leaf_name = name.build();
         let mut b = X509Builder::new().expect("builder");
         b.set_version(2).expect("v3");
-        b.set_serial_number(&serial()).expect("serial");
+        b.set_serial_number(&serial_of(opts.leaf_serial.as_deref()))
+            .expect("serial");
         b.set_subject_name(&leaf_name).expect("subject");
-        b.set_issuer_name(self.root.subject_name()).expect("issuer");
+        match &intermediate {
+            Some((cert, _)) => b.set_issuer_name(cert.subject_name()).expect("issuer"),
+            None => b.set_issuer_name(self.root.subject_name()).expect("issuer"),
+        }
         b.set_pubkey(cred_key).expect("pubkey");
         b.set_not_before(&Asn1Time::from_unix(now_unix() - 86_400).expect("t"))
             .expect("nb");
         b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
             .expect("na");
-        let oid = Asn1Object::from_str("1.3.6.1.4.1.11129.2.1.17").expect("oid");
-        let value = Asn1OctetString::new_from_bytes(&android_key_description(&client_data_hash))
-            .expect("octets");
+        let value = Asn1OctetString::new_from_bytes(&key_description).expect("octets");
         b.append_extension(X509Extension::new_from_der(&oid, false, &value).expect("ext"))
             .expect("android key extension");
-        b.sign(&self.root_key, MessageDigest::sha256())
-            .expect("sign android leaf");
+        match &intermediate {
+            Some((_, key)) => b.sign(key, MessageDigest::sha256()),
+            None => b.sign(&self.root_key, MessageDigest::sha256()),
+        }
+        .expect("sign android leaf");
         let leaf = b.build();
 
+        let mut x5c = vec![Cbor::Bytes(leaf.to_der().expect("der"))];
+        if let Some((cert, _)) = &intermediate {
+            x5c.push(Cbor::Bytes(cert.to_der().expect("der")));
+        }
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&client_data_hash);
         let stmt = Cbor::Map(vec![
             (text("alg"), Cbor::Integer((-7).into())),
             (text("sig"), Cbor::Bytes(sign(cred_key, &signed))),
-            (
-                text("x5c"),
-                Cbor::Array(vec![Cbor::Bytes(leaf.to_der().expect("der"))]),
-            ),
+            (text("x5c"), Cbor::Array(x5c)),
         ]);
         with_attestation(registration, "android-key", stmt, auth_data)
+    }
+
+    /// The root's serial number, as lowercase hex without leading zeros (the
+    /// form of a status-list entry's key).
+    #[must_use]
+    pub fn root_serial_hex(&self) -> String {
+        let hex = self
+            .root
+            .serial_number()
+            .to_bn()
+            .expect("bn")
+            .to_hex_str()
+            .expect("hex")
+            .to_ascii_lowercase();
+        let trimmed = hex.trim_start_matches('0');
+        if trimmed.is_empty() {
+            "0".into()
+        } else {
+            trimmed.to_string()
+        }
     }
 
     /// The root, PEM, as a relying party's CA file holds it.
@@ -720,4 +858,48 @@ fn now_unix() -> i64 {
             .as_secs(),
     )
     .expect("time")
+}
+
+/// Google's attestation status lists the tests use (`tests/fixtures/
+/// android-key-status/`, embedded so this file works from any crate's tests).
+pub mod android_status {
+    /// The example list of Google's key attestation documentation: serial
+    /// `2c8cdddfd5e03bfc` REVOKED, `c8966fcb2fbb0d7a` SUSPENDED.
+    pub const GOOGLE_EXAMPLE: &str =
+        include_str!("../fixtures/android-key-status/google-example.json");
+    /// No entry.
+    pub const EMPTY: &str = include_str!("../fixtures/android-key-status/empty.json");
+    /// Serial `0a1b2c3d4e5f6071` REVOKED, keyed `a1b2c3d4e5f6071`.
+    pub const LEADING_ZERO: &str = include_str!("../fixtures/android-key-status/leading-zero.json");
+    /// The REVOKED serial of [`GOOGLE_EXAMPLE`], as certificate bytes.
+    pub const REVOKED_SERIAL: [u8; 8] = [0x2c, 0x8c, 0xdd, 0xdf, 0xd5, 0xe0, 0x3b, 0xfc];
+    /// The SUSPENDED serial of [`GOOGLE_EXAMPLE`], as certificate bytes.
+    pub const SUSPENDED_SERIAL: [u8; 8] = [0xc8, 0x96, 0x6f, 0xcb, 0x2f, 0xbb, 0x0d, 0x7a];
+    /// The REVOKED serial of [`LEADING_ZERO`], as certificate bytes.
+    pub const LEADING_ZERO_SERIAL: [u8; 8] = [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
+
+    /// `list` written to a fresh file in the temporary directory, last
+    /// modified `age` ago: what the operator's refresh job leaves for
+    /// `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`.
+    #[must_use]
+    pub fn file(list: &str, age: std::time::Duration) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("epigraph-android-status-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("status dir");
+        let path = dir.join("status.json");
+        std::fs::write(&path, list).expect("status file");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open status file")
+            .set_modified(std::time::SystemTime::now() - age)
+            .expect("set its modification time");
+        path
+    }
+
+    /// A list with no entry, written just now.
+    #[must_use]
+    pub fn fresh_empty() -> std::path::PathBuf {
+        file(EMPTY, std::time::Duration::ZERO)
+    }
 }

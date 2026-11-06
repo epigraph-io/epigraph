@@ -3505,6 +3505,7 @@ fn anchored_rp(att: &TestAttestation, anchored: bool) -> Passkeys {
                 aaguids: [MODEL].into_iter().collect(),
             }),
             android_key_ca_pem: None,
+            android_key_status_file: None,
             allow_synced_anchored: anchored,
         }),
     })
@@ -3849,6 +3850,7 @@ async fn an_android_hardware_key_enrolls_under_an_android_root(pool: PgPool) {
         policy: AttestationPolicy::Attested(epigraph_passkey::AttestedPolicy {
             allowlist: None,
             android_key_ca_pem: Some(google.root_pem()),
+            android_key_status_file: Some(support::android_status::fresh_empty()),
             allow_synced_anchored: false,
         }),
     })

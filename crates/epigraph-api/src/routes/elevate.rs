@@ -15,8 +15,11 @@
 //! act) takes the ANCHORED path when `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY`
 //! is on and the act's confirming passkey anchors it
 //! (`epigraph_passkey::Passkeys::check_anchor` over migration 200's reader,
-//! which re-verifies the recorded confirmation): a plain registration with no
-//! attestation, so a synced passkey can register. The path is decided from
+//! which re-verifies the recorded confirmation, and the anchor's and its
+//! lineage's stored attestation against the roots configured NOW): a plain
+//! registration with no attestation, so a synced passkey can register.
+//! Migration 200's insert guard refuses the completion if the anchor was
+//! revoked meanwhile, and its cascade revokes the passkey with its anchor. The path is decided from
 //! those rows at the challenge AND again at the finish, never from the stored
 //! ceremony state (which the request DSN can write); a first passkey's
 //! maintenance enrollment has no anchor and is always attested.
@@ -110,8 +113,8 @@ use epigraph_db::{
     VerifiedPasskey,
 };
 use epigraph_passkey::{
-    act_challenge as act_challenge_of, ActAnchor, AuthenticationState, PasskeyError, Passkeys,
-    RegistrationState, StoredPasskey, ACT_NONCE_LEN,
+    act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
+    PasskeyError, Passkeys, RegistrationState, StoredPasskey, ACT_NONCE_LEN,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -243,7 +246,11 @@ async fn live(state: &AppState, id: Uuid) -> Result<CeremonyEnrollment, Box<Resp
 }
 
 fn act_anchor(row: EnrollmentAnchor) -> ActAnchor {
+    // A lineage that does not read is an incomplete one: it anchors nothing.
+    let lineage = LineagePasskey::list_from_json(&row.anchor_lineage);
     ActAnchor {
+        anchor_lineage_complete: row.anchor_lineage_complete && lineage.is_some(),
+        anchor_lineage: lineage.unwrap_or_default(),
         act_id: row.act_id,
         act_kind: row.act_kind,
         act_outcome: row.act_outcome,

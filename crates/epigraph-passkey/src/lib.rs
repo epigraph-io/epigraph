@@ -19,9 +19,13 @@
 //!   credential) are checked here on the registered credential, whatever
 //!   the stored state allowed;
 //! * whether a registration may carry no attestation (the anchored path) is
-//!   the caller's finding from rows the request DSN cannot write
-//!   ([`ActAnchor`]), re-verified here ([`Passkeys::check_anchor`]); the
-//!   stored state only has to agree with it;
+//!   decided here ([`Passkeys::check_anchor`]) from the caller's
+//!   [`ActAnchor`]: rows only the API (after verifying a ceremony) or the
+//!   maintenance DSN writes. Nothing in them is taken on trust: the
+//!   confirmation is re-verified against the anchor's key, and the anchor's
+//!   own attestation (its stored certificate chain) is re-verified against
+//!   the roots THIS process trusts now, as is every passkey on its lineage;
+//!   the stored state only has to agree;
 //! * user verification is checked on the registered credential and on every
 //!   assertion here, whatever policy the stored state names (operator ruling
 //!   D5: a passkey with user verification);
@@ -36,6 +40,7 @@
 //! image and the stdio server stay free of it
 //! (`tests/dependency_boundary.rs`).
 
+pub mod android;
 pub mod config;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -43,12 +48,14 @@ use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use uuid::Uuid;
 use webauthn_rs::prelude::{
-    AttestationCaList, AttestationCaListBuilder, AttestedPasskeyRegistration, Passkey,
-    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
-    Webauthn, WebauthnBuilder, WebauthnError,
+    AttestationCaList, AttestationCaListBuilder, AttestationMetadata, AttestedPasskeyRegistration,
+    ParsedAttestation, ParsedAttestationData, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, Webauthn, WebauthnBuilder, WebauthnError,
 };
+use webauthn_rs_core::attestation::verify_attestation_ca_chain;
 
 pub use config::{
     AaguidAllowlist, AttestationPolicy, AttestedPolicy, ConfigError, PasskeyConfig, RelyingParty,
@@ -231,6 +238,9 @@ pub struct Passkeys {
     /// separate list, never merged into `allowlist_cas`: the library's union
     /// of a blanket and a restricted entry for one root is a blanket allow.
     android_cas: Option<AttestationCaList>,
+    /// [`config::ENV_ANDROID_KEY_STATUS_FILE`]: `Some` exactly when
+    /// `android_cas` is.
+    android_status_file: Option<PathBuf>,
     /// [`config::ENV_ALLOW_SYNCED_ANCHORED_PASSKEY`].
     allow_synced_anchored: bool,
 }
@@ -312,10 +322,11 @@ impl Passkeys {
             .rp_name(RP_NAME)
             .build()
             .map_err(|e| PasskeyError::Config(e.to_string()))?;
-        let (allowlist, android, allow_synced_anchored) = match &config.policy {
-            AttestationPolicy::SoftwareAllowed => (None, None, false),
+        let (allowlist, android, android_status_file, allow_synced_anchored) = match &config.policy
+        {
+            AttestationPolicy::SoftwareAllowed => (None, None, None, false),
             AttestationPolicy::Allowlist { ca_pem, aaguids } => {
-                (Some(allowlist_cas(ca_pem, aaguids)?), None, false)
+                (Some(allowlist_cas(ca_pem, aaguids)?), None, None, false)
             }
             AttestationPolicy::Attested(p) => {
                 let allowlist = p
@@ -333,7 +344,18 @@ impl Passkeys {
                         "the attested policy needs the allowlist or the Android key roots".into(),
                     ));
                 }
-                (allowlist, android, p.allow_synced_anchored)
+                // No Android root without the revocation input (P779-2).
+                let status = match (&android, &p.android_key_status_file) {
+                    (Some(_), Some(path)) => Some(path.clone()),
+                    (Some(_), None) => {
+                        return Err(PasskeyError::Config(format!(
+                            "the Android key roots need {}",
+                            config::ENV_ANDROID_KEY_STATUS_FILE
+                        )))
+                    }
+                    (None, _) => None,
+                };
+                (allowlist, android, status, p.allow_synced_anchored)
             }
         };
         if let (Some(a), Some(b)) = (&allowlist, &android) {
@@ -354,6 +376,7 @@ impl Passkeys {
             webauthn,
             allowlist_cas: allowlist,
             android_cas: android,
+            android_status_file,
             allow_synced_anchored,
         })
     }
@@ -475,16 +498,19 @@ impl Passkeys {
     /// verified against the allowlist first (today's path, unchanged) and,
     /// only when that refuses it, against the Android roots ALONE. A
     /// registration verified that way is accepted only as a device-bound
-    /// `android-key` attestation ([`android_key_rules`]): a `packed` or `tpm`
-    /// certificate chaining to an Android root is refused, as is a
-    /// backup-eligible credential, whatever the stored state allowed.
+    /// `android-key` attestation of a key the attestation places in a TEE or
+    /// StrongBox, none of whose certificates is on the attestation status
+    /// list (`android_key_rules`): a `packed` or `tpm` certificate chaining
+    /// to an Android root is refused, as are a backup-eligible credential and
+    /// a software-level key, whatever the stored state allowed.
     ///
     /// # Errors
     /// [`PasskeyError::Refused`] / [`PasskeyError::UserNotVerified`]: the
     /// response does not verify (wrong origin or rp id, bad signature, an
     /// attestation that is not allowlisted, no user verification, ...).
     /// [`PasskeyError::AttestationRefused`]: it verified under an Android
-    /// root, and is not a device-bound `android-key` attestation.
+    /// root, and is not a device-bound, hardware-level `android-key`
+    /// attestation in good standing.
     /// [`PasskeyError::State`]: the state was not started under this policy.
     pub fn finish_registration(
         &self,
@@ -505,7 +531,7 @@ impl Passkeys {
                     (first, Some(android)) => {
                         match self.finish_attested_under(&reg, library, android) {
                             Ok(pk) => {
-                                android_key_rules(&pk)?;
+                                self.android_key_rules(&pk)?;
                                 pk
                             }
                             Err(second) => {
@@ -565,10 +591,10 @@ impl Passkeys {
     /// passkey registration (no attestation asked, a synced credential
     /// allowed, user verification required), stored as an `anchored` state.
     ///
-    /// The caller decides it is the anchored path from rows the request DSN
-    /// cannot write, and only when [`Self::check_anchor`] admits the
-    /// enrollment's [`ActAnchor`]; [`Self::finish_anchored_registration`]
-    /// checks it again.
+    /// The caller takes the anchored path only when [`Self::check_anchor`]
+    /// admits the enrollment's [`ActAnchor`] (rows only the API or the
+    /// maintenance DSN writes, re-verified there);
+    /// [`Self::finish_anchored_registration`] checks it again.
     ///
     /// # Errors
     /// [`PasskeyError::Config`]: the anchored path is not enabled; or the
@@ -606,7 +632,8 @@ impl Passkeys {
     /// attestation statement (`none`): this path verifies none, so a
     /// statement here would be recorded as if it had been, and could anchor
     /// a further passkey. The passkey is recorded as `none` with the nil
-    /// AAGUID; [`is_hardware_attested`] never admits it as an anchor.
+    /// AAGUID; [`Self::hardware_attested`] never admits it as an anchor, and
+    /// [`Self::check_anchor`] refuses any anchor whose lineage contains it.
     ///
     /// # Errors
     /// [`PasskeyError::Config`] (the path is off), [`PasskeyError::Anchor`],
@@ -647,9 +674,15 @@ impl Passkeys {
     }
 
     /// Whether `anchor` admits an anchored registration: its act is a
-    /// CONFIRMED `passkey.register` act of the enrollment's person, its
-    /// confirming passkey is that person's, live and hardware-attested
-    /// ([`is_hardware_attested`]), and the confirmation's stored assertion
+    /// CONFIRMED `passkey.register` act of the enrollment's person; its
+    /// confirming passkey is that person's, live, and HARDWARE-ATTESTED UNDER
+    /// THIS PROCESS'S CONFIGURATION NOW ([`Self::hardware_attested`]: its
+    /// stored certificate chain re-verified against today's roots, AAGUID
+    /// allowlist, Android security-level rules and status list, never the
+    /// columns its registration wrote alone); so is every passkey on its
+    /// LINEAGE back to the person's first, maintenance-enrolled passkey
+    /// ([`ActAnchor::anchor_lineage`]), so a synced passkey anchors nothing
+    /// through any chain of acts; and the confirmation's stored assertion
     /// RE-VERIFIES: made over the act's own challenge
     /// ([`act_challenge`] of the act id, its stored args digest and its
     /// stored nonce, which is also the stored ceremony's), by that passkey's
@@ -673,12 +706,45 @@ impl Passkeys {
         if anchor.anchor_revoked {
             return Err(AnchorRefusal::AnchorRevoked);
         }
-        if !is_hardware_attested(
+        if let Err(why) = self.hardware_attested(
+            &anchor.anchor_passkey,
             &anchor.anchor_attestation_format,
             anchor.anchor_aaguid,
             anchor.anchor_backup_eligible,
         ) {
+            tracing::warn!(
+                target: "passkey.anchor",
+                act = %anchor.act_id,
+                reason = %why,
+                "the act's confirming passkey is not hardware-attested under this configuration"
+            );
             return Err(AnchorRefusal::AnchorNotAttested);
+        }
+        if !anchor.anchor_lineage_complete {
+            tracing::warn!(
+                target: "passkey.anchor",
+                act = %anchor.act_id,
+                "the confirming passkey's lineage does not reach a maintenance-enrolled passkey"
+            );
+            return Err(AnchorRefusal::LineageNotAttested);
+        }
+        for ancestor in &anchor.anchor_lineage {
+            if let Err(why) = self.hardware_attested(
+                &ancestor.passkey,
+                &ancestor.attestation_format,
+                ancestor.aaguid,
+                ancestor.backup_eligible,
+            ) {
+                tracing::warn!(
+                    target: "passkey.anchor",
+                    act = %anchor.act_id,
+                    ancestor = %ancestor.passkey_id,
+                    reason = %why,
+                    "a passkey on the confirming passkey's lineage is not hardware-attested \
+                     under this configuration"
+                );
+                return Err(AnchorRefusal::LineageNotAttested);
+            }
         }
         let evidence = anchor
             .assertion_evidence
@@ -725,6 +791,174 @@ impl Passkeys {
             return Err(AnchorRefusal::BackupEligibilityChanged);
         }
         Ok(())
+    }
+
+    /// Whether a STORED passkey is hardware-attested under THIS process's
+    /// configuration, NOW: device-bound, and its stored attestation (the
+    /// certificate chain the library verified at registration, kept in the
+    /// credential at `/cred/attestation`) still verifies against the roots
+    /// configured today:
+    ///
+    /// * `packed` / `tpm`: chains to an allowlist root that admits the
+    ///   credential's AAGUID (a non-nil one, recorded in the row);
+    /// * `android-key`: chains to an Android key root, its KeyDescription
+    ///   (the leaf's, and only the leaf's) places the attestation and the key
+    ///   in a TEE or StrongBox with `purpose` and `origin` hardware-enforced,
+    ///   and no certificate of the chain, root included, is on the status list
+    ///   (which must be no older than
+    ///   [`android::ANDROID_KEY_STATUS_MAX_AGE`]);
+    /// * any other format (`none`, self attestation, ...): never.
+    ///
+    /// The row's columns (`attestation_format`, `aaguid`, `backup_eligible`)
+    /// must agree with the credential they were written from. Certificate
+    /// validity periods are checked, as at registration, so an anchor whose
+    /// chain has expired anchors nothing.
+    ///
+    /// What this does NOT re-check: that the certificate attests THIS
+    /// credential's key. The attestation signature that bound them is not
+    /// stored; it was checked at registration, by the API, which is the only
+    /// writer of the row besides the maintenance DSN.
+    ///
+    /// # Errors
+    /// Why not, in words, for the log.
+    pub fn hardware_attested(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+        aaguid: Uuid,
+        backup_eligible: bool,
+    ) -> Result<(), String> {
+        let cred = passkey
+            .get("cred")
+            .ok_or_else(|| "the stored credential has no `cred`".to_string())?;
+        if backup_eligible || cred.get("backup_eligible").and_then(Value::as_bool) != Some(false) {
+            return Err("a backup-eligible (syncable) credential".into());
+        }
+        let stored_format = cred.get("attestation_format").and_then(Value::as_str);
+        if stored_format != Some(attestation_format) {
+            return Err(format!(
+                "the row's attestation format `{attestation_format}` is not the credential's \
+                 ({stored_format:?})"
+            ));
+        }
+        let attestation: ParsedAttestation = cred
+            .get("attestation")
+            .cloned()
+            .ok_or_else(|| "the stored credential holds no attestation".to_string())
+            .and_then(|a| {
+                serde_json::from_value(a)
+                    .map_err(|e| format!("the stored attestation does not parse: {e}"))
+            })?;
+        match attestation_format {
+            "packed" | "tpm" => {
+                let model = match &attestation.metadata {
+                    AttestationMetadata::Packed { aaguid: m }
+                    | AttestationMetadata::Tpm { aaguid: m, .. } => *m,
+                    _ => return Err("the stored attestation names no model".into()),
+                };
+                if aaguid.is_nil() || model != aaguid {
+                    return Err(format!(
+                        "the row's AAGUID {aaguid} is not the attested model {model}"
+                    ));
+                }
+                let cas = self
+                    .allowlist_cas
+                    .as_ref()
+                    .ok_or_else(|| "no attestation allowlist is configured".to_string())?;
+                let ca = verify_attestation_ca_chain(&attestation.data, cas, false)
+                    .map_err(|e| format!("its chain no longer verifies to an allowlist root: {e}"))?
+                    .ok_or_else(|| "it carries no certificate chain".to_string())?;
+                if !ca.blanket_allow() && !ca.aaguids().contains_key(&aaguid) {
+                    return Err(format!("its model {aaguid} is no longer on the allowlist"));
+                }
+                Ok(())
+            }
+            "android-key" => self.android_key_trusted(&attestation),
+            other => Err(format!("a `{other}` attestation is not hardware-attested")),
+        }
+    }
+
+    /// The Android half of [`Self::hardware_attested`], over a credential's
+    /// stored attestation: the chain to an Android key root, the
+    /// KeyDescription's hardware rules ([`android::hardware_rules`]) and the
+    /// status list.
+    fn android_key_trusted(&self, attestation: &ParsedAttestation) -> Result<(), String> {
+        let cas = self
+            .android_cas
+            .as_ref()
+            .ok_or_else(|| "no Android key roots are configured".to_string())?;
+        let chain = match &attestation.data {
+            ParsedAttestationData::Basic(chain) if !chain.is_empty() => chain,
+            _ => {
+                return Err("the stored Android key attestation holds no certificate chain".into())
+            }
+        };
+        let ca = verify_attestation_ca_chain(&attestation.data, cas, false)
+            .map_err(|e| format!("its chain does not verify to an Android key root: {e}"))?
+            .ok_or_else(|| "it carries no certificate chain".to_string())?;
+        let der = chain
+            .iter()
+            .map(|c| c.to_der())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("a certificate does not encode: {e}"))?;
+        let (mut serials, description) = android::inspect_chain(&der)?;
+        android::hardware_rules(&description)?;
+        let root = ca
+            .ca()
+            .to_der()
+            .map_err(|e| format!("the root does not encode: {e}"))?;
+        let (_, root) = x509_parser::parse_x509_certificate(&root)
+            .map_err(|e| format!("the root does not parse: {e}"))?;
+        serials.push(android::serial_hex(root.raw_serial()));
+        let path = self
+            .android_status_file
+            .as_deref()
+            .ok_or_else(|| format!("no {} is configured", config::ENV_ANDROID_KEY_STATUS_FILE))?;
+        let list = android::StatusList::load(path, std::time::SystemTime::now())?;
+        for serial in &serials {
+            if let Some(status) = list.status_of(serial) {
+                return Err(format!(
+                    "attestation certificate {serial} is {status} on the attestation status list"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The rules for a registration that verified under the Android key
+    /// roots (a blanket allow): the `android-key` format with Android key
+    /// metadata, a device-bound credential, and [`Self::android_key_trusted`]
+    /// (hardware level, status list). User verification is
+    /// [`registered_from`]'s, as for every registration.
+    fn android_key_rules(&self, passkey: &Value) -> Result<(), PasskeyError> {
+        let cred = passkey
+            .get("cred")
+            .ok_or_else(|| malformed("credential", "no cred"))?;
+        let format = cred.get("attestation_format").and_then(Value::as_str);
+        let android_metadata = cred
+            .pointer("/attestation/metadata/AndroidKey")
+            .is_some_and(Value::is_object);
+        if format != Some("android-key") || !android_metadata {
+            return Err(PasskeyError::AttestationRefused(format!(
+                "an Android key root vouches only for the android-key attestation format, and \
+                 this is `{}`",
+                format.unwrap_or("unknown")
+            )));
+        }
+        if cred.get("backup_eligible").and_then(Value::as_bool) != Some(false) {
+            return Err(PasskeyError::AttestationRefused(
+                "an Android key attestation is accepted only for a device-bound credential, and \
+                 this one is backup-eligible"
+                    .into(),
+            ));
+        }
+        let attestation: ParsedAttestation = cred
+            .get("attestation")
+            .cloned()
+            .ok_or_else(|| malformed("credential", "no attestation"))
+            .and_then(|a| serde_json::from_value(a).map_err(|e| malformed("attestation", e)))?;
+        self.android_key_trusted(&attestation)
+            .map_err(PasskeyError::AttestationRefused)
     }
 
     fn passkey_of(stored: &StoredPasskey, counter: u32) -> Result<Passkey, PasskeyError> {
@@ -940,9 +1174,12 @@ impl Verifier {
 
 /// What the anchored path knows of an enrollment's `passkey.register` act and
 /// the passkey that confirmed it (migration 200's
-/// `epigraph_enrollment_anchor`): rows the request DSN reads but does not
-/// write, except for the confirmation, which [`Passkeys::check_anchor`]
-/// re-verifies.
+/// `epigraph_enrollment_anchor`). Rows only the API (after verifying a
+/// ceremony) or the maintenance DSN writes; the request DSN calls 124's
+/// completion definer with values of its choosing, so nothing here is taken on
+/// trust: [`Passkeys::check_anchor`] re-verifies the confirmation, and the
+/// anchor's and every ancestor's stored attestation against the CURRENT
+/// configuration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActAnchor {
     /// The act the enrollment was opened on.
@@ -973,6 +1210,55 @@ pub struct ActAnchor {
     pub anchor_backup_eligible: bool,
     /// Whether it has been revoked since.
     pub anchor_revoked: bool,
+    /// The passkeys that authorized the anchor, nearest first: the passkey
+    /// that confirmed the act its own enrollment was opened on, then the one
+    /// that confirmed THAT passkey's act, and so on, up to a passkey enrolled
+    /// by the maintenance DSN (the person's first). Empty for an anchor that
+    /// is itself the first.
+    pub anchor_lineage: Vec<LineagePasskey>,
+    /// Whether [`Self::anchor_lineage`] reaches a maintenance-enrolled
+    /// passkey (the reader stops at a depth bound and reports `false`).
+    pub anchor_lineage_complete: bool,
+}
+
+/// One passkey on an anchor's lineage ([`ActAnchor::anchor_lineage`]): its
+/// stored credential and the columns its registration wrote. Revoked or not:
+/// a lineage passkey authorized the anchor once, and is held to
+/// [`Passkeys::hardware_attested`] whatever became of it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineagePasskey {
+    /// Its id.
+    pub passkey_id: Uuid,
+    /// Its stored credential.
+    pub passkey: Value,
+    /// Its recorded AAGUID.
+    pub aaguid: Uuid,
+    /// Its recorded attestation format.
+    pub attestation_format: String,
+    /// Its recorded backup-eligible flag.
+    pub backup_eligible: bool,
+}
+
+impl LineagePasskey {
+    /// The lineage as migration 200's reader returns it (a JSON array of
+    /// `{passkey_id, passkey, aaguid, attestation_format, backup_eligible}`).
+    /// `None` when it is not that shape (the caller then treats the lineage
+    /// as incomplete).
+    #[must_use]
+    pub fn list_from_json(v: &Value) -> Option<Vec<Self>> {
+        v.as_array()?
+            .iter()
+            .map(|e| {
+                Some(Self {
+                    passkey_id: e.get("passkey_id")?.as_str()?.parse().ok()?,
+                    passkey: e.get("passkey")?.clone(),
+                    aaguid: e.get("aaguid")?.as_str()?.parse().ok()?,
+                    attestation_format: e.get("attestation_format")?.as_str()?.to_string(),
+                    backup_eligible: e.get("backup_eligible")?.as_bool()?,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Why an [`ActAnchor`] does not admit an anchored registration.
@@ -990,12 +1276,21 @@ pub enum AnchorRefusal {
     /// The confirming passkey has been revoked.
     #[error("the passkey that confirmed the act has been revoked")]
     AnchorRevoked,
-    /// The confirming passkey is not hardware-attested.
+    /// The confirming passkey is not hardware-attested under the current
+    /// configuration.
     #[error(
-        "the passkey that confirmed the act is not hardware-attested (a synced or unattested \
-         passkey anchors nothing)"
+        "the passkey that confirmed the act is not hardware-attested under the current \
+         configuration (a synced or unattested passkey anchors nothing)"
     )]
     AnchorNotAttested,
+    /// A passkey that authorized the confirming passkey is not
+    /// hardware-attested under the current configuration, or the lineage does
+    /// not reach the person's first passkey.
+    #[error(
+        "a passkey on the confirming passkey's lineage is not hardware-attested under the \
+         current configuration (a synced passkey anchors nothing, through any chain of acts)"
+    )]
+    LineageNotAttested,
     /// The stored assertion was not made over the act's own challenge.
     #[error("the act's recorded confirmation is not over the act's own challenge")]
     ChallengeNotBound,
@@ -1020,58 +1315,13 @@ impl AnchorRefusal {
             Self::PersonMismatch => "person_mismatch",
             Self::AnchorRevoked => "anchor_revoked",
             Self::AnchorNotAttested => "anchor_not_attested",
+            Self::LineageNotAttested => "lineage_not_attested",
             Self::ChallengeNotBound => "challenge_not_bound",
             Self::AssertionDoesNotVerify => "assertion_does_not_verify",
             Self::CredentialMismatch => "credential_mismatch",
             Self::BackupEligibilityChanged => "backup_eligibility_changed",
         }
     }
-}
-
-/// Whether a stored passkey was registered HARDWARE-ATTESTED, from what its
-/// registration recorded: device-bound (not backup-eligible), and either a
-/// `packed` / `tpm` attestation naming its model (a non-nil AAGUID: `none`
-/// and self attestation record the nil one) or an `android-key` one (which
-/// names no model). Under the attested policy those are recorded only from
-/// an attestation verified against the configured roots; the anchored path
-/// records `none` only.
-#[must_use]
-pub fn is_hardware_attested(attestation_format: &str, aaguid: Uuid, backup_eligible: bool) -> bool {
-    !backup_eligible
-        && match attestation_format {
-            "packed" | "tpm" => !aaguid.is_nil(),
-            "android-key" => true,
-            _ => false,
-        }
-}
-
-/// The rules for a registration that verified under the Android key roots
-/// (a blanket allow): the `android-key` format with Android key metadata,
-/// and a device-bound credential. User verification is
-/// [`registered_from`]'s, as for every registration.
-fn android_key_rules(passkey: &Value) -> Result<(), PasskeyError> {
-    let cred = passkey
-        .get("cred")
-        .ok_or_else(|| malformed("credential", "no cred"))?;
-    let format = cred.get("attestation_format").and_then(Value::as_str);
-    let android_metadata = cred
-        .pointer("/attestation/metadata/AndroidKey")
-        .is_some_and(Value::is_object);
-    if format != Some("android-key") || !android_metadata {
-        return Err(PasskeyError::AttestationRefused(format!(
-            "an Android key root vouches only for the android-key attestation format, and this \
-             is `{}`",
-            format.unwrap_or("unknown")
-        )));
-    }
-    if cred.get("backup_eligible").and_then(Value::as_bool) != Some(false) {
-        return Err(PasskeyError::AttestationRefused(
-            "an Android key attestation is accepted only for a device-bound credential, and \
-             this one is backup-eligible"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Both attested attempts refused: the allowlist's reason and the Android
