@@ -266,6 +266,8 @@ mod tests {
                 signature: None,
             },
             signature: "0".repeat(128),
+            visibility: None,
+            group_id: None,
         }
     }
 

@@ -146,7 +146,7 @@ async fn create_claim_with_derived_from_records_derivation_evidence() {
         &client,
         &endpoint,
         &token,
-        serde_json::json!({ "content": parent_text, "agent_id": agent }),
+        serde_json::json!({ "content": parent_text, "agent_id": agent, "visibility": "public" }),
     )
     .await;
     assert!(st.is_success(), "seeding the parent failed: {st} {body}");
@@ -534,7 +534,7 @@ async fn derived_from_on_a_dedup_hit_of_a_claim_the_caller_does_not_own() {
         &client,
         &endpoint,
         &token,
-        serde_json::json!({ "content": parent_text, "agent_id": legacy_author }),
+        serde_json::json!({ "content": parent_text, "agent_id": legacy_author, "visibility": "public" }),
     )
     .await;
     assert!(st.is_success(), "seeding the parent failed: {st} {body}");
@@ -660,7 +660,7 @@ async fn derived_from_a_foreign_public_parent_and_then_a_second_parent_records_o
         &client,
         &endpoint,
         &token,
-        serde_json::json!({ "content": p2_text, "agent_id": agent }),
+        serde_json::json!({ "content": p2_text, "agent_id": agent, "visibility": "public" }),
     )
     .await;
     assert!(st.is_success(), "seeding P2 failed: {st} {body}");
