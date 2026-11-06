@@ -1067,9 +1067,10 @@ async fn anchored_android(
 /// an untrusted statement (a software-level key) under the same stale list
 /// is still dropped to `none`, as is a listed certificate under a fresh list.
 /// CALIBRATION: under a fresh list the same key is recorded `android-key`.
-/// Red line (3ad5ff92): the stale and missing cases returned
-/// `Ok(("none", nil))`. Mutation: the status-unknown arm of the anchored
-/// finish dropping instead of refusing -> both cases record `none`.
+/// Red line (3ad5ff92): the stale case returned `Ok(("none", nil))` (the
+/// test stops there; the round-3 review's probe saw the same for the missing
+/// file). Mutation: the status-unknown arm of the anchored finish dropping
+/// instead of refusing -> the stale case records `none`.
 #[tokio::test]
 async fn an_android_key_whose_standing_cannot_be_checked_is_refused_on_the_anchored_path() {
     let vendor = TestAttestation::new("Allowlisted");
