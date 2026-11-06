@@ -1,11 +1,12 @@
 //! `AuthoredByRepository::for_claim`: a claim's `authored_by` block, decided
 //! under the caller's viewer on the caller's stamped connection.
 //!
-//! * `human` is the agent's binding (`epigraph_human_of(agent, false)`),
-//!   shown to every reader of the claim. No `OPERATED_BY` edge decides it:
-//!   anyone with edges:write can forge one, so a forged edge changes nothing.
-//!   A registered human's own claim names no human (it is bound to itself,
-//!   which is not an operator), exactly as an agent bound to no human.
+//! * `human` is the agent's binding RECORD (its operator link in any state,
+//!   else its unrevoked client allowance), shown to every reader of the
+//!   claim. No `OPERATED_BY` edge decides it (anyone with edges:write can
+//!   forge one, so a forged edge changes nothing), and no client or
+//!   registration status moves it. A registered human's own claim names no
+//!   human, exactly as an agent bound to no human.
 //! * `prompt_snapshot` follows the audience setting: under
 //!   `OperatorAndAdmins` only the agent's human and admins see it; under
 //!   `ClaimReaders` every caller does.
@@ -319,6 +320,124 @@ async fn a_registered_humans_own_claim_names_no_human(pool: PgPool) {
             "a human's own claim reads as no human"
         );
     }
+}
+
+/// A fresh agent bound to `operator` by a client allowance (a service
+/// client on the maintenance-only registry): `(agent, client)`.
+async fn allowance_bound(pool: &PgPool, operator: Uuid) -> (Uuid, Uuid) {
+    let (agent, _) = fixture::seed_agent_with_group(pool, "allowance").await;
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'authored-by allowance fixture', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("authored-by-allowance-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("service client");
+    let allowed: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT allowed_now FROM public.epigraph_allow_author_binding_client($1, $2, $3)",
+        )
+        .bind(client)
+        .bind(operator)
+        .bind("authored-by test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("allow the client for the operator");
+        (conn, r)
+    })
+    .await;
+    assert!(allowed, "CALIBRATION: the allowance is in force");
+    (agent, client)
+}
+
+async fn human_client_of(pool: &PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \
+          ORDER BY created_at LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client")
+}
+
+async fn set_client_status(pool: &PgPool, client: Uuid, status: &str) {
+    sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+        .bind(client)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("client status -> {status}: {e}"));
+}
+
+/// The human is read from the binding RECORD, so no client or registration
+/// event moves it: a stranger's whole block for each agent is byte-identical
+/// before and after every event, while each event is shown (CALIBRATION) to
+/// move `epigraph_human_of`. A reader can never watch a suspension.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_human_does_not_move_with_client_or_registration_status(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (h1, _) = human(&pool, "Linked Operator").await;
+    let (linked, _) = fixture::seed_agent_with_group(&pool, "linked").await;
+    link(&pool, linked, h1).await;
+    let (h2, _) = human(&pool, "Allowance Operator").await;
+    let (allowed, allowed_client) = allowance_bound(&pool, h2).await;
+    // A registered human that is also linked as an agent: link, then register.
+    let (o3, _) = human(&pool, "Dual Operator").await;
+    let (dual, _) = fixture::seed_agent_with_group(&pool, "dual").await;
+    link(&pool, dual, o3).await;
+    fixture::make_human_operator(&pool, dual).await;
+    assert_eq!(binding(&pool, allowed).await, Some(h2), "CALIBRATION");
+
+    let agents = [linked, allowed, dual];
+    let blocks = || {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        async move {
+            let mut out = Vec::new();
+            for a in agents {
+                out.push(block_json(&pool, scoped, stranger, a).await);
+            }
+            out
+        }
+    };
+    let before = blocks().await;
+    let shown: Vec<Value> = before.iter().map(|b| b["human"]["id"].clone()).collect();
+    assert_eq!(
+        shown,
+        vec![json!(h1), json!(h2), json!(o3)],
+        "each agent's operator, a dual principal's included"
+    );
+
+    // 1. The allowlisted agent's own client suspended.
+    set_client_status(&pool, allowed_client, "suspended").await;
+    assert_eq!(binding(&pool, allowed).await, None, "CALIBRATION 1");
+    assert_eq!(blocks().await, before, "allowlisted client suspended");
+    set_client_status(&pool, allowed_client, "active").await;
+
+    // 2. The allowance operator's human client suspended.
+    let h2_client = human_client_of(&pool, h2).await;
+    set_client_status(&pool, h2_client, "suspended").await;
+    assert_eq!(binding(&pool, allowed).await, None, "CALIBRATION 2");
+    assert_eq!(blocks().await, before, "operator's human client suspended");
+    set_client_status(&pool, h2_client, "active").await;
+
+    // 3. The dual principal's own human client suspended.
+    assert_eq!(binding(&pool, dual).await, Some(dual), "CALIBRATION 3a");
+    let dual_client = human_client_of(&pool, dual).await;
+    set_client_status(&pool, dual_client, "suspended").await;
+    assert_eq!(binding(&pool, dual).await, Some(o3), "CALIBRATION 3b");
+    assert_eq!(blocks().await, before, "dual principal's client suspended");
+    set_client_status(&pool, dual_client, "active").await;
+
+    // 4. The allowlisted client revoked (the allowance itself is not).
+    set_client_status(&pool, allowed_client, "revoked").await;
+    assert_eq!(blocks().await, before, "allowlisted client revoked");
 }
 
 /// A registered identity (no parent) through the attestor: its agent id.

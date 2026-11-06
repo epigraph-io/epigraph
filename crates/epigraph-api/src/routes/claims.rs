@@ -249,11 +249,12 @@ pub enum AuthoredByView {
     Agent {
         /// The agent that filed the claim (`agent_id`), for every reader.
         agent: AuthorRefView,
-        /// The human operator the agent is bound to (migration 149's
-        /// `epigraph_human_of`, any link state), for every reader. Read from
-        /// the binding only, never from an `OPERATED_BY` edge. `null` when the
-        /// agent is bound to no human, and on a registered human's own claim
-        /// (bound to itself, which is not an operator).
+        /// The human operator the agent is bound to, for every reader: its
+        /// operator link in any state, else its unrevoked client allowance.
+        /// Read from that binding record only: never from an `OPERATED_BY`
+        /// edge, and never from client or registration status. `null` when
+        /// the agent is bound to no human, and on a registered human's own
+        /// claim.
         human: Option<AuthorRefView>,
         /// The prompt snapshot the agent was running at the claim's
         /// `created_at`, shown only to the agent's linked human and to admins

@@ -12,18 +12,23 @@
 //!   readable by every session (077's `agents_identity` policy), and
 //!   `GET /api/v1/agents/:id` answers the same two fields for any id.
 //! * **`human`** `{id, display_name}`: every reader of the claim. It is the
-//!   agent's binding, migration 149's `epigraph_human_of(agent, false)`: its
-//!   operator link, in ANY state, so the attribution outlives a retirement;
-//!   else the operator of its allowlisted client. It is read from that
-//!   binding and from nothing else. In particular no `OPERATED_BY` edge
-//!   decides it: any edges:write caller can write one between two agents, so
-//!   an edge proves nothing about who operates whom, and a forged edge
-//!   changes nothing here. A registered human operator is bound to ITSELF;
-//!   that is not an operator, so a human's own claim names no human (the
-//!   agent part already names them), and the block never says who is a
-//!   registered human operator. The link tables themselves
-//!   (`operator_links`, `human_operators`, `author_binding_clients`) are
-//!   never read here.
+//!   agent's binding RECORD: its operator link in ANY state (107's
+//!   `epigraph_operator_of_author`, retired links included, so the
+//!   attribution outlives a retirement), else the operator its unrevoked
+//!   migration-149 client allowance names (`author_binding_clients`). That
+//!   equals 149's `epigraph_human_of(agent, false)` for every bound agent
+//!   while the binding is in force; it differs only where `epigraph_human_of`
+//!   consults client or registration STATUS (an allowance whose client, or
+//!   whose operator's human client, is not active; a registered human that is
+//!   also linked as an agent, which `epigraph_human_of` reads as itself while
+//!   its own client is active). A reader must not be able to watch those
+//!   events, so this block never reads status. It is the same expression the
+//!   agent card's `operator_human` reads. No `OPERATED_BY` edge decides it:
+//!   any edges:write caller can write one between two agents, so an edge
+//!   proves nothing about who operates whom, and a forged edge changes
+//!   nothing here. A binding to the agent itself is not an operator and is
+//!   not shown, so a registered human's own claim names no human and the
+//!   block never says who is a registered human operator.
 //! * **`prompt_snapshot`** `{snapshot_id, model, prompt_hash, started_at}`:
 //!   the snapshot (161, design D4) the agent was running at the claim's
 //!   `created_at`, read through migration 199's
@@ -79,7 +84,6 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::pool::ScopedRead;
-use crate::repos::agent::AgentRepository;
 use crate::visibility::Viewer;
 
 /// Who may see a claim's `authored_by.prompt_snapshot`.
@@ -230,12 +234,21 @@ impl AuthoredByRepository {
     ) -> Result<AuthoredBy, DbError> {
         let conn: &mut sqlx::PgConnection = read;
 
-        // The human: the agent's binding, for every reader. Never an edge.
-        // A binding to the agent itself (a registered human operator) is not
-        // an operator and is not shown.
-        let human_id = AgentRepository::human_of(&mut *conn, agent_id, false)
-            .await?
-            .filter(|h| *h != agent_id);
+        // The human: the agent's binding RECORD, for every reader. Never an
+        // edge, and never a client or registration status. This expression
+        // must stay identical to the agent card's operator-binding read
+        // (`agent_lookup.rs::operator_binding_sql`), so the two surfaces
+        // disclose one fact under one rule. A binding to the agent itself is
+        // not an operator and is not shown.
+        let human_id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT o.operator_id FROM public.epigraph_operator_of_author($1) o), \
+                             (SELECT r.operator_id FROM public.author_binding_clients r \
+                               WHERE r.agent_id = $1 AND r.revoked_at IS NULL))",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut *conn)
+        .await?;
+        let human_id = human_id.filter(|h| *h != agent_id);
 
         // Both names in one read; `agents` is readable by every session.
         let wanted: Vec<Uuid> = std::iter::once(agent_id).chain(human_id).collect();
