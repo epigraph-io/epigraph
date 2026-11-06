@@ -3156,7 +3156,8 @@ async fn a_compromised_revoke_waits_for_and_sweeps_a_completion_in_flight(pool: 
     release(a).await;
     let got = revoke.await.unwrap().expect("the compromised revoke");
     assert!(
-        got.iter().any(|(id, depth, now)| *id == child && *depth == 2 && *now),
+        got.iter()
+            .any(|(id, depth, now)| *id == child && *depth == 2 && *now),
         "the passkey that completed under the lock is reached: {got:?}"
     );
     assert!(
