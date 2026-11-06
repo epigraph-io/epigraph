@@ -1419,6 +1419,12 @@ async fn ingest_records(pool: &PgPool, claim: Uuid) -> Vec<(String, Uuid, bool)>
     rows
 }
 
+/// `v`, sorted as [`ingest_records`] sorts (the ingester ids are random).
+fn sorted(mut v: Vec<(String, Uuid, bool)>) -> Vec<(String, Uuid, bool)> {
+    v.sort();
+    v
+}
+
 /// The claim the paper keyed `doi` asserts whose content is `content`.
 async fn claim_of(pool: &PgPool, doi: &str, content: &str) -> Uuid {
     sqlx::query_scalar(
@@ -1465,7 +1471,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
     for c in [x, only1] {
         assert_eq!(
             ingest_records(&pool, c).await,
-            vec![(d1.to_string(), a_id, true)],
+            sorted(vec![(d1.to_string(), a_id, true)]),
             "the creating ingest is recorded at creation"
         );
     }
@@ -1478,13 +1484,16 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
     .await;
     assert_eq!(
         ingest_records(&pool, x).await,
-        vec![(d1.to_string(), a_id, true), (d2.to_string(), b_id, false)],
+        sorted(vec![
+            (d1.to_string(), a_id, true),
+            (d2.to_string(), b_id, false)
+        ]),
         "a converging document is recorded, never as the creator"
     );
     let only2 = claim_of(&pool, d2, "Only in record two.").await;
     assert_eq!(
         ingest_records(&pool, only2).await,
-        vec![(d2.to_string(), b_id, true)]
+        sorted(vec![(d2.to_string(), b_id, true)])
     );
 
     // The same document, re-ingested by another ingester.
@@ -1493,7 +1502,10 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         .expect("b re-ingests the first document");
     assert_eq!(
         ingest_records(&pool, only1).await,
-        vec![(d1.to_string(), a_id, true), (d1.to_string(), b_id, false)],
+        sorted(vec![
+            (d1.to_string(), a_id, true),
+            (d1.to_string(), b_id, false)
+        ]),
         "every later ingester of the same document is recorded"
     );
     // A re-run by the same ingester adds nothing.
@@ -1539,7 +1551,7 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
     );
     assert_eq!(
         ingest_records(&pool, direct).await,
-        vec![(d3.to_string(), b_id, false)],
+        sorted(vec![(d3.to_string(), b_id, false)]),
         "a document repeating a directly filed claim never becomes its creator"
     );
 }
