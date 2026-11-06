@@ -142,7 +142,8 @@
 //! none elsewhere; an UNSTAMPED `epigraph_app` session reads exactly the same
 //! keys (keep) or lost exactly the narrowed keys (group); and the atlas epoch
 //! is unchanged (keep) or bumped once (group). Any violation rolls the batch
-//! back (exit 2).
+//! back (exit 2). An `--apply` whose batches held a component under lock, or
+//! moved a different number of workflow rows than `--confirm-count`, exits 3.
 //!
 //! # Reversal (`reown-reverse --manifest <this manifest>`)
 //!
@@ -2129,6 +2130,24 @@ pub struct RunReport {
     pub epoch_bumps: usize,
 }
 
+/// The process exit code of a run: 2 when a batch was rolled back; 3 when an
+/// `--apply` held a component under lock or moved a different number of
+/// workflow rows than the operator confirmed (the shortfall must not pass as
+/// success); else 0.
+#[must_use]
+pub fn exit_code(report: &RunReport, opts: &Options) -> i32 {
+    if !report.batch_failures.is_empty() {
+        2
+    } else if opts.apply
+        && (!report.held_under_lock.is_empty()
+            || Some(report.workflows_moved) != opts.confirm_count)
+    {
+        3
+    } else {
+        0
+    }
+}
+
 fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
     for (n, h) in &p.held {
         writeln!(out, "HELD-LINEAGE\t{n}\t{h}")?;
@@ -2464,6 +2483,13 @@ pub async fn run(
             "all held in every batch (visibility unchanged, atlas epoch unchanged)".to_string()
         }
     )?;
+    if exit_code(&report, opts) == 3 {
+        writeln!(
+            out,
+            "SHORTFALL: {} workflow row(s) moved, {:?} confirmed; exit 3",
+            report.workflows_moved, opts.confirm_count
+        )?;
+    }
     if act.narrows() && opts.apply && report.epoch_bumps > 0 {
         writeln!(
             out,
@@ -3337,6 +3363,42 @@ mod tests {
         assert_eq!(Visibility::parse("group").unwrap(), Visibility::Group);
         assert!(Visibility::parse("public").is_err());
         assert!(Visibility::parse("").is_err());
+    }
+
+    #[test]
+    fn an_apply_that_held_or_fell_short_of_the_confirmed_count_exits_3() {
+        let o = Options {
+            confirm_count: Some(3),
+            ..opts()
+        };
+        let ok = RunReport {
+            workflows_moved: 3,
+            ..Default::default()
+        };
+        assert_eq!(exit_code(&ok, &o), 0);
+        let short = RunReport {
+            workflows_moved: 2,
+            ..Default::default()
+        };
+        assert_eq!(exit_code(&short, &o), 3, "fewer rows than confirmed");
+        let held = RunReport {
+            workflows_moved: 3,
+            held_under_lock: vec![(vec!["a".into()], "changed".into())],
+            ..Default::default()
+        };
+        assert_eq!(exit_code(&held, &o), 3, "a component held under lock");
+        let failed = RunReport {
+            batch_failures: vec![(1, "x".into())],
+            ..Default::default()
+        };
+        assert_eq!(exit_code(&failed, &o), 2);
+        // A dry run moves nothing and confirms nothing: 0.
+        let dry = Options {
+            apply: false,
+            confirm_count: None,
+            ..opts()
+        };
+        assert_eq!(exit_code(&RunReport::default(), &dry), 0);
     }
 
     #[test]

@@ -2080,11 +2080,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         Command::ReownWorkflows { .. } => {
             let (opts, names) = reown_wf_opts.expect("built above");
             let report = reown_workflows::run(&mut conn, &opts, &names, &mut stdout).await?;
-            Ok(if report.batch_failures.is_empty() {
-                0
-            } else {
-                2
-            })
+            Ok(reown_workflows::exit_code(&report, &opts))
         }
         Command::RestrictClaims { claims_file, .. } => {
             let opts = restrict_opts.expect("built above");
