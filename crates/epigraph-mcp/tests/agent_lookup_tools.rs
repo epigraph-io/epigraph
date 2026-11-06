@@ -215,3 +215,94 @@ fn both_tools_are_mapped_to_claims_read() {
         Some("claims:read")
     );
 }
+
+/// A document extraction naming one author, as the ingest tools take it.
+fn one_author_extraction(
+    doi: &str,
+    author: &str,
+    tag: &str,
+) -> epigraph_ingest::schema::DocumentExtraction {
+    serde_json::from_value(serde_json::json!({
+        "source": {
+            "title": format!("Card Count Study {tag}"),
+            "doi": doi,
+            "source_type": "Paper",
+            "authors": [{"name": author, "affiliations": [], "roles": ["author"]}]
+        },
+        "thesis": format!("Ingested authorship is counted on the author's card ({tag})."),
+        "thesis_derivation": "TopDown",
+        "sections": [{
+            "title": format!("Counting {tag}"),
+            "paragraphs": [{
+                "text": format!("Every claim the ingest attributes to an author is backed by its paper ({tag})."),
+                "atoms": [format!("An ingest attribution is backed by the author's paper ({tag}).")],
+                "generality": [1],
+                "confidence": 0.9
+            }]
+        }],
+        "relationships": []
+    }))
+    .expect("fixture parses")
+}
+
+/// The card's trusted-attribution rule against the REAL ingest walks (the
+/// document walk and the spine walk), not a hand-built copy of what they
+/// write: every in-force `asserts` edge the ingest gives a name-derived
+/// author is backed by that author's paper, so `get_agent` counts all of
+/// them, and the paper once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) {
+    let reader = app_server(&pool).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let ingester = common::build_scoped_test_server_generated_signer(
+        pool.clone(),
+        fixture::scoped_pool(&pool).await,
+    );
+    let v = fixture::public_viewer(&pool).await;
+
+    for (walk, doi, author) in [
+        ("document", "10.9999/card-count.doc", "Thaddeus Wrenfield"),
+        ("spine", "10.9999/card-count.spine", "Philippa Ashcombe"),
+    ] {
+        let x = one_author_extraction(doi, author, walk);
+        if walk == "document" {
+            tools::ingestion::do_ingest_document(&ingester, &v, &x, None)
+                .await
+                .expect("document ingest");
+        } else {
+            tools::ingestion::do_ingest_document_spine(&ingester, &v, &x, None)
+                .await
+                .expect("spine ingest");
+        }
+        let node: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE display_name = $1")
+            .bind(author)
+            .fetch_one(&pool)
+            .await
+            .expect("the name-derived author node");
+        let attributions: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT e.target_id) FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'agent' \
+                AND e.relationship = 'asserts' AND e.target_type = 'claim' \
+                AND (e.valid_to IS NULL OR e.valid_to > now())",
+        )
+        .bind(node)
+        .fetch_one(&pool)
+        .await
+        .expect("attribution edges");
+        assert!(
+            attributions > 0,
+            "CALIBRATION ({walk}): the ingest attributed claims to its author"
+        );
+
+        let card = get(&reader, &pool, outsider, node).await;
+        assert_eq!(card["counts"]["authored_papers"], 1, "{walk}: {card}");
+        assert_eq!(
+            card["counts"]["pending_authored_papers"], 0,
+            "{walk}: {card}"
+        );
+        assert_eq!(
+            card["counts"]["asserted_claims"], attributions,
+            "{walk}: the card left out attributions the real ingest wrote: {card}"
+        );
+    }
+}
