@@ -725,28 +725,87 @@ async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
     }
 }
 
-/// The retirement instant is read from the audit row only 191's trigger can
-/// write. An application session cannot plant an earlier one: the insert is
-/// refused, so a stranger cannot cut a live agent's claims off its human.
+/// `INSERT` one `security_events` row on `conn`: `(event_type, agent_id,
+/// details {operator_id}, created_at or now())`.
+async fn plant_event(
+    conn: &mut sqlx::PgConnection,
+    event_type: &str,
+    agent: Uuid,
+    operator: Uuid,
+    created_at: Option<chrono::DateTime<Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO security_events (event_type, agent_id, success, details, created_at) \
+         VALUES ($1, $2, true, jsonb_build_object('operator_id', $3::text), \
+                 COALESCE($4, now()))",
+    )
+    .bind(event_type)
+    .bind(agent)
+    .bind(operator)
+    .bind(created_at)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+}
+
+/// The retirement instant is read from the `operator.link_retired` audit row,
+/// and migration 191's restrictive policy makes that row the trigger's alone.
+/// Both arms the permissive append policy admits are refused for it, with or
+/// without a backdated `created_at`: a session stamped as the agent itself,
+/// and an application session with no principal. CALIBRATION: the same
+/// sessions append a benign event attributed the same way, so the refusal is
+/// the restrictive policy's. No planted row cuts a live agent's claims off
+/// its human.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_application_session_cannot_plant_a_retirement(pool: PgPool) {
+async fn an_application_session_cannot_plant_or_backdate_a_retirement(pool: PgPool) {
     let scoped = app_scoped(&pool).await;
     let (op, _) = human(&pool, "Linked Operator").await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
     link(&pool, agent, op).await;
-    let viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
-    let mut tx = scoped.begin_as(&viewer).await.expect("stamped write");
-    let planted = sqlx::query(
-        "INSERT INTO security_events (event_type, agent_id, success, details) \
-         VALUES ('operator.link_retired', $1, true, jsonb_build_object('operator_id', $2::text))",
+    let plain = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let as_agent = Viewer::resolve(&pool, agent).await.expect("resolve");
+    let backdated = Some(Utc::now() - Duration::days(30));
+
+    for created_at in [None, backdated] {
+        // No principal (the append policy's pre-authentication arm).
+        let mut conn = plain.acquire().await.expect("conn");
+        plant_event(&mut conn, "test.provenance_benign", agent, op, created_at)
+            .await
+            .expect("CALIBRATION: a principal-less session appends a benign event");
+        assert!(
+            plant_event(&mut conn, "operator.link_retired", agent, op, created_at)
+                .await
+                .is_err(),
+            "no principal: refused (created_at {created_at:?})"
+        );
+        drop(conn);
+
+        // Stamped as the agent itself (the append policy's attribution arm).
+        let mut tx = scoped.begin_as(&as_agent).await.expect("stamped write");
+        plant_event(&mut tx, "test.provenance_benign", agent, op, created_at)
+            .await
+            .expect("CALIBRATION: the agent appends a benign event about itself");
+        tx.commit().await.expect("commit");
+        let mut tx = scoped.begin_as(&as_agent).await.expect("stamped write");
+        assert!(
+            plant_event(&mut tx, "operator.link_retired", agent, op, created_at)
+                .await
+                .is_err(),
+            "stamped as the agent: refused (created_at {created_at:?})"
+        );
+        drop(tx);
+    }
+
+    let planted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE agent_id = $1 AND event_type = 'operator.link_retired'",
     )
     .bind(agent)
-    .bind(op)
-    .execute(&mut *tx)
-    .await;
-    assert!(planted.is_err(), "the audit row is the trigger's alone");
-    drop(tx);
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(planted, 0, "no retirement row landed");
     assert_eq!(
         human_at(
             &pool,
