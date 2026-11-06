@@ -290,6 +290,142 @@ async fn themes_overview_is_cached_per_viewer() {
     app.upstream.verify().await;
 }
 
+/// The `after` value of an upstream request, if any.
+fn after_param(req: &wiremock::Request) -> Option<String> {
+    req.url
+        .query_pairs()
+        .find(|(k, _)| k == "after")
+        .map(|(_, v)| v.into_owned())
+}
+
+#[tokio::test]
+async fn themes_overview_walks_upstream_pages() {
+    let app = spawn().await;
+    let t1 = "00000000-0000-0000-0000-0000000000c1";
+    let t2 = "00000000-0000-0000-0000-0000000000c2";
+    let t3 = "00000000-0000-0000-0000-0000000000c3";
+    let cursor = "t1.1.000000000000000000000000000000c2";
+    // Page 2 first, at a higher priority, so the cursor-carrying request
+    // cannot fall through to page 1's mock.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .and(query_param("after", cursor))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "themes": [{"id": t3, "label": "Third", "claim_count": 1}],
+            "total": 3,
+            "next_cursor": null
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "themes": [{"id": t1, "label": "First", "claim_count": 5},
+                       {"id": t2, "label": "Second", "claim_count": 1}],
+            "total": 3,
+            "next_cursor": cursor
+        })))
+        .expect(1)
+        .mount(&app.upstream)
+        .await;
+    let a = app.sign_in("tok-walk");
+
+    let res = app.get_as("/explorer/bff/themes", &a).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let body = res.json();
+    let ids: Vec<&str> = body["themes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![t1, t2, t3], "all pages, in upstream order");
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["truncated"], false);
+
+    let calls = app.upstream.received_requests().await.unwrap();
+    assert_eq!(calls.len(), 2, "one upstream call per page");
+    assert_eq!(after_param(&calls[0]), None, "page 1 carries no cursor");
+    assert_eq!(after_param(&calls[1]).as_deref(), Some(cursor));
+    for c in &calls {
+        assert!(
+            c.url.query_pairs().any(|(k, v)| k == "limit" && v == "200"),
+            "{}",
+            c.url
+        );
+    }
+
+    // Within 60 s the walked body is served from the cache.
+    let again = app.get_as("/explorer/bff/themes", &a).await;
+    assert_eq!(again.json(), body);
+    assert_eq!(app.upstream.received_requests().await.unwrap().len(), 2);
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn themes_overview_walk_stops_at_three_pages() {
+    let app = spawn().await;
+    // Every page names the same theme and a further page: the walk must stop
+    // at three calls, de-duplicate the theme, and report the cut.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "themes": [{"id": THEME, "label": "Endless", "claim_count": 1}],
+            "total": 9,
+            "next_cursor": "t1.1.2c9a5a4e5f434c4b9a523f0d1e2c7a10"
+        })))
+        .expect(3)
+        .mount(&app.upstream)
+        .await;
+    let a = app.sign_in("tok-endless");
+
+    let res = app.get_as("/explorer/bff/themes", &a).await;
+    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
+    let body = res.json();
+    assert_eq!(
+        body["themes"].as_array().unwrap().len(),
+        1,
+        "a theme repeated across pages is held once"
+    );
+    assert_eq!(body["total"], 9);
+    assert_eq!(body["truncated"], true);
+    assert_eq!(app.upstream.received_requests().await.unwrap().len(), 3);
+    app.upstream.verify().await;
+}
+
+#[tokio::test]
+async fn themes_overview_walk_fails_whole_on_a_page_error() {
+    let app = spawn().await;
+    let cursor = "t1.1.2c9a5a4e5f434c4b9a523f0d1e2c7a10";
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .and(query_param("after", cursor))
+        .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+        .with_priority(1)
+        .mount(&app.upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/graph/themes/overview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "themes": [{"id": THEME, "label": "Page one", "claim_count": 2}],
+            "total": 2,
+            "next_cursor": cursor
+        })))
+        .mount(&app.upstream)
+        .await;
+    let a = app.sign_in("tok-fail");
+
+    let res = app.get_as("/explorer/bff/themes", &a).await;
+    assert_ne!(res.status, StatusCode::OK, "a failed page fails the walk");
+    // Nothing partial was cached: the next request walks again.
+    let before = app.upstream.received_requests().await.unwrap().len();
+    let _ = app.get_as("/explorer/bff/themes", &a).await;
+    let after = app.upstream.received_requests().await.unwrap().len();
+    assert_eq!(after, before + 2, "no partial body was cached");
+}
+
 #[tokio::test]
 async fn communities_overview_is_cached_and_linked() {
     let app = spawn().await;

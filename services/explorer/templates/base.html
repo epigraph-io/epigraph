@@ -19,11 +19,13 @@
 <header class="site-header">
   <div class="site-header__inner">
     <a class="brand" href="{{ ctx.home_url() }}">{{ ctx.product_name() }}</a>
+    {%- block header_search %}
     <form class="search-form" method="get" action="{{ ctx.search_url() }}" role="search">
       <label class="visually-hidden" for="site-search">Search claims</label>
       <input id="site-search" type="search" name="q" value="{{ ctx.search_query }}" placeholder="Search claims" autocomplete="off">
       <button type="submit">Search</button>
     </form>
+    {%- endblock %}
     <nav class="auth-nav" aria-label="Account">
       {%- if ctx.signed_in %}
       <form method="post" action="{{ ctx.logout_url() }}">

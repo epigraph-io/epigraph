@@ -44,7 +44,11 @@ pub mod batch;
 pub mod bba_retract;
 pub mod belief;
 pub mod challenge;
+#[cfg(feature = "db")]
+pub mod claim_context;
 pub mod claims;
+#[cfg(feature = "db")]
+pub mod claims_batch_get;
 pub mod claims_query;
 pub mod clusters;
 pub mod community;
@@ -77,6 +81,9 @@ pub mod extensions;
 pub mod gaps;
 #[cfg(feature = "db")]
 pub mod graph;
+/// The Atlas layout and its bundle drill-down (migration 197).
+#[cfg(feature = "db")]
+pub mod graph_layout;
 #[cfg(feature = "db")]
 pub mod graph_neighborhood;
 #[cfg(feature = "db")]
@@ -274,6 +281,31 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
+    res
+}
+
+/// Response headers for a route whose every response is viewer-scoped
+/// (`POST /api/v1/search/semantic`): its body depends on who asks, so no
+/// shared cache may store it, and a private cache must key on the credential.
+///
+/// * `Cache-Control: private, no-store`.
+/// * `Vary: Authorization`.
+///
+/// Inserted, not appended, so a handler cannot weaken them. Applied with
+/// `middleware::map_response` on the method router, inside the protected
+/// chain, so bearer auth still wraps it; the handler's own return type is
+/// unchanged.
+#[cfg(feature = "db")]
+async fn viewer_scoped_cache_headers(
+    mut res: axum::response::Response,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let h = res.headers_mut();
+    h.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    h.insert(header::VARY, HeaderValue::from_static("Authorization"));
     res
 }
 
@@ -721,6 +753,11 @@ pub fn create_router_with_extensions(
         .route("/api/v1/graph/neighborhood", get(graph::neighborhood))
         .route("/api/v1/graph/themes/overview", get(graph::themes_overview))
         .route(
+            "/api/v1/graph/themes/layout",
+            get(graph_layout::themes_layout),
+        )
+        .route("/api/v1/graph/links", get(graph_layout::graph_links))
+        .route(
             "/api/v1/graph/themes/:theme_id/expand",
             get(graph::themes_expand),
         )
@@ -808,13 +845,21 @@ pub fn create_router_with_extensions(
             get(timeline::get_agent_timeline),
         )
         .route("/lineage/:claim_id", get(lineage::get_lineage))
-        .route("/api/v1/search/semantic", post(search::semantic_search))
+        .route(
+            "/api/v1/search/semantic",
+            post(search::semantic_search)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         .route("/api/v1/claims", get(claims_query::list_claims_query_route))
         .route(
             "/api/v1/claims/needing-embeddings",
             get(claims::find_claims_needing_embeddings),
         )
         .route("/api/v1/claims/:id", get(claims::get_claim))
+        .route(
+            "/api/v1/claims/batch-get",
+            post(claims_batch_get::batch_get_claims),
+        )
         .route("/api/v1/query/rag", get(rag::rag_context))
         .route("/api/v1/search/evidence", get(rag::search_evidence))
         .route(
@@ -901,6 +946,10 @@ pub fn create_router_with_extensions(
             get(provenance_chain::claim_provenance_chain),
         )
         .route("/api/v1/claims/:id/ego", get(ego::claim_ego))
+        .route(
+            "/api/v1/claims/:id/context",
+            get(claim_context::claim_context),
+        )
         .route(
             "/api/v1/claims/:id/placement",
             get(placement::claim_placement),

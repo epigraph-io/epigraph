@@ -162,6 +162,14 @@ impl ResponseCache {
     pub fn purge_expired(&self) -> usize {
         self.map.purge_expired()
     }
+
+    /// Shrink the cache to at most `max` entries, dropping the nearest
+    /// deadlines first (see [`TtlMap::evict_oldest_beyond`]); returns how
+    /// many were dropped. The per-viewer Atlas layout entries make the
+    /// number of keys grow with viewers × regions, so housekeeping bounds it.
+    pub fn evict_oldest_beyond(&self, max: usize) -> usize {
+        self.map.evict_oldest_beyond(max)
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +222,18 @@ mod tests {
         assert_eq!(m.evict_oldest_beyond(0), 2);
         assert!(m.is_empty());
         assert_eq!(m.evict_oldest_beyond(0), 0);
+    }
+
+    #[test]
+    fn response_cache_evicts_oldest_beyond_the_cap() {
+        let c = ResponseCache::new();
+        c.insert("short", Arc::new(1u8), Duration::from_secs(10));
+        c.insert("long", Arc::new(2u8), Duration::from_secs(60));
+        c.insert("mid", Arc::new(3u8), Duration::from_secs(30));
+        assert_eq!(c.evict_oldest_beyond(3), 0, "already within the cap");
+        assert_eq!(c.evict_oldest_beyond(1), 2);
+        assert!(c.get::<u8>("short").is_none() && c.get::<u8>("mid").is_none());
+        assert_eq!(c.get::<u8>("long").as_deref(), Some(&2));
     }
 
     #[test]

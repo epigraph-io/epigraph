@@ -39,6 +39,7 @@
 <div class="landing-overviews">
   <section class="section" aria-labelledby="themes-title">
     <h2 id="themes-title" class="section__title">Themes</h2>
+    <p class="small"><a href="{{ ctx.links.atlas() }}">Open the Atlas</a>, a zoomable map of these themes and their claims.</p>
     {%- match themes %}
     {%- when Degraded::Available { data } %}
     {%- if data.items.is_empty() %}

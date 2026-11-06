@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}{{ og.title }} · {{ ctx.product_name() }}{% endblock %}
+
+{% block og %}
+{% include "core/og.html" %}
+{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("atlas.css") }}">
+<script src="{{ ctx.static_url("atlas.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<section class="notice signin-prompt atlas-anon" id="atlas" data-atlas-mode="anon" aria-labelledby="signin-title">
+  <h1 id="signin-title">Sign in to open the Atlas</h1>
+  <p class="lead">The Atlas is a zoomable map of the EpiGraph knowledge graph: regions, themes and the claims in them. It shows signed-in readers what they can read.</p>
+  <p><a class="button" data-role="atlas-signin" href="{{ ctx.login_url() }}">Sign in</a></p>
+</section>
+{% endblock %}

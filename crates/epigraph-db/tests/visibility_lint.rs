@@ -2498,6 +2498,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "insert_attested_conn",
         "WRITE. The attested edge INSERT (ruling R-50) every signed edge twin runs: one INSERT carrying content_hash, the v1 edge signature and signer_id, re-made once over the stored row if the database rewrote a column; nothing to filter, and the INSERT is authorised by edges_tenancy's WITH CHECK.",
     ),
+    // Atlas P3a (migration 197): the operator layout build's writes.
+    (
+        "atlas_layout.rs",
+        "write_run",
+        "WRITE. One Atlas layout run into the four untenanted derived tables `atlas_layout_runs`, \
+         `_regions`, `_themes` and `_theme_links` (migration 197): no claim_id column, no FK to \
+         claims, no visibility or owner_group_id. Every row is an aggregate of PUBLIC rows the \
+         same transaction read through `read_public_inputs`, which spends its viewer and names \
+         `visibility = 'public'`; the operator CLI `atlas_layout` calls it on the maintenance \
+         connection, and the application role holds SELECT only on these tables.",
+    ),
+    (
+        "atlas_layout.rs",
+        "prune_runs",
+        "WRITE. Deletes all but the newest N rows of the untenanted `atlas_layout_runs` \
+         (migration 197), its child rows going by the FK cascade; a corpus-wide maintenance \
+         statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
+         column to name (the shape of claim_theme.rs `delete_all_conn`).",
+    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -2651,6 +2670,64 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // Atlas P3a (migration 197): untenanted layout reads. Each is ONE statement
+    // over `atlas_layout_*` (no claim_id, no FK to claims, no visibility or
+    // owner_group_id) and `claim_themes` (a corpus-wide row, as
+    // `ClaimThemeRepository::list_summaries` treats it). The per-viewer decision
+    // is made before each is called, by `visible_themes` /
+    // `any_visible_member`, which splice the viewer onto `claims`.
+    (
+        "atlas_layout.rs",
+        "run",
+        "Reads one `atlas_layout_runs` row (the named run or the latest) joined to the one-row \
+         `atlas_layout_epoch`, with a staleness probe over `claim_themes.created_at` and the \
+         run's own `atlas_layout_themes` count. None of these tables has a visibility or \
+         owner_group_id column, the row carries no claim content or claim id, and the epoch \
+         number itself is not returned (only whether it still equals the run's). Same reason \
+         class as cluster_run.rs `latest`; the layout routes then read the run's contents \
+         through the caller's viewer.",
+    ),
+    (
+        "atlas_layout.rs",
+        "resolve_sides",
+        "Resolves the two ids of a `/graph/links` request in one statement: a region id of the \
+         run to its shared themes (`atlas_layout_themes`), else a `claim_themes` id to itself. \
+         Neither table carries tenancy columns, and the answer is theme ids only. The route \
+         refuses either side unless `any_visible_member` (spliced onto `claims`) finds a current \
+         member the caller can read, with the same 404 as an id that names nothing.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_rows",
+        "Reads the `atlas_layout_regions` rows of one run (ordinal, label, x, y, r): shared \
+         positions computed from public rows only, with no visibility or owner_group_id column. \
+         The caller (`overview`, `region_detail`) keeps only regions holding a theme the viewer \
+         can read, as decided by the spliced `visible_themes`.",
+    ),
+    (
+        "atlas_layout.rs",
+        "theme_rows",
+        "Reads `claim_themes` labels (a corpus-wide row, as `list_summaries` treats it) and the \
+         shared `atlas_layout_themes` position for theme ids the caller already established the \
+         viewer can see through the spliced `visible_themes`; neither table has a visibility or \
+         owner_group_id column, and no claim row is read.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_bundle_rows",
+        "Sums `atlas_layout_theme_links` (public link counts the build stored) into region-pair \
+         bundles over a theme set BOUND by the caller: the viewer's visible shared themes from \
+         the spliced `visible_themes`, both themes of every pair required in it. The layout \
+         tables have no visibility or owner_group_id column; no claim or edge row is read.",
+    ),
+    (
+        "atlas_layout.rs",
+        "region_link_rows",
+        "Sums `atlas_layout_theme_links` into a region's theme pairs and theme-to-region stubs \
+         over a theme set BOUND by the caller: the viewer's visible shared themes from the \
+         spliced `visible_themes`, both themes of every pair required in it. The layout tables \
+         have no visibility or owner_group_id column; no claim or edge row is read.",
+    ),
     // ── Batch B1 (rulings R-22, R-36): derivation scope and same-human owners.
     (
         "agent.rs",

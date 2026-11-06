@@ -111,7 +111,7 @@ pub use repos::{
     EventCursor, EventRepository, EventRow, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow,
     EvidenceEncryptionRepository, EvidenceEncryptionRow, EvidenceListFilter, EvidenceListRow,
     EvidenceRepository, EvidenceSearchResult, EvolveStepResult, ExperimentRepository,
-    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository,
+    ExperimentResultRepository, ExperimentResultRow, ExperimentRow, FactorRepository, FlatRanking,
     FrameClaimBeliefHit, FrameRepository, GapAnalysisResult, GapChallengeRow, GapRecord,
     GapRepository, GraphExpansionHit, GraphViewRepository, GroundedNeighbor,
     GroupKeyEpochRepository, GroupMembershipRepository, GroupRepository, GroupRow,
@@ -155,10 +155,13 @@ pub use repos::{PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{RoleAssignmentRepository, RoleAssignmentRow};
 pub use repos::{SystemAgentLookup, SystemAgentRepository, SystemAgentRole};
 pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
+// The Atlas layout reads and the operator build (migration 197).
+pub use repos::AtlasLayoutRepository;
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
-    ClaimPlacement, ClusterRunRepository, ClusterRunRow, EgoEdgeRow, EgoEdges, EgoEntity,
-    EgoRepository,
+    ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,
+    ContextEdgeRow, ContextEdgeTally, ContextPage, ContextPaperRow, EgoEdgeRow, EgoEdges,
+    EgoEntity, EgoRepository, CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
 pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
 

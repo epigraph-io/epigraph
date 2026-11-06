@@ -110,7 +110,9 @@ use std::path::Path;
 /// * **untenanted** — the table has no tenancy columns (`agents`, `methods`,
 ///   `experiments`, `experiment_results`, `behavioral_executions`,
 ///   `match_candidates`, `entities`, `claim_themes`, `graph_cluster_runs`,
-///   `claim_encryption`), or the read is the caller's own membership.
+///   `claim_encryption`, `atlas_layout_runs`, `atlas_layout_regions`,
+///   `atlas_layout_themes`, `atlas_layout_theme_links`, `atlas_layout_epoch`),
+///   or the read is the caller's own membership.
 ///   `workflows` left this list with migration 183 (ruling R-74): a row
 ///   carries its plan's tenancy under forced row security, so a `workflows`
 ///   read is **stamped**, never untenanted.
@@ -692,6 +694,25 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
+    // untenanted: the Atlas layout run and its epoch flag (migration 197); the
+    // run's contents are read through the viewer (`overview`, `region_detail`,
+    // `unplaced_themes`).
+    (
+        "graph_layout.rs",
+        "themes_layout",
+        &["AtlasLayoutRepository::run"],
+    ),
+    // untenanted: the run, and both drill-down ids resolved to theme ids in
+    // one statement (`claim_themes`, `atlas_layout_themes`); each side is then
+    // refused unless `any_visible_member` (viewed) finds a readable member.
+    (
+        "graph_layout.rs",
+        "graph_links",
+        &[
+            "AtlasLayoutRepository::resolve_sides",
+            "AtlasLayoutRepository::run",
+        ],
+    ),
     // open finding: F-aggregate-existence-oracles (the two decomposes_to
     // counts deciding center_kind).
     (
@@ -1008,8 +1029,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // no SQL: the query embedding.
     ("rag.rs", "rag_context", &["generate_query_embedding"]),
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
-    // no SQL (embeddings), untenanted (claim_themes, the centroid-dimension
-    // probe), and the content read registered in viewer_route_table_lint.rs's
+    // no SQL (embeddings, including `generate_walk_query_embedding`, the
+    // pageable request's variant that answers 503 instead of the mock when the
+    // service fails), untenanted (claim_themes, the centroid-dimension probe),
+    // and the content read registered in viewer_route_table_lint.rs's
     // UNCOMPENSATED_INLINE_READS (ids from a viewer-spliced theme read).
     (
         "search.rs",
@@ -1019,6 +1042,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "generate_query_embedding",
             "generate_query_embedding",
             "generate_query_embedding_with_dim",
+            "generate_walk_query_embedding",
             "sqlx::query(SELECT).fetch_all",
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
