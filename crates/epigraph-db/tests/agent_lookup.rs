@@ -1040,6 +1040,37 @@ async fn a_disclosed_role_does_not_move_with_client_or_registration_status(pool:
     );
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn punctuation_and_identifier_spelling_fold(pool: PgPool) {
+    let (asker, _) = named(&pool, "asker").await;
+    let (jp, _) = named(&pool, "Jean-Pierre Dubois").await;
+    let (ob, _) = named(&pool, "Aine O'Brien").await;
+    let (orc, _) = named(&pool, "Hale Mercer").await;
+    sqlx::query("UPDATE agents SET orcid = '0000-0002-0000-000X' WHERE id = $1")
+        .bind(orc)
+        .execute(&pool)
+        .await
+        .expect("public orcid");
+
+    for (q, want, tier) in [
+        ("jean pierre dubois", jp, MatchTier::Exact),
+        ("Jean–Pierre Dubois", jp, MatchTier::Exact),
+        ("pierre", jp, MatchTier::Prefix),
+        ("Aine O’Brien", ob, MatchTier::Exact),
+        ("aine obrien", ob, MatchTier::Exact),
+        ("000000020000000x", orc, MatchTier::Orcid),
+        ("0000-0002-0000-000x", orc, MatchTier::Orcid),
+        ("orcid.org/0000-0002-0000-000X", orc, MatchTier::Orcid),
+    ] {
+        let r = find_as(&pool, asker, q, None, None, None).await;
+        let top = r
+            .results
+            .first()
+            .unwrap_or_else(|| panic!("{q:?} found nothing"));
+        assert_eq!((top.card.id, top.tier), (want, tier), "{q:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Migration 198
 // ---------------------------------------------------------------------------

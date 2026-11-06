@@ -114,17 +114,26 @@ pub fn d4_operator_gate(agent_expr: &str, principal_bind: usize, admin_bind: usi
         .replace("$A", &format!("${admin_bind}"))
 }
 
-/// The accent- and case-folding of a text expression, in SQL.
+/// The accent-, case- and punctuation-folding of a text expression, in SQL.
 ///
 /// NFD-decompose, drop the combining marks (U+0300..U+036F), spell out the
 /// letters that do not decompose (`ß` → `ss`, `æ` → `ae`, `ø` → `o`, `ł` →
-/// `l`, ...), lower-case (last, so it only ever lower-cases ASCII letters,
-/// which every collation does, a `C` one included), and collapse whitespace.
-/// Built-in functions only: no `unaccent`.
+/// `l`, ...), drop apostrophes (`O'Brien`, `O’Brien` and `OBrien` fold
+/// alike), turn hyphens, dashes, periods and commas into spaces
+/// (`Jean-Pierre` folds as `jean pierre`, so each part is a word for the
+/// prefix tier), lower-case, and collapse whitespace. Built-in functions
+/// only: no `unaccent`.
+///
+/// `lower()` follows the database's collation: under a libc or ICU UTF-8
+/// collation it folds Greek, Cyrillic and other cased scripts too; under the
+/// `C` collation it folds ASCII only, so non-Latin names then match
+/// case-sensitively. The query and the stored name always fold on the same
+/// database, so the two sides never fold differently.
 #[must_use]
 pub fn fold_sql(expr: &str) -> String {
     format!(
         "pg_catalog.btrim(pg_catalog.regexp_replace(pg_catalog.lower(\
+           pg_catalog.regexp_replace(pg_catalog.regexp_replace(\
            pg_catalog.translate(\
              pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(\
              pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(\
@@ -132,17 +141,32 @@ pub fn fold_sql(expr: &str) -> String {
                                          '[\\u0300-\\u036f]', '', 'g'), \
              'ß', 'ss'), 'ẞ', 'SS'), 'æ', 'ae'), 'Æ', 'AE'), 'œ', 'oe'), 'Œ', 'OE'), \
              'þ', 'th'), 'Þ', 'TH'), \
-             'øØłŁđĐħĦŧŦıðÐ', 'oOlLdDhHtTidD')), \
+             'øØłŁđĐħĦŧŦıðÐ', 'oOlLdDhHtTidD'), \
+           '[''’ʼ]', '', 'g'), \
+           '[‐‑‒–—―.,-]', ' ', 'g')), \
          '\\s+', ' ', 'g'))"
     )
 }
 
-/// Strip the resolver prefix an ORCID or ROR id may be written with, in SQL.
+/// Strip the resolver prefix a ROR id may be written with, in SQL.
 fn ident_sql(expr: &str) -> String {
     format!(
         "pg_catalog.lower(pg_catalog.btrim(pg_catalog.regexp_replace(pg_catalog.btrim({expr}), \
            '^https?://(www\\.)?(orcid\\.org|ror\\.org)/', '', 'i')))"
     )
+}
+
+/// An ORCID iD's 16-character key, in SQL, or NULL when `expr` is not one:
+/// the resolver prefix (with or without a scheme) and every separator are
+/// dropped and the check character upper-cased, so `0000-0002-0000-000x`,
+/// `000000020000000X` and `https://orcid.org/0000-0002-0000-000X` are one key.
+fn orcid_sql(expr: &str) -> String {
+    let norm = format!(
+        "pg_catalog.upper(pg_catalog.regexp_replace(pg_catalog.regexp_replace(\
+           pg_catalog.btrim({expr}), '^(https?://)?(www\\.)?orcid\\.org/', '', 'i'), \
+           '[^0-9A-Za-z]', '', 'g'))"
+    );
+    format!("(CASE WHEN {norm} ~ '^[0-9]{{15}}[0-9X]$' THEN {norm} END)")
 }
 
 /// The human an agent acts for, in SQL, read from the binding RECORD so that
@@ -434,9 +458,9 @@ impl AgentLookupRepository {
     ) -> Result<Vec<AgentNameMatch>, DbError> {
         let sql = format!(
             "WITH q AS ( \
-                 SELECT {fold_q} AS f, {ident_q} AS ident \
+                 SELECT {fold_q} AS f, {ident_q} AS ident, {orcid_q} AS orcid_q \
              ), q2 AS ( \
-                 SELECT f, ident, \
+                 SELECT f, ident, orcid_q, \
                         pg_catalog.replace(pg_catalog.replace(pg_catalog.replace(f, '\\', '\\\\'), \
                                            '%', '\\%'), '_', '\\_') AS f_like \
                    FROM q \
@@ -453,7 +477,7 @@ impl AgentLookupRepository {
              ), ranked AS ( \
                  SELECT c.id, c.display_name, c.created_at, \
                         CASE \
-                          WHEN c.details_ok AND q2.ident <> '' AND c.orcid_k = q2.ident THEN 'orcid' \
+                          WHEN c.details_ok AND c.orcid_k = q2.orcid_q THEN 'orcid' \
                           WHEN c.details_ok AND q2.ident <> '' AND c.ror_k = q2.ident THEN 'ror' \
                           WHEN c.fname = q2.f THEN 'exact' \
                           WHEN c.fname LIKE q2.f_like || '%' \
@@ -463,8 +487,8 @@ impl AgentLookupRepository {
                         COALESCE(similarity(c.fname, q2.f), 0)::float8 AS score \
                    FROM cand c, q2 \
                   WHERE q2.f <> '' AND ( \
-                        (c.details_ok AND q2.ident <> '' \
-                          AND (c.orcid_k = q2.ident OR c.ror_k = q2.ident)) \
+                        (c.details_ok AND (c.orcid_k = q2.orcid_q \
+                                            OR (q2.ident <> '' AND c.ror_k = q2.ident))) \
                      OR c.fname = q2.f \
                      OR c.fname LIKE q2.f_like || '%' \
                      OR c.fname LIKE '% ' || q2.f_like || '%' \
@@ -477,8 +501,9 @@ impl AgentLookupRepository {
               LIMIT $6",
             fold_q = fold_sql("$1::text"),
             ident_q = ident_sql("$1::text"),
+            orcid_q = orcid_sql("$1::text"),
             fold_name = fold_sql("a.display_name"),
-            ident_orcid = ident_sql("a.orcid"),
+            ident_orcid = orcid_sql("a.orcid"),
             ident_ror = ident_sql("a.ror_id"),
         );
         type MatchRow = (Uuid, Option<String>, DateTime<Utc>, String, f64);
