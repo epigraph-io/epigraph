@@ -4822,6 +4822,172 @@ async fn after_a_restore_a_registered_revert_to_an_identity_attached_by_name_sta
     }
 }
 
+/// Rows `epigraph_role_derived_memberships(agent, now() + secs)` answers for
+/// `group`, on the test's privileged session.
+async fn derived_rows_at(pool: &PgPool, agent: Uuid, group: Uuid, secs: i32) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM public.epigraph_role_derived_memberships( \
+                $1, now() + make_interval(secs => $3)) WHERE group_id = $2",
+    )
+    .bind(agent)
+    .bind(group)
+    .bind(secs)
+    .fetch_one(pool)
+    .await
+    .expect("the derivation at an instant")
+}
+
+/// STEP A of the cut-off, as `docs/tenancy.md` ("Cutting a job off") states
+/// it, run on a MAINTENANCE session (`role_agents` is FORCE RLS: any other
+/// session reads no row, so its empty answer means nothing). Returns the
+/// `(role, identity)` pairs it called 166's detach verb on; the verb detaches
+/// EVERY un-detached row the identity holds for the role, made by name or
+/// copied, in any window, a future-dated one included.
+async fn step_a(pool: &PgPool, group: Uuid, folder: &str) -> Vec<(String, Uuid)> {
+    let mut c = maint(pool).await;
+    // Every role the group is bound to in attached mode; every identity with
+    // a prompt snapshot in the folder; their un-detached rows (any window) and
+    // the rows those chain up to. A row made by name among them, un-detached,
+    // names an identity to detach.
+    let targets: Vec<(String, Uuid)> = sqlx::query_as(
+        "WITH RECURSIVE roles AS ( \
+             SELECT b.role FROM group_role_bindings b \
+              WHERE b.group_id = $1 AND b.revoked_at IS NULL AND b.attached_agents), \
+         ids AS ( \
+             SELECT DISTINCT s.agent_id FROM agent_prompt_snapshots s \
+              WHERE s.group_folder = $2), \
+         chain (id, role, agent_id, inherited_from, detached_at) AS ( \
+             SELECT ra.id, ra.role, ra.agent_id, ra.inherited_from, ra.detached_at \
+               FROM role_agents ra JOIN ids ON ids.agent_id = ra.agent_id \
+              WHERE ra.role IN (SELECT role FROM roles) AND ra.detached_at IS NULL \
+             UNION \
+             SELECT hop.id, hop.role, hop.agent_id, hop.inherited_from, hop.detached_at \
+               FROM role_agents hop JOIN chain ch ON hop.id = ch.inherited_from) \
+         SELECT DISTINCT role, agent_id FROM chain \
+          WHERE inherited_from IS NULL AND detached_at IS NULL \
+          ORDER BY 1, 2",
+    )
+    .bind(group)
+    .bind(folder)
+    .fetch_all(&mut *c)
+    .await
+    .expect("step A's enumeration");
+    reset(c).await;
+    for (role, agent) in &targets {
+        detach_from_role(pool, role, *agent).await;
+    }
+    targets
+}
+
+/// STEP A TAKES THE JOB OUT FOR GOOD: EVERY UN-DETACHED ROW MADE BY NAME, A
+/// FUTURE-DATED ONE INCLUDED, FOR EVERY ROLE THE GROUP IS BOUND TO IN
+/// `attached_agents` MODE. The group carries two attached-mode bindings
+/// (ROLE and ALT; 165 allows one live binding per role). Q is attached by
+/// name to both; P succeeds Q; Z, in the same folder, is attached by name to
+/// ROLE with a window that opens in an hour (166 refuses only a back-dated
+/// row). Step A as documented: on a maintenance session, list every identity
+/// with a prompt snapshot in the folder and, for every attached-mode role of
+/// the group, call the detach verb on each that holds an un-detached row made
+/// by name (any window) or roots a copy one of them holds. An app session
+/// reads no row of `role_agents` at all. Afterwards Q, P and Z are out now and
+/// in two hours, and so is E, the job's next edit from Z registered after
+/// step A. CONTROL: a `registered_agents` binding admits the job through its
+/// operator's role assignment, which no detach touches.
+#[sqlx::test(migrations = "../../migrations")]
+async fn step_a_detaches_every_un_detached_row_made_by_name_in_every_attached_role(pool: PgPool) {
+    const ALT: &str = "role:team-alt";
+    const THIRD: &str = "role:team-third";
+    let (h, _) = human(&pool, "step-a-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Step A Team", "writer").await;
+    define_mode(&pool, ALT, group, "writer", ATTACHED_AGENTS)
+        .await
+        .expect("PREMISE: a second role bound to the same group, attached mode");
+    grant(&pool, ROLE, h, 0, None).await;
+    grant(&pool, ALT, h, 0, None).await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    attach_to_role(&pool, ALT, q).await;
+    let p = register_in(&pool, &identity_key(), Some(q), "g-job").await;
+    let z = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, z, h).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() + interval '1 hour', \
+                                                         NULL, 'role membership test future attach')",
+        )
+        .bind(ROLE)
+        .bind(z)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("PREMISE: a future-dated attachment by name is accepted");
+        (conn, ())
+    })
+    .await;
+    for (id, l) in [(q, "Q"), (p, "P")] {
+        assert_eq!(
+            resolves(&pool, id, group).await,
+            (true, true),
+            "PREMISE: {l}"
+        );
+    }
+    assert_eq!(
+        resolves(&pool, z, group).await,
+        (false, false),
+        "PREMISE: Z's row made by name is not live yet"
+    );
+    assert_eq!(
+        derived_rows_at(&pool, z, group, 7200).await,
+        1,
+        "PREMISE: Z's row made by name admits it in two hours"
+    );
+    let app_rows: i64 = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM role_agents")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("the app session reads role_agents");
+        (conn, n)
+    })
+    .await;
+    assert_eq!(
+        app_rows, 0,
+        "an app session reads no row of role_agents (FORCE RLS): step A's enumeration means nothing there"
+    );
+
+    let detached = step_a(&pool, group, "g-job").await;
+    println!("STEP-A detached (role, identity) = {detached:?} q={q} z={z}");
+    let e = register_in(&pool, &identity_key(), Some(z), "g-job").await;
+    let mut seen = vec![];
+    for (id, l) in [(q, "Q"), (p, "P"), (z, "Z"), (e, "E")] {
+        seen.push((
+            l,
+            resolves(&pool, id, group).await,
+            derived_rows_at(&pool, id, group, 7200).await,
+        ));
+    }
+    println!("STEP-A after: {seen:?}");
+    assert_eq!(
+        seen,
+        vec![
+            ("Q", (false, false), 0),
+            ("P", (false, false), 0),
+            ("Z", (false, false), 0),
+            ("E", (false, false), 0),
+        ],
+        "after step A every identity of the job is out, now and in two hours"
+    );
+
+    define_mode(&pool, THIRD, group, "writer", REGISTERED_AGENTS)
+        .await
+        .expect("PREMISE: a third role bound to the group, registered-agents mode");
+    grant(&pool, THIRD, h, 0, None).await;
+    assert_eq!(
+        resolves(&pool, q, group).await,
+        (true, true),
+        "CONTROL: a registered_agents binding admits Q through its operator's role; no detach reaches it"
+    );
+}
+
 /// A FOLLOW-WRITTEN CHAIN WITH THE DEAD HOP TWO LEVELS UP. P precedes A; A is
 /// attached by name and detached; the job moves on to C (parent A) and then E
 /// (parent C), neither inheriting anything; then P is attached by name. The
