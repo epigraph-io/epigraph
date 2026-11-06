@@ -2612,26 +2612,112 @@ The policy:
   minutes in the future is refused too. Android passkeys still ASSERT
   (elevate) while the file is stale.
 
-Fetching and refreshing the file is an operator job outside the API. Run it
-at least daily, for example from a systemd timer, as a user that can write
-the file's directory:
+Fetching and refreshing the file is an operator job outside the API. A job
+that fails leaves the old file in place, and nothing in the API refuses until
+the file is 48 hours old. Without an alert, the first sign would be a refused
+enrollment. Install BOTH of the following, because each catches what the other
+cannot: a failing run alerts at once, and a job that stopped running (a
+disabled timer never fails) is caught by its age.
+
+**1. The refresh job.** It exits non-zero and prints one line on any failure:
+a failed fetch, a download that fails the API's parse rule (for example one
+non-hex key upstream), or a failed replace. Paths are placeholders:
 
 ```bash
+#!/usr/bin/env bash
+# refresh-android-attestation-status: replace the API's copy of Google's
+# attestation status list. Exit 0 only when the file was replaced.
+set -euo pipefail
 STATUS=/path/readable/by/the/api/android-attestation-status.json
-curl -fsS --max-time 30 -o "$STATUS.tmp" https://android.googleapis.com/attestation/status \
-  && jq -e '(.entries | type == "object")
-            and (.entries | to_entries
-                 | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
-         "$STATUS.tmp" >/dev/null \
-  && mv -f "$STATUS.tmp" "$STATUS"
+URL=https://android.googleapis.com/attestation/status
+TMP="$STATUS.tmp"
+fail() { echo "ANDROID-STATUS REFRESH FAILED: $*" >&2; rm -f "$TMP"; exit 1; }
+curl -fsS --max-time 30 -o "$TMP" "$URL" \
+  || fail "the fetch of $URL failed (curl exit $?); the old file is kept"
+jq -e '(.entries | type == "object")
+       and (.entries | to_entries
+            | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
+   "$TMP" >/dev/null \
+  || fail "the download does not pass the API's parse rule; the old file is kept"
+mv -f "$TMP" "$STATUS" || fail "could not replace $STATUS"
+echo "android attestation status list refreshed: $(jq '.entries | length' "$STATUS") entries"
 ```
 
-The `jq` check is the API's own parse rule (an `entries` object, every key
-hex digits, every entry a string `status`). A download that fails it never
-replaces the good file. The API exits 1 at boot on a file that does not
-parse, so a bad file left in place would take the whole API down at the next
-restart. The `mv` replaces the file atomically, so a partial download is
-never read.
+Run it from a systemd timer at least daily (every 6 hours leaves room for a
+failed run before the 24-hour warning), as a user that can write the file's
+directory, with an alert on failure:
+
+```ini
+# android-status-refresh.service
+[Unit]
+Description=Refresh the Android attestation status list
+OnFailure=android-status-alert@%n.service
+
+[Service]
+Type=oneshot
+User=<a user that can write the file's directory>
+ExecStart=/usr/local/bin/refresh-android-attestation-status
+
+# android-status-refresh.timer
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`android-status-alert@.service` is your alert: a oneshot whose `ExecStart`
+sends the failing unit's name (`%i`) and its last journal lines through a mail
+or chat path whose delivery you have verified end to end. An alert nobody
+receives is no alert.
+
+**2. The age check.** It exits 1 and prints one line unless the file exists,
+is readable, is at most 24 hours old, is not dated in the future, and passes
+the API's parse rule:
+
+```bash
+#!/usr/bin/env bash
+# check-android-attestation-status: exit 1 with one line unless the API's copy
+# of the attestation status list is present, fresh (<= 24h) and well-formed.
+set -uo pipefail
+STATUS=/path/readable/by/the/api/android-attestation-status.json
+MAX_AGE_H=24
+bad() { echo "ANDROID-STATUS CHECK FAILED: $*"; exit 1; }
+[ -r "$STATUS" ] || bad "$STATUS is missing or unreadable; every Android enrollment and anchor is refused"
+age_s=$(( $(date +%s) - $(stat -c %Y "$STATUS") ))
+[ "$age_s" -ge -300 ] || bad "$STATUS is dated in the future; the API refuses it"
+[ "$age_s" -le $(( MAX_AGE_H * 3600 )) ] \
+  || bad "$STATUS is $(( age_s / 3600 ))h old (over ${MAX_AGE_H}h; refused at 48h): the refresh job has stopped or is failing"
+jq -e '(.entries | type == "object")
+       and (.entries | to_entries
+            | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
+   "$STATUS" >/dev/null 2>&1 \
+  || bad "$STATUS does not pass the API's parse rule; the API exits 1 at its next restart"
+echo "android attestation status list OK: $(( age_s / 3600 ))h old, $(jq '.entries | length' "$STATUS") entries"
+```
+
+Run it hourly from your monitoring (or from its own timer with the same
+`OnFailure=` alert), and alert on a non-zero exit.
+
+**What the API logs.** These thresholds are constants, not settings.
+- **At boot**, after `passkey relying party configured`: the line `Android
+  attestation status list` with `path=`, `age_hours=` and `entries=` (INFO).
+  Past 24 hours the same facts are a WARN ("older than 24h: its refresh job
+  has missed a run"). A file that cannot be read is a WARN too. None of these
+  blocks boot.
+- **At every use** (an Android enrollment, an Android anchor, an Android
+  passkey on a lineage) past 24 hours: a WARN (target
+  `passkey.android_status`, `age_hours=`). The file is still used.
+- **Past 48 hours:** refused, as above.
+
+The `jq` check in both scripts is the API's own parse rule (an `entries`
+object, every key hex digits, every entry a string `status`). A download that
+fails it never replaces the good file. The API exits 1 at boot on a file that
+does not parse, so a bad file left in place would take the whole API down at
+the next restart. The `mv` replaces the file atomically, so a partial download
+is never read.
 Never use `curl -R`, `cp -a` or `rsync -t` for this step. Each keeps an older
 modification time, and a file that looks stale refuses every Android anchor
 even though its content is new.
@@ -2797,9 +2883,12 @@ which revokes it.
    the same commit; `verify` checks the three functions' owner and the
    reader's grant to `epigraph_app`. The guard and the cascade apply
    whatever the settings say.
-2. **The status list.** Install the refresh job above, run it once, and
-   check that the file exists and is fresh. Set
-   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` to it.
+2. **The status list.** Install the refresh job and its timer with the
+   `OnFailure=` alert, and the age check under your monitoring (both above).
+   Run the job once, then run the age check: it must print `android
+   attestation status list OK`. Trigger the alert once (for example, run the
+   alert unit by hand) and confirm it arrives. Set
+   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` to the file.
 3. **The Android roots.** Write Google's hardware attestation root
    certificates to a PEM file the API unit can read (one or more
    `-----BEGIN CERTIFICATE-----` blocks). Google publishes them in the
@@ -2817,8 +2906,10 @@ which revokes it.
 4. **The anchored setting** (only if a synced second passkey is wanted): set
    `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY=1`.
 5. **Restart the API.** The boot line `passkey relying party configured`
-   shows `software_attestation=false` and `synced_anchored=true|false`. A
-   configuration error exits 1 with the variable named.
+   shows `software_attestation=false` and `synced_anchored=true|false`, and
+   the next line, `Android attestation status list`, shows the file's
+   `age_hours=` and `entries=` (a WARN past 24 hours). A configuration error
+   exits 1 with the variable named.
 6. **First passkey**, on the phone: `epigraph-operator passkey-enroll
    --person <agent> --reason <text> [--label <device>] --apply`, then open
    the printed `/elevate/enroll/<id>` path on the phone. `list-passkeys`

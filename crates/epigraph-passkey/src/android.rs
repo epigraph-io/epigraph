@@ -49,6 +49,58 @@ pub const KEY_DESCRIPTION_OID: &str = "1.3.6.1.4.1.11129.2.1.17";
 /// leaves a day's slack for one failed run.
 pub const ANDROID_KEY_STATUS_MAX_AGE: Duration = Duration::from_secs(48 * 60 * 60);
 
+/// The age past which a status list copy is reported as AGING: a WARN at
+/// boot and at every use, a day before it is refused at
+/// [`ANDROID_KEY_STATUS_MAX_AGE`]. A daily refresh job that ran keeps the
+/// file younger than this; one that failed, or stopped, does not.
+pub const ANDROID_KEY_STATUS_WARN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How a status list copy's age stands ([`freshness`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusFreshness {
+    /// At most [`ANDROID_KEY_STATUS_WARN_AGE`] old.
+    Fresh,
+    /// Older than [`ANDROID_KEY_STATUS_WARN_AGE`], at most
+    /// [`ANDROID_KEY_STATUS_MAX_AGE`]: still used, and logged at WARN (the
+    /// refresh job has missed a run).
+    Aging,
+    /// Older than [`ANDROID_KEY_STATUS_MAX_AGE`]: refused (fail closed).
+    Stale,
+}
+
+/// How a copy `age` old stands.
+#[must_use]
+pub fn freshness(age: Duration) -> StatusFreshness {
+    if age > ANDROID_KEY_STATUS_MAX_AGE {
+        StatusFreshness::Stale
+    } else if age > ANDROID_KEY_STATUS_WARN_AGE {
+        StatusFreshness::Aging
+    } else {
+        StatusFreshness::Fresh
+    }
+}
+
+/// How old the file at `path` is at `now`, by its modification time. A file
+/// dated in the future within the clock-skew allowance is 0 old.
+///
+/// # Errors
+/// It cannot be read, or it is dated further in the future than the skew
+/// allows (a copy dated far ahead would stay "fresh" forever).
+pub fn age_of(path: &Path, now: SystemTime) -> Result<Duration, String> {
+    let shown = path.display();
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("the attestation status list {shown} cannot be read: {e}"))?;
+    match now.duration_since(modified) {
+        Ok(age) => Ok(age),
+        Err(ahead) if ahead.duration() > STATUS_FUTURE_SKEW => Err(format!(
+            "the attestation status list {shown} is dated {}s in the future",
+            ahead.duration().as_secs()
+        )),
+        Err(_) => Ok(Duration::ZERO),
+    }
+}
+
 /// How far in the future a status file's modification time may be (clock
 /// skew) before the file is refused: a time far ahead would keep a stale copy
 /// "fresh" forever.
@@ -136,17 +188,17 @@ impl StatusList {
     }
 
     /// Read the list at `path`, refusing a copy older than
-    /// [`ANDROID_KEY_STATUS_MAX_AGE`] at `now` (or dated in the future).
+    /// [`ANDROID_KEY_STATUS_MAX_AGE`] at `now` (or dated in the future), and
+    /// logging a WARN for one older than [`ANDROID_KEY_STATUS_WARN_AGE`] (it
+    /// is still used).
     ///
     /// # Errors
     /// The file cannot be read, is stale, or does not parse.
     pub fn load(path: &Path, now: SystemTime) -> Result<Self, String> {
         let shown = path.display();
-        let modified = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| format!("the attestation status list {shown} cannot be read: {e}"))?;
-        match now.duration_since(modified) {
-            Ok(age) if age > ANDROID_KEY_STATUS_MAX_AGE => {
+        let age = age_of(path, now)?;
+        match freshness(age) {
+            StatusFreshness::Stale => {
                 return Err(format!(
                     "the attestation status list {shown} is {}h old, older than the {}h maximum; \
                      refresh it",
@@ -154,18 +206,33 @@ impl StatusList {
                     ANDROID_KEY_STATUS_MAX_AGE.as_secs() / 3600
                 ))
             }
-            Ok(_) => {}
-            Err(ahead) if ahead.duration() > STATUS_FUTURE_SKEW => {
-                return Err(format!(
-                    "the attestation status list {shown} is dated {}s in the future",
-                    ahead.duration().as_secs()
-                ))
-            }
-            Err(_) => {}
+            StatusFreshness::Aging => tracing::warn!(
+                target: "passkey.android_status",
+                path = %shown,
+                age_hours = age.as_secs() / 3600,
+                "the Android attestation status list is older than {}h; its refresh job has \
+                 missed a run, and every Android enrollment and anchor is refused once it is \
+                 older than {}h",
+                ANDROID_KEY_STATUS_WARN_AGE.as_secs() / 3600,
+                ANDROID_KEY_STATUS_MAX_AGE.as_secs() / 3600
+            ),
+            StatusFreshness::Fresh => {}
         }
         let bytes = std::fs::read(path)
             .map_err(|e| format!("the attestation status list {shown} cannot be read: {e}"))?;
         Self::parse(&bytes).map_err(|e| format!("the attestation status list {shown}: {e}"))
+    }
+
+    /// How many serials it lists.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether it lists none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// The status of the certificate with serial `serial` ([`serial_hex`]
@@ -421,6 +488,28 @@ mod tests {
                 String::from_utf8_lossy(bad)
             );
         }
+    }
+
+    /// The status list's age thresholds (P779R-4): up to 24h fresh; past 24h
+    /// AGING (still used, a WARN at boot and at every use); past 48h STALE
+    /// (refused). Each boundary is inclusive on the younger side. Mutations:
+    /// the warn age set to the maximum age (48h) -> 25h is Fresh; the
+    /// comparison `>=` -> exactly 24h is Aging.
+    #[test]
+    fn the_status_list_warns_past_24_hours_and_refuses_past_48() {
+        let h = |n: u64| Duration::from_secs(n * 3600);
+        let s = Duration::from_secs(1);
+        assert_eq!(freshness(Duration::ZERO), StatusFreshness::Fresh);
+        assert_eq!(freshness(h(23) + h(1) - s), StatusFreshness::Fresh);
+        assert_eq!(freshness(h(24)), StatusFreshness::Fresh);
+        assert_eq!(freshness(h(24) + s), StatusFreshness::Aging);
+        assert_eq!(freshness(h(25)), StatusFreshness::Aging);
+        assert_eq!(freshness(h(47)), StatusFreshness::Aging);
+        assert_eq!(freshness(h(48)), StatusFreshness::Aging);
+        assert_eq!(freshness(h(48) + s), StatusFreshness::Stale);
+        assert_eq!(freshness(h(49)), StatusFreshness::Stale);
+        assert_eq!(ANDROID_KEY_STATUS_WARN_AGE, h(24));
+        assert_eq!(ANDROID_KEY_STATUS_MAX_AGE, h(48));
     }
 
     fn kd(level: u32, hw_origin: Option<u32>, hw_purposes: Vec<u32>) -> KeyDescription {

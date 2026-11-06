@@ -386,6 +386,36 @@ impl Passkeys {
         })
     }
 
+    /// The Android attestation status list as THIS process sees it at `now`,
+    /// for the boot log: `None` without the Android roots. It never refuses
+    /// anything (a stale list refuses Android enrollments and anchors at use;
+    /// boot already refused an unreadable or malformed one). A caller logs a
+    /// WARN unless it is [`android::StatusFreshness::Fresh`].
+    #[must_use]
+    pub fn android_status_report(
+        &self,
+        now: SystemTime,
+    ) -> Option<Result<AndroidStatusReport, String>> {
+        let path = self.android_status_file.as_deref()?;
+        Some((|| {
+            let age = android::age_of(path, now)?;
+            let bytes = std::fs::read(path).map_err(|e| {
+                format!(
+                    "the attestation status list {} cannot be read: {e}",
+                    path.display()
+                )
+            })?;
+            let list = android::StatusList::parse(&bytes)
+                .map_err(|e| format!("the attestation status list {}: {e}", path.display()))?;
+            Ok(AndroidStatusReport {
+                path: path.to_path_buf(),
+                age,
+                entries: list.len(),
+                freshness: android::freshness(age),
+            })
+        })())
+    }
+
     /// Whether this relying party runs the anchored path
     /// ([`Self::start_anchored_registration`]).
     #[must_use]
@@ -1472,6 +1502,21 @@ fn both_refused(allowlist: PasskeyError, android: PasskeyError) -> PasskeyError 
         )),
         (PasskeyError::Refused(_), other) | (other, _) => other,
     }
+}
+
+/// The Android attestation status list at boot
+/// ([`Passkeys::android_status_report`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AndroidStatusReport {
+    /// [`config::ENV_ANDROID_KEY_STATUS_FILE`].
+    pub path: PathBuf,
+    /// Its age, by modification time.
+    pub age: Duration,
+    /// How many serials it lists.
+    pub entries: usize,
+    /// How that age stands: past 24 hours AGING (log a WARN), past 48 STALE
+    /// (Android enrollments and anchors are refused).
+    pub freshness: android::StatusFreshness,
 }
 
 /// When a stored attestation's certificates must have been valid

@@ -19,6 +19,7 @@ mod support;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
     LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StoredPasskey,
@@ -470,6 +471,64 @@ async fn a_stale_status_list_refuses_android_enrollments_and_anchors() {
     std::fs::remove_file(&gone).unwrap();
     let (_, r) = android_registration(&vanished, &google, &AndroidKeyOpts::default()).await;
     assert!(policy_refusal(r).contains("cannot be read"));
+}
+
+/// The status list's age is REPORTED before it refuses (P779R-4): the boot
+/// report gives the file, its age and its entry count, and calls a list past
+/// 24 hours AGING (the server logs it at WARN; `StatusList::load` logs a WARN
+/// at every use past 24 hours too) while a 25-hour list is still USED: an
+/// Android key registers under it. Past 48 hours the report says STALE.
+/// Without the Android roots there is no report. Mutation: the report's
+/// freshness taken from the 48h maximum alone -> the 25h list reports Fresh.
+#[tokio::test]
+async fn the_status_lists_age_is_reported_before_it_refuses() {
+    let google = TestAttestation::new("Android");
+    let hour = Duration::from_secs(3600);
+    for (age, freshness) in [
+        (10 * hour, StatusFreshness::Fresh),
+        (25 * hour, StatusFreshness::Aging),
+        (49 * hour, StatusFreshness::Stale),
+    ] {
+        let path = android_status::file(android_status::GOOGLE_EXAMPLE, age);
+        let rp = attested_with(None, Some(&google), Some(path.clone()), false);
+        // After the file is written, so its age is at least `age`.
+        let now = SystemTime::now();
+        let report = rp
+            .android_status_report(now)
+            .expect("the Android roots are configured")
+            .expect("the file reads");
+        assert_eq!(
+            (
+                report.path,
+                report.age.as_secs() / 3600,
+                report.entries,
+                report.freshness
+            ),
+            (path, age.as_secs() / 3600, 2, freshness),
+            "{age:?}"
+        );
+    }
+    let aging = attested_with(
+        None,
+        Some(&google),
+        Some(android_status::file(android_status::EMPTY, 25 * hour)),
+        false,
+    );
+    let (_, reg) = android_registration(&aging, &google, &AndroidKeyOpts::default()).await;
+    reg.expect("an aging list is still used");
+    let gone = android_status::fresh_empty();
+    let vanished = attested_with(None, Some(&google), Some(gone.clone()), false);
+    std::fs::remove_file(&gone).unwrap();
+    let now = SystemTime::now();
+    let why = vanished
+        .android_status_report(now)
+        .expect("configured")
+        .unwrap_err();
+    assert!(why.contains("cannot be read"), "{why}");
+    let vendor = TestAttestation::new("Allowlisted");
+    assert!(attested(Some((&vendor, &[MODEL])), None, false)
+        .android_status_report(now)
+        .is_none());
 }
 
 /// A certificate listed AFTER the passkey registered stops it anchoring:
