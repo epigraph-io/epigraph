@@ -1171,10 +1171,7 @@ async fn a_retired_link_is_not_shown_as_the_agents_human(pool: PgPool) {
     link(&pool, bot, human).await;
     for who in [outsider, bot, human] {
         assert_eq!(
-            card_as(&pool, who, bot)
-                .await
-                .operator_human
-                .map(|h| h.id),
+            card_as(&pool, who, bot).await.operator_human.map(|h| h.id),
             Some(human),
             "CALIBRATION: a live link is shown"
         );
@@ -1242,8 +1239,7 @@ async fn a_revoked_binding_is_not_shown_and_a_retired_link_never_falls_back(pool
     let (h_link, _) = named_human(&pool, "Caspian Thornbury").await;
 
     // 1. An allowance revoked through 149's maintenance verb.
-    let (revoked_agent, revoked_client) =
-        allowance_bound(&pool, h_allow, "ledger-service").await;
+    let (revoked_agent, revoked_client) = allowance_bound(&pool, h_allow, "ledger-service").await;
     assert_eq!(
         card_as(&pool, outsider, revoked_agent)
             .await
