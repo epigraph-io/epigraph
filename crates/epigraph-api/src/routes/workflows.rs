@@ -1756,8 +1756,9 @@ pub struct EvolveStepResponse {
 /// parent or any claim sharing its `step_lineage_id`, retracted `executes`
 /// edges included), the caller needs workflow authority over EVERY such
 /// workflow, as `add_step` / `delete_step` need over theirs: its recorded
-/// submitter, the submitter's operator, or the audited `claims:admin` path (a
-/// workflow with no recorded submitter admits only that path). Anyone else is
+/// submitter, the submitter's operator, a writer of its owner group, or the
+/// audited `claims:admin` path (a workflow with no recorded submitter admits
+/// a writer of its owner group or that path). Anyone else is
 /// refused 403 with nothing written. Each admitted write records one
 /// `workflows.caller_write` (or `workflows.admin_write`) row per workflow. A
 /// claim no workflow executes is unaffected.
@@ -2493,9 +2494,10 @@ pub async fn ingest_workflow(
 /// row security and migration 122's claims trigger see the real writer, and no
 /// caller writes into a group it does not write through any of these routes.
 ///
-/// The authority over an EXISTING workflow (the submitter, its operator, or
-/// the audited admin arm; [`workflow_authority`]) is unchanged and still
-/// checked by every route on this transaction, before the write.
+/// The authority over an EXISTING workflow (the submitter, its operator, a
+/// writer of its owner group, or the audited admin arm;
+/// [`workflow_authority`]) is checked by every route on this transaction,
+/// before the write.
 ///
 /// # Errors
 /// 403 for a viewer with no principal (no agent to write as) or with no live
@@ -2931,6 +2933,8 @@ enum ApiWorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
+    /// The caller writes the workflow's owner group `0`, live.
+    OwnerGroupWriter(Uuid),
     /// The AUDITED admin arm.
     Admin,
 }
@@ -2957,12 +2961,20 @@ impl ApiWorkflowGrant {
 /// H3 (batch H-b; the MCP twin is `epigraph-mcp/src/tools/workflow_authority.rs`,
 /// whose module doc records the measurements and the rule). Refuse unless the
 /// caller has authority over workflow `workflow_id`: when a submitter is
-/// recorded, in this order, the submitter, its operator, or the AUDITED admin
-/// arm — `claims:admin` in the token AND a live grant on the token's client
-/// record (migration 111's predicate), never the scope alone. A workflow with
-/// no record (written before batch H-b) is platform corpus (U005, default
-/// decision A): only the audited admin arm admits it, and a caller with no
-/// token is refused.
+/// recorded, in this order, the submitter, its operator, a WRITER OF THE
+/// WORKFLOW'S OWNER GROUP, or the AUDITED admin arm — `claims:admin` in the
+/// token AND a live grant on the token's client record (migration 111's
+/// predicate), never the scope alone. A workflow with no record (written
+/// before batch H-b) admits a writer of its owner group or the audited admin
+/// arm; a caller with neither is refused.
+///
+/// The owner-group writer arm: the caller reads the row and holds a live
+/// writer or admin membership of its owner group NOW (direct or through a
+/// role binding), checked on `conn`, the write's own caller-stamped
+/// transaction (`epigraph_ingest_executor::caller_writes_group_now`, which
+/// also asks the stamp). An operator link or an author binding is not a
+/// membership: an agent bound to a human gains nothing over the human's
+/// workflows through them (operator ruling 2026-10-13).
 ///
 /// Every REFUSAL to a caller whose `viewer` cannot READ the row is
 /// `not_found()`, the call site's answer for a workflow that does not exist,
@@ -3008,6 +3020,12 @@ async fn workflow_authority(
     // A GROUP row with no record (a plan migration 183 backfilled into its
     // group) is the group's, not the platform's, and is not called one.
     let Some(owner) = owner else {
+        if let Some(group) = api_owner_group_arm(conn, caller, view.as_ref()).await? {
+            return Ok(ApiWorkflowGrant {
+                owner: None,
+                arm: ApiWorkflowArm::OwnerGroupWriter(group),
+            });
+        }
         let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
         let subject = if group_row {
             format!(
@@ -3027,8 +3045,8 @@ async fn workflow_authority(
             });
         }
         return Err(refuse(format!(
-            "{subject}; it is mutable only through the audited claims:admin path, and the caller \
-             holds no claims:admin. Nothing was written."
+            "{subject}; it is mutable only by a writer of its owner group or through the audited \
+             claims:admin path, and the caller is neither. Nothing was written."
         )));
     };
     let allowed = |arm| ApiWorkflowGrant {
@@ -3049,17 +3067,41 @@ async fn workflow_authority(
             return Ok(allowed(ApiWorkflowArm::Operator));
         }
     }
+    if let Some(group) = api_owner_group_arm(conn, caller, view.as_ref()).await? {
+        return Ok(allowed(ApiWorkflowArm::OwnerGroupWriter(group)));
+    }
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
     if api_admin_arm(conn, auth, caller, &subject, &refuse).await? {
         return Ok(allowed(ApiWorkflowArm::Admin));
     }
     Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; the caller is neither its \
-         submitter, its submitter's operator, nor a live claims:admin holder. Nothing was written."
+         submitter, its submitter's operator, a writer of its owner group, nor a live \
+         claims:admin holder. Nothing was written."
     )))
 }
 
-/// The PROVENANCE of a write admitted through the submitter or operator arm
+/// The owner-group writer arm of [`workflow_authority`]: `Some(group)` when
+/// the caller reads the row (`view`) and writes its owner group NOW, on `conn`.
+#[cfg(feature = "db")]
+async fn api_owner_group_arm(
+    conn: &mut sqlx::PgConnection,
+    caller: Option<Uuid>,
+    view: Option<&(String, Uuid)>,
+) -> Result<Option<Uuid>, ApiError> {
+    let (Some(caller), Some((_, group))) = (caller, view) else {
+        return Ok(None);
+    };
+    let writes = epigraph_ingest_executor::caller_writes_group_now(conn, caller, *group)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("could not check the caller's owner-group membership: {e}"),
+        })?;
+    Ok(writes.then_some(*group))
+}
+
+/// The PROVENANCE of a write admitted through the submitter, operator or
+/// owner-group writer arm
 /// (the MCP twin's `record_caller_workflow_write`, the same
 /// `workflows.caller_write` row and fields), on the write's own transaction.
 /// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
@@ -3076,10 +3118,11 @@ async fn record_api_caller_workflow_write(
     grant: ApiWorkflowGrant,
     details: serde_json::Value,
 ) -> Result<(), ApiError> {
-    let (arm, operator) = match grant.arm {
+    let (arm, operator, owner_group) = match grant.arm {
         ApiWorkflowArm::Admin => return Ok(()),
-        ApiWorkflowArm::Submitter => ("submitter", None),
-        ApiWorkflowArm::Operator => ("operator", Some(acting)),
+        ApiWorkflowArm::Submitter => ("submitter", None, None),
+        ApiWorkflowArm::Operator => ("operator", Some(acting), None),
+        ApiWorkflowArm::OwnerGroupWriter(group) => ("owner_group_writer", None, Some(group)),
     };
     let record = serde_json::json!({
         "action": action,
@@ -3088,6 +3131,7 @@ async fn record_api_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
+        "owner_group": owner_group,
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
         "write": details,

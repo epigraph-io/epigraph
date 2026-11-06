@@ -42,15 +42,26 @@
 //!   (`WorkflowRepository::ingest_anchors`, via
 //!   `WorkflowRepository::resolve_ingest_parent`), not the latest generation of
 //!   the parent's name, and inherits that row's submitter when the name is new.
-//! * `add_step`, `delete_step`, `deprecate_workflow` and every new generation
-//!   require, over the AUTHENTICATED transport and when a submitter is
-//!   recorded, in this order: the submitter; its operator (#503, the operator
-//!   itself as on every HTTP gate); or the AUDITED admin arm. Agents bound to the
-//!   submitter's human are NOT admitted over HTTP (operator ruling,
-//!   2026-10-13: the shared host credential must not gain edit rights over a
-//!   human's workflows); their authority traces to the human through
-//!   `OPERATED_BY` / the author binding, and their authorship through the
-//!   `AUTHORED` edges below.
+//! * `add_step`, `delete_step`, `deprecate_workflow`, `evolve_step` and every
+//!   new generation require, over the AUTHENTICATED transport and when a
+//!   submitter is recorded, in this order: the submitter; its operator (#503,
+//!   the operator itself as on every HTTP gate); a WRITER OF THE WORKFLOW'S
+//!   OWNER GROUP; or the AUDITED admin arm. Agents bound to the submitter's
+//!   human are not admitted as such over HTTP (operator ruling, 2026-10-13: the
+//!   shared host credential must not gain edit rights over a human's
+//!   workflows); their authority traces to the human through `OPERATED_BY` /
+//!   the author binding, and their authorship through the `AUTHORED` edges
+//!   below.
+//! * THE OWNER-GROUP WRITER ARM. A team's workflows are the team's: a caller
+//!   that holds a live writer or admin membership of the row's owner group
+//!   (direct or through a role binding, checked live on the write's own
+//!   transaction by `epigraph_ingest_executor::caller_writes_group_now`, which
+//!   also asks the session stamp) may edit it and publish its next generation,
+//!   whoever submitted it, and on a row with no recorded submitter too. An
+//!   operator link or an author binding confers no membership, so an agent
+//!   bound to a human is admitted over the human's workflows only where it
+//!   holds a membership row of their owner group itself. Recorded as
+//!   `"arm": "owner_group_writer"` with the `owner_group`.
 //! * STDIO (backlog 222289f3, reversing the batch H-b bar that left stdio
 //!   unchecked). The writes run on the system agent's stamp, which writes
 //!   every group the system agent is a writer of, so an unchecked stdio caller
@@ -60,9 +71,9 @@
 //!   agent, the write identity) is now checked against the TARGET row
 //!   ([`stdio_workflow_authority`]): it must READ the row on its OWN stamp
 //!   (a row it cannot read is refused without naming it) and, for a group row,
-//!   WRITE the row's owner group; then a recorded submitter admits only the
-//!   submitter or its operator (the operator itself, as over HTTP; there is no
-//!   admin arm without a token). Two stdio-only arms remain, both recorded:
+//!   WRITE the row's owner group; then a recorded submitter admits the
+//!   submitter, its operator (the operator itself, as over HTTP), or a live
+//!   writer of the row's owner group (there is no admin arm without a token). Two stdio-only arms remain, both recorded:
 //!   a LEGACY row (no recorded submitter) that passes the read (and group
 //!   write) check is admitted (stdio has no audited admin path to send it to; an operator
 //!   ruling may close this), and a server with NO declared signer identity
@@ -131,10 +142,13 @@
 //!   not-found answer, with no id, no submitter and no arm. Only the answer
 //!   changes: the arms admit exactly whom they admitted before.
 //!
-//! Writing as the caller adds the database's own check on top of these arms:
-//! the rows land in a group the caller writes (`epigraph_ingest_executor::owner`)
-//! and row security refuses a write into one it does not, so every arm, the
-//! audited admin arm included, now also needs write access to the rows' group.
+//! Writing as the caller adds the database's own check on top of these arms
+//! for the rows a write CREATES: they land in a group the caller writes
+//! (`epigraph_ingest_executor::owner`) and row security refuses a new claim or
+//! edge in one it does not. It is not a check on the existing `workflows` row
+//! itself: migration 183's `workflows_update` policy admits an UPDATE of any
+//! public row, so an entry point must never update an existing row on a path
+//! these arms did not admit (a re-ingest stores no goal embedding).
 
 use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -147,6 +161,8 @@ pub(crate) enum WorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
+    /// The caller writes the workflow's owner group `group`, live.
+    OwnerGroupWriter { group: uuid::Uuid },
     /// The AUDITED admin arm.
     Admin,
     /// stdio only: a row with no recorded submitter (platform corpus) that
@@ -234,14 +250,18 @@ pub(crate) async fn require_workflow_authority(
             not_found()
         }
     };
-    // A workflow with NO recorded submitter (written before batch H-b) is
-    // platform corpus (U005, default decision A; the D1 ruling keeps the
-    // legacy corpus platform-owned). There is no submitter to match and no
-    // operator to derive, so the only arm is the audited admin arm. When the
-    // custodian role lands (#529), its check replaces `claims:admin` here.
-    // A GROUP row with no record (a plan migration 183 backfilled into its
-    // group) is the group's, not the platform's, and is not called one.
+    // A workflow with NO recorded submitter (written before batch H-b) has no
+    // submitter to match and no operator to derive: a writer of its owner
+    // group, or the audited admin arm. When the custodian role lands (#529),
+    // its check replaces `claims:admin` here. A GROUP row with no record (a
+    // plan migration 183 backfilled into its group) is the group's, not the
+    // platform's, and is not called one.
     let Some(owner) = owner else {
+        if let Some(group) =
+            owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await?
+        {
+            return Ok(grant(WorkflowArm::OwnerGroupWriter { group }));
+        }
         let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");
         let (subject, kind) = if group_row {
             (
@@ -260,7 +280,8 @@ pub(crate) async fn require_workflow_authority(
                 "a legacy platform workflow",
             )
         };
-        let needs = "a live claims:admin grant (the audited claims:admin path)";
+        let needs = "a writer of the workflow's owner group, or a live claims:admin grant (the \
+                     audited claims:admin path)";
         return match admin_arm(
             conn,
             auth,
@@ -274,8 +295,9 @@ pub(crate) async fn require_workflow_authority(
         {
             Some(()) => Ok(grant(WorkflowArm::Admin)),
             None => Err(refuse(format!(
-                "{subject}; caller agent {caller_agent} holds no claims:admin. {tool_name} on \
-                 {kind} requires the audited claims:admin path. Nothing was written."
+                "{subject}; caller agent {caller_agent} does not write the workflow's owner \
+                 group and holds no claims:admin. {tool_name} on {kind} requires a writer of its \
+                 owner group or the audited claims:admin path. Nothing was written."
             ))),
         };
     };
@@ -288,9 +310,14 @@ pub(crate) async fn require_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
-    // 3. The AUDITED admin arm.
+    // 3. A writer of the workflow's owner group.
+    if let Some(group) = owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await? {
+        return Ok(grant(WorkflowArm::OwnerGroupWriter { group }));
+    }
+    // 4. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    let needs = "the workflow's submitter, the submitter's operator, or a live claims:admin grant";
+    let needs = "the workflow's submitter, the submitter's operator, a writer of its owner \
+                 group, or a live claims:admin grant";
     if admin_arm(
         conn,
         auth,
@@ -307,10 +334,38 @@ pub(crate) async fn require_workflow_authority(
     }
     Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
-         neither that submitter nor its operator and holds no claims:admin. {tool_name} requires \
-         the workflow's submitter, the submitter's operator, or the audited claims:admin path. \
-         Nothing was written."
+         neither that submitter nor its operator, does not write the workflow's owner group, and \
+         holds no claims:admin. {tool_name} requires the workflow's submitter, the submitter's \
+         operator, a writer of its owner group, or the audited claims:admin path. Nothing was \
+         written."
     )))
+}
+
+/// The owner-group writer arm: `Some(group)` when the caller can READ the row
+/// (`view`, its own view of it) and holds a live writer or admin membership
+/// of the row's owner group NOW, on `conn` (the write's own transaction,
+/// stamped from the caller): the live-membership definer and the session
+/// stamp both (`epigraph_ingest_executor::caller_writes_group_now`). An
+/// operator link or an author binding is not a membership, so it admits no
+/// agent bound to a human through them alone.
+async fn owner_group_arm(
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    view: Option<&(String, uuid::Uuid)>,
+    tool_name: &'static str,
+) -> Result<Option<uuid::Uuid>, McpError> {
+    let Some((_, group)) = view else {
+        return Ok(None);
+    };
+    let writes = epigraph_ingest_executor::caller_writes_group_now(conn, caller_agent, *group)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not check the caller's owner-group membership"),
+                e,
+            )
+        })?;
+    Ok(writes.then_some(*group))
 }
 
 /// The stdio arms of [`require_workflow_authority`] (backlog 222289f3; see the
@@ -327,10 +382,10 @@ pub(crate) async fn require_workflow_authority(
 ///    HTTP twins' 403 does.
 /// 2. A GROUP row: the caller must hold a live writer/admin membership of the
 ///    row's owner group, the group the write lands in.
-/// 3. A recorded submitter: the submitter, or its operator (the operator
-///    itself, as over HTTP); a server with no declared signer identity is
-///    admitted with a WARN (undecidable, as for claims). No submitter: the
-///    legacy stdio arm.
+/// 3. A recorded submitter: the submitter, its operator (the operator
+///    itself, as over HTTP), or a live writer of the row's owner group; a
+///    server with no declared signer identity is admitted with a WARN
+///    (undecidable, as for claims). No submitter: the legacy stdio arm.
 ///
 /// # Errors
 /// A refusal (nothing was written), or an internal error if the caller's view
@@ -411,6 +466,10 @@ async fn stdio_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(WorkflowArm::Operator);
     }
+    let view = (visibility, owner_group);
+    if let Some(group) = owner_group_arm(conn, caller_agent, Some(&view), tool_name).await? {
+        return Ok(WorkflowArm::OwnerGroupWriter { group });
+    }
     if !server.signer_identity_declared {
         tracing::warn!(
             workflow_id = %workflow_id,
@@ -425,9 +484,10 @@ async fn stdio_workflow_authority(
     }
     Err(crate::errors::invalid_params(format!(
         "workflow {workflow_id} was submitted by agent {owner}; stdio caller agent \
-         {caller_agent} is neither that submitter nor its operator. {tool_name} over stdio \
-         requires the workflow's submitter or the submitter's operator (the audited \
-         claims:admin path needs an authenticated transport). Nothing was written."
+         {caller_agent} is neither that submitter nor its operator and does not write the \
+         workflow's owner group. {tool_name} over stdio requires the workflow's submitter, the \
+         submitter's operator, or a writer of its owner group (the audited claims:admin path \
+         needs an authenticated transport). Nothing was written."
     )))
 }
 
@@ -615,12 +675,13 @@ pub(crate) async fn record_caller_workflow_write(
     details: serde_json::Value,
 ) -> Result<(), McpError> {
     let acting = caller.agent_id();
-    let (arm, operator) = match grant.arm {
+    let (arm, operator, owner_group) = match grant.arm {
         WorkflowArm::Admin => return Ok(()),
-        WorkflowArm::Submitter => ("submitter", None),
-        WorkflowArm::Operator => ("operator", Some(acting)),
-        WorkflowArm::StdioLegacy => ("legacy", None),
-        WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None),
+        WorkflowArm::Submitter => ("submitter", None, None),
+        WorkflowArm::Operator => ("operator", Some(acting), None),
+        WorkflowArm::OwnerGroupWriter { group } => ("owner_group_writer", None, Some(group)),
+        WorkflowArm::StdioLegacy => ("legacy", None, None),
+        WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None, None),
     };
     let (transport, client_id, token_jti) = match auth {
         Some(token) => ("http", Some(token.client_id), Some(token.jti)),
@@ -643,6 +704,7 @@ pub(crate) async fn record_caller_workflow_write(
         "arm": arm,
         "acting_agent": acting,
         "operator": operator,
+        "owner_group": owner_group,
         "transport": transport,
         "client_id": client_id,
         "token_jti": token_jti,
