@@ -33,6 +33,12 @@
 //! S1 -> Y owned by SRC that is not a plan edge (Y is an unrelated SRC claim):
 //! it stays.
 //!
+//! The private neighbour PN: S6 `refines` PN, a group-visible note. Its group
+//! is the fixture's one parameter ([`Neighbour`]): the SOURCE's by default
+//! (in place it is the same group, so it never blocks; a move would make the
+//! target the owner of that private edge, so the move holds the lineage), or
+//! the TARGET's (a move meets it into the group it is already in).
+//!
 //! # What a snapshot is
 //!
 //! Every row of every table the run could reach, as `to_jsonb(row)::text`,
@@ -137,8 +143,9 @@ struct Fx {
     s4: Uuid,
     s4b: Uuid,
     /// S5 and S6 (alpha) are the provenance of one fragment; S6 has an edge to
-    /// the private thesis PC, so it stays, and S5 must stay with it (the
-    /// cascaded-row fixpoint).
+    /// the private note PN. Under `keep` that non-public endpoint leaves S6,
+    /// and S5 must stay with it (the cascaded-row fixpoint). A narrowing
+    /// decides by the edge's meet instead (see [`Neighbour`]).
     s5: Uuid,
     s6: Uuid,
     frag56: Uuid,
@@ -154,6 +161,16 @@ struct Fx {
     e_s1_y: Uuid,
     /// The held private plan's `executes` edge: ('group', SRC).
     e_private: Uuid,
+    /// The private note S6 refines, and that edge.
+    pn: Uuid,
+    e_s6_pn: Uuid,
+}
+
+/// Whose group the private note PN is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Neighbour {
+    Source,
+    Target,
 }
 
 async fn team_group(pool: &PgPool, label: &str, admin: Uuid, role: &str) -> Uuid {
@@ -307,6 +324,10 @@ async fn edge(
 }
 
 async fn seed(pool: &PgPool) -> Fx {
+    seed_with(pool, Neighbour::Source).await
+}
+
+async fn seed_with(pool: &PgPool, neighbour: Neighbour) -> Fx {
     let (operator, src) = fixture::seed_human_operator(pool, "operator").await;
     let (ingest, _) = fixture::seed_agent_with_group(pool, "workflow-ingest").await;
     let (author, _) = fixture::seed_agent_with_group(pool, "author").await;
@@ -473,10 +494,22 @@ async fn seed(pool: &PgPool) -> Fx {
         plan_edges.push(edge(&mut c, (s, "claim"), (tg, "claim"), rel).await);
     }
     let e_s1_y = edge(&mut c, (s1, "claim"), (y, "claim"), "supports").await;
-    // S6 -> the private thesis: a non-public endpoint, so S6 stays.
-    edge(&mut c, (s6, "claim"), (pc, "claim"), "refines").await;
     unstamp(&mut c).await;
     drop(c);
+
+    // S6 -> the private note PN: an edge with a non-public endpoint. Written
+    // on the maintenance pool, so the edges trigger gives it the meet:
+    // (PN's group, 'group').
+    let pn_owner = match neighbour {
+        Neighbour::Source => src,
+        Neighbour::Target => target,
+    };
+    let (pn, e_s6_pn) = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let pn = claim(&mut m, ingest, pn_owner, "group", 0, "a private note").await;
+        let e = edge(&mut m, (s6, "claim"), (pn, "claim"), "refines").await;
+        (pn, e)
+    };
 
     // One fragment, the provenance of S5 and S6, owned like the plan.
     let hsource: Uuid = sqlx::query_scalar(
@@ -589,6 +622,8 @@ async fn seed(pool: &PgPool) -> Fx {
         structural_edges: structural,
         e_s1_y,
         e_private,
+        pn,
+        e_s6_pn,
     }
 }
 
@@ -706,6 +741,24 @@ async fn apply_to(
     target: Uuid,
     visibility: Option<&str>,
 ) -> Run {
+    let mut extra = Vec::new();
+    if let Some(v) = visibility {
+        extra.extend(["--visibility", v]);
+    }
+    reown_run(pool, fx, dir, manifest, target, Some("3"), &extra).await
+}
+
+/// A run of the LISTED lineages into `target` with `extra` arguments: an
+/// `--apply` confirming `confirm` when given, else a dry run.
+async fn reown_run(
+    pool: &PgPool,
+    fx: &Fx,
+    dir: &Path,
+    manifest: &Path,
+    target: Uuid,
+    confirm: Option<&str>,
+    extra: &[&str],
+) -> Run {
     let names = names_file(dir, LISTED);
     let target = target.to_string();
     let operator = fx.operator.to_string();
@@ -719,18 +772,19 @@ async fn apply_to(
         &operator,
         "--manifest-out",
         manifest.to_str().unwrap(),
-        "--apply",
-        "--confirm-count",
-        "3",
-        "--ruling",
-        RULING,
-        "--reason",
-        "the team evolves these plans",
     ];
-    if let Some(v) = visibility {
-        args.push("--visibility");
-        args.push(v);
+    if let Some(n) = confirm {
+        args.extend([
+            "--apply",
+            "--confirm-count",
+            n,
+            "--ruling",
+            RULING,
+            "--reason",
+            "the team evolves these plans",
+        ]);
     }
+    args.extend(extra.iter().copied());
     run_op(pool, &args).await
 }
 
@@ -1236,7 +1290,12 @@ async fn reverse_refuses_after(
     grow: &str,
     expect: impl Fn(&Fx) -> String,
 ) {
-    let fx = seed(pool).await;
+    // A move that narrows meets S6's edge into the group PN is already in.
+    let fx = if visibility == Some("group") {
+        seed_with(pool, Neighbour::Target).await
+    } else {
+        seed(pool).await
+    };
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
     let r = apply_to(pool, &fx, &dir, &manifest, fx.target, visibility).await;
@@ -1450,7 +1509,7 @@ async fn writer_owned(pool: &PgPool, table: &str, id: Uuid) -> bool {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch(pool: PgPool) {
-    let fx = seed(&pool).await;
+    let fx = seed_with(&pool, Neighbour::Target).await;
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
     let epoch_before = epoch(&pool).await;
@@ -1462,7 +1521,11 @@ async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch
 
     let narrowed = (fx.target, "group".to_string());
     let moved_wf = [fx.w_a0, fx.w_a1, fx.w_b0];
-    let moved_claims = [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb];
+    // S5 and S6 included: S6's edge to PN, already private to the target,
+    // meets into the target unchanged, so nothing keeps either public.
+    let moved_claims = [
+        fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb, fx.s5, fx.s6,
+    ];
     for w in moved_wf {
         assert_eq!(
             tenancy(&pool, "workflows", w).await,
@@ -1499,8 +1562,18 @@ async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch
     assert!(fx.e_exec_left.len() == 3);
     assert_eq!(tenancy(&pool, "edges", fx.e_authored).await, narrowed);
     assert_eq!(tenancy(&pool, "edges", fx.e_s1_y).await, narrowed);
-    // What stays: left steps, other plans, their edges.
-    for c in [fx.x, fx.s4, fx.s4b, fx.s5, fx.s6, fx.y] {
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag56).await,
+        narrowed,
+        "a fragment whose every claim narrows narrows with them"
+    );
+    assert_eq!(
+        tenancy(&pool, "edges", fx.e_s6_pn).await,
+        narrowed,
+        "an edge to a row already private to the target stays as it is"
+    );
+    // What stays: shared steps, other plans, their edges.
+    for c in [fx.x, fx.s4, fx.s4b, fx.y] {
         assert_eq!(
             tenancy(&pool, "claims", c).await,
             (fx.src, "public".into()),
@@ -1514,10 +1587,6 @@ async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch
     assert_eq!(
         tenancy(&pool, "claims", fx.pc).await,
         (fx.src, "group".into())
-    );
-    assert_eq!(
-        tenancy(&pool, "harvester_fragments", fx.frag56).await,
-        (fx.src, "public".into())
     );
     for (w, t) in [
         (fx.w_f, (fx.other_team, "public".to_string())),
@@ -1548,7 +1617,7 @@ async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn group_reverse_restores_every_row_and_its_visibility_exactly(pool: PgPool) {
-    let fx = seed(&pool).await;
+    let fx = seed_with(&pool, Neighbour::Target).await;
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
     let before = snapshot_sans_epoch(&pool).await;
@@ -1646,5 +1715,424 @@ async fn in_place_needs_group_visibility(pool: PgPool) {
         assert_eq!(snapshot(&pool).await, before);
         assert!(!manifest.exists());
     }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A narrowing leaves no unshared plan row public
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The contents of `ids` an UNSTAMPED `epigraph_app` session reads.
+async fn app_reads_claims(pool: &PgPool, ids: &[Uuid]) -> Vec<String> {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+        .execute(&mut *tx)
+        .await
+        .expect("become epigraph_app");
+    sqlx::query(
+        "SELECT set_config('epigraph.group_ids', '', true), \
+                set_config('epigraph.writable_group_ids', '', true), \
+                set_config('epigraph.principal_id', '', true)",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("unstamp");
+    let out: Vec<String> =
+        sqlx::query_scalar("SELECT content FROM claims WHERE id = ANY($1) ORDER BY content")
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("app read");
+    tx.rollback().await.expect("rollback");
+    out
+}
+
+fn line_with(stdout: &str, prefix: &str, needles: &[&str]) -> bool {
+    stdout
+        .lines()
+        .any(|l| l.starts_with(prefix) && needles.iter().all(|n| l.contains(n)))
+}
+
+const GROUP: &[&str] = &["--visibility", "group"];
+const CATCH_UP: &[&str] = &["--visibility", "group", "--catch-up"];
+
+/// In place, every unshared step of a plan narrows. S6's edge to a note that
+/// is already private to the SAME group meets into exactly the tuple it has,
+/// and S3's pinned evidence is already in the group's private state: neither
+/// hands anything to anyone, so neither may keep its step (or, through the
+/// fragment S5 shares with S6, its sibling) public. An edge on a step's
+/// evidence narrows with the step instead of keeping it public. A recorded run
+/// of the plan (`behavioral_executions`, no tenancy) is reported, not hidden.
+#[sqlx::test(migrations = "../../migrations")]
+async fn in_place_narrowing_leaves_no_unshared_plan_row_public(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let ev_pinned: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, 'document', $2, 'pinned evidence of step three') RETURNING id",
+    )
+    .bind(fx.s3)
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("evidence to pin");
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'kept private by its owner')",
+    )
+    .bind(ev_pinned)
+    .bind(fx.operator)
+    .execute(&pool)
+    .await
+    .expect("pin");
+    sqlx::query("UPDATE evidence SET visibility = 'group' WHERE id = $1")
+        .bind(ev_pinned)
+        .execute(&pool)
+        .await
+        .expect("pinned row private");
+    assert_eq!(
+        tenancy(&pool, "evidence", ev_pinned).await,
+        (fx.src, "group".to_string()),
+        "PREMISE: the pinned row is already in the in-place target state"
+    );
+    let e_ev = {
+        let mut m = pool.acquire().await.expect("acquire");
+        edge(&mut m, (fx.ev_s1, "evidence"), (fx.y, "claim"), "supports").await
+    };
+    assert_eq!(tenancy(&pool, "edges", e_ev).await.1, "public", "PREMISE");
+    sqlx::query(
+        "INSERT INTO behavioral_executions (workflow_id, goal_text, success, step_claim_id) \
+         VALUES ($1, 'PRIVATE GOAL of alpha', true, $2)",
+    )
+    .bind(fx.w_a0)
+    .bind(fx.s2)
+    .execute(&pool)
+    .await
+    .expect("a recorded run");
+
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let before = snapshot_sans_epoch(&pool).await;
+    let dry = reown_run(&pool, &fx, &dir, &manifest, fx.src, None, GROUP).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    for c in [fx.s3, fx.s5, fx.s6, fx.s1] {
+        assert!(
+            !line_with(&dry.stdout, "LEFT-CLAIM\t", &[&c.to_string()]),
+            "unshared step {c} must not be left: {}",
+            dry.show()
+        );
+    }
+    assert!(
+        line_with(
+            &dry.stdout,
+            "BEHAVIORAL-EXECUTIONS-TOTAL\t1",
+            &["no row security"]
+        ),
+        "the recorded run must be counted: {}",
+        dry.show()
+    );
+
+    let r = reown_run(&pool, &fx, &dir, &manifest, fx.src, Some("3"), GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let in_place = (fx.src, "group".to_string());
+    let alpha = [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.s5, fx.s6];
+    for c in alpha {
+        assert_eq!(tenancy(&pool, "claims", c).await, in_place, "claim {c}");
+    }
+    assert_eq!(
+        app_reads_claims(&pool, &alpha).await,
+        Vec::<String>::new(),
+        "an unstamped session still reads a narrowed plan's steps"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag56).await,
+        in_place
+    );
+    assert_eq!(tenancy(&pool, "evidence", ev_pinned).await, in_place);
+    assert_eq!(tenancy(&pool, "edges", fx.e_s6_pn).await, in_place);
+    assert_eq!(
+        tenancy(&pool, "edges", e_ev).await,
+        in_place,
+        "an edge on a narrowed step's evidence narrows with it"
+    );
+    assert!(
+        r.stdout.contains("BEHAVIORAL-EXECUTIONS-TOTAL\t1"),
+        "{}",
+        r.show()
+    );
+
+    let rev = reverse(&pool, &manifest, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "the reversal did not restore exactly: {}",
+        rev.show()
+    );
+    assert_eq!(tenancy(&pool, "edges", e_ev).await.1, "public");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A move that narrows must not make the target the OWNER of a row another
+/// group keeps private: S6's edge to the SOURCE's private note would be
+/// re-met to ('group', target, co-owner source). The whole lineage stays and
+/// nothing of it is written; the lineages it does not touch narrow; the apply
+/// exits 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_move_holds_a_lineage_whose_narrowing_would_hand_a_private_row_to_the_target(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let dry = reown_run(&pool, &fx, &dir, &manifest, fx.target, None, GROUP).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(
+            &dry.stdout,
+            "HELD-LINEAGE\talpha\t",
+            &[&fx.e_s6_pn.to_string()]
+        ),
+        "alpha must be held on the edge: {}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        dry.show()
+    );
+    let alpha_wf = [fx.w_a0, fx.w_a1];
+    let alpha = [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.s5, fx.s6];
+
+    let r = reown_run(&pool, &fx, &dir, &manifest, fx.target, Some("1"), GROUP).await;
+    assert_eq!(
+        r.code,
+        3,
+        "an apply that held a lineage on a hand-off must exit 3: {}",
+        r.show()
+    );
+    assert!(
+        line_with(&r.stdout, "SHORTFALL", &["alpha"]),
+        "{}",
+        r.show()
+    );
+    let src_public = (fx.src, "public".to_string());
+    for w in alpha_wf {
+        assert_eq!(tenancy(&pool, "workflows", w).await, src_public, "{w}");
+    }
+    for c in alpha {
+        assert_eq!(tenancy(&pool, "claims", c).await, src_public, "{c}");
+    }
+    assert_eq!(
+        tenancy(&pool, "edges", fx.e_s6_pn).await,
+        (fx.src, "group".to_string())
+    );
+    let narrowed = (fx.target, "group".to_string());
+    assert_eq!(tenancy(&pool, "workflows", fx.w_b0).await, narrowed);
+    assert_eq!(tenancy(&pool, "claims", fx.tb).await, narrowed);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catch-up: a lineage re-ingested between runs
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn reverse_many(pool: &PgPool, manifests: &[&Path], apply: bool) -> Run {
+    let mut args = vec!["reown-reverse"];
+    for m in manifests {
+        args.push("--manifest");
+        args.push(m.to_str().unwrap());
+    }
+    if apply {
+        args.push("--apply");
+    }
+    run_op(pool, &args).await
+}
+
+/// After a move, alpha is re-ingested: generation 2 lands in the SOURCE's
+/// private state (neither the run's FROM nor its TO state), with a new step.
+/// The main act holds it and names `--catch-up`; `--catch-up` moves ONLY that
+/// generation and its new step into the target, audited, and its manifest
+/// reverses exactly. The original manifest then refuses (a generation joined
+/// after it).
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_moves_only_a_re_ingested_generation_and_reverses(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    let m1 = dir.join("m1.jsonl");
+    let m2 = dir.join("m2.jsonl");
+
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, None, &["--catch-up"]).await;
+    assert_eq!(r.code, 1, "--catch-up needs a narrowing: {}", r.show());
+    assert!(r.stderr.contains("--visibility group"), "{}", r.show());
+
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    for n in ["alpha", "beta"] {
+        assert!(
+            r.stdout
+                .lines()
+                .any(|l| l.starts_with(&format!("SKIPPED-LINEAGE\t{n}\t"))),
+            "{n}: a lineage with no stray generation is the main act's: {}",
+            r.show()
+        );
+    }
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "{}",
+        r.show()
+    );
+
+    let r = reown_run(&pool, &fx, &dir, &m1, fx.target, Some("3"), GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    let (w_a2, ns, e_exec, e_var, e_exec_t) = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut m, "alpha", 2, Some(fx.w_a1), fx.src, "group").await;
+        let ns = claim(
+            &mut m,
+            fx.operator,
+            fx.src,
+            "group",
+            2,
+            "alpha step seven (generation 2)",
+        )
+        .await;
+        let e1 = edge(&mut m, (w, "workflow"), (ns, "claim"), "executes").await;
+        let e2 = edge(&mut m, (w, "workflow"), (fx.w_a1, "workflow"), "variant_of").await;
+        let e3 = edge(&mut m, (w, "workflow"), (fx.t, "claim"), "executes").await;
+        (w, ns, e1, e2, e3)
+    };
+    let stray = snapshot_sans_epoch(&pool).await;
+
+    let m3 = dir.join("m3.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m3, fx.target, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &["--catch-up"]),
+        "the main act holds the re-ingested lineage and names the remedy: {}",
+        r.show()
+    );
+
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout
+            .lines()
+            .any(|l| l.starts_with("ALREADY-LINEAGE\tbeta\t")),
+        "{}",
+        r.show()
+    );
+    let audits = security_events(&pool, "operator.workflows_reowned").await;
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, Some("1"), CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        security_events(&pool, "operator.workflows_reowned").await,
+        audits + 1,
+        "the catch-up is audited"
+    );
+    let narrowed = (fx.target, "group".to_string());
+    assert_eq!(tenancy(&pool, "workflows", w_a2).await, narrowed);
+    assert_eq!(tenancy(&pool, "claims", ns).await, narrowed);
+    for e in [e_exec, e_var, e_exec_t] {
+        assert_eq!(tenancy(&pool, "edges", e).await, narrowed, "edge {e}");
+    }
+    let mut after = snapshot_sans_epoch(&pool).await;
+    let mut want = stray.clone();
+    for s in [&mut after, &mut want] {
+        for rows in s.values_mut() {
+            rows.retain(|row| {
+                ![w_a2, ns, e_exec, e_var]
+                    .iter()
+                    .any(|id| row.contains(&id.to_string()))
+            });
+        }
+    }
+    assert_eq!(
+        after, want,
+        "the catch-up changed something besides the stray generation"
+    );
+
+    // Both manifests in one reversal, newest first, as the operator script
+    // passes them.
+    let rev = reverse_many(&pool, &[&m1, &m2], true).await;
+    assert_eq!(rev.code, 3, "{}", rev.show());
+    assert!(rev.stdout.contains(&w_a2.to_string()), "{}", rev.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        stray,
+        "the catch-up's reversal must restore exactly the state it started from"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After an in-place narrowing, a generation ingested PUBLIC (before the
+/// private default) is the FROM state while the rest of its lineage is the TO
+/// state. The main act holds it; `--catch-up` narrows only it and its step.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_narrows_a_public_generation_ingested_after_an_in_place_narrowing(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let m1 = dir.join("m1.jsonl");
+    let m2 = dir.join("m2.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m1, fx.src, Some("3"), GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let (w_a2, np) = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut m, "alpha", 2, Some(fx.w_a1), fx.src, "public").await;
+        let np = claim(&mut m, fx.operator, fx.src, "public", 2, "alpha step eight").await;
+        edge(&mut m, (w, "workflow"), (np, "claim"), "executes").await;
+        (w, np)
+    };
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.src, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &["--catch-up"]),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.src, Some("1"), CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let in_place = (fx.src, "group".to_string());
+    assert_eq!(tenancy(&pool, "workflows", w_a2).await, in_place);
+    assert_eq!(tenancy(&pool, "claims", np).await, in_place);
+    assert_eq!(app_reads_claims(&pool, &[np]).await, Vec::<String>::new());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A step executed by a listed lineage AND by a source-owned public lineage
+/// left off the list is shared, so this run never narrows it. Narrowing the
+/// two lineages in separate runs would leave it public for good, so the dry
+/// run names the split for the operator to rule on.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPool) {
+    let fx = seed(&pool).await;
+    {
+        let mut m = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut m, "epsilon", 0, None, fx.src, "public").await;
+        edge(&mut m, (w, "workflow"), (fx.s2, "claim"), "executes").await;
+    }
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &manifest, fx.src, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(
+            &r.stdout,
+            "SHARED-SPLIT\t",
+            &[&fx.s2.to_string(), "epsilon"]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(
+        !line_with(&r.stdout, "SHARED-SPLIT\t", &[&fx.x.to_string()]),
+        "X is shared with another team's lineage, not split: {}",
+        r.show()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
