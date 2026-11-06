@@ -123,7 +123,9 @@
 -- detach reaches. What a host that keys succession on the group's lane
 -- adds: a detach of an identity the job ran also takes every identity the
 -- host registers below it afterwards, edits and reverts at any model, that
--- holds no live row made by name.
+-- holds no live row made by name. Never pick for this an identity the host
+-- also runs for another kind of run or another group: the detach takes it
+-- out there too.
 -- A DIRECT attachment (`inherited_from` NULL, the operator's own act naming
 -- the identity) counts as before wherever it sits, as the row asked about or
 -- as a chain's root, even when its agent also holds a detached row, and an

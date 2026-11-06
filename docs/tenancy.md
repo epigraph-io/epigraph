@@ -1575,7 +1575,9 @@ made by name. It never takes one that does, so the attachments made by name
 above still have to be detached. Which identity to detach so that the job's
 later identities are all below it depends on how the host records a plain
 model switch: an identity with the same prompt bytes at another model that
-the job ran before the one you detach is above it, not below. Limits: an
+the job ran before the one you detach is above it, not below. Never pick
+for this an identity the host also runs for another kind of run or another
+group: the detach takes it out there too. Limits: an
 attachment made by name is not tied to a folder, so an identity attached by
 name in another group's folder whose model and prompt files are identical
 to ones this job can put back keeps the group when the job runs it, and is

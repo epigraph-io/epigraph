@@ -2450,7 +2450,9 @@ restart.
   assignment, which no detach reaches. A lane-keyed host adds only that
   a detach of an identity the job ran also takes every identity it
   registers below that one afterwards that holds no live row made by
-  name. A detach also reaches the
+  name; never pick for this an identity the host also runs for another
+  kind of run or another group, since the detach takes it out there too.
+  A detach also reaches the
   identity that runs now when the operator detaches an OLD identity it
   descends from (a registered revert records a succession too), and the
   walk ignores when a succession or a detach was recorded, so an answer
