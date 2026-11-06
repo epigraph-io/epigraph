@@ -310,11 +310,13 @@ pub struct CardRole {
 /// Counts computed under the caller's viewer.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CardCounts {
-    /// Visible `authored` edges from the agent to a paper.
+    /// Visible in-force `authored` edges from the agent to a paper, except
+    /// those still awaiting the agent's countersignature
+    /// ([`crate::AUTHORED_PENDING_KEY`]).
     pub authored_papers: i64,
     /// Visible claims the agent asserts: those it authored
-    /// (`claims.agent_id`) and those an ingest attributed to it (an `asserts`
-    /// edge from the agent), each claim once.
+    /// (`claims.agent_id`) and those an ingest attributed to it (an in-force
+    /// `asserts` edge from the agent), each claim once.
     pub asserted_claims: i64,
     /// True when either count reached [`COUNT_CAP`] (the value shown is the cap).
     pub capped: bool,
@@ -964,35 +966,49 @@ impl AgentLookupRepository {
     }
 
     /// Visible authored papers and asserted claims of each of `ids`, capped.
+    ///
+    /// Only edges in force count (a retracted authorship or attribution is
+    /// not the agent's). An `authored` edge an ingester wrote naming someone
+    /// it neither is nor operates ([`crate::AUTHORED_PENDING_KEY`]) does not
+    /// count until that person countersigns: it is the ingester's word, not
+    /// the agent's.
     async fn counts(
         conn: &mut PgConnection,
         viewer: &Viewer,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, CardCounts>, DbError> {
         let sql = viewer.splice(
-            r"
+            &format!(
+                r"
             SELECT u.id,
                    (SELECT count(*) FROM (
                         SELECT 1 FROM edges e
                          WHERE e.source_id = u.id AND e.source_type = 'agent'
                            AND e.relationship = 'authored' AND e.target_type = 'paper'
-                           /* {EDGE_VISIBILITY:e} */
+                           AND {in_force_e}
+                           AND COALESCE(e.properties ->> '{pending}', 'false') <> 'true'
+                           /* {{EDGE_VISIBILITY:e}} */
                          LIMIT $2) p) AS papers,
                    (SELECT count(*) FROM (
                         (SELECT c.id FROM claims c
                           WHERE c.agent_id = u.id
-                            /* {VISIBILITY:c} */
+                            /* {{VISIBILITY:c}} */
                           LIMIT $2)
                         UNION
                         (SELECT c2.id FROM edges e2
                            JOIN claims c2 ON c2.id = e2.target_id
                           WHERE e2.source_id = u.id AND e2.source_type = 'agent'
                             AND e2.relationship = 'asserts' AND e2.target_type = 'claim'
-                            /* {EDGE_VISIBILITY:e2} */
-                            /* {VISIBILITY:c2} */
+                            AND {in_force_e2}
+                            /* {{EDGE_VISIBILITY:e2}} */
+                            /* {{VISIBILITY:c2}} */
                           LIMIT $2)) k) AS claims
               FROM unnest($1::uuid[]) AS u(id)
             ",
+                in_force_e = crate::repos::edge::EDGE_IN_FORCE,
+                in_force_e2 = crate::repos::edge::EDGE_IN_FORCE.replace("e.", "e2."),
+                pending = crate::AUTHORED_PENDING_KEY,
+            ),
             3,
         );
         let mut q = sqlx::query_as::<_, (Uuid, i64, i64)>(&sql)
