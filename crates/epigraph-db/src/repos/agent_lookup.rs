@@ -46,8 +46,10 @@
 //!   status never moves it), plus the caller's own assignments of any role.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
-//!   number. Capped at [`COUNT_CAP`] so a fleet agent with 10^5 claims cannot
-//!   stall a request.
+//!   number. Only in-force edges the document ingest wrote count, and an
+//!   authorship awaiting its author's countersignature is reported apart
+//!   (see [`CardCounts`]). Capped at [`COUNT_CAP`] so a fleet agent with
+//!   10^5 claims cannot stall a request.
 //!
 //! # Matching
 //!
@@ -73,6 +75,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::repos::edge::EDGE_IN_FORCE;
 use crate::visibility::Viewer;
 
 /// Shortest accepted query, in characters after trimming.
@@ -207,6 +210,27 @@ fn operator_binding_sql(agent: &str) -> String {
     )
 }
 
+/// The `authored -> paper` edge property a document ingest writes as `true`
+/// when it names an author it neither is nor operates: the authorship is the
+/// ingester's word until that person countersigns. The agent card reads it
+/// ([`authorship_pending_sql`]); every other reader of `authored` edges must
+/// read it the same way.
+pub const AUTHORSHIP_PENDING_PROPERTY: &str = "pending_countersign";
+
+/// The property naming the agent that ingested the document, on an
+/// `authored -> paper` edge marked [`AUTHORSHIP_PENDING_PROPERTY`]: the one
+/// asserting the authorship.
+pub const AUTHORSHIP_INGESTED_BY_PROPERTY: &str = "ingested_by";
+
+/// SQL: true when the `authored` edge aliased `alias` awaits its author's
+/// countersignature ([`AUTHORSHIP_PENDING_PROPERTY`] is JSON `true`). An edge
+/// without the property (every name-derived author, every legacy edge) is
+/// not pending.
+#[must_use]
+pub fn authorship_pending_sql(alias: &str) -> String {
+    format!("COALESCE({alias}.properties ->> '{AUTHORSHIP_PENDING_PROPERTY}', 'false') = 'true'")
+}
+
 /// How a name matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -321,15 +345,34 @@ pub struct CardRole {
 }
 
 /// Counts computed under the caller's viewer.
+///
+/// An authorship or attribution counts only when the document ingest wrote
+/// it and it is in force. `authored` edges have no other application
+/// writer: `POST /api/v1/edges` does not accept the relationship and the MCP
+/// edge tools write claim-to-claim edges only (the `claims:admin` staged-edge
+/// promote copies a staged row verbatim, an administrative path). An
+/// `agent -asserts-> claim` edge has another writer: `POST /api/v1/edges`
+/// accepts one from any agent. So an attribution
+/// counts only when the paper authorship it comes from also exists: an
+/// in-force, countersigned `authored` edge from the agent to a paper that
+/// itself asserts the claim (in force). A lone `asserts` edge from an agent,
+/// whoever wrote it, is not the agent's.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CardCounts {
-    /// Visible `authored` edges from the agent to a paper.
+    /// Visible in-force `authored` edges from the agent to a paper, except
+    /// those awaiting the agent's countersignature.
     pub authored_papers: i64,
-    /// Visible claims the agent asserts: those it authored
-    /// (`claims.agent_id`) and those an ingest attributed to it (an `asserts`
-    /// edge from the agent), each claim once.
+    /// Visible in-force `authored` edges from the agent to a paper that an
+    /// ingester wrote naming it and that it has not countersigned
+    /// ([`AUTHORSHIP_PENDING_PROPERTY`]): the ingester's word, not the
+    /// agent's, so never in `authored_papers`.
+    pub pending_authored_papers: i64,
+    /// Visible claims the agent asserts, each claim once: those it filed
+    /// (`claims.agent_id`), and those a document ingest attributed to it (an
+    /// in-force `asserts` edge from the agent, backed by its countersigned
+    /// in-force authorship of a paper asserting the claim).
     pub asserted_claims: i64,
-    /// True when either count reached [`COUNT_CAP`] (the value shown is the cap).
+    /// True when any count reached [`COUNT_CAP`] (the value shown is the cap).
     pub capped: bool,
 }
 
@@ -713,6 +756,7 @@ impl AgentLookupRepository {
                 created_at,
                 counts: counts.get(&id).copied().unwrap_or(CardCounts {
                     authored_papers: 0,
+                    pending_authored_papers: 0,
                     asserted_claims: 0,
                     capped: false,
                 }),
@@ -811,39 +855,71 @@ impl AgentLookupRepository {
         Ok(out)
     }
 
-    /// Visible authored papers and asserted claims of each of `ids`, capped.
+    /// Visible authored papers (countersigned, and pending apart) and asserted
+    /// claims of each of `ids`, capped. See [`CardCounts`] for what counts.
     async fn counts(
         conn: &mut PgConnection,
         viewer: &Viewer,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, CardCounts>, DbError> {
+        let in_force = |alias: &str| EDGE_IN_FORCE.replace("e.", &format!("{alias}."));
         let sql = viewer.splice(
-            r"
+            &format!(
+                r"
             SELECT u.id,
                    (SELECT count(*) FROM (
                         SELECT 1 FROM edges e
                          WHERE e.source_id = u.id AND e.source_type = 'agent'
                            AND e.relationship = 'authored' AND e.target_type = 'paper'
-                           /* {EDGE_VISIBILITY:e} */
+                           AND {in_force_e} AND NOT {pending_e}
+                           /* {{EDGE_VISIBILITY:e}} */
                          LIMIT $2) p) AS papers,
+                   (SELECT count(*) FROM (
+                        SELECT 1 FROM edges ep
+                         WHERE ep.source_id = u.id AND ep.source_type = 'agent'
+                           AND ep.relationship = 'authored' AND ep.target_type = 'paper'
+                           AND {in_force_ep} AND {pending_ep}
+                           /* {{EDGE_VISIBILITY:ep}} */
+                         LIMIT $2) pp) AS pending_papers,
                    (SELECT count(*) FROM (
                         (SELECT c.id FROM claims c
                           WHERE c.agent_id = u.id
-                            /* {VISIBILITY:c} */
+                            /* {{VISIBILITY:c}} */
                           LIMIT $2)
                         UNION
                         (SELECT c2.id FROM edges e2
                            JOIN claims c2 ON c2.id = e2.target_id
                           WHERE e2.source_id = u.id AND e2.source_type = 'agent'
                             AND e2.relationship = 'asserts' AND e2.target_type = 'claim'
-                            /* {EDGE_VISIBILITY:e2} */
-                            /* {VISIBILITY:c2} */
+                            AND {in_force_e2}
+                            AND EXISTS (
+                                SELECT 1 FROM edges ea
+                                  JOIN edges pa ON pa.source_id = ea.target_id
+                                 WHERE ea.source_id = u.id AND ea.source_type = 'agent'
+                                   AND ea.relationship = 'authored' AND ea.target_type = 'paper'
+                                   AND {in_force_ea} AND NOT {pending_ea}
+                                   AND pa.source_type = 'paper' AND pa.relationship = 'asserts'
+                                   AND pa.target_type = 'claim' AND pa.target_id = c2.id
+                                   AND {in_force_pa}
+                                   /* {{EDGE_VISIBILITY:ea}} */
+                                   /* {{EDGE_VISIBILITY:pa}} */)
+                            /* {{EDGE_VISIBILITY:e2}} */
+                            /* {{VISIBILITY:c2}} */
                           LIMIT $2)) k) AS claims
               FROM unnest($1::uuid[]) AS u(id)
             ",
+                in_force_e = EDGE_IN_FORCE,
+                pending_e = authorship_pending_sql("e"),
+                in_force_ep = in_force("ep"),
+                pending_ep = authorship_pending_sql("ep"),
+                in_force_e2 = in_force("e2"),
+                in_force_ea = in_force("ea"),
+                pending_ea = authorship_pending_sql("ea"),
+                in_force_pa = in_force("pa"),
+            ),
             3,
         );
-        let mut q = sqlx::query_as::<_, (Uuid, i64, i64)>(&sql)
+        let mut q = sqlx::query_as::<_, (Uuid, i64, i64, i64)>(&sql)
             .bind(ids)
             .bind(COUNT_CAP + 1);
         if let Some(g) = viewer.group_bind() {
@@ -852,12 +928,13 @@ impl AgentLookupRepository {
         let rows = q.fetch_all(&mut *conn).await?;
         Ok(rows
             .into_iter()
-            .map(|(id, papers, claims)| {
-                let capped = papers > COUNT_CAP || claims > COUNT_CAP;
+            .map(|(id, papers, pending, claims)| {
+                let capped = papers > COUNT_CAP || pending > COUNT_CAP || claims > COUNT_CAP;
                 (
                     id,
                     CardCounts {
                         authored_papers: papers.min(COUNT_CAP),
+                        pending_authored_papers: pending.min(COUNT_CAP),
                         asserted_claims: claims.min(COUNT_CAP),
                         capped,
                     },
@@ -983,6 +1060,19 @@ mod tests {
                 .expect("valid")
                 .limit,
             1
+        );
+    }
+
+    /// The document ingest writes these keys on an `authored` edge; a
+    /// spelling drift on either side would silently count every pending
+    /// authorship as the person's.
+    #[test]
+    fn the_pending_authorship_contract_is_pinned() {
+        assert_eq!(AUTHORSHIP_PENDING_PROPERTY, "pending_countersign");
+        assert_eq!(AUTHORSHIP_INGESTED_BY_PROPERTY, "ingested_by");
+        assert_eq!(
+            authorship_pending_sql("ea"),
+            "COALESCE(ea.properties ->> 'pending_countersign', 'false') = 'true'"
         );
     }
 
