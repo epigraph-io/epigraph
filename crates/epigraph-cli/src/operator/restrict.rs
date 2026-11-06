@@ -1238,6 +1238,9 @@ async fn run_batch(
 
     let readable_before = app_readable(conn, ctx.specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Narrowing a public claim bumps the Atlas layout epoch once per
+    // transaction (migration 197); whether this batch is that first narrowing.
+    let epoch_bump_due = tables::layout_epoch_bump_due(conn).await?;
 
     let moved = sqlx::query(
         "UPDATE claims SET visibility = 'group', owner_group_id = $2 \
@@ -1427,6 +1430,11 @@ async fn run_batch(
     }
     for (t, n) in &planned {
         expect_counts.entry(t.clone()).or_default().1 += i64::try_from(*n).unwrap_or(i64::MAX);
+    }
+    if moved > 0 && epoch_bump_due {
+        // Migration 197's trigger: one bump for the transaction's first
+        // public-to-non-public narrowing, however many rows narrowed.
+        expect_counts.insert("atlas_layout_epoch".into(), (0, 1, 0));
     }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),

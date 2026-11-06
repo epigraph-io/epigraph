@@ -278,7 +278,9 @@ const UNCOMPENSATED_INLINE_READS: &[(&str, usize)] = &[
     // `ClaimThemeRepository::claims_in_themes_at_dim_since`, which splices
     // `{VISIBILITY:c}` onto the joined `claims` (PR-29 re-pointed the route at
     // that repo method directly; it previously named the engine wrapper
-    // `candidates_in_themes_at_dim`, whose body was the same call) — and that
+    // `candidates_in_themes_at_dim`, whose body was the same call), or, for a
+    // request pinned with `theme_id`, from the equally spliced
+    // `ClaimThemeRepository::claims_in_theme_exact_at_dim` — and that
     // derivation looks sound. It is
     // registered anyway: the argument is a caller-side invariant with nothing
     // enforcing it, which is precisely the kind of reasoning this register

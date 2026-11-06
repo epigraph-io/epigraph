@@ -41,6 +41,11 @@ const CROSS_SOURCE_SWEEP: Option<&str> = None;
 /// relative to the crate root)`.
 const BINS: &[(&str, Option<&str>, &str)] = &[
     (
+        "atlas_layout",
+        Some(env!("CARGO_BIN_EXE_atlas_layout")),
+        "src/bin/atlas_layout.rs",
+    ),
+    (
         "backfill_dedup_identity_edges",
         Some(env!("CARGO_BIN_EXE_backfill_dedup_identity_edges")),
         "src/bin/backfill_dedup_identity_edges.rs",
