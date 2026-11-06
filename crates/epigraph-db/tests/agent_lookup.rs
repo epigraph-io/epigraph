@@ -790,6 +790,40 @@ async fn roles_show_disclosed_assignments_and_never_the_admin_roster(pool: PgPoo
     );
 }
 
+/// The auditor roster (`role:auditor`: elevates = false, reads_audit = true)
+/// is not disclosed: the reads-audit half of 198's filter, on its own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_auditor_roster_is_not_disclosed(pool: PgPool) {
+    let (elevates, reads_audit): (bool, bool) = sqlx::query_as(
+        "SELECT elevates, reads_audit FROM platform_roles WHERE key = 'role:auditor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("123 seeds role:auditor");
+    assert!(
+        !elevates && reads_audit,
+        "CALIBRATION: only the reads_audit half of the filter covers this role"
+    );
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (auditor, _) = named_human(&pool, "Noor Castell").await;
+    let (plain, _) = named_human(&pool, "Noor Castell").await;
+    grant(&pool, "role:auditor", auditor).await;
+
+    let out = cards_as(&pool, outsider, &[auditor, plain]).await;
+    assert_eq!(
+        shape(&out[0]),
+        shape(&out[1]),
+        "an outsider cannot tell the auditor"
+    );
+    assert!(out[0].roles.is_empty());
+    let r = find_as(&pool, outsider, "noor castell", None, Some("auditor"), None).await;
+    assert!(ids(&r).is_empty(), "the role filter is no auditor oracle");
+
+    // The holder sees its own.
+    let own = card_as(&pool, auditor, auditor).await;
+    assert!(own.roles.iter().any(|r| r.role == "role:auditor"), "{own:?}");
+}
+
 /// A disclosed role is decided by the assignment window alone, as the public
 /// projection shows it, so no client or registration event moves an
 /// outsider's card (`kind` included).
