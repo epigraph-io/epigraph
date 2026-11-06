@@ -13,6 +13,25 @@ pub struct AuthorEntry {
     pub affiliations: Vec<String>,
     #[serde(default)]
     pub roles: Vec<String>,
+    /// The EXISTING agent this author is, by id (a UUID string, e.g. from
+    /// MCP `find_agent`). Optional; document ingest only.
+    ///
+    /// * Given: the author's `authored` and `asserts` edges attach to exactly
+    ///   that agent. It must exist and must not be a registered system
+    ///   identity, a role node, or a system agent's legacy key; otherwise the
+    ///   whole ingest is refused before any write. `name` is still recorded
+    ///   in the report but does not choose the node.
+    /// * Absent (the default, unchanged): the author is the node whose key
+    ///   `did_key_for_author` derives from `name` (reused when it exists,
+    ///   created when not). The ingest NEVER attaches an absent-id author to
+    ///   another existing agent that merely shares the name; it reports such
+    ///   agents as `candidates` (`status: "ambiguous"`) so the caller can
+    ///   re-ingest with an explicit `agent_id`.
+    ///
+    /// Workflow ingest refuses an `agent_id` (workflow authors are always
+    /// name-derived).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Normalised author names that an extractor emits when it could NOT identify
@@ -85,6 +104,66 @@ impl AuthorEntry {
     #[must_use]
     pub fn is_placeholder(&self) -> bool {
         is_placeholder_author_name(&self.name)
+    }
+}
+
+/// Parse every `source.authors[].agent_id` of a DOCUMENT, before any write.
+///
+/// Returns one entry per author, in order: `Some(id)` where the author names
+/// an existing agent, `None` where it does not (the name-derived default).
+/// Refuses, naming the offending `source.authors[i].agent_id`:
+/// * a value that is not a UUID;
+/// * an `agent_id` on a placeholder name ("Unknown", ...): the ingest skips
+///   placeholder entries, so the id would be dropped without a word;
+/// * the same agent on two entries: its edges dedupe on the triple, so one of
+///   the two positions would be lost.
+///
+/// Existence and kind (not a system identity, not a role node) need the
+/// database and are checked by the ingest walk.
+///
+/// # Errors
+/// The first offending entry.
+pub fn parse_author_agent_ids(authors: &[AuthorEntry]) -> Result<Vec<Option<uuid::Uuid>>, String> {
+    let mut out: Vec<Option<uuid::Uuid>> = Vec::with_capacity(authors.len());
+    for (i, author) in authors.iter().enumerate() {
+        let Some(raw) = author.agent_id.as_deref() else {
+            out.push(None);
+            continue;
+        };
+        let id = uuid::Uuid::parse_str(raw.trim()).map_err(|_| {
+            format!("source.authors[{i}].agent_id {raw:?}: not a UUID (pass an agent id, e.g. from find_agent)")
+        })?;
+        if author.is_placeholder() {
+            return Err(format!(
+                "source.authors[{i}].agent_id {id}: the name {:?} is empty or a placeholder, and \
+                 placeholder authors are skipped; give the author's real name with the agent_id",
+                author.name
+            ));
+        }
+        if let Some(j) = out.iter().position(|o| *o == Some(id)) {
+            return Err(format!(
+                "source.authors[{i}].agent_id {id}: the same agent as source.authors[{j}]; \
+                 list each author once"
+            ));
+        }
+        out.push(Some(id));
+    }
+    Ok(out)
+}
+
+/// Refuse a WORKFLOW whose authors carry an `agent_id`: workflow ingest
+/// resolves its authors by name only, and ignoring the id would attribute the
+/// workflow to a node the caller did not choose.
+///
+/// # Errors
+/// The first author with an `agent_id`.
+pub fn refuse_author_agent_ids(authors: &[AuthorEntry]) -> Result<(), String> {
+    match authors.iter().position(|a| a.agent_id.is_some()) {
+        Some(i) => Err(format!(
+            "source.authors[{i}].agent_id: workflow ingest resolves authors by name only and \
+             does not accept an agent_id; remove it (agent_id is for document ingest)"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -286,6 +365,7 @@ mod tests {
             name: "Unknown".to_string(),
             affiliations: vec![],
             roles: vec![],
+            agent_id: None,
         };
         assert!(entry.is_placeholder());
         let real = AuthorEntry {
@@ -293,5 +373,62 @@ mod tests {
             ..entry
         };
         assert!(!real.is_placeholder());
+    }
+
+    fn author(name: &str, agent_id: Option<&str>) -> AuthorEntry {
+        AuthorEntry {
+            name: name.to_string(),
+            affiliations: vec![],
+            roles: vec![],
+            agent_id: agent_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn author_agent_ids_parse_or_refuse_naming_the_entry() {
+        let a = "6f1c1f9e-3a52-4c1b-9d55-0d4b1f7f2a10";
+        let b = "0b7d2c6e-9a41-4f7e-8c3a-5e2d1a9b8c70";
+        let ids =
+            parse_author_agent_ids(&[author("Ada Q", Some(a)), author("Bo R", None)]).expect("ok");
+        assert_eq!(ids, vec![Some(uuid::Uuid::parse_str(a).unwrap()), None]);
+
+        let err = parse_author_agent_ids(&[author("Ada Q", None), author("Bo R", Some("nope"))])
+            .unwrap_err();
+        assert!(err.starts_with("source.authors[1].agent_id"), "{err}");
+        assert!(err.contains("not a UUID"), "{err}");
+
+        let err = parse_author_agent_ids(&[author("Unknown", Some(a))]).unwrap_err();
+        assert!(err.starts_with("source.authors[0].agent_id"), "{err}");
+        assert!(err.contains("placeholder"), "{err}");
+
+        let err = parse_author_agent_ids(&[
+            author("Ada Q", Some(a)),
+            author("Bo R", Some(b)),
+            author("Ada Quinn", Some(&a.to_uppercase())),
+        ])
+        .unwrap_err();
+        assert!(err.starts_with("source.authors[2].agent_id"), "{err}");
+        assert!(err.contains("source.authors[0]"), "{err}");
+    }
+
+    #[test]
+    fn an_absent_agent_id_is_not_serialised_and_old_json_parses() {
+        let parsed: AuthorEntry =
+            serde_json::from_str(r#"{"name": "Ada Q", "affiliations": [], "roles": []}"#)
+                .expect("pre-agent_id JSON parses");
+        assert!(parsed.agent_id.is_none());
+        let json = serde_json::to_value(&parsed).expect("serialise");
+        assert!(json.get("agent_id").is_none(), "{json}");
+    }
+
+    #[test]
+    fn workflow_authors_refuse_an_agent_id() {
+        refuse_author_agent_ids(&[author("Ada Q", None)]).expect("name only is fine");
+        let err = refuse_author_agent_ids(&[
+            author("Ada Q", None),
+            author("Bo R", Some("6f1c1f9e-3a52-4c1b-9d55-0d4b1f7f2a10")),
+        ])
+        .unwrap_err();
+        assert!(err.starts_with("source.authors[1].agent_id"), "{err}");
     }
 }

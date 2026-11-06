@@ -1945,6 +1945,51 @@ pub struct AuthorResponse {
     pub name: String,
 }
 
+/// One author of an ingested document, as the walk resolved it (backlog
+/// 94cc12db): the ingest responses' `authors[]`. `agent_id` and `name` are
+/// the two fields those entries always had; the rest say how the node was
+/// chosen.
+#[derive(Debug, Serialize)]
+pub struct IngestAuthorReport {
+    /// The agent the `authored` and `asserts` edges come from.
+    pub agent_id: String,
+    /// The name as the extraction spelled it.
+    pub name: String,
+    /// The author's index in `source.authors` (gaps where a placeholder or a
+    /// system identity was skipped).
+    pub position: usize,
+    /// `explicit` (the caller's `agent_id`), `matched` (the name-derived node
+    /// existed and no other agent has this name), `created` (it did not, and
+    /// none does), or `ambiguous` (other agents have this name: see
+    /// `candidates`; the ingest attached the name-derived node, never one of
+    /// them).
+    pub status: &'static str,
+    /// What the walk did: `attached_given`, `reused_name_key` or
+    /// `created_name_key`.
+    pub action: &'static str,
+    /// The attached agent's own `display_name`, on an `explicit` author.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Other agents whose case- and accent-folded name equals this author's
+    /// (public fields only; `get_agent` gives the card). Re-ingest with
+    /// `agent_id` to attach one of them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<AuthorCandidate>,
+    /// True when more candidates exist than are listed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub candidates_truncated: bool,
+}
+
+/// An existing agent an absent-`agent_id` author's name also matches.
+#[derive(Debug, Serialize)]
+pub struct AuthorCandidate {
+    pub agent_id: String,
+    pub display_name: Option<String>,
+    /// Always `exact` (folded name equality).
+    pub tier: epigraph_db::MatchTier,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IngestDocumentParams {
     #[schemars(
@@ -2001,7 +2046,7 @@ pub struct IngestDocumentSpineResponse {
     /// document carries no DOI — it is this document's identity, not a real DOI
     /// (issue #356). Poll and label with it exactly as returned.
     pub synthesized_key: bool,
-    pub authors: Vec<AuthorResponse>,
+    pub authors: Vec<IngestAuthorReport>,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
     pub paragraphs_embedded: usize,
@@ -2327,7 +2372,7 @@ pub struct IngestDocumentResponse {
     /// document carries no DOI — it is this document's identity, not a real DOI
     /// (issue #356). Poll and label with it exactly as returned.
     pub synthesized_key: bool,
-    pub authors: Vec<AuthorResponse>,
+    pub authors: Vec<IngestAuthorReport>,
     pub claims_ingested: usize,
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,
