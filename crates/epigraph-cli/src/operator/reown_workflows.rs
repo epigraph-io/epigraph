@@ -156,8 +156,9 @@
 //! * a workflow row of a moved lineage that the run did not see (a new
 //!   generation);
 //! * a claim a manifest workflow executes (retracted edges included), or a
-//!   member of a manifest claim's step lineage (an evolved step's successor),
-//!   that the run did not see;
+//!   member of a MOVED claim's step lineage (an evolved step's successor),
+//!   that the run did not see (a lineage the run left as shared belongs to
+//!   another plan too, so its growth does not block this reversal);
 //! * a moved claim now executed by a workflow the run did not move;
 //! * a row attached to a moved claim, or an edge touching a moved claim or
 //!   workflow, that the run did not see (new evidence, a BBA, a new link);
@@ -2945,14 +2946,19 @@ async fn reverse_tx(
             ),
         ));
     }
-    // A member of a recorded claim's step lineage that the run did not see
+    // A member of a moved claim's step lineage that the run did not see
     // (evolve_step's successor).
+    // Only a MOVED claim's lineage counts: a lineage the run left (shared with
+    // another plan) is not this run's, and another team evolving it must not
+    // block this reversal. A moved lineage is never shared, so growth there is
+    // the moved plan's own.
     for (c, l) in sqlx::query_as::<_, (Uuid, Uuid)>(
         "SELECT c.id, c.step_lineage_id FROM claims c \
           WHERE c.step_lineage_id IN (SELECT k.step_lineage_id FROM claims k \
                                        WHERE k.id = ANY($1) AND k.step_lineage_id IS NOT NULL) \
-            AND c.id <> ALL($1)",
+            AND c.id <> ALL($2)",
     )
+    .bind(&claim_ids)
     .bind(&known_claim_vec)
     .fetch_all(&mut *conn)
     .await?

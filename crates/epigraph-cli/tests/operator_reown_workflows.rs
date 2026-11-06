@@ -1371,6 +1371,48 @@ async fn reverse_refuses_after_a_moved_edge_was_repointed(pool: PgPool) {
     reverse_refuses_after(&pool, None, "repoint", |fx| fx.plan_edges[5].to_string()).await;
 }
 
+/// Another team evolving a step the run LEFT (S4B, shared with gamma, whose
+/// lineage S4 stays with) is not growth of the moved plan: the reversal goes
+/// ahead and restores exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_ignores_growth_of_a_step_lineage_the_run_left(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let before = snapshot(&pool).await;
+    let r = apply(&pool, &fx, &dir, &manifest).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let successor: Uuid = sqlx::query_scalar(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, properties, step_lineage_id) \
+         SELECT gen_random_uuid(), 'step four, evolved by the other team', \
+                decode(md5(random()::text) || md5(random()::text), 'hex'), 0.7, agent_id, \
+                true, 'public', $2, properties, step_lineage_id \
+           FROM claims WHERE id = $1 RETURNING id",
+    )
+    .bind(fx.s4b)
+    .bind(fx.other_team)
+    .fetch_one(&pool)
+    .await
+    .expect("the other team's successor of a left step");
+
+    let rev = reverse(&pool, &manifest, true).await;
+    assert_eq!(
+        rev.code,
+        0,
+        "growth of a lineage the run left must not refuse the reversal: {}",
+        rev.show()
+    );
+    let mut after = snapshot(&pool).await;
+    let id = successor.to_string();
+    after
+        .get_mut("claims")
+        .expect("claims")
+        .retain(|row| !row.contains(&id));
+    assert_eq!(after, before, "the reversal did not restore exactly");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_narrowing_reverse_refuses_after_the_team_evolved_a_moved_step(pool: PgPool) {
     reverse_refuses_after(&pool, Some("group"), "evolved", |_| "step lineage".into()).await;
