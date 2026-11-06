@@ -512,7 +512,9 @@ impl PaperRepository {
                         CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
                              THEN (e.properties ->> 'position')::bigint END, \
                         COALESCE(e.properties ->> '{explicit}' = 'true', false), \
-                        e.properties ->> '{name}' \
+                        e.properties ->> '{name}', \
+                        {pending}, \
+                        CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END \
                    FROM edges e \
                   WHERE e.target_id = $1 AND e.target_type = 'paper' \
                     AND e.source_type = 'agent' AND e.relationship = 'authored' \
@@ -521,12 +523,22 @@ impl PaperRepository {
                   ORDER BY 3 NULLS LAST, e.created_at, e.id",
                 explicit = AUTHORED_EXPLICIT_KEY,
                 name = AUTHORED_NAME_KEY,
+                pending = crate::agent_lookup::authorship_pending_sql("e"),
+                ingested_by = AUTHORED_INGESTED_BY_KEY,
                 in_force = crate::repos::edge::EDGE_IN_FORCE,
             ),
             2,
         );
-        let mut q = sqlx::query_as::<_, (Uuid, Uuid, Option<i64>, bool, Option<String>)>(&sql)
-            .bind(paper_id);
+        type Row = (
+            Uuid,
+            Uuid,
+            Option<i64>,
+            bool,
+            Option<String>,
+            bool,
+            Option<String>,
+        );
+        let mut q = sqlx::query_as::<_, Row>(&sql).bind(paper_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -534,12 +546,16 @@ impl PaperRepository {
             .await?
             .into_iter()
             .map(
-                |(edge_id, agent_id, position, explicit, author_name)| PaperAuthorEdge {
-                    edge_id,
-                    agent_id,
-                    position,
-                    explicit,
-                    author_name,
+                |(edge_id, agent_id, position, explicit, author_name, pending, by)| {
+                    PaperAuthorEdge {
+                        edge_id,
+                        agent_id,
+                        position,
+                        explicit,
+                        author_name,
+                        pending,
+                        ingested_by: by.and_then(|s| s.parse().ok()),
+                    }
                 },
             )
             .collect())
@@ -686,6 +702,12 @@ pub struct PaperAuthorEdge {
     pub explicit: bool,
     /// The extraction's spelling, on an explicit edge ([`AUTHORED_NAME_KEY`]).
     pub author_name: Option<String>,
+    /// The authorship awaits the person's countersignature
+    /// ([`AUTHORED_PENDING_KEY`]).
+    pub pending: bool,
+    /// On a pending edge, the ingester that asserted the authorship
+    /// ([`AUTHORED_INGESTED_BY_KEY`]).
+    pub ingested_by: Option<Uuid>,
 }
 
 /// One author of a paper as [`PaperRepository::list_authors`] lists it.

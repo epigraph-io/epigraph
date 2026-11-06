@@ -1543,3 +1543,159 @@ async fn the_ingest_records_which_paper_created_each_claim_and_every_later_inges
         "a document repeating a directly filed claim never becomes its creator"
     );
 }
+
+/// A stranger's PENDING naming of a person is not kept for a later
+/// ingester's name-only re-ingest: the later ingest attaches the name-derived
+/// author as it would without the squat (reporting the person in
+/// `also_at_position`), and an explicit re-attachment of a pending authorship
+/// is reported as the stored pending authorship it is, with the ingester who
+/// made it, and asserts nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_pending_naming_is_not_kept_for_a_later_ingester(pool: PgPool) {
+    let squatter = app_role_server(&pool).await;
+    let honest = app_role_server(&pool).await;
+    let squatter_id = squatter.server_agent_id().await.expect("squatter");
+    let name = "Perpetua Vandersloot";
+    let victim = human_named(&pool, name).await;
+    let doi = "10.9999/author-squat";
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let json = ingest_wait(
+        &squatter,
+        &pool,
+        doc(doi, json!([{"name": name, "agent_id": victim.to_string()}])),
+    )
+    .await;
+    assert_eq!(
+        json["authors"][0]["attribution"], "pending_countersign",
+        "{json}"
+    );
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &honest,
+            &viewer,
+            &doc(doi, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the honest re-ingest"),
+    );
+    let report = &json["authors"][0];
+    let key = name_key_node(&pool, name)
+        .await
+        .expect("the name path ran: a name-derived node exists");
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["attribution"], "name_derived", "{json}");
+    assert_eq!(
+        report["also_at_position"],
+        json!([victim.to_string()]),
+        "{json}"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi).await,
+        paper_claims(&pool, doi).await,
+        "the name-derived author asserts the document"
+    );
+
+    // The squatter's own name-only re-run keeps its pending attachment, and
+    // says so.
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &squatter,
+            &viewer,
+            &doc(doi, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the squatter re-runs"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], victim.to_string(), "{json}");
+    assert_eq!(report["action"], "kept_attached", "{json}");
+    assert_eq!(report["attribution"], "pending_countersign", "{json}");
+    assert_eq!(
+        report["pending_ingested_by"],
+        squatter_id.to_string(),
+        "{json}"
+    );
+    assert_eq!(asserts_edges(&pool, victim).await, 0, "{json}");
+}
+
+/// The person named by a stranger re-attaches themselves explicitly: the
+/// stored authorship stays the stranger's pending one (no session can rewrite
+/// an agent's edge), so the report says pending, names the stranger, and
+/// writes no `asserts` that the card would then contradict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_person_reattaching_a_pending_authorship_is_told_it_is_still_pending(pool: PgPool) {
+    let squatter = app_role_server(&pool).await;
+    let person = app_role_server(&pool).await;
+    let squatter_id = squatter.server_agent_id().await.expect("squatter");
+    let me = person.server_agent_id().await.expect("person");
+    let doi = "10.9999/author-reattach";
+    ingest_wait(
+        &squatter,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "Me Myself", "agent_id": me.to_string()}]),
+        ),
+    )
+    .await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &person,
+            &viewer,
+            &doc(
+                doi,
+                json!([{"name": "Me Myself", "agent_id": me.to_string()}]),
+            ),
+            None,
+        )
+        .await
+        .expect("the person re-attaches"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["attribution"], "pending_countersign", "{json}");
+    assert_eq!(report["asserts_claims"], false, "{json}");
+    assert_eq!(
+        report["pending_ingested_by"],
+        squatter_id.to_string(),
+        "{json}"
+    );
+    assert_eq!(asserts_edges(&pool, me).await, 0, "{json}");
+    assert_eq!(json["ingested_by"], me.to_string(), "this call's ingester");
+}
+
+/// Replacement follows the entry's own SPELLING. A re-ingest with `agent_id`
+/// and a different spelling is not a replacement: the agent is added at the
+/// position and the earlier name-derived author is reported beside it in
+/// `also_at_position` (the tool text says exactly this).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_respelled_explicit_author_is_added_beside_and_reported(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Bellamy Strand";
+    let human = human_named(&pool, name).await;
+    let doi = "10.9999/author-respelled";
+    ingest_wait(&server, &pool, doc(doi, json!([{"name": name}]))).await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "B. Strand", "agent_id": human.to_string()}]),
+        ),
+    )
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["action"], "attached_given", "{json}");
+    assert!(report.get("replaced").is_none(), "{json}");
+    assert_eq!(
+        report["also_at_position"],
+        json!([key.to_string()]),
+        "{json}"
+    );
+    assert_eq!(authored_in_force(&pool, key, doi).await, 1, "left in place");
+}

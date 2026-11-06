@@ -24,7 +24,10 @@
 //!   whose author an earlier ingest attached by `agent_id`: the name-only
 //!   entry with that same spelling keeps the explicit author
 //!   (`action: "kept_attached"`) instead of adding the name-derived node
-//!   beside it.
+//!   beside it, unless that attachment is ANOTHER ingester's pending naming
+//!   (one ingester's word is not kept for the next one; the next one's
+//!   name path runs and the pending agent is reported in
+//!   `also_at_position`).
 //!
 //! # Who asserts the claims (the explicit-author rule)
 //!
@@ -38,7 +41,10 @@
 //! `ingested_by: <the ingester>`, and no `asserts` edge from that agent onto
 //! any claim; the agent card does not count that paper until the person
 //! countersigns. [`check_explicit_author_ids`] decides it, so the handlers'
-//! preflight and the walk's transaction decide it the same way.
+//! preflight and the walk's transaction decide it the same way. A STORED
+//! pending authorship of the agent on the paper stays pending whoever
+//! re-attaches it ([`effective_attribution`]): no application session can
+//! rewrite an agent's edge, and no countersign route exists yet.
 //!
 //! # Replacing the name-derived author on a re-ingest
 //!
@@ -86,6 +92,11 @@ pub const ATTRIBUTION_OPERATED: &str = "operated_by_caller";
 pub const ATTRIBUTION_PENDING: &str = "pending_countersign";
 /// The name path (no `agent_id`): the name-derived node, as always.
 pub const ATTRIBUTION_NAME_DERIVED: &str = "name_derived";
+/// An earlier attachment of this agent to this paper that is NOT pending
+/// (the person, or their operator, attached it), kept or re-named by an
+/// ingester that does not speak for the agent: it stays the agent's own,
+/// and this call writes no `asserts` for it.
+pub const ATTRIBUTION_CONFIRMED: &str = "confirmed";
 
 /// An explicit `agent_id` that passed every check, and whether the ingester
 /// speaks for it.
@@ -173,6 +184,26 @@ async fn attributions(
             (*a, how)
         })
         .collect())
+}
+
+/// The attribution an explicit or kept author is reported and written with,
+/// given this ingester's relation to it (`how`, from [`attributions`]) and
+/// the paper's STORED in-force authorship of that agent, if any. A stored
+/// pending authorship stays pending whoever re-attaches it (no application
+/// session can rewrite an agent's edge, so reporting anything else would
+/// contradict what readers see), and writes no `asserts`. A stored confirmed
+/// one stays the agent's own. Returns `(attribution, asserts, pending_by)`.
+fn effective_attribution(
+    how: &'static str,
+    stored: Option<&PaperAuthorEdge>,
+    writer: Uuid,
+) -> (&'static str, bool, Option<Uuid>) {
+    match stored {
+        Some(e) if e.pending => (ATTRIBUTION_PENDING, false, e.ingested_by),
+        Some(_) if how == ATTRIBUTION_PENDING => (ATTRIBUTION_CONFIRMED, false, None),
+        _ if how == ATTRIBUTION_PENDING => (ATTRIBUTION_PENDING, false, Some(writer)),
+        _ => (how, true, None),
+    }
 }
 
 /// The database half: every explicit `agent_id` names an agent that may be
@@ -405,11 +436,15 @@ pub(crate) async fn resolve_document_authors(
         if explicit.contains_key(&i) || a.is_placeholder() {
             continue;
         }
+        // A PENDING attachment is one ingester's word: kept only for that
+        // ingester. Anyone else's name-only re-ingest takes the name path, as
+        // without it, and reports the pending agent in `also_at_position`.
         let mut found: Vec<&PaperAuthorEdge> = edges
             .iter()
             .filter(|e| {
                 e.explicit
                     && e.author_name.as_deref() == Some(a.name.as_str())
+                    && (!e.pending || e.ingested_by == Some(writer))
                     && !this_call.contains(&e.agent_id)
                     && !taken.contains(&e.agent_id)
             })
@@ -478,14 +513,15 @@ pub(crate) async fn resolve_document_authors(
                 let name = kept_nodes.get(&id).and_then(|n| n.display_name.clone());
                 Some((id, name, how, "kept_attached"))
             });
-        if let Some((id, display_name, attribution, action)) = given {
-            let asserts = attribution != ATTRIBUTION_PENDING;
+        if let Some((id, display_name, how, action)) = given {
+            let stored = edges.iter().find(|e| e.agent_id == id);
+            let (attribution, asserts, pending_by) = effective_attribution(how, stored, writer);
             out.push(ResolvedAuthor {
                 idx,
                 agent_id: id,
                 asserts,
                 explicit: true,
-                pending: !asserts,
+                pending: attribution == ATTRIBUTION_PENDING,
                 report: IngestAuthorReport {
                     agent_id: id.to_string(),
                     name: author.name.clone(),
@@ -494,6 +530,7 @@ pub(crate) async fn resolve_document_authors(
                     action,
                     attribution,
                     asserts_claims: asserts,
+                    pending_ingested_by: pending_by.map(|u| u.to_string()),
                     display_name,
                     replaced: replaced.remove(&idx),
                     also_at_position: Vec::new(),
@@ -556,6 +593,7 @@ pub(crate) async fn resolve_document_authors(
                 },
                 attribution: ATTRIBUTION_NAME_DERIVED,
                 asserts_claims: true,
+                pending_ingested_by: None,
                 display_name: None,
                 replaced: None,
                 also_at_position: Vec::new(),
