@@ -281,6 +281,20 @@ pub struct AgentCard {
     pub counts: CardCounts,
 }
 
+/// An agent the document ingest may be asked to attach as an author
+/// ([`AgentLookupRepository::author_nodes`]).
+#[derive(Debug, Clone)]
+pub struct AuthorNode {
+    pub id: Uuid,
+    pub display_name: Option<String>,
+    /// `agent_type = 'role'` (migrations 123 / 165): a role's graph node.
+    pub is_role_node: bool,
+    /// Registered in migration 148's `system_agents`.
+    pub is_registered_system: bool,
+    /// Holds a system role's legacy public-constant key (migration 148).
+    pub has_reserved_key: bool,
+}
+
 /// One `find_agent` result: the card and how its name matched.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentSearchHit {
@@ -657,6 +671,102 @@ impl AgentLookupRepository {
         id: Uuid,
     ) -> Result<Option<AgentCard>, DbError> {
         Ok(Self::cards(conn, viewer, &[id]).await?.into_iter().next())
+    }
+
+    /// What the document ingest needs to know about each of `ids` it may
+    /// attach as an author: public `agents` columns (`agents_identity` is
+    /// `USING (true)`, so this reveals nothing a caller could not read with
+    /// `GET /api/v1/agents/:id`) and migration 148's registry, which the
+    /// application role may read. Unknown ids are dropped; at most
+    /// [`CANDIDATE_POOL`] ids.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for more than [`CANDIDATE_POOL`] ids;
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn author_nodes(
+        conn: &mut PgConnection,
+        ids: &[Uuid],
+    ) -> Result<Vec<AuthorNode>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > usize::try_from(CANDIDATE_POOL).unwrap_or(200) {
+            return Err(DbError::InvalidData {
+                reason: format!("at most {CANDIDATE_POOL} agent ids per call"),
+            });
+        }
+        type Row = (Uuid, Option<String>, String, Vec<u8>, bool);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT a.id, a.display_name, a.agent_type, a.public_key, \
+                    EXISTS (SELECT 1 FROM system_agents s WHERE s.agent_id = a.id) \
+               FROM agents a WHERE a.id = ANY($1::uuid[])",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut by_id: HashMap<Uuid, AuthorNode> = rows
+            .into_iter()
+            .map(|(id, display_name, agent_type, public_key, system)| {
+                let has_reserved_key = <[u8; 32]>::try_from(public_key.as_slice())
+                    .is_ok_and(|k| crate::is_reserved_author_key(&k));
+                (
+                    id,
+                    AuthorNode {
+                        id,
+                        display_name,
+                        is_role_node: agent_type == "role",
+                        is_registered_system: system,
+                        has_reserved_key,
+                    },
+                )
+            })
+            .collect();
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
+    /// The agents OTHER than `attached` whose folded name equals `name`'s
+    /// (the matcher's `exact` tier), excluding registered system identities
+    /// and role nodes (neither can be named as an author), oldest first, at
+    /// most `limit`; and whether more exist.
+    ///
+    /// What the document ingest reports as an author's `candidates` when it
+    /// attaches the name-derived node and will not choose among the others.
+    /// The matches carry only public fields (id, `display_name`, tier,
+    /// `created_at`); the ORCID / ROR tiers never apply (`exact` only).
+    ///
+    /// # Errors
+    /// As [`Self::match_by_name`] and [`Self::author_nodes`].
+    pub async fn exact_name_candidates(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        name: &str,
+        attached: Uuid,
+        limit: usize,
+    ) -> Result<(Vec<AgentNameMatch>, bool), DbError> {
+        // Exact sorts first, so the pool holds every exact match unless it
+        // is full and still exact at its last row (then more may exist).
+        let pool = Self::match_by_name(conn, viewer, name, CANDIDATE_POOL).await?;
+        let more_beyond_pool = pool.len() >= usize::try_from(CANDIDATE_POOL).unwrap_or(200)
+            && pool.last().is_some_and(|m| m.tier == MatchTier::Exact);
+        let exact: Vec<AgentNameMatch> = pool
+            .into_iter()
+            .filter(|m| m.tier == MatchTier::Exact && m.agent_id != attached)
+            .collect();
+        let ids: Vec<Uuid> = exact.iter().map(|m| m.agent_id).collect();
+        let excluded: std::collections::HashSet<Uuid> = Self::author_nodes(conn, &ids)
+            .await?
+            .into_iter()
+            .filter(|n| n.is_role_node || n.is_registered_system || n.has_reserved_key)
+            .map(|n| n.id)
+            .collect();
+        let mut kept: Vec<AgentNameMatch> = exact
+            .into_iter()
+            .filter(|m| !excluded.contains(&m.agent_id))
+            .collect();
+        // `match_by_name` ranks exact ties by score (1.0 for all), then oldest.
+        let truncated = more_beyond_pool || kept.len() > limit;
+        kept.truncate(limit);
+        Ok((kept, truncated))
     }
 
     /// `find_agent`: rank name matches, card them, filter, cut to the limit.

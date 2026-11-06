@@ -108,7 +108,7 @@ pub use agent_identity::{
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use agent_lookup::{
     AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch, AgentRef, AgentSearchHit,
-    CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
+    AuthorNode, CardCounts, CardRole, FindAgentQuery, FindAgentResult, MatchTier,
 };
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
