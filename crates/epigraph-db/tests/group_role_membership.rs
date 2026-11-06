@@ -4027,11 +4027,13 @@ async fn a_successor_of_a_detached_and_a_clean_parent_runs_through_the_detached_
 // to the first identity on the way that the operator attached by name. Such
 // an identity's copy is a dead hop. So a job whose running identity the
 // operator detaches stays out when it MOVES ON (a later prompt edit) or
-// REVERTS (to an earlier identity that still holds a live copy), however
-// many registrations later, until the operator attaches the identity that
-// runs by name. Up to the first identity on the way that holds a live row
-// made by name, the answer does not depend on the order the lineage was
-// built in, nor on which parent a successor's copy happens to chain through.
+// REVERTS (to an earlier identity that still holds a live copy), as far as
+// the host registers it (each edit and revert naming the identity that ran
+// as its parent), however many registrations later, until the operator
+// attaches the identity that runs by name. Up to the first identity on the
+// way that holds a live row made by name, the answer does not depend on the
+// order the lineage was built in, nor on which parent a successor's copy
+// happens to chain through.
 // That row ends the walk, so below it the copy chain decides: a successor of
 // a restored identity (detached, then attached by name again) is out when its
 // copy runs through the old, detached copy and in when it names the row made

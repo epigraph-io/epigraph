@@ -1419,12 +1419,13 @@ copy, and nothing copied through a copy it holds admits anyone.
 
 And a detach CUTS OFF THE LINEAGE below the detached identity (migration
 195), as far as `agent_succession` records it. The registration records
-each identity's parents: the identity the group ran before it and, for a
-revert the host registers (the earlier identity's key again, naming the
-identity the job reverts FROM as its parent), that later identity too. A
-revert the host does not register records nothing (see "What the
-cut-off cannot see" below). No succession copy admits an identity that
-descends from a detached identity through identities holding no live
+the parents the host names: for a new identity, the identity the host ran
+before it (a host that keys the parent per model names that model's last
+identity, see "What the cut-off cannot see" below) and, for a revert the
+host registers (the earlier identity's key again, naming the identity the
+job reverts FROM as its parent), that later identity too. A revert the
+host does not register records nothing (same section). No succession copy
+admits an identity that descends from a detached identity through identities holding no live
 attachment you made by name, however many registrations lie in between. The first identity on
 the way up that you attached by name stops the walk. So none of these
 regains the group:
@@ -1436,7 +1437,10 @@ regains the group:
 * a registered revert FROM a detached identity to an earlier one that still
   holds the copy it inherited before the detach, and never was detached
   itself: detaching the identity a job runs cuts the job off, also when it
-  then reverts, moves on and reverts again, or reverted before the detach;
+  then reverts, moves on and reverts again, or reverted before the detach,
+  when each revert and edit is registered with the identity that ran as
+  its parent, and up to an identity holding a live attachment made by name
+  (below);
 * a detached identity that 166's attach-time follow attaches again when you
   attach one of its recorded predecessors by name;
 * a later identity of the job registered after the detach or the revert (a
