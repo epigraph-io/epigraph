@@ -1644,6 +1644,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // answers "no snapshot" to every caller, admitted or not (quiet, the stake
     // that makes the owner a control here).
     ("epigraph_agent_prompt_snapshot_at", 199),
+    // 199, the human an agent was bound to at an instant, for the claim
+    // read's `authored_by.human` and each ingester's human. Its link read is
+    // of the FORCEd `operator_links` (definer-only read policy) and its
+    // retirement read of `security_events`: under a non-member owner it sees
+    // no link and no audit row and answers from the allowance arm alone, so
+    // every linked agent's claims name no human (quiet, the stake that makes
+    // the owner a control here).
+    ("epigraph_operator_bound_at", 199),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2903,6 +2911,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_agent_prompt_snapshot_at",
             "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
+            true,
+        ),
+        // 199: every claim read calls it on the request DSN for
+        // `authored_by.human` (the filer's and each ingester's human);
+        // without the grant every claim read is 42501.
+        (
+            "epigraph_operator_bound_at",
+            "public.epigraph_operator_bound_at(uuid, timestamptz)",
             true,
         ),
     ];

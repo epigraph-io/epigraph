@@ -1,6 +1,8 @@
 -- 199: the prompt snapshot an agent was running at a given instant, for a
 -- claim's provenance (`authored_by.prompt_snapshot` on GET /api/v1/claims/:id
--- and on the MCP `get_claim` tool), read with 161's prompt-history gate.
+-- and on the MCP `get_claim` tool), read with 161's prompt-history gate; and
+-- the human an agent was BOUND to at a given instant (`authored_by.human`, and
+-- each ingester's human), read from the binding record (section 4).
 --
 -- ===================================================================
 -- 1. WHY
@@ -101,8 +103,70 @@
 -- it every GET /api/v1/claims/:id and MCP get_claim errors (42883). An older
 -- binary ignores it.
 --
--- UNDO, only AFTER rolling the binary back to one that does not call it:
+-- UNDO, only AFTER rolling the binary back to one that calls neither:
 --   DROP FUNCTION IF EXISTS public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean);
+--   DROP FUNCTION IF EXISTS public.epigraph_operator_bound_at(uuid, timestamptz);
+--
+-- ===================================================================
+-- 4. THE HUMAN BOUND AT AN INSTANT: `epigraph_operator_bound_at`
+--
+-- `public.epigraph_operator_bound_at(p_agent uuid, p_at timestamptz) RETURNS
+-- uuid`: SECURITY DEFINER, owned by `epigraph_maintenance`, STABLE, PL/pgSQL,
+-- path `pg_catalog, pg_temp`, every relation schema-qualified. The human
+-- operator `p_agent` was bound to at `p_at`, read from the binding RECORD
+-- alone, or NULL.
+--
+-- WHY. A claim names the human its filer was bound to WHEN IT WAS FILED, and
+-- every ingester of a claim the human it was bound to when it ingested. The
+-- agent card names the human bound NOW (a retired link or a revoked allowance
+-- names nobody). A claim filed while a link was live keeps naming that
+-- operator after the link is retired (107 section 7: the operator owns the
+-- agent's claims), and a claim filed after the retirement names nobody,
+-- because the agent no longer acted for anyone. 107's
+-- `epigraph_operator_of_author` reports the link but not WHEN it ended, and
+-- `operator_links` is readable only in a maintenance-owned definer frame, so
+-- the request path needs a definer to answer "at that instant".
+--
+-- THE RULE, the card's structure (149's `epigraph_human_of` with every status
+-- arm left out: no client, registration or membership status is read, so a
+-- reader cannot watch a suspension) evaluated at `p_at` instead of now:
+--   * A LINK (`operator_links`, one per agent for all time, never re-pointed)
+--     names its operator from its creation until its retirement. The
+--     retirement instant is the latest `operator.link_retired` audit row 191's
+--     trigger wrote for that agent and operator. 191 section (e) makes that row
+--     the trigger's alone: an application session cannot insert one, and a
+--     maintenance insert must carry `created_at = now()`, so it can be neither
+--     forged nor backdated below a superuser. A retired link with NO such row
+--     (recorded retired by 107's `epigraph_link_retired_agent`, or retired by a
+--     direct UPDATE before 191 audited the flip) is taken as retired since its
+--     creation: it names its operator for nothing filed after it was recorded,
+--     which never names a human for a claim the agent filed while not bound.
+--   * BEFORE a link's creation (an agent filed claims, then was linked), the
+--     client allowance in force at `p_at` names its operator; with none, the
+--     link's operator does, provided the link was not retired before `p_at`
+--     (the operator owns the agent's earlier claims: 107 section 7's purpose
+--     for a retired link).
+--   * With NO link, the 149 allowance (`author_binding_clients`) in force at
+--     `p_at`: `added_at <= p_at` and not revoked at or before `p_at`; the
+--     latest such row if several.
+-- At `p_at = now()` this is exactly the card's `operator_human`: a live link's
+-- operator, nobody for a retired link, else the unrevoked allowance.
+--
+-- WHAT IT REVEALS. A caller with EXECUTE (the application role) who passes
+-- arbitrary instants can bisect a link's creation and retirement instants and
+-- an allowance's window. The allowance window is already readable
+-- (`author_binding_clients` is SELECT-granted to `epigraph_app`, 149), the
+-- retired bit is disclosed by the card (107 section 5 accepts it), and the
+-- request path only ever passes a claim's `created_at` or an ingest record's
+-- time. What a DSN holder newly learns is the link's creation and retirement
+-- instants, to the precision of its bisection. No client, registration or
+-- membership status leaves the function.
+--
+-- EXECUTE: revoked from PUBLIC; granted to `epigraph_app` and
+-- `epigraph_maintenance`. REGISTERED in `tenancy_backfill.rs`
+-- `DEFERRED_DEFINER_FUNCTIONS` at 199 (under a non-bypassing owner it reads no
+-- link and no audit row: it answers from the allowance arm alone, so a linked
+-- agent's claims name nobody) and in its app-grant check.
 SET LOCAL lock_timeout = '3s';
 
 CREATE OR REPLACE FUNCTION public.epigraph_agent_prompt_snapshot_at(
@@ -162,5 +226,72 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_agent_prompt_snapshot_at(uuid, '
                 'timestamptz, boolean) TO epigraph_app';
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_operator_bound_at(
+    p_agent uuid,
+    p_at timestamptz)
+RETURNS uuid
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_operator uuid;
+    v_linked   timestamptz;
+    v_retired  boolean;
+    v_until    timestamptz;
+    v_allowed  uuid;
+BEGIN
+    IF p_agent IS NULL OR p_at IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT l.operator_id, l.created_at, l.retired
+      INTO v_operator, v_linked, v_retired
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent;
+    IF v_operator IS NOT NULL THEN
+        IF v_retired THEN
+            SELECT max(s.created_at) INTO v_until
+              FROM public.security_events s
+             WHERE s.agent_id = p_agent
+               AND s.event_type = 'operator.link_retired'
+               AND s.details ->> 'operator_id' = v_operator::text;
+            v_until := COALESCE(v_until, v_linked);
+        ELSE
+            v_until := 'infinity'::timestamptz;
+        END IF;
+        IF p_at >= v_linked THEN
+            RETURN CASE WHEN p_at < v_until THEN v_operator END;
+        END IF;
+    END IF;
+
+    SELECT r.operator_id INTO v_allowed
+      FROM public.author_binding_clients r
+     WHERE r.agent_id = p_agent
+       AND r.added_at <= p_at
+       AND (r.revoked_at IS NULL OR p_at < r.revoked_at)
+     ORDER BY r.added_at DESC, r.client_id
+     LIMIT 1;
+    IF v_allowed IS NOT NULL THEN
+        RETURN v_allowed;
+    END IF;
+    IF v_operator IS NOT NULL AND p_at < v_until THEN
+        RETURN v_operator;
+    END IF;
+    RETURN NULL;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_operator_bound_at(uuid, timestamptz) FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_operator_bound_at(uuid, timestamptz) '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_bound_at(uuid, '
+                'timestamptz) TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_operator_bound_at(uuid, '
+                'timestamptz) TO epigraph_app';
     END IF;
 END $$;
