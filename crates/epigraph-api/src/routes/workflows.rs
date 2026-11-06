@@ -2320,6 +2320,15 @@ pub async fn ingest_workflow(
             field: "relationships".to_string(),
             reason,
         })?;
+    // Workflow authors are name-derived only: an `agent_id` (a document-ingest
+    // field on the shared `AuthorEntry`, backlog 94cc12db) is refused rather
+    // than silently ignored.
+    epigraph_ingest::common::schema::refuse_author_agent_ids(&extraction.source.authors).map_err(
+        |reason| ApiError::ValidationError {
+            field: "source.authors".to_string(),
+            reason,
+        },
+    )?;
     let declared_group = tenancy.map(|t| t.owner_group_id);
     // The caller's OWN membership of a declared group, before anything is
     // begun (`require_caller_writes_group`). A viewer with no principal names
