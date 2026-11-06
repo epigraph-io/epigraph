@@ -3,7 +3,9 @@
 -- to decide whether a LATER passkey may be registered without attestation (the
 -- enrollment's `passkey.register` act, the passkey that confirmed it, and that
 -- passkey's lineage); two triggers on `person_authenticators` keep the
--- decision true while the passkey is recorded and afterwards.
+-- decision true while the passkey is recorded and afterwards; a
+-- maintenance-only COMPROMISED revoke takes out a passkey with every passkey
+-- enrolled through it, and the revoke audit records which mode revoked.
 --
 -- ===================================================================
 -- 1. WHY
@@ -96,7 +98,10 @@
 -- follows only the same person's passkeys (an act enrollment is always the
 -- act proposer's own and a proposer's act is confirmed only by the
 -- proposer's passkey, so another person's passkey is never on the walk; the
--- filter keeps it so on any rows), and stops at a cycle. The passkey is
+-- filter keeps it so on any rows), and stops at a cycle. It first locks
+-- every passkey of the person (FOR NO KEY UPDATE, which (b)'s FOR SHARE
+-- conflicts with), so a completion in flight on any of their acts is waited
+-- for and then walked, and one that starts later is refused (ELV04). The passkey is
 -- stamped with the reason as given; each other one `compromised anchor <id>
 -- (lineage): <reason>`. 124's update guard and audit run on every row, and
 -- 125's end trigger ends every elevation each revoked passkey confirmed.
@@ -315,6 +320,14 @@ BEGIN
         RAISE EXCEPTION 'ELV04: no passkey %', p_id
             USING ERRCODE = 'ELV04';
     END IF;
+    -- Lock every passkey of the person first (the lock the UPDATE takes
+    -- anyway, which conflicts with (b)'s FOR SHARE): a completion in flight
+    -- on an act one of them confirmed is waited for, and the walk below, a
+    -- later statement with a later snapshot, then sees the passkey it
+    -- recorded; a completion that starts later waits for this transaction
+    -- and is refused (ELV04, its confirmer revoked).
+    PERFORM 1 FROM public.person_authenticators k
+      WHERE k.person_agent_id = v_person ORDER BY k.id FOR NO KEY UPDATE;
     -- The walk, down the acts each passkey confirmed: through revoked
     -- passkeys too, the same person's only, never round a cycle.
     WITH RECURSIVE down (id, depth, path) AS (

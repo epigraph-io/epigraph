@@ -2881,8 +2881,11 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     those confirmed, and so on, attested ones included. It never touches
     another person's passkeys. Every elevation any of them confirmed ends
     (`passkey_revoked`), and every unexecuted act they confirmed is voided,
-    as for any revoke. It prints one line per passkey reached (`depth=` 0
-    for the passkey named) and, without `--apply`, rolls everything back.
+    as for any revoke. It first locks the person's passkeys, so an
+    enrollment completing at that moment on one of their acts is waited
+    for and then revoked with the rest, and one that starts later is
+    refused. It prints one line per passkey reached (`depth=` 0 for the
+    passkey named) and, without `--apply`, rolls everything back.
     It also works on a passkey already revoked: revoked passkeys are walked
     through, not revoked again, and anything still live below them is
     revoked. Afterwards the person enrolls a replacement on a

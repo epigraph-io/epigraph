@@ -2757,7 +2757,8 @@ async fn revoke_compromised(
 }
 
 /// The `mode` of each passkey's `platform.passkey_revoked` audit row (`None`
-/// when it has none; absent when it was never revoked).
+/// when it has none; absent when it was never revoked). Rows written in one
+/// statement share `created_at`, so compare them as a set.
 async fn revoke_modes(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, Option<String>)> {
     sqlx::query_as(
         "SELECT (details->>'authenticator_id')::uuid, details->>'mode' FROM security_events \
@@ -2992,12 +2993,15 @@ async fn a_lost_revoke_keeps_the_backup_and_a_later_compromised_revoke_sweeps_it
             "CALIBRATION: a lost revoke leaves {live} live"
         );
     }
+    let mut modes = revoke_modes(&pool, &[f.p.passkey, f.synced]).await;
+    modes.sort();
+    let mut want = vec![
+        (f.p.passkey, Some("lost".to_string())),
+        (f.synced, Some("lost".to_string())),
+    ];
+    want.sort();
     assert_eq!(
-        revoke_modes(&pool, &[f.p.passkey, f.synced]).await,
-        vec![
-            (f.p.passkey, Some("lost".to_string())),
-            (f.synced, Some("lost".to_string()))
-        ],
+        modes, want,
         "the lost revoke and its cascade are audited `lost`"
     );
     maint(
@@ -3092,4 +3096,107 @@ async fn the_compromised_revoke_is_a_maintenance_only_definer(pool: PgPool) {
     assert_eq!(owner, "epigraph_maintenance");
     assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
     assert_eq!((app, public), (false, false));
+}
+
+/// A completion in flight (uncommitted) on an act the BACKUP confirmed holds
+/// the backup under the insert guard's share lock. A compromised revoke of
+/// the phone started meanwhile WAITS for it, then takes out the ATTESTED
+/// passkey that completed (the lost cascade would leave an attested one
+/// live, so only the compromised walk can reach it): it appears in the
+/// returned rows and is revoked. Then the reverse order: a completion on an
+/// act confirmed by a passkey the compromised revoke has locked waits, and is
+/// refused ELV04 once the revoke commits. CALIBRATION: each side waits.
+/// Red line (the walk computed before any lock): the attested child stays
+/// live and is not in the returned rows. Mutation: the person-wide
+/// `FOR NO KEY UPDATE` dropped -> the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_compromised_revoke_waits_for_and_sweeps_a_completion_in_flight(pool: PgPool) {
+    use sqlx::Executor;
+    let wait = std::time::Duration::from_millis(700);
+    let p = elevated_custodian(&pool, "phone owner", 1).await;
+    let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+    let backup = try_complete(&pool, e_backup, 2, "packed").await.unwrap();
+    let via_backup = Elevated {
+        passkey: backup,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (_, e_child) = anchored_enrollment(&pool, &via_backup).await;
+    let (_, e_late) = anchored_enrollment(&pool, &via_backup).await;
+
+    // (1) The completion first: uncommitted, holding the backup.
+    let mut a = app_session(&pool).await;
+    a.execute("BEGIN").await.unwrap();
+    sqlx::query(
+        "SELECT public.epigraph_set_passkey_enrollment_challenge($1, '{\"rs\": 1}'::jsonb)",
+    )
+    .bind(e_child)
+    .execute(&mut *a)
+    .await
+    .unwrap();
+    let child: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_complete_passkey_enrollment($1, $2, '{\"cred\": 1}'::jsonb, \
+                '2fc0579f-8113-47ea-b116-bb5a8db9202a'::uuid, 'packed', true, false)",
+    )
+    .bind(e_child)
+    .bind(credential(3))
+    .fetch_one(&mut *a)
+    .await
+    .expect("the attested completion, uncommitted");
+    let pool2 = pool.clone();
+    let phone = p.passkey;
+    let revoke =
+        tokio::spawn(async move { revoke_compromised(&pool2, phone, "phone stolen").await });
+    tokio::time::sleep(wait).await;
+    assert!(
+        !revoke.is_finished(),
+        "CALIBRATION: the compromised revoke waits for the completion"
+    );
+    a.execute("COMMIT").await.unwrap();
+    release(a).await;
+    let got = revoke.await.unwrap().expect("the compromised revoke");
+    assert!(
+        got.iter().any(|(id, depth, now)| *id == child && *depth == 2 && *now),
+        "the passkey that completed under the lock is reached: {got:?}"
+    );
+    assert!(
+        revoked(&pool, child).await.is_some(),
+        "the attested passkey that completed meanwhile is revoked"
+    );
+
+    // (2) The revoke first: a later completion on the backup's act waits,
+    // then is refused.
+    let q = elevated_custodian(&pool, "second owner", 4).await;
+    let (_, e_q) = anchored_enrollment(&pool, &q).await;
+    let mut m = pool.acquire().await.unwrap();
+    m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .unwrap();
+    m.execute("BEGIN").await.unwrap();
+    sqlx::query("SELECT * FROM public.epigraph_revoke_passkey_compromised($1, 'suspect')")
+        .bind(q.passkey)
+        .execute(&mut *m)
+        .await
+        .expect("the compromised revoke, uncommitted");
+    let pool3 = pool.clone();
+    let complete = tokio::spawn(async move { try_complete(&pool3, e_q, 5, "packed").await });
+    tokio::time::sleep(wait).await;
+    assert!(
+        !complete.is_finished(),
+        "CALIBRATION: the completion waits for the revoke"
+    );
+    m.execute("COMMIT").await.unwrap();
+    m.execute("RESET SESSION AUTHORIZATION").await.unwrap();
+    drop(m);
+    assert_code(
+        &complete.await.unwrap(),
+        "ELV04",
+        "the completion after the compromised revoke committed",
+    );
+    // The phone's revoked backup refuses its own later enrollment too.
+    assert_code(
+        &try_complete(&pool, e_late, 6, "packed").await,
+        "ELV04",
+        "a completion on a revoked backup's act",
+    );
 }
