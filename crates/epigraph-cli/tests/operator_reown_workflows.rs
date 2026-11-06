@@ -132,6 +132,20 @@ struct Fx {
     y: Uuid,
     ev_s1: Uuid,
     mf_s2: Uuid,
+    /// S4 (alpha) and S4B (gamma) share a step lineage: S4B is shared, so S4
+    /// must be LEFT with it.
+    s4: Uuid,
+    s4b: Uuid,
+    /// S5 and S6 (alpha) are the provenance of one fragment; S6 has an edge to
+    /// the private thesis PC, so it stays, and S5 must stay with it (the
+    /// cascaded-row fixpoint).
+    s5: Uuid,
+    s6: Uuid,
+    frag56: Uuid,
+    /// author -> alpha generation 0 `AUTHORED`: structural, world-owned.
+    e_authored: Uuid,
+    /// alpha generation 0 `executes` S4, S5, S6 (three LEFT claims).
+    e_exec_left: Vec<Uuid>,
     /// Claim-to-claim plan edges between moving claims (or to X): SRC's.
     plan_edges: Vec<Uuid>,
     /// `executes`, `variant_of`, `asserts`: world.
@@ -384,6 +398,30 @@ async fn seed(pool: &PgPool) -> Fx {
     )
     .await;
 
+    let step_lineage_2 = Uuid::new_v4();
+    let s4 = claim_in_lineage(
+        &mut c,
+        ingest,
+        src,
+        "public",
+        2,
+        "alpha step four",
+        Some(step_lineage_2),
+    )
+    .await;
+    let s4b = claim_in_lineage(
+        &mut c,
+        ingest,
+        src,
+        "public",
+        2,
+        "step four as gamma runs it",
+        Some(step_lineage_2),
+    )
+    .await;
+    let s5 = claim(&mut c, ingest, src, "public", 2, "alpha step five").await;
+    let s6 = claim(&mut c, ingest, src, "public", 2, "alpha step six").await;
+
     let mut structural = Vec::new();
     for (w, cl) in [
         (w_a0, t),
@@ -402,9 +440,18 @@ async fn seed(pool: &PgPool) -> Fx {
         (w_f, fc),
         (w_g, x),
         (w_g, gc),
+        (w_g, s4b),
     ] {
         structural.push(edge(&mut c, (w, "workflow"), (cl, "claim"), "executes").await);
     }
+    let mut e_exec_left = Vec::new();
+    for cl in [s4, s5, s6] {
+        let e = edge(&mut c, (w_a0, "workflow"), (cl, "claim"), "executes").await;
+        structural.push(e);
+        e_exec_left.push(e);
+    }
+    let e_authored = edge(&mut c, (author, "agent"), (w_a0, "workflow"), "AUTHORED").await;
+    structural.push(e_authored);
     structural.push(edge(&mut c, (w_a1, "workflow"), (w_a0, "workflow"), "variant_of").await);
     // The private plan's `executes` edge takes the meet of a private endpoint:
     // ('group', SRC). Its lineage is held, so it never moves.
@@ -426,8 +473,40 @@ async fn seed(pool: &PgPool) -> Fx {
         plan_edges.push(edge(&mut c, (s, "claim"), (tg, "claim"), rel).await);
     }
     let e_s1_y = edge(&mut c, (s1, "claim"), (y, "claim"), "supports").await;
+    // S6 -> the private thesis: a non-public endpoint, so S6 stays.
+    edge(&mut c, (s6, "claim"), (pc, "claim"), "refines").await;
     unstamp(&mut c).await;
     drop(c);
+
+    // One fragment, the provenance of S5 and S6, owned like the plan.
+    let hsource: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_sources (content_hash, modality) VALUES ($1, 'text') RETURNING id",
+    )
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester source");
+    let frag56: Uuid = sqlx::query_scalar(
+        "INSERT INTO harvester_fragments (source_id, content_hash, content_text, owner_group_id, \
+                                          visibility) \
+         VALUES ($1, $2, 'shared fragment', $3, 'public') RETURNING id",
+    )
+    .bind(hsource)
+    .bind(h32(Uuid::new_v4()))
+    .bind(src)
+    .fetch_one(pool)
+    .await
+    .expect("seed fragment");
+    for cl in [s5, s6] {
+        sqlx::query(
+            "INSERT INTO harvester_claim_provenance (claim_id, fragment_id) VALUES ($1, $2)",
+        )
+        .bind(cl)
+        .bind(frag56)
+        .execute(pool)
+        .await
+        .expect("seed provenance");
+    }
 
     let ev_s1: Uuid = sqlx::query_scalar(
         "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
@@ -499,6 +578,13 @@ async fn seed(pool: &PgPool) -> Fx {
         y,
         ev_s1,
         mf_s2,
+        s4,
+        s4b,
+        s5,
+        s6,
+        frag56,
+        e_authored,
+        e_exec_left,
         plan_edges,
         structural_edges: structural,
         e_s1_y,
@@ -519,6 +605,8 @@ const SNAPSHOT_TABLES: &[&str] = &[
     "groups",
     "group_memberships",
     "operator_links",
+    "harvester_fragments",
+    "harvester_claim_provenance",
     "atlas_layout_epoch",
 ];
 
@@ -606,29 +694,44 @@ const LISTED: &[&str] = &[
 ];
 
 async fn apply(pool: &PgPool, fx: &Fx, dir: &Path, manifest: &Path) -> Run {
+    apply_to(pool, fx, dir, manifest, fx.target, None).await
+}
+
+/// An `--apply` run into `target`, with `--visibility <v>` when given.
+async fn apply_to(
+    pool: &PgPool,
+    fx: &Fx,
+    dir: &Path,
+    manifest: &Path,
+    target: Uuid,
+    visibility: Option<&str>,
+) -> Run {
     let names = names_file(dir, LISTED);
-    run_op(
-        pool,
-        &[
-            "reown-workflows",
-            "--canonical-names-file",
-            names.to_str().unwrap(),
-            "--target-group",
-            &fx.target.to_string(),
-            "--operator",
-            &fx.operator.to_string(),
-            "--manifest-out",
-            manifest.to_str().unwrap(),
-            "--apply",
-            "--confirm-count",
-            "3",
-            "--ruling",
-            RULING,
-            "--reason",
-            "the team evolves these plans",
-        ],
-    )
-    .await
+    let target = target.to_string();
+    let operator = fx.operator.to_string();
+    let mut args = vec![
+        "reown-workflows",
+        "--canonical-names-file",
+        names.to_str().unwrap(),
+        "--target-group",
+        &target,
+        "--operator",
+        &operator,
+        "--manifest-out",
+        manifest.to_str().unwrap(),
+        "--apply",
+        "--confirm-count",
+        "3",
+        "--ruling",
+        RULING,
+        "--reason",
+        "the team evolves these plans",
+    ];
+    if let Some(v) = visibility {
+        args.push("--visibility");
+        args.push(v);
+    }
+    run_op(pool, &args).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -734,6 +837,20 @@ async fn a_dry_run_writes_nothing_and_reports_the_plan(pool: PgPool) {
         "a step another group owns must be reported and left: {}",
         r.show()
     );
+    assert!(
+        r.stdout.lines().any(|l| l.starts_with("LEFT-CLAIM\t")
+            && l.contains(&fx.s4.to_string())
+            && l.contains("step lineage")),
+        "a step whose lineage has a shared member is left whole: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.lines().any(|l| l.starts_with("LEFT-CLAIM\t")
+            && l.contains(&fx.s5.to_string())
+            && l.contains("shared with a plan claim that stays")),
+        "a step sharing a cascaded row with a step that stays, stays (the fixpoint): {}",
+        r.show()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -798,6 +915,18 @@ async fn apply_moves_only_the_source_groups_rows_and_keeps_visibility(pool: PgPo
     assert_eq!(
         tenancy(&pool, "claims", fx.y).await,
         (fx.src, "public".into())
+    );
+    for c in [fx.s4, fx.s4b, fx.s5, fx.s6] {
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            (fx.src, "public".into()),
+            "a left step stays on the source: {c}"
+        );
+    }
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag56).await,
+        (fx.src, "public".into()),
+        "a fragment shared with a step that stays does not move"
     );
     assert_eq!(
         tenancy(&pool, "claims", fx.pc).await,
@@ -1091,5 +1220,389 @@ async fn reverse_refuses_after_a_new_generation_joined_the_lineage(pool: PgPool)
     assert_eq!(rev.code, 3, "{}", rev.show());
     assert!(rev.stdout.contains("alpha"), "{}", rev.show());
     assert_eq!(snapshot(&pool).await, changed, "a refused reversal wrote");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Growth since the move: the reversal refuses
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply (with `visibility`), grow the moved plan with `grow`, then reverse:
+/// the reversal must refuse (exit 3), write nothing, name `expect`, and write
+/// no reversal audit row.
+async fn reverse_refuses_after(
+    pool: &PgPool,
+    visibility: Option<&str>,
+    grow: &str,
+    expect: impl Fn(&Fx) -> String,
+) {
+    let fx = seed(pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let r = apply_to(pool, &fx, &dir, &manifest, fx.target, visibility).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let vis = visibility.unwrap_or("public");
+    match grow {
+        // evolve_step: a successor in S1's step lineage, inheriting S1's
+        // tenancy (the target's now), executed by no workflow.
+        "evolved" => {
+            sqlx::query(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                     is_current, visibility, owner_group_id, properties, \
+                                     step_lineage_id) \
+                 SELECT gen_random_uuid(), 'alpha step one, evolved by the team', \
+                        decode(md5(random()::text) || md5(random()::text), 'hex'), 0.7, \
+                        agent_id, true, $2, $3, properties, step_lineage_id \
+                   FROM claims WHERE id = $1",
+            )
+            .bind(fx.s1)
+            .bind(vis)
+            .bind(fx.target)
+            .execute(pool)
+            .await
+            .expect("an evolved successor");
+        }
+        // add_step: a new claim, executed by a moved generation.
+        "add_step" => {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                     is_current, visibility, owner_group_id, properties) \
+                 SELECT gen_random_uuid(), 'a step the team added', \
+                        decode(md5(random()::text) || md5(random()::text), 'hex'), 0.7, \
+                        agent_id, true, $2, $3, properties \
+                   FROM claims WHERE id = $1 RETURNING id",
+            )
+            .bind(fx.s2)
+            .bind(vis)
+            .bind(fx.target)
+            .fetch_one(pool)
+            .await
+            .expect("an added step");
+            sqlx::query(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'workflow', $2, 'claim', 'executes')",
+            )
+            .bind(fx.w_a1)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("its executes edge");
+        }
+        // A team member's evidence on a moved step.
+        "evidence" => {
+            sqlx::query(
+                "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
+                 VALUES ($1, 'document', $2, 'the team''s evidence')",
+            )
+            .bind(fx.s2)
+            .bind(h32(Uuid::new_v4()))
+            .execute(pool)
+            .await
+            .expect("new evidence");
+        }
+        // A new edge from a moved step.
+        "edge" => {
+            sqlx::query(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+                 VALUES ($1, 'claim', $2, 'claim', 'supports')",
+            )
+            .bind(fx.s2)
+            .bind(fx.s3)
+            .execute(pool)
+            .await
+            .expect("new edge");
+        }
+        // evolve_step's supersede cascade re-points a moved plan edge onto the
+        // successor (same tenancy, new endpoint).
+        "repoint" => {
+            sqlx::query("UPDATE edges SET source_id = $2 WHERE id = $1")
+                .bind(fx.plan_edges[5])
+                .bind(fx.s1n)
+                .execute(pool)
+                .await
+                .expect("re-point a moved plan edge");
+        }
+        other => panic!("unknown growth {other}"),
+    }
+    let grown = snapshot(pool).await;
+    let rev = reverse(pool, &manifest, true).await;
+    assert_eq!(
+        rev.code,
+        3,
+        "growth `{grow}` must refuse the reversal: {}",
+        rev.show()
+    );
+    assert!(
+        rev.stdout.contains(&expect(&fx)),
+        "growth `{grow}`: the refusal must name {}: {}",
+        expect(&fx),
+        rev.show()
+    );
+    assert_eq!(snapshot(pool).await, grown, "a refused reversal wrote");
+    assert_eq!(
+        security_events(pool, "operator.workflows_reown_reversed").await,
+        0
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_after_the_team_evolved_a_moved_step(pool: PgPool) {
+    reverse_refuses_after(&pool, None, "evolved", |_| "step lineage".into()).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_after_the_team_added_a_step(pool: PgPool) {
+    reverse_refuses_after(&pool, None, "add_step", |fx| fx.w_a1.to_string()).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_after_new_evidence_on_a_moved_step(pool: PgPool) {
+    reverse_refuses_after(&pool, None, "evidence", |_| "evidence".into()).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_after_a_new_edge_on_a_moved_step(pool: PgPool) {
+    reverse_refuses_after(&pool, None, "edge", |fx| fx.s2.to_string()).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn reverse_refuses_after_a_moved_edge_was_repointed(pool: PgPool) {
+    reverse_refuses_after(&pool, None, "repoint", |fx| fx.plan_edges[5].to_string()).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_narrowing_reverse_refuses_after_the_team_evolved_a_moved_step(pool: PgPool) {
+    reverse_refuses_after(&pool, Some("group"), "evolved", |_| "step lineage".into()).await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Narrowing: --visibility group (into a team, or in place)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async fn snapshot_sans_epoch(pool: &PgPool) -> BTreeMap<String, Vec<String>> {
+    let mut s = snapshot(pool).await;
+    s.remove("atlas_layout_epoch");
+    s
+}
+
+/// Every edge with an endpoint among `ids`, with its full tenancy.
+async fn edges_touching(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, Uuid, String, Option<Uuid>)> {
+    sqlx::query_as(
+        "SELECT id, owner_group_id, visibility::text, co_owner_group_id FROM edges \
+          WHERE source_id = ANY($1) OR target_id = ANY($1) ORDER BY id",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await
+    .expect("edges touching")
+}
+
+async fn writer_owned(pool: &PgPool, table: &str, id: Uuid) -> bool {
+    sqlx::query_scalar(&format!("SELECT writer_owned FROM {table} WHERE id = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("writer_owned")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_apply_narrows_every_moved_row_into_the_target_and_bumps_the_epoch(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let epoch_before = epoch(&pool).await;
+    let audits = security_events(&pool, "operator.workflows_reowned").await;
+    let left_edges_before = edges_touching(&pool, &[fx.w_g, fx.w_f]).await;
+
+    let r = apply_to(&pool, &fx, &dir, &manifest, fx.target, Some("group")).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+
+    let narrowed = (fx.target, "group".to_string());
+    let moved_wf = [fx.w_a0, fx.w_a1, fx.w_b0];
+    let moved_claims = [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb];
+    for w in moved_wf {
+        assert_eq!(
+            tenancy(&pool, "workflows", w).await,
+            narrowed,
+            "workflow {w}"
+        );
+    }
+    for c in moved_claims {
+        assert_eq!(tenancy(&pool, "claims", c).await, narrowed, "claim {c}");
+    }
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_s1).await, narrowed);
+    assert_eq!(
+        tenancy(&pool, "mass_functions", fx.mf_s2).await,
+        narrowed,
+        "a writer-owned public row narrows with its claim (migration 114)"
+    );
+    assert!(!writer_owned(&pool, "mass_functions", fx.mf_s2).await);
+    // Every edge touching a moved workflow or claim: no more visible than the
+    // plan it belongs to. Claim endpoints: the cascade's meet. Workflow and
+    // agent endpoints (`executes` into a left step, `variant_of`, `AUTHORED`):
+    // narrowed by the tool.
+    let all: Vec<Uuid> = moved_wf
+        .iter()
+        .chain(moved_claims.iter())
+        .copied()
+        .collect();
+    for (e, o, v, co) in edges_touching(&pool, &all).await {
+        assert_eq!(
+            (o, v.clone(), co),
+            (fx.target, "group".to_string(), None),
+            "edge {e}"
+        );
+    }
+    assert!(fx.e_exec_left.len() == 3);
+    assert_eq!(tenancy(&pool, "edges", fx.e_authored).await, narrowed);
+    assert_eq!(tenancy(&pool, "edges", fx.e_s1_y).await, narrowed);
+    // What stays: left steps, other plans, their edges.
+    for c in [fx.x, fx.s4, fx.s4b, fx.s5, fx.s6, fx.y] {
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            (fx.src, "public".into()),
+            "claim {c}"
+        );
+    }
+    assert_eq!(
+        tenancy(&pool, "claims", fx.z).await,
+        (fx.other_team, "public".into())
+    );
+    assert_eq!(
+        tenancy(&pool, "claims", fx.pc).await,
+        (fx.src, "group".into())
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", fx.frag56).await,
+        (fx.src, "public".into())
+    );
+    for (w, t) in [
+        (fx.w_f, (fx.other_team, "public".to_string())),
+        (fx.w_g, (fx.other_team, "public".to_string())),
+        (fx.w_p, (fx.src, "group".to_string())),
+        (fx.w_d0, (fx.target, "public".to_string())),
+        (fx.w_d1, (fx.src, "public".to_string())),
+    ] {
+        assert_eq!(tenancy(&pool, "workflows", w).await, t, "workflow {w}");
+    }
+    assert_eq!(
+        edges_touching(&pool, &[fx.w_g, fx.w_f]).await,
+        left_edges_before,
+        "another plan's edges are untouched"
+    );
+    assert_eq!(
+        epoch(&pool).await,
+        epoch_before + 1,
+        "a narrowing must bump the atlas epoch (migration 197): {}",
+        r.show()
+    );
+    assert_eq!(
+        security_events(&pool, "operator.workflows_reowned").await,
+        audits + 1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn group_reverse_restores_every_row_and_its_visibility_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let before = snapshot_sans_epoch(&pool).await;
+    let r = apply_to(&pool, &fx, &dir, &manifest, fx.target, Some("group")).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let after_apply = snapshot_sans_epoch(&pool).await;
+    assert_ne!(after_apply, before, "the apply narrowed nothing");
+    let epoch_after_apply = epoch(&pool).await;
+
+    let dry = reverse(&pool, &manifest, false).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        after_apply,
+        "a dry reversal wrote"
+    );
+
+    let rev = reverse(&pool, &manifest, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "the reversal did not restore every row and its visibility: {}",
+        rev.show()
+    );
+    assert_eq!(
+        epoch(&pool).await,
+        epoch_after_apply,
+        "a widening never moves the atlas epoch, and nothing decrements it"
+    );
+    assert_eq!(
+        security_events(&pool, "operator.workflows_reown_reversed").await,
+        1
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn in_place_narrowing_keeps_every_owner_and_reverses_exactly(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let before = snapshot_sans_epoch(&pool).await;
+    let epoch_before = epoch(&pool).await;
+
+    let r = apply_to(&pool, &fx, &dir, &manifest, fx.src, Some("group")).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let in_place = (fx.src, "group".to_string());
+    for w in [fx.w_a0, fx.w_a1, fx.w_b0] {
+        assert_eq!(
+            tenancy(&pool, "workflows", w).await,
+            in_place,
+            "workflow {w}"
+        );
+    }
+    for c in [fx.t, fx.p, fx.s1, fx.s1n, fx.s2, fx.s3, fx.a1, fx.tb] {
+        assert_eq!(tenancy(&pool, "claims", c).await, in_place, "claim {c}");
+    }
+    assert_eq!(tenancy(&pool, "evidence", fx.ev_s1).await, in_place);
+    for e in &fx.plan_edges {
+        assert_eq!(tenancy(&pool, "edges", *e).await, in_place, "plan edge {e}");
+    }
+    assert_eq!(
+        tenancy(&pool, "workflows", fx.w_p).await,
+        in_place,
+        "the already-private lineage is untouched"
+    );
+    assert_eq!(epoch(&pool).await, epoch_before + 1, "{}", r.show());
+
+    let rev = reverse(&pool, &manifest, true).await;
+    assert_eq!(rev.code, 0, "{}", rev.show());
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "the in-place reversal did not restore exactly: {}",
+        rev.show()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn in_place_needs_group_visibility(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let before = snapshot(&pool).await;
+    for vis in [None, Some("keep")] {
+        let r = apply_to(&pool, &fx, &dir, &manifest, fx.src, vis).await;
+        assert_eq!(r.code, 1, "{vis:?}: {}", r.show());
+        assert!(
+            r.stderr.contains("--visibility group"),
+            "{vis:?}: {}",
+            r.show()
+        );
+        assert_eq!(snapshot(&pool).await, before);
+        assert!(!manifest.exists());
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
