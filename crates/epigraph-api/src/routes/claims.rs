@@ -1476,7 +1476,7 @@ pub async fn get_claim(
     // Who wrote it, on the same stamped connection: the asserting documents'
     // authors under this caller's edge visibility, the filer's human from its
     // binding, the prompt snapshot through the audience
-    // `PROMPT_SNAPSHOT_AUDIENCE` names (default: the prompt-history gate).
+    // `PROMPT_SNAPSHOT_AUDIENCE` names (ruled: the prompt-history gate).
     // Only reached for a claim the caller has just read.
     let authored_by = epigraph_db::AuthoredByRepository::for_claim(
         &mut read,
