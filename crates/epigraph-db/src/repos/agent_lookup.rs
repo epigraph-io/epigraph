@@ -356,6 +356,9 @@ pub struct AuthorNode {
     pub is_registered_system: bool,
     /// Holds a system role's legacy public-constant key (migration 148).
     pub has_reserved_key: bool,
+    /// The agent's identity key (public), so the ingest can tell whether an
+    /// explicit id is another author's name-derived node in the same document.
+    pub public_key: Vec<u8>,
 }
 
 /// One `find_agent` result: the card and how its name matched.
@@ -778,6 +781,7 @@ impl AgentLookupRepository {
                         is_role_node: agent_type == "role",
                         is_registered_system: system,
                         has_reserved_key,
+                        public_key,
                     },
                 )
             })

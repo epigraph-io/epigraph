@@ -221,6 +221,7 @@ pub async fn ingest_document(
         "ingest_document",
         auth,
         &extraction.source.authors,
+        &doi,
     )
     .await?;
     if params.wait.unwrap_or(false) {
@@ -290,6 +291,7 @@ async fn preflight_write_authority(
     tool_name: &'static str,
     auth: Option<&epigraph_auth::AuthContext>,
     authors: &[epigraph_ingest::common::schema::AuthorEntry],
+    doi: &str,
 ) -> Result<(), McpError> {
     let author = server.write_identity(auth, viewer).await?;
     let agent_id = author.agent_id();
@@ -304,9 +306,22 @@ async fn preflight_write_authority(
     // Every explicit `source.authors[].agent_id` names an agent that may
     // author (backlog 94cc12db), on the same connection the walk will use, so
     // an unknown or system id is refused to the caller BEFORE the eager
-    // `papers` row, not in the detached task's log.
-    crate::tools::ingest_authors::check_explicit_author_ids(&mut tx, authors).await?;
-    // Nothing was written on it; dropping it rolls back.
+    // `papers` row, not in the detached task's log. On a re-ingest (the row
+    // exists) the name-derived authors an `agent_id` replaces are retracted
+    // here too, inside this transaction, so an author this caller cannot
+    // retract is refused now rather than in the task.
+    let existing_paper = find_paper_by_document_key(&server.pool, doi)
+        .await?
+        .map(|p| p.id);
+    crate::tools::ingest_authors::preflight_document_authors(
+        &mut tx,
+        viewer,
+        authors,
+        agent_id,
+        existing_paper,
+    )
+    .await?;
+    // Nothing is kept from it; dropping it rolls back (the retractions too).
     drop(tx);
     Ok(())
 }
@@ -348,6 +363,7 @@ pub async fn ingest_document_inline(
         "ingest_document_inline",
         auth,
         &extraction.source.authors,
+        &doi,
     )
     .await?;
     if wait {
@@ -1153,42 +1169,40 @@ pub async fn do_ingest_document(
     // system-identity skips and the per-author report: `tools::ingest_authors`.
     let resolved = crate::tools::ingest_authors::resolve_document_authors(
         &mut tx,
+        viewer,
         authors,
+        agent_id,
+        paper_id,
         "ingest_document",
         &paper_title,
     )
     .await?;
-    for crate::tools::ingest_authors::ResolvedAuthor {
-        idx,
-        agent_id: agent_uuid,
-        report,
-    } in resolved
-    {
-        let author = &authors[idx];
+    for r in resolved {
+        let author = &authors[r.idx];
         let (_row, _was_created) =
             EdgeRepository::create_if_absent_including_retracted_signed_conn(
                 &mut tx,
                 edge_key,
-                agent_uuid,
+                r.agent_id,
                 "agent",
                 paper_id,
                 "paper",
                 "authored",
-                Some(serde_json::json!({
-                    // The ORIGINAL extraction index: it can have gaps where a
-                    // placeholder author was dropped ([Unknown, Alice] gives Alice
-                    // position 1 and no edge position 0).
-                    "position": idx,
-                    "role": author.roles.first().map_or("author", String::as_str),
-                    "affiliations": author.affiliations,
-                })),
+                Some(crate::tools::ingest_authors::authored_edge_properties(
+                    &r, author, agent_id,
+                )),
                 None,
                 None,
             )
             .await
             .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(report);
+        // The plan's per-claim `asserts` edges come from this map: an author
+        // the ingester does not speak for is not in it, so it gets `authored`
+        // only (`tools::ingest_authors`, the explicit-author rule).
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
+        }
+        author_responses.push(r.report);
     }
 
     // ── 4. Walk planned claims: dedup → claim/trace/evidence/embed ──
@@ -1570,6 +1584,7 @@ pub async fn do_ingest_document(
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
@@ -2125,41 +2140,38 @@ pub async fn do_ingest_document_spine(
     // system-identity skips and the per-author report: `tools::ingest_authors`.
     let resolved = crate::tools::ingest_authors::resolve_document_authors(
         &mut tx,
+        viewer,
         authors,
+        agent_id,
+        paper_id,
         "ingest_document_spine",
         &paper_title,
     )
     .await?;
-    for crate::tools::ingest_authors::ResolvedAuthor {
-        idx,
-        agent_id: agent_uuid,
-        report,
-    } in resolved
-    {
-        let author = &authors[idx];
+    for r in resolved {
+        let author = &authors[r.idx];
         let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut tx,
             edge_key,
-            agent_uuid,
+            r.agent_id,
             "agent",
             paper_id,
             "paper",
             "authored",
-            Some(serde_json::json!({
-                // The ORIGINAL extraction index: it can have gaps where a
-                // placeholder author was dropped ([Unknown, Alice] gives Alice
-                // position 1 and no edge position 0).
-                "position": idx,
-                "role": author.roles.first().map_or("author", String::as_str),
-                "affiliations": author.affiliations,
-            })),
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
             None,
             None,
         )
         .await
         .map_err(internal_error)?;
-        author_agent_map.insert(idx, agent_uuid);
-        author_responses.push(report);
+        // As in `do_ingest_document`: `asserts` only from an author the
+        // ingester speaks for.
+        if r.asserts {
+            author_agent_map.insert(r.idx, r.agent_id);
+        }
+        author_responses.push(r.report);
     }
 
     // ── 3. Walk claims: levels 0–2 only ──
@@ -2424,6 +2436,7 @@ pub async fn do_ingest_document_spine(
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
+        ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
         paragraphs_embedded: queued,

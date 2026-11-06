@@ -16,11 +16,16 @@ pub struct AuthorEntry {
     /// The EXISTING agent this author is, by id (a UUID string, e.g. from
     /// MCP `find_agent`). Optional; document ingest only.
     ///
-    /// * Given: the author's `authored` and `asserts` edges attach to exactly
-    ///   that agent. It must exist and must not be a registered system
-    ///   identity, a role node, or a system agent's legacy key; otherwise the
-    ///   whole ingest is refused before any write. `name` is still recorded
-    ///   in the report but does not choose the node.
+    /// * Given: the author's `authored` edge attaches to exactly that agent.
+    ///   Its `asserts` edges onto the document's claims are written only when
+    ///   the ingester is that agent or the human operating it; for anyone
+    ///   else the authorship is recorded as the ingester's word, pending the
+    ///   person's countersignature, with no `asserts` edge. It must exist and
+    ///   must not be a registered system identity, a role node, or a system
+    ///   agent's legacy key; otherwise the whole ingest is refused before any
+    ///   write. `name` is still recorded in the report but does not choose
+    ///   the node. A re-ingest with it replaces the name-derived node an
+    ///   earlier ingest attached for the same spelling.
     /// * Absent (the default, unchanged): the author is the node whose key
     ///   `did_key_for_author` derives from `name` (reused when it exists,
     ///   created when not). The ingest NEVER attaches an absent-id author to

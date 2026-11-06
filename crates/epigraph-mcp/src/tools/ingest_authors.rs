@@ -10,39 +10,130 @@
 //! * `agent_id` given: the author IS that agent. It must exist and must not be
 //!   a registered system identity, a role node, or hold a system role's
 //!   legacy key (migration 148: a document never names a system identity as
-//!   its author). Anything else refuses the whole ingest, naming
+//!   its author), and it must not be another author's name-derived node in
+//!   the same document. Anything else refuses the whole ingest, naming
 //!   `source.authors[i].agent_id`. `agents` rows are readable by every session
 //!   (`agents_identity ... USING (true)`, as `GET /api/v1/agents/:id` answers
 //!   for any id), so "exists" is "visible to the caller".
-//! * `agent_id` absent: UNCHANGED. The author is the node
-//!   `did_key_for_author(None, name)` derives (reused, or created). The walk
-//!   never attaches the author to another agent that merely shares the name:
-//!   a name collision would otherwise put every `asserts` edge of a stranger's
-//!   paper on a real person's node. Those agents are reported as `candidates`
-//!   (`status: "ambiguous"`) so the caller can re-ingest with an explicit
-//!   `agent_id`.
+//! * `agent_id` absent: the author is the node `did_key_for_author(None,
+//!   name)` derives (reused, or created), as before. The walk never attaches
+//!   the author to another agent that merely shares the name: a name
+//!   collision would otherwise put every `asserts` edge of a stranger's paper
+//!   on a real person's node. Those agents are reported as `candidates`
+//!   (`status: "ambiguous"`). The one exception is a re-ingest of a document
+//!   whose author an earlier ingest attached by `agent_id`: the name-only
+//!   entry with that same spelling keeps the explicit author
+//!   (`action: "kept_attached"`) instead of adding the name-derived node
+//!   beside it.
+//!
+//! # Who asserts the claims (the explicit-author rule)
+//!
+//! Naming an agent as an author is the INGESTER's statement. It becomes that
+//! agent's own `asserts` edges only when the ingester speaks for it: the
+//! agent is the ingester's write identity (`attribution: "caller"`), or the
+//! ingester is the human that agent acts for (`epigraph_human_of(agent,
+//! true)`, `attribution: "operated_by_caller"`). For any other agent
+//! (`attribution: "pending_countersign"`) the walk writes ONLY
+//! `agent --authored--> paper`, marked with `pending_countersign: true` and
+//! `ingested_by: <the ingester>`, and no `asserts` edge from that agent onto
+//! any claim; the agent card does not count that paper until the person
+//! countersigns. [`check_explicit_author_ids`] decides it, so the handlers'
+//! preflight and the walk's transaction decide it the same way.
+//!
+//! # Replacing the name-derived author on a re-ingest
+//!
+//! An `ambiguous` result is fixed by re-ingesting with `agent_id`, which
+//! REPLACES the name-derived author; it never adds the chosen agent beside
+//! it. When the document already lists THIS entry's own name-derived node
+//! (the node its spelling derives, attached by the name path), the walk
+//! retracts that node's `authored` edge on this paper and its `asserts` edges
+//! onto this paper's claims (never a claim another paper it authors also
+//! asserts), and reports it in `replaced`.
+//!
+//! Those edges have an agent endpoint, so migration 120 leaves them
+//! `('public', world)`: administrative, owned by no writer, and no
+//! application session may retract them (117's owner-scoped UPDATE matches no
+//! row). On an MCP server the replacement is therefore REFUSED, before
+//! anything is written, with the remedy: re-run that ingest through the
+//! operator `ingest-document` CLI, whose ingest runs on the maintenance
+//! connection and performs it, or omit `agent_id`. Any other author already
+//! at the same position is left alone and reported in `also_at_position`.
 //!
 //! The report carries public fields only (id, `display_name`, match tier,
 //! `created_at`), never a card's viewer-computed facts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
 use crate::errors::{internal_error, invalid_params, McpError};
-use crate::types::{AuthorCandidate, IngestAuthorReport};
-use epigraph_db::{AgentLookupRepository, AgentRepository, AuthorNode};
+use crate::types::{AuthorCandidate, IngestAuthorReport, ReplacedAuthor};
+use epigraph_db::visibility::Viewer;
+use epigraph_db::{
+    AgentLookupRepository, AgentRepository, AuthorNode, DbError, PaperAuthorEdge, PaperRepository,
+};
 use epigraph_ingest::common::schema::AuthorEntry;
 
 /// Most candidates listed per author.
 pub const AUTHOR_CANDIDATE_LIMIT: usize = 10;
 
-/// One author the walk will attach: its original index, the agent, and the
-/// report entry.
+/// The ingester's write identity is the named agent.
+pub const ATTRIBUTION_CALLER: &str = "caller";
+/// The ingester is the human the named agent acts for.
+pub const ATTRIBUTION_OPERATED: &str = "operated_by_caller";
+/// Anyone else: `authored` only, awaiting the person's countersignature.
+pub const ATTRIBUTION_PENDING: &str = "pending_countersign";
+/// The name path (no `agent_id`): the name-derived node, as always.
+pub const ATTRIBUTION_NAME_DERIVED: &str = "name_derived";
+
+/// An explicit `agent_id` that passed every check, and whether the ingester
+/// speaks for it.
+pub(crate) struct ExplicitAuthor {
+    pub node: AuthorNode,
+    /// [`ATTRIBUTION_CALLER`], [`ATTRIBUTION_OPERATED`] or
+    /// [`ATTRIBUTION_PENDING`].
+    pub attribution: &'static str,
+}
+
+/// One author the walk will attach: its original index, the agent, what to
+/// write, and the report entry.
 pub(crate) struct ResolvedAuthor {
     pub idx: usize,
     pub agent_id: Uuid,
+    /// Write this agent's `asserts` edges onto the document's claims.
+    pub asserts: bool,
+    /// Mark the `authored` edge as an explicit attachment.
+    pub explicit: bool,
+    /// Mark the `authored` edge as awaiting the person's countersignature.
+    pub pending: bool,
     pub report: IngestAuthorReport,
+}
+
+/// The `authored` edge properties for one resolved author.
+pub(crate) fn authored_edge_properties(
+    resolved: &ResolvedAuthor,
+    author: &AuthorEntry,
+    ingester: Uuid,
+) -> serde_json::Value {
+    let mut props = serde_json::json!({
+        // The ORIGINAL extraction index: it can have gaps where a placeholder
+        // author was dropped ([Unknown, Alice] gives Alice position 1 and no
+        // edge position 0).
+        "position": resolved.idx,
+        "role": author.roles.first().map_or("author", String::as_str),
+        "affiliations": author.affiliations,
+    });
+    // Name-derived edges keep the exact shape they always had.
+    if resolved.explicit {
+        props[epigraph_db::AUTHORED_EXPLICIT_KEY] = serde_json::Value::Bool(true);
+        props[epigraph_db::AUTHORED_NAME_KEY] = serde_json::Value::String(author.name.clone());
+    }
+    if resolved.pending {
+        props[epigraph_db::AUTHORED_PENDING_KEY] = serde_json::Value::Bool(true);
+        props[epigraph_db::AUTHORED_INGESTED_BY_KEY] =
+            serde_json::Value::String(ingester.to_string());
+    }
+    props
 }
 
 /// The caller-payload half of the check, before any database access: each
@@ -53,16 +144,49 @@ pub(crate) fn parse_explicit_author_ids(
     epigraph_ingest::common::schema::parse_author_agent_ids(authors).map_err(invalid_params)
 }
 
+/// The key the name path derives for `name`.
+fn name_key(name: &str) -> [u8; 32] {
+    epigraph_crypto::did_key::did_key_for_author(None, name).1
+}
+
+/// Which of `agents` the ingester `writer` speaks for, and how: the agent is
+/// `writer` itself, or `writer` is the human it acts for (migration 149's
+/// `epigraph_human_of(agent, true)`: only a binding in force confers it).
+async fn attributions(
+    conn: &mut sqlx::PgConnection,
+    writer: Uuid,
+    agents: &[Uuid],
+) -> Result<HashMap<Uuid, &'static str>, McpError> {
+    let humans = AgentRepository::humans_of(&mut *conn, agents, true)
+        .await
+        .map_err(internal_error)?;
+    Ok(agents
+        .iter()
+        .map(|a| {
+            let how = if *a == writer {
+                ATTRIBUTION_CALLER
+            } else if humans.get(a) == Some(&writer) {
+                ATTRIBUTION_OPERATED
+            } else {
+                ATTRIBUTION_PENDING
+            };
+            (*a, how)
+        })
+        .collect())
+}
+
 /// The database half: every explicit `agent_id` names an agent that may be
-/// attached as an author. Returns that agent's row by author index.
+/// attached as an author, and whether the ingester `writer` speaks for it
+/// (the explicit-author rule, module doc). Returns it by author index.
 ///
 /// Runs on the connection the caller holds: the handlers' synchronous
 /// preflight (so the queued path refuses before its eager `papers` row) and
-/// the walk's own transaction.
+/// the walk's own transaction, so both decide the same way.
 pub(crate) async fn check_explicit_author_ids(
     conn: &mut sqlx::PgConnection,
     authors: &[AuthorEntry],
-) -> Result<HashMap<usize, AuthorNode>, McpError> {
+    writer: Uuid,
+) -> Result<HashMap<usize, ExplicitAuthor>, McpError> {
     let ids = parse_explicit_author_ids(authors)?;
     let given: Vec<(usize, Uuid)> = ids
         .iter()
@@ -84,6 +208,15 @@ pub(crate) async fn check_explicit_author_ids(
             nodes.insert(node.id, node);
         }
     }
+    // The name-derived key of every name-path entry: an explicit id equal to
+    // one of them would make two entries one agent, and the walk would write
+    // one `authored` edge for two positions.
+    let name_path_keys: Vec<(usize, [u8; 32])> = authors
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| ids[*i].is_none() && !a.is_placeholder())
+        .map(|(i, a)| (i, name_key(&a.name)))
+        .collect();
     let mut out = HashMap::with_capacity(given.len());
     for (i, id) in given {
         let Some(node) = nodes.remove(&id) else {
@@ -104,22 +237,192 @@ pub(crate) async fn check_explicit_author_ids(
                  name the person who holds the role"
             )));
         }
-        out.insert(i, node);
+        if let Some((j, _)) = name_path_keys
+            .iter()
+            .find(|(_, k)| k.as_slice() == node.public_key.as_slice())
+        {
+            return Err(invalid_params(format!(
+                "source.authors[{i}].agent_id {id} is the name-derived author of \
+                 source.authors[{j}] ({:?}): two authors cannot be one agent. Give \
+                 source.authors[{j}] its own agent_id, or drop one of the two entries",
+                authors[*j].name
+            )));
+        }
+        out.insert(i, (node, ATTRIBUTION_PENDING));
+    }
+    let explicit_ids: Vec<Uuid> = out.values().map(|(n, _)| n.id).collect();
+    let how = attributions(conn, writer, &explicit_ids).await?;
+    Ok(out
+        .into_iter()
+        .map(|(i, (node, _))| {
+            let attribution = how.get(&node.id).copied().unwrap_or(ATTRIBUTION_PENDING);
+            (i, ExplicitAuthor { node, attribution })
+        })
+        .collect())
+}
+
+/// For each explicit author, retract THIS entry's own name-derived node from
+/// `paper_id` when an earlier name-path ingest attached it (module doc), and
+/// return what was retracted by author index. Run on the walk's transaction,
+/// and on the preflight's (rolled back) so a refusal reaches the queued
+/// caller. `edges` is [`PaperRepository::author_edges_conn`] of the paper.
+async fn retract_replaced_name_nodes(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    paper_id: Uuid,
+    authors: &[AuthorEntry],
+    explicit: &HashMap<usize, ExplicitAuthor>,
+    edges: &[PaperAuthorEdge],
+) -> Result<HashMap<usize, ReplacedAuthor>, McpError> {
+    let mut out = HashMap::new();
+    if explicit.is_empty() || edges.is_empty() {
+        return Ok(out);
+    }
+    // A node another name-path entry of THIS document resolves to stays.
+    let name_path_keys: HashSet<[u8; 32]> = authors
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !explicit.contains_key(i) && !a.is_placeholder())
+        .map(|(_, a)| name_key(&a.name))
+        .collect();
+    let mut order: Vec<&usize> = explicit.keys().collect();
+    order.sort_unstable();
+    for &i in order {
+        let chosen = explicit[&i].node.id;
+        let key = name_key(&authors[i].name);
+        if name_path_keys.contains(&key) {
+            continue;
+        }
+        let Some(node) = AgentRepository::get_by_public_key(&mut *conn, &key)
+            .await
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        let node_id: Uuid = node.id.into();
+        // Only a node the NAME path attached: an explicit attachment of the
+        // same agent is someone's deliberate choice and is never undone here.
+        let attached_by_name = edges.iter().any(|e| e.agent_id == node_id && !e.explicit);
+        if node_id == chosen || !attached_by_name {
+            continue;
+        }
+        let (authored, asserts) =
+            match PaperRepository::retract_author_conn(&mut *conn, viewer, paper_id, node_id).await
+            {
+                Ok(n) => n,
+                Err(DbError::WriteRefused { .. }) => {
+                    return Err(invalid_params(format!(
+                        "source.authors[{i}].agent_id {chosen}: this document already lists \
+                         {node_id}, the name-derived author for {:?}, and the agent_id would \
+                         REPLACE it (retract its authored edge and its asserts edges on this \
+                         document), not add a second author beside it. Those edges are \
+                         administrative (an agent's edges belong to no writer), so this \
+                         session cannot retract them, and nothing was written. To replace \
+                         it, run this ingest through the operator ingest-document CLI (it \
+                         runs on the maintenance connection); or omit agent_id to keep the \
+                         name-derived author",
+                        authors[i].name
+                    )));
+                }
+                Err(e) => return Err(internal_error(e)),
+            };
+        out.insert(
+            i,
+            ReplacedAuthor {
+                agent_id: node_id.to_string(),
+                authored_edges_retracted: authored,
+                asserts_edges_retracted: asserts,
+            },
+        );
     }
     Ok(out)
 }
 
+/// The handlers' synchronous preflight of the document's authors, on the
+/// transaction it opens and rolls back: [`check_explicit_author_ids`], and,
+/// when the document's `papers` row already exists, the replacement
+/// [`resolve_document_authors`] will make, so an author whose name-derived
+/// node this caller cannot retract is refused before anything is queued.
+pub(crate) async fn preflight_document_authors(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    authors: &[AuthorEntry],
+    writer: Uuid,
+    paper_id: Option<Uuid>,
+) -> Result<(), McpError> {
+    let explicit = check_explicit_author_ids(conn, authors, writer).await?;
+    if let (Some(paper_id), false) = (paper_id, explicit.is_empty()) {
+        let edges = PaperRepository::author_edges_conn(conn, viewer, paper_id)
+            .await
+            .map_err(internal_error)?;
+        retract_replaced_name_nodes(conn, viewer, paper_id, authors, &explicit, &edges).await?;
+    }
+    Ok(())
+}
+
 /// Resolve every author of a document to the agent its edges come from, on
-/// the walk's transaction. Placeholder names and authors that resolve to a
-/// system identity are skipped, as before (and logged); every other author
-/// gets one [`ResolvedAuthor`].
+/// the walk's transaction (module doc). Placeholder names and authors that
+/// resolve to a system identity are skipped, as before (and logged); every
+/// other author gets one [`ResolvedAuthor`]. `writer` is the ingester's write
+/// identity; `paper_id` the document's `papers` row.
 pub(crate) async fn resolve_document_authors(
     conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
     authors: &[AuthorEntry],
+    writer: Uuid,
+    paper_id: Uuid,
     tool_name: &'static str,
     paper_title: &str,
 ) -> Result<Vec<ResolvedAuthor>, McpError> {
-    let explicit = check_explicit_author_ids(conn, authors).await?;
+    let explicit = check_explicit_author_ids(conn, authors, writer).await?;
+    // The document's authors as earlier ingests left them.
+    let edges = if authors.is_empty() {
+        Vec::new()
+    } else {
+        PaperRepository::author_edges_conn(conn, viewer, paper_id)
+            .await
+            .map_err(internal_error)?
+    };
+    let mut replaced =
+        retract_replaced_name_nodes(conn, viewer, paper_id, authors, &explicit, &edges).await?;
+    let retracted: HashSet<Uuid> = replaced
+        .values()
+        .filter_map(|r| r.agent_id.parse().ok())
+        .collect();
+    let edges: Vec<PaperAuthorEdge> = edges
+        .into_iter()
+        .filter(|e| !retracted.contains(&e.agent_id))
+        .collect();
+    // An explicit attachment an earlier ingest made, by the spelling it was
+    // made for: a name-only entry with that spelling keeps it.
+    let kept_for = |idx: usize, name: &str| -> Option<Uuid> {
+        let mut found: Vec<&PaperAuthorEdge> = edges
+            .iter()
+            .filter(|e| e.explicit && e.author_name.as_deref() == Some(name))
+            .collect();
+        found.sort_by_key(|e| e.position != i64::try_from(idx).ok());
+        found.first().map(|e| e.agent_id)
+    };
+    let kept: HashMap<usize, Uuid> = authors
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !explicit.contains_key(i) && !a.is_placeholder())
+        .filter_map(|(i, a)| kept_for(i, &a.name).map(|id| (i, id)))
+        .collect();
+    let kept_ids: Vec<Uuid> = kept.values().copied().collect();
+    let kept_how = attributions(conn, writer, &kept_ids).await?;
+    let kept_nodes: HashMap<Uuid, AuthorNode> = AgentLookupRepository::author_nodes(
+        conn,
+        &kept_ids[..kept_ids
+            .len()
+            .min(usize::try_from(epigraph_db::agent_lookup::CANDIDATE_POOL).unwrap_or(200))],
+    )
+    .await
+    .map_err(internal_error)?
+    .into_iter()
+    .map(|n| (n.id, n))
+    .collect();
+
     // Migration 148: a document never names a system identity as its author.
     // The legacy public-constant key is refused before the lookup (so it is
     // never adopted, and never re-minted after a rotation), and an author that
@@ -148,25 +451,48 @@ pub(crate) async fn resolve_document_authors(
             }
             continue;
         }
-        if let Some(node) = explicit.get(&idx) {
+        let given = explicit
+            .get(&idx)
+            .map(|e| {
+                (
+                    e.node.id,
+                    e.node.display_name.clone(),
+                    e.attribution,
+                    "attached_given",
+                )
+            })
+            .or_else(|| {
+                let id = *kept.get(&idx)?;
+                let how = kept_how.get(&id).copied().unwrap_or(ATTRIBUTION_PENDING);
+                let name = kept_nodes.get(&id).and_then(|n| n.display_name.clone());
+                Some((id, name, how, "kept_attached"))
+            });
+        if let Some((id, display_name, attribution, action)) = given {
+            let asserts = attribution != ATTRIBUTION_PENDING;
             out.push(ResolvedAuthor {
                 idx,
-                agent_id: node.id,
+                agent_id: id,
+                asserts,
+                explicit: true,
+                pending: !asserts,
                 report: IngestAuthorReport {
-                    agent_id: node.id.to_string(),
+                    agent_id: id.to_string(),
                     name: author.name.clone(),
                     position: idx,
                     status: "explicit",
-                    action: "attached_given",
-                    display_name: node.display_name.clone(),
+                    action,
+                    attribution,
+                    asserts_claims: asserts,
+                    display_name,
+                    replaced: replaced.remove(&idx),
+                    also_at_position: Vec::new(),
                     candidates: Vec::new(),
                     candidates_truncated: false,
                 },
             });
             continue;
         }
-        let (_did, pub_key_bytes) =
-            epigraph_crypto::did_key::did_key_for_author(None, &author.name);
+        let pub_key_bytes = name_key(&author.name);
         if epigraph_db::is_reserved_author_key(&pub_key_bytes) {
             tracing::warn!(
                 target: "ingest.authors",
@@ -204,6 +530,9 @@ pub(crate) async fn resolve_document_authors(
         out.push(ResolvedAuthor {
             idx,
             agent_id: agent_uuid,
+            asserts: true,
+            explicit: false,
+            pending: false,
             report: IngestAuthorReport {
                 agent_id: agent_uuid.to_string(),
                 name: author.name.clone(),
@@ -214,11 +543,37 @@ pub(crate) async fn resolve_document_authors(
                 } else {
                     "created_name_key"
                 },
+                attribution: ATTRIBUTION_NAME_DERIVED,
+                asserts_claims: true,
                 display_name: None,
+                replaced: None,
+                also_at_position: Vec::new(),
                 candidates: Vec::new(),
                 candidates_truncated: false,
             },
         });
+    }
+    // Two entries that resolved to one agent (a kept explicit author equal to
+    // another entry's agent, say) would share one `authored` edge: refuse.
+    let mut seen: HashMap<Uuid, usize> = HashMap::new();
+    for r in &out {
+        if let Some(first) = seen.insert(r.agent_id, r.idx) {
+            return Err(invalid_params(format!(
+                "source.authors[{first}] and source.authors[{}] both resolve to agent {}: two \
+                 authors cannot be one agent. Give one of them its own agent_id, or drop one",
+                r.idx, r.agent_id
+            )));
+        }
+    }
+    // Whoever else the document already lists at an author's position.
+    for r in &mut out {
+        let pos = i64::try_from(r.idx).ok();
+        r.report.also_at_position = edges
+            .iter()
+            .filter(|e| e.position == pos && e.agent_id != r.agent_id)
+            .map(|e| e.agent_id.to_string())
+            .collect();
+        r.report.also_at_position.dedup();
     }
     // Other agents with each name-derived author's (folded) name: listed,
     // never chosen. An explicit author has no candidates.
