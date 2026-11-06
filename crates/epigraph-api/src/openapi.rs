@@ -100,6 +100,7 @@ use workflow_schema_stubs::{
         deprecate_workflow_doc,
         ingest_workflow_doc,
         create_hierarchical_edge_doc,
+        search_agents_doc,
     ),
     components(
         schemas(
@@ -393,6 +394,40 @@ async fn mark_duplicate_doc() {}
     security(("ed25519_signature" = []))
 )]
 async fn unmark_duplicate_doc() {}
+
+/// Find agents by name (doc stub)
+///
+/// Case-insensitive, accent-folded name match (plus exact ORCID / ROR id where
+/// the caller may see the profile), ranked `orcid`/`ror` > `exact` > `prefix` >
+/// `trigram`. The body is `{results: [...], candidates_truncated}`; each result
+/// is an agent card (`id`, `display_name`, `kind`, `kind_evidence`, `roles`,
+/// `orcid`, `ror_id`, `operator_human`, `created_at`, `counts`) plus `tier`
+/// and `score`. `operator_human` (the human the agent is currently bound
+/// to: its live operator link, else its unrevoked client allowance; null
+/// once the link is retired) is shown to every reader; every other field is
+/// computed under the caller's viewer. `counts` holds `authored_papers`,
+/// `pending_authored_papers` (named by an ingester, not countersigned) and
+/// `asserted_claims`, over in-force edges the document ingest wrote.
+/// Same code as MCP `find_agent`. Scope `claims:read`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/agents/search",
+    tag = "agents",
+    params(
+        ("name" = String, Query, description = "Name, ORCID or ROR id (2-200 characters)"),
+        ("kind" = Option<String>, Query, description = "human | llm_agent | system | role | ingest_author | unknown"),
+        ("role" = Option<String>, Query, description = "Keep agents holding this role (role:<key> or <key>)"),
+        ("limit" = Option<i64>, Query, description = "1-25, default 10"),
+    ),
+    responses(
+        (status = 200, description = "Ranked agent cards"),
+        (status = 400),
+        (status = 401),
+        (status = 403),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn search_agents_doc() {}
 
 /// Partial update of a claim (doc stub)
 #[utoipa::path(
