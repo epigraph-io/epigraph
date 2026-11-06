@@ -175,6 +175,16 @@ pub struct CreateClaimRequest {
     /// refused with 400 and nothing is written. Public tier only.
     #[serde(default)]
     pub derived_from: Option<DerivedFrom>,
+    /// Who may read the claim, on the plain (`privacy_tier = "public"`) tier:
+    /// `"team"` (the default), `"private"` or `"public"`
+    /// (docs/tenancy/claim-visibility-controls.md). On the plain tier
+    /// `group_id` names the team, and naming one implies `"team"`. Omitted: the
+    /// caller's default team, else its only team, else private, never public.
+    /// One exception: a `derived_from` claim with no visibility named is public,
+    /// as its parent must be. Refused on the `fully_private` tier, whose
+    /// `group_id` is the sealing group.
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 /// The parent a claim was derived from, for [`CreateClaimRequest::derived_from`].
@@ -228,6 +238,17 @@ pub struct ClaimResponse {
     /// the create handler; omitted from non-create responses (GET/PATCH/list).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub was_created: bool,
+    /// On a create: where the claim landed, `team`, `private` or `public`
+    /// (docs/tenancy/claim-visibility-controls.md). Omitted elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// On a create: the claim's owner group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<Uuid>,
+    /// On a create: how a default visibility was resolved (D-V1), or that an
+    /// existing claim of another visibility was returned unchanged (D-V4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility_note: Option<String>,
 }
 
 impl From<Claim> for ClaimResponse {
@@ -246,6 +267,9 @@ impl From<Claim> for ClaimResponse {
             group_id: None,
             labels: Vec::new(),
             was_created: false,
+            visibility: None,
+            owner_group_id: None,
+            visibility_note: None,
         }
     }
 }
@@ -685,6 +709,76 @@ pub(crate) async fn create_claim_core(
     // caller must be bound and may name only an author of its own human. On
     // the raw pool the trigger saw no principal at all (and, once armed, now
     // refuses the write outright rather than checking the body's author).
+    // ── Visibility (docs/tenancy/claim-visibility-controls.md) ──
+    //
+    // Plain tier only. Resolved for the AUTHENTICATED principal
+    // (`author_agent_id`, never the body's `agent_id`, for the reason the
+    // PR-16 block below gives), BEFORE the transaction: a team the caller writes
+    // only through its human (D-V3) must be stamped into it.
+    let resolved = if privacy_tier == "public" {
+        let choice =
+            match (request.visibility.as_deref(), &request.derived_from) {
+                // A derivation of a PUBLIC parent stays public unless the caller
+                // says otherwise (`decompose_claims` posts atoms this way).
+                (None, Some(_)) => epigraph_core::VisibilityChoice::Public,
+                (v, _) => epigraph_core::VisibilityChoice::parse(v, request.group_id).map_err(
+                    |reason| ApiError::ValidationError {
+                        field: "visibility".to_string(),
+                        reason,
+                    },
+                )?,
+            };
+        if request.derived_from.is_some() && choice != epigraph_core::VisibilityChoice::Public {
+            return Err(ApiError::ValidationError {
+                field: "visibility".to_string(),
+                reason: "derived_from is only supported for a public claim".to_string(),
+            });
+        }
+        let mut conn = state
+            .db_pool
+            .acquire()
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to acquire a connection: {e}"),
+            })?;
+        Some(ClaimRepository::resolve_write_decl(&mut conn, author_agent_id, choice).await?)
+    } else {
+        if request.visibility.is_some() {
+            return Err(ApiError::ValidationError {
+                field: "visibility".to_string(),
+                reason: "visibility applies to the plain tier; a fully_private claim is sealed \
+                         into its group_id"
+                    .to_string(),
+            });
+        }
+        None
+    };
+    // A home group the resolution just PROVISIONED (`default_decl_for_author`
+    // mints a personal group on a miss) is not in the viewer resolved at the
+    // start of the request. A private claim written there would then be
+    // invisible to this request's own dedup find, so a second identical item in
+    // the same batch would land as a second row. Re-resolve the caller once in
+    // that case. Production tokens are provisioned at mint (PR-02), so this is
+    // the rare first-write path.
+    let refreshed = match &resolved {
+        Some(r)
+            if r.decl.visibility_bind() == Some("group")
+                && r.operator_grant.is_none()
+                && viewer.principal() == Some(author_agent_id)
+                && viewer.group_bind().is_some_and(|g| {
+                    r.decl.owner_group_bind().is_some_and(|o| !g.contains(&o))
+                }) =>
+        {
+            Some(epigraph_db::visibility::Viewer::resolve(&state.db_pool, author_agent_id).await?)
+        }
+        _ => None,
+    };
+    let viewer = refreshed.as_ref().unwrap_or(viewer);
+    let granted = resolved
+        .as_ref()
+        .and_then(|r| r.operator_grant.as_ref())
+        .and_then(|g| viewer.with_team_write_grant(g));
+    let viewer = granted.as_ref().unwrap_or(viewer);
     let mut tx = state.begin_claim_write(viewer, "create_claim").await?;
 
     // ── Tenancy declaration (PR-16) ──
@@ -739,8 +833,10 @@ pub(crate) async fn create_claim_core(
     //
     // Resolved inside the same transaction as the insert, so a rollback takes
     // any minted personal group with it.
-    let decl = if privacy_tier == "public" {
-        ClaimRepository::default_decl_for_author(&mut tx, author_agent_id).await?
+    let decl = if let Some(r) = &resolved {
+        // The plain tier: the caller's visibility, resolved above through
+        // `resolve_write_decl` (which runs `default_decl_for_author` first).
+        r.decl
     } else {
         // `validate_privacy_fields` above rejects a non-public tier with no
         // `group_id`, and the membership check has already run against it.
@@ -1015,50 +1111,70 @@ pub(crate) async fn create_claim_core(
     // `DERIVED_FROM` edges off another tenant's claim. Guarded the same way,
     // and for the same reason, as the labels and properties writes above.
     if was_created {
-        let _ = epigraph_db::EdgeRepository::create_signed(
-            &state.db_pool,
-            state.edge_signing_key(),
-            request.agent_id,
-            "agent",
-            claim_uuid,
-            "claim",
-            "AUTHORED",
-            None,
-            None,
-            None,
-        )
-        .await;
-
+        let mut structural: Vec<(Uuid, &str, Uuid, &str, &str)> =
+            vec![(request.agent_id, "agent", claim_uuid, "claim", "AUTHORED")];
         if let Some(trace_uuid) = request.trace_id {
-            let _ = epigraph_db::EdgeRepository::create_signed(
-                &state.db_pool,
-                state.edge_signing_key(),
-                claim_uuid,
-                "claim",
-                trace_uuid,
-                "trace",
-                "HAS_TRACE",
-                None,
-                None,
-                None,
-            )
-            .await;
+            structural.push((claim_uuid, "claim", trace_uuid, "trace", "HAS_TRACE"));
         }
-
         if let Some(evidence_id) = request.evidence_id {
-            let _ = epigraph_db::EdgeRepository::create_signed(
-                &state.db_pool,
-                state.edge_signing_key(),
-                claim_uuid,
-                "claim",
-                evidence_id,
-                "evidence",
-                "DERIVED_FROM",
-                None,
-                None,
-                None,
-            )
-            .await;
+            structural.push((claim_uuid, "claim", evidence_id, "evidence", "DERIVED_FROM"));
+        }
+        // A group-visible claim (the team / private default,
+        // docs/tenancy/claim-visibility-controls.md) is invisible to the
+        // unstamped pool, so the edge trigger's reference check refuses these
+        // inserts there and the `let _` below would drop them silently. Write
+        // them as the caller that just wrote the claim, one transaction per
+        // edge so one bad reference does not take the others with it (the
+        // same best-effort contract as the public path).
+        let group_visible = resolved
+            .as_ref()
+            .is_some_and(|r| r.decl.visibility_bind() == Some("group"));
+        for (source, source_type, target, target_type, relationship) in structural {
+            if group_visible {
+                let written = async {
+                    let mut etx = state
+                        .begin_claim_write(viewer, "create_claim_edges")
+                        .await?;
+                    epigraph_db::EdgeRepository::create_signed_conn(
+                        &mut etx,
+                        state.edge_signing_key(),
+                        source,
+                        source_type,
+                        target,
+                        target_type,
+                        relationship,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    etx.commit().await?;
+                    Ok::<(), ApiError>(())
+                }
+                .await;
+                if let Err(e) = written {
+                    tracing::warn!(
+                        claim_id = %claim_uuid,
+                        relationship,
+                        error = ?e,
+                        "could not write a group-visible claim's structural edge"
+                    );
+                }
+            } else {
+                let _ = epigraph_db::EdgeRepository::create_signed(
+                    &state.db_pool,
+                    state.edge_signing_key(),
+                    source,
+                    source_type,
+                    target,
+                    target_type,
+                    relationship,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
         }
     }
 
@@ -1069,6 +1185,35 @@ pub(crate) async fn create_claim_core(
     response.group_id = encryption_response.3;
     response.labels = request.labels;
     response.was_created = was_created;
+    if let Some(r) = &resolved {
+        let report = ClaimRepository::write_tenancy_report(
+            &mut *state
+                .db_pool
+                .acquire()
+                .await
+                .map_err(|e| ApiError::DatabaseError {
+                    message: format!("Failed to acquire a connection: {e}"),
+                })?,
+            response.id,
+            r,
+            was_created,
+        )
+        .await;
+        match report {
+            Ok(rep) => {
+                response.visibility = Some(rep.visibility.to_string());
+                response.owner_group_id = Some(rep.owner_group_id);
+                response.visibility_note = rep.note;
+            }
+            // Read on the unstamped pool: a group-visible row is not readable
+            // there, so report what was declared.
+            Err(_) => {
+                response.visibility = Some(r.resolved.to_string());
+                response.owner_group_id = r.decl.owner_group_bind();
+                response.visibility_note = r.note.clone();
+            }
+        }
+    }
 
     // Record provenance chain of custody. Unconditional on the caller (`ctx`
     // is bound by the guard at the top of this function), but only for a row
@@ -1147,6 +1292,9 @@ pub async fn create_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
     };
 
     Ok(Json(response))
@@ -1376,6 +1524,9 @@ pub async fn get_claim(
         group_id: None,
         labels: Vec::new(),
         was_created: false,
+        visibility: None,
+        owner_group_id: None,
+        visibility_note: None,
     };
 
     Ok(Json(response))
@@ -3678,6 +3829,7 @@ mod db_tests {
             labels: vec![],
             if_not_exists: false,
             derived_from: None,
+            visibility: None,
         };
 
         let result = create_claim_core(&state, &viewer, Some(&auth), request).await;
@@ -3765,6 +3917,7 @@ mod db_tests {
                 labels: vec![],
                 if_not_exists: false,
                 derived_from: None,
+                visibility: None,
             };
             let result = create_claim_core(&state, &viewer, None, request).await;
             assert!(

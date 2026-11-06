@@ -56,6 +56,16 @@ pub async fn memorize(
     // visible to the caller that can still fix it.
     epigraph_db::reject_unexpanded_labels(&tags).map_err(db_caller_error)?;
 
+    // Visibility, before the novelty gate and before any transaction (see
+    // `tools::claims::prepare_submission`, which does the same).
+    let tenancy = crate::claim_helper::resolve_claim_visibility(
+        server,
+        agent_id,
+        params.visibility.as_deref(),
+        params.group_id.as_deref(),
+    )
+    .await?;
+
     let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
@@ -135,6 +145,9 @@ pub async fn memorize(
                     plausibility: None,
                     pignistic_prob: None,
                     deduplicated: Some(deduplicated),
+                    visibility: None,
+                    owner_group_id: None,
+                    visibility_note: None,
                 });
             }
             pending_embedding = Some(pgvec);
@@ -154,7 +167,18 @@ pub async fn memorize(
     // why claim + labels + Trace + Evidence + `update_trace_id` + the DS auto-wire
     // must share one author-stamped transaction, and why only the embedding stays
     // outside it.
-    let mut tx = crate::claim_helper::begin_author_stamped_tx(server, author, "memorize").await?;
+    let mut tx = crate::claim_helper::begin_author_stamped_tx_for(
+        server,
+        author,
+        "memorize",
+        tenancy.operator_grant.as_ref(),
+    )
+    .await?;
+    // See `tools::claims::submit_claim_response`: a D-V3 team is read through
+    // for this write only.
+    let granted =
+        crate::claim_helper::write_viewer(server, viewer, author.agent_id(), &tenancy).await?;
+    let viewer = granted.as_ref().unwrap_or(viewer);
 
     // Idempotent canonical claim create + AUTHORED verb-edge.
     let (claim, was_created) = crate::claim_helper::create_claim_idempotent(
@@ -164,9 +188,13 @@ pub async fn memorize(
         Some(signer_typed.as_uuid()),
         "memorize",
         Some(server.edge_signing_key().await?),
+        tenancy.decl,
     )
     .await?;
     let claim_uuid = claim.id.as_uuid();
+    let tenancy_report =
+        crate::claim_helper::claim_tenancy_report(&mut tx, claim_uuid, &tenancy, was_created)
+            .await?;
 
     // Persist tags as claim labels so `query_claims_by_label` can surface them.
     // Apply on dedup-hit too — labels accumulate non-destructively via the repo's
@@ -368,6 +396,9 @@ pub async fn memorize(
         plausibility: ds.as_ref().map(|d| d.plausibility),
         pignistic_prob: ds.as_ref().map(|d| d.pignistic_prob),
         deduplicated,
+        visibility: Some(tenancy_report.visibility.to_string()),
+        owner_group_id: Some(tenancy_report.owner_group_id.to_string()),
+        visibility_note: tenancy_report.note,
     })
 }
 

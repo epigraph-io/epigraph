@@ -477,6 +477,8 @@ fn inline_doc(doi: &str) -> epigraph_mcp::types::IngestDocumentInlineParams {
             "relationships": []
         }))
         .expect("extraction"),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 
@@ -486,6 +488,8 @@ fn memorize_params(content: &str) -> epigraph_mcp::types::MemorizeParams {
         confidence: Some(0.7),
         tags: Some(vec![]),
         novelty_threshold: Some(0.0),
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 

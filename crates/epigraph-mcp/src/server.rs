@@ -1584,6 +1584,48 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Make team or private claims PUBLIC (readable by every authenticated agent). Only a live ADMIN of each claim's owning group may do this; a plain writer, a reader or an operated agent acting for an admin is refused. Sealed (encrypted) claims are refused. All or nothing: if any claim is not found, not readable, sealed or not yours to publish, nothing changes and the error lists each refused claim. The owner group stays the same. The claims' unpinned evidence and reasoning traces become public with them, and edges between claims that are now public become public too. An edge someone declared group-only, and evidence an operator hid, stay as they were. Requires a reason, recorded with your identity in a claim.publicized audit event. Returns {results: [{claim_id, outcome: publicized | already_public}]}."
+    )]
+    async fn publicize_claims(
+        &self,
+        Parameters(params): Parameters<PublicizeClaimsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::publicize_claims(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Move PRIVATE claims (owned by your home group: your personal group, or your operator's) into a team you write, so the team's members can read them. Visibility stays group-only; publicize_claims publishes. You must have written each claim, or be an admin of your home group, and you (or your human operator) need a live writer or admin membership of the team. Public and team claims are refused. All or nothing, and audited (claim.shared_with_team, with your reason). Evidence and traces move with the claims. Returns {results: [{claim_id, outcome: shared}]}."
+    )]
+    async fn share_claims_with_team(
+        &self,
+        Parameters(params): Parameters<ShareClaimsWithTeamParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::share_claims_with_team(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Set the team your claim writes go to when they name no visibility (submit_claim, memorize, batch_submit_claims, ingest_document*). It must be a team you, or your human operator, may write. Omit group_id to clear it. With no default, a write goes to your only team, else private. Your operated agents use your default when they have none of their own. Audited (agent.default_group_set). Returns {agent_id, default_group_id, writable_teams: [{group_id, via: own | operator}]}."
+    )]
+    async fn set_default_group(
+        &self,
+        Parameters(params): Parameters<SetDefaultGroupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::set_default_group(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)'s write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group the calling agent cannot write (another agent's claim) is refused that way, unless the token carries claims:admin: then the resolution claim is still yours, in your own group, and only the original's 'resolved' label is written through the AUDITED ADMIN PATH (recorded with you as principal, plus a security_events claims.admin_write audit row; it requires a live claims:admin grant on your token's own client record). On an --allow-unauthenticated-http listener the injected context carries claims:admin but no client record, so a claim owned by a group this server cannot write is refused there (ADM02) with nothing written. Only the resolution claim's embedding runs after commit, best-effort."
     )]
     async fn resolve_backlog_item(

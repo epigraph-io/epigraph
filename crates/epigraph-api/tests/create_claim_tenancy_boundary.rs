@@ -157,7 +157,7 @@ async fn a_public_claims_owner_follows_the_principal_not_the_body_agent() {
     let r = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/claims"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({ "content": content, "agent_id": body_agent }))
+        .json(&serde_json::json!({ "content": content, "agent_id": body_agent, "visibility": "public" }))
         .send()
         .await
         .unwrap();

@@ -34,6 +34,8 @@ fn rfp_submission(content: &str, evidence_type: &str, url: Option<&str>) -> Subm
         reasoning: None,
         labels: vec!["u036-rfp".into()],
         novelty_threshold: None,
+        visibility: Some("public".to_string()),
+        group_id: None,
     }
 }
 

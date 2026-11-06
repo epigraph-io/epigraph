@@ -283,6 +283,30 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "resolve_challenge",
         &["ChallengeRepository::resolve_as_claim_owner"],
     ),
+    // write: claim_visibility.rs (docs/tenancy/claim-visibility-controls.md)
+    // runs each act on `AppState::write_as`, the transaction stamped with this
+    // viewer, and calls a migration-200 SECURITY DEFINER that reads the caller
+    // from that stamp (`epigraph_principal_id()`) and makes the authority
+    // decision itself; a claim the caller cannot read is answered not-found by
+    // the definer. `writable_teams` reports the caller's own teams back.
+    (
+        "claim_visibility.rs",
+        "publicize_claims",
+        &["ClaimRepository::publicize_conn"],
+    ),
+    (
+        "claim_visibility.rs",
+        "set_default_group",
+        &[
+            "ClaimRepository::set_default_group_conn",
+            "ClaimRepository::writable_teams",
+        ],
+    ),
+    (
+        "claim_visibility.rs",
+        "share_claims_with_team",
+        &["ClaimRepository::share_with_team_conn"],
+    ),
     // untenanted: the caller's own membership, and the seal record of a claim
     // already read through the viewer.
     (
@@ -1207,6 +1231,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // best-effort post-commit embedding now receives the viewer
     // (`AppState::store_claim_embedding_as`, backlog 1e2315a9), so one
     // `sqlx::query(UPDATE).execute` left this list.
+    // Claim visibility controls (docs/tenancy/claim-visibility-controls.md):
+    // `resolve_write_decl` (on a `db_pool.acquire`) runs only definers (107's
+    // author decl, migration 200's team list) for the AUTHOR, before the
+    // transaction; `Viewer::resolve` re-resolves the CALLER's own viewer once
+    // when that resolution minted its home group mid-request;
+    // `write_tenancy_report` (on a `db_pool.acquire`) reads back the row this
+    // call wrote or found, and falls back to the declaration when the
+    // unstamped pool cannot see it. The structural edges now run on ONE loop
+    // site each way: `create_signed` on the raw pool for a public claim (as
+    // before), `create_signed_conn` on a `begin_claim_write` transaction
+    // stamped with this viewer for a group-visible one.
     (
         "claims.rs",
         "create_claim_core",
@@ -1214,13 +1249,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
             "ClaimEncryptionRepository::insert_conn",
             "ClaimRepository::create_strict",
-            "ClaimRepository::default_decl_for_author",
             "ClaimRepository::lock_content_hash_agent",
+            "ClaimRepository::resolve_write_decl",
+            "ClaimRepository::write_tenancy_report",
             "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed_conn",
             "GroupKeyEpochRepository::get_current_epoch",
             "GroupMembershipRepository::is_member",
+            "Viewer::resolve",
+            "db_pool.acquire",
+            "db_pool.acquire",
             "provenance::record_provenance",
             "sqlx::query(UPDATE).execute",
             "sqlx::query(UPDATE).execute",
@@ -1309,13 +1347,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // write: submit.rs::persist_packet runs on the claim-write transaction
     // stamped with this viewer (claim, trace, evidence, edges); the raw-pool
-    // read is the packet's author agent (untenanted).
+    // read is the packet's author agent (untenanted). `resolve_write_decl`,
+    // `Viewer::resolve` and `write_tenancy_report` are `create_claim_core`'s
+    // (above), for the packet's `visibility`; the one `db_pool.acquire` is the
+    // resolution's.
     (
         "submit.rs",
         "persist_packet",
         &[
             "AgentRepository::get_by_id",
-            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::resolve_write_decl",
+            "ClaimRepository::write_tenancy_report",
+            "Viewer::resolve",
+            "db_pool.acquire",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",

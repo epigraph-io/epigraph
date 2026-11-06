@@ -228,6 +228,8 @@ async fn inline(server: &EpiGraphMcpFull, doi: &str) -> Result<serde_json::Value
         IngestDocumentInlineParams {
             wait: None,
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -304,6 +306,8 @@ async fn inline_wait_ingest_by_a_linked_agent_lands_in_its_operators_group(pool:
         IngestDocumentInlineParams {
             wait: Some(true),
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -397,6 +401,8 @@ async fn spine_by_a_linked_agent_lands_in_its_operators_group(pool: PgPool) {
         &viewer,
         IngestDocumentSpineParams {
             extraction: spine_doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -643,6 +649,8 @@ async fn an_allowlist_only_author_is_refused_opl02_synchronously(pool: PgPool) {
         IngestDocumentInlineParams {
             wait: None,
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         Some(&auth),
     )
@@ -675,6 +683,8 @@ async fn an_allowlist_only_author_is_refused_opl02_in_wait_mode(pool: PgPool) {
         IngestDocumentInlineParams {
             wait: Some(true),
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         Some(&auth),
     )

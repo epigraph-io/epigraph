@@ -220,6 +220,8 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
                 "Control labels are well formed.",
                 Some(&["stage:ok"]),
             ),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -251,6 +253,8 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
                 "Unexpanded variables are not labels.",
                 Some(&["stage:$STAGE"]),
             ),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -294,6 +298,8 @@ impl CwdFixture {
         IngestDocumentParams {
             wait: None,
             file_path: self.0.display().to_string(),
+            visibility: Some("public".to_string()),
+            group_id: None,
         }
     }
 }

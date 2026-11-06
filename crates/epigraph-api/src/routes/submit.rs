@@ -290,6 +290,20 @@ pub struct EpistemicPacket {
 
     /// Ed25519 signature over the entire packet (hex-encoded)
     pub signature: String,
+
+    /// Who may read the claim: `"team"` (the default), `"private"` or
+    /// `"public"` (docs/tenancy/claim-visibility-controls.md). Omitted: the
+    /// author's default team, else its only team, else private, never public.
+    /// A routing choice of the AUTHENTICATED caller, like the bearer token, and
+    /// so NOT covered by `signature` (`signable_bytes` is unchanged, and so are
+    /// existing clients' signatures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+
+    /// The team for `visibility = "team"` (naming it implies `"team"`).
+    /// Refused beside `"private"` or `"public"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<Uuid>,
 }
 
 impl EpistemicPacket {
@@ -343,6 +357,20 @@ pub struct SubmitPacketResponse {
 
     /// Whether this was a duplicate submission (idempotent return)
     pub was_duplicate: bool,
+
+    /// Where the claim is: `team`, `private` or `public`. Absent on an
+    /// idempotency-cache replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+
+    /// The claim's owner group. Absent on an idempotency-cache replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_group_id: Option<Uuid>,
+
+    /// How a default visibility was resolved (D-V1), or that an existing claim
+    /// of another visibility was returned unchanged (D-V4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility_note: Option<String>,
 }
 
 /// Error response structure
@@ -1090,6 +1118,30 @@ struct PersistOutcome {
     trace_id: Option<TraceId>,
     /// Evidence ids written on this submit — empty on a dedup.
     evidence_ids: Vec<EvidenceId>,
+    /// Where the claim is (docs/tenancy/claim-visibility-controls.md).
+    tenancy: epigraph_db::WriteTenancyReport,
+}
+
+/// Map a visibility refusal (`ClaimRepository::resolve_write_decl`) for the
+/// caller: a malformed request 400, a team the caller may not write 403, and
+/// the author refusals as [`author_tenancy_error`] maps them.
+#[cfg(feature = "db")]
+fn visibility_error(e: epigraph_db::DbError) -> (StatusCode, ErrorResponse) {
+    use epigraph_db::errors::RefusalKind;
+    match e {
+        epigraph_db::DbError::Refused {
+            kind: RefusalKind::Input,
+            message,
+        } => (
+            StatusCode::BAD_REQUEST,
+            ErrorResponse::new("ValidationError", message),
+        ),
+        epigraph_db::DbError::Refused { message, .. } => (
+            StatusCode::FORBIDDEN,
+            ErrorResponse::new("Forbidden", message),
+        ),
+        other => author_tenancy_error(other),
+    }
 }
 
 /// Map a failure to resolve the packet author's owner group.
@@ -1195,6 +1247,76 @@ async fn persist_packet(
         ));
     }
 
+    // 1b. Visibility (docs/tenancy/claim-visibility-controls.md), resolved for
+    // the packet's author BEFORE the transaction: a team written through the
+    // author's human (D-V3) must be stamped into it. The stamp is the CALLER's,
+    // so a team must also be one the caller writes (077's WITH CHECK asks the
+    // stamp, not the author).
+    let choice =
+        epigraph_core::VisibilityChoice::parse(packet.visibility.as_deref(), packet.group_id)
+            .map_err(|m| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    ErrorResponse::with_details(
+                        "ValidationError",
+                        m,
+                        serde_json::json!({ "field": "visibility" }),
+                    ),
+                )
+            })?;
+    let resolved = {
+        let mut conn = pool.acquire().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorResponse::new("DatabaseError", format!("Failed to acquire: {e}")),
+            )
+        })?;
+        epigraph_db::ClaimRepository::resolve_write_decl(&mut conn, agent_id.into(), choice)
+            .await
+            .map_err(visibility_error)?
+    };
+    // A home group the resolution just provisioned is not in the request's
+    // viewer: re-resolve it once, so the dedup find sees a private claim this
+    // caller writes (see `routes/claims.rs::create_claim_core`).
+    let refreshed = if resolved.decl.visibility_bind() == Some("group")
+        && resolved.operator_grant.is_none()
+        && viewer.principal() == Some(agent_id.into())
+        && viewer.group_bind().is_some_and(|g| {
+            resolved
+                .decl
+                .owner_group_bind()
+                .is_some_and(|o| !g.contains(&o))
+        }) {
+        Some(
+            epigraph_db::visibility::Viewer::resolve(pool, agent_id.into())
+                .await
+                .map_err(author_tenancy_error)?,
+        )
+    } else {
+        None
+    };
+    let viewer = refreshed.as_ref().unwrap_or(viewer);
+    let granted = resolved
+        .operator_grant
+        .as_ref()
+        .and_then(|g| viewer.with_team_write_grant(g));
+    let viewer = granted.as_ref().unwrap_or(viewer);
+    if resolved.resolved == "team" {
+        let team = resolved.decl.owner_group_bind().unwrap_or_default();
+        if !viewer.writable_groups().contains(&team) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                ErrorResponse::new(
+                    "Forbidden",
+                    format!(
+                        "the authenticated caller does not write team {team}, so it cannot write \
+                         this claim there; nothing was written"
+                    ),
+                ),
+            ));
+        }
+    }
+
     // 2. Begin transaction, STAMPED with the authenticated viewer. The
     // packet's author is a body field; migration 122's claims trigger binds
     // the session principal whenever it differs from that author (the caller
@@ -1248,9 +1370,10 @@ async fn persist_packet(
     // the same transaction as the insert. `SubmitPacket` carries no visibility
     // field; a signed packet's author is the principal, and its own personal
     // group is the only owner this surface can name without inventing one.
-    let decl = epigraph_db::ClaimRepository::default_decl_for_author(&mut tx, agent_id.into())
-        .await
-        .map_err(author_tenancy_error)?;
+    //
+    // Now the caller's `visibility` (step 1b), whose resolution ran
+    // `default_decl_for_author` first: its refusals are unchanged.
+    let decl = resolved.decl;
 
     let (persisted, was_created) =
         epigraph_db::ClaimRepository::create_or_get(&mut tx, viewer, &claim, decl)
@@ -1270,6 +1393,22 @@ async fn persist_packet(
     // All dependent rows hang off the canonical claim id, not the
     // pre-generated one (which differs on a duplicate submit).
     let claim_uuid: Uuid = canonical_id.into();
+    let tenancy = epigraph_db::ClaimRepository::write_tenancy_report(
+        &mut tx,
+        claim_uuid,
+        &resolved,
+        was_created,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorResponse::new(
+                "DatabaseError",
+                format!("Failed to read the claim's tenancy: {e}"),
+            ),
+        )
+    })?;
 
     // Port the `properties` write to the create path (B1): `create_strict`
     // omits `properties`, mirroring `claims.rs::create_claim`. On a duplicate
@@ -1593,7 +1732,10 @@ async fn persist_packet(
     let dedup_trace_id = if was_created {
         None
     } else {
-        let existing = epigraph_db::ClaimRepository::get_by_id(pool, viewer, canonical_id)
+        // On the write's own stamped transaction: a group-visible duplicate
+        // (the team / private default) is invisible to the unstamped pool,
+        // which would report it as vanished.
+        let existing = epigraph_db::ClaimRepository::get_by_id_conn(&mut tx, viewer, canonical_id)
             .await
             .map_err(|e| {
                 (
@@ -1655,6 +1797,7 @@ async fn persist_packet(
         } else {
             Vec::new()
         },
+        tenancy,
     })
 }
 
@@ -1708,6 +1851,9 @@ pub async fn submit_packet(
                     trace_id: cached_response.trace_id,
                     evidence_ids: cached_response.evidence_ids.clone(),
                     was_duplicate: true,
+                    visibility: None,
+                    owner_group_id: None,
+                    visibility_note: None,
                 }),
             )
                 .into_response();
@@ -1751,6 +1897,9 @@ pub async fn submit_packet(
     // locals are kept intact for the in-memory propagation claim and the
     // figure-embedding loop (which indexes `evidence_ids[i]`); the full
     // propagation/embedding skip on dedup is Task 5.
+    // (visibility, owner group, note) for the response; set by the db build.
+    #[allow(unused_mut, unused_assignments)]
+    let mut packet_tenancy: Option<(String, Uuid, Option<String>)> = None;
     #[cfg(feature = "db")]
     let (claim_id, was_duplicate, response_trace_id, response_evidence_ids) = {
         let domain_claim_id = ClaimId::from_uuid(claim_id);
@@ -1784,6 +1933,11 @@ pub async fn submit_packet(
                     .iter()
                     .map(EvidenceId::as_uuid)
                     .collect();
+                packet_tenancy = Some((
+                    outcome.tenancy.visibility.to_string(),
+                    outcome.tenancy.owner_group_id,
+                    outcome.tenancy.note.clone(),
+                ));
                 (
                     outcome.claim_id.as_uuid(),
                     outcome.was_duplicate,
@@ -2112,6 +2266,9 @@ pub async fn submit_packet(
         trace_id: response_trace_id,
         evidence_ids: response_evidence_ids.clone(),
         was_duplicate,
+        visibility: packet_tenancy.as_ref().map(|t| t.0.clone()),
+        owner_group_id: packet_tenancy.as_ref().map(|t| t.1),
+        visibility_note: packet_tenancy.and_then(|t| t.2),
     };
 
     // 9. Publish ClaimSubmitted event (fire-and-forget)
@@ -2606,6 +2763,8 @@ mod signature_verification_tests {
             evidence,
             reasoning_trace,
             signature: String::new(),
+            visibility: None,
+            group_id: None,
         };
         let canonical = packet.signable_bytes().unwrap();
         packet.signature = hex::encode(signer.sign(&canonical));
@@ -2635,6 +2794,8 @@ mod signature_verification_tests {
             evidence,
             reasoning_trace,
             signature: String::new(),
+            visibility: None,
+            group_id: None,
         };
         let canonical = packet.signable_bytes().unwrap();
         // Sign with the attacker's key — wrong key for the agent's stored pubkey.
@@ -2665,6 +2826,8 @@ mod signature_verification_tests {
             evidence,
             reasoning_trace,
             signature: String::new(),
+            visibility: None,
+            group_id: None,
         };
         let canonical = packet.signable_bytes().unwrap();
         packet.signature = hex::encode(signer.sign(&canonical));
@@ -2702,6 +2865,8 @@ mod signature_verification_tests {
             evidence: vec![],
             reasoning_trace: build_test_trace(),
             signature: String::new(),
+            visibility: None,
+            group_id: None,
         };
         let canonical = packet.signable_bytes().unwrap();
         packet.signature = hex::encode(signer.sign(&canonical));

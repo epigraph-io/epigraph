@@ -88,6 +88,30 @@ use std::path::{Path, PathBuf};
 // ===========================================================================
 const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     (
+        "claim_helper.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_claim_visibility` (docs/tenancy/claim-visibility-controls.md), the write-time \
+         visibility resolution of `submit_claim` / `memorize` / `batch_submit_claims` / \
+         `resolve_backlog_item`. It must run BEFORE the author-stamped transaction, because a \
+         team the author writes only through its live human (D-V3) has to be stamped INTO that \
+         transaction (`begin_author_stamped_tx_for`'s grant). Every statement it runs is a \
+         SECURITY DEFINER: `default_decl_for_author`'s 107 lookup and personal-group mint, and \
+         migration 200's `epigraph_writable_teams` / `epigraph_default_group` reads. The only \
+         row it can write is the author's own personal group, minted by the definer under its \
+         own identity exactly as the stamped path mints it, so a viewer stamp on the calling \
+         connection would change nothing the definers check.",
+    ),
+    (
+        "tools/ingestion.rs",
+        "server.pool.acquire",
+        1,
+        "`resolve_ingest_visibility`, the ingest tools' twin of `claim_helper.rs`'s \
+         `resolve_claim_visibility` (same reason, same definers): an `ingest_document*` call's \
+         visibility is resolved before `begin_ingest_tx`, so a D-V3 team grant can be stamped \
+         into the ingest transaction.",
+    ),
+    (
         "operator.rs",
         "server.pool.acquire",
         1,

@@ -113,6 +113,8 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             reasoning: None,
             labels: vec!["backlog".into()],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -339,6 +341,8 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             reasoning: None,
             labels: vec![],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )

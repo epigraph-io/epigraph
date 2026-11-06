@@ -57,6 +57,8 @@ async fn submit_claim_rejects_unexpanded_label_and_writes_no_claim(pool: PgPool)
             reasoning: None,
             labels: vec!["fine-label".into(), BAD_LABEL.into()],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -110,6 +112,8 @@ async fn submit_claim_still_accepts_the_live_label_vocabulary(pool: PgPool) {
                 "group:0f4d3c1e-2b8a-4c6d-9e31-7a5b2c8d4f60".into(),
             ],
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -145,6 +149,8 @@ async fn memorize_rejects_unexpanded_tag_and_writes_no_claim(pool: PgPool) {
             confidence: Some(0.7),
             tags: Some(vec!["claude-memory".into(), BAD_LABEL.into()]),
             novelty_threshold: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
@@ -194,6 +200,8 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),
                     labels: vec!["backlog".into()],
+                    visibility: Some("public".to_string()),
+                    group_id: None,
                 },
                 epigraph_mcp::types::BatchClaimEntry {
                     content: bad.into(),
@@ -205,6 +213,8 @@ async fn batch_submit_claims_rejects_one_entry_without_orphaning_it(pool: PgPool
                     evidence_type: "logical".into(),
                     confidence: Some(0.6),
                     labels: vec![BAD_LABEL.into()],
+                    visibility: Some("public".to_string()),
+                    group_id: None,
                 },
             ],
         },

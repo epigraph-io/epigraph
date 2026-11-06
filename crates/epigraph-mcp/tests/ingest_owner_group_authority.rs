@@ -182,6 +182,8 @@ async fn revoked_personal_membership_is_refused_by_the_preflight(pool: PgPool) {
         IngestDocumentInlineParams {
             wait: None,
             extraction: doc(doi),
+            visibility: Some("public".to_string()),
+            group_id: None,
         },
         None,
     )
