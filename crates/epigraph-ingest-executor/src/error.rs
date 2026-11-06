@@ -61,20 +61,13 @@ pub enum IngestExecutorError {
         group: uuid::Uuid,
     },
 
-    /// A declared-tenancy ingest names a group the workflow-ingest system
-    /// agent does not write, so its stamp could not satisfy the row-security
-    /// `WITH CHECK` on the claims and edges it would create. Raised on the
-    /// stamped transaction before anything is written.
+    /// A caller-authored workflow write was handed a viewer with no
+    /// principal: there is no agent to author the rows as.
     #[error(
-        "the workflow-ingest system agent {system_agent} holds no live writer or admin \
-         membership of group {group}, so no claim of this ingest could be owned by it: a \
-         maintenance session must grant that agent a writer row in the group first. Nothing \
-         was written"
+        "a workflow write needs an authenticated agent principal to write as; this request \
+         names none. Nothing was written"
     )]
-    DeclaredGroupNotWritable {
-        group: uuid::Uuid,
-        system_agent: uuid::Uuid,
-    },
+    CallerUnidentified,
 
     /// A declared-tenancy ingest's plan names a claim that already exists and
     /// that is private to a group the CALLING agent does not write (or that the
@@ -144,8 +137,9 @@ pub enum IngestExecutorError {
 
 impl IngestExecutorError {
     /// Whether this is one of the declared-tenancy refusals
-    /// ([`Self::CallerNotGroupWriter`], [`Self::DeclaredGroupNotWritable`],
-    /// [`Self::ReusedClaimOutsideCallerGroups`]): a denial the caller can act
+    /// ([`Self::CallerNotGroupWriter`], [`Self::InheritedGroupNotWritable`],
+    /// [`Self::ReusedClaimOutsideCallerGroups`], [`Self::CallerUnidentified`]):
+    /// a denial the caller can act
     /// on (403 / `INVALID_REQUEST`), not a fault.
     #[must_use]
     pub const fn is_declared_tenancy_refusal(&self) -> bool {
@@ -153,8 +147,8 @@ impl IngestExecutorError {
             self,
             Self::CallerNotGroupWriter { .. }
                 | Self::InheritedGroupNotWritable { .. }
-                | Self::DeclaredGroupNotWritable { .. }
                 | Self::ReusedClaimOutsideCallerGroups { .. }
+                | Self::CallerUnidentified
         )
     }
 }

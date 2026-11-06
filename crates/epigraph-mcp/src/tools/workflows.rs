@@ -435,8 +435,11 @@ pub async fn store_workflow(
     if let Ok(wf_id) = uuid::Uuid::parse_str(&response.workflow_id) {
         match server.embedder.generate(&params.goal).await {
             Ok(qvec) => {
-                crate::tools::workflow_ingest::store_workflow_goal_embedding(server, wf_id, &qvec)
-                    .await;
+                let caller = server.write_identity(auth, viewer).await?;
+                crate::tools::workflow_ingest::store_workflow_goal_embedding(
+                    server, caller, wf_id, &qvec,
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
@@ -1458,7 +1461,7 @@ pub async fn deprecate_workflow(
     // this same path: `deprecate_claim` matched zero rows, the thesis, phase and
     // step claims stayed current, and the id was reported as deprecated anyway.
     // It now takes `deprecate_hierarchical_workflow` below (U017; backlog
-    // fe874d2a), on the ingest system agent's stamp, behind the workflow
+    // fe874d2a), on the caller's own stamp, behind the workflow
     // authority rule. The dispatch is by what the id IS: a claim this caller
     // can read takes this path (flat first, so an id that is both keeps
     // today's behaviour), else a `workflows` row takes the hierarchical one,
@@ -1673,10 +1676,10 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
 /// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
 /// retire the workflow as a unit (U017; backlog fe874d2a).
 ///
-/// * ONE transaction on the ingest system agent's stamp
-///   (`begin_system_ingest_stamped_tx`, as `step_ops::delete_step`): the
-///   thesis, phase and step claims are that agent's, and the server agent's
-///   stamp that the flat path uses is USING-filtered to zero rows on them.
+/// * ONE transaction on the CALLER's own stamp (`begin_caller_workflow_tx`,
+///   as `step_ops::delete_step`): the caller retires only rows of groups it
+///   writes (row security refuses the rest), including a plan the shared
+///   system agent wrote before workflow writes moved to the caller.
 /// * The target set is the row plus, with `cascade`, every row descended from
 ///   it through `workflows.parent_id` (the lineage the `workflow -variant_of->
 ///   workflow` edges describe).
@@ -1720,9 +1723,7 @@ async fn deprecate_hierarchical_workflow(
     params: DeprecateWorkflowParams,
 ) -> Result<CallToolResult, McpError> {
     const TOOL: &str = "deprecate_workflow";
-    let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, TOOL, caller.agent_id())
-            .await?;
+    let mut tx = crate::claim_helper::begin_caller_workflow_tx(server, caller, TOOL).await?;
 
     let mut targets = vec![workflow_id];
     if cascade {

@@ -128,12 +128,11 @@ async fn require_authority_over(
 ///
 /// # One stamped transaction, not five pool checkouts
 ///
-/// The step claim is authored by the registered workflow-ingest system agent
-/// (migration 148) and owned by that
-/// agent's personal group, so on the unstamped pool its INSERT is refused on a
-/// cleanly-migrated schema. The stamp is therefore the system agent's — see
-/// [`crate::claim_helper::begin_system_ingest_stamped_tx`] — not
-/// `server.agent_id()`.
+/// The step claim is authored by the CALLER (the request's write identity)
+/// and owned by a group it writes (`epigraph_ingest_executor::owner`), so on
+/// the unstamped pool its INSERT is refused on a cleanly-migrated schema. The
+/// stamp is therefore the caller's own — see
+/// [`crate::claim_helper::begin_caller_workflow_tx`].
 ///
 /// Holding one transaction across the whole call also makes the chain rewire
 /// atomic. `add_step` writes the claim, an `executes` edge, a `decomposes_to`
@@ -150,11 +149,9 @@ pub async fn add_step(
     auth: Option<&epigraph_auth::AuthContext>,
 ) -> Result<CallToolResult, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
-    let (_system_agent_id, mut tx) =
-        crate::claim_helper::begin_system_ingest_stamped_tx(server, "add_step", caller.agent_id())
-            .await?;
+    let mut tx = crate::claim_helper::begin_caller_workflow_tx(server, caller, "add_step").await?;
     // H3 (batch H-b): the CALLER's authority over the workflow, before the
-    // system-stamped write. The stamp stays the system agent's.
+    // write, on the caller's own stamp.
     let authority = require_authority_over(
         server,
         &mut tx,
@@ -166,7 +163,7 @@ pub async fn add_step(
     .await?;
     let r = epigraph_ingest_executor::add_step(
         &mut tx,
-        Some(caller.agent_id()),
+        caller.agent_id(),
         &params.canonical_name,
         &params.step_text,
         params.position,
@@ -175,7 +172,7 @@ pub async fn add_step(
     .map_err(map_step_err)?;
     // AUTHORSHIP (operator rulings, 2026-10-13): the acting agent (the caller
     // over HTTP, this server's pinned agent on stdio) AUTHORED the step claim
-    // this call created; the claim itself stays the system agent's.
+    // this call created, and the claim is its own (`claims.agent_id`).
     if r.claim_created {
         epigraph_ingest_executor::record_caller_authorship(
             &mut tx,
@@ -217,7 +214,7 @@ pub async fn add_step(
     // embed holds a network round trip to OpenAI, and CLAUDE.md's embedding
     // policy forbids a failed embed from unwinding a committed claim.
     // `embed_and_store` reads the author off the row, so it stamps from the
-    // system agent without being told to.
+    // caller without being told to.
     if let Some(ref content) = r.inserted_content {
         let _ = server
             .embedder
@@ -237,11 +234,12 @@ pub async fn add_step(
 
 /// Soft-delete a step lineage by setting its head claim's `truth_value` to 0.05.
 ///
-/// Same stamp and same reason as [`add_step`]: the row being updated is owned by
-/// the system agent's personal group, and `claims_tenancy`'s `WITH CHECK`
-/// governs an UPDATE as well as an INSERT. On the unstamped pool this was
-/// admitted in production only by the orphan `claims_privacy` policy and refused
-/// on a clean migrate.
+/// Same stamp as [`add_step`], the caller's own: `claims_tenancy`'s `WITH
+/// CHECK` governs an UPDATE as well as an INSERT, so the caller must write the
+/// step claim's owner group (a step the shared system agent wrote before
+/// workflow writes moved to the caller included). On the unstamped pool this
+/// was admitted in production only by the orphan `claims_privacy` policy and
+/// refused on a clean migrate.
 pub async fn delete_step(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -250,12 +248,8 @@ pub async fn delete_step(
 ) -> Result<CallToolResult, McpError> {
     let lineage = parse_uuid(&params.step_lineage_id)?;
     let caller = server.write_identity(auth, viewer).await?;
-    let (_system_agent_id, mut tx) = crate::claim_helper::begin_system_ingest_stamped_tx(
-        server,
-        "delete_step",
-        caller.agent_id(),
-    )
-    .await?;
+    let mut tx =
+        crate::claim_helper::begin_caller_workflow_tx(server, caller, "delete_step").await?;
     // H3 (batch H-b); see `add_step`.
     let authority = require_authority_over(
         server,

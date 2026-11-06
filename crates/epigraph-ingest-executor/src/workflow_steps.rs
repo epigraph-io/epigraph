@@ -11,12 +11,13 @@
 //!
 //! # Every entry point takes a CONNECTION the caller has stamped
 //!
-//! The step claim [`add_step`] inserts is owned by the `workflow-ingest-system`
-//! agent's personal group — not by whoever called the tool — so on the unstamped
-//! pool migration 077's `claims_tenancy` `WITH CHECK` refuses it on a cleanly
-//! migrated schema. See
-//! [`crate::system_agent::system_agent_write_authority`] for the measurement of
-//! which identity the stamp must be, and why the answer is not the caller's.
+//! The step claim [`add_step`] inserts is authored by the CALLER and owned by
+//! a group the caller writes (`crate::owner`), and every write here is a row a
+//! row-security `WITH CHECK` asks about, so the connection must be a
+//! transaction stamped from the CALLER's own viewer: on the unstamped pool
+//! migration 077's `claims_tenancy` `WITH CHECK` refuses it on a cleanly
+//! migrated schema. [`delete_step`]'s soft delete is an `UPDATE` of the step's
+//! head claim on that same stamp, so the caller must write the claim's group.
 //!
 //! Taking a connection is also what makes these operations ATOMIC. `add_step`
 //! writes a claim, two `executes`/`decomposes_to` edges and up to three
@@ -34,7 +35,6 @@ use epigraph_ingest::workflow::builder::{
 };
 
 use crate::error::IngestExecutorError;
-use crate::system_agent::get_or_create_system_agent;
 
 #[derive(Debug, Clone)]
 pub struct AddStepResult {
@@ -110,9 +110,9 @@ pub enum StepOpError {
     StepNotWritable { step_claim_id: Uuid, lineage: Uuid },
     /// `add_step` into a GROUP plan by a caller that does not itself hold a
     /// live writer/admin membership of the plan's group (ruling R-98: the new
-    /// step takes the plan's group, and the system agent's stamp writes it;
-    /// inheriting the plan's tenancy must not let a non-writer write into the
-    /// group). The group is not named. Nothing is written.
+    /// step takes the plan's group; inheriting the plan's tenancy must not let
+    /// a non-writer write into the group). The group is not named. Nothing is
+    /// written.
     #[error(
         "workflow {canonical_name:?} belongs to a group the calling agent {caller} does not \
          write (it holds no live writer or admin membership of it), so it may not add a step \
@@ -329,9 +329,19 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 ///
 /// The `workflows` row is locked first, so two concurrent calls on one
 /// workflow cannot both take the same index.
+///
+/// # Written as the caller
+///
+/// The step claim is authored by `caller` (`claims.agent_id`), and `conn`
+/// must be a transaction stamped from `caller`'s own viewer. Its owner:
+/// a GROUP plan's group (ruling R-98; `caller` must write it now, else
+/// [`StepOpError::GroupNotWritable`]); otherwise
+/// [`crate::owner::resolve_caller_owner`] with the plan's own owner group as
+/// the container (the plan's group when `caller` writes it, else `caller`'s
+/// one team group, else its default declaration), public.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
-    caller: Option<Uuid>,
+    caller: Uuid,
     canonical_name: &str,
     step_text: &str,
     position: Option<u32>,
@@ -343,31 +353,21 @@ pub async fn add_step(
     // Before the plan is read: a concurrent add_step on this workflow waits
     // here, so the two cannot both take the same next `plan_index`.
     epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *conn, workflow_id).await?;
-    // A GROUP plan's new step lands in the plan's group (below), on the
-    // system agent's stamp, which writes that group whoever called. So the
-    // CALLER itself must write the group, decided here before anything is
-    // read or written, on every transport (REST and MCP pass their acting
-    // agent; `None` names no agent and is refused). Not left to row security:
-    // the stamp is not the caller's.
-    let plan_group =
-        match epigraph_db::WorkflowRepository::tenancy_of(&mut *conn, workflow_id).await? {
-            Some((visibility, group)) if visibility == "group" => Some(group),
-            _ => None,
-        };
+    // A GROUP plan's new step lands in the plan's group (below). The CALLER
+    // must write that group NOW, decided here before anything is read or
+    // written, on every transport, and refused by name rather than by the
+    // row-security refusal of the caller's own stamp further down.
+    let plan_tenancy = epigraph_db::WorkflowRepository::tenancy_of(&mut *conn, workflow_id).await?;
+    let (plan_group, plan_public_owner) = match plan_tenancy {
+        Some((visibility, group)) if visibility == "group" => (Some(group), None),
+        Some((_, owner)) => (None, Some(owner)),
+        None => (None, None),
+    };
     if let Some(group) = plan_group {
-        let writes = match caller {
-            Some(agent) => {
-                epigraph_db::GroupMembershipRepository::agent_writes_group_conn(
-                    &mut *conn, agent, group,
-                )
-                .await?
-            }
-            None => false,
-        };
-        if !writes {
+        if !crate::owner::caller_writes_group_now(&mut *conn, caller, group).await? {
             return Err(StepOpError::GroupNotWritable {
                 canonical_name: canonical_name.to_string(),
-                caller: caller.unwrap_or_else(Uuid::nil),
+                caller,
             });
         }
     }
@@ -463,7 +463,7 @@ pub async fn add_step(
         None
     };
 
-    let agent_id = get_or_create_system_agent(&mut *conn).await?;
+    let agent_id = caller;
     let step_lineage = Uuid::new_v4();
 
     // ── Tenancy declaration (PR-16) ──
@@ -472,26 +472,24 @@ pub async fn add_step(
     // finds no sibling to inherit from and the row would fall through to the
     // seed arm (test roles) or raise 23502 (the app role). It has to declare.
     //
-    // CORRECTION TO THE PLAN. §4.6 says `add_step` "takes a `TenancyDecl` from
-    // its caller". Its two callers -- `epigraph-mcp/src/tools/step_ops.rs` and
-    // `epigraph-api/src/routes/workflows.rs` -- have no group to give: a
-    // workflow step is instance-wide content authored by the SYSTEM agent
-    // (`get_or_create_system_agent` above, already resolved for `agent_id`),
-    // and `find_workflow` / `find_workflow_hierarchical` read it for every
-    // principal. Owning a step with the calling principal's group would make
-    // every workflow private to whoever last edited it. A parameter here would
-    // therefore only widen the ways to get it wrong, so the declaration is
-    // derived from the author the row already names.
+    // The step is authored by the CALLER and owned where the caller writes.
+    // A public plan's step stays public (`find_workflow` and
+    // `find_workflow_hierarchical` read it for every principal): owned by the
+    // plan's own group when the caller writes it, else by the caller's one
+    // team group, else by its default declaration (`crate::owner`).
     //
-    // A GROUP plan is the exception (ruling R-98 Q5(a), backlog 630af617):
-    // its new step takes the `workflows` row's tenancy, read under the row
-    // lock taken above, so the step, its `executes` edge and its chain edges
-    // (the endpoint meet) are the plan's group and not public. The system
-    // agent's stamp writes that group (a declared ingest required it); if it
-    // no longer does, the INSERT is refused and nothing is written.
+    // A GROUP plan (ruling R-98 Q5(a), backlog 630af617): its new step takes
+    // the `workflows` row's tenancy, read under the row lock taken above, so
+    // the step, its `executes` edge and its chain edges (the endpoint meet)
+    // are the plan's group and not public. The caller was proved to write
+    // that group above.
     let decl = match plan_group {
         Some(group) => epigraph_core::TenancyDecl::group(group),
-        None => epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, agent_id).await?,
+        None => {
+            crate::owner::resolve_caller_owner(&mut *conn, caller, None, plan_public_owner)
+                .await?
+                .decl
+        }
     };
 
     let claim_created = sqlx::query(
@@ -502,9 +500,9 @@ pub async fn add_step(
     )
     .bind(step_claim_id)
     .bind(step_text)
-    // Scoped to the workflow like the builder's step nodes: the row is
-    // authored by the shared system agent, so a plain `blake3(step_text)`
-    // collides on the (content_hash, agent_id) dedup key with any other
+    // Scoped to the workflow like the builder's step nodes: rows written
+    // before workflow writes moved to the caller were authored by one shared
+    // system agent, so a plain `blake3(step_text)` collides on the (content_hash, agent_id) dedup key with any other
     // workflow's step of the same text (backlog 6178a205; 013's
     // `uq_claims_content_hash_agent` through migration 149, the app-layer
     // lock from 150).
