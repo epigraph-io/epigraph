@@ -997,7 +997,10 @@ async fn the_auditor_roster_is_not_disclosed(pool: PgPool) {
 
     // The holder sees its own.
     let own = card_as(&pool, auditor, auditor).await;
-    assert!(own.roles.iter().any(|r| r.role == "role:auditor"), "{own:?}");
+    assert!(
+        own.roles.iter().any(|r| r.role == "role:auditor"),
+        "{own:?}"
+    );
 }
 
 /// A disclosed role is decided by the assignment window alone, as the public
