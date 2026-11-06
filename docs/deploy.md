@@ -2584,8 +2584,12 @@ The passkey is recorded with format `android-key` and the nil AAGUID. A
 **`EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`** is REQUIRED with the Android
 roots. It is a local copy of Google's attestation status list:
 - the URL is <https://android.googleapis.com/attestation/status>;
-- the format is `{"entries": {"<serial, lowercase hex>": {"status":
-  "REVOKED"|"SUSPENDED", ...}}}`.
+- the format is `{"entries": {"<serial>": {"status":
+  "REVOKED"|"SUSPENDED", ...}}}`. Google's schema says the key is the serial
+  in lowercase hex, but the published list keys its 64-bit serials in
+  DECIMAL and its 128-bit ones in hex (measured 2026-11-06: 981 of 1,771
+  keys were 17-20 decimal digits). The API therefore looks each certificate
+  up in both forms.
 
 Google lists the serial numbers of attestation certificates it has revoked or
 suspended, for example leaked device keys. The library loads no CRL and no
@@ -2595,7 +2599,8 @@ request reaches the network.
 The policy:
 - **At boot.** The roots without the file, or a file that is unreadable or
   is not a status list, are a boot error (exit 1). The file alone, without
-  the roots, is also a boot error.
+  the roots, is also a boot error. A file that is valid but stale never
+  blocks boot; it refuses Android enrollments and anchors only.
 - **At every use.** The file is re-read at every Android enrollment and at
   every use of an Android passkey as an anchor. A refreshed file takes
   effect without a restart.
@@ -2614,11 +2619,19 @@ the file's directory:
 ```bash
 STATUS=/path/readable/by/the/api/android-attestation-status.json
 curl -fsS --max-time 30 -o "$STATUS.tmp" https://android.googleapis.com/attestation/status \
-  && jq -e '.entries | type == "object"' "$STATUS.tmp" >/dev/null \
+  && jq -e '(.entries | type == "object")
+            and (.entries | to_entries
+                 | all((.key | test("^[0-9a-fA-F]+$")) and (.value.status | type == "string")))' \
+         "$STATUS.tmp" >/dev/null \
   && mv -f "$STATUS.tmp" "$STATUS"
 ```
 
-The `mv` replaces the file atomically, so a partial download is never read.
+The `jq` check is the API's own parse rule (an `entries` object, every key
+hex digits, every entry a string `status`). A download that fails it never
+replaces the good file. The API exits 1 at boot on a file that does not
+parse, so a bad file left in place would take the whole API down at the next
+restart. The `mv` replaces the file atomically, so a partial download is
+never read.
 Never use `curl -R`, `cp -a` or `rsync -t` for this step. Each keeps an older
 modification time, and a file that looks stale refuses every Android anchor
 even though its content is new.
@@ -2707,16 +2720,20 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   hardware key registers on it. That hardware key never anchors, because
   its lineage holds the synced passkey. So the password-manager account
   cannot mint an anchor, through any number of acts.
-- **Not re-checked at use:** that the anchor's stored certificate attests
-  the anchor's own key. The attestation signature that bound them is not
-  stored. It was verified at registration by the API, the only writer of the
-  row besides the maintenance DSN.
+- **Not re-checked at use, for `packed`/`tpm`:** that the anchor's stored
+  certificate chain was the one that attested its stored key. That
+  certificate is the authenticator model's, and the attestation signature
+  that bound it to the key is not stored. It was verified at registration by
+  the API, the only writer of the row besides the maintenance DSN. For
+  `android-key` the leaf is issued for the credential's key, and the API
+  checks at every use that the two are the same key.
 
 **The accepted cost.** Once a synced passkey is registered, an elevation (and
 every admin-act confirmation) is only as strong as the password-manager
 account that holds it: whoever controls that account can elevate as the
 person. Revoking the synced passkey (`epigraph-operator revoke-passkey`)
-ends that, and ends any elevation it confirmed. So does revoking its anchor.
+ends that, and ends any elevation it confirmed. So does revoking its anchor,
+which revokes it.
 
 **Operator steps.**
 
