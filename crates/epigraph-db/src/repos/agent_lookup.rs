@@ -34,9 +34,11 @@
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
 //!   falls through, so an agent whose only evidence is hidden reads exactly as
 //!   one with no evidence (`unknown`). See [`AgentKind`].
-//! * `roles`: migration 198's `epigraph_disclosed_role_assignments`, the live
-//!   assignments of NON-elevating roles (publicly projected by design, 165),
-//!   plus the caller's own assignments of any role.
+//! * `roles`: migration 198's `epigraph_disclosed_role_assignments`: for any
+//!   agent, the assignments of roles that neither elevate nor read the audit
+//!   trail whose window is open now (exactly what 123's public projection
+//!   shows, and decided by the window alone, so client or registration
+//!   status never moves it), plus the caller's own assignments of any role.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
 //!   number. Capped at [`COUNT_CAP`] so a fleet agent with 10^5 claims cannot

@@ -2111,11 +2111,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_atlas_layout_narrowed", 197),
     // 198, the agent-lookup card's disclosed roles (find_agent / get_agent).
     // Its read of the FORCEd `role_assignments` is admitted by
-    // `epigraph_definer_bypass()` (the owner), and it calls 123's
-    // maintenance-only `epigraph_live_role_assignment`. Under a non-member
-    // owner the read is filtered to the session principal's own rows (or the
-    // call fails 42501 on the maintenance-only function): fail CLOSED, fewer
-    // or no roles shown, never more.
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner the
+    // read is filtered to the session principal's own rows: fail CLOSED,
+    // fewer roles shown, never more.
     ("epigraph_disclosed_role_assignments", 198),
 ];
 

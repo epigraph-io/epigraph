@@ -11,12 +11,11 @@
 --     RETURNS TABLE (agent_id uuid, role text, valid_from timestamptz,
 --                    valid_to timestamptz)
 --
--- For each agent of `p_agents` it returns the LIVE assignment of each catalog
--- role that agent holds right now, exactly as 123's
--- `epigraph_live_role_assignment(holder, role, now())` names it (the window
--- `valid_from <= now() < valid_to`, not ended, and the holder re-checked as a
--- registered human that is no other human's agent), one row per (agent, role),
--- and ONLY for:
+-- For each agent of `p_agents` it returns, per catalog role, the assignment
+-- whose WINDOW is open now: not revoked and `valid_from <= now() < valid_to`
+-- (`valid_to` NULL: open-ended), the earliest by (`valid_from`, `id`) when
+-- several are, exactly as 123's public projection of the grant shows it; one
+-- row per (agent, role), and ONLY for:
 --
 --   (a) a role that neither elevates nor reads the audit trail
 --       (`platform_roles.elevates = false AND reads_audit = false`): the
@@ -44,6 +43,17 @@
 -- authority table instead of the projection, so a projection-shaped edge that
 -- any writer of the world group could add is never shown as a role.
 --
+-- DECIDED BY THE WINDOW ALONE, deliberately. 123's
+-- `epigraph_live_role_assignment` additionally re-checks the holder as a
+-- registered human (`epigraph_is_human_operator`: a live `human_operators`
+-- row AND an `active` human OAuth client) that is not linked as an agent.
+-- Using that here would make a role vanish from the card, and `kind` drop
+-- from human to unknown, while the holder's client is suspended or its
+-- registration revoked, when the projection edge and the unrevoked
+-- assignment still show it: any reader comparing the two would learn the
+-- holder's client and registration status. The card mirrors the projection
+-- instead; authority questions keep 123's re-check (below).
+--
 -- It is NOT read for authority and confers none. It answers "which roles does
 -- this card show", nothing else; every authority question still goes to
 -- 123's subject-bound readers.
@@ -59,8 +69,7 @@
 -- object schema-qualified, `pg_catalog.now()`. Owner `epigraph_maintenance`
 -- (inside the frame `current_user` is the owner, so
 -- `role_assignments_self_or_definer` admits the read through its
--- `epigraph_definer_bypass()` arm, and the owner may call 123's
--- maintenance-only `epigraph_live_role_assignment`); EXECUTE revoked from
+-- `epigraph_definer_bypass()` arm); EXECUTE revoked from
 -- PUBLIC and granted to `epigraph_app`. The role-guarded owner and grant
 -- blocks can silently no-op; `tenancy_backfill.rs`'s registers report it and
 -- `agent_lookup.rs` (epigraph-db tests) pins the catalog at head.
@@ -89,17 +98,18 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     RETURN QUERY
-    SELECT ra.holder_person_id, ra.role, ra.valid_from, ra.valid_to
+    SELECT DISTINCT ON (ra.holder_person_id, ra.role)
+           ra.holder_person_id, ra.role, ra.valid_from, ra.valid_to
       FROM public.role_assignments ra
       JOIN public.platform_roles r ON r.key = ra.role
      WHERE ra.holder_person_id = ANY (p_agents)
        AND ra.revoked_at IS NULL
-       AND ra.id = public.epigraph_live_role_assignment(ra.holder_person_id, ra.role,
-                                                        pg_catalog.now())
+       AND ra.valid_from <= pg_catalog.now()
+       AND (ra.valid_to IS NULL OR pg_catalog.now() < ra.valid_to)
        AND (   (NOT r.elevates AND NOT r.reads_audit)
             OR ra.holder_person_id = public.epigraph_principal_id()
             OR public.epigraph_bypass())
-     ORDER BY ra.holder_person_id, ra.role;
+     ORDER BY ra.holder_person_id, ra.role, ra.valid_from, ra.id;
 END $$;
 REVOKE ALL ON FUNCTION public.epigraph_disclosed_role_assignments(uuid[]) FROM PUBLIC;
 

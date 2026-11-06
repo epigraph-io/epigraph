@@ -186,6 +186,49 @@ async fn seed_role(pool: &PgPool, key: &str, elevates: bool) {
     .expect("platform role");
 }
 
+/// `agent`'s (first) human OAuth client.
+async fn human_client_of(pool: &PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM oauth_clients WHERE agent_id = $1 AND client_type = 'human' \
+          ORDER BY created_at LIMIT 1",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("the human's client")
+}
+
+async fn set_client_status(pool: &PgPool, client: Uuid, status: &str) {
+    sqlx::query("UPDATE oauth_clients SET status = $2 WHERE id = $1")
+        .bind(client)
+        .bind(status)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("client status -> {status}: {e}"));
+}
+
+/// Revoke `human`'s registration through the real maintenance definer.
+async fn revoke_registration(pool: &PgPool, human: Uuid) {
+    let revoked: bool = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, 'test revoke')",
+        )
+        .bind(human)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke registration");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the registration was live");
+}
+
+/// Whole card JSON, nothing stripped: for before/after comparisons of the
+/// SAME agents.
+fn whole(cards: &[AgentCard]) -> serde_json::Value {
+    serde_json::to_value(cards).expect("serialize cards")
+}
+
 async fn grant(pool: &PgPool, role: &str, holder: Uuid) -> Uuid {
     sqlx::query_scalar(
         "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
@@ -744,6 +787,46 @@ async fn roles_show_disclosed_assignments_and_never_the_admin_roster(pool: PgPoo
     assert!(
         ids(&r).is_empty(),
         "the role filter is no roster oracle either"
+    );
+}
+
+/// A disclosed role is decided by the assignment window alone, as the public
+/// projection shows it, so no client or registration event moves an
+/// outsider's card (`kind` included).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disclosed_role_does_not_move_with_client_or_registration_status(pool: PgPool) {
+    seed_role(&pool, "role:test-members", false).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (member, _) = named_human(&pool, "Juno Marsh").await;
+    grant(&pool, "role:test-members", member).await;
+
+    let before = whole(&cards_as(&pool, outsider, &[member]).await);
+    assert_eq!(before[0]["kind"], "human");
+    assert_eq!(before[0]["roles"][0]["role"], "role:test-members");
+
+    let is_human = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, bool>("SELECT public.epigraph_is_human_operator($1)")
+            .bind(member)
+            .fetch_one(&pool)
+            .await
+            .expect("is_human_operator")
+    };
+    let client = human_client_of(&pool, member).await;
+    set_client_status(&pool, client, "suspended").await;
+    assert!(!is_human(pool.clone()).await, "CALIBRATION: suspended");
+    assert_eq!(
+        whole(&cards_as(&pool, outsider, &[member]).await),
+        before,
+        "client suspended"
+    );
+    set_client_status(&pool, client, "active").await;
+
+    revoke_registration(&pool, member).await;
+    assert!(!is_human(pool.clone()).await, "CALIBRATION: deregistered");
+    assert_eq!(
+        whole(&cards_as(&pool, outsider, &[member]).await),
+        before,
+        "registration revoked"
     );
 }
 
