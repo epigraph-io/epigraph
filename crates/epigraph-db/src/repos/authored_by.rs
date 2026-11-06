@@ -11,17 +11,17 @@
 //! * **`agent`** `{id, display_name}`: every reader of the claim. `agents` is
 //!   readable by every session (077's `agents_identity` policy), and
 //!   `GET /api/v1/agents/:id` answers the same two fields for any id.
-//! * **`human`** `{id, display_name}`: the human migration 149's
-//!   `epigraph_human_of(agent, false)` names (the agent itself when it is a
-//!   registered human operator; else its operator link, in ANY state, so the
-//!   attribution outlives a retirement; else the operator of its allowlisted
-//!   client). Shown only when the caller could already read that binding:
-//!   the caller IS that human, or an `OPERATED_BY` edge from the agent to
-//!   exactly that human is readable under the caller's viewer (the edge every
-//!   link writes, 107 / 161; edge predicate spliced, row security on the
-//!   stamped connection). So a human-operator self-binding, an allowlist
-//!   binding (no edge) and a link whose edge is private to a group the caller
-//!   is not in are shown to nobody but the human. The link tables themselves
+//! * **`human`** `{id, display_name}`: every reader of the claim. It is the
+//!   agent's binding, migration 149's `epigraph_human_of(agent, false)`: its
+//!   operator link, in ANY state, so the attribution outlives a retirement;
+//!   else the operator of its allowlisted client. It is read from that
+//!   binding and from nothing else. In particular no `OPERATED_BY` edge
+//!   decides it: any edges:write caller can write one between two agents, so
+//!   an edge proves nothing about who operates whom, and a forged edge
+//!   changes nothing here. A registered human operator is bound to ITSELF;
+//!   that is not an operator, so a human's own claim names no human (the
+//!   agent part already names them), and the block never says who is a
+//!   registered human operator. The link tables themselves
 //!   (`operator_links`, `human_operators`, `author_binding_clients`) are
 //!   never read here.
 //! * **`prompt_snapshot`** `{snapshot_id, model, prompt_hash, started_at}`:
@@ -34,9 +34,8 @@
 //!   stays behind `GET /api/v1/agents/:id/prompt-history/blobs/:hash`.
 //!
 //! A part the caller may not see is `null`, byte for byte the same as a part
-//! that does not exist (an agent bound to no human, an agent that never
-//! registered a snapshot), so the block is not an oracle for hidden links or
-//! for who operates whom.
+//! that does not exist (an agent that never registered a snapshot), so the
+//! block is not an oracle for who may read an agent's prompt history.
 //!
 //! `prompt_hash` is the identity prompt hash (161: the identity key is a
 //! function of the model and this hash, so both are the same for every
@@ -106,8 +105,8 @@ pub struct PromptSnapshotAt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuthoredBy {
     pub agent: AuthorRef,
-    /// `None` both when the agent is bound to no human and when the caller
-    /// may not see the binding.
+    /// The agent's operator (its binding), for every reader; `None` when the
+    /// agent is bound to no human or only to itself.
     pub human: Option<AuthorRef>,
     /// `None` both when no snapshot was active and when the caller is not in
     /// the audience.
@@ -119,8 +118,7 @@ pub struct AuthoredByRepository;
 impl AuthoredByRepository {
     /// The `authored_by` block of a claim filed by `agent_id` at
     /// `created_at`, as `viewer` may see it. `read` must be `viewer`'s own
-    /// stamped connection (the human's edge and the snapshot gate read its
-    /// row security and its session principal). Call it only for a claim
+    /// stamped connection (the snapshot gate reads its session principal). Call it only for a claim
     /// `viewer` has already read.
     ///
     /// # Errors
@@ -128,33 +126,19 @@ impl AuthoredByRepository {
     /// without migration 199 (42883).
     pub async fn for_claim(
         read: &mut ScopedRead<'_>,
-        viewer: &Viewer,
+        _viewer: &Viewer,
         agent_id: Uuid,
         created_at: DateTime<Utc>,
         audience: PromptSnapshotAudience,
     ) -> Result<AuthoredBy, DbError> {
         let conn: &mut sqlx::PgConnection = read;
 
-        // The human, shown only through a binding the caller can read.
-        let human_id = match AgentRepository::human_of(&mut *conn, agent_id, false).await? {
-            Some(h) if viewer.principal() == Some(h) => Some(h),
-            Some(h) => {
-                let sql = viewer.splice(
-                    "SELECT EXISTS (SELECT 1 FROM edges e \
-                      WHERE e.source_id = $1 AND e.source_type = 'agent' \
-                        AND e.target_id = $2 AND e.target_type = 'agent' \
-                        AND e.relationship = 'OPERATED_BY' \
-                        /* {EDGE_VISIBILITY:e} */)",
-                    3,
-                );
-                let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(agent_id).bind(h);
-                if let Some(g) = viewer.group_bind() {
-                    q = q.bind(g);
-                }
-                q.fetch_one(&mut *conn).await?.then_some(h)
-            }
-            None => None,
-        };
+        // The human: the agent's binding, for every reader. Never an edge.
+        // A binding to the agent itself (a registered human operator) is not
+        // an operator and is not shown.
+        let human_id = AgentRepository::human_of(&mut *conn, agent_id, false)
+            .await?
+            .filter(|h| *h != agent_id);
 
         // Both names in one read; `agents` is readable by every session.
         let wanted: Vec<Uuid> = std::iter::once(agent_id).chain(human_id).collect();

@@ -943,14 +943,11 @@ async fn an_elevated_tool_call_is_recorded_before_its_result_returns(pool: PgPoo
     assert_eq!(log.len(), 1, "{log:?}");
     let (surface, rows, groups, args) = &log[0];
     assert_eq!(surface, "mcp:get_claim");
-    // Three id-bearing objects: the claim, its `authored_by.agent` (P, who
-    // filed it) and `authored_by.human` (P again: a registered human operator
-    // is its own human, shown to P). The recorder counts every nested row
-    // object.
-    assert_eq!(
-        *rows, 3,
-        "the claim and its author (agent and human) in the result"
-    );
+    // Two id-bearing objects: the claim and its `authored_by.agent` (P, who
+    // filed it). P is a registered human operator, bound to itself, which is
+    // not an operator, so `authored_by.human` is null and not counted. The
+    // recorder counts every nested row object.
+    assert_eq!(*rows, 2, "the claim and its author in the result");
     assert!(
         groups.is_empty(),
         "a public row names no subject: {groups:?}"

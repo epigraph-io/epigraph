@@ -402,9 +402,9 @@ async fn unmark_duplicate_doc() {}
 /// Read one claim (doc stub)
 ///
 /// A claim the caller may not read is 404, exactly as an id with no claim.
-/// The response carries `authored_by`: `agent` for every reader; `human`
-/// only to that human and to a caller who can read the agent's
-/// `OPERATED_BY` edge to it; `prompt_snapshot` only to the audience
+/// The response carries `authored_by`: `agent` for every reader; `human`,
+/// the human operator the agent is bound to (never inferred from an
+/// `OPERATED_BY` edge), for every reader; `prompt_snapshot` only to the audience
 /// `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names (the agent's linked human and
 /// admins, the prompt-history gate; or every reader of the claim). A part the
 /// caller may not see is `null`, exactly as a part that does not exist.

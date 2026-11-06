@@ -242,9 +242,11 @@ pub struct ClaimResponse {
 pub struct AuthoredByView {
     /// The agent that filed the claim (`agent_id`), for every reader.
     pub agent: AuthorRefView,
-    /// The human the agent acts for (migration 149's `epigraph_human_of`, any
-    /// link state). Shown only to that human and to a caller who can read the
-    /// agent's `OPERATED_BY` edge to that human; otherwise `null`.
+    /// The human operator the agent is bound to (migration 149's
+    /// `epigraph_human_of`, any link state), for every reader. Read from the
+    /// binding only, never from an `OPERATED_BY` edge. `null` when the agent
+    /// is bound to no human, and on a registered human's own claim (bound to
+    /// itself, which is not an operator).
     pub human: Option<AuthorRefView>,
     /// The prompt snapshot the agent was running at the claim's `created_at`.
     /// Shown to the audience `epigraph_db::PROMPT_SNAPSHOT_AUDIENCE` names
@@ -1368,8 +1370,8 @@ pub async fn get_claim(
             message: format!("Failed to query claim encryption: {e}"),
         })?;
 
-    // Who filed it, on the same stamped connection: the human through a
-    // binding this caller can read, the prompt snapshot through the audience
+    // Who filed it, on the same stamped connection: the human from the
+    // agent's binding, the prompt snapshot through the audience
     // `PROMPT_SNAPSHOT_AUDIENCE` names (default: the prompt-history gate).
     // Only reached for a claim the caller has just read.
     let authored_by = epigraph_db::AuthoredByRepository::for_claim(

@@ -1400,7 +1400,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state, `source_urls`: the URLs of the evidence attached to it (empty when none), and `authored_by`: `agent` {id, display_name} that filed it; `human` {id, display_name} it acts for, shown only to that human and to a caller who can read the agent's OPERATED_BY edge to it; `prompt_snapshot` {snapshot_id, model, prompt_hash, started_at} it was running at the claim's created_at, shown to the audience the server is built for (either only the agent's linked human and admins, the prompt-history gate, or every reader of the claim; prompt text is never included). A part you may not see is null, exactly as a part that does not exist."
+        description = "Retrieve a single epistemic claim by its UUID, including full epistemic state, `source_urls`: the URLs of the evidence attached to it (empty when none), and `authored_by`: `agent` {id, display_name} that filed it; `human` {id, display_name}, the human operator the agent is bound to (null when it is bound to none, and on a human's own claim), shown to every reader and never inferred from an OPERATED_BY edge; `prompt_snapshot` {snapshot_id, model, prompt_hash, started_at} it was running at the claim's created_at, shown to the audience the server is built for (either only the agent's linked human and admins, the prompt-history gate, or every reader of the claim; prompt text is never included). A part you may not see is null, exactly as a part that does not exist."
     )]
     async fn get_claim(
         &self,

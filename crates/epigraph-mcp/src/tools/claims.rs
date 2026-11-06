@@ -1091,8 +1091,8 @@ pub async fn get_claim(
 
     // Who filed it: the same block, from the same repo call, as
     // `GET /api/v1/claims/:id`. It needs the caller's viewer-STAMPED
-    // connection (the human's edge is read under row security, and the
-    // prompt-snapshot gate reads the session principal), so a server built
+    // connection (the prompt-snapshot gate reads the session principal), so
+    // a server built
     // without a scoped pool omits the block rather than answer it unstamped.
     let authored_by = match server.scoped.as_ref() {
         Some(scoped) => {

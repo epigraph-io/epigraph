@@ -116,7 +116,7 @@ async fn get_claim_names_the_agent_the_human_and_the_snapshot_by_audience(pool: 
 
     let theirs = read(&server, &pool, stranger, claim).await;
     let theirs = &theirs["authored_by"];
-    assert_eq!(theirs["human"], block["human"], "the link edge is public");
+    assert_eq!(theirs["human"], block["human"], "every reader sees the human");
     match PROMPT_SNAPSHOT_AUDIENCE {
         PromptSnapshotAudience::OperatorAndAdmins => assert_eq!(
             theirs["prompt_snapshot"],

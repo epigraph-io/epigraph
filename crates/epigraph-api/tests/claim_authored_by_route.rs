@@ -144,8 +144,9 @@ async fn authored_by(state: &AppState, caller: Uuid, claim: Uuid) -> Value {
 }
 
 /// The agent's human sees the whole block; an admin sees the snapshot; a
-/// stranger sees the agent and (through the public link edge) the human, and
-/// the snapshot only when the audience setting is every claim reader.
+/// stranger sees the agent and its human (the binding is shown to every
+/// reader), and the snapshot only when the audience setting is every claim
+/// reader.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_claim_read_names_the_agent_the_human_and_the_snapshot_by_audience(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -186,7 +187,7 @@ async fn a_claim_read_names_the_agent_the_human_and_the_snapshot_by_audience(poo
 
     let theirs = authored_by(&state, stranger, claim).await;
     assert_eq!(theirs["agent"], mine["agent"]);
-    assert_eq!(theirs["human"], mine["human"], "the link edge is public");
+    assert_eq!(theirs["human"], mine["human"], "every reader sees the human");
     match PROMPT_SNAPSHOT_AUDIENCE {
         PromptSnapshotAudience::OperatorAndAdmins => assert_eq!(
             theirs["prompt_snapshot"],
@@ -204,43 +205,86 @@ async fn a_claim_read_names_the_agent_the_human_and_the_snapshot_by_audience(poo
     );
 }
 
-/// A link the caller cannot read (its edge private to a group the caller is
-/// not in) reads, on the wire, exactly like an agent bound to no human; a
-/// claim the caller cannot read is the 404 a missing id gets, with no block.
+/// `caller` writes an `OPERATED_BY` edge `agent -> target` through
+/// `POST /api/v1/edges`, as any edges:write caller may.
+async fn forge_over_http(state: &AppState, caller: Uuid, agent: Uuid, target: Uuid) {
+    let token = common::mint_token_with_agent(&["edges:write"], caller);
+    let body = json!({
+        "source_id": agent, "source_type": "agent",
+        "target_id": target, "target_type": "agent",
+        "relationship": "OPERATED_BY",
+    });
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/edges")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    assert!(
+        status.is_success(),
+        "CALIBRATION: the route writes the forged edge: {status} {}",
+        String::from_utf8_lossy(&bytes)
+    );
+}
+
+/// On the wire the human is the agent's binding, for every reader: a stranger
+/// sees the human of a link no edge records, and edges the stranger forges
+/// through `POST /api/v1/edges`, to a wrong guess and to the right human,
+/// leave the block byte for byte as it was. A claim the caller cannot read is
+/// the 404 a missing id gets, with no block.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_hidden_link_and_a_hidden_claim_leak_nothing_on_the_wire(pool: PgPool) {
+async fn a_forged_edge_changes_nothing_and_a_hidden_claim_leaks_nothing(pool: PgPool) {
     let state = app_role_state(&pool).await;
-    let operator = human(&pool, "Operator Fixture").await;
+    let (operator, operator_group) = viewer_fixture::seed_agent_with_group(&pool, "op").await;
+    viewer_fixture::make_human_operator(&pool, operator).await;
+    named(&pool, operator, "Operator Fixture").await;
+    let decoy = human(&pool, "Decoy Fixture").await;
     let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "stranger").await;
     let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "member").await;
     let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "agent").await;
-    link(&pool, agent, operator).await;
-    let (unbound, _) = viewer_fixture::seed_agent_with_group(&pool, "unbound").await;
-    let moved = sqlx::query(
-        "UPDATE edges SET visibility = 'group', owner_group_id = $3, co_owner_group_id = NULL \
-          WHERE source_id = $1 AND target_id = $2 AND relationship = 'OPERATED_BY'",
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
     )
     .bind(agent)
     .bind(operator)
-    .bind(group)
+    .bind(operator_group)
     .execute(&pool)
     .await
-    .expect("make the link edge group-private")
-    .rows_affected();
-    assert_eq!(moved, 1, "CALIBRATION: one OPERATED_BY edge");
-    let linked_claim = viewer_fixture::seed_public_claim(&pool, agent, "hidden link claim").await;
-    let unbound_claim = viewer_fixture::seed_public_claim(&pool, unbound, "unbound claim").await;
+    .expect("a link row with no edge");
+    let edges = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'OPERATED_BY'",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    assert_eq!(edges().await, 0, "CALIBRATION: no edge records the link");
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "edgeless link claim").await;
 
+    let before = authored_by(&state, stranger, claim).await;
     assert_eq!(
-        authored_by(&state, member, linked_claim).await["human"]["id"],
-        json!(operator),
-        "CONTROL: a member of the edge's group sees the human"
+        before["human"],
+        json!({"id": operator, "display_name": "Operator Fixture"}),
+        "a stranger sees the binding: {before}"
     );
-    let mut hidden = authored_by(&state, stranger, linked_claim).await;
-    let mut none = authored_by(&state, stranger, unbound_claim).await;
-    hidden["agent"] = Value::Null;
-    none["agent"] = Value::Null;
-    assert_eq!(hidden, none, "a hidden link reads as no human");
+    forge_over_http(&state, stranger, agent, decoy).await;
+    forge_over_http(&state, stranger, agent, operator).await;
+    assert_eq!(edges().await, 2, "CALIBRATION: both forged edges landed");
+    assert_eq!(
+        authored_by(&state, stranger, claim).await,
+        before,
+        "forged edges change nothing on the wire"
+    );
 
     let private = viewer_fixture::seed_group_claim(&pool, agent, group, "private claim").await;
     let (status, body) = get_claim(&state, member, private).await;

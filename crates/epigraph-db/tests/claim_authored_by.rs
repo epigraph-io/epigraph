@@ -1,11 +1,11 @@
 //! `AuthoredByRepository::for_claim`: a claim's `authored_by` block, decided
 //! under the caller's viewer on the caller's stamped connection.
 //!
-//! * `human` is shown only through a binding the caller can already read:
-//!   the caller is that human, or an `OPERATED_BY` edge from the agent to that
-//!   human is readable under the caller's viewer. A link whose edge is private
-//!   to a group, a link with no edge, and a human-operator self-binding are
-//!   hidden from everyone else, and hidden reads exactly as "no human".
+//! * `human` is the agent's binding (`epigraph_human_of(agent, false)`),
+//!   shown to every reader of the claim. No `OPERATED_BY` edge decides it:
+//!   anyone with edges:write can forge one, so a forged edge changes nothing.
+//!   A registered human's own claim names no human (it is bound to itself,
+//!   which is not an operator), exactly as an agent bound to no human.
 //! * `prompt_snapshot` follows the audience setting: under
 //!   `OperatorAndAdmins` only the agent's human and admins see it; under
 //!   `ClaimReaders` every caller does.
@@ -19,10 +19,10 @@ mod fixture;
 use chrono::{Duration, Utc};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{
-    AgentRepository, AuthorRef, AuthoredBy, AuthoredByRepository, PromptSnapshotAudience,
-    ScopedPool, SessionGucMode,
+    AgentRepository, AuthorRef, AuthoredBy, AuthoredByRepository, EdgeRepository,
+    PromptSnapshotAudience, ScopedPool, SessionGucMode,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -102,18 +102,88 @@ async fn human_seen(pool: &PgPool, scoped: &ScopedPool, caller: Uuid, agent: Uui
     .map(|h| h.id)
 }
 
-/// Public edge: every caller sees the human, with names on both parts.
-/// Group-private edge: a member of the group and the human see it, a
-/// stranger does not.
+/// `epigraph_human_of(agent, false)`, the binding itself (harness pool).
+async fn binding(pool: &PgPool, agent: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT public.epigraph_human_of($1, false)")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("human_of")
+}
+
+/// A link row and no `OPERATED_BY` edge: a binding no edge records.
+async fn edgeless_link(pool: &PgPool, agent: Uuid, operator: Uuid, operator_group: Uuid) {
+    sqlx::query(
+        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
+    )
+    .bind(agent)
+    .bind(operator)
+    .bind(operator_group)
+    .execute(pool)
+    .await
+    .expect("a link row with no edge");
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'OPERATED_BY'",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(edges, 0, "CALIBRATION: no edge records this link");
+    assert_eq!(
+        binding(pool, agent).await,
+        Some(operator),
+        "CALIBRATION: the link binds the agent"
+    );
+}
+
+/// `caller` writes an `OPERATED_BY` edge `agent -> target` through the
+/// application role, as REST `create_edge` would for any edges:write caller.
+async fn forge(pool: &PgPool, scoped: &ScopedPool, caller: Uuid, agent: Uuid, target: Uuid) {
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped write");
+    EdgeRepository::create(
+        &mut *tx,
+        agent,
+        "agent",
+        target,
+        "agent",
+        "OPERATED_BY",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("CALIBRATION: the application role writes the forged edge");
+    tx.commit().await.expect("commit the forged edge");
+}
+
+async fn block_json(pool: &PgPool, scoped: &ScopedPool, caller: Uuid, agent: Uuid) -> Value {
+    serde_json::to_value(
+        authored_by(
+            pool,
+            scoped,
+            caller,
+            agent,
+            PromptSnapshotAudience::OperatorAndAdmins,
+        )
+        .await,
+    )
+    .expect("serialize")
+}
+
+/// The human is the agent's binding, shown to every reader: through a link
+/// with its edge, and through a link no edge records, alike.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_human_is_shown_only_through_a_link_edge_the_caller_can_read(pool: PgPool) {
+async fn the_human_is_the_binding_for_every_reader(pool: PgPool) {
     let scoped = app_scoped(&pool).await;
-    let (operator, _) = human(&pool, "Operator Fixture").await;
+    let (operator, operator_group) = human(&pool, "Operator Fixture").await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
-    let (member, group) = fixture::seed_agent_with_group(&pool, "member").await;
     let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
     named(&pool, agent, "agent-fixture").await;
     link(&pool, agent, operator).await;
+    let (edgeless, _) = fixture::seed_agent_with_group(&pool, "edgeless").await;
+    edgeless_link(&pool, edgeless, operator, operator_group).await;
 
     let seen = authored_by(
         &pool,
@@ -136,122 +206,113 @@ async fn the_human_is_shown_only_through_a_link_edge_the_caller_can_read(pool: P
             id: operator,
             display_name: Some("Operator Fixture".into())
         }),
-        "CONTROL: a public link edge shows the human to a stranger"
+        "a stranger sees a linked agent's human"
     );
-
-    let moved = sqlx::query(
-        "UPDATE edges SET visibility = 'group', owner_group_id = $3, co_owner_group_id = NULL \
-          WHERE source_id = $1 AND target_id = $2 AND relationship = 'OPERATED_BY'",
-    )
-    .bind(agent)
-    .bind(operator)
-    .bind(group)
-    .execute(&pool)
-    .await
-    .expect("make the link edge group-private")
-    .rows_affected();
-    assert_eq!(moved, 1, "CALIBRATION: the link wrote one OPERATED_BY edge");
-
     assert_eq!(
-        human_seen(&pool, &scoped, member, agent).await,
+        human_seen(&pool, &scoped, stranger, edgeless).await,
         Some(operator),
-        "a member of the edge's group reads it"
+        "a link no edge records is the same binding, and is shown the same way"
     );
-    assert_eq!(
-        human_seen(&pool, &scoped, operator, agent).await,
-        Some(operator),
-        "the human sees itself"
-    );
-    assert_eq!(
-        human_seen(&pool, &scoped, stranger, agent).await,
-        None,
-        "a stranger who cannot read the edge does not learn the link"
-    );
-}
-
-/// A link with no edge, and a human operator filing its own claim, are
-/// bindings no edge records: only the human sees them, and a stranger's
-/// block is exactly the block of an agent bound to no human.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_binding_without_a_readable_edge_reads_as_no_human(pool: PgPool) {
-    let scoped = app_scoped(&pool).await;
-    let (operator, operator_group) = human(&pool, "Operator Fixture").await;
-    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
-    let (edgeless, _) = fixture::seed_agent_with_group(&pool, "edgeless").await;
-    let (unbound, _) = fixture::seed_agent_with_group(&pool, "unbound").await;
-    sqlx::query(
-        "INSERT INTO operator_links (agent_id, operator_id, operator_group_id) VALUES ($1, $2, $3)",
-    )
-    .bind(edgeless)
-    .bind(operator)
-    .bind(operator_group)
-    .execute(&pool)
-    .await
-    .expect("a link row with no edge");
-    let edges: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM edges WHERE source_id = $1 AND relationship = 'OPERATED_BY'",
-    )
-    .bind(edgeless)
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    assert_eq!(edges, 0, "CALIBRATION: no edge records this link");
-    let bound: Option<Uuid> = sqlx::query_scalar("SELECT public.epigraph_human_of($1, false)")
-        .bind(edgeless)
-        .fetch_one(&pool)
-        .await
-        .expect("human_of");
-    assert_eq!(
-        bound,
-        Some(operator),
-        "CALIBRATION: the link binds the agent"
-    );
-
     assert_eq!(
         human_seen(&pool, &scoped, operator, edgeless).await,
         Some(operator),
-        "CONTROL: the human sees its own binding"
+        "the human sees it too"
     );
-    assert_eq!(human_seen(&pool, &scoped, stranger, edgeless).await, None);
+}
 
-    // A human operator's own claim: the binding is the agent itself.
+/// An `OPERATED_BY` edge anyone can write decides nothing. A stranger who
+/// forges edges from a bound agent, to a wrong guess and then to the right
+/// human, leaves every reader's block byte for byte as it was; a forged edge
+/// from an unbound agent shows no human; a forged edge from a bound agent to a
+/// decoy never shows the decoy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_operated_by_edge_changes_nothing(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (operator, operator_group) = human(&pool, "Operator Fixture").await;
+    let (decoy, _) = human(&pool, "Decoy Fixture").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (bystander, _) = fixture::seed_agent_with_group(&pool, "bystander").await;
+    let (edgeless, _) = fixture::seed_agent_with_group(&pool, "edgeless").await;
+    edgeless_link(&pool, edgeless, operator, operator_group).await;
+    let (linked, _) = fixture::seed_agent_with_group(&pool, "linked").await;
+    link(&pool, linked, operator).await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    assert_eq!(binding(&pool, unbound).await, None, "CALIBRATION: unbound");
+
+    let before_stranger = block_json(&pool, &scoped, stranger, edgeless).await;
+    let before_bystander = block_json(&pool, &scoped, bystander, edgeless).await;
     assert_eq!(
-        human_seen(&pool, &scoped, operator, operator).await,
-        Some(operator),
-        "CONTROL: a human sees itself as the human behind its own claim"
+        before_stranger["human"]["id"],
+        json!(operator),
+        "CALIBRATION: the binding is shown before any forgery"
+    );
+
+    forge(&pool, &scoped, stranger, edgeless, decoy).await;
+    assert_eq!(
+        block_json(&pool, &scoped, stranger, edgeless).await,
+        before_stranger,
+        "a wrong guess changes nothing"
+    );
+    forge(&pool, &scoped, stranger, edgeless, operator).await;
+    assert_eq!(
+        block_json(&pool, &scoped, stranger, edgeless).await,
+        before_stranger,
+        "a right guess changes nothing"
     );
     assert_eq!(
-        human_seen(&pool, &scoped, stranger, operator).await,
+        block_json(&pool, &scoped, bystander, edgeless).await,
+        before_bystander,
+        "nor does it change a third reader's block"
+    );
+
+    let unbound_before = block_json(&pool, &scoped, bystander, unbound).await;
+    forge(&pool, &scoped, stranger, unbound, operator).await;
+    assert_eq!(
+        human_seen(&pool, &scoped, bystander, unbound).await,
         None,
-        "a stranger does not learn that an agent is a registered human operator"
+        "a forged edge from an unbound agent shows no human"
+    );
+    assert_eq!(
+        block_json(&pool, &scoped, bystander, unbound).await,
+        unbound_before
     );
 
-    let hidden = authored_by(
-        &pool,
-        &scoped,
-        stranger,
-        edgeless,
-        PromptSnapshotAudience::OperatorAndAdmins,
-    )
-    .await;
-    let none = authored_by(
-        &pool,
-        &scoped,
-        stranger,
-        unbound,
-        PromptSnapshotAudience::OperatorAndAdmins,
-    )
-    .await;
-    let strip = |b: &AuthoredBy| {
-        let mut v = serde_json::to_value(b).expect("serialize");
+    forge(&pool, &scoped, stranger, linked, decoy).await;
+    assert_eq!(
+        human_seen(&pool, &scoped, bystander, linked).await,
+        Some(operator),
+        "a bound agent shows its real human, never the forged decoy"
+    );
+}
+
+/// A registered human filing its own claim is bound to itself. That is not
+/// an operator: the block names no human, to the human and to a stranger
+/// alike, byte for byte the block of an agent bound to no human, so it never
+/// says who is a registered human operator.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_registered_humans_own_claim_names_no_human(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (operator, _) = human(&pool, "Operator Fixture").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (unbound, _) = fixture::seed_agent_with_group(&pool, "unbound").await;
+    assert_eq!(
+        binding(&pool, operator).await,
+        Some(operator),
+        "CALIBRATION: a registered human is its own binding"
+    );
+
+    let strip = |mut v: Value| {
         v["agent"] = json!(null);
         v
     };
-    assert_eq!(
-        strip(&hidden),
-        strip(&none),
-        "hidden reads byte for byte as no human"
-    );
+    let none = strip(block_json(&pool, &scoped, stranger, unbound).await);
+    for caller in [stranger, operator] {
+        assert_eq!(
+            strip(block_json(&pool, &scoped, caller, operator).await),
+            none,
+            "a human's own claim reads as no human"
+        );
+    }
 }
 
 /// A registered identity (no parent) through the attestor: its agent id.
