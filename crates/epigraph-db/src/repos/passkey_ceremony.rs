@@ -102,7 +102,9 @@ pub struct EnrollmentAnchor {
     pub anchor_revoked: bool,
     /// The passkeys that authorized it, nearest first, up to the person's
     /// maintenance-enrolled passkey: a JSON array of `{passkey_id, passkey,
-    /// aaguid, attestation_format, backup_eligible}`
+    /// aaguid, attestation_format, backup_eligible, confirmed_at_unix}`, the
+    /// last the `asserted_at` (whole Unix seconds) of the act the entry
+    /// confirmed for its successor
     /// (`epigraph_passkey::LineagePasskey::list_from_json`).
     pub anchor_lineage: serde_json::Value,
     /// Whether the lineage reaches a maintenance-enrolled passkey (the reader

@@ -52,12 +52,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use webauthn_rs::prelude::{
-    AttestationCaList, AttestationCaListBuilder, AttestationMetadata, AttestedPasskeyRegistration,
-    COSEKey, ParsedAttestation, ParsedAttestationData, Passkey, PasskeyAuthentication,
-    PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential, Webauthn,
-    WebauthnBuilder, WebauthnError,
+    AttestationCa, AttestationCaList, AttestationCaListBuilder, AttestationMetadata,
+    AttestedPasskeyRegistration, COSEKey, ParsedAttestation, ParsedAttestationData, Passkey,
+    PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential, RegisterPublicKeyCredential,
+    Webauthn, WebauthnBuilder, WebauthnError,
 };
 use webauthn_rs_core::attestation::verify_attestation_ca_chain;
 
@@ -733,11 +734,15 @@ impl Passkeys {
             return Err(AnchorRefusal::LineageNotAttested);
         }
         for ancestor in &anchor.anchor_lineage {
-            if let Err(why) = self.hardware_attested(
+            // An ancestor is held to today's roots, allowlist, hardware rules
+            // and status list, and to its certificates' validity WHEN IT
+            // CONFIRMED the act its successor was enrolled on (P779R-1).
+            if let Err(why) = self.hardware_attested_at(
                 &ancestor.passkey,
                 &ancestor.attestation_format,
                 ancestor.aaguid,
                 ancestor.backup_eligible,
+                CertificateTime::At(ancestor.confirmed_at),
             ) {
                 tracing::warn!(
                     target: "passkey.anchor",
@@ -815,8 +820,9 @@ impl Passkeys {
     ///
     /// The row's columns (`attestation_format`, `aaguid`, `backup_eligible`)
     /// must agree with the credential they were written from. Certificate
-    /// validity periods are checked, as at registration, so an anchor whose
-    /// chain has expired anchors nothing.
+    /// validity periods are checked NOW, as at registration, so an anchor
+    /// whose chain has expired anchors nothing ([`Self::hardware_attested_at`]
+    /// checks them at another time, for a lineage ancestor).
     ///
     /// For `android-key` the leaf certificate is issued FOR the credential's
     /// key, so the two must be the same key. For `packed` / `tpm` the
@@ -833,6 +839,41 @@ impl Passkeys {
         attestation_format: &str,
         aaguid: Uuid,
         backup_eligible: bool,
+    ) -> Result<(), String> {
+        self.hardware_attested_at(
+            passkey,
+            attestation_format,
+            aaguid,
+            backup_eligible,
+            CertificateTime::Now,
+        )
+    }
+
+    /// [`Self::hardware_attested`], with the certificates' validity periods
+    /// checked at `at` instead of now. Everything else is checked as of NOW
+    /// whatever `at` says: the chain must reach a root configured today (its
+    /// signatures verified with the library's own verifier), the AAGUID must
+    /// be allowlisted today, the Android hardware rules must hold, and no
+    /// certificate may be on today's status list (which must be fresh today).
+    ///
+    /// [`CertificateTime::At`] is what a LINEAGE ancestor is held to
+    /// ([`Passkeys::check_anchor`]): its certificates must have been valid
+    /// when it confirmed the act its successor was enrolled on
+    /// ([`LineagePasskey::confirmed_at`]). An ancestor whose chain expired
+    /// afterwards therefore still counts, and one whose chain had already
+    /// expired, or was not yet valid, when it confirmed does not (nor does
+    /// anything enrolled on that act). The anchor itself is checked
+    /// [`CertificateTime::Now`].
+    ///
+    /// # Errors
+    /// Why not, in words, for the log.
+    pub fn hardware_attested_at(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+        aaguid: Uuid,
+        backup_eligible: bool,
+        at: CertificateTime,
     ) -> Result<(), String> {
         let cred = passkey
             .get("cred")
@@ -871,15 +912,15 @@ impl Passkeys {
                     .allowlist_cas
                     .as_ref()
                     .ok_or_else(|| "no attestation allowlist is configured".to_string())?;
-                let ca = verify_attestation_ca_chain(&attestation.data, cas, false)
+                let ca = verify_attestation_ca_chain(&attestation.data, cas, at.is_past())
                     .map_err(|e| format!("its chain no longer verifies to an allowlist root: {e}"))?
                     .ok_or_else(|| "it carries no certificate chain".to_string())?;
                 if !ca.blanket_allow() && !ca.aaguids().contains_key(&aaguid) {
                     return Err(format!("its model {aaguid} is no longer on the allowlist"));
                 }
-                Ok(())
+                chain_valid_at(&attestation.data, ca, at)
             }
-            "android-key" => self.android_key_trusted(cred, &attestation),
+            "android-key" => self.android_key_trusted(cred, &attestation, at),
             other => Err(format!("a `{other}` attestation is not hardware-attested")),
         }
     }
@@ -888,12 +929,13 @@ impl Passkeys {
     /// (`cred`, the `{"cred": ...}` object's inside) and its stored
     /// attestation: the leaf certificate's key is the credential's, the chain
     /// reaches an Android key root, the KeyDescription's hardware rules
-    /// ([`android::hardware_rules`]) hold, and no certificate is on the status
-    /// list.
+    /// ([`android::hardware_rules`]) hold, no certificate is on the status
+    /// list, and every certificate was valid at `at`.
     fn android_key_trusted(
         &self,
         cred: &Value,
         attestation: &ParsedAttestation,
+        at: CertificateTime,
     ) -> Result<(), String> {
         let cas = self
             .android_cas
@@ -918,9 +960,10 @@ impl Passkeys {
         if certified != key {
             return Err("the leaf certificate does not attest this credential's key".into());
         }
-        let ca = verify_attestation_ca_chain(&attestation.data, cas, false)
+        let ca = verify_attestation_ca_chain(&attestation.data, cas, at.is_past())
             .map_err(|e| format!("its chain does not verify to an Android key root: {e}"))?
             .ok_or_else(|| "it carries no certificate chain".to_string())?;
+        chain_valid_at(&attestation.data, ca, at)?;
         let der = chain
             .iter()
             .map(|c| c.to_der())
@@ -982,7 +1025,7 @@ impl Passkeys {
             .cloned()
             .ok_or_else(|| malformed("credential", "no attestation"))
             .and_then(|a| serde_json::from_value(a).map_err(|e| malformed("attestation", e)))?;
-        self.android_key_trusted(cred, &attestation)
+        self.android_key_trusted(cred, &attestation, CertificateTime::Now)
             .map_err(PasskeyError::AttestationRefused)
     }
 
@@ -1248,9 +1291,17 @@ pub struct ActAnchor {
 }
 
 /// One passkey on an anchor's lineage ([`ActAnchor::anchor_lineage`]): its
-/// stored credential and the columns its registration wrote. Revoked or not:
-/// a lineage passkey authorized the anchor once, and is held to
-/// [`Passkeys::hardware_attested`] whatever became of it.
+/// stored credential, the columns its registration wrote, and when it
+/// confirmed the act its successor was enrolled on.
+///
+/// A REVOKED passkey stays on the lineage and does not break it by being
+/// revoked: it authorized its successor once, and is held to
+/// [`Passkeys::hardware_attested_at`] whatever became of it (so a backup key
+/// enrolled on an act a lost phone confirmed still anchors after the phone is
+/// revoked). What does break the lineage: a root, model or Android rule no
+/// longer trusted today, a certificate on today's status list (a REVOKED
+/// CERTIFICATE), or a certificate that was not valid at
+/// [`Self::confirmed_at`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LineagePasskey {
     /// Its id.
@@ -1263,13 +1314,18 @@ pub struct LineagePasskey {
     pub attestation_format: String,
     /// Its recorded backup-eligible flag.
     pub backup_eligible: bool,
+    /// When it confirmed the act its successor on the lineage (the anchor,
+    /// for the first entry) was enrolled on: that act's `asserted_at`, which
+    /// migration 130's guard sets to the database's `now()` at the assertion.
+    /// Its certificates must have been valid then.
+    pub confirmed_at: SystemTime,
 }
 
 impl LineagePasskey {
     /// The lineage as migration 200's reader returns it (a JSON array of
-    /// `{passkey_id, passkey, aaguid, attestation_format, backup_eligible}`).
-    /// `None` when it is not that shape (the caller then treats the lineage
-    /// as incomplete).
+    /// `{passkey_id, passkey, aaguid, attestation_format, backup_eligible,
+    /// confirmed_at_unix}`, the last in whole Unix seconds). `None` when it is
+    /// not that shape (the caller then treats the lineage as incomplete).
     #[must_use]
     pub fn list_from_json(v: &Value) -> Option<Vec<Self>> {
         v.as_array()?
@@ -1281,6 +1337,8 @@ impl LineagePasskey {
                     aaguid: e.get("aaguid")?.as_str()?.parse().ok()?,
                     attestation_format: e.get("attestation_format")?.as_str()?.to_string(),
                     backup_eligible: e.get("backup_eligible")?.as_bool()?,
+                    confirmed_at: UNIX_EPOCH
+                        + Duration::from_secs(e.get("confirmed_at_unix")?.as_u64()?),
                 })
             })
             .collect()
@@ -1360,6 +1418,87 @@ fn both_refused(allowlist: PasskeyError, android: PasskeyError) -> PasskeyError 
         )),
         (PasskeyError::Refused(_), other) | (other, _) => other,
     }
+}
+
+/// When a stored attestation's certificates must have been valid
+/// ([`Passkeys::hardware_attested_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CertificateTime {
+    /// Now: an anchor, and a registration.
+    Now,
+    /// At this time: a lineage ancestor, at the moment it confirmed the act
+    /// its successor was enrolled on ([`LineagePasskey::confirmed_at`]).
+    At(SystemTime),
+}
+
+impl CertificateTime {
+    /// Whether the time is not now, so the library's own time check (which
+    /// knows only now) is off and [`chain_valid_at`] is the window check.
+    fn is_past(self) -> bool {
+        matches!(self, Self::At(_))
+    }
+}
+
+/// Every certificate of a stored chain (`data`, leaf first) and the root it
+/// verified to (`root`) was valid at `at`: notBefore <= `at` <= notAfter, to
+/// the second. For [`CertificateTime::Now`] the library has checked this
+/// already, and it is checked again here.
+fn chain_valid_at(
+    data: &ParsedAttestationData,
+    root: &AttestationCa,
+    at: CertificateTime,
+) -> Result<(), String> {
+    let when = match at {
+        CertificateTime::Now => SystemTime::now(),
+        CertificateTime::At(t) => t,
+    };
+    let secs = when
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or_else(|| "the validity time is before 1970".to_string())?;
+    let chain = match data {
+        ParsedAttestationData::Basic(c)
+        | ParsedAttestationData::AttCa(c)
+        | ParsedAttestationData::AnonCa(c) => c,
+        _ => return Err("it carries no certificate chain".into()),
+    };
+    let mut der = chain
+        .iter()
+        .map(|c| c.to_der())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("a certificate does not encode: {e}"))?;
+    der.push(
+        root.ca()
+            .to_der()
+            .map_err(|e| format!("the root does not encode: {e}"))?,
+    );
+    let last = der.len() - 1;
+    for (index, cert) in der.iter().enumerate() {
+        let (_, cert) = x509_parser::parse_x509_certificate(cert)
+            .map_err(|e| format!("attestation certificate {index} does not parse: {e}"))?;
+        let validity = cert.validity();
+        let (from, to) = (
+            validity.not_before.timestamp(),
+            validity.not_after.timestamp(),
+        );
+        if secs < from || secs > to {
+            let which = if index == last {
+                "the root".to_string()
+            } else {
+                format!("attestation certificate {index}")
+            };
+            return Err(format!(
+                "{which} was not valid at {secs} (Unix seconds; valid {from}..={to}){}",
+                if at.is_past() {
+                    ", when this passkey confirmed its successor's act"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The length of the server nonce an admin act's confirmation challenge is

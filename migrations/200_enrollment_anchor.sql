@@ -53,7 +53,11 @@
 -- a maintenance-enrolled passkey. The API refuses an anchor whose lineage is
 -- incomplete or holds a passkey that is not hardware-attested: a synced
 -- passkey that confirmed the act a phone was enrolled on would otherwise
--- anchor further synced passkeys through that phone.
+-- anchor further synced passkeys through that phone. Each lineage entry
+-- carries `confirmed_at_unix`, the `asserted_at` (whole Unix seconds) of the
+-- act it confirmed for its successor: the API holds an ancestor's
+-- certificates to their validity at that moment, and to today's roots and
+-- status list. A revoked passkey stays on the lineage.
 --
 -- (b) `epigraph_person_authenticators_guard_act_confirmer()`, BEFORE INSERT
 -- (after 124's guard, which locks the enrollment: triggers fire in name
@@ -136,18 +140,22 @@ SET search_path = pg_catalog, pg_temp AS $$
            AND pg_catalog.now() < en.expires_at
     ),
     -- Step 0 is the anchor itself; each further step is the passkey that
-    -- confirmed the act the previous one was enrolled on.
-    up (depth, passkey_id, via, parent, passkey, aaguid, attestation_format,
-        backup_eligible) AS (
-        SELECT 0, k.id, en.created_via, pa.authenticator_id, k.passkey, k.aaguid,
-               k.attestation_format, k.backup_eligible
+    -- confirmed the act the previous one was enrolled on (`parent`), and
+    -- `confirmed_at` is WHEN it confirmed that act: the act's `asserted_at`,
+    -- which 130's guard sets to now() at the assertion (so the API can hold
+    -- the passkey's certificates to their validity at that moment).
+    up (depth, passkey_id, via, parent, parent_confirmed_at, confirmed_at, passkey, aaguid,
+        attestation_format, backup_eligible) AS (
+        SELECT 0, k.id, en.created_via, pa.authenticator_id, pa.asserted_at,
+               NULL::timestamptz, k.passkey, k.aaguid, k.attestation_format, k.backup_eligible
           FROM anchor
           JOIN public.person_authenticators k ON k.id = anchor.anchor_id
           JOIN public.passkey_enrollments en ON en.id = k.enrollment_id
           LEFT JOIN public.pending_admin_acts pa ON pa.id = en.act_id
         UNION ALL
-        SELECT up.depth + 1, k.id, en.created_via, pa.authenticator_id, k.passkey, k.aaguid,
-               k.attestation_format, k.backup_eligible
+        SELECT up.depth + 1, k.id, en.created_via, pa.authenticator_id, pa.asserted_at,
+               up.parent_confirmed_at, k.passkey, k.aaguid, k.attestation_format,
+               k.backup_eligible
           FROM up
           JOIN public.person_authenticators k ON k.id = up.parent
           JOIN public.passkey_enrollments en ON en.id = k.enrollment_id
@@ -162,7 +170,10 @@ SET search_path = pg_catalog, pg_temp AS $$
                                  'passkey_id', up.passkey_id, 'passkey', up.passkey,
                                  'aaguid', up.aaguid,
                                  'attestation_format', up.attestation_format,
-                                 'backup_eligible', up.backup_eligible) ORDER BY up.depth)
+                                 'backup_eligible', up.backup_eligible,
+                                 'confirmed_at_unix',
+                                 pg_catalog.floor(EXTRACT(EPOCH FROM up.confirmed_at))::bigint)
+                                 ORDER BY up.depth)
                        FROM up WHERE up.depth > 0), '[]'::jsonb),
            EXISTS (SELECT 1 FROM up WHERE up.via = 'maintenance')
       FROM anchor

@@ -2658,14 +2658,41 @@ manager's synced passkey. It is anchored by a passkey they already hold:
       status list above.
 
     The row's recorded format, AAGUID and backup-eligible flag must also
-    agree with that credential. Certificate validity periods are checked as
-    at registration, so an anchor whose chain has expired anchors nothing.
-  - every passkey on its LINEAGE passes the same check. The lineage is the
-    passkey that confirmed the act the anchor was itself enrolled on, then
-    that passkey's own confirmer, and so on, back to the person's first,
+    agree with that credential. The anchor's certificate validity periods are
+    checked NOW, as at registration, so an anchor whose chain has expired
+    anchors nothing.
+  - every passkey on its LINEAGE passes the same check, with one
+    difference: its certificates' VALIDITY PERIODS are checked at the moment
+    it confirmed the act its successor was enrolled on, not now. The lineage
+    is the passkey that confirmed the act the anchor was itself enrolled on,
+    then that passkey's own confirmer, and so on, back to the person's first,
     maintenance-enrolled passkey. A lineage that does not reach the first
-    passkey within 32 steps anchors nothing. A revoked passkey on the lineage
-    is still checked; being revoked does not disqualify it.
+    passkey within 32 steps anchors nothing.
+    - **As of now** for every ancestor: the roots and the allowlist
+      configured today, the Android hardware rules, and today's status list
+      (which must be fresh). A certificate revoked on the status list breaks
+      the lineage, whenever it was listed.
+    - **As of its confirmation** for every ancestor: each certificate of its
+      stored chain, and the root, must have been valid then. The time is the
+      act's `asserted_at`, which the database sets at the assertion. An
+      ancestor whose chain expired AFTER it confirmed still counts, so a
+      first passkey's expiry does not stop the person's later hardware keys
+      anchoring.
+    - **A revoked passkey** on the lineage is still checked, and being
+      revoked (`revoke-passkey`) does not disqualify it: it authorized its
+      successor while it was live. So a backup key enrolled on an act a lost
+      phone confirmed still anchors after the phone is revoked.
+    - **The consequence of expiry.** A passkey whose chain has expired can
+      still elevate and confirm acts. It no longer anchors. A passkey
+      enrolled on an act it confirmed after the expiry never anchors either:
+      its lineage holds a chain that was not valid at that confirmation. To
+      recover, confirm the next `passkey.register` act with a passkey whose
+      chain is still valid. If none is left, revoke every passkey of the
+      person and enroll a first passkey again (`passkey-enroll` without
+      `--act`, which 130 allows only once the person has no live passkey).
+      How long real Android chains stay valid was not measured. Remotely
+      provisioned intermediates may be short-lived; the API log names the
+      certificate and its window (`reason=... was not valid at ...`).
 - **The confirmation is re-verified.** The API re-verifies the act's
   recorded confirmation before taking the anchored path: the act's own
   challenge, the anchor's stored public key and the credential. The

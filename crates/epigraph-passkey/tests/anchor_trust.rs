@@ -17,7 +17,7 @@
 mod support;
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
@@ -145,13 +145,53 @@ async fn confirmed_anchor(
 }
 
 fn lineage_entry(reg: &RegisteredPasskey) -> LineagePasskey {
+    lineage_entry_at(reg, SystemTime::now())
+}
+
+/// [`lineage_entry`], having confirmed its successor's act at `confirmed_at`.
+fn lineage_entry_at(reg: &RegisteredPasskey, confirmed_at: SystemTime) -> LineagePasskey {
     LineagePasskey {
         passkey_id: Uuid::new_v4(),
         passkey: reg.passkey.clone(),
         aaguid: reg.aaguid,
         attestation_format: reg.attestation_format.clone(),
         backup_eligible: reg.backup_eligible,
+        confirmed_at,
     }
+}
+
+/// `reg` with its STORED attestation chain replaced by `chain` (DER, leaf
+/// first), as the library serializes one (`/cred/attestation/data/Basic`,
+/// base64url). Its key and every column are unchanged.
+fn with_stored_chain(reg: &RegisteredPasskey, chain: &[Vec<u8>]) -> RegisteredPasskey {
+    let mut passkey = reg.passkey.clone();
+    passkey["cred"]["attestation"]["data"]["Basic"] = chain
+        .iter()
+        .map(|der| {
+            serde_json::Value::from(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                der,
+            ))
+        })
+        .collect();
+    RegisteredPasskey {
+        passkey,
+        ..reg.clone()
+    }
+}
+
+fn now_unix() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+fn unix(secs: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap())
 }
 
 // =====================================================================
@@ -718,14 +758,16 @@ async fn a_synced_passkey_on_the_lineage_anchors_nothing() {
 }
 
 /// The lineage JSON migration 200's reader returns parses, and anything else
-/// is `None` (the API then reports the lineage incomplete). Mutation:
-/// `list_from_json` skipping malformed entries -> the second case parses.
+/// is `None` (the API then reports the lineage incomplete), including an entry
+/// without `confirmed_at_unix`. Mutation: `list_from_json` skipping malformed
+/// entries -> the second case parses.
 #[test]
 fn the_lineage_reads_from_the_readers_json() {
     let id = Uuid::new_v4();
     let v = serde_json::json!([{
         "passkey_id": id.to_string(), "passkey": {"cred": {}},
         "aaguid": MODEL.to_string(), "attestation_format": "packed", "backup_eligible": false,
+        "confirmed_at_unix": 1_762_400_000_u64,
     }]);
     let list = LineagePasskey::list_from_json(&v).expect("parses");
     assert_eq!(list.len(), 1);
@@ -733,14 +775,172 @@ fn the_lineage_reads_from_the_readers_json() {
         (
             list[0].passkey_id,
             list[0].aaguid,
-            list[0].attestation_format.as_str()
+            list[0].attestation_format.as_str(),
+            list[0].confirmed_at
         ),
-        (id, MODEL, "packed")
+        (id, MODEL, "packed", unix(1_762_400_000))
     );
     let bad = serde_json::json!([{"passkey_id": "x"}]);
     assert!(LineagePasskey::list_from_json(&bad).is_none());
+    // An entry without its confirmation time does not read: the lineage is
+    // then incomplete, and anchors nothing.
+    let mut untimed = v.clone();
+    untimed[0]
+        .as_object_mut()
+        .unwrap()
+        .remove("confirmed_at_unix");
+    assert!(LineagePasskey::list_from_json(&untimed).is_none());
     assert_eq!(
         LineagePasskey::list_from_json(&serde_json::json!([])),
         Some(vec![])
     );
+}
+
+// =====================================================================
+// P779R-1: a lineage ancestor's certificates, at the time it confirmed
+// =====================================================================
+
+/// A passkey on the LINEAGE is held to its certificates' validity WHEN IT
+/// CONFIRMED the act its successor was enrolled on, and to today's roots,
+/// rules and status list; the ANCHOR is held to its validity now.
+///
+/// The person's first passkey (a phone, and in the second half a packed
+/// security key) has a stored chain that was valid from 30 days ago until
+/// yesterday (expired now). As an ancestor that confirmed 2 days ago it still
+/// counts; confirming after its chain expired (now) or before it was valid
+/// (40 days ago) it does not. As THE anchor it anchors nothing. A
+/// certificate of an ancestor listed on today's status list refuses even
+/// though the window covers the confirmation (a revoked CERTIFICATE breaks
+/// the lineage; a revoked passkey is not seen here and does not).
+/// CALIBRATION: the phone with its genuine chain anchors, and every ancestor
+/// case uses a hardware-attested packed anchor that admits on its own.
+///
+/// Red line (df4c5cdf, time checks at now for every ancestor): the 2-days-ago
+/// cases are `Err(LineageNotAttested)`. Mutation: `chain_valid_at` accepting
+/// any time -> the after-expiry and before-validity cases admit.
+#[tokio::test]
+async fn an_ancestor_is_held_to_its_certificates_validity_when_it_confirmed() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let google = TestAttestation::new("Android");
+    let rp = attested(Some((&vendor, &[MODEL])), Some(&google), true);
+    let person = Uuid::new_v4();
+    let (now, day) = (now_unix(), 86_400);
+    let lapsed_window = (now - 30 * day, now - day);
+
+    // The first passkey: a phone. Its stored chain is then replaced by one
+    // with the same key, root and KeyDescription that lapsed yesterday.
+    let (options, state) = rp.start_registration(person, "op", "Op").unwrap();
+    let mut phone_key = SoftAuthenticator::new(MODEL).hardware();
+    let created = phone_key
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let listed_leaf = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let phone = rp
+        .finish_registration(
+            &google.android_key_with(&phone_key, &created, true, &listed_leaf),
+            &state,
+        )
+        .expect("a genuine phone registers (its serial is not listed yet)");
+    let lapsed = with_stored_chain(
+        &phone,
+        &google.android_chain_der(
+            &phone_key,
+            &created,
+            &AndroidKeyOpts {
+                leaf_validity: Some(lapsed_window),
+                ..listed_leaf.clone()
+            },
+        ),
+    );
+
+    // The anchor: a packed security key, enrolled on an act the phone
+    // confirmed.
+    let (options, state) = rp.start_registration(person, "op", "Op").unwrap();
+    let mut key = SoftAuthenticator::new(MODEL).hardware();
+    let created_key = key.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let packed = rp
+        .finish_registration(&vendor.rewrap(&created_key), &state)
+        .unwrap();
+    let mut anchor = confirmed_anchor(&rp, &mut key, &packed, person).await;
+
+    // CALIBRATION: the phone with its genuine chain anchors.
+    let as_anchor = confirmed_anchor(&rp, &mut phone_key, &phone, person).await;
+    assert_eq!(rp.check_anchor(&as_anchor), Ok(()), "CALIBRATION");
+    // THE anchor is held to now: the lapsed chain anchors nothing.
+    let mut lapsed_anchor = as_anchor.clone();
+    lapsed_anchor.anchor_passkey = lapsed.passkey.clone();
+    assert_eq!(
+        rp.check_anchor(&lapsed_anchor),
+        Err(AnchorRefusal::AnchorNotAttested),
+        "an anchor whose chain has expired"
+    );
+
+    for (when, expected, label) in [
+        (now - 2 * day, Ok(()), "confirmed while the chain was valid"),
+        (
+            now,
+            Err(AnchorRefusal::LineageNotAttested),
+            "confirmed after it expired",
+        ),
+        (
+            now - 40 * day,
+            Err(AnchorRefusal::LineageNotAttested),
+            "confirmed before it was valid",
+        ),
+    ] {
+        anchor.anchor_lineage = vec![lineage_entry_at(&lapsed, unix(when))];
+        assert_eq!(rp.check_anchor(&anchor), expected, "android: {label}");
+    }
+
+    // A certificate on TODAY's status list refuses, whatever the window says.
+    let listing = attested_with(
+        Some((&vendor, &[MODEL])),
+        Some(&google),
+        Some(android_status::file(
+            android_status::GOOGLE_EXAMPLE,
+            Duration::ZERO,
+        )),
+        true,
+    );
+    anchor.anchor_lineage = vec![lineage_entry_at(&lapsed, unix(now - 2 * day))];
+    assert_eq!(
+        listing.check_anchor(&anchor),
+        Err(AnchorRefusal::LineageNotAttested),
+        "a listed certificate on the lineage"
+    );
+    anchor.anchor_lineage = vec![];
+    assert_eq!(
+        listing.check_anchor(&anchor),
+        Ok(()),
+        "CALIBRATION: the packed anchor itself admits under that list"
+    );
+
+    // The same for a packed ancestor (the allowlist branch).
+    let packed_lapsed = with_stored_chain(
+        &packed,
+        &[vendor.leaf_der_valid(lapsed_window.0, lapsed_window.1)],
+    );
+    let (options, state) = rp.start_registration(person, "op", "Op").unwrap();
+    let mut second = SoftAuthenticator::new(MODEL).hardware();
+    let created_second = second
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let second_reg = rp
+        .finish_registration(&vendor.rewrap(&created_second), &state)
+        .unwrap();
+    let mut by_packed = confirmed_anchor(&rp, &mut second, &second_reg, person).await;
+    for (when, expected, label) in [
+        (now - 2 * day, Ok(()), "confirmed while the chain was valid"),
+        (
+            now,
+            Err(AnchorRefusal::LineageNotAttested),
+            "confirmed after it expired",
+        ),
+    ] {
+        by_packed.anchor_lineage = vec![lineage_entry_at(&packed_lapsed, unix(when))];
+        assert_eq!(rp.check_anchor(&by_packed), expected, "packed: {label}");
+    }
 }

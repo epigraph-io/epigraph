@@ -2278,6 +2278,94 @@ async fn the_anchor_reports_its_lineage_up_to_the_first_passkey(pool: PgPool) {
     );
 }
 
+/// Each lineage entry carries `confirmed_at_unix`: the `asserted_at` (whole
+/// Unix seconds) of the act ITS SUCCESSOR was enrolled on, the moment it
+/// confirmed that act (the API holds its certificates to their validity
+/// then). For the third passkey's enrollment the lineage is [second, first]:
+/// second's time is the act third was enrolled on (confirmed by second),
+/// first's the act second was enrolled on (confirmed by first). The two acts
+/// are backdated a day apart (triggers off: an asserted act never changes) so
+/// a shifted pairing cannot pass. Red line (df4c5cdf's reader): no
+/// `confirmed_at_unix` key. Mutation: the recursive step taking the entry's
+/// OWN enrollment act's `asserted_at` (`pa.asserted_at` for `confirmed_at`)
+/// -> second carries first's act time, and first none.
+#[sqlx::test(migrations = "../../migrations")]
+async fn each_lineage_entry_carries_when_it_confirmed_its_successors_act(pool: PgPool) {
+    let p = elevated_custodian(&pool, "custodian", 1).await;
+    let (a1, e1) = anchored_enrollment(&pool, &p).await;
+    let second = complete_enrollment(&pool, e1, 2).await;
+    let p2 = Elevated {
+        passkey: second,
+        cred: credential(2),
+        ..p.clone()
+    };
+    let (a2, e2) = anchored_enrollment(&pool, &p2).await;
+    let third = complete_enrollment(&pool, e2, 3).await;
+    let p3 = Elevated {
+        passkey: third,
+        cred: credential(3),
+        ..p.clone()
+    };
+    let (_, e3) = anchored_enrollment(&pool, &p3).await;
+
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    for (act, days) in [(a1, 2), (a2, 1)] {
+        sqlx::query(
+            "UPDATE public.pending_admin_acts \
+                SET asserted_at = now() - make_interval(days => $2) WHERE id = $1",
+        )
+        .bind(act)
+        .bind(days)
+        .execute(&mut *tx)
+        .await
+        .expect("backdate the act's assertion");
+    }
+    tx.commit().await.expect("commit");
+    let epoch = |act: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT floor(extract(epoch FROM asserted_at))::bigint \
+                   FROM public.pending_admin_acts WHERE id = $1",
+            )
+            .bind(act)
+            .fetch_one(&pool)
+            .await
+            .expect("asserted_at")
+        }
+    };
+    let (t1, t2) = (epoch(a1).await, epoch(a2).await);
+    assert!(t2 - t1 >= 86_000, "CALIBRATION: the acts are a day apart");
+
+    let lineage: serde_json::Value = as_app(&pool, None, "", "", |mut conn| async move {
+        let l =
+            sqlx::query_scalar("SELECT anchor_lineage FROM public.epigraph_enrollment_anchor($1)")
+                .bind(e3)
+                .fetch_one(&mut *conn)
+                .await
+                .expect("the anchor reader");
+        (conn, l)
+    })
+    .await;
+    let entries: Vec<(Uuid, Option<i64>)> = lineage
+        .as_array()
+        .expect("a JSON array")
+        .iter()
+        .map(|e| {
+            (
+                e["passkey_id"].as_str().unwrap().parse().unwrap(),
+                e.get("confirmed_at_unix")
+                    .and_then(serde_json::Value::as_i64),
+            )
+        })
+        .collect();
+    assert_eq!(entries, vec![(second, Some(t2)), (p.passkey, Some(t1))]);
+}
+
 /// `complete_enrollment` with the attestation format `format`, returning the
 /// refusal instead of panicking.
 async fn try_complete(

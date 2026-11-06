@@ -537,6 +537,9 @@ pub struct AndroidKeyOpts {
     pub leaf_serial: Option<Vec<u8>>,
     /// The intermediate's serial number; random when `None`.
     pub intermediate_serial: Option<Vec<u8>>,
+    /// The leaf's validity, (notBefore, notAfter) in Unix seconds; from
+    /// yesterday for a year when `None`.
+    pub leaf_validity: Option<(i64, i64)>,
 }
 
 impl Default for AndroidKeyOpts {
@@ -549,6 +552,7 @@ impl Default for AndroidKeyOpts {
             key_description_on_intermediate: false,
             leaf_serial: None,
             intermediate_serial: None,
+            leaf_validity: None,
         }
     }
 }
@@ -624,7 +628,9 @@ impl TestAttestation {
         b.set_subject_name(&root_name).expect("subject");
         b.set_issuer_name(&root_name).expect("issuer");
         b.set_pubkey(&root_key).expect("pubkey");
-        b.set_not_before(&Asn1Time::from_unix(now_unix() - 86_400).expect("t"))
+        // Valid from a year ago: a test may hold a lineage passkey's chain to
+        // its validity at a past confirmation time, which the root must cover.
+        b.set_not_before(&Asn1Time::from_unix(now_unix() - ROOT_AGE).expect("t"))
             .expect("nb");
         b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
             .expect("na");
@@ -713,7 +719,31 @@ impl TestAttestation {
             "clientDataJSON",
         );
         let client_data_hash = sha256(&cdj);
-        let key_description = android_key_description(&client_data_hash, opts);
+        let x5c = self
+            .android_chain(cred_key, &client_data_hash, opts)
+            .iter()
+            .map(|c| Cbor::Bytes(c.to_der().expect("der")))
+            .collect();
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&client_data_hash);
+        let stmt = Cbor::Map(vec![
+            (text("alg"), Cbor::Integer((-7).into())),
+            (text("sig"), Cbor::Bytes(sign(cred_key, &signed))),
+            (text("x5c"), Cbor::Array(x5c)),
+        ]);
+        with_attestation(registration, "android-key", stmt, auth_data)
+    }
+
+    /// The `x5c` chain [`Self::android_key_with`] builds (leaf first, then
+    /// the intermediate when `opts` asks for one) for the credential key
+    /// `cred_key`, its KeyDescription's challenge `client_data_hash`.
+    fn android_chain(
+        &self,
+        cred_key: &PKey<Private>,
+        client_data_hash: &[u8],
+        opts: &AndroidKeyOpts,
+    ) -> Vec<X509> {
+        let key_description = android_key_description(client_data_hash, opts);
         let oid = Asn1Object::from_str("1.3.6.1.4.1.11129.2.1.17").expect("oid");
 
         // The issuer of the leaf: the root, or an intermediate the root
@@ -769,9 +799,12 @@ impl TestAttestation {
             None => b.set_issuer_name(self.root.subject_name()).expect("issuer"),
         }
         b.set_pubkey(cred_key).expect("pubkey");
-        b.set_not_before(&Asn1Time::from_unix(now_unix() - 86_400).expect("t"))
+        let (not_before, not_after) = opts
+            .leaf_validity
+            .unwrap_or((now_unix() - 86_400, now_unix() + 365 * 86_400));
+        b.set_not_before(&Asn1Time::from_unix(not_before).expect("t"))
             .expect("nb");
-        b.set_not_after(&Asn1Time::days_from_now(365).expect("t"))
+        b.set_not_after(&Asn1Time::from_unix(not_after).expect("t"))
             .expect("na");
         let value = Asn1OctetString::new_from_bytes(&key_description).expect("octets");
         b.append_extension(X509Extension::new_from_der(&oid, false, &value).expect("ext"))
@@ -783,18 +816,56 @@ impl TestAttestation {
         .expect("sign android leaf");
         let leaf = b.build();
 
-        let mut x5c = vec![Cbor::Bytes(leaf.to_der().expect("der"))];
-        if let Some((cert, _)) = &intermediate {
-            x5c.push(Cbor::Bytes(cert.to_der().expect("der")));
+        let mut chain = vec![leaf];
+        if let Some((cert, _)) = intermediate {
+            chain.push(cert);
         }
-        let mut signed = auth_data.clone();
-        signed.extend_from_slice(&client_data_hash);
-        let stmt = Cbor::Map(vec![
-            (text("alg"), Cbor::Integer((-7).into())),
-            (text("sig"), Cbor::Bytes(sign(cred_key, &signed))),
-            (text("x5c"), Cbor::Array(x5c)),
-        ]);
-        with_attestation(registration, "android-key", stmt, auth_data)
+        chain
+    }
+
+    /// The DER chain [`Self::android_key_with`] would put in `x5c` for
+    /// `registration` (made by `auth`) under `opts`, on its own: a test splices
+    /// it into a STORED credential to give that credential a chain it could
+    /// not register with (an expired one, say).
+    #[must_use]
+    pub fn android_chain_der(
+        &self,
+        auth: &SoftAuthenticator,
+        registration: &Value,
+        opts: &AndroidKeyOpts,
+    ) -> Vec<Vec<u8>> {
+        let cdj = unb64(
+            &registration["response"]["clientDataJSON"],
+            "clientDataJSON",
+        );
+        self.android_chain(auth.key_of(registration), &sha256(&cdj), opts)
+            .iter()
+            .map(|c| c.to_der().expect("der"))
+            .collect()
+    }
+
+    /// This attestation's `packed` leaf certificate re-issued by its root with
+    /// the validity `not_before..=not_after` (Unix seconds), same key and
+    /// subject, as DER: spliced into a stored credential like
+    /// [`Self::android_chain_der`].
+    #[must_use]
+    pub fn leaf_der_valid(&self, not_before: i64, not_after: i64) -> Vec<u8> {
+        let mut b = X509Builder::new().expect("builder");
+        b.set_version(2).expect("v3");
+        b.set_serial_number(&serial()).expect("serial");
+        b.set_subject_name(self.leaf.subject_name())
+            .expect("subject");
+        b.set_issuer_name(self.root.subject_name()).expect("issuer");
+        b.set_pubkey(&self.leaf_key).expect("pubkey");
+        b.set_not_before(&Asn1Time::from_unix(not_before).expect("t"))
+            .expect("nb");
+        b.set_not_after(&Asn1Time::from_unix(not_after).expect("t"))
+            .expect("na");
+        b.append_extension(BasicConstraints::new().critical().build().expect("bc"))
+            .expect("bc");
+        b.sign(&self.root_key, MessageDigest::sha256())
+            .expect("sign leaf");
+        b.build().to_der().expect("der")
     }
 
     /// The root's serial number, as lowercase hex without leading zeros (the
@@ -849,6 +920,9 @@ impl TestAttestation {
         with_attestation(registration, "packed", stmt, auth_data)
     }
 }
+
+/// How long before now a test root's validity starts.
+const ROOT_AGE: i64 = 365 * 86_400;
 
 fn now_unix() -> i64 {
     i64::try_from(
