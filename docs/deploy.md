@@ -2586,6 +2586,11 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   `none`. Its passkey is recorded as `none` (usually backup-eligible), so it
   never anchors a further one. Otherwise the act's enrollment is attested,
   exactly as with the setting off.
+- **Every later passkey takes it.** With the setting on and a valid anchor,
+  a later passkey is registered on the anchored path even when it is a
+  hardware key, and is then recorded as `none`: it can never anchor. To add
+  a backup hardware key that can anchor (for a lost phone), enroll it with
+  the setting OFF.
 - **The response says which act anchored it.** The enrollment finish
   answers `anchored_by` with that act's id; it is `null` on the attested
   path.
@@ -2607,11 +2612,13 @@ ends that, and ends any elevation it confirmed.
    certificates to a PEM file the API unit can read (one or more
    `-----BEGIN CERTIFICATE-----` blocks). Google publishes them in the
    Android key attestation documentation. Set
-   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` to it. Take them OUT of
-   `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` if an earlier configuration put
-   them there; a root in both files stops the server. Leave
-   `EPIGRAPH_WEBAUTHN_AAGUIDS` and `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` as
-   they are for security keys, or unset BOTH to accept Android keys only.
+   `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` to it. If an earlier
+   configuration allowlisted Android (a Google root in
+   `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` with an Android AAGUID in
+   `EPIGRAPH_WEBAUTHN_AAGUIDS`), remove that root and that AAGUID IN THE SAME
+   CHANGE: a root in both files stops the server at boot (exit 1). Keep the
+   allowlist for security keys, or unset BOTH of its variables when no
+   security-key model remains, to accept Android keys only.
 3. **The anchored setting** (only if a synced second passkey is wanted): set
    `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY=1`.
 4. **Restart the API.** The boot line `passkey relying party configured`
@@ -2620,7 +2627,13 @@ ends that, and ends any elevation it confirmed.
 5. **First passkey**, on the phone: `epigraph-operator passkey-enroll
    --person <agent> --reason <text> [--label <device>] --apply`, then open
    the printed `/elevate/enroll/<id>` path on the phone. `list-passkeys`
-   shows it as `android-key`.
+   shows it as `android-key`. A first passkey must be device-bound: a synced
+   passkey offered by the phone (its password manager's) is refused with
+   "not truly bound to hardware" or "this one is backup-eligible", whatever
+   either setting says; choose the device's own key. About one Android key
+   in 64 is refused by the WebAuthn library with "The COSEKey contains
+   invalid ECDSA X/Y coordinate data" (a coordinate with a leading zero
+   byte); a retry creates a new key and passes.
 6. **Second (synced) passkey.**
    1. Elevate with the phone.
    2. Propose `passkey.register` with
