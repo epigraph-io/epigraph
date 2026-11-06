@@ -32,6 +32,10 @@ regexes = [
   # alphanumerics), the comparison key of the label-dedup engine's id tests
   # (crates/epigraph-engine/tests/label_dedup/ids.rs). Not a credential.
   '''^ACSDFACLCPFY29317$''',
+  # A themes-overview keyset cursor (`t1.<member count>.<theme id, 32 hex>`)
+  # in claim_theme.rs's round-trip unit test: a count and a fixture UUID, an
+  # opaque page position, not a credential.
+  '''^t1\.41\.6f1c0b2e9d3a4c55a1b2c3d4e5f60718$''',
 ]
 
 [[allowlists]]

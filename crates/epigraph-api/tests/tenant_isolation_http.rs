@@ -1020,13 +1020,15 @@ async fn semantic_search_flat_does_not_rank_a_group_private_claim_for_a_stranger
     let owner_hits = ClaimRepository::semantic_search_flat(
         &pool,
         &owner,
-        &vec_literal,
+        epigraph_db::FlatRanking::Query(&vec_literal),
         -1.0,
         None,
         None,
         None,
         None,
         100,
+        None,
+        0,
     )
     .await
     .expect("owner semantic_search_flat");
@@ -1039,13 +1041,15 @@ async fn semantic_search_flat_does_not_rank_a_group_private_claim_for_a_stranger
     let stranger_hits = ClaimRepository::semantic_search_flat(
         &pool,
         &stranger,
-        &vec_literal,
+        epigraph_db::FlatRanking::Query(&vec_literal),
         -1.0,
         None,
         None,
         None,
         None,
         100,
+        None,
+        0,
     )
     .await
     .expect("stranger semantic_search_flat");
@@ -2007,6 +2011,116 @@ async fn cross_source_matches_http_answers_404_identically_for_invisible_and_abs
         !invisible_body.contains("xsm-http private content"),
         "the refusal body leaked the private claim's content: {invisible_body}"
     );
+
+    let _ = shutdown.send(());
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/v1/search/semantic with theme_id / rank_by=theme_core, through
+// the router: viewer-scoped and uncacheable.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The theme pin through `create_router`: the bearer middleware, the
+/// `ViewerExtractor`, the handler and the response-header layer are all in
+/// the path. A stranger pinning a theme whose most relevant member is private
+/// to another group gets 200 with the public member only, and the response
+/// says `Cache-Control: private, no-store` and `Vary: Authorization`, for
+/// both rankings. Without a bearer the route is 401.
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_search_theme_filter_through_the_router_is_viewer_scoped_and_uncacheable(
+    pool: PgPool,
+) {
+    let (owner_agent, group) = fixture::seed_agent_with_group(&pool, "search-theme-http").await;
+    let (stranger_agent, _g) =
+        fixture::seed_agent_with_group(&pool, "search-theme-http-stranger").await;
+    let theme: Uuid = sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, description) \
+         VALUES ('search-theme-http theme', 'router test') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert theme");
+    let public =
+        fixture::seed_public_claim(&pool, owner_agent, "search-theme-http public content").await;
+    let private = fixture::seed_group_claim(
+        &pool,
+        owner_agent,
+        group,
+        "search-theme-http private content",
+    )
+    .await;
+    // No embedding service on the router fixture: the handler embeds with its
+    // non-negative mock, so a uniform positive vector is a positive match.
+    let vec_literal = pgvector_literal(1.0);
+    for id in [public, private] {
+        sqlx::query("UPDATE claims SET embedding = $1::vector, theme_id = $2 WHERE id = $3")
+            .bind(&vec_literal)
+            .bind(theme)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("embed and attach");
+    }
+
+    let url = fixture::database_url_for(&pool).await;
+    let stranger_token =
+        common::mint_token_with_agent(&["claims:read", "graph:read"], stranger_agent);
+    let (addr, shutdown) = common::spawn_app(&url).await;
+    let post = |body: serde_json::Value, token: Option<String>| async move {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/search/semantic"))
+            .header("content-type", "application/json")
+            .body(body.to_string());
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().await.expect("POST /api/v1/search/semantic");
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().await.expect("body");
+        (status, headers, text)
+    };
+
+    for body in [
+        serde_json::json!({ "query": "router probe", "theme_id": theme, "limit": 20 }),
+        serde_json::json!({ "theme_id": theme, "rank_by": "theme_core", "limit": 20 }),
+    ] {
+        let (status, headers, text) = post(body.clone(), Some(stranger_token.clone())).await;
+        assert!(status.is_success(), "{body}: got {status}: {text}");
+        assert!(
+            text.contains(&public.to_string()),
+            "{body}: the stranger must still get the public member; got {text}"
+        );
+        assert!(
+            !text.contains(&private.to_string()),
+            "{body}: another group's claim id leaked: {text}"
+        );
+        assert!(
+            !text.contains("search-theme-http private content"),
+            "{body}: another group's content leaked: {text}"
+        );
+        assert!(
+            !text.contains("search-theme-http theme"),
+            "{body}: the theme label must never be returned: {text}"
+        );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "{body}: a viewer-scoped response must not be stored by a shared cache"
+        );
+        assert_eq!(
+            headers.get("vary").and_then(|v| v.to_str().ok()),
+            Some("Authorization"),
+            "{body}: a private cache must key on the credential"
+        );
+    }
+
+    let (status, _, text) = post(
+        serde_json::json!({ "query": "router probe", "theme_id": theme }),
+        None,
+    )
+    .await;
+    assert_eq!(status.as_u16(), 401, "no bearer, no search; got {text}");
 
     let _ = shutdown.send(());
 }

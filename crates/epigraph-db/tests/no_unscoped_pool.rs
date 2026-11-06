@@ -739,7 +739,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 223 -> 222 (staging integration of both entries above): the two moves touch
 /// disjoint files (`routes/submit.rs` + `routes/claims.rs` vs `routes/workflows.rs`),
 /// so the merged count is 226 - 3 - 1.
-const HIGH_WATER: usize = 222;
+///
+/// 222 -> 221 (backlog 57917c13, 2026-11-04): `themes_overview` holds a
+/// `Viewer` and runs its one read, `ClaimThemeRepository::overview_page`, on
+/// the caller's stamped read (`routes/graph.rs` 3 -> 2), confirmed by
+/// `the_scanner_is_not_vacuous` passing on the converted tree. No file reached
+/// zero.
+const HIGH_WATER: usize = 221;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -958,10 +964,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `fetch_subgraph_edges`, whose signature changed to `&mut PgConnection` in
     // place — it has exactly one caller workspace-wide, so no pool-shaped
     // wrapper was created and this file leaves the `&PgPool`-PARAMETER blind
-    // spot enumerated in the Known limits above. The three that remain
-    // (`overview`, `themes_overview`, `themes_expand`) are routed GETs that hold
-    // NO `Viewer`; their owner is `D-PR16-theme-cluster-viewer-scope`.
-    ("routes/graph.rs", 3),
+    // spot enumerated in the Known limits above. 3 -> 2 (backlog 57917c13):
+    // `themes_overview` now holds a `Viewer` and reads through
+    // `AppState::read_as` and the viewer-spliced
+    // `ClaimThemeRepository::overview_page`. The two that remain (`overview`,
+    // `themes_expand`) are routed GETs that hold NO `Viewer`; their owner is
+    // `D-PR16-theme-cluster-viewer-scope`.
+    ("routes/graph.rs", 2),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see

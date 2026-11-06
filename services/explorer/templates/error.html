@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} · {{ ctx.product_name() }}{% endblock %}
+
+{% block content %}
+<section class="error-page" aria-labelledby="error-title">
+  <p class="error-page__status">Error {{ status }}</p>
+  <h1 id="error-title">{{ title }}</h1>
+  <p class="lead">{{ message }}</p>
+  <p><a href="{{ ctx.home_url() }}">Back to the start</a></p>
+</section>
+{% endblock %}

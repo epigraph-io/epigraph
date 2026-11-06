@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Atlas · {{ ctx.product_name() }}{% endblock %}
+
+{%- block header_search %}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("atlas.css") }}">
+<script src="{{ ctx.static_url("vendor/d3-color.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-interpolate.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-ease.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-hierarchy.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-dispatch.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-timer.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-quadtree.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("vendor/d3-force.min.js") }}" defer></script>
+<script src="{{ ctx.static_url("atlas.js") }}" defer></script>
+{% endblock %}
+
+{% block content %}
+<div class="atlas" id="atlas" data-atlas-mode="signed-in"
+     data-layout-url="{{ shell.layout_url }}"
+     data-theme-claims-prefix="{{ shell.theme_claims_prefix }}"
+     data-claim-prefix="{{ shell.claim_prefix }}"
+     data-links-url="{{ shell.links_url }}"
+     data-search-url="{{ shell.search_url }}"
+     data-resolve-prefix="{{ shell.resolve_prefix }}"
+     data-themes-url="{{ shell.themes_url }}"
+     data-claim-page-prefix="{{ shell.claim_page_prefix }}"
+     data-login-url="{{ shell.login_url }}"
+     data-atlas-url="{{ shell.atlas_url }}">
+  <div class="atlas__bar">
+    <div class="atlas__tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" aria-selected="true" class="atlas__tab">Topics</button>
+    </div>
+    <form class="atlas__search" role="search" data-role="search-form">
+      <label class="visually-hidden" for="atlas-q">Search claims</label>
+      <input id="atlas-q" type="search" placeholder="Search claims (press /)" autocomplete="off"
+             role="combobox" aria-expanded="false" aria-controls="atlas-results" aria-autocomplete="list">
+      <label class="atlas__in-theme small"><input type="checkbox" data-role="in-theme" disabled> In this theme</label>
+      <ul id="atlas-results" class="atlas__results" role="listbox" aria-label="Search results" hidden></ul>
+    </form>
+    <nav class="atlas__crumbs" aria-label="Breadcrumb"><ol data-role="crumbs"></ol></nav>
+    <label class="atlas__toggle small"><input type="checkbox" data-role="structure"> Include structure links</label>
+  </div>
+  <div class="atlas__body">
+    <div class="atlas__stage" data-role="stage">
+      <canvas class="atlas__canvas" data-role="canvas" role="img" aria-label="Map of themes and claims. Use the panel or search to move around."></canvas>
+      <p class="atlas__notice notice small" data-role="notice" role="status" hidden></p>
+      <p class="atlas__caption small muted" data-role="caption" hidden></p>
+    </div>
+    <aside class="atlas__panel" aria-live="polite" aria-labelledby="atlas-panel-title">
+      <h2 class="atlas__panel-title" id="atlas-panel-title" data-role="panel-title">The Atlas</h2>
+      <p class="atlas__panel-status small muted" data-role="panel-status">Loading the map…</p>
+      <div class="atlas__panel-body" data-role="panel-body"></div>
+    </aside>
+  </div>
+  <div class="atlas__legend small muted" aria-hidden="true">
+    <span class="atlas__key"><span class="atlas__ramp"></span>fill: authored truth value, low to high; grey = none</span>
+    <span class="atlas__key"><span class="atlas__swatch atlas__swatch--critical"></span>dashed: contradicts or refutes</span>
+  </div>
+  <noscript><p>The Atlas needs JavaScript. <a href="{{ shell.home_url }}">Browse themes</a> or <a href="{{ shell.search_page_url }}">search</a>.</p></noscript>
+</div>
+{% endblock %}
