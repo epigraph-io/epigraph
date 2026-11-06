@@ -7,9 +7,10 @@
 //! ingest's thesis, phase, step and operation claims) gets one `AUTHORED` edge
 //! (`source_type = 'agent'` -> `target_type = 'claim'`, the convention of the
 //! submit path) from the ACTING agent — the token's agent over HTTP, this
-//! server's pinned agent on stdio — on the write's own transaction. The claim
-//! itself stays authored and stamped by the workflow-ingest system agent
-//! (`claims.agent_id` unchanged).
+//! server's pinned agent on stdio — on the write's own transaction. Since
+//! workflow writes are made as the caller, the claim itself is authored by
+//! that same acting agent too (`claims.agent_id`); it used to be the shared
+//! workflow-ingest system agent's.
 //!
 //! A claim the call did NOT create (a deduplicated operation atom shared with
 //! another workflow, a re-ingest, a step already present) gets no edge from
@@ -209,7 +210,10 @@ async fn a_stdio_add_step_records_the_pinned_agent_as_author(pool: PgPool) {
         "one AUTHORED edge from the pinned stdio agent"
     );
     let author = claim_author(&pool, step).await;
-    assert_ne!(author, pinned, "claims.agent_id stays the system agent");
+    assert_eq!(
+        author, pinned,
+        "claims.agent_id is the pinned stdio agent too (workflow writes are made as the caller)"
+    );
 }
 
 /// HTTP `add_step` by the submitting human: one edge from that principal; the
@@ -235,10 +239,10 @@ async fn an_http_add_step_records_the_principal_as_author(pool: PgPool) {
         authored(&pool, step).await,
         vec![(h, "agent".to_string(), "claim".to_string())]
     );
-    assert_ne!(
+    assert_eq!(
         claim_author(&pool, step).await,
         h,
-        "the system agent authors it"
+        "the caller authors it (workflow writes are made as the caller)"
     );
     let (vis, owner): (String, Uuid) = sqlx::query_as(
         "SELECT visibility::text, owner_group_id FROM edges \
@@ -318,7 +322,7 @@ async fn a_new_generation_records_one_author_edge_per_created_claim(pool: PgPool
             vec![(h, "agent".to_string(), "claim".to_string())],
             "created claim {c} has exactly one AUTHORED edge, from the actor"
         );
-        assert_ne!(claim_author(&pool, *c).await, h, "system agent authors {c}");
+        assert_eq!(claim_author(&pool, *c).await, h, "the caller authors {c}");
     }
     let gen1_claims = executed(&pool, "ae-gen", 1).await;
     let reused: Vec<Uuid> = gen1_claims

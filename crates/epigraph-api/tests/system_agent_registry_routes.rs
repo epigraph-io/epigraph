@@ -184,10 +184,11 @@ fn challenge_content(host: &str) -> String {
     format!("Network access challenge: {host}:443 (https)")
 }
 
-/// `POST /api/v1/workflows` after a rotation: the step claim is S's and no
-/// agent holds the public-constant key.
+/// `POST /api/v1/workflows` after a rotation: the step claim is the CALLER's
+/// (workflow writes are made as the caller; it used to be S's) and no agent
+/// holds the public-constant key, so the route minted nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn rest_workflow_ingest_after_rotation_authors_as_the_registered_agent(pool: PgPool) {
+async fn rest_workflow_ingest_after_rotation_authors_as_the_caller(pool: PgPool) {
     let s = legacy_system_agent_registered(&pool).await;
     rotate(&pool, s).await;
     let (caller, _) = seed_agent_with_group(&pool, "caller").await;
@@ -210,7 +211,8 @@ async fn rest_workflow_ingest_after_rotation_authors_as_the_registered_agent(poo
     r.expect("store_workflow after the rotation");
     let authors = authors_of(&pool, &step).await;
     assert_eq!(authors.len(), 1);
-    assert_eq!(authors[0].0, s, "the step claim is the registered agent's");
+    assert_eq!(authors[0].0, caller, "the step claim is the caller's");
+    assert_ne!(authors[0].0, s, "not the registered system agent's");
     assert_eq!(k_holders(&pool).await, 0);
 }
 
@@ -258,10 +260,12 @@ async fn policy_challenge_on_an_armed_unregistered_database_refuses_without_writ
     assert_eq!(count(&pool, "agents").await, agents);
 }
 
-/// Armed, nothing registered: `POST /api/v1/workflows/steps` refuses (500
-/// naming the registry) before writing anything.
+/// Armed, nothing registered: `POST /api/v1/workflows/steps` no longer needs
+/// the system agent (workflow writes are made as the caller), so an unknown
+/// workflow is the caller's 404, not the registry's 500, and nothing is
+/// written or minted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing(pool: PgPool) {
+async fn rest_add_step_on_an_armed_unregistered_database_needs_no_system_agent(pool: PgPool) {
     let (a, _) = seed_human_operator(&pool, "human-a").await;
     arm(&pool).await;
     let state = app_role_state(&pool).await;
@@ -280,8 +284,8 @@ async fn rest_add_step_on_an_armed_unregistered_database_refuses_without_writing
     )
     .await;
     let (status, body) = body_text(r.into_response()).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    assert!(body.contains("system_agents"), "names the registry: {body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(!body.contains("system_agents"), "no registry refusal: {body}");
     assert_eq!(count(&pool, "claims").await, claims);
     assert_eq!(count(&pool, "agents").await, agents);
 }

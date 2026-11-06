@@ -628,10 +628,14 @@ async fn a_stdio_submitter_who_no_longer_writes_the_group_is_refused(pool: PgPoo
             "{tool}: the refusal must not name the now-hidden workflow: {message}"
         );
         let expected = match tool {
-            // The gate's own masked refusal.
-            "add_step" | "delete_step" | "improve_workflow_hierarchy" => "can read matches",
-            // Both resolve their target on the caller's view first, and the
-            // hidden step / row reads as absent.
+            // Workflow writes run on the CALLER's own stamp, so the hidden
+            // row reads as absent before the gate is reached: the executor's
+            // unknown-name answer (the bare name, as for any unknown name),
+            // and the generation lookup's.
+            "add_step" | "delete_step" => name,
+            "improve_workflow_hierarchy" => "no workflow with canonical_name",
+            // Resolves its target on the caller's view first, and the hidden
+            // step reads as absent.
             "evolve_step" => "not found",
             _ => "can read",
         };

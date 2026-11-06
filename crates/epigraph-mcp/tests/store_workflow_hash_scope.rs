@@ -205,10 +205,16 @@ async fn add_step_text_already_used_by_another_workflow_succeeds(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
 
     let name_a = format!("hash-scope-a-{}", Uuid::new_v4());
-    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool,
+    // Through the server, as its own (stdio) agent: workflow writes are made
+    // as the caller, so A and B must share a caller to share an author (the
+    // `uq_claims_content_hash_agent` key this test exercises).
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow(
+        &server,
         &viewer,
         &extraction_with_step(&name_a, SHARED_STEP),
+        None,
+        None,
+        false,
     )
     .await
     .expect("ingest workflow A");
@@ -656,8 +662,9 @@ async fn scope_marked_row_without_an_executing_workflow_is_not_applicable(pool: 
 
 /// A step text equal to another workflow's OPERATION ATOM text must not
 /// collide. Atoms keep the plain `blake3(text)` (they converge across
-/// workflows and documents by design), so on origin/main a plain-hash step
-/// written by the same system agent hit `uq_claims_content_hash_agent`.
+/// workflows and documents by design), so a plain-hash step written by the
+/// same author (once one shared system agent, now one caller) hit
+/// `uq_claims_content_hash_agent`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPool) {
     put_constraint_in_force(&pool).await;
@@ -669,10 +676,15 @@ async fn step_text_equal_to_another_workflows_operation_atom_succeeds(pool: PgPo
     let mut extraction_a = extraction_with_step(&name_a, "Run the suite");
     extraction_a.phases[0].steps[0].operations = vec![shared.clone()];
     extraction_a.phases[0].steps[0].generality = vec![1];
-    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow_via_pool(
-        &pool,
+    // Through the server, as its own (stdio) agent, so the atom and B's step
+    // share their author (workflow writes are made as the caller).
+    epigraph_mcp::tools::workflow_ingest::do_ingest_workflow(
+        &server,
         &viewer,
         &extraction_a,
+        None,
+        None,
+        false,
     )
     .await
     .expect("ingest workflow A with the operation atom");

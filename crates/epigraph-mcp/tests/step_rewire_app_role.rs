@@ -546,17 +546,17 @@ async fn a_retracted_prev_to_next_alone_also_refuses_the_rewire(pool: PgPool) {
     assert_eq!(order().await, vec![s0, s1, s2], "the order is unchanged");
 }
 
-/// Operator default W12-OD2: `add_step` writes under the shared
-/// `workflow-ingest-system` principal, so after migration 120 its chain edges
-/// between two step claims (`step_follows`, `decomposes_to`) are owned by THAT
-/// agent's writer group, whichever MCP caller asked, and `executes` (workflow
-/// -> claim) is a structural edge outside D8's scope, so world-owned. Two
-/// servers with different signing agents therefore share the chain: the second
-/// rewires the first's links. The caller's AUTHORITY over the workflow is the
-/// app-layer check the per-caller identity batch adds, which is not in this
-/// branch's base; this pins the database half only.
+/// Operator default W12-OD2, revised when workflow writes moved to the
+/// caller: `add_step` writes AS ITS CALLER, so after migration 120 the chain
+/// edges a caller writes between two step claims (`step_follows`,
+/// `decomposes_to`) are owned by THAT caller's writer group, and `executes`
+/// (workflow -> claim) and `AUTHORED` (agent -> claim) stay outside D8's
+/// scope, so world-owned. (Before, every caller wrote under the one shared
+/// `workflow-ingest-system` principal, so its group owned every caller's chain
+/// edges.) The caller's AUTHORITY over the workflow is the app-layer check
+/// (`tools::workflow_authority`); this pins the database half only.
 #[sqlx::test(migrations = "../../migrations")]
-async fn two_callers_chain_edges_share_the_workflow_ingest_owner(pool: PgPool) {
+async fn two_callers_chain_edges_are_owned_by_whichever_caller_wrote_them(pool: PgPool) {
     let wf = legacy_workflow(&pool).await;
     let s2 = wf.steps[2].0;
     let url = fixture::database_url_for(&pool).await;
@@ -589,50 +589,46 @@ async fn two_callers_chain_edges_share_the_workflow_ingest_owner(pool: PgPool) {
     let a = add(&first, &wf.name, "by the first caller", None).await;
     let b = add(&second, &wf.name, "by the second caller", None).await;
 
-    let system: Uuid =
-        sqlx::query_scalar("SELECT id FROM agents WHERE display_name = 'workflow-ingest-system'")
+    let first_group = personal_group_of(&pool, first_agent).await;
+    let second_group = personal_group_of(&pool, second_agent).await;
+    let world = fixture::world_group(&pool).await;
+    for (step, author, group) in [(a, first_agent, first_group), (b, second_agent, second_group)] {
+        let claim_author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(step)
             .fetch_one(&pool)
             .await
-            .expect("the workflow-ingest-system agent");
-    let shared = personal_group_of(&pool, system).await;
-    let world = fixture::world_group(&pool).await;
-    let owners: Vec<(String, Uuid, Option<Uuid>)> = sqlx::query_as(
-        "SELECT relationship, owner_group_id, writer_group_id FROM edges \
-          WHERE target_id = ANY($1) ORDER BY relationship, target_id",
-    )
-    .bind(vec![a, b])
-    .fetch_all(&pool)
-    .await
-    .expect("the new edges");
-    assert!(!owners.is_empty());
-    for (rel, owner, writer) in &owners {
-        assert_eq!(
-            *writer,
-            Some(shared),
-            "{rel}: the author record is the shared agent's"
-        );
-        // `executes` (a workflow endpoint) and `AUTHORED` (an agent endpoint,
-        // the acting caller's authorship of the step it created) are outside
-        // migration 120's writer scope, so the trigger owns them by the world.
-        let want = if rel == "executes" || rel == "AUTHORED" {
-            world
-        } else {
-            shared
-        };
-        assert_eq!(*owner, want, "{rel}: {owners:?}");
-    }
-    for g in [
-        personal_group_of(&pool, first_agent).await,
-        personal_group_of(&pool, second_agent).await,
-    ] {
-        assert!(
-            owners.iter().all(|(_, o, _)| *o != g),
-            "no caller's own group owns a chain edge"
-        );
+            .expect("the step's author");
+        assert_eq!(claim_author, author, "the step is its caller's own");
+        let owners: Vec<(String, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT relationship, owner_group_id, writer_group_id FROM edges \
+              WHERE target_id = $1 ORDER BY relationship",
+        )
+        .bind(step)
+        .fetch_all(&pool)
+        .await
+        .expect("the new edges");
+        assert!(!owners.is_empty());
+        for (rel, owner, writer) in &owners {
+            assert_eq!(
+                *writer,
+                Some(group),
+                "{rel}: the author record is the writing caller's own group"
+            );
+            // `executes` (a workflow endpoint) and `AUTHORED` (an agent
+            // endpoint) are outside migration 120's writer scope, so the
+            // trigger owns them by the world.
+            let want = if rel == "executes" || rel == "AUTHORED" {
+                world
+            } else {
+                group
+            };
+            assert_eq!(*owner, want, "{rel}: {owners:?}");
+        }
     }
     assert_eq!(successors(&pool, s2).await, vec![a]);
 
-    // The accepted residual: the second caller rewires the first caller's link.
+    // `a -> b` was written by the SECOND caller (it appended b), so the second
+    // caller removes it to insert between them.
     let mid = add(&second, &wf.name, "between the two callers", Some(4)).await;
     assert_eq!(
         successors(&pool, a).await,

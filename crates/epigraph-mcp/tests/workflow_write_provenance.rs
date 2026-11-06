@@ -258,8 +258,9 @@ async fn provenance_total(pool: &PgPool) -> i64 {
         .expect("count provenance")
 }
 
-/// The author (the stamp) of a claim the tool wrote: the workflow-ingest
-/// system agent.
+/// The author (the stamp) of a claim the tool wrote: the caller (workflow
+/// writes are made as the caller; it used to be the shared workflow-ingest
+/// system agent).
 async fn author_of(pool: &PgPool, claim: &str) -> Uuid {
     sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1::uuid")
         .bind(claim)
@@ -289,7 +290,7 @@ fn assert_provenance(
     assert_eq!(
         *agent_id,
         Some(stamp),
-        "the row is attributed to the session that wrote it, the system stamp: {d}"
+        "the row is attributed to the session that wrote it, the caller's own stamp: {d}"
     );
     assert_eq!(d["action"], action, "{d}");
     assert_eq!(d["workflow_id"], workflow.to_string(), "{d}");
@@ -424,7 +425,7 @@ async fn the_submitter_adds_a_step_with_provenance(pool: PgPool) {
         .expect("step id")
         .to_string();
     let stamp = author_of(&pool, &step).await;
-    assert_ne!(stamp, h, "the system agent still authors the step");
+    assert_eq!(stamp, h, "the caller authors the step");
     let rows = provenance(&pool, wf).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_provenance(
@@ -475,9 +476,12 @@ async fn the_operator_deletes_a_step_with_provenance(pool: PgPool) {
         .to_string();
     let rows = provenance(&pool, wf).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
+    // The session that wrote the soft delete is the acting operator's own
+    // stamp (workflow writes are made as the caller).
+    let _ = author_of(&pool, &step).await;
     assert_provenance(
         &rows[0],
-        author_of(&pool, &step).await,
+        h,
         "delete_step",
         wf,
         s,

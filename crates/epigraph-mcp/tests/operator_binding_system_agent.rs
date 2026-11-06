@@ -1,27 +1,24 @@
-//! Operator binding (migration 122) and the `workflow-ingest-system` agent.
+//! Operator binding (migration 122) and workflow writes, once armed.
 //!
-//! The workflow executor authors every workflow and step claim as ONE system
-//! agent, stamped from that agent's own viewer. It is not a human, so once a
-//! database is armed its writes are refused unless it holds a LIVE link; the
-//! deploy order registers it (migration 148: once armed, an unregistered
-//! system agent is refused outright) and live-links it before arming. And because the claims trigger
-//! sees only that shared identity, the request path binds the CALLER itself
-//! (`claim_helper::begin_system_ingest_stamped_tx`, review SEC-3): an unbound
-//! caller is refused (OPL01) even though the system agent is bound, and a
-//! caller of ANOTHER human is refused (OPL02), so the shared identity is not a
-//! way into the linked human's group. A caller bound to that human writes, and
-//! its claims are owned by the OPERATOR's group.
+//! Workflow writes used to be authored by ONE shared `workflow-ingest-system`
+//! agent, with the caller bound to that agent's human, so a caller of ANOTHER
+//! human was refused OPL02 outright. They are now authored by, and stamped
+//! from, the CALLER itself (`claim_helper::begin_caller_workflow_tx`), so the
+//! database's own operator binding applies to the real writer: an unbound
+//! caller is refused (OPL01) whether or not the system agent is linked; a
+//! caller of another human writes into ITS OWN operator's group, never into
+//! this human's; a caller bound to this human writes into this human's group,
+//! as itself.
 //!
 //! Both server pools are downgraded to `epigraph_app` (a superuser pool proves
 //! nothing about row security); links and arming run on the harness pool, the
 //! maintenance connection's stand-in.
 //!
 //! Verified to fail: `default_decl_for_author`'s acting-link branch removed ->
-//! the step claim lands in the system agent's own group and the owner
-//! assertion fails; the `require_caller_write_authority` call removed from
-//! `begin_system_ingest_stamped_tx` -> the unbound caller's store lands;
-//! `tools::evolve_step` back on `ClaimRepository::evolve_step(&server.pool, ..)`
-//! (unstamped) -> the bound caller's evolve is refused OPL01 once armed.
+//! the step claim lands in the caller's own group and the owner assertion
+//! fails; `tools::evolve_step` back on
+//! `ClaimRepository::evolve_step(&server.pool, ..)` (unstamped) -> the bound
+//! caller's evolve is refused OPL01 once armed.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -124,7 +121,8 @@ async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(poo
             .expect("live link");
     }
 
-    // The system agent is bound now, but the CALLER is not: refused.
+    // The system agent is bound now, but the CALLER is not, and the caller is
+    // the author: refused.
     let caller = caller_of(&pool, 0xA7).await;
     let unbound_step = format!("unbound caller step {}", Uuid::new_v4());
     let refused = store(&server, &unbound_step)
@@ -144,12 +142,29 @@ async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(poo
             .await
             .expect("the other caller's live link");
     }
+    let other_group: Uuid = sqlx::query_scalar(
+        "SELECT g.id FROM groups g WHERE g.did_key = 'did:epigraph:personal:' || $1::text",
+    )
+    .bind(other_human)
+    .fetch_one(&pool)
+    .await
+    .expect("the other human's group");
     let foreign_step = format!("other human's caller step {}", Uuid::new_v4());
-    let refused = store(&other, &foreign_step)
+    store(&other, &foreign_step)
         .await
-        .expect_err("another human's caller must not write into this human's group");
-    assert!(refused.contains("OPL02"), "{refused}");
-    assert_eq!(claims_with(&pool, &foreign_step).await, 0);
+        .expect("another human's caller writes, as itself, into its own operator's group");
+    let (author, owner): (Uuid, Uuid) =
+        sqlx::query_as("SELECT agent_id, owner_group_id FROM claims WHERE content = $1")
+            .bind(&foreign_step)
+            .fetch_one(&pool)
+            .await
+            .expect("the other caller's step claim");
+    assert_eq!(author, other_caller, "authored by the other human's caller");
+    assert_eq!(
+        owner, other_group,
+        "owned by the other human's group, never by this human's"
+    );
+    assert_ne!(owner, human_group);
 
     // A caller bound to THIS human writes, into the operator's group.
     {
@@ -161,20 +176,18 @@ async fn a_live_linked_system_agent_keeps_workflow_ingest_working_once_armed(poo
     let step = format!("bound step {}", Uuid::new_v4());
     store(&server, &step)
         .await
-        .expect("a bound caller writes through a live-linked system agent on the app role");
+        .expect("a bound caller writes, as itself, on the app role");
     let (author, owner): (Uuid, Uuid) =
         sqlx::query_as("SELECT agent_id, owner_group_id FROM claims WHERE content = $1")
             .bind(&step)
             .fetch_one(&pool)
             .await
             .expect("step claim");
-    assert_eq!(
-        author, system,
-        "the executor still authors as the system agent"
-    );
+    assert_eq!(author, caller, "the executor authors as the caller");
+    assert_ne!(author, system, "not as the shared system agent");
     assert_eq!(
         owner, human_group,
-        "a live-linked system agent's claims belong to its operator"
+        "a live-linked caller's claims belong to its operator"
     );
 
     // Delta review (the no-principal rule): `evolve_step` writes its step claim

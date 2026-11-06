@@ -13,26 +13,29 @@
 //! # The rules pinned
 //!
 //! * The new claims land `('group', G)`, and so do their `executes` edges. The
-//!   rows are written on a transaction stamped from the SYSTEM agent, so the
-//!   row-security `WITH CHECK` on `claims`/`edges` passes only because that
-//!   agent writes G: the success arms below are the measurement of that check.
+//!   rows are written AS THE CALLER, on a transaction stamped from the
+//!   caller's own viewer, so the row-security `WITH CHECK` on `claims`/`edges`
+//!   passes because the caller writes G: the success arms below are the
+//!   measurement of that check. (They used to be written on the shared
+//!   workflow-ingest system agent's stamp, which had to write G too; it no
+//!   longer needs any membership.)
 //! * The CALLER AGENT ITSELF must hold a live writer/admin membership of G.
 //!   Its human's memberships do not count: a fleet agent linked to `H`, who
 //!   writes G, is refused when it is not a member of G itself. A refusal
 //!   writes nothing.
-//! * The system agent must write G too, or the ingest is refused before any
-//!   row is written (rather than failing on the first INSERT).
 //! * Every claim the ingest did NOT create (a reused step of an earlier
-//!   generation, a shared operation atom, a whole re-ingest) whose tenancy is
-//!   not `('group', G)` is listed in `reused_items`, with its tenancy. Nothing
-//!   re-tenants it.
+//!   generation, a shared operation atom) whose tenancy is not `('group', G)`
+//!   is listed in `reused_items`, with its tenancy. Nothing re-tenants it.
 //! * `embed: false` makes no embedding call and writes no claim embedding and
 //!   no goal embedding, on REST and on stdio MCP (the stdio servers here embed
 //!   through a counting generator, `McpEmbedder::with_generator`).
 //! * A plan that reuses a claim private to a group the caller does not write
 //!   is refused before any edge is written: those edges would be owned by that
-//!   group and written on the system agent's stamp.
-//! * Without `tenancy` nothing changes: public, and no `reused_items` key.
+//!   group.
+//! * A lineage with generations the caller cannot read is not written at all
+//!   (migration 202), re-ingests included.
+//! * Without `tenancy`: public, no `reused_items` key, owned by the caller's
+//!   one team group (else its default group).
 //!
 //! # The ownership the tests use: the operator group, and a team group
 //!
@@ -989,59 +992,73 @@ async fn a_caller_is_refused_for_a_group_it_does_not_write(pool: PgPool) {
     }
 }
 
-/// A group the caller writes but the ingest system agent does not: refused
-/// before any row is written, naming the system agent, rather than failing on
-/// the first INSERT. On REST (the human) and on stdio (the curator, a writer
-/// of the group, which the MCP transport maps to its own refusal arm).
+/// A group the caller writes but the ingest system agent does not: ADMITTED.
+/// Workflow writes are made as the caller, so only the caller's own
+/// membership decides (the system agent's used to be required too, and the
+/// ingest was refused naming it). On REST (the human, the group's admin) and
+/// on stdio (the curator, a writer of the group); each writes as itself.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_ingest_system_agent_must_write_the_declared_group(pool: PgPool) {
+async fn the_ingest_system_agent_need_not_write_the_declared_group(pool: PgPool) {
     let w = world(&pool).await;
     let unprovisioned = team_group(&pool, w.h).await;
     add_member(&pool, unprovisioned, w.c, "writer").await;
-    let name = "acme-tenancy-unprovisioned";
-    let before = row_counts(&pool).await;
-    let (s, b) = w
+    let system_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(unprovisioned)
+    .bind(w.system)
+    .fetch_one(&pool)
+    .await
+    .expect("system rows");
+    assert_eq!(system_rows, 0, "PREMISE: the system agent is not a member");
+
+    let rest_name = "acme-tenancy-unprovisioned";
+    let out = w
         .api
-        .ingest(
+        .ingest_ok(
             &token(w.h, WRITE_SCOPES),
-            &declared(extraction(name, 0, &[&[]]), unprovisioned, None),
+            &declared(extraction(rest_name, 0, &[&[]]), unprovisioned, None),
         )
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    let rest_plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
+    assert!(!rest_plan.is_empty());
     assert!(
-        b.to_string().contains(&w.system.to_string()),
-        "the refusal names the system agent: {b}"
+        rest_plan
+            .iter()
+            .all(|(_, v, o)| v == "group" && *o == unprovisioned),
+        "every claim is ('group', unprovisioned): {rest_plan:?}"
     );
-    assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
-    assert_eq!(claims_mentioning(&pool, name).await, 0, "no claim");
 
-    let refused = stdio_ingest_refused(
+    let stdio_name = "acme-tenancy-unprovisioned-stdio";
+    let out = stdio_ingest(
         &w.c_server,
         mcp_params(
-            extraction(name, 0, &[&["acme unprovisioned operation"]]),
+            extraction(stdio_name, 0, &[&["acme unprovisioned operation"]]),
             Some(unprovisioned),
         ),
     )
-    .await;
-    assert_eq!(
-        refused.code,
-        rmcp::model::ErrorCode::INVALID_REQUEST,
-        "a denial, not an internal error: {refused:?}"
-    );
-    let refused = refused.message.to_string();
+    .await
+    .expect("the curator writes the group, so it ingests into it");
+    let stdio_plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
     assert!(
-        refused.contains(&w.system.to_string()) && refused.contains(&unprovisioned.to_string()),
-        "the stdio refusal names the system agent and the group: {refused}"
+        stdio_plan
+            .iter()
+            .all(|(_, v, o)| v == "group" && *o == unprovisioned),
+        "{stdio_plan:?}"
     );
-    assert!(
-        !refused.contains(&w.c.to_string()),
-        "refused by the system-agent check, not as the caller: {refused}"
-    );
-    assert_eq!(
-        row_counts(&pool).await,
-        before,
-        "neither refusal wrote a claim, an edge, a workflow or a BBA"
-    );
+    for (id, author) in rest_plan
+        .iter()
+        .map(|p| (p.0, w.h))
+        .chain(stdio_plan.iter().map(|p| (p.0, w.c)))
+    {
+        let agent: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("author");
+        assert_eq!(agent, author, "{id} is written as its caller");
+        assert_ne!(agent, w.system, "never as the system agent");
+    }
 }
 
 /// Only `visibility: "group"` is a declaration; anything else is refused and
@@ -1070,6 +1087,10 @@ async fn a_tenancy_other_than_group_is_refused(pool: PgPool) {
 /// steps it keeps and the operation atom it shares are the claims generation 0
 /// wrote, still public. Each is listed in `reused_items` with its tenancy, and
 /// none is re-tenanted; every claim generation 1 created is `('group', og)`.
+///
+/// Generation 0 declares nothing, so it is written as the caller `h` into its
+/// ONE team group `g` (public): `h` writes `og` (personal) and `g` (team), and
+/// the undeclared order picks the single non-personal group.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPool) {
     let w = world(&pool).await;
@@ -1113,13 +1134,13 @@ async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPoo
     );
     for (id, (vis, owner)) in &listed {
         assert_eq!(vis, &json!("public"), "{id}: {gen1}");
-        assert_eq!(owner, &json!(w.og), "{id}: {gen1}");
+        assert_eq!(owner, &json!(w.g), "{id}: {gen1}");
     }
     for (id, v, o) in &gen1_plan {
         if carried.contains(id) {
             assert_eq!(
                 (v.as_str(), *o),
-                ("public", w.og),
+                ("public", w.g),
                 "{id} is not re-tenanted"
             );
         } else {
@@ -1181,9 +1202,10 @@ async fn reused_items_omits_reused_claims_already_in_the_declared_group(pool: Pg
 /// private to `g`, which the system agent writes. Calibrated by the curator
 /// `c`, a member of `g`, which may link the same atom and is told its tenancy.
 ///
-/// A re-ingest writes nothing, so it is not refused: there a reused claim the
-/// caller cannot read is listed with a null tenancy, and again the response
-/// never names its group.
+/// A re-ingest of the owner's (hidden) generation by the non-member is
+/// refused too: workflow writes run on the caller's own stamp, and a lineage
+/// with generations the caller cannot read is not written (migration 202).
+/// The refusal names neither the group nor the workflow.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the_ingest(
     pool: PgPool,
@@ -1231,26 +1253,18 @@ async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the
         "the refusal wrote no claim, edge, workflow or BBA"
     );
 
-    // A re-ingest of the owner's generation by f: nothing is written, so it
-    // is answered, and every g-private claim is listed without its tenancy.
-    let again = stdio_ingest(&w.f_server, mcp_params(owner, Some(w.og)))
+    // A re-ingest of the owner's generation by f: refused (f cannot read the
+    // lineage), naming neither g nor the workflow, and writing nothing.
+    let refused = stdio_ingest(&w.f_server, mcp_params(owner, Some(w.og)))
         .await
-        .expect("a re-ingest writes nothing, so it is not refused");
-    assert_eq!(again["already_ingested"], json!(true), "{again}");
-    let listed = reused(&again);
-    assert_eq!(
-        listed.keys().copied().collect::<BTreeSet<_>>(),
-        seeded_plan.iter().map(|p| p.0).collect::<BTreeSet<_>>(),
-        "every planned claim is listed: {again}"
-    );
+        .expect_err("a re-ingest of a lineage f cannot read is refused");
+    assert!(refused.contains("cannot read"), "{refused}");
     assert!(
-        listed.values().all(|t| t == &(Value::Null, Value::Null)),
-        "listed without the tenancy f cannot read: {again}"
+        !refused.contains(&w.g.to_string())
+            && !refused.contains(&seeded["workflow_id"].as_str().unwrap_or("-").to_string()),
+        "the refusal names neither g nor the hidden workflow: {refused}"
     );
-    assert!(
-        !again.to_string().contains(&w.g.to_string()),
-        "the response never names g to a non-member: {again}"
-    );
+    let _ = &seeded_plan;
     assert_eq!(
         row_counts(&pool).await,
         before,
@@ -1306,9 +1320,12 @@ async fn a_declared_re_ingest_lists_every_claim_and_re_tenants_nothing(pool: PgP
 // Unchanged behaviour, and embed
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Without `tenancy` an ingest is what it was: public, owned by the system
-/// agent's default group, and the response has no `reused_items` key, on both
-/// transports.
+/// Without `tenancy` an ingest is public and the response has no
+/// `reused_items` key, on both transports. Written as the caller, it is owned
+/// by the caller's ONE team group: `h` (REST) writes its personal group `og`
+/// and the team group `g`; the curator `c` (stdio) writes `og` (its acting
+/// row), its own personal group and `g`. Both land in `g`. (It used to be the
+/// system agent's default group, `og`, whoever called.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: PgPool) {
     let w = world(&pool).await;
@@ -1322,7 +1339,7 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
     assert!(out.get("reused_items").is_none(), "{out}");
     let plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
     assert!(
-        plan.iter().all(|(_, v, o)| v == "public" && *o == w.og),
+        plan.iter().all(|(_, v, o)| v == "public" && *o == w.g),
         "{plan:?}"
     );
     let out = stdio_ingest(
@@ -1335,7 +1352,7 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
     assert!(plan_tenancy(&pool, uuid_of(&out["workflow_id"]))
         .await
         .iter()
-        .all(|(_, v, o)| v == "public" && *o == w.og));
+        .all(|(_, v, o)| v == "public" && *o == w.g));
 }
 
 /// `embed: false` makes no embedding call and writes no claim or goal
@@ -1672,26 +1689,26 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
     let before = row_counts(&pool).await;
 
     // f writes og but is not a member of g: undeclared, and declared into og.
+    // Workflow writes run on f's own stamp, so a lineage with generations f
+    // cannot read is refused (migration 202): the same answer for both plans,
+    // carrying nothing of the private plan (no id, no size).
     for declared_group in [None, Some(w.og)] {
         let mut answers = Vec::new();
-        for body in [&small, &large] {
-            let out = stdio_ingest(&w.f_server, mcp_params(body.clone(), declared_group))
+        for (body, name) in [(&small, "acme-plan-size-small"), (&large, "acme-plan-size-large")]
+        {
+            let refused = stdio_ingest(&w.f_server, mcp_params(body.clone(), declared_group))
                 .await
-                .expect("a re-ingest writes nothing, so it is answered");
-            assert_eq!(out["already_ingested"], json!(true), "{out}");
-            answers.push(plan_answer(&out));
+                .expect_err("a non-member's re-ingest of a hidden lineage is refused");
+            assert!(refused.contains("cannot read"), "{refused}");
+            answers.push(refused.replace(name, "<name>"));
         }
         assert_eq!(
             answers[0], answers[1],
             "a non-member's answer must not depend on the private plan's size \
              (declared {declared_group:?}): {answers:?}"
         );
-        assert_eq!(
-            answers[0]["executes_edges"],
-            json!(0),
-            "a non-member reads none of the private plan's executes edges: {answers:?}"
-        );
     }
+    let _ = plan_answer;
 
     // c is a member of g: each plan's true size.
     for (body, size) in [&small, &large].into_iter().zip(&true_sizes) {
@@ -2064,12 +2081,11 @@ async fn a_non_writer_cannot_add_a_step_to_a_group_plan(pool: PgPool) {
     // A NON-member recorded as the submitter.
     set_role(&pool, w.g, w.h, "admin").await;
     set_submitter(&pool, wf, w.h2).await;
+    // A non-member cannot read the plan on its own stamp, so it is answered as
+    // an unknown name (404, backlog c831df4a), never with the plan's id.
     let (s, b) = rest_add(token(w.h2, WRITE_SCOPES), "acme stranger rest step").await;
-    assert_eq!(
-        s,
-        StatusCode::FORBIDDEN,
-        "REST: a non-member is refused: {b}"
-    );
+    assert_eq!(s, StatusCode::NOT_FOUND, "REST: a non-member is refused: {b}");
+    assert!(!b.to_string().contains(&wf.to_string()), "{b}");
     assert_eq!(
         executes_count(&pool, wf).await,
         before,
@@ -2284,17 +2300,18 @@ async fn a_declared_generations_workflow_row_is_hidden_from_a_non_member(pool: P
 
 /// Guard: a non-member cannot extend a lineage whose head is a generation
 /// declared into a group it does not read, by ingesting the next generation or
-/// by `add_step` on the lineage's name. Both decide on the head's authority on
-/// the ingest system agent's stamp, which reads the group, so the hidden head
-/// is the row checked; nothing is written. The caller holds workflow authority
+/// by `add_step` on the lineage's name. The caller holds workflow authority
 /// over the older, public W1 (it is recorded as W1's submitter), so a check
-/// that moved to W1 would admit it: the refusal is the head's. (It holds
-/// before and after migration 183.)
+/// that decided on W1 would admit it. Workflow writes run on the caller's own
+/// stamp, where the private head is invisible, so the refusal is migration
+/// 202's: a lineage with generations the caller cannot read is not written
+/// (the ingest 409, the step edit answered as an unknown name, 404), naming
+/// neither the hidden head nor its group. Nothing is written.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_member_cannot_extend_a_lineage_whose_head_is_private(pool: PgPool) {
     let w = world(&pool).await;
     let name = "acme-private-head";
-    let (w1, _w2) = reused_step_generations(&w, &pool, name).await;
+    let (w1, w2) = reused_step_generations(&w, &pool, name).await;
     set_submitter(&pool, w1, w.h2).await;
     let stranger = token(w.h2, WRITE_SCOPES);
     let before = row_counts(&pool).await;
@@ -2304,8 +2321,12 @@ async fn a_non_member_cannot_extend_a_lineage_whose_head_is_private(pool: PgPool
     let (status, out) = w.api.ingest(&stranger, &gen2).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::CONFLICT,
         "the next generation of a private head is refused: {out}"
+    );
+    assert!(
+        out.to_string().contains("cannot read") && !out.to_string().contains(&w2.to_string()),
+        "refused without naming the hidden head: {out}"
     );
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
     assert_eq!(workflows_named(&pool, name).await, 2, "no generation 2");
@@ -2321,9 +2342,10 @@ async fn a_non_member_cannot_extend_a_lineage_whose_head_is_private(pool: PgPool
         .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
         "add_step on a private head is refused: {out}"
     );
+    assert!(!out.to_string().contains(&w2.to_string()), "{out}");
     assert_eq!(row_counts(&pool).await, before, "the refusal wrote nothing");
 }
 
@@ -3159,11 +3181,13 @@ async fn over_mcp_the_hierarchical_embedding_path_finds_a_declared_generation_on
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(pool: PgPool) {
     let w = world(&pool).await;
-    let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve", w.g).await;
+    // W1 (undeclared) is written as `h` into its one team group `g`, so W2 is
+    // declared into `og` to keep the shared step outside W2's group.
+    let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve", w.og).await;
     let step = shared_step(&pool, w1, w2).await;
     let owner = claim_owner(&pool, step).await;
     assert_ne!(
-        owner, w.g,
+        owner, w.og,
         "premise: W2's group does not own the shared step"
     );
     // The caller writes the shared step's owning group (so row security admits
@@ -3223,11 +3247,13 @@ async fn over_mcp_evolving_a_step_a_hidden_generation_executes_needs_authority_o
     pool: PgPool,
 ) {
     let w = world(&pool).await;
-    let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve-mcp", w.g).await;
+    // W1 (undeclared) is written as `h` into its one team group `g`, so W2 is
+    // declared into `og` to keep the shared step outside W2's group.
+    let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve-mcp", w.og).await;
     let step = shared_step(&pool, w1, w2).await;
     let owner = claim_owner(&pool, step).await;
     assert_ne!(
-        owner, w.g,
+        owner, w.og,
         "premise: W2's group does not own the shared step"
     );
     // The caller writes the shared step's owning group (so row security admits
@@ -3278,7 +3304,7 @@ async fn over_mcp_evolving_a_step_a_hidden_generation_executes_needs_authority_o
 }
 
 /// A `('group', group)` workflows row for `(name, 0)`, as a plan declared into
-/// a group the ingest system agent does not read leaves it (harness).
+/// a group the caller does not read leaves it (harness).
 async fn seed_hidden_row(pool: &PgPool, name: &str, group: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -3295,8 +3321,8 @@ async fn seed_hidden_row(pool: &PgPool, name: &str, group: Uuid) -> Uuid {
 }
 
 /// An ingest whose `(canonical_name, generation)` is already held by a
-/// `workflows` row its stamp cannot read (a group the ingest system agent does
-/// not read) is refused with a typed conflict on REST and on stdio MCP, before
+/// `workflows` row the caller cannot read (a group it does not read) is
+/// refused with a typed conflict on REST and on stdio MCP, before
 /// any claim or edge is written, and the answer names neither the row nor its
 /// group. A free name ingests as before.
 #[sqlx::test(migrations = "../../migrations")]
@@ -3315,8 +3341,11 @@ async fn an_ingest_whose_name_is_held_by_a_row_it_cannot_read_is_refused(pool: P
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{out}");
     let text = out.to_string();
+    // Migration 202's lineage check answers first (the name has a row the
+    // caller cannot read); the exact-row check (`WorkflowOutsideView`) stays
+    // behind it as the backstop.
     assert!(
-        text.contains("not readable by this ingest") && text.contains("Nothing was written"),
+        text.contains("cannot read") && text.contains("Nothing was written"),
         "{text}"
     );
     assert!(
@@ -3334,10 +3363,7 @@ async fn an_ingest_whose_name_is_held_by_a_row_it_cannot_read_is_refused(pool: P
         rmcp::model::ErrorCode::INVALID_REQUEST,
         "{refused:?}"
     );
-    assert!(
-        refused.message.contains("not readable by this ingest"),
-        "{refused:?}"
-    );
+    assert!(refused.message.contains("cannot read"), "{refused:?}");
 
     assert_eq!(row_counts(&pool).await, before, "nothing was written");
     assert_eq!(

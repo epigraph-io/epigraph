@@ -613,16 +613,6 @@ fn vector_steps() -> [Uuid; 3] {
     [2, 5, 7].map(|i| uuid_of(&plan[i]["claim_id"]))
 }
 
-/// The workflow-ingest system agent: the author of every claim the ingest
-/// wrote (harness read of the vectors' thesis row).
-async fn ingest_system_agent(pool: &PgPool) -> Uuid {
-    sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(uuid_of(&vector_plan()[0]["claim_id"]))
-        .fetch_one(pool)
-        .await
-        .expect("the thesis row's author")
-}
-
 /// The two step orders `add_step` must keep equal (harness reads): the
 /// `step_follows` chain `workflow_steps::ordered_steps` walks, and the
 /// workflow's live level-2 `executes` targets by their integer `plan_index`.
@@ -746,10 +736,10 @@ async fn executes_edge_of(pool: &PgPool, workflow_id: Uuid, target: Uuid) -> (St
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(pool: PgPool) {
     let w = private_workflow(&pool).await;
-    // The stamp sees (and writes) every private edge: the index would be
-    // derivable, so the test covers the derivation, not a blind stamp.
-    let system = ingest_system_agent(&pool).await;
-    add_member(&pool, w.g, system, "writer").await;
+    // The write runs on the curator's own stamp (workflow writes are made as
+    // the caller), and the curator writes G, so the stamp sees (and writes)
+    // every private edge: the index would be derivable, so the test covers
+    // the derivation, not a blind stamp.
     add_member(&pool, w.g, w.curator, "writer").await;
     let curator = token(w.curator, WRITE_SCOPES);
     let reader = token(w.reader, READ_SCOPES);
