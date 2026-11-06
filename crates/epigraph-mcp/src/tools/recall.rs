@@ -47,8 +47,12 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// denominator is, and the auto-detect decision is surfaced through
 /// `centroid_dim_used`. Scoped, both counts are the reader's own, and the
 /// decision is made on the corpus the reader will actually search.
-pub async fn embedded_3072_population(
-    pool: &sqlx::PgPool,
+///
+/// Generic over the executor so the tool passes its viewer-stamped read
+/// (`EpiGraphMcpFull::read_as`): the counts are the reader's own only if the
+/// session's row security agrees with the predicate.
+pub async fn embedded_3072_population<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<f64, sqlx::Error> {
     let row = sqlx::query!(
@@ -64,17 +68,17 @@ pub async fn embedded_3072_population(
         viewer.bypass_bind(),
         viewer.group_bind().unwrap_or(&[])
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(row.frac_3072.unwrap_or(0.0))
 }
 
-async fn detect_centroid_dim(
+async fn detect_centroid_dim<'e, E: sqlx::PgExecutor<'e>>(
     cache: &CentroidPopulationCache,
-    pool: &sqlx::PgPool,
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<u32, sqlx::Error> {
-    let frac = cache.fraction(pool, viewer).await?;
+    let frac = cache.fraction(executor, viewer).await?;
     Ok(if frac >= 0.5 { 3072 } else { 1536 })
 }
 
@@ -161,27 +165,32 @@ impl CentroidPopulationCache {
     ///
     /// # Errors
     /// The population query failed (not cached).
-    pub async fn fraction(
+    pub async fn fraction<'e, E: sqlx::PgExecutor<'e>>(
         &self,
-        pool: &sqlx::PgPool,
+        executor: E,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<f64, sqlx::Error> {
         if let Some(frac) = self.cached(viewer) {
             return Ok(frac);
         }
-        self.refresh(pool, viewer).await
+        self.refresh(executor, viewer).await
     }
 
     /// A fresh read for `viewer`'s scope, which then stands for the TTL.
     ///
+    /// The tool passes its viewer-stamped read, so the slot keyed by the
+    /// viewer's binds holds the fraction that viewer's session reads (on an
+    /// unstamped session row security would fill it with the public-only
+    /// fraction under a group-scoped key).
+    ///
     /// # Errors
     /// The population query failed (not cached).
-    pub async fn refresh(
+    pub async fn refresh<'e, E: sqlx::PgExecutor<'e>>(
         &self,
-        pool: &sqlx::PgPool,
+        executor: E,
         viewer: &epigraph_db::visibility::Viewer,
     ) -> Result<f64, sqlx::Error> {
-        let frac = embedded_3072_population(pool, viewer).await?;
+        let frac = embedded_3072_population(executor, viewer).await?;
         if let Ok(mut slots) = self.slots.lock() {
             if slots.len() >= Self::MAX_SCOPES {
                 let ttl = self.ttl;
@@ -203,8 +212,8 @@ impl CentroidPopulationCache {
 /// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
 /// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
 /// control. Both are annotated in the SQL rather than left silent.
-async fn compute_corpus_scope(
-    pool: &sqlx::PgPool,
+async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<CorpusScope, sqlx::Error> {
     // Per spec §3.1 / Locked-in 5.5: corpus_scope always populated on success.
@@ -245,7 +254,7 @@ async fn compute_corpus_scope(
         viewer.bypass_bind(),
         viewer.group_bind().unwrap_or(&[])
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(CorpusScope {
         claims_total: row.claims_total.unwrap_or(0).max(0) as usize,
@@ -899,6 +908,10 @@ pub async fn recall_with_context(
     let neighbor_paragraphs_limit = params.neighbor_paragraphs_limit.unwrap_or(16);
 
     // Stage 1: pick centroid_dim (request hint OR auto-detect via population threshold).
+    // The population reads run on the caller's stamped read: the cache is keyed
+    // by the viewer's binds, so it must be filled by what that viewer's session
+    // reads (the plain pool's session reads public rows only). Released before
+    // the embedding round trip.
     let centroid_dim = match params.centroid_dim {
         Some(d) if d == 1536 || d == 3072 => d,
         Some(d) => {
@@ -906,9 +919,14 @@ pub async fn recall_with_context(
                 "centroid_dim must be 1536 or 3072 (got {d})"
             )));
         }
-        None => detect_centroid_dim(&server.centroid_population, &server.pool, viewer)
-            .await
-            .map_err(|e| recall_fault("could not detect the centroid dimension", e))?,
+        None => {
+            let mut read = server.read_as(viewer, "recall_with_context").await?;
+            let dim = detect_centroid_dim(&server.centroid_population, &mut *read, viewer)
+                .await
+                .map_err(|e| recall_fault("could not detect the centroid dimension", e))?;
+            read.commit().await.map_err(internal_error)?;
+            dim
+        }
     };
 
     // Spec §3.4: explicit 3072 against an unpopulated column must error
@@ -920,10 +938,16 @@ pub async fn recall_with_context(
     if matches!(params.centroid_dim, Some(3072)) {
         let cache = &server.centroid_population;
         let frac = match cache.cached(viewer) {
-            Some(frac) if frac > 0.0 => Ok(frac),
-            _ => cache.refresh(&server.pool, viewer).await,
-        }
-        .map_err(|e| recall_fault("could not check the 3072-dim embedding population", e))?;
+            Some(frac) if frac > 0.0 => frac,
+            _ => {
+                let mut read = server.read_as(viewer, "recall_with_context").await?;
+                let frac = cache.refresh(&mut *read, viewer).await.map_err(|e| {
+                    recall_fault("could not check the 3072-dim embedding population", e)
+                })?;
+                read.commit().await.map_err(internal_error)?;
+                frac
+            }
+        };
         if frac == 0.0 {
             return Err(invalid_params(
                 "centroid_dim=3072 requested but embedding_3072 has no populated rows among the embedded claims; re-run with centroid_dim=1536 or omit to auto-detect"
@@ -948,8 +972,10 @@ pub async fn recall_with_context(
         params.perspective_id.as_deref(),
     )?;
     if let Some((frame_id, perspective_id)) = lens {
-        crate::tools::lens::validate_lens_exists(&server.pool, viewer, frame_id, perspective_id)
+        let mut read = server.read_as(viewer, "recall_with_context").await?;
+        crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
             .await?;
+        read.commit().await.map_err(internal_error)?;
     }
 
     recall_with_context_post_embed(
@@ -1011,7 +1037,7 @@ const GRAPH_EXPANSION_DEGREE_WEIGHT: f64 = 0.1;
 ///    ([`epigraph_db::ClaimRepository::in_epistemic_degree_batch`]) — not
 ///    one query per claim.
 async fn apply_graph_expansion(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     seeds: Vec<epigraph_db::ClaimEmbeddingHit>,
     depth: u32,
@@ -1027,8 +1053,8 @@ async fn apply_graph_expansion(
     // walk itself is not pruned (an old claim may bridge to a new one); only
     // the emitted destinations are, and only in-window destinations consume
     // the expansion budget.
-    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds_since(
-        pool, viewer, &seed_ids, depth, since,
+    let expansion = epigraph_db::ClaimRepository::graph_expand_seeds_since_conn(
+        &mut *conn, viewer, &seed_ids, depth, since,
     )
     .await
     .map_err(|e| recall_fault("graph expansion could not traverse from the seed claims", e))?;
@@ -1078,7 +1104,7 @@ async fn apply_graph_expansion(
     }
 
     let all_ids: Vec<Uuid> = combined.iter().map(|h| h.claim_id).collect();
-    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(pool, viewer, &all_ids)
+    let degree = epigraph_db::ClaimRepository::in_epistemic_degree_batch(conn, viewer, &all_ids)
         .await
         .map_err(|e| recall_fault("could not read the candidates' epistemic degree", e))?;
 
@@ -1126,6 +1152,12 @@ async fn recall_with_context_post_embed(
         .map(crate::types::validate_diversity_radius)
         .transpose()
         .map_err(invalid_params)?;
+
+    // Every read of the pipeline on ONE connection stamped with the caller's
+    // viewer: on the plain pool row security admits public rows only, so a
+    // member's own group-private claims would never be seeds, context or
+    // corpus counts.
+    let mut read = server.read_as(viewer, "recall_with_context").await?;
 
     // Stage 3: candidate retrieval. Two paths:
     //
@@ -1190,11 +1222,8 @@ async fn recall_with_context_post_embed(
             // silently ignore `since`.
             since: params.since,
         };
-        let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline(
-            &server.pool,
-            viewer,
-            pgvec,
-            config,
+        let selected = epigraph_engine::diverse_retrieval::run_diverse_pipeline_conn(
+            &mut read, viewer, pgvec, config,
         )
         .await
         .map_err(|e| recall_fault("diverse retrieval failed", e))?;
@@ -1204,8 +1233,8 @@ async fn recall_with_context_post_embed(
             // or no candidates in themes — fall back to flat ANN so callers
             // still get relevant results in an unclustered, partially
             // clustered, or stale-clustered corpus.
-            epigraph_db::ClaimRepository::search_by_embedding_since(
-                &server.pool,
+            epigraph_db::ClaimRepository::search_by_embedding_since_conn(
+                &mut read,
                 viewer,
                 pgvec,
                 centroid_dim,
@@ -1230,8 +1259,8 @@ async fn recall_with_context_post_embed(
     } else {
         // Flat whole-corpus kNN (every embedded claim the viewer can see, at
         // any level; optional paper_doi pre-filter).
-        epigraph_db::ClaimRepository::search_by_embedding_since(
-            &server.pool,
+        epigraph_db::ClaimRepository::search_by_embedding_since_conn(
+            &mut read,
             viewer,
             pgvec,
             centroid_dim,
@@ -1246,7 +1275,7 @@ async fn recall_with_context_post_embed(
 
     if raw_hits.is_empty() {
         // Empty result still returns corpus_scope (#52 Finding 2).
-        let corpus_scope = compute_corpus_scope(&server.pool, viewer)
+        let corpus_scope = compute_corpus_scope(&mut *read, viewer)
             .await
             .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
         let event_id = Uuid::new_v4();
@@ -1296,8 +1325,7 @@ async fn recall_with_context_post_embed(
     // ANN seeds — matching "expand seeds, then rank" rather than "rank seeds,
     // then expand the winners".
     if let Some(depth) = params.graph_expansion_depth {
-        raw_hits =
-            apply_graph_expansion(&server.pool, viewer, raw_hits, depth, params.since).await?;
+        raw_hits = apply_graph_expansion(&mut read, viewer, raw_hits, depth, params.since).await?;
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
@@ -1310,7 +1338,7 @@ async fn recall_with_context_post_embed(
     > = std::collections::HashMap::new();
     if params.rerank.unwrap_or(false) {
         let ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
-        let contents = epigraph_db::ClaimRepository::contents_by_ids(&server.pool, viewer, &ids)
+        let contents = epigraph_db::ClaimRepository::contents_by_ids(&mut *read, viewer, &ids)
             .await
             .map_err(|e| recall_fault("could not fetch claim content for reranking", e))?;
         let cands: Vec<epigraph_engine::rerank::RerankCandidate> = raw_hits
@@ -1399,7 +1427,7 @@ async fn recall_with_context_post_embed(
     // Stage 5: batch context fetches.
     let paragraph_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
     let ctx = fetch_batched_context(
-        &server.pool,
+        &mut read,
         viewer,
         &paragraph_ids,
         siblings_limit,
@@ -1435,7 +1463,7 @@ async fn recall_with_context_post_embed(
         .into_iter()
         .collect();
     let belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
-        &server.pool,
+        &mut *read,
         viewer,
         &belief_ids,
     )
@@ -1595,8 +1623,8 @@ async fn recall_with_context_post_embed(
         // claim carries its own `Result`, so one malformed claim warns + serves
         // a null lens without aborting the page.
         let claim_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
-        match epigraph_engine::belief_query::get_perspective_belief_batch(
-            &server.pool,
+        match epigraph_engine::belief_query::get_perspective_belief_batch_conn(
+            &mut read,
             viewer,
             &claim_ids,
             frame_id,
@@ -1654,8 +1682,7 @@ async fn recall_with_context_post_embed(
     // dispute status can recall it as a hit in its own right.
     {
         let paragraph_ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
-        match epigraph_db::ClaimRepository::dispute_batch(&server.pool, viewer, &paragraph_ids)
-            .await
+        match epigraph_db::ClaimRepository::dispute_batch(&mut *read, viewer, &paragraph_ids).await
         {
             Ok(mut by_claim) => {
                 for hit in &mut results {
@@ -1721,7 +1748,7 @@ async fn recall_with_context_post_embed(
     if let Some(radius) = diversity_radius {
         let ids: Vec<Uuid> = results.iter().map(|h| h.paragraph_id).collect();
         match epigraph_db::ClaimRepository::pairwise_cosine_distance_at_dim(
-            &server.pool,
+            &mut *read,
             viewer,
             &ids,
             radius,
@@ -1757,7 +1784,7 @@ async fn recall_with_context_post_embed(
         }
     }
 
-    let corpus_scope = compute_corpus_scope(&server.pool, viewer)
+    let corpus_scope = compute_corpus_scope(&mut *read, viewer)
         .await
         .map_err(|e| recall_fault("could not compute the corpus scope", e))?;
 
@@ -1885,8 +1912,13 @@ pub struct BatchedContext {
 /// the filter — is delivered here; the relocation is recorded as outstanding in
 /// `crates/epigraph-mcp/tests/no_inline_sql_in_tools.rs`'s expected set, which
 /// is an exact-set ratchet, so it cannot quietly grow.
+///
+/// `conn` is the tool's viewer-stamped read (`EpiGraphMcpFull::read_as`), so
+/// every statement runs under the viewer's own session GUCs: on an unstamped
+/// session row security admits public rows only, whatever the predicate
+/// admits. (A test holding a pool goes through `__test_only`'s wrapper.)
 pub async fn fetch_batched_context(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     paragraph_ids: &[Uuid],
     siblings_limit: u32,
@@ -1959,7 +1991,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             paragraph_to_section.insert(r.paragraph_id, r.section_id);
@@ -2008,7 +2040,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             atoms_total_by_paragraph
@@ -2050,7 +2082,7 @@ pub async fn fetch_batched_context(
                 v_bypass,
                 v_groups
             )
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
             let mut all_parents: std::collections::HashMap<Uuid, Vec<Uuid>> = Default::default();
             for r in rows {
@@ -2096,7 +2128,7 @@ pub async fn fetch_batched_context(
                 v_bypass,
                 v_groups
             )
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
 
             // Group by section_id.
@@ -2185,7 +2217,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             corroborates_total_by_paragraph
@@ -2292,7 +2324,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             epistemic_edges_total_by_paragraph
@@ -2337,7 +2369,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             continues_argument_by_paragraph
@@ -2392,7 +2424,7 @@ pub async fn fetch_batched_context(
                 v_bypass,
                 v_groups
             )
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
             for r in rows {
                 atom_atom_links_by_atom
@@ -2426,7 +2458,7 @@ pub async fn fetch_batched_context(
                 v_bypass,
                 v_groups
             )
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await?;
             for r in rows {
                 paragraphs_by_atom
@@ -2473,7 +2505,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             paragraph_meta.insert(
@@ -2509,7 +2541,7 @@ pub async fn fetch_batched_context(
             v_bypass,
             v_groups
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
         for r in rows {
             paper_meta.insert(
@@ -2690,9 +2722,37 @@ pub fn assemble_neighbor_paragraphs(
 #[doc(hidden)]
 pub mod __test_only {
     pub use super::{
-        assemble_neighbor_paragraphs, embedded_3072_population, fetch_batched_context,
-        BatchedContext, ParagraphCore,
+        assemble_neighbor_paragraphs, embedded_3072_population, BatchedContext, ParagraphCore,
     };
+
+    /// [`super::fetch_batched_context`] for a test holding a pool (or any
+    /// [`sqlx::Acquire`]): one connection, acquired here, carries every
+    /// statement, as the tool's stamped read does.
+    ///
+    /// # Errors
+    /// As [`super::fetch_batched_context`], plus the acquire.
+    pub async fn fetch_batched_context<'a, A>(
+        executor: A,
+        viewer: &epigraph_db::visibility::Viewer,
+        paragraph_ids: &[uuid::Uuid],
+        siblings_limit: u32,
+        corroborates_limit: u32,
+        epistemic_limit: u32,
+    ) -> Result<BatchedContext, sqlx::Error>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
+        let mut conn = executor.acquire().await?;
+        super::fetch_batched_context(
+            &mut conn,
+            viewer,
+            paragraph_ids,
+            siblings_limit,
+            corroborates_limit,
+            epistemic_limit,
+        )
+        .await
+    }
     use super::{
         recall_with_context_post_embed, EpiGraphMcpFull, McpError, RecallWithContextParams,
     };
@@ -2748,13 +2808,10 @@ pub mod __test_only {
             params.perspective_id.as_deref(),
         )?;
         if let Some((frame_id, perspective_id)) = lens {
-            crate::tools::lens::validate_lens_exists(
-                &server.pool,
-                viewer,
-                frame_id,
-                perspective_id,
-            )
-            .await?;
+            let mut read = server.read_as(viewer, "recall_with_context").await?;
+            crate::tools::lens::validate_lens_exists(&mut read, viewer, frame_id, perspective_id)
+                .await?;
+            read.commit().await.map_err(crate::errors::internal_error)?;
         }
         recall_with_context_post_embed(
             server,

@@ -247,9 +247,11 @@ pub async fn list_challenges(
 ) -> Result<CallToolResult, McpError> {
     let claim_id = parse_uuid(&params.claim_id)?;
 
-    let challenges = ChallengeRepository::list_for_claim(&server.pool, viewer, claim_id)
+    let mut read = server.read_as(viewer, "list_challenges").await?;
+    let challenges = ChallengeRepository::list_for_claim(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?;
+    read.commit().await.map_err(internal_error)?;
 
     let results: Vec<serde_json::Value> = challenges
         .into_iter()

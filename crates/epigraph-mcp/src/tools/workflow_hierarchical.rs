@@ -89,38 +89,21 @@ pub async fn find_workflow_hierarchical(
     // Both searches read `workflows` rows, which carry their plan's tenancy
     // (ruling R-74, migration 183): run them as the CALLER, on one
     // viewer-stamped read taken after the embedding round trip, so a member
-    // finds its group's workflows and nobody else does. A server with no
-    // tenancy-aware pool (a development superuser) reads its plain pool.
-    let mut read = match server.scoped.as_ref() {
-        Some(scoped) => Some(scoped.read_as(viewer).await.map_err(internal_error)?),
-        None => None,
-    };
+    // finds its group's workflows and nobody else does. The step resolution
+    // below reads claims and edges on the same read. A server with no
+    // tenancy-aware pool refuses (`EpiGraphMcpFull::read_as`).
+    let mut read = server.read_as(viewer, "find_workflow_hierarchical").await?;
     let mut rows = match qvec {
         Some(qvec) => {
-            let found = match read.as_mut() {
-                Some(read) => {
-                    epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
-                        &mut **read,
-                        &qvec,
-                        similarity_threshold,
-                        min_truth,
-                        limit,
-                        resolve_to_latest,
-                    )
-                    .await
-                }
-                None => {
-                    epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
-                        &server.pool,
-                        &qvec,
-                        similarity_threshold,
-                        min_truth,
-                        limit,
-                        resolve_to_latest,
-                    )
-                    .await
-                }
-            };
+            let found = epigraph_db::WorkflowRepository::find_hierarchical_by_embedding(
+                &mut *read,
+                &qvec,
+                similarity_threshold,
+                min_truth,
+                limit,
+                resolve_to_latest,
+            )
+            .await;
             match found {
                 Ok(rs) if !rs.is_empty() => {
                     search_path = "embedding";
@@ -140,32 +123,15 @@ pub async fn find_workflow_hierarchical(
     };
 
     if rows.is_empty() {
-        rows = match read.as_mut() {
-            Some(read) => {
-                epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-                    &mut **read,
-                    &params.query,
-                    limit,
-                    min_truth,
-                    resolve_to_latest,
-                )
-                .await
-            }
-            None => {
-                epigraph_db::WorkflowRepository::search_hierarchical_by_text(
-                    &server.pool,
-                    &params.query,
-                    limit,
-                    min_truth,
-                    resolve_to_latest,
-                )
-                .await
-            }
-        }
+        rows = epigraph_db::WorkflowRepository::search_hierarchical_by_text(
+            &mut *read,
+            &params.query,
+            limit,
+            min_truth,
+            resolve_to_latest,
+        )
+        .await
         .map_err(internal_error)?;
-    }
-    if let Some(read) = read {
-        read.commit().await.map_err(internal_error)?;
     }
 
     // With `resolve_to_latest` both searches add the head of every matched
@@ -198,15 +164,17 @@ pub async fn find_workflow_hierarchical(
         }
 
         if resolve_to_latest {
-            let resolved =
-                epigraph_db::WorkflowRepository::resolve_steps_to_heads(&server.pool, viewer, r.id)
-                    .await
-                    .map_err(internal_error)?;
+            let resolved = epigraph_db::WorkflowRepository::resolve_steps_to_heads_conn(
+                &mut read, viewer, r.id,
+            )
+            .await
+            .map_err(internal_error)?;
             entry["resolved_steps"] = serde_json::to_value(resolved).map_err(internal_error)?;
         }
 
         workflows.push(entry);
     }
+    read.commit().await.map_err(internal_error)?;
 
     success_json(&serde_json::json!({
         "workflows": workflows,

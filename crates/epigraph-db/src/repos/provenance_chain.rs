@@ -96,7 +96,6 @@ impl ProvenanceChainRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the traversal or hydration query
     /// fails.
-    #[instrument(skip(pool, viewer))]
     pub async fn chain(
         pool: &PgPool,
         viewer: &crate::visibility::Viewer,

@@ -30,7 +30,8 @@ pub async fn get_neighborhood(
     // (backlog cdd8d097). The repo reads below key on `(id, type)`, and this
     // tool used to pass the literal "claim", so a paper, workflow or agent node
     // returned 0 edges.
-    let node_types = EdgeRepository::endpoint_types(&server.pool, viewer, node_id)
+    let mut read = server.read_as(viewer, "get_neighborhood").await?;
+    let node_types = EdgeRepository::endpoint_types(&mut *read, viewer, node_id)
         .await
         .map_err(internal_error)?;
 
@@ -46,7 +47,7 @@ pub async fn get_neighborhood(
 
     if direction == "outgoing" || direction == "both" {
         for node_type in &node_types {
-            let outgoing = EdgeRepository::get_by_source(&server.pool, viewer, node_id, node_type)
+            let outgoing = EdgeRepository::get_by_source(&mut *read, viewer, node_id, node_type)
                 .await
                 .map_err(internal_error)?;
             edges.extend(
@@ -60,7 +61,7 @@ pub async fn get_neighborhood(
 
     if direction == "incoming" || direction == "both" {
         for node_type in &node_types {
-            let incoming = EdgeRepository::get_by_target(&server.pool, viewer, node_id, node_type)
+            let incoming = EdgeRepository::get_by_target(&mut *read, viewer, node_id, node_type)
                 .await
                 .map_err(internal_error)?;
             edges.extend(
@@ -132,7 +133,8 @@ pub async fn traverse(
     let mut queue: VecDeque<(uuid::Uuid, i32, Vec<String>)> = VecDeque::new();
     let mut depth_reached = 0;
 
-    let start_types = EdgeRepository::endpoint_types(&server.pool, viewer, start_id)
+    let mut read = server.read_as(viewer, "traverse").await?;
+    let start_types = EdgeRepository::endpoint_types(&mut *read, viewer, start_id)
         .await
         .unwrap_or_default();
     queue.push_back((start_id, 0, start_types));
@@ -149,7 +151,7 @@ pub async fn traverse(
         // still probed as a claim, as before.
         let may_be_claim = node_types.is_empty() || node_types.iter().any(|t| t == "claim");
         let (label, truth) = if may_be_claim {
-            match ClaimRepository::get_by_id(&server.pool, viewer, ClaimId::from_uuid(current_id))
+            match ClaimRepository::get_by_id(&mut *read, viewer, ClaimId::from_uuid(current_id))
                 .await
             {
                 Ok(Some(claim)) => (
@@ -176,7 +178,7 @@ pub async fn traverse(
         let belief_score = match truth {
             Some(tv) if min_truth > 0.0 => {
                 let resolved = ClaimRepository::effective_belief_batch(
-                    &server.pool,
+                    &mut *read,
                     viewer,
                     std::slice::from_ref(&current_id),
                 )
@@ -232,7 +234,7 @@ pub async fn traverse(
             };
             for node_type in &expand_as {
                 let outgoing =
-                    EdgeRepository::get_by_source(&server.pool, viewer, current_id, node_type)
+                    EdgeRepository::get_by_source(&mut *read, viewer, current_id, node_type)
                         .await
                         .unwrap_or_default();
 

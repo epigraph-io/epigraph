@@ -4664,7 +4664,7 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
     let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read", "claims:write"]).await;
     let bytes = profile_bytes();
     for allowed in [&[][..], &["some-other-index"][..]] {
-        let server = build_test_server(pool.clone())
+        let server = build_unscoped_test_server(pool.clone())
             .with_label_dedup_config(config_allowing(None, None, 5000, allowed));
         let p = plan_params_json(&bytes, DEDUP);
         let e = plan_label_dedup(
@@ -4699,7 +4699,8 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
         assert_eq!(code(&e), "FAMILY_NOT_ALLOWED", "{}", e.message);
     }
     // Calibration: allowlisted, the same unscoped server reaches the read.
-    let server = build_test_server(pool.clone()).with_label_dedup_config(config(None, None, 5000));
+    let server =
+        build_unscoped_test_server(pool.clone()).with_label_dedup_config(config(None, None, 5000));
     let e = plan_label_dedup(
         &server,
         &viewer,
@@ -4725,7 +4726,7 @@ async fn a_family_off_the_allowlist_is_refused_before_any_read(pool: PgPool) {
 async fn a_non_index_family_is_refused_before_any_read_by_every_tool(pool: PgPool) {
     let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read", "claims:write"]).await;
     let unscoped = |families: &[&str]| {
-        build_test_server(pool.clone())
+        build_unscoped_test_server(pool.clone())
             .with_label_dedup_config(config_allowing(None, None, 5000, families))
     };
     let mut knowledge = profile_value();

@@ -1076,6 +1076,34 @@ impl ScopedPool {
         Ok(id)
     }
 
+    /// TEST SUPPORT ONLY (the `test-support` feature): [`Self::connect`]
+    /// without the `async`, connecting LAZILY on first acquire with the
+    /// options of a pool the caller already holds (a `#[sqlx::test]` pool's
+    /// `connect_options()`), and with the same after-connect hooks and
+    /// release scrub, because it is built by the same builder.
+    ///
+    /// Why: `epigraph-mcp`'s synchronous test-server constructor gives every
+    /// fixture a `ScopedPool` (its read tools refuse without one, as a
+    /// deployed server's would), and it cannot await a connect. Lazy, so a
+    /// fixture that never reads opens no connection. The role is whatever
+    /// `options` connects as; nothing is downgraded.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn connect_lazy_for_tests(
+        options: sqlx::postgres::PgConnectOptions,
+        mode: SessionGucMode,
+    ) -> Self {
+        let inner = Self::pool_options(ScopedPoolOptions::default(), None, false)
+            .connect_lazy_with(options);
+        Self {
+            inner,
+            mode,
+            maintenance: None,
+            records_elevated_access: false,
+        }
+    }
+
     async fn connect_inner(
         database_url: &str,
         mode: SessionGucMode,
@@ -1083,11 +1111,39 @@ impl ScopedPool {
         downgrade_to: Option<&'static str>,
         access_recorder: bool,
     ) -> Result<Self, DbError> {
+        let inner = Self::pool_options(options, downgrade_to, access_recorder)
+            .connect(database_url)
+            .await
+            .map_err(|source| DbError::ConnectionFailed { source })?;
+
+        info!(
+            mode = ?mode,
+            max_connections = options.max_connections,
+            statement_timeout_ms = options.statement_timeout.map(|t| t.as_millis() as u64),
+            "ScopedPool created"
+        );
+        Ok(Self {
+            inner,
+            mode,
+            maintenance: None,
+            records_elevated_access: access_recorder,
+        })
+    }
+
+    /// The ONE builder every `ScopedPool` constructor connects through: the
+    /// after-connect hooks (downgrade, statement timeout, operator-binding
+    /// valve, recorder declaration) and the release scrub. Shared so a
+    /// constructor cannot get the pool without the scrub.
+    fn pool_options(
+        options: ScopedPoolOptions,
+        downgrade_to: Option<&'static str>,
+        access_recorder: bool,
+    ) -> PgPoolOptions {
         let statement_timeout = options.statement_timeout;
         // Read the operator-binding valve (migration 122) now, so a process
         // whose valve is off logs its WARN at boot, before any connection.
         crate::operator_binding::enforcement();
-        let inner = PgPoolOptions::new()
+        PgPoolOptions::new()
             .max_connections(options.max_connections)
             .acquire_timeout(options.acquire_timeout)
             .after_connect(move |conn, _meta| {
@@ -1145,22 +1201,6 @@ impl ScopedPool {
                     }
                 })
             })
-            .connect(database_url)
-            .await
-            .map_err(|source| DbError::ConnectionFailed { source })?;
-
-        info!(
-            mode = ?mode,
-            max_connections = options.max_connections,
-            statement_timeout_ms = options.statement_timeout.map(|t| t.as_millis() as u64),
-            "ScopedPool created"
-        );
-        Ok(Self {
-            inner,
-            mode,
-            maintenance: None,
-            records_elevated_access: access_recorder,
-        })
     }
 
     /// Attach the privileged pool [`Self::unscoped_for_maintenance`] draws from.

@@ -423,8 +423,8 @@ impl ClaimThemeRepository {
     /// tenancy table (migration 062's `tier_a` does not list it), so the theme
     /// ROWS are corpus-wide by design and only the counts narrow — which is
     /// what keeps this consistent with [`Self::count_summaries`].
-    pub async fn list_summaries(
-        pool: &PgPool,
+    pub async fn list_summaries<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         label_prefix: Option<&str>,
         limit: i64,
@@ -457,7 +457,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $4
         }
-        let rows = q.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = q.fetch_all(executor).await.map_err(DbError::from)?;
         Ok(rows)
     }
 
@@ -573,8 +573,8 @@ impl ClaimThemeRepository {
     /// an unfiltered read but does not remove it: claim IDs, truth values and
     /// timestamps for rows the caller cannot read are themselves a disclosure,
     /// and every id returned here is directly resolvable via `get_claim`.
-    pub async fn member_claim_ids(
-        pool: &PgPool,
+    pub async fn member_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         viewer: &crate::visibility::Viewer,
         theme_id: Uuid,
         limit: i64,
@@ -596,7 +596,7 @@ impl ClaimThemeRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g); // $4
         }
-        let rows = q.fetch_all(pool).await.map_err(DbError::from)?;
+        let rows = q.fetch_all(executor).await.map_err(DbError::from)?;
         Ok(rows)
     }
 

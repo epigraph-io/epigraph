@@ -180,9 +180,10 @@ pub fn theme_coverage_allows_diverse<E: std::fmt::Display>(
 /// would have authored a connection-taking form that neither connection-shape
 /// lint in `epigraph-db/tests/visibility_lint.rs` can see, because their
 /// `repos_dir()` is a non-recursive `read_dir` over `epigraph-db/src/repos`.
-/// The remaining callers, enumerated rather than gestured at: [`run_diverse_pipeline`]
-/// — which is how MCP `recall.rs` reaches this wrapper, transitively; it does
-/// not call it directly — and `epigraph-engine/tests/diverse_retrieval_integration.rs`.
+/// The remaining caller, enumerated rather than gestured at:
+/// `epigraph-engine/tests/diverse_retrieval_integration.rs`.
+/// [`run_diverse_pipeline_conn`] (and so MCP `recall.rs`) calls the repo
+/// function directly on its stamped connection, for the reason above.
 pub async fn find_similar_themes_at_dim(
     pool: &PgPool,
     query_pgvec: &str,
@@ -208,9 +209,9 @@ pub async fn find_similar_themes_at_dim(
 /// onto a viewer-stamped connection calling
 /// `ClaimThemeRepository::claims_in_themes_at_dim_since` directly (see
 /// [`find_similar_themes_at_dim`] for why the route bypasses these wrappers
-/// rather than widening them). [`run_diverse_pipeline`] calls the `_since`
-/// sibling, not this one; the only remaining mentions of this name in the
-/// workspace are comments.
+/// rather than widening them). [`run_diverse_pipeline_conn`] calls the repo's
+/// `_since` function directly, not this one; the only remaining mentions of
+/// this name in the workspace are comments.
 ///
 /// Retained rather than removed: deleting a `pub` engine API is a decision for
 /// a shard that owns this crate's surface, not for a route conversion.
@@ -388,9 +389,39 @@ pub async fn run_diverse_pipeline(
     query_pgvec: &str,
     config: DiverseRetrievalConfig,
 ) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
-    let themes =
-        find_similar_themes_at_dim(pool, query_pgvec, config.max_themes, config.centroid_dim)
-            .await?;
+    let mut conn = pool.acquire().await?;
+    run_diverse_pipeline_conn(&mut conn, viewer, query_pgvec, config).await
+}
+
+/// [`run_diverse_pipeline`] on a caller-supplied connection: the form a
+/// request reaches through `ScopedPool::read_as`, so the theme lookup, the
+/// coverage probe and the candidate pull run under the viewer's own session
+/// and row security agrees with the in-query predicates. The pool form
+/// delegates here.
+///
+/// The coverage probe fails OPEN (see [`theme_coverage_allows_diverse`]), so
+/// it runs in a nested transaction (a savepoint when `conn` is already in one,
+/// which it is under `SessionGucMode::Transaction`): a failed probe is rolled
+/// back rather than aborting the caller's transaction, whose next statement
+/// is the flat fallback.
+///
+/// # Errors
+/// As [`run_diverse_pipeline`], plus a failure to open or close the probe's
+/// bracket.
+pub async fn run_diverse_pipeline_conn(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    query_pgvec: &str,
+    config: DiverseRetrievalConfig,
+) -> Result<Vec<(Uuid, String, f64)>, sqlx::Error> {
+    let themes = ClaimThemeRepository::find_similar_themes_at_dim(
+        &mut *conn,
+        query_pgvec,
+        config.max_themes,
+        config.centroid_dim,
+    )
+    .await
+    .map_err(db_error_to_sqlx)?;
 
     if themes.is_empty() {
         return Ok(vec![]);
@@ -405,8 +436,9 @@ pub async fn run_diverse_pipeline(
     // (same candidate space, before theme restriction) is reachable through
     // the shortlist. MCP's candidate space is one dimension throughout, so the
     // neighbourhood and reachability dimensions are both `centroid_dim`.
+    let mut bracket = sqlx::Connection::begin(&mut *conn).await?;
     let probe = ClaimThemeRepository::nearest_theme_coverage_since(
-        pool,
+        &mut *bracket,
         viewer,
         query_pgvec,
         config.centroid_dim,
@@ -417,12 +449,17 @@ pub async fn run_diverse_pipeline(
         config.since,
     )
     .await;
+    if probe.is_ok() {
+        bracket.commit().await?;
+    } else {
+        bracket.rollback().await?;
+    }
     if !theme_coverage_allows_diverse(probe, "run_diverse_pipeline", config.centroid_dim) {
         return Ok(vec![]);
     }
 
-    let candidates = candidates_in_themes_at_dim_since(
-        pool,
+    let candidates = ClaimThemeRepository::claims_in_themes_at_dim_since(
+        &mut *conn,
         viewer,
         &theme_ids,
         query_pgvec,
@@ -431,7 +468,8 @@ pub async fn run_diverse_pipeline(
         config.paragraph_only,
         config.since,
     )
-    .await?;
+    .await
+    .map_err(db_error_to_sqlx)?;
 
     if candidates.is_empty() {
         return Ok(vec![]);

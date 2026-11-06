@@ -22,51 +22,6 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
     )]))
 }
 
-/// One read of `workflows` rows as the CALLER.
-///
-/// Since migration 183 (ruling R-74) a `workflows` row carries its plan's
-/// tenancy under FORCEd row security. On the server's plain application pool
-/// (an unstamped session) that policy admits public rows only, so a reader
-/// run there hides a group's workflows from the group's own members. Every
-/// reader of `workflows` rows on behalf of a caller opens one of these: a read
-/// stamped from the caller's viewer on the tenancy-aware pool, or, on a server
-/// without one (a development superuser), a connection of its plain pool, as
-/// before. Keep it short-lived: it holds a connection until [`Self::close`].
-pub(crate) enum CallerRead<'a> {
-    Stamped(epigraph_db::ScopedRead<'a>),
-    Plain(sqlx::pool::PoolConnection<sqlx::Postgres>),
-}
-
-impl<'a> CallerRead<'a> {
-    pub(crate) async fn open(
-        server: &'a EpiGraphMcpFull,
-        viewer: &epigraph_db::visibility::Viewer,
-    ) -> Result<Self, McpError> {
-        match server.scoped.as_ref() {
-            Some(scoped) => Ok(Self::Stamped(
-                scoped.read_as(viewer).await.map_err(internal_error)?,
-            )),
-            None => Ok(Self::Plain(
-                server.pool.acquire().await.map_err(internal_error)?,
-            )),
-        }
-    }
-
-    pub(crate) fn conn(&mut self) -> &mut sqlx::PgConnection {
-        match self {
-            Self::Stamped(read) => read,
-            Self::Plain(conn) => conn,
-        }
-    }
-
-    pub(crate) async fn close(self) -> Result<(), McpError> {
-        match self {
-            Self::Stamped(read) => read.commit().await.map_err(internal_error),
-            Self::Plain(_) => Ok(()),
-        }
-    }
-}
-
 /// Read-only window into a workflow's recent behavioral executions, newest
 /// first: per-run `success`, `quality`, `tool_pattern`, `deviation_count`, and
 /// `step_beliefs` (per-step `deviation_reason`), plus a `window_success_rate`.
@@ -496,9 +451,15 @@ async fn find_workflow_post_embed(
     // not evidence; evidence.embedding is 100% empty in prod). Scoped to the
     // "workflow" label so only workflow claims compete for the budget.
     let workflow_tag = vec!["workflow".to_string()];
+    // Every read below runs as the CALLER, on ONE connection stamped with its
+    // viewer: claims, edges and (since migration 183, ruling R-74) `workflows`
+    // rows carry tenancy under FORCEd row security, and on the plain
+    // application pool only public rows would be found, the caller's own
+    // group's workflows included.
+    let mut read = server.read_as(viewer, "find_workflow").await?;
     let semantic_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
         ClaimRepository::search_by_embedding_scoped(
-            &server.pool,
+            &mut *read,
             viewer,
             pgvec,
             limit * 3,
@@ -515,10 +476,7 @@ async fn find_workflow_post_embed(
     let affinity_map: std::collections::HashMap<uuid::Uuid, (f64, i64)> =
         if let Some(pgvec) = pgvec_opt.as_deref() {
             match BehavioralExecutionRepository::behavioral_affinity_lineage(
-                &server.pool,
-                viewer,
-                pgvec,
-                0.5, // min_similarity
+                &mut *read, viewer, pgvec, 0.5, // min_similarity
                 1,   // min_executions
                 20,  // limit
             )
@@ -542,18 +500,10 @@ async fn find_workflow_post_embed(
     // would let hierarchical roots push flat roots out of it. The key spaces
     // are disjoint (a `workflows.id` is never a claim id), so extending the
     // map cannot overwrite a flat entry.
-    //
-    // Every read of `workflows` rows below runs as the CALLER (`CallerRead`):
-    // since migration 183 (ruling R-74) each row carries its plan's tenancy,
-    // and on the plain application pool only public rows would be found, the
-    // caller's own group's workflows included.
     let mut affinity_map = affinity_map;
     if let Some(pgvec) = pgvec_opt.as_deref() {
-        let mut read = CallerRead::open(server, viewer).await?;
         match BehavioralExecutionRepository::behavioral_affinity_hierarchical(
-            read.conn(),
-            pgvec,
-            0.5, // min_similarity
+            &mut *read, pgvec, 0.5, // min_similarity
             1,   // min_executions
             20,  // limit
         )
@@ -564,7 +514,6 @@ async fn find_workflow_post_embed(
             }
             Err(e) => tracing::warn!("hierarchical behavioral affinity lookup failed: {e}"),
         }
-        read.close().await?;
     }
 
     // Hierarchical leg (backlog 18168514). `store_workflow` writes a row in the
@@ -577,9 +526,8 @@ async fn find_workflow_post_embed(
     // Best-effort: a failure here degrades to the flat-only behaviour rather
     // than blanking the whole tool.
     let hierarchical_hits = if let Some(pgvec) = pgvec_opt.as_deref() {
-        let mut read = CallerRead::open(server, viewer).await?;
-        let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
-            read.conn(),
+        WorkflowRepository::search_hierarchical_by_embedding_scored(
+            &mut *read,
             viewer,
             pgvec,
             min_truth,
@@ -589,9 +537,7 @@ async fn find_workflow_post_embed(
         .unwrap_or_else(|e| {
             tracing::warn!("hierarchical workflow embedding search failed: {e}");
             Vec::new()
-        });
-        read.close().await?;
-        hits
+        })
     } else {
         Vec::new()
     };
@@ -602,15 +548,13 @@ async fn find_workflow_post_embed(
     // rows whose steps cannot be resolved are dropped below rather than
     // surfaced hollow.
     let hierarchical_ids: Vec<uuid::Uuid> = hierarchical_hits.iter().map(|r| r.id).collect();
-    let mut read = CallerRead::open(server, viewer).await?;
     let mut hierarchical_steps =
-        WorkflowRepository::step_texts_for_hierarchical(read.conn(), viewer, &hierarchical_ids)
+        WorkflowRepository::step_texts_for_hierarchical(&mut read, viewer, &hierarchical_ids)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!("hierarchical step resolution failed: {e}");
                 std::collections::HashMap::new()
             });
-    read.close().await?;
 
     // Merge both stores onto ONE ranked list before truncating to `limit`.
     // Appending the hierarchical leg after the flat leg had already consumed
@@ -642,14 +586,14 @@ async fn find_workflow_post_embed(
         match candidate {
             Candidate::Flat(hit) => {
                 if let Ok(Some(claim)) = ClaimRepository::get_by_id(
-                    &server.pool,
+                    &mut *read,
                     viewer,
                     epigraph_core::ClaimId::from_uuid(hit.claim_id),
                 )
                 .await
                 {
                     if let Some(r) = enrich_workflow_result(
-                        &server.pool,
+                        &mut read,
                         viewer,
                         hit.claim_id,
                         &claim,
@@ -666,7 +610,8 @@ async fn find_workflow_post_embed(
             Candidate::Hierarchical(row) => {
                 let steps = hierarchical_steps.remove(&row.id).unwrap_or_default();
                 if let Some(r) =
-                    hierarchical_workflow_result(server, viewer, &row, steps, &affinity_map).await
+                    hierarchical_workflow_result(&mut read, viewer, &row, steps, &affinity_map)
+                        .await
                 {
                     results.push(r);
                 }
@@ -685,7 +630,7 @@ async fn find_workflow_post_embed(
     let half = (limit_usize / 2).max(1);
     if results.len() < half {
         let text_hits = ClaimRepository::search_by_label_and_text(
-            &server.pool,
+            &mut *read,
             viewer,
             &["workflow".to_string()],
             &params.goal,
@@ -710,7 +655,7 @@ async fn find_workflow_post_embed(
                 continue;
             }
             if let Some(r) = enrich_workflow_result(
-                &server.pool,
+                &mut read,
                 viewer,
                 claim_uuid,
                 &claim,
@@ -731,9 +676,8 @@ async fn find_workflow_post_embed(
     // integration tests run in — without this leg the union would be
     // unreachable exactly where it is cheapest to verify.
     if results.len() < half {
-        let mut read = CallerRead::open(server, viewer).await?;
         let text_rows = WorkflowRepository::search_hierarchical_by_text(
-            read.conn(),
+            &mut *read,
             &params.goal,
             limit * 2,
             min_truth,
@@ -744,7 +688,6 @@ async fn find_workflow_post_embed(
             tracing::warn!("search_hierarchical_by_text fallback failed: {e}");
             Vec::new()
         });
-        read.close().await?;
 
         let already_seen: std::collections::HashSet<String> =
             results.iter().map(|r| r.workflow_id.clone()).collect();
@@ -753,15 +696,13 @@ async fn find_workflow_post_embed(
             .filter(|r| !already_seen.contains(&r.id.to_string()))
             .map(|r| r.id)
             .collect();
-        let mut read = CallerRead::open(server, viewer).await?;
         let mut text_steps =
-            WorkflowRepository::step_texts_for_hierarchical(read.conn(), viewer, &text_ids)
+            WorkflowRepository::step_texts_for_hierarchical(&mut read, viewer, &text_ids)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!("hierarchical step resolution failed: {e}");
                     std::collections::HashMap::new()
                 });
-        read.close().await?;
 
         for row in text_rows {
             if results.len() >= limit_usize {
@@ -783,13 +724,14 @@ async fn find_workflow_post_embed(
             };
             let steps = text_steps.remove(&scored.id).unwrap_or_default();
             if let Some(r) =
-                hierarchical_workflow_result(server, viewer, &scored, steps, &affinity_map).await
+                hierarchical_workflow_result(&mut read, viewer, &scored, steps, &affinity_map).await
             {
                 results.push(r);
             }
         }
     }
 
+    read.commit().await.map_err(internal_error)?;
     success_json(&results)
 }
 
@@ -810,8 +752,10 @@ async fn find_workflow_post_embed(
 /// The truth floor is NOT re-applied here: both hierarchical queries already
 /// filter on `truth_value >= min_truth` in SQL, which is also what drops
 /// `deprecate_workflow`'s 0.05 rows.
+///
+/// `conn` is the caller's viewer-stamped read (`EpiGraphMcpFull::read_as`).
 async fn hierarchical_workflow_result(
-    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     row: &epigraph_db::ScoredHierarchicalWorkflowRow,
     steps: Vec<String>,
@@ -824,7 +768,6 @@ async fn hierarchical_workflow_result(
         );
         return None;
     }
-    let pool = &server.pool;
 
     // Counters live in `workflows.metadata`, written by
     // `report_hierarchical_outcome`; the flat store keeps the equivalents
@@ -840,7 +783,7 @@ async fn hierarchical_workflow_result(
         .and_then(serde_json::Value::as_i64)
         .unwrap_or(0);
 
-    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, row.id)
+    let lineage_root = WorkflowRepository::find_lineage_root(&mut *conn, viewer, row.id)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(workflow_id = %row.id, "find_lineage_root failed: {e}");
@@ -866,7 +809,7 @@ async fn hierarchical_workflow_result(
     // text. Best-effort: a failed lookup leaves the fields absent rather than
     // dropping the result.
     let (has_evolved_steps, evolved_steps) =
-        match WorkflowRepository::resolve_steps_to_heads(pool, viewer, row.id).await {
+        match WorkflowRepository::resolve_steps_to_heads_conn(&mut *conn, viewer, row.id).await {
             Ok(resolved) => {
                 let evolved: Vec<EvolvedStep> = resolved
                     .into_iter()
@@ -907,24 +850,15 @@ async fn hierarchical_workflow_result(
         };
     // The lineage's newest generation the CALLER reads: a generation declared
     // into a group it does not read is neither counted nor hinted at.
-    let latest_generation = match CallerRead::open(server, viewer).await {
-        Ok(mut read) => {
-            let max =
-                WorkflowRepository::max_generation_by_canonical(read.conn(), &row.canonical_name)
-                    .await;
-            if let Err(e) = read.close().await {
-                tracing::warn!(workflow_id = %row.id, "closing the caller read failed: {e:?}");
-            }
-            match max {
-                Ok(max) => max.map(i64::from),
-                Err(e) => {
-                    tracing::warn!(workflow_id = %row.id, "max_generation_by_canonical failed: {e}");
-                    None
-                }
-            }
-        }
+    let latest_generation = match WorkflowRepository::max_generation_by_canonical(
+        &mut *conn,
+        &row.canonical_name,
+    )
+    .await
+    {
+        Ok(max) => max.map(i64::from),
         Err(e) => {
-            tracing::warn!(workflow_id = %row.id, "caller read for the latest generation failed: {e:?}");
+            tracing::warn!(workflow_id = %row.id, "max_generation_by_canonical failed: {e}");
             None
         }
     };
@@ -959,7 +893,7 @@ async fn hierarchical_workflow_result(
 /// a goal nor steps. Used by both the semantic and text-fallback loops in
 /// `find_workflow` to keep enrichment behavior identical.
 async fn enrich_workflow_result(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     workflow_id: uuid::Uuid,
     claim: &Claim,
@@ -995,7 +929,7 @@ async fn enrich_workflow_result(
 
     // Look up behavioral data via lineage root (best-effort; reuse the
     // affinity_map already built from the original embedding query).
-    let lineage_root = WorkflowRepository::find_lineage_root(pool, viewer, workflow_id)
+    let lineage_root = WorkflowRepository::find_lineage_root(&mut *conn, viewer, workflow_id)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(workflow_id = %workflow_id, "find_lineage_root failed: {e}");
@@ -1011,7 +945,8 @@ async fn enrich_workflow_result(
     // this specific workflow has executions — variants with zero
     // executions show None, not Some(0.0).
     let behavioral_success_rate = if behavioral_execution_count.is_some() {
-        match BehavioralExecutionRepository::rolling_success_rate(pool, workflow_id, 20).await {
+        match BehavioralExecutionRepository::rolling_success_rate(&mut *conn, workflow_id, 20).await
+        {
             Ok(rate) if rate > 0.0 => Some(rate),
             _ => None,
         }
@@ -1021,9 +956,10 @@ async fn enrich_workflow_result(
 
     // Promotion flag set by the refresh_workflow_promotion maintenance pass.
     // Advisory metadata; best-effort (a lookup failure must not drop the result).
-    let promotable = ClaimRepository::promotion_flag(pool, viewer, ClaimId::from_uuid(workflow_id))
-        .await
-        .unwrap_or(None);
+    let promotable =
+        ClaimRepository::promotion_flag(&mut *conn, viewer, ClaimId::from_uuid(workflow_id))
+            .await
+            .unwrap_or(None);
 
     Some(FindWorkflowResult {
         workflow_id: workflow_id.to_string(),
