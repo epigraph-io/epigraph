@@ -4703,7 +4703,10 @@ async fn after_a_restore_detaching_the_restored_identity_alone_leaves_an_unregis
 /// Detaching Q's row made by name takes Q and E out and refuses both armed
 /// forged writes. So detaching the running identity is never the whole lever:
 /// every live row made by name that an identity the job can run holds must be
-/// detached too.
+/// detached too. And it is permanent: an edit E2 from E, a registered revert
+/// to P (parent E2), a registered revert to Q (parent P) and an edit E3 from Q
+/// all stay out, E3's armed forged write refused, until the operator attaches
+/// E3 by name (the control).
 #[sqlx::test(migrations = "../../migrations")]
 async fn after_a_restore_a_registered_revert_to_an_identity_attached_by_name_stays_in_until_its_row_is_detached(
     pool: PgPool,
@@ -4820,6 +4823,52 @@ async fn after_a_restore_a_registered_revert_to_an_identity_attached_by_name_sta
             &format!("{l} after Q's row made by name is detached, forged stamp (armed)"),
         );
     }
+
+    // PERMANENCE: no row made by name in the job's chains is left, so nothing
+    // the job registers afterwards inherits a live root. Every registration
+    // names the lane's newest identity as its parent, as a lane-keyed host
+    // names it.
+    let e2 = register_in(&pool, &identity_key(), Some(e), "g-job").await;
+    assert_eq!(
+        register_in(&pool, &p_key, Some(e2), "g-job").await,
+        p,
+        "PREMISE: a registered revert to P, parent E2"
+    );
+    assert_eq!(
+        register_in(&pool, &q_key, Some(p), "g-job").await,
+        q,
+        "PREMISE: a registered revert to Q, parent P"
+    );
+    let e3 = register_in(&pool, &identity_key(), Some(q), "g-job").await;
+    for (id, l) in [
+        (q, "Q"),
+        (e, "E"),
+        (p, "P"),
+        (a, "A"),
+        (e2, "E2"),
+        (e3, "E3"),
+    ] {
+        assert_eq!(
+            (
+                resolves(&pool, id, group).await,
+                derived_rows(&pool, id).await
+            ),
+            ((false, false), 0),
+            "{l} stays out after every later registration"
+        );
+    }
+    assert_refused(
+        &write_forged(&pool, e3, group).await,
+        OPL02,
+        AGENT_SCOPE,
+        "E3, the job's edit from Q after the cut-off, forged stamp (armed)",
+    );
+    attach_to_role(&pool, ROLE, e3).await;
+    assert_eq!(
+        resolves(&pool, e3, group).await,
+        (true, true),
+        "CONTROL: attaching the identity that runs by name is what brings the job back"
+    );
 }
 
 /// Rows `epigraph_role_derived_memberships(agent, now() + secs)` answers for
