@@ -1046,6 +1046,89 @@ async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reing
     assert_eq!(authored_in_force(&pool, human, doi1).await, 1);
 }
 
+/// The default path is unchanged for a name listed twice: one node, one
+/// `authored` edge, and the ingest is NOT refused (only an explicit author
+/// shared with another entry is).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_name_only_document_listing_one_name_twice_still_ingests(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Li Arvenna";
+    let doi = "10.9999/author-same-name-twice";
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(doi, json!([{"name": name}, {"name": name}])),
+    )
+    .await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let authors = json["authors"].as_array().expect("authors");
+    assert_eq!(authors.len(), 2, "{json}");
+    for a in authors {
+        assert_eq!(a["agent_id"], key.to_string(), "{json}");
+        assert_eq!(a["attribution"], "name_derived", "{json}");
+    }
+    assert_eq!(
+        authored_edges(&pool, key, doi).await,
+        1,
+        "one edge, as always"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi).await,
+        paper_claims(&pool, doi).await
+    );
+}
+
+/// Re-running the SAME extraction converges: an explicit author beside a
+/// same-spelled name-only entry resolves the second time exactly as the
+/// first (the name-only entry does not "keep" the explicit author this very
+/// call names), and writes nothing new.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rerunning_an_extraction_with_an_explicit_and_a_same_named_entry_converges(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Hesper Quill";
+    let human = human_named(&pool, name).await;
+    let doi = "10.9999/author-rerun-converges";
+    let extraction = || {
+        doc(
+            doi,
+            json!([{"name": name, "agent_id": human.to_string()}, {"name": name}]),
+        )
+    };
+    let edges_now = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM edges")
+            .fetch_one(&pool)
+            .await
+            .expect("count edges")
+    };
+    let first = ingest_wait(&server, &pool, extraction()).await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    assert_eq!(
+        first["authors"][0]["agent_id"],
+        human.to_string(),
+        "{first}"
+    );
+    assert_eq!(first["authors"][1]["agent_id"], key.to_string(), "{first}");
+    let before = edges_now().await;
+
+    let second = ingest_wait(&server, &pool, extraction()).await;
+    assert_eq!(
+        second["authors"][0]["agent_id"],
+        human.to_string(),
+        "{second}"
+    );
+    assert_eq!(second["authors"][0]["action"], "attached_given", "{second}");
+    assert_eq!(
+        second["authors"][1]["agent_id"],
+        key.to_string(),
+        "{second}"
+    );
+    assert_eq!(
+        second["authors"][1]["action"], "reused_name_key",
+        "{second}"
+    );
+    assert_eq!(edges_now().await, before, "a re-run writes no edge");
+}
+
 /// An explicit id that IS another entry's name-derived node would make two
 /// entries one agent with one `authored` edge: refused before the paper row.
 #[sqlx::test(migrations = "../../migrations")]

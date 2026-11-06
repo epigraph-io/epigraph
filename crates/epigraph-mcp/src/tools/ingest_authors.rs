@@ -394,21 +394,32 @@ pub(crate) async fn resolve_document_authors(
         .filter(|e| !retracted.contains(&e.agent_id))
         .collect();
     // An explicit attachment an earlier ingest made, by the spelling it was
-    // made for: a name-only entry with that spelling keeps it.
-    let kept_for = |idx: usize, name: &str| -> Option<Uuid> {
+    // made for: a name-only entry with that spelling keeps it. Each earlier
+    // edge is kept by at most one entry (the one at its position first), and
+    // never when this call names that agent explicitly itself: a re-run of the
+    // same extraction must resolve exactly as the first run did.
+    let this_call: HashSet<Uuid> = explicit.values().map(|e| e.node.id).collect();
+    let mut taken: HashSet<Uuid> = HashSet::new();
+    let mut kept: HashMap<usize, Uuid> = HashMap::new();
+    for (i, a) in authors.iter().enumerate() {
+        if explicit.contains_key(&i) || a.is_placeholder() {
+            continue;
+        }
         let mut found: Vec<&PaperAuthorEdge> = edges
             .iter()
-            .filter(|e| e.explicit && e.author_name.as_deref() == Some(name))
+            .filter(|e| {
+                e.explicit
+                    && e.author_name.as_deref() == Some(a.name.as_str())
+                    && !this_call.contains(&e.agent_id)
+                    && !taken.contains(&e.agent_id)
+            })
             .collect();
-        found.sort_by_key(|e| e.position != i64::try_from(idx).ok());
-        found.first().map(|e| e.agent_id)
-    };
-    let kept: HashMap<usize, Uuid> = authors
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| !explicit.contains_key(i) && !a.is_placeholder())
-        .filter_map(|(i, a)| kept_for(i, &a.name).map(|id| (i, id)))
-        .collect();
+        found.sort_by_key(|e| e.position != i64::try_from(i).ok());
+        if let Some(e) = found.first() {
+            taken.insert(e.agent_id);
+            kept.insert(i, e.agent_id);
+        }
+    }
     let kept_ids: Vec<Uuid> = kept.values().copied().collect();
     let kept_how = attributions(conn, writer, &kept_ids).await?;
     let kept_nodes: HashMap<Uuid, AuthorNode> = AgentLookupRepository::author_nodes(
@@ -553,16 +564,27 @@ pub(crate) async fn resolve_document_authors(
             },
         });
     }
-    // Two entries that resolved to one agent (a kept explicit author equal to
-    // another entry's agent, say) would share one `authored` edge: refuse.
-    let mut seen: HashMap<Uuid, usize> = HashMap::new();
+    // An explicit author that another entry also resolves to would share one
+    // `authored` edge with it: refuse. Two NAME-path entries with one name
+    // (one node) are not refused: they always ingested, one edge, as before.
+    let mut any_entry: HashMap<Uuid, usize> = HashMap::new();
+    let mut explicit_entry: HashMap<Uuid, usize> = HashMap::new();
     for r in &out {
-        if let Some(first) = seen.insert(r.agent_id, r.idx) {
+        let clash = if r.explicit {
+            any_entry.get(&r.agent_id)
+        } else {
+            explicit_entry.get(&r.agent_id)
+        };
+        if let Some(&first) = clash {
             return Err(invalid_params(format!(
                 "source.authors[{first}] and source.authors[{}] both resolve to agent {}: two \
                  authors cannot be one agent. Give one of them its own agent_id, or drop one",
                 r.idx, r.agent_id
             )));
+        }
+        any_entry.entry(r.agent_id).or_insert(r.idx);
+        if r.explicit {
+            explicit_entry.entry(r.agent_id).or_insert(r.idx);
         }
     }
     // Whoever else the document already lists at an author's position.
