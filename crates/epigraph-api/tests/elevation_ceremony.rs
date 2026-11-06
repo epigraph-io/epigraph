@@ -3693,6 +3693,75 @@ async fn a_synced_passkey_registers_on_an_act_confirmed_by_an_attested_one(pool:
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// A synced passkey anchors nothing THROUGH A CHAIN OF ACTS (P779-7): the
+/// synced passkey confirms an act on which a genuine attested hardware key is
+/// then registered (the attested ceremony admits it: it is real hardware);
+/// that hardware key confirms a further act, whose enrollment would anchor
+/// on it, but its lineage holds the synced passkey, so the enrollment runs
+/// the attested ceremony and another synced passkey is refused. CALIBRATION:
+/// a hardware key registered on an act confirmed by the FIRST passkey (by a
+/// server with the setting off: with it on, that enrollment would take the
+/// anchored path, which records only unattested passkeys) does anchor a
+/// synced passkey.
+///
+/// Mutation: `check_anchor`'s lineage loop removed -> the second synced
+/// passkey registers (the PR head's behaviour).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_synced_passkey_anchors_nothing_through_a_chain_of_acts(pool: PgPool) {
+    let att = TestAttestation::new("Allowlisted");
+    let s = spawn(&pool, Some(anchored_rp(&att, true))).await;
+    let (p, mut first) = attested_holder(&pool, &s, &att, "chain").await;
+    let token = elevated_token_device_bound(&s, &pool, &p).await;
+
+    // first -> synced (anchored)
+    let act = register_act(&s, &p, &token, &mut first).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut synced = SoftAuthenticator::new(SYNCED_MODEL);
+    let (_, (status, body)) = enroll_on(&s, id, &mut synced, Value::clone).await;
+    assert_eq!(status, StatusCode::OK, "CALIBRATION: anchored: {body}");
+
+    // synced -> a hardware key (attested ceremony: synced anchors nothing)
+    let act = register_act(&s, &p, &token, &mut synced).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut laundered = SoftAuthenticator::new(MODEL).hardware();
+    let (options, (status, body)) = enroll_on(&s, id, &mut laundered, |x| att.rewrap(x)).await;
+    assert_eq!(options["publicKey"]["attestation"], "direct", "{options}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a real hardware key registers: {body}"
+    );
+
+    // that hardware key -> a synced passkey: refused, its lineage holds one.
+    let act = register_act(&s, &p, &token, &mut laundered).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut second_synced = SoftAuthenticator::new(SYNCED_MODEL);
+    let (options, (status, body)) = enroll_on(&s, id, &mut second_synced, Value::clone).await;
+    assert_eq!(
+        options["publicKey"]["attestation"], "direct",
+        "the lineage holds a synced passkey, so the ceremony is attested: {options}"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "registration_refused", "{body}");
+
+    // CALIBRATION: a hardware key authorized by the FIRST passkey anchors.
+    // With the setting on, an enrollment the first passkey anchors accepts
+    // only an unattested passkey, so the second hardware key is enrolled by a
+    // server with the setting off.
+    let s_off = spawn(&pool, Some(anchored_rp(&att, false))).await;
+    let act = register_act(&s, &p, &token, &mut first).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut clean = SoftAuthenticator::new(MODEL).hardware();
+    let (_, (status, body)) = enroll_on(&s_off, id, &mut clean, |x| att.rewrap(x)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let act = register_act(&s, &p, &token, &mut clean).await;
+    let id = act_enrollment(&pool, p.person, act).await;
+    let mut third_synced = SoftAuthenticator::new(SYNCED_MODEL);
+    let (options, (status, body)) = enroll_on(&s, id, &mut third_synced, Value::clone).await;
+    assert_eq!(options["publicKey"]["attestation"], "none", "{options}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 /// A FIRST passkey is attested whatever the anchored setting says: with it
 /// on, a maintenance enrollment (no act) refuses `none`, both for a person
 /// with no passkey and for one who has since registered an attested passkey
@@ -3742,10 +3811,15 @@ async fn a_first_passkey_is_attested_with_the_anchored_setting_on(pool: PgPool) 
 /// A confirmation recorded with FABRICATED evidence (the application DSN can
 /// call the confirm definer with any evidence; the database cannot verify a
 /// signature) anchors nothing: the act's enrollment runs the attested
-/// ceremony and refuses a synced passkey. The evidence names the act's OWN
-/// challenge, so what refuses it is the signature re-verification.
-/// CALIBRATION: the act really is confirmed in the database, by P's attested
-/// passkey.
+/// ceremony and refuses a synced passkey. The evidence is a WELL-FORMED
+/// assertion over the act's OWN challenge, for this relying party and
+/// origin, naming P's credential id and user handle, but signed by another
+/// key (a software authenticator's); so what refuses it is the signature
+/// re-verification, not a parse. CALIBRATIONS: the same assertion with its
+/// own credential id re-verifies against its own key (it is genuine but for
+/// the key), and against P's stored passkey the library refuses it (a
+/// `Refused`, never `Malformed`); the act really is confirmed in the
+/// database, by P's credential id.
 ///
 /// Mutation: `check_anchor`'s re-verification of the recorded assertion
 /// skipped -> the synced passkey registers.
@@ -3776,12 +3850,55 @@ async fn a_forged_act_confirmation_anchors_nothing(pool: PgPool) {
     .try_into()
     .unwrap();
     let bound = epigraph_passkey::act_challenge(act, &digest.try_into().unwrap(), &nonce);
-    let forged = json!({
-        "v": 1,
-        "challenge": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bound),
-        "response": {"id": "forged"},
-    });
     let cred = credential_of(&pool, p.person).await;
+
+    // The forger's own key, registered where nothing checks attestation.
+    let soft = Passkeys::new(PasskeyConfig {
+        rp_id: RP_ID.into(),
+        origin: ORIGIN.parse().unwrap(),
+        policy: AttestationPolicy::SoftwareAllowed,
+    })
+    .unwrap();
+    let (options, state) = soft.start_registration(p.person, "p", "p").unwrap();
+    let mut forger = SoftAuthenticator::new(SYNCED_MODEL).hardware();
+    let created = forger
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let theirs = epigraph_passkey::StoredPasskey {
+        passkey: soft.finish_registration(&created, &state).unwrap().passkey,
+        sign_count: 0,
+    };
+    let (options, _) = soft
+        .start_authentication(std::slice::from_ref(&theirs), Some(&bound))
+        .unwrap();
+    let genuine = forger.authenticate(ORIGIN, options).await;
+    let b64 =
+        |b: &[u8]| base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, b);
+    let evidence =
+        |response: &Value| json!({"v": 1, "challenge": b64(&bound), "response": response});
+    soft.reverify(&evidence(&genuine), &theirs)
+        .expect("CALIBRATION: a genuine assertion by the forger's own key");
+    let mut response = genuine.clone();
+    response["id"] = Value::from(b64(&cred));
+    response["rawId"] = Value::from(b64(&cred));
+    let forged = evidence(&response);
+    let ours: Value =
+        sqlx::query_scalar("SELECT passkey FROM person_authenticators WHERE credential_id = $1")
+            .bind(&cred)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let refused = soft.reverify(
+        &forged,
+        &epigraph_passkey::StoredPasskey {
+            passkey: ours,
+            sign_count: 0,
+        },
+    );
+    assert!(
+        matches!(refused, Err(epigraph_passkey::PasskeyError::Refused(_))),
+        "CALIBRATION: a well-formed assertion, refused on its signature: {refused:?}"
+    );
     let outcome: String = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         let (outcome,): (String,) = sqlx::query_as(
             "SELECT outcome FROM public.epigraph_confirm_admin_act($1, $2, 0, false, $3)",
@@ -3806,10 +3923,16 @@ async fn a_forged_act_confirmation_anchors_nothing(pool: PgPool) {
 }
 
 /// With the anchored setting OFF, today's behaviour: the act's enrollment is
-/// attested, a synced passkey is refused there, and an attested hardware key
-/// registers as the later passkey. Mutation: the route ignoring
-/// `allows_synced_anchored` (reading the anchor whatever the setting) -> the
-/// synced passkey registers.
+/// attested (the challenge answers 200 with attested options), a synced
+/// passkey is refused there, and an attested hardware key registers as the
+/// later passkey.
+///
+/// Mutations (measured in review P779-10): the ROUTE's gate in
+/// `elevate.rs::anchored` removed (reading the anchor whatever the setting)
+/// -> red at the CHALLENGE, a 500, because the crate's own gate in
+/// `Passkeys::start_anchored_registration` refuses; the synced passkey is
+/// never registered. The route's gate is defence in depth over the crate's;
+/// the synced passkey registers only with BOTH removed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn with_the_setting_off_a_later_passkey_is_attested(pool: PgPool) {
     let att = TestAttestation::new("Allowlisted");
