@@ -55,9 +55,21 @@
 //!   as done; one that is PART in the TO state and part in the FROM state is
 //!   HELD: its manifest would record only the FROM part, and the reversal,
 //!   which refuses a lineage row it did not see, could then never restore it.
-//!   Remedy for such a lineage: reverse the earlier run that moved part of it
-//!   (which refuses while the plan has grown), or move the stray generation by
-//!   hand with a reviewed maintenance act.
+//!
+//!   `--catch-up` (with `--visibility group`) is the remedy for a lineage
+//!   re-ingested between runs. A STRAY generation is one in the source's
+//!   private state (the owner-group-only default for new workflow writes puts
+//!   a re-ingest there: in a move it is neither FROM nor TO), or a FROM one
+//!   beside generations already in TO. A catch-up run takes only the
+//!   lineages that have one, and changes only their non-TO generations and
+//!   their plan rows (the source's private plan claims too, into exactly the
+//!   TO state); the TO generations and claims are recorded as SEEN, so the
+//!   reversal's growth check accepts them, and are never written. A lineage
+//!   with no stray generation is SKIPPED (it is the main act's), and one that
+//!   is wholly private stays held. It is audited, manifested and reversed
+//!   exactly like the main act; reversing the catch-up puts the lineage back
+//!   in the state it found it in, and the original manifest then refuses (a
+//!   generation joined after it).
 //! * `claims`: the plan claims, i.e. the target of every `executes` edge from
 //!   any of those rows (thesis, phases, steps, operation atoms; retracted
 //!   edges count too, as migration 183's backfill counts them), plus every
@@ -68,7 +80,8 @@
 //!     a paper, or decomposed into from a claim outside the plans (level-3
 //!     atoms are content-addressed in the namespace documents share), or in a
 //!     step lineage with such a member. A shared claim is never moved;
-//!   - owned by a group other than the source, or not public;
+//!   - owned by a group other than the source, or not public (under
+//!     `--catch-up`, the source's private state counts as source-owned);
 //!   - `keep` only: carrying a row the cascade would move that is not
 //!     `('public', source)` (a third group's derived row, pinned evidence), or
 //!     an edge with a non-public endpoint, or sharing a cascaded row (a
@@ -91,7 +104,8 @@
 //!   an `--apply` exits 3. Holding a move on a source-private edge is a
 //!   choice: the target would get owner and delete rights over a row the
 //!   source kept private, which a ruling to narrow public plans does not
-//!   cover. The remedy is a separate act on that row.
+//!   cover. The remedy is a separate act on that row (or, for the source's
+//!   own private plan rows of a listed lineage, `--catch-up`).
 //!
 //!   A claim shared with a source-owned PUBLIC lineage the list omits is
 //!   named on a `SHARED-SPLIT` line: no run of either list narrows it alone,
@@ -284,6 +298,10 @@ pub struct Act {
     pub source: Uuid,
     pub target: Uuid,
     pub visibility: Visibility,
+    /// `--catch-up`: also take the source's PRIVATE rows of a listed lineage,
+    /// and lineages already partly in the TO state (only their other
+    /// generations change).
+    pub catch_up: bool,
 }
 
 impl Act {
@@ -314,6 +332,18 @@ impl Act {
         }
     }
 
+    /// `('group', source)`: the source's private state. In place it IS the TO
+    /// state; in a move, `--catch-up` takes it too (a re-ingest under the
+    /// owner-group-only default lands there).
+    #[must_use]
+    pub fn source_private(&self) -> Tenancy {
+        Tenancy {
+            owner: self.source,
+            visibility: GROUP.into(),
+            co_owner: None,
+        }
+    }
+
     #[must_use]
     pub fn narrows(&self) -> bool {
         self.visibility == Visibility::Group
@@ -325,10 +355,12 @@ impl Act {
     }
 
     fn name(&self) -> &'static str {
-        match (self.in_place(), self.visibility) {
-            (true, _) => "NARROW-IN-PLACE",
-            (false, Visibility::Keep) => "MOVE",
-            (false, Visibility::Group) => "MOVE-AND-NARROW",
+        match (self.in_place(), self.visibility, self.catch_up) {
+            (true, _, false) => "NARROW-IN-PLACE",
+            (true, _, true) => "CATCH-UP-NARROW-IN-PLACE",
+            (false, Visibility::Keep, _) => "MOVE",
+            (false, Visibility::Group, false) => "MOVE-AND-NARROW",
+            (false, Visibility::Group, true) => "CATCH-UP-MOVE-AND-NARROW",
         }
     }
 }
@@ -346,6 +378,8 @@ pub struct Options {
     pub ruling: String,
     pub reason: String,
     pub visibility: Visibility,
+    /// `--catch-up` (see [`Act::catch_up`]); needs `--visibility group`.
+    pub catch_up: bool,
     /// Lineages per transaction (a component is never split).
     pub batch_size: usize,
     pub lock_timeout: String,
@@ -359,6 +393,12 @@ pub struct Options {
 pub fn validate(opts: &Options) -> anyhow::Result<()> {
     if opts.batch_size == 0 {
         bail!("--batch-size must be at least 1");
+    }
+    if opts.catch_up && opts.visibility != Visibility::Group {
+        bail!(
+            "--catch-up needs --visibility group: it catches a lineage up to a narrowing that \
+             already ran"
+        );
     }
     if opts.apply {
         if opts.ruling.trim().is_empty() {
@@ -570,6 +610,9 @@ pub enum LineageHold {
     NotPublic {
         generation: i32,
         visibility: String,
+        /// A source-private generation of a lineage with others in the FROM
+        /// or TO state (a re-ingest): `--catch-up` takes it.
+        catch_up: bool,
     },
     /// Some generations are in the TO state already and some in the FROM
     /// state.
@@ -610,10 +653,17 @@ impl fmt::Display for LineageHold {
             Self::NotPublic {
                 generation,
                 visibility,
+                catch_up,
             } => write!(
                 f,
                 "generation {generation} has visibility {visibility}, not public, and is not in \
-                 this run's target state; the whole lineage stays"
+                 this run's target state; the whole lineage stays{}",
+                if *catch_up {
+                    " (the source's private generation of a lineage this run otherwise covers, \
+                     e.g. a re-ingest: run again with --catch-up to take it)"
+                } else {
+                    ""
+                }
             ),
             Self::PartlyMoved {
                 source_gens,
@@ -621,8 +671,9 @@ impl fmt::Display for LineageHold {
             } => write!(
                 f,
                 "partly the target's already (generations {target_gens:?}) and partly the \
-                 source's ({source_gens:?}); a lineage moves whole, and a run that moved only \
-                 part of it could not be reversed exactly, so it stays"
+                 source's ({source_gens:?}); a run that moved only part of it could not be \
+                 reversed exactly, so it stays (run again with --catch-up to take only the \
+                 other generations, recording the target's as seen)"
             ),
             Self::HandOff {
                 table,
@@ -702,8 +753,12 @@ impl fmt::Display for Left {
 pub struct Component {
     /// Sorted.
     pub lineages: Vec<String>,
-    /// Rows in the FROM state: they move.
+    /// Generations that change (the FROM state, or under `--catch-up` the
+    /// source's private state).
     pub workflows: Vec<WfRow>,
+    /// Generations already in the TO state (`--catch-up`): recorded as seen,
+    /// never written.
+    pub seen_workflows: Vec<WfRow>,
     /// Plan claims that move.
     pub claims: Vec<ClaimRow>,
     pub left: Vec<(Uuid, Left)>,
@@ -756,6 +811,8 @@ impl Component {
             .collect();
         let mut wf = self.workflows.clone();
         wf.sort();
+        let mut seen_wf = self.seen_workflows.clone();
+        seen_wf.sort();
         let mut edges = self.edges.clone();
         edges.sort();
         let mut kept: Vec<_> = self.edges_kept.clone();
@@ -765,6 +822,7 @@ impl Component {
             (
                 &self.lineages,
                 wf,
+                seen_wf,
                 claims,
                 left,
                 already,
@@ -782,7 +840,11 @@ impl Component {
 
     /// Every generation of the component's lineages.
     fn all_workflow_ids(&self) -> Vec<Uuid> {
-        self.workflows.iter().map(|w| w.id).collect()
+        self.workflows
+            .iter()
+            .chain(self.seen_workflows.iter())
+            .map(|w| w.id)
+            .collect()
     }
 
     /// The claims that end non-public: the ones it narrows and the ones
@@ -801,6 +863,8 @@ impl Component {
 pub struct Plan {
     pub held: Vec<(String, LineageHold)>,
     pub already: Vec<String>,
+    /// `--catch-up`: lineages with no stray generation (the main act's).
+    pub skipped: Vec<String>,
     pub components: Vec<Component>,
 }
 
@@ -846,6 +910,8 @@ fn tuple_text(t: &Tenancy) -> String {
 /// * `prior == post`: nothing changes (an edge to a row already private to the
 ///   target, or in place to the same group; a cascaded row already in the TO
 ///   state). Never blocks.
+/// * `--catch-up` re-owning the source's private plan row into exactly the TO
+///   state: the operator's own row of a lineage this act covers.
 /// * `post` readable by a group that cannot read `prior`: a widening.
 /// * a non-public `prior` whose owner changes: the target would become the
 ///   OWNER (delete and re-tenant rights) of a row its owner keeps private,
@@ -863,6 +929,9 @@ fn hand_off(
     public_taken: bool,
 ) -> Option<&'static str> {
     if prior == post {
+        return None;
+    }
+    if act.catch_up && *prior == act.source_private() && *post == act.to_state() {
         return None;
     }
     if !narrows(prior, post) {
@@ -1167,6 +1236,7 @@ pub async fn plan(
 ) -> anyhow::Result<Plan> {
     let (source, target) = (act.source, act.target);
     let (from, to) = (act.from_state(), act.to_state());
+    let source_private = act.source_private();
     let mut out = Plan::default();
     let rows = sqlx::query(
         "SELECT id, canonical_name, generation, owner_group_id, visibility::text FROM workflows \
@@ -1192,6 +1262,11 @@ pub async fn plan(
     }
 
     // ---- lineages ----
+    // A generation is FROM ('public', source), TO, or (a move) the source's
+    // private state; anything else holds the lineage. Without --catch-up a
+    // lineage moves only from the FROM state whole; with it, a lineage moves
+    // when it has a STRAY generation (the source's private one, or a FROM one
+    // beside generations already in TO), and its TO generations are seen.
     let mut eligible: BTreeMap<String, Vec<WfRow>> = BTreeMap::new();
     let mut moving_wf: BTreeSet<Uuid> = BTreeSet::new();
     for name in names {
@@ -1199,17 +1274,24 @@ pub async fn plan(
             out.held.push((name.clone(), LineageHold::NotFound));
             continue;
         };
-        let (mut from_g, mut to_g) = (Vec::new(), Vec::new());
+        let (mut from_g, mut to_g, mut priv_g) = (Vec::new(), Vec::new(), Vec::new());
         let mut other = None;
         for w in gens {
             if w.tenancy == from {
                 from_g.push(w);
             } else if w.tenancy == to {
                 to_g.push(w);
+            } else if w.tenancy == source_private {
+                priv_g.push(w);
             } else if other.is_none() {
                 other = Some(w);
             }
         }
+        let not_public = |w: &WfRow, catch_up: bool| LineageHold::NotPublic {
+            generation: w.generation,
+            visibility: w.tenancy.visibility.clone(),
+            catch_up,
+        };
         if let Some(w) = other {
             out.held.push((
                 name.clone(),
@@ -1219,29 +1301,39 @@ pub async fn plan(
                         owner: w.tenancy.owner,
                     }
                 } else {
-                    LineageHold::NotPublic {
-                        generation: w.generation,
-                        visibility: w.tenancy.visibility.clone(),
-                    }
+                    not_public(w, false)
                 },
             ));
             continue;
         }
-        if from_g.is_empty() {
+        if from_g.is_empty() && priv_g.is_empty() {
             out.already.push(name.clone());
             continue;
         }
-        if !to_g.is_empty() {
-            out.held.push((
-                name.clone(),
-                LineageHold::PartlyMoved {
-                    source_gens: from_g.iter().map(|w| w.generation).collect(),
-                    target_gens: to_g.iter().map(|w| w.generation).collect(),
-                },
-            ));
+        let stray = !to_g.is_empty() || (!from_g.is_empty() && !priv_g.is_empty());
+        if !act.catch_up {
+            if let Some(w) = priv_g.first() {
+                out.held.push((name.clone(), not_public(w, stray)));
+                continue;
+            }
+            if !to_g.is_empty() {
+                out.held.push((
+                    name.clone(),
+                    LineageHold::PartlyMoved {
+                        source_gens: from_g.iter().map(|w| w.generation).collect(),
+                        target_gens: to_g.iter().map(|w| w.generation).collect(),
+                    },
+                ));
+                continue;
+            }
+        } else if !stray {
+            match priv_g.first() {
+                None => out.skipped.push(name.clone()),
+                Some(w) => out.held.push((name.clone(), not_public(w, false))),
+            }
             continue;
         }
-        moving_wf.extend(from_g.iter().map(|w| w.id));
+        moving_wf.extend(from_g.iter().chain(priv_g.iter()).map(|w| w.id));
         eligible.insert(name.clone(), gens.clone());
     }
     if eligible.is_empty() {
@@ -1408,7 +1500,7 @@ pub async fn plan(
             left.insert(*id, Left::Shared(by.iter().cloned().collect()));
         } else if c.owner != source {
             left.insert(*id, Left::NotSourceOwned { owner: c.owner });
-        } else if c.visibility != PUBLIC {
+        } else if c.visibility != PUBLIC && !(act.catch_up && state == source_private) {
             left.insert(
                 *id,
                 Left::NotPublic {
@@ -1628,7 +1720,13 @@ pub async fn plan(
         let root = dsu.find(n);
         let c = comps.entry(root).or_default();
         c.lineages.push(n.clone());
-        c.workflows.extend(gens.iter().cloned());
+        for w in gens {
+            if moving_wf.contains(&w.id) {
+                c.workflows.push(w.clone());
+            } else {
+                c.seen_workflows.push(w.clone());
+            }
+        }
     }
     let root_of = |id: &Uuid, dsu: &mut Dsu| lineage_of(id).map(|l| dsu.find(&l));
     for id in &candidates {
@@ -2095,18 +2193,20 @@ fn claim_tenancy(c: &ClaimRow) -> Tenancy {
 /// every plan row it saw and leaves.
 fn prior_records(c: &Component, specs: &[TableSpec]) -> Vec<Record> {
     let mut out = Vec::new();
-    for w in &c.workflows {
-        let id = json!(w.id.to_string());
-        out.push(rec(
-            "workflows",
-            id,
-            &w.tenancy,
-            w.id,
-            false,
-            false,
-            None,
-            false,
-        ));
+    for (wfs, seen) in [(&c.workflows, false), (&c.seen_workflows, true)] {
+        for w in wfs {
+            let id = json!(w.id.to_string());
+            out.push(rec(
+                "workflows",
+                id,
+                &w.tenancy,
+                w.id,
+                false,
+                false,
+                None,
+                seen,
+            ));
+        }
     }
     for cl in &c.claims {
         let id = json!(cl.id.to_string());
@@ -2314,7 +2414,8 @@ pub async fn run_batch(
     let bump_due = tables::layout_epoch_bump_due(conn).await?;
     let counters_before = xact_counters(conn).await?;
 
-    // Each row compare-and-swapped on the prior the plan read.
+    // Each row compare-and-swapped on the prior the plan read (the FROM state,
+    // or under --catch-up the source's private state).
     let wf_payload: Vec<Value> = comps
         .iter()
         .flat_map(|c| c.workflows.iter())
@@ -2486,7 +2587,8 @@ pub async fn run_batch(
             )),
         }
     }
-    // A row that was public and ends non-public.
+    // A row that was public and ends non-public; a source-private row a
+    // catch-up re-owns was never readable to an unstamped session.
     let public_claims: Vec<Uuid> = comps
         .iter()
         .flat_map(|c| c.claims.iter())
@@ -2675,6 +2777,13 @@ fn print_plan(out: &mut dyn std::io::Write, p: &Plan) -> anyhow::Result<usize> {
             "ALREADY-LINEAGE\t{n}\tevery generation is in this run's target state"
         )?;
     }
+    for n in &p.skipped {
+        writeln!(
+            out,
+            "SKIPPED-LINEAGE\t{n}\tno stray generation: every generation is in the FROM state, \
+             so it is the main act's (run without --catch-up)"
+        )?;
+    }
     let mut eligible_rows = 0usize;
     let mut claims = 0usize;
     let mut rows: BTreeMap<String, usize> = BTreeMap::new();
@@ -2764,6 +2873,7 @@ pub async fn run(
         source,
         target,
         visibility: opts.visibility,
+        catch_up: opts.catch_up,
     };
     tables::probe_session_switch(conn).await?;
     let names_sha256 = sha256_file(&opts.names_file)?;
@@ -2829,8 +2939,8 @@ pub async fn run(
     if act.narrows() {
         writeln!(
             out,
-            "RULE: only ('public', source) generations and plan claims change, and each ends \
-             ('group', target); the claims \
+            "RULE: only ('public', source) generations and plan claims change (with --catch-up \
+             also the source's private ones), and each ends ('group', target); the claims \
              narrow through the tenancy cascade (derived rows, fragments, every edge with a \
              claim endpoint; another writer's public row joins the claim's group and loses its \
              writer_owned flag, which the manifest records; pinned evidence keeps its owner); \
@@ -2898,6 +3008,7 @@ pub async fn run(
         "source_group_id": source,
         "target_group_id": target,
         "visibility": act.visibility.as_str(),
+        "catch_up": act.catch_up,
         "act": act.name(),
         "created_at": chrono::Utc::now().to_rfc3339(),
         "ruling": opts.ruling,
@@ -2926,6 +3037,7 @@ pub async fn run(
         "command": "reown-workflows",
         "act": act.name(),
         "visibility": act.visibility.as_str(),
+        "catch_up": act.catch_up,
         "behavioral_executions_unhidden": report.behavioral_rows,
         "ruling": opts.ruling,
         "reason": opts.reason,
@@ -3259,6 +3371,11 @@ pub async fn reverse_manifest(
         source,
         target,
         visibility,
+        catch_up: m
+            .header
+            .get("catch_up")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     };
     let rec = read_records(m, &specs, path)?;
     let (wf_ids, claim_ids, edge_ids) = (
@@ -3936,6 +4053,7 @@ mod tests {
             ruling: "r".into(),
             reason: "why".into(),
             visibility: Visibility::Keep,
+            catch_up: false,
             batch_size: 25,
             lock_timeout: "5s".into(),
         }
@@ -3975,9 +4093,23 @@ mod tests {
         assert!(validate(&Options {
             batch_size: 0,
             apply: false,
-            ..o
+            ..o.clone()
         })
         .is_err());
+        assert!(
+            validate(&Options {
+                catch_up: true,
+                ..o.clone()
+            })
+            .is_err(),
+            "--catch-up needs --visibility group"
+        );
+        assert!(validate(&Options {
+            catch_up: true,
+            visibility: Visibility::Group,
+            ..o
+        })
+        .is_ok());
     }
 
     #[test]
@@ -4043,6 +4175,7 @@ mod tests {
             source: s,
             target: t,
             visibility: Visibility::Keep,
+            catch_up: false,
         };
         assert_eq!(mv.to_state().visibility, "public");
         assert_eq!(mv.name(), "MOVE");
@@ -4064,6 +4197,12 @@ mod tests {
         };
         assert_eq!(in_place.to_state().owner, in_place.from_state().owner);
         assert_eq!(in_place.name(), "NARROW-IN-PLACE");
+        assert_eq!(in_place.source_private(), in_place.to_state());
+        let catch_up = Act {
+            catch_up: true,
+            ..narrow
+        };
+        assert_eq!(catch_up.name(), "CATCH-UP-MOVE-AND-NARROW");
     }
 
     fn t(owner: u128, visibility: &str, co: Option<u128>) -> Tenancy {
@@ -4081,6 +4220,7 @@ mod tests {
             source: Uuid::from_u128(1),
             target: Uuid::from_u128(2),
             visibility: Visibility::Group,
+            catch_up: false,
         };
         // Nothing changes: never a hand-off (in place, or already the target's).
         assert!(hand_off(&act, &t(2, "group", None), &t(2, "group", None), false).is_none());
@@ -4096,6 +4236,14 @@ mod tests {
         assert!(hand_off(&act, &t(3, "group", None), &t(2, "group", None), true).is_some());
         // Same owner, a co-owner added: narrower, held by no one.
         assert!(hand_off(&act, &t(2, "group", None), &t(2, "group", Some(3)), true).is_none());
+        // --catch-up takes the source's private row into exactly the TO state.
+        let cu = Act {
+            catch_up: true,
+            ..act
+        };
+        assert!(hand_off(&act, &t(1, "group", None), &t(2, "group", None), false).is_some());
+        assert!(hand_off(&cu, &t(1, "group", None), &t(2, "group", None), false).is_none());
+        assert!(hand_off(&cu, &t(1, "group", None), &t(2, "group", Some(1)), true).is_some());
     }
 
     #[test]

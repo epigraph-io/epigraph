@@ -814,6 +814,14 @@ enum Command {
         /// bumps the atlas layout epoch; re-run `atlas_layout --apply` after).
         #[arg(long, default_value = "keep")]
         visibility: String,
+        /// With `--visibility group`: catch a lineage up to a narrowing that
+        /// already ran. Takes only its STRAY generations (the source's private
+        /// state, e.g. a re-ingest, or the FROM state beside generations
+        /// already in the target state, which are recorded as seen and never
+        /// written) and their plan rows; a lineage with none is skipped.
+        /// Audited and reversed like the main act.
+        #[arg(long)]
+        catch_up: bool,
         /// The operator (a person's agent id) the act is attributed to.
         #[arg(long)]
         operator: Uuid,
@@ -1083,6 +1091,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         canonical_names_file,
         target_group,
         visibility,
+        catch_up,
         operator: op,
         from_group,
         manifest_out,
@@ -1105,6 +1114,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             ruling: ruling.clone(),
             reason: reason.clone(),
             visibility: reown_workflows::Visibility::parse(visibility)?,
+            catch_up: *catch_up,
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
         };
