@@ -283,6 +283,44 @@ impl ReasoningTraceRepository {
         Ok(q.fetch_optional(executor).await?)
     }
 
+    /// Which of `ids` this viewer may read, as a set. An id naming a trace the
+    /// viewer cannot read and an id naming no trace are both simply absent; the
+    /// caller treats both as "no trace". Used to keep a claim body from naming
+    /// a trace whose own `(visibility, owner_group_id)` withholds it: a claim's
+    /// `trace_id` is a bare FK, and a trace private to another group can hang
+    /// off a public claim (see [`Self::get_by_id`]).
+    ///
+    /// One marker, on `rt`: `reasoning_traces` is the only relation. The caller
+    /// has already read the owning claims through the same viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, ids), fields(n = ids.len()))]
+    pub async fn readable_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let sql = viewer.splice(
+            r#"
+            SELECT rt.id
+            FROM reasoning_traces rt
+            WHERE rt.id = ANY($1)
+              /* {VISIBILITY:rt} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid,)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Get a reasoning trace by ID
     ///
     /// # Errors

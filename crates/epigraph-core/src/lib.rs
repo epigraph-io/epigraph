@@ -38,6 +38,7 @@ pub mod graph;
 pub mod ids;
 pub mod labels;
 pub mod node;
+pub mod projection;
 pub mod properties;
 pub mod prov;
 pub mod tenancy;

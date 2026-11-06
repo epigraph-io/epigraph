@@ -1688,6 +1688,292 @@ async fn the_180_undo_restores_the_catalog_below_180(pool: PgPool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Migration 195 (a detach is sticky per identity; a revert always restricts)
+// re-states 179's derivation and 180's registration: its precondition and its
+// undo
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DERIVATION_SIG: &str =
+    "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)";
+/// The md5 of `prosrc` 195 leaves for each function it re-states (the deploy
+/// gate's values). A later re-statement starts from these bodies.
+const DERIVATION_195_MD5: &str = "1c5c6925547d6aa0d0a54e718ce6bd47";
+const REGISTRATION_195_MD5: &str = "a792b630dd34b1ab8c36218b5cb698d1";
+const FOLLOW_195_MD5: &str = "f60c55756be189b751565de942d63a0a";
+
+async fn derivation_src(pool: &PgPool) -> String {
+    sqlx::query_scalar(&format!(
+        "SELECT p.prosrc FROM pg_proc p WHERE p.oid = to_regprocedure('{DERIVATION_SIG}')"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("the derivation exists")
+}
+
+/// Re-body the derivation with `src` (signature, owner and ACL unchanged).
+async fn set_derivation_src(pool: &PgPool, src: &str) {
+    assert!(!src.contains("$body$"));
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_role_derived_memberships(\
+             p_agent uuid, p_at timestamptz) \
+         RETURNS TABLE (group_id uuid, role text) \
+         LANGUAGE sql STABLE SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $body${src}$body$"
+    ))
+    .execute(pool)
+    .await
+    .expect("re-body the derivation");
+}
+
+const FOLLOW_SIG: &str = "public.epigraph_role_agents_follow_lineage()";
+
+async fn follow_src(pool: &PgPool) -> String {
+    sqlx::query_scalar(&format!(
+        "SELECT p.prosrc FROM pg_proc p WHERE p.oid = to_regprocedure('{FOLLOW_SIG}')"
+    ))
+    .fetch_one(pool)
+    .await
+    .expect("the lineage follow exists")
+}
+
+/// Re-body the attach-time lineage follow with `src` (owner, ACL unchanged).
+async fn set_follow_src(pool: &PgPool, src: &str) {
+    assert!(!src.contains("$body$"));
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_role_agents_follow_lineage() \
+         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $body${src}$body$"
+    ))
+    .execute(pool)
+    .await
+    .expect("re-body the lineage follow");
+}
+
+/// `md5(prosrc)` of one function, by signature.
+async fn body_md5(pool: &PgPool, signature: &str) -> String {
+    sqlx::query_scalar("SELECT md5(p.prosrc) FROM pg_proc p WHERE p.oid = to_regprocedure($1)")
+        .bind(signature)
+        .fetch_one(pool)
+        .await
+        .expect("md5(prosrc)")
+}
+
+async fn applied(pool: &PgPool, version: i64) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = $1)")
+        .bind(version)
+        .fetch_one(pool)
+        .await
+        .expect("_sqlx_migrations")
+}
+
+/// 195 re-states three bodies whole, so it first checks all three. Over
+/// another derivation (179's plus one comment line, standing in for a
+/// re-statement applied out of order) it refuses 55000 naming the
+/// derivation, and over another registration or another lineage follow
+/// likewise, applying nothing each time. POSITIVE CONTROL: with the exact
+/// bodies back, it applies; the three bodies it leaves have the md5s the
+/// deploy gate measures, and the registration no longer carries 180's
+/// reverse-pair guard while keeping the chain guard.
+#[sqlx::test(migrations = false)]
+async fn migration_195_refuses_to_restate_a_body_it_was_not_written_from(pool: PgPool) {
+    migrate(&pool, &up_to_below(195))
+        .await
+        .expect("migrate below 195");
+    let derivation = derivation_src(&pool).await;
+    let registration = register_src(&pool).await;
+    assert!(
+        registration.contains("v_reverse"),
+        "CALIBRATION: below 195 the registration is 180's"
+    );
+
+    set_derivation_src(
+        &pool,
+        &format!("{derivation}-- an out-of-order re-statement\n"),
+    )
+    .await;
+    let err = migrate(&pool, &up_to_below(196))
+        .await
+        .expect_err("195 refuses a derivation it was not written from");
+    assert!(
+        err.contains("55000") && err.contains("epigraph_role_derived_memberships"),
+        "the refusal names the derivation: {err}"
+    );
+    assert!(!applied(&pool, 195).await, "a refused 195 is not recorded");
+    assert_eq!(
+        register_src(&pool).await,
+        registration,
+        "a refused 195 changes nothing"
+    );
+    set_derivation_src(&pool, &derivation).await;
+
+    set_register_src(
+        &pool,
+        &format!("{registration}-- an out-of-order re-statement\n"),
+    )
+    .await;
+    let err = migrate(&pool, &up_to_below(196))
+        .await
+        .expect_err("195 refuses a registration it was not written from");
+    assert!(
+        err.contains("55000") && err.contains("epigraph_register_agent_identity"),
+        "the refusal names the registration: {err}"
+    );
+    assert!(!applied(&pool, 195).await, "a refused 195 is not recorded");
+    assert_eq!(
+        derivation_src(&pool).await,
+        derivation,
+        "a refused 195 changes nothing"
+    );
+    set_register_src(&pool, &registration).await;
+
+    let follow = follow_src(&pool).await;
+    set_follow_src(&pool, &format!("{follow}-- an out-of-order re-statement\n")).await;
+    let err = migrate(&pool, &up_to_below(196))
+        .await
+        .expect_err("195 refuses a lineage follow it was not written from");
+    assert!(
+        err.contains("55000") && err.contains("epigraph_role_agents_follow_lineage"),
+        "the refusal names the follow: {err}"
+    );
+    assert!(!applied(&pool, 195).await, "a refused 195 is not recorded");
+    assert_eq!(
+        derivation_src(&pool).await,
+        derivation,
+        "a refused 195 changes nothing"
+    );
+    set_follow_src(&pool, &follow).await;
+
+    migrate(&pool, &up_to_below(196))
+        .await
+        .expect("over 179's, 180's and 166's exact bodies, 195 applies");
+    // The bodies 195 leaves, as the deploy gate measures them on a database.
+    for (signature, expected) in [
+        (DERIVATION_SIG, DERIVATION_195_MD5),
+        (
+            "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
+            REGISTRATION_195_MD5,
+        ),
+        (FOLLOW_SIG, FOLLOW_195_MD5),
+    ] {
+        assert_eq!(
+            body_md5(&pool, signature).await,
+            expected,
+            "195's body of {signature}"
+        );
+    }
+    let after = register_src(&pool).await;
+    assert!(
+        !after.contains("v_reverse"),
+        "195 drops the reverse-pair guard"
+    );
+    assert!(
+        after.contains("SELECT 1 FROM up WHERE up.hop_agent = v_child"),
+        "195 keeps the chain guard"
+    );
+}
+
+/// `docs/runbooks/195-undo.sql`, applied twice to a database migrated through
+/// 195, returns the catalog to exactly what it was below 195 (179's
+/// derivation, 180's registration and 166's lineage follow, owners and ACLs).
+/// Over a body a LATER migration re-stated, for any of the three, it refuses
+/// 55000 and changes nothing.
+#[sqlx::test(migrations = false)]
+async fn the_195_undo_restores_the_catalog_below_195(pool: PgPool) {
+    migrate(&pool, &up_to_below(195)).await.expect("below 195");
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to_below(196))
+        .await
+        .expect("through 195");
+    let through_195 = catalog(&pool).await;
+    assert_ne!(through_195, before, "CALIBRATION: 195 changed the catalog");
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/195-undo.sql"),
+    )
+    .expect("195-undo.sql");
+    let run_refused = |pool: PgPool, undo: String| async move {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+        // The undo's own BEGIN is left aborted on this connection.
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("ROLLBACK");
+        r.expect_err("the undo refuses a body it does not know")
+    };
+
+    let derivation_195 = derivation_src(&pool).await;
+    set_derivation_src(&pool, &format!("{derivation_195}-- a later re-statement\n")).await;
+    let refused = run_refused(pool.clone(), undo.clone()).await;
+    assert!(
+        refused.to_string().contains("195-undo")
+            && refused
+                .to_string()
+                .contains("epigraph_role_derived_memberships"),
+        "the refusal names the undo and the derivation: {refused}"
+    );
+    set_derivation_src(&pool, &derivation_195).await;
+
+    let registration_195 = register_src(&pool).await;
+    set_register_src(
+        &pool,
+        &format!("{registration_195}-- a later re-statement\n"),
+    )
+    .await;
+    let refused = run_refused(pool.clone(), undo.clone()).await;
+    assert!(
+        refused.to_string().contains("195-undo")
+            && refused
+                .to_string()
+                .contains("epigraph_register_agent_identity"),
+        "the refusal names the undo and the registration: {refused}"
+    );
+    assert!(
+        register_src(&pool)
+            .await
+            .ends_with("-- a later re-statement\n"),
+        "a refused undo changes nothing"
+    );
+    set_register_src(&pool, &registration_195).await;
+
+    let follow_195 = follow_src(&pool).await;
+    set_follow_src(&pool, &format!("{follow_195}-- a later re-statement\n")).await;
+    let refused = run_refused(pool.clone(), undo.clone()).await;
+    assert!(
+        refused.to_string().contains("195-undo")
+            && refused
+                .to_string()
+                .contains("epigraph_role_agents_follow_lineage"),
+        "the refusal names the undo and the follow: {refused}"
+    );
+    assert_eq!(
+        derivation_src(&pool).await,
+        derivation_195,
+        "a refused undo changes nothing"
+    );
+    set_follow_src(&pool, &follow_195).await;
+    assert_eq!(
+        catalog(&pool).await,
+        through_195,
+        "CALIBRATION: back to 195's catalog"
+    );
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo applies (run {run}): {e}"));
+    }
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the undo does not restore the catalog below 195.\nleft: {left:#?}\nlost: {lost:#?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The registration's role-attachment copy (166's step 5b) never copies a
 // grant back onto the identity it came from (180)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1833,9 +2119,11 @@ async fn a_revert_never_copies_an_attachment_back_onto_its_detached_source(pool:
 /// A, B succeeds X (B's row is a copy of X's, which is a copy of A's); A is
 /// detached; A is registered with B as its parent. "B succeeded A" is NOT on
 /// record (B's parent is X), but A's own attachment is in the chain of B's
-/// row, so nothing is copied back onto A. The same through 166's attach-time
-/// lineage follow, where B's row names A's (detached) row DIRECTLY. POSITIVE
-/// CONTROL: a fresh successor of B is copied.
+/// row, so nothing is copied back onto A. The same through the attach-time
+/// lineage follow, whose copies chain the same way since 195 (B's row names
+/// X's copy, which names A's row; under 166 B's row named A's directly, and
+/// the guard tripped as well). POSITIVE CONTROL: a fresh successor of B is
+/// copied.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
     seed_role(&pool, CYCLE_ROLE).await;
@@ -1875,15 +2163,23 @@ async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
     );
 
     // The attach-time follow: the lineage is registered first, then A2 is
-    // attached, and 166 copies A2's row to B2 directly (no row of X2 between).
+    // attached, and the follow copies A2's row to X2 and X2's copy to B2
+    // (195 chains the follow's copies as the registration does).
     let a2_id = new_identity();
     let a2 = register_id(&pool, &a2_id, None).await;
     let x2 = register_id(&pool, &new_identity(), Some(a2)).await;
     let b2 = register_id(&pool, &new_identity(), Some(x2)).await;
     let ra2 = attach_role(&pool, a2).await;
+    let x2_rows = live_rows(&pool, x2).await;
+    assert_eq!(x2_rows.len(), 1, "PREMISE: X2 got a copy");
+    assert_eq!(x2_rows[0].1, Some(ra2), "PREMISE: naming A2's row");
     let b2_rows = live_rows(&pool, b2).await;
     assert_eq!(b2_rows.len(), 1, "PREMISE: B2 got a copy");
-    assert_eq!(b2_rows[0].1, Some(ra2), "PREMISE: naming A2's row directly");
+    assert_eq!(
+        b2_rows[0].1,
+        Some(x2_rows[0].0),
+        "PREMISE: naming X2's copy, so A2's row is two hops up"
+    );
     assert_eq!(detach_role(&pool, a2).await, 1, "A2 detached");
     assert_eq!(
         register_id(&pool, &a2_id, Some(b2)).await,
@@ -1897,16 +2193,16 @@ async fn a_copy_whose_chain_reaches_the_child_is_withheld(pool: PgPool) {
     assert_eq!(withheld(&pool, a2).await, Some(1));
 }
 
-/// THE REVERSE-PAIR GUARD ALONE (the chain does not reach the child). B
-/// succeeded A while nothing was attached; the operator then attaches B
-/// itself (its own root row); the job reverts, so A is registered with B as
-/// its parent. B's row names no row of A, but "B succeeded A" is on record,
-/// so nothing is copied onto A. DOCUMENTED COST: an attachment is also 166's
-/// restriction, so with the role unheld B may not run while the reverted A,
-/// holding no attachment, may. POSITIVE CONTROL: a fresh successor of B is
-/// copied.
+/// A COPY BACK ONTO THE PARENT'S OWN PREDECESSOR RESTRICTS (migration 195
+/// dropped 180's reverse-pair guard; the chain guard stays). B succeeded A
+/// while nothing was attached; the operator then attaches B itself (its own
+/// root row); the job reverts, so A is registered with B as its parent. B's
+/// row names no row of A, so the chain guard does not trip, and "B succeeded
+/// A" on record no longer withholds anything: B's row is copied onto A, so
+/// with the role unheld A is held by 166's restriction exactly as B is.
+/// Nothing is withheld. POSITIVE CONTROL: a fresh successor of B is copied.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
+async fn a_copy_onto_the_parents_own_predecessor_restricts(pool: PgPool) {
     seed_role(&pool, CYCLE_ROLE).await;
     let a_id = new_identity();
     let a = register_id(&pool, &a_id, None).await;
@@ -1931,18 +2227,17 @@ async fn a_copy_onto_the_parents_own_predecessor_is_withheld(pool: PgPool) {
         a,
         "the revert is A"
     );
-    assert!(
-        live_rows(&pool, a).await.is_empty(),
-        "nothing is copied onto the parent's own recorded predecessor"
-    );
-    assert_eq!(withheld(&pool, a).await, Some(1));
+    let a_rows = live_rows(&pool, a).await;
+    assert_eq!(a_rows.len(), 1, "B's row is copied onto its predecessor");
+    assert_eq!(a_rows[0].1, Some(rb), "from B's own row");
+    assert_eq!(withheld(&pool, a).await, Some(0), "nothing is withheld");
     assert!(
         !may_run(&pool, b).await,
         "PREMISE: B is held (the role is unheld)"
     );
     assert!(
-        may_run(&pool, a).await,
-        "DOCUMENTED COST: the reverted A holds no attachment, so 166's restriction no longer holds it"
+        !may_run(&pool, a).await,
+        "the reverted A is held by the role exactly as B is"
     );
 
     let c = register_id(&pool, &new_identity(), Some(b)).await;

@@ -130,13 +130,15 @@ pub async fn detect_voids(
         let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
             &mut *read,
             &viewer,
-            &format_embedding(&embedding),
+            epigraph_db::FlatRanking::Query(&format_embedding(&embedding)),
             NO_SIMILARITY_FLOOR,
             None,
             None,
             None,
             None,
             1,
+            None,
+            0,
         )
         .await
         .map_err(|e| ApiError::InternalError {
@@ -253,13 +255,15 @@ pub async fn embedding_density(
     let nearest = epigraph_db::ClaimRepository::semantic_search_flat(
         &mut *read,
         &viewer,
-        &format_embedding(&embedding),
+        epigraph_db::FlatRanking::Query(&format_embedding(&embedding)),
         NO_SIMILARITY_FLOOR,
         None,
         None,
         None,
         None,
         1,
+        None,
+        0,
     )
     .await
     .map_err(|e| ApiError::InternalError {
