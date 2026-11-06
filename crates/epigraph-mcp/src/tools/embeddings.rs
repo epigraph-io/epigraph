@@ -46,8 +46,11 @@ pub async fn embedding_neighborhood_density(
     let embedding_dim = embedding.len() as u32;
     let embedding_str = crate::embed::format_pgvector(&embedding);
 
+    let mut read = server
+        .read_as(viewer, "embedding_neighborhood_density")
+        .await?;
     let (n_claims, mean_opt, median_opt) = epigraph_db::ClaimRepository::embedding_radius_density(
-        &server.pool,
+        &mut *read,
         viewer,
         &embedding_str,
         radius,
@@ -58,7 +61,7 @@ pub async fn embedding_neighborhood_density(
     let median_similarity = median_opt.unwrap_or(0.0);
 
     let breakdown_rows = epigraph_db::ClaimRepository::embedding_radius_breakdown(
-        &server.pool,
+        &mut *read,
         viewer,
         &embedding_str,
         radius,

@@ -39,7 +39,16 @@ fn signer() -> AgentSigner {
 /// Mock embedder (no API key): `find_workflow_hierarchical` takes the ILIKE path.
 fn ilike_server(pool: PgPool) -> EpiGraphMcpFull {
     let embedder = McpEmbedder::new(pool.clone(), None);
-    EpiGraphMcpFull::new(pool, signer(), embedder, false)
+    {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool, signer(), embedder, false).with_scoped_pool(scoped)
+    }
 }
 
 /// A non-mock embedder whose `generate` is the axis-0 unit vector for every
@@ -47,7 +56,16 @@ fn ilike_server(pool: PgPool) -> EpiGraphMcpFull {
 fn embedding_server(pool: PgPool) -> EpiGraphMcpFull {
     let embedder = McpEmbedder::new(pool.clone(), Some("in-process-generator".to_string()))
         .with_generator(std::sync::Arc::new(|_text: &str| Ok(at_similarity(1.0))));
-    EpiGraphMcpFull::new(pool, signer(), embedder, false)
+    {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool, signer(), embedder, false).with_scoped_pool(scoped)
+    }
 }
 
 async fn seed(

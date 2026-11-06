@@ -262,12 +262,22 @@ fn build_test_server(pool: PgPool) -> epigraph_mcp::EpiGraphMcpFull {
     use epigraph_mcp::EpiGraphMcpFull;
     let signer = AgentSigner::from_bytes(&[0u8; 32]).expect("signer");
     // Mock embedder (no API key in CI) — tests drive the pgvec seams directly.
-    EpiGraphMcpFull::new(
-        pool.clone(),
-        signer,
-        McpEmbedder::new(pool, None),
-        /*read_only=*/ false,
-    )
+    {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(
+            pool.clone(),
+            signer,
+            McpEmbedder::new(pool, None),
+            /*read_only=*/ false,
+        )
+        .with_scoped_pool(scoped)
+    }
 }
 
 // ── Result plumbing ───────────────────────────────────────────────────────

@@ -174,7 +174,16 @@ async fn absent_llm_identity_leaves_agent_properties_clean(pool: PgPool) {
     let signer = AgentSigner::from_bytes(&signer_bytes).expect("signer");
     let pk = signer.public_key();
     let embedder = McpEmbedder::new(pool.clone(), None);
-    let server = EpiGraphMcpFull::new(pool.clone(), signer, embedder, false);
+    let server = {
+        // Every deployed server carries a ScopedPool; content reads refuse
+        // without one (`EpiGraphMcpFull::read_as`). Lazy, on this fixture's
+        // own connect options.
+        let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+            (*pool.connect_options()).clone(),
+            epigraph_db::SessionGucMode::Session,
+        );
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped)
+    };
 
     server.emit_tool_invoked("query_claims").await;
     let id = epigraph_db::AgentRepository::get_by_public_key(&pool, &pk)
