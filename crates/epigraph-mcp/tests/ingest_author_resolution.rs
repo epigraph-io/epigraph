@@ -716,31 +716,82 @@ async fn the_core_refuses_an_unknown_agent_id_and_writes_no_claim(pool: PgPool) 
     assert_eq!(claims_labelled(&pool, doi).await, 0, "no claim written");
 }
 
-/// The spine shares the resolver: an explicit id is honoured and reported.
-#[sqlx::test(migrations = "../../migrations")]
-async fn the_spine_honours_an_explicit_agent_id(pool: PgPool) {
-    let server = app_role_server(&pool).await;
-    let human = human_named(&pool, "Oren Vasquez-Lindqvist").await;
-    let viewer = fixture::public_viewer(&pool).await;
-    let doi = "10.9999/author-spine";
+/// `ingest_document_spine` on `server`, as a public viewer.
+async fn spine(server: &EpiGraphMcpFull, pool: &PgPool, extraction: DocumentExtraction) -> Value {
+    let viewer = fixture::public_viewer(pool).await;
     let r = tools::ingestion::ingest_document_spine(
-        &server,
+        server,
         &viewer,
-        IngestDocumentSpineParams {
-            extraction: doc(
-                doi,
-                json!([{"name": "O. Vasquez", "agent_id": human.to_string()}]),
-            ),
-        },
+        IngestDocumentSpineParams { extraction },
         None,
     )
     .await
     .expect("spine ingests");
-    let json = text(&r);
+    text(&r)
+}
+
+/// The spine shares the resolver AND the explicit-author rule: a stranger's
+/// naming of a person by id makes them an author (`authored`, pending, marked
+/// with the ingester) and asserts NONE of the spine's claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_spine_honours_an_explicit_agent_id(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let human = human_named(&pool, "Oren Vasquez-Lindqvist").await;
+    let doi = "10.9999/author-spine";
+    let json = spine(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "O. Vasquez", "agent_id": human.to_string()}]),
+        ),
+    )
+    .await;
     assert_eq!(json["authors"][0]["agent_id"], human.to_string(), "{json}");
     assert_eq!(json["authors"][0]["status"], "explicit", "{json}");
+    assert_eq!(
+        json["authors"][0]["attribution"], "pending_countersign",
+        "{json}"
+    );
+    assert_eq!(json["authors"][0]["asserts_claims"], false, "{json}");
     assert_eq!(authored_edges(&pool, human, doi).await, 1);
     assert_eq!(name_key_node(&pool, "O. Vasquez").await, None);
+    let ingester = server.server_agent_id().await.expect("server agent");
+    let props = authored_props(&pool, human, doi).await;
+    assert_eq!(props["pending_countersign"], true, "{props}");
+    assert_eq!(props["ingested_by"], ingester.to_string(), "{props}");
+    assert!(
+        paper_claims(&pool, doi).await > 0,
+        "CALIBRATION: the spine asserted claims"
+    );
+    assert_eq!(
+        asserts_edges(&pool, human).await,
+        0,
+        "a stranger's naming on the spine makes the person assert nothing"
+    );
+}
+
+/// CONTROL for the spine's gate: the ingester naming ITSELF asserts every
+/// spine claim, so the zero above is the gate's, not an empty spine's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_spine_lets_the_ingester_name_itself_and_assert(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let me = server.server_agent_id().await.expect("server agent");
+    let doi = "10.9999/author-spine-self";
+    let json = spine(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "Spine Self", "agent_id": me.to_string()}]),
+        ),
+    )
+    .await;
+    assert_eq!(json["authors"][0]["attribution"], "caller", "{json}");
+    assert_eq!(json["authors"][0]["asserts_claims"], true, "{json}");
+    let claims = paper_claims(&pool, doi).await;
+    assert!(claims > 0, "{json}");
+    assert_eq!(asserts_on_doc(&pool, me, doi).await, claims, "{json}");
 }
 
 /// The two arms of the explicit-author rule that DO write `asserts`: the
