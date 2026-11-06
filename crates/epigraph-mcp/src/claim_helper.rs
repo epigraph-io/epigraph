@@ -457,6 +457,33 @@ pub async fn wire_ds_for_new_claim_in_tx(
     Ok(result)
 }
 
+/// The canonical claim's text when it still needs an embedding, read as the
+/// CALLER: the repair-embed check `submit_claim` and `memorize` run after a
+/// content-hash dedup hit (`was_created == false`).
+///
+/// On the plain pool this read was blind to group-private rows, so a dedup hit
+/// on the caller's own private claim whose vector was missing answered "no
+/// embedding needed" and the claim stayed out of semantic recall. A failure is
+/// reported as text for the caller's warning, never returned as an error: the
+/// claim is committed, and the maintenance backfill covers a skipped embed.
+///
+/// # Errors
+/// The read's failure, as text.
+pub async fn claim_text_if_embedding_missing_as_caller(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: uuid::Uuid,
+) -> Result<Option<String>, String> {
+    let mut read = crate::tools::workflows::CallerRead::open(server, viewer)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let text = ClaimRepository::claim_text_if_embedding_missing(read.conn(), viewer, claim_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    read.close().await.map_err(|e| format!("{e:?}"))?;
+    Ok(text)
+}
+
 /// Generate (or reuse) a claim's embedding vector and store it on a connection
 /// stamped from the **author's** viewer. Post-commit, best-effort, and
 /// deliberately NOT inside the submission's write transaction.
