@@ -74,9 +74,11 @@
 //! read a document's assertion never learns it exists, and the tag tells
 //! nothing about records the caller may not read.
 //!
-//! Each document's authors are read with the paper listing's own read
-//! (`PaperRepository::list_authors`, the one `query_paper` uses): in-force
-//! `authored` edges the caller can read, in position order. An author an
+//! Each document's authors are read with the paper listing's own columns,
+//! predicate and order (`PaperRepository::list_authors_bounded`, sharing them
+//! with `list_authors`, the read `query_paper` uses): in-force `authored`
+//! edges the caller can read, in position order, in ONE read for every listed
+//! document, bounded in SQL. An author an
 //! ingester named without speaking for them (`pending_countersign`) is
 //! listed under `pending_authors`, with `named_by` (the ingester whose word
 //! it is), and never under `authors`, so a pending author is never shown as
@@ -337,7 +339,18 @@ impl AuthoredByRepository {
                 .iter()
                 .map(|r| (r.ingested_by, r.recorded_at)),
         );
-        let bound = Self::humans_bound_at(&mut *conn, &asks).await?;
+        let bound: Vec<Option<Uuid>> = sqlx::query_as::<_, (i64, Option<Uuid>)>(
+            "SELECT u.n, public.epigraph_operator_bound_at(u.a, u.t) \
+               FROM unnest($1::uuid[], $2::timestamptz[]) WITH ORDINALITY AS u(a, t, n) \
+              ORDER BY u.n",
+        )
+        .bind(asks.iter().map(|(a, _)| *a).collect::<Vec<Uuid>>())
+        .bind(asks.iter().map(|(_, t)| *t).collect::<Vec<DateTime<Utc>>>())
+        .fetch_all(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|(_, h)| h)
+        .collect();
         let filer_human = bound.first().copied().flatten();
 
         // The documents: the creator's first, then each other document once,
@@ -353,16 +366,36 @@ impl AuthoredByRepository {
         others.truncate(MAX_PAPERS);
         let mut paper_ids: Vec<Uuid> = creator_paper.into_iter().collect();
         paper_ids.extend(others.iter().copied());
-        let mut listings: HashMap<Uuid, (PaperRef, Vec<PaperAuthorListing>)> = HashMap::new();
+        // The documents and their authors: two reads, both bounded (at most
+        // 1 + MAX_PAPERS documents, at most MAX_PAPER_AUTHORS + 1 authors each).
+        let mut listings: HashMap<Uuid, (PaperRef, Vec<PaperAuthorListing>, bool)> = HashMap::new();
         if !paper_ids.is_empty() {
-            let rows: Vec<(Uuid, String, Option<String>)> =
-                sqlx::query_as("SELECT id, doi, title FROM papers WHERE id = ANY($1)")
-                    .bind(&paper_ids)
-                    .fetch_all(&mut *conn)
-                    .await?;
+            // Only for a claim the caller can read (the records already
+            // require it; the statement says so too).
+            let sql = viewer.splice(
+                "SELECT p.id, p.doi, p.title FROM papers p \
+                  WHERE p.id = ANY($1) \
+                    AND EXISTS (SELECT 1 FROM claims ac WHERE ac.id = $2 \
+                                /* {VISIBILITY:ac} */)",
+                3,
+            );
+            let mut q = sqlx::query_as::<_, (Uuid, String, Option<String>)>(&sql)
+                .bind(&paper_ids)
+                .bind(claim_id);
+            if let Some(g) = viewer.group_bind() {
+                q = q.bind(g);
+            }
+            let rows = q.fetch_all(&mut *conn).await?;
+            let mut authors = PaperRepository::list_authors_bounded(
+                &mut *conn,
+                viewer,
+                &paper_ids,
+                i64::try_from(MAX_PAPER_AUTHORS).unwrap_or(i64::MAX),
+            )
+            .await?;
             for (id, doi, title) in rows {
-                let authors = PaperRepository::list_authors(&mut *conn, viewer, id).await?;
-                listings.insert(id, (PaperRef { id, doi, title }, authors));
+                let (listed, truncated) = authors.remove(&id).unwrap_or_default();
+                listings.insert(id, (PaperRef { id, doi, title }, listed, truncated));
             }
         }
 
@@ -370,7 +403,7 @@ impl AuthoredByRepository {
         let mut wanted: Vec<Uuid> = vec![agent_id];
         wanted.extend(bound.iter().flatten().copied());
         wanted.extend(ingests.records.iter().map(|r| r.ingested_by));
-        for (_, authors) in listings.values() {
+        for (_, authors, _) in listings.values() {
             wanted.extend(authors.iter().filter_map(|a| a.ingested_by));
         }
         wanted.sort_unstable();
@@ -413,11 +446,10 @@ impl AuthoredByRepository {
         };
 
         let authorship = |id: Uuid| -> Option<PaperAuthorship> {
-            let (paper, listing) = listings.get(&id)?;
-            let authors_truncated = listing.len() > MAX_PAPER_AUTHORS;
+            let (paper, listing, authors_truncated) = listings.get(&id)?;
+            let authors_truncated = *authors_truncated;
             let (pending, plain): (Vec<PaperAuthor>, Vec<PaperAuthor>) = listing
                 .iter()
-                .take(MAX_PAPER_AUTHORS)
                 .map(|a| PaperAuthor {
                     id: a.agent_id,
                     display_name: a.display_name.clone(),
@@ -469,25 +501,5 @@ impl AuthoredByRepository {
                 corroboration,
             }),
         })
-    }
-
-    /// The human each `(agent, instant)` was bound to, in order (migration
-    /// 199's `epigraph_operator_bound_at`, one round trip).
-    async fn humans_bound_at(
-        conn: &mut sqlx::PgConnection,
-        asks: &[(Uuid, DateTime<Utc>)],
-    ) -> Result<Vec<Option<Uuid>>, DbError> {
-        let agents: Vec<Uuid> = asks.iter().map(|(a, _)| *a).collect();
-        let instants: Vec<DateTime<Utc>> = asks.iter().map(|(_, t)| *t).collect();
-        let rows: Vec<(i64, Option<Uuid>)> = sqlx::query_as(
-            "SELECT u.n, public.epigraph_operator_bound_at(u.a, u.t) \
-               FROM unnest($1::uuid[], $2::timestamptz[]) WITH ORDINALITY AS u(a, t, n) \
-              ORDER BY u.n",
-        )
-        .bind(&agents)
-        .bind(&instants)
-        .fetch_all(&mut *conn)
-        .await?;
-        Ok(rows.into_iter().map(|(_, h)| h).collect())
     }
 }
