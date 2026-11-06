@@ -2117,6 +2117,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the migration runner's superuser it keeps working with more authority
     // than intended, which only this check reports.
     ("epigraph_atlas_layout_narrowed", 197),
+    // 198, the agent-lookup card's disclosed roles (find_agent / get_agent).
+    // Its read of the FORCEd `role_assignments` is admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner the
+    // read is filtered to the session principal's own rows: fail CLOSED,
+    // fewer roles shown, never more.
+    ("epigraph_disclosed_role_assignments", 198),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2883,6 +2889,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_retire_operator_link",
             "public.epigraph_retire_operator_link(uuid, text, boolean)",
             false,
+        ),
+        // 198: the request path builds the agent-lookup card through it;
+        // without the grant find_agent / get_agent fail 42501.
+        (
+            "epigraph_disclosed_role_assignments",
+            "public.epigraph_disclosed_role_assignments(uuid[])",
+            true,
         ),
         // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
         // calls it on the request DSN for `authored_by.prompt_snapshot`;

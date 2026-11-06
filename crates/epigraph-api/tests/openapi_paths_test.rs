@@ -22,6 +22,7 @@ async fn openapi_documents_in_scope_paths() {
         "/api/v1/workflows/hierarchical/{id}/outcome",
         "/api/v1/workflows/{id}",
         "/api/v1/workflows/ingest",
+        "/api/v1/agents/search",
     ] {
         assert!(
             paths.contains_key(required),

@@ -156,9 +156,12 @@ pub async fn query_paper(
         .await
         .map_err(internal_error)?
         .into_iter()
-        .map(|(agent_id, display_name)| AuthorResponse {
-            agent_id: agent_id.to_string(),
-            name: display_name.unwrap_or_default(),
+        .map(|a| AuthorResponse {
+            agent_id: a.agent_id.to_string(),
+            name: a.display_name.unwrap_or_default(),
+            position: a.position,
+            pending_countersign: a.pending_countersign,
+            ingested_by: a.ingested_by.map(|u| u.to_string()),
         })
         .collect();
 

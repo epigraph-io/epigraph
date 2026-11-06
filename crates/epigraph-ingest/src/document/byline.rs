@@ -76,6 +76,7 @@ fn parse_byline_line(line: &str) -> Option<Vec<AuthorEntry>> {
             name: (*seg).to_string(),
             affiliations: Vec::new(),
             roles: Vec::new(),
+            agent_id: None,
         });
     }
     Some(authors)

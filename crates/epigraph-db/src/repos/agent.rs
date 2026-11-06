@@ -265,6 +265,15 @@ pub struct AgentPublicProfile {
 /// Repository for Agent operations
 pub struct AgentRepository;
 
+/// How a writer speaks for an agent ([`AgentRepository::speaks_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeaksFor {
+    /// The agent is the writer's own write identity.
+    Itself,
+    /// The writer is the human the agent acts for, through a live binding.
+    Operator,
+}
+
 impl AgentRepository {
     /// Create a new agent in the database
     ///
@@ -1609,6 +1618,43 @@ impl AgentRepository {
         Ok(rows
             .into_iter()
             .filter_map(|(agent, human)| human.map(|h| (agent, h)))
+            .collect())
+    }
+
+    /// How `writer` speaks for each of `agents`, for the writes that put words
+    /// in an agent's mouth (an `asserts` or authorship edge FROM the agent):
+    /// [`SpeaksFor::Itself`] when the agent IS the writer,
+    /// [`SpeaksFor::Operator`] when the writer is the human the agent acts for
+    /// through a binding in force now (migration 149's
+    /// `epigraph_human_of(agent, true)`: a retired link or a revoked
+    /// allowance confers nothing). An agent the writer does not speak for is
+    /// absent. The one rule the document ingest's explicit authors and
+    /// `POST /api/v1/edges` share.
+    ///
+    /// Authority, not disclosure: it reads binding STATUS on purpose (a
+    /// suspended client's agent cannot be spoken for), which is why it is not
+    /// the binding-record read the agent card shows.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn speaks_for<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        writer: Uuid,
+        agents: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, SpeaksFor>, DbError> {
+        let others: Vec<Uuid> = agents.iter().copied().filter(|a| *a != writer).collect();
+        let humans = Self::humans_of(executor, &others, true).await?;
+        Ok(agents
+            .iter()
+            .filter_map(|a| {
+                if *a == writer {
+                    Some((*a, SpeaksFor::Itself))
+                } else if humans.get(a) == Some(&writer) {
+                    Some((*a, SpeaksFor::Operator))
+                } else {
+                    None
+                }
+            })
             .collect())
     }
 

@@ -211,6 +211,33 @@ pub struct GetWorkflowPlanParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct FindAgentParams {
+    #[schemars(
+        description = "The name to look up (2 to 200 characters), or an ORCID / ROR id. Case-insensitive and accent-folded: 'jose nunez' finds 'José Núñez'."
+    )]
+    pub name: String,
+    #[schemars(
+        description = "Optional: keep only agents of this kind: human, llm_agent, system, role, ingest_author or unknown. Kind is derived from evidence you may see, never from the legacy agent_type column."
+    )]
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Optional: keep only agents holding this role ('role:<key>' or '<key>')."
+    )]
+    #[serde(default)]
+    pub role: Option<String>,
+    #[schemars(description = "Optional: at most this many results (default 10, at most 25).")]
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetAgentParams {
+    #[schemars(description = "The UUID of the agent (for example a claim's agent_id).")]
+    pub agent_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetClaimParams {
     #[schemars(description = "The UUID of the claim to retrieve")]
     pub claim_id: String,
@@ -1912,10 +1939,120 @@ pub(crate) fn split_epistemic<T: RecallGatedSignals>(
     }
 }
 
+/// One author of a paper as `query_paper` lists it: only authorships in
+/// force, in the extraction's order (`position`). An authorship an ingester
+/// named without speaking for the person (`pending_countersign`) is listed
+/// as PENDING, with the ingester that asserted it (`ingested_by`), never as a
+/// plain author.
 #[derive(Debug, Serialize)]
 pub struct AuthorResponse {
     pub agent_id: String,
     pub name: String,
+    /// The author's index in the document's author list, when recorded.
+    pub position: Option<i64>,
+    /// The ingester's word, not yet countersigned by the person.
+    pub pending_countersign: bool,
+    /// On a pending authorship, the agent that ingested the document and
+    /// named this author; `null` otherwise.
+    pub ingested_by: Option<String>,
+}
+
+/// One author of an ingested document, as the walk resolved it (backlog
+/// 94cc12db): the ingest responses' `authors[]`. `agent_id` and `name` are
+/// the two fields those entries always had; the rest say how the node was
+/// chosen and what was written for it.
+#[derive(Debug, Serialize)]
+pub struct IngestAuthorReport {
+    /// The agent the `authored` edge comes from (and the `asserts` edges,
+    /// when `asserts_claims` is true).
+    pub agent_id: String,
+    /// The name as the extraction spelled it.
+    pub name: String,
+    /// The author's index in `source.authors` (gaps where a placeholder or a
+    /// system identity was skipped).
+    pub position: usize,
+    /// `explicit` (an `agent_id`: given now, or kept from an earlier ingest of
+    /// this document), `matched` (the name-derived node existed and no other
+    /// agent has this name), `created` (it did not, and none does), or
+    /// `ambiguous` (other agents have this name: see `candidates`; the ingest
+    /// attached the name-derived node, never one of them).
+    pub status: &'static str,
+    /// What the walk did: `attached_given` (this call's `agent_id`),
+    /// `kept_attached` (no `agent_id` now, but an earlier ingest attached one
+    /// for this spelling, and it stays the author), `reused_name_key` or
+    /// `created_name_key`.
+    pub action: &'static str,
+    /// Who vouches for the STORED attribution: `name_derived` (the name
+    /// path), `caller` (the agent is the ingester), `operated_by_caller` (the
+    /// ingester is the human the agent acts for), `confirmed` (kept: an
+    /// earlier attachment the person or their operator made, which this
+    /// ingester does not speak for), or `pending_countersign` (the
+    /// authorship is an ingester's word, see `pending_ingested_by`; the agent
+    /// is listed as a pending author of the paper and asserts none of its
+    /// claims; no countersign route exists yet, so only an operator clears
+    /// the mark). An earlier pending authorship of this agent on this paper
+    /// stays pending whoever re-attaches it: no session can rewrite an
+    /// agent's edge.
+    pub attribution: &'static str,
+    /// True when this agent's `asserts` edges onto the document's claims were
+    /// written by this call: only when this ingester speaks for the agent
+    /// (`caller` / `operated_by_caller`) and its authorship is not pending.
+    pub asserts_claims: bool,
+    /// On a `pending_countersign` author, the ingester recorded on the stored
+    /// authorship: the one whose word it is (an earlier ingester's, when this
+    /// call re-attached or kept it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_ingested_by: Option<String>,
+    /// The attached agent's own `display_name`, on an `explicit` author.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// The name-derived author an earlier ingest attached for this entry's
+    /// spelling, which this call's `agent_id` replaced: its `authored` edge on
+    /// this paper and its `asserts` edges onto this paper's claims were
+    /// retracted (a claim another of its papers also asserts keeps its edge).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<ReplacedAuthor>,
+    /// Other agents the document already lists as an author at this same
+    /// `position`, left in place: an earlier ingest with a different spelling
+    /// or order (replacement follows this entry's own spelling: an
+    /// `agent_id` given with a different spelling than the name-derived
+    /// author's is ADDED here, beside it), or an earlier ingester's pending
+    /// naming that a name-only entry does not keep. This call did not change
+    /// them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub also_at_position: Vec<String>,
+    /// Other agents whose case- and accent-folded name equals this author's
+    /// (public fields only; `get_agent` gives the card). To make one of them
+    /// the author instead, re-ingest with `agent_id` (and this entry's same
+    /// spelling) through the operator `ingest-document` CLI: the name-derived
+    /// node is then replaced (`replaced`), never kept beside it. Its edges are
+    /// administrative, so an MCP server refuses that replacement and writes
+    /// nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<AuthorCandidate>,
+    /// True when more candidates exist than are listed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub candidates_truncated: bool,
+}
+
+/// The name-derived author an explicit `agent_id` replaced on a re-ingest.
+#[derive(Debug, Serialize)]
+pub struct ReplacedAuthor {
+    pub agent_id: String,
+    /// Its `authored` edges into this paper retracted (0 or 1).
+    pub authored_edges_retracted: u64,
+    /// Its `asserts` edges onto this paper's claims retracted.
+    pub asserts_edges_retracted: u64,
+}
+
+/// An existing agent an absent-`agent_id` author's name also matches.
+#[derive(Debug, Serialize)]
+pub struct AuthorCandidate {
+    pub agent_id: String,
+    pub display_name: Option<String>,
+    /// Always `exact` (folded name equality).
+    pub tier: epigraph_db::MatchTier,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1974,7 +2111,14 @@ pub struct IngestDocumentSpineResponse {
     /// document carries no DOI — it is this document's identity, not a real DOI
     /// (issue #356). Poll and label with it exactly as returned.
     pub synthesized_key: bool,
-    pub authors: Vec<AuthorResponse>,
+    /// The document's authors, as resolved (see each one's `attribution`).
+    pub authors: Vec<IngestAuthorReport>,
+    /// The agent that ingested the document (this call's write identity),
+    /// shown apart from the authors: it authors the claim rows, and it is
+    /// the `ingested_by` of every `pending_countersign` authorship THIS call
+    /// wrote (an earlier ingester's pending authorship keeps its own: see
+    /// `authors[].pending_ingested_by`).
+    pub ingested_by: String,
     pub paragraphs_new: usize,
     pub paragraphs_deduped: usize,
     pub paragraphs_embedded: usize,
@@ -2300,7 +2444,14 @@ pub struct IngestDocumentResponse {
     /// document carries no DOI — it is this document's identity, not a real DOI
     /// (issue #356). Poll and label with it exactly as returned.
     pub synthesized_key: bool,
-    pub authors: Vec<AuthorResponse>,
+    /// The document's authors, as resolved (see each one's `attribution`).
+    pub authors: Vec<IngestAuthorReport>,
+    /// The agent that ingested the document (this call's write identity),
+    /// shown apart from the authors: it authors the claim rows, and it is
+    /// the `ingested_by` of every `pending_countersign` authorship THIS call
+    /// wrote (an earlier ingester's pending authorship keeps its own: see
+    /// `authors[].pending_ingested_by`).
+    pub ingested_by: String,
     pub claims_ingested: usize,
     pub claims_embedded: usize,
     pub claims_skipped_dedup: usize,

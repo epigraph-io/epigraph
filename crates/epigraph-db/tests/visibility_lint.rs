@@ -1857,6 +1857,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          Returns workflow ids only, never content.",
     ),
     (
+        "agent_lookup.rs",
+        "author_nodes",
+        "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
+         the document ingest's explicit-author check, plus migration 148's `system_agents` \
+         registry (no row security, app-readable). `agents_identity` is USING (true) and \
+         GET /api/v1/agents/:id answers for any id: no tenancy columns, nothing to filter.",
+    ),
+    (
+        "agent_lookup.rs",
+        "disclosed_roles",
+        "READ through migration 198's `epigraph_disclosed_role_assignments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_assignments` (FORCE RLS, holder \
+         only). The function decides in its body, on the SESSION: non-elevating roles for any \
+         agent (a subset of 123's public projection), any role of the session principal itself, \
+         everything on a privileged session. No tenancy columns; nothing for a Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
+        "exact_name_candidates",
+        "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
+         equality, excluding migration 148's `system_agents` rows (no row security): the \
+         document ingest's same-name author candidates. `agents_identity` is USING (true), only \
+         the public identity columns are returned and no ORCID / ROR tier is used, so no fact \
+         depends on the caller and there is nothing for a Viewer to add.",
+    ),
+    (
         "system_agent.rs",
         "lookup",
         "READ of migration 148's `system_agents` row for one role, with \
@@ -2258,6 +2284,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          write-path read `create_or_get` already documents (it must see an existing edge \
          regardless of who asks, or the get half becomes a duplicate create); the INSERT is \
          authorised by edges_tenancy's WITH CHECK.",
+    ),
+    (
+        "claim_ingest.rs",
+        "record_signed_conn",
+        "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \
+         the claim, and every later one), on the ingest's own transaction, deduplicated on \
+         (paper, claim, properties->>'ingested_by'). Its dedup probe on edges is the same \
+         VISIBILITY-EXEMPT write-path read as create_processed_by_stamp_if_absent_conn (it \
+         must see an existing record whoever asks, or a re-run writes a duplicate); the INSERT \
+         goes through EdgeRepository::create_signed_conn and is authorised by edges_tenancy's \
+         WITH CHECK.",
     ),
     (
         "edge.rs",
@@ -2736,6 +2773,14 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          agent ids (ruling R-36: which human each BBA's writer acts for). It touches no table \
          itself and returns agent -> human ids, the same answer `human_of` gives one at a time; \
          `agents` and the binding tables are identity data, not tenant content.",
+    ),
+    (
+        "agent.rs",
+        "speaks_for",
+        "READ, no SQL of its own: `humans_of(agents, live)` (above) plus an id comparison, \
+         answering whether a writer IS an agent or operates it through a live binding (the \
+         authority rule for an agent-sourced asserts/authored edge). Identity data, not \
+         tenant content.",
     ),
     (
         "derivation_scope.rs",
