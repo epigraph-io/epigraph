@@ -1388,7 +1388,10 @@ pub async fn get_claim(
     // /api/v1/claims/batch-get` checks the trace against the viewer
     // (`ReasoningTraceRepository::readable_ids`) and passes the answer here;
     // doing the same on GET is a separate, wire-changing follow-up.
-    let response = claim_response_for_read(claim, labels, encryption, true);
+    let mut response = claim_response_for_read(claim, labels, encryption, true);
+    // GET only: `POST /api/v1/claims/batch-get` shares the body above and
+    // carries no `authored_by` (the field is omitted there).
+    response.authored_by = Some(authored_by.into());
 
     // No redaction pass. `get_by_id_with_labels` above already ran under `&viewer`,
     // so reaching this line means the claim is readable; the post-pass that
@@ -1415,7 +1418,6 @@ pub(crate) fn claim_response_for_read(
 ) -> ClaimResponse {
     let mut response: ClaimResponse = claim.into();
     response.labels = labels;
-    response.authored_by = Some(authored_by.into());
 
     if let Some(enc) = encryption {
         response.privacy_tier = Some(enc.privacy_tier);
