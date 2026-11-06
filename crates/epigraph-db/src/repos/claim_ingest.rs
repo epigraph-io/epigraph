@@ -112,7 +112,7 @@ impl ClaimIngestRepository {
     /// # Errors
     /// `DbError::QueryFailed` if the probe or the INSERT fails.
     #[allow(clippy::too_many_arguments)]
-    pub async fn record_conn(
+    pub async fn record_signed_conn(
         conn: &mut sqlx::PgConnection,
         key: Option<EdgeSigningKey<'_>>,
         paper_id: Uuid,

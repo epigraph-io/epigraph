@@ -5,7 +5,7 @@
 //! The record is written by the document walk
 //! (`epigraph-mcp/tests/ingest_author_resolution.rs` pins that, through the
 //! real ingest). Pinned here, with records written by the same writer
-//! (`ClaimIngestRepository::record_conn`):
+//! (`ClaimIngestRepository::record_signed_conn`):
 //! * a record counts only while the SAME paper's `asserts` edge onto the claim
 //!   is in force AND readable: a record whose assertion was retracted, or
 //!   whose paper never asserted the claim, is not listed;
@@ -48,7 +48,7 @@ async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) -> Uuid {
 
 async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> bool {
     let mut conn = pool.acquire().await.expect("conn");
-    ClaimIngestRepository::record_conn(
+    ClaimIngestRepository::record_signed_conn(
         &mut conn,
         None,
         paper,

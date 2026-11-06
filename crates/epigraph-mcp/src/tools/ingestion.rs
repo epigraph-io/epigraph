@@ -1304,15 +1304,19 @@ pub async fn do_ingest_document(
                 )
                 .await
                 .map_err(internal_error)?;
-            record_ingest(
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
                 &mut tx,
                 edge_key,
-                (paper_id, persisted_id, agent_id),
+                paper_id,
+                persisted_id,
+                agent_id,
                 false,
                 "ingest_document",
                 &pipeline_version,
             )
-            .await?;
+            .await
+            .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             claim_ids.push(persisted_id.to_string());
             dedup_count += 1;
@@ -1394,15 +1398,19 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        record_ingest(
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
             &mut tx,
             edge_key,
-            (paper_id, persisted_id, agent_id),
+            paper_id,
+            persisted_id,
+            agent_id,
             true,
             "ingest_document",
             &pipeline_version,
         )
-        .await?;
+        .await
+        .map_err(internal_error)?;
 
         embed_queue.push((persisted_id, planned.content.clone()));
 
@@ -1987,29 +1995,6 @@ async fn persist_planned_claim(
     ))
 }
 
-/// Record that this walk's ingest of `paper` asserted `claim`, and whether it
-/// CREATED the claim (`created`: the walk persisted a new row, as opposed to
-/// converging on an existing one): `epigraph_db::ClaimIngestRepository`'s
-/// `paper -ingested_claim-> claim` record, on the walk's transaction, right
-/// after the paper's `asserts` edge onto the claim. Decided here, where
-/// `persist_planned_claim` says whether the row was new, because nothing
-/// read later can tell (atoms converge by content hash).
-async fn record_ingest(
-    conn: &mut sqlx::PgConnection,
-    edge_key: Option<epigraph_db::repos::EdgeSigningKey<'_>>,
-    (paper, claim, writer): (Uuid, Uuid, Uuid),
-    created: bool,
-    tool: &str,
-    pipeline: &str,
-) -> Result<(), McpError> {
-    epigraph_db::ClaimIngestRepository::record_conn(
-        conn, edge_key, paper, claim, writer, created, tool, pipeline,
-    )
-    .await
-    .map(|_| ())
-    .map_err(internal_error)
-}
-
 fn methodology_from_planned(planned: &PlannedClaim) -> Methodology {
     match planned.methodology.as_deref() {
         Some("statistical" | "instrumental" | "computational") => Methodology::Instrumental,
@@ -2307,15 +2292,19 @@ pub async fn do_ingest_document_spine(
             )
             .await
             .map_err(internal_error)?;
-            record_ingest(
+            // The ingest record: this walk converged on an existing claim.
+            epigraph_db::ClaimIngestRepository::record_signed_conn(
                 &mut tx,
                 edge_key,
-                (paper_id, persisted_id, agent_id),
+                paper_id,
+                persisted_id,
+                agent_id,
                 false,
                 "ingest_document_spine",
                 &pipeline_version,
             )
-            .await?;
+            .await
+            .map_err(internal_error)?;
             id_map.insert(planned.id, persisted_id);
             if planned.level == 2 {
                 para_dedup_count += 1;
@@ -2394,15 +2383,19 @@ pub async fn do_ingest_document_spine(
         .await
         .map_err(internal_error)?;
 
-        record_ingest(
+        // The ingest record: this walk CREATED the claim.
+        epigraph_db::ClaimIngestRepository::record_signed_conn(
             &mut tx,
             edge_key,
-            (paper_id, persisted_id, agent_id),
+            paper_id,
+            persisted_id,
+            agent_id,
             true,
             "ingest_document_spine",
             &pipeline_version,
         )
-        .await?;
+        .await
+        .map_err(internal_error)?;
 
         embed_queue.push((persisted_id, planned.content.clone()));
 

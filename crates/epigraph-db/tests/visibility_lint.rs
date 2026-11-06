@@ -2287,7 +2287,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_ingest.rs",
-        "record_conn",
+        "record_signed_conn",
         "WRITE. The document walk's paper -ingested_claim-> claim record (which ingest created \
          the claim, and every later one), on the ingest's own transaction, deduplicated on \
          (paper, claim, properties->>'ingested_by'). Its dedup probe on edges is the same \
