@@ -213,13 +213,16 @@ pub async fn add_step(
     // Post-commit and best-effort, deliberately outside the transaction: the
     // embed holds a network round trip to OpenAI, and CLAUDE.md's embedding
     // policy forbids a failed embed from unwinding a committed claim.
-    // `embed_and_store` reads the author off the row, so it stamps from the
-    // caller without being told to.
-    if let Some(ref content) = r.inserted_content {
-        let _ = server
-            .embedder
-            .embed_and_store(r.step_claim_id, content)
-            .await;
+    // Stored through the caller, which authored the step: a step of a group
+    // plan is not readable as public, so the embedder's own path (which reads
+    // the author off the row as public) would store nothing for it.
+    if let Some(content) = r.inserted_content.clone() {
+        crate::tools::workflow_ingest::embed_created_workflow_claims(
+            server,
+            caller,
+            &[(r.step_claim_id, content)],
+        )
+        .await;
     }
 
     success_json(&AddStepResponse {

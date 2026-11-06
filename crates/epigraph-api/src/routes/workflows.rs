@@ -141,6 +141,12 @@ pub struct StoreWorkflowRequest {
     /// same goal is a no-op that keeps the original tags. Not added as claim
     /// labels.
     pub tags: Option<Vec<String>>,
+    /// Optional declared tenancy, as for `POST /api/v1/workflows/ingest`
+    /// ([`IngestWorkflowRequest::tenancy`]): `{"visibility": "group" |
+    /// "public", "owner_group_id": G}`. Absent: private to the caller's owner
+    /// group.
+    #[serde(default)]
+    pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
 }
 
 #[cfg(feature = "db")]
@@ -298,9 +304,12 @@ fn slugify_goal(s: &str) -> String {
 /// Input shape stays simple (`goal` + `steps[]`); internally constructs a
 /// `WorkflowExtraction` (single `"Body"` phase, thesis = goal) and runs
 /// `execute_workflow_ingest_plan_in_group` AS THE CALLER (the request's
-/// principal authors every claim; the owner is the caller's one team group,
-/// else its default group, public). Each step becomes a first-class claim.
-/// Idempotent on `(slugify(goal), generation=0)`.
+/// principal authors every claim). Without `tenancy` the workflow is private
+/// to its owner group: the caller's one team group, else its default group;
+/// `tenancy` declares a group or, explicitly, public (see
+/// [`IngestWorkflowRequest`]). Each step becomes a first-class claim.
+/// Idempotent on `(slugify(goal), generation=0)`: a re-store writes nothing,
+/// and emits no event.
 #[cfg(feature = "db")]
 pub async fn store_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -323,6 +332,15 @@ pub async fn store_workflow(
     crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
 
     let canonical_name = slugify_goal(&request.goal);
+    let declared = request.tenancy.map(|t| t.decl());
+    if let Some(group) = declared.and_then(|d| d.owner_group_bind()) {
+        let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
+            reason: "store_workflow: a declared tenancy needs an authenticated agent principal"
+                .to_string(),
+        })?;
+        epigraph_ingest_executor::require_caller_writes_group(&viewer, caller, group)
+            .map_err(workflow_ingest_error)?;
+    }
     let prereqs = request.prerequisites.unwrap_or_default();
     let tags = request.tags.unwrap_or_default();
     let confidence = request.confidence.unwrap_or(0.8).clamp(0.0, 1.0);
@@ -377,7 +395,7 @@ pub async fn store_workflow(
         &plan,
         &extraction,
         &viewer,
-        None,
+        declared,
     )
     .await
     .map_err(workflow_ingest_error)?;
@@ -458,8 +476,17 @@ pub async fn store_workflow(
         omit_workflow_id(&mut event);
         omit_workflow_id(&mut body);
     }
-    let _ = epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
-        .await;
+    // `events` has no row security: every reader of the event stream sees a
+    // row's payload. So the event announces only a workflow this call CREATED
+    // as PUBLIC; a group-private plan's goal and id stay with its group.
+    let created_public = result
+        .decl
+        .is_some_and(|d| d.visibility_bind() == Some("public"));
+    if created_public {
+        let _ =
+            epigraph_db::EventRepository::insert(&state.db_pool, "workflow.created", None, &event)
+                .await;
+    }
 
     Ok(Json(body))
 }
@@ -2265,7 +2292,12 @@ pub async fn record_behavioral_execution(
 /// two optional keys beside its own.
 ///
 /// * `tenancy`: `{"visibility": "group", "owner_group_id": G}` declares
-///   `('group', G)` for every claim the ingest creates (absent: public).
+///   `('group', G)` for the `workflows` row and every claim the ingest
+///   creates; `{"visibility": "public", "owner_group_id": G}` declares
+///   `('public', G)`, the only way to publish a new workflow. The caller must
+///   write G either way. Absent: a new workflow is private to the caller's
+///   owner group (its one team group, else its default group), and a new
+///   generation keeps its lineage's visibility.
 /// * `embed`: `false` embeds nothing (default `true`).
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
@@ -2290,28 +2322,31 @@ pub struct IngestWorkflowRequest {
 /// # A declared tenancy
 ///
 /// With `tenancy` (see [`IngestWorkflowRequest`]) every claim the ingest
-/// creates is `('group', G)`. The REQUEST's principal itself must hold a live
+/// creates takes the declared `(visibility, G)`; declaring public on a new
+/// generation of a group-private lineage is refused (403), since it would
+/// publish the lineage. The REQUEST's principal itself must hold a live
 /// writer or admin membership of G (checked on its own viewer before any
 /// transaction, so a refusal writes nothing; its operator's membership does
 /// not count), and the executor re-checks it LIVE on the caller-stamped
 /// transaction. Both refusals are 403. The response
 /// then carries `reused_items`: every planned claim the call did not create
-/// whose tenancy is not `('group', G)`, with its tenancy (`null` when the
+/// whose tenancy is not the declared one, with its tenancy (`null` when the
 /// caller cannot read it, which only a re-ingest can report). Nothing
 /// re-tenants a reused claim, and a plan that reuses a claim private to a group
 /// the caller does not write is refused (403) before any edge is written.
 ///
-/// The `workflows` row itself has no row security: its `canonical_name`,
-/// `goal`, `metadata` and (unless `embed` is `false`) `goal_embedding` stay
-/// instance-readable whatever the tenancy, so a caller must keep them neutral.
+/// The `workflows` row takes the same tenancy as its plan (migration 183).
+/// A re-ingest of an existing `(canonical_name, generation)` writes nothing,
+/// not even the goal embedding.
 ///
 /// # Written as the caller
 ///
 /// Every claim, edge and the `workflows` row are authored by the request's
-/// principal and stamped from its viewer. Without `tenancy` the owner is
-/// `epigraph_ingest_executor::owner`'s order: the extended lineage's public
-/// group when the caller writes it, else the caller's one live team group,
-/// else its default group; all public.
+/// principal and stamped from its viewer. Without `tenancy` the tenancy is
+/// `epigraph_ingest_executor::owner`'s order: a new generation of a public
+/// lineage stays public (in the lineage's group when the caller writes it,
+/// else in the caller's own); a new workflow is private to the caller's one
+/// live team group, else to its default group.
 #[cfg(feature = "db")]
 #[utoipa::path(
     post,
@@ -2353,11 +2388,11 @@ pub async fn ingest_workflow(
             field: "relationships".to_string(),
             reason,
         })?;
-    let declared_group = tenancy.map(|t| t.owner_group_id);
+    let declared = tenancy.map(|t| t.decl());
     // The caller's OWN membership of a declared group, before anything is
     // begun (`require_caller_writes_group`). A viewer with no principal names
     // no caller and is refused.
-    if let Some(group) = declared_group {
+    if let Some(group) = declared.and_then(|d| d.owner_group_bind()) {
         let caller = viewer.principal().ok_or_else(|| ApiError::Forbidden {
             reason: "workflow ingest: a declared tenancy needs an authenticated agent principal"
                 .to_string(),
@@ -2379,7 +2414,7 @@ pub async fn ingest_workflow(
         &plan,
         &extraction,
         &viewer,
-        declared_group,
+        declared,
     )
     .await
     .map_err(workflow_ingest_error)?;
@@ -2460,7 +2495,7 @@ pub async fn ingest_workflow(
     if !caller_reads_row {
         omit_workflow_id(&mut body);
     }
-    if declared_group.is_some() {
+    if declared.is_some() {
         body["reused_items"] = result
             .reused_items
             .iter()
@@ -3497,15 +3532,8 @@ async fn gate_planless_existing_row(
             result.canonical_name, result.generation
         ),
     };
-    let grant = workflow_authority(
-        conn,
-        auth,
-        viewer,
-        viewer.principal(),
-        existing,
-        &not_found,
-    )
-    .await?;
+    let grant =
+        workflow_authority(conn, auth, viewer, viewer.principal(), existing, &not_found).await?;
     decision.admin |= grant.is_admin();
     decision.grants.push((existing, grant));
     Ok(())

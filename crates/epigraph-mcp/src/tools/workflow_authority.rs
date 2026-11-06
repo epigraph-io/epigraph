@@ -257,9 +257,7 @@ pub(crate) async fn require_workflow_authority(
     // plan migration 183 backfilled into its group) is the group's, not the
     // platform's, and is not called one.
     let Some(owner) = owner else {
-        if let Some(group) =
-            owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await?
-        {
+        if let Some(group) = owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await? {
             return Ok(grant(WorkflowArm::OwnerGroupWriter { group }));
         }
         let group_row = matches!(view.as_ref(), Some((visibility, _)) if visibility == "group");

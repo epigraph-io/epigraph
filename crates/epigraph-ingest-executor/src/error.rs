@@ -61,6 +61,21 @@ pub enum IngestExecutorError {
         group: uuid::Uuid,
     },
 
+    /// A declared PUBLIC tenancy on a new generation of a group-private
+    /// lineage: it would publish the lineage. Raised before anything is
+    /// written; the generation inherits the lineage's group when it declares
+    /// none, or moves to another group the caller writes when it declares
+    /// that group.
+    #[error(
+        "canonical_name '{canonical_name}' is a lineage private to group {group}; a new \
+         generation of it cannot be declared public. Omit tenancy (the generation stays in the \
+         lineage's group) or declare a group you write. Nothing was written"
+    )]
+    DeclaredPublicOverGroupLineage {
+        canonical_name: String,
+        group: uuid::Uuid,
+    },
+
     /// A caller-authored workflow write was handed a viewer with no
     /// principal: there is no agent to author the rows as.
     #[error(
@@ -148,6 +163,7 @@ pub enum IngestExecutorError {
 impl IngestExecutorError {
     /// Whether this is one of the declared-tenancy refusals
     /// ([`Self::CallerNotGroupWriter`], [`Self::InheritedGroupNotWritable`],
+    /// [`Self::DeclaredPublicOverGroupLineage`],
     /// [`Self::ReusedClaimOutsideCallerGroups`], [`Self::CallerUnidentified`]):
     /// a denial the caller can act
     /// on (403 / `INVALID_REQUEST`), not a fault.
@@ -157,6 +173,7 @@ impl IngestExecutorError {
             self,
             Self::CallerNotGroupWriter { .. }
                 | Self::InheritedGroupNotWritable { .. }
+                | Self::DeclaredPublicOverGroupLineage { .. }
                 | Self::ReusedClaimOutsideCallerGroups { .. }
                 | Self::CallerUnidentified
         )

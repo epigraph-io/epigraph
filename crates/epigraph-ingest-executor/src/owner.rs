@@ -1,36 +1,34 @@
-//! Where a CALLER-authored workflow write lands: the owner group of the rows
-//! a workflow ingest or an `add_step` creates.
+//! Where a CALLER-authored workflow write lands: the owner group, and the
+//! visibility, of the rows a workflow ingest or an `add_step` creates.
 //!
 //! Every workflow write is authored by, and stamped from, the CALLER's own
 //! agent (the request's write identity), so the rows it creates must be owned
 //! by a group the caller writes. The order, decided here once for every entry
-//! point:
+//! point (the call sites handle steps 1 and 2 before asking):
 //!
-//! 1. A DECLARED group (the `tenancy` parameter): `('group', G)`. The caller
-//!    must write `G`, checked live inside the write's transaction.
-//! 2. The CONTAINER's group, when the write extends an existing public
-//!    workflow or lineage (an `add_step`, a new generation) whose owner group
-//!    the caller writes: `('public', owner)`. A group-PRIVATE container is not
-//!    decided here: its rows must stay in its group (ruling R-98), and the
-//!    call sites refuse a caller that does not write it.
-//! 3. The caller's ONE team group: exactly one live non-personal writer or
-//!    admin membership (`GroupMembershipRepository::live_team_writer_groups_conn`):
-//!    `('public', team)`.
-//! 4. Otherwise the caller's own default declaration
+//! 1. A DECLARED tenancy (the `tenancy` parameter): `('group', G)` or, the
+//!    explicit request to publish, `('public', G)`. The caller must write `G`,
+//!    checked live inside the write's transaction.
+//! 2. A GROUP-PRIVATE container (a new generation of a group lineage, a step
+//!    added to a group plan) keeps its group (ruling R-98); the caller must
+//!    write it. A declared public tenancy there is refused: it would publish
+//!    the lineage.
+//! 3. A PUBLIC container (a new generation of a public lineage, a step added
+//!    to a public plan) stays public: in the container's own owner group when
+//!    the caller writes it, else in the caller's own group (steps 4, 5), with
+//!    the parent link (`parent_id`, the `variant_of` edge) kept by the plan walk.
+//! 4. Otherwise the caller's ONE team group: exactly one live non-personal
+//!    writer or admin membership
+//!    (`GroupMembershipRepository::live_team_writer_groups_conn`):
+//!    `('group', team)`.
+//! 5. Otherwise the owner group of the caller's own default declaration
 //!    (`ClaimRepository::default_decl_for_author`): its personal group, or its
-//!    operator's for an operated agent, public. This is the declaration every
-//!    other claim the caller submits takes, with the same refusals (`OPL01` for
-//!    an unbound author, `OPL02` for an operated agent its operator does not
-//!    let write there).
+//!    operator's for an operated agent, `('group', that group)`. Its refusals
+//!    stand (`OPL01` for an unbound author, `OPL02` for an operated agent its
+//!    operator does not let write there).
 //!
-//! Step 2 is how a new generation of a public lineage whose group the caller
-//! no longer writes is published: in the caller's own group (steps 3, 4), with
-//! the parent link (`parent_id`, the `variant_of` edge) kept by the plan walk.
-//!
-//! The team and container answers are visibility `public`, as every
-//! undeclared workflow write was before (the shared system agent's default
-//! declaration was public): only the owner group moves. A caller that wants
-//! the rows private to a group declares it (step 1).
+//! An undeclared new workflow is therefore readable only by its owner group
+//! (the team, or the person): public only when the caller asks for it.
 
 use uuid::Uuid;
 
@@ -39,9 +37,7 @@ use crate::error::IngestExecutorError;
 /// Which step of the order decided a [`CallerOwner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerSource {
-    /// The caller declared the group.
-    Declared,
-    /// The existing workflow or lineage's own (public) owner group.
+    /// The existing public workflow or lineage's own owner group.
     Container,
     /// The caller's one live team group.
     Team,
@@ -80,30 +76,21 @@ pub async fn caller_writes_group_now(
     )
 }
 
-/// Resolve the owner of a caller-authored workflow write; see the module doc
-/// for the order. `declared` is the caller's `tenancy` group; `public_container`
-/// is the owner group of the PUBLIC workflow or lineage the write extends, if
-/// any. Runs on the write's own transaction, stamped from the caller.
+/// Resolve the tenancy of a caller-authored workflow write with no declared
+/// tenancy and no group-private container (the module doc's steps 3 to 5).
+/// `public_container` is the owner group of the PUBLIC workflow or lineage
+/// the write extends, if any: the rows stay public. With none they are
+/// private to the caller's own owner group. Runs on the write's own
+/// transaction, stamped from the caller.
 ///
 /// # Errors
-/// [`IngestExecutorError::CallerNotGroupWriter`] for a declared group the
-/// caller does not write now; whatever `default_decl_for_author` refuses
-/// (`OPL01` / `OPL02`, as `Repository`); `Repository` for a failed read.
+/// Whatever `default_decl_for_author` refuses (`OPL01` / `OPL02`, as
+/// `Repository`); `Repository` for a failed read.
 pub async fn resolve_caller_owner(
     conn: &mut sqlx::PgConnection,
     caller: Uuid,
-    declared: Option<Uuid>,
     public_container: Option<Uuid>,
 ) -> Result<CallerOwner, IngestExecutorError> {
-    if let Some(group) = declared {
-        if !caller_writes_group_now(&mut *conn, caller, group).await? {
-            return Err(IngestExecutorError::CallerNotGroupWriter { caller, group });
-        }
-        return Ok(CallerOwner {
-            decl: epigraph_core::TenancyDecl::group(group),
-            source: OwnerSource::Declared,
-        });
-    }
     if let Some(group) = public_container {
         if caller_writes_group_now(&mut *conn, caller, group).await? {
             return Ok(CallerOwner {
@@ -112,6 +99,23 @@ pub async fn resolve_caller_owner(
             });
         }
     }
+    let (own, source) = callers_own_decl(&mut *conn, caller).await?;
+    let decl = match own.owner_group_bind() {
+        // A public container keeps its visibility wherever it lands.
+        Some(group) if public_container.is_some() => epigraph_core::TenancyDecl::public(group),
+        Some(group) => epigraph_core::TenancyDecl::group(group),
+        // A declaration that names no owner group: passed through as is.
+        None => own,
+    };
+    Ok(CallerOwner { decl, source })
+}
+
+/// The caller's OWN declaration: its one live team group (`Team`), else its
+/// default declaration (`Default`: its personal group, or its operator's).
+async fn callers_own_decl(
+    conn: &mut sqlx::PgConnection,
+    caller: Uuid,
+) -> Result<(epigraph_core::TenancyDecl, OwnerSource), IngestExecutorError> {
     let teams =
         epigraph_db::GroupMembershipRepository::live_team_writer_groups_conn(&mut *conn, caller)
             .await?;
@@ -119,14 +123,11 @@ pub async fn resolve_caller_owner(
         if epigraph_db::GroupMembershipRepository::session_can_write_group_conn(&mut *conn, *team)
             .await?
         {
-            return Ok(CallerOwner {
-                decl: epigraph_core::TenancyDecl::public(*team),
-                source: OwnerSource::Team,
-            });
+            return Ok((epigraph_core::TenancyDecl::group(*team), OwnerSource::Team));
         }
     }
-    Ok(CallerOwner {
-        decl: epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, caller).await?,
-        source: OwnerSource::Default,
-    })
+    Ok((
+        epigraph_db::ClaimRepository::default_decl_for_author(&mut *conn, caller).await?,
+        OwnerSource::Default,
+    ))
 }

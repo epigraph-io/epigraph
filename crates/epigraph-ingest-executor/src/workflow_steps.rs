@@ -355,8 +355,8 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
 /// a GROUP plan's group (ruling R-98; `caller` must write it now, else
 /// [`StepOpError::GroupNotWritable`]); otherwise
 /// [`crate::owner::resolve_caller_owner`] with the plan's own owner group as
-/// the container (the plan's group when `caller` writes it, else `caller`'s
-/// one team group, else its default declaration), public.
+/// the public container (the plan's group when `caller` writes it, else
+/// `caller`'s own group): a public plan's step stays public.
 pub async fn add_step(
     conn: &mut sqlx::PgConnection,
     caller: Uuid,
@@ -505,7 +505,7 @@ pub async fn add_step(
     let decl = match plan_group {
         Some(group) => epigraph_core::TenancyDecl::group(group),
         None => {
-            crate::owner::resolve_caller_owner(&mut *conn, caller, None, plan_public_owner)
+            crate::owner::resolve_caller_owner(&mut *conn, caller, plan_public_owner)
                 .await?
                 .decl
         }

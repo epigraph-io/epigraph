@@ -286,15 +286,18 @@ pub struct WorkflowIngestExecutionResult {
     /// (nothing created, no edges to wire).
     pub author_id: Option<Uuid>,
     /// Declared-tenancy ingests only ([`execute_workflow_ingest_plan_in_group`]
-    /// with a group): every planned claim this call did NOT create whose
-    /// tenancy is not `('group', <the declared group>)`, in plan order. On an
-    /// idempotent re-ingest that is every planned claim of another tenancy.
-    /// Always empty when no group was declared.
+    /// with a declaration, or a generation inheriting a group lineage's
+    /// group): every planned claim this call did NOT create whose tenancy is
+    /// not the declared one, in plan order. On an idempotent re-ingest that is
+    /// every planned claim of another tenancy. Always empty otherwise.
     pub reused_items: Vec<ReusedClaim>,
+    /// The tenancy of the `workflows` row and every claim this call CREATED;
+    /// `None` on an idempotent re-ingest (nothing created).
+    pub decl: Option<epigraph_core::TenancyDecl>,
 }
 
 /// A planned claim a declared-tenancy ingest reused rather than created, whose
-/// tenancy differs from the declared one. Nothing re-tenants it: the plan then
+/// tenancy differs from the declared one (visibility and owner group). Nothing re-tenants it: the plan then
 /// executes a claim outside the declared group, and the caller decides whether
 /// that is acceptable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,13 +338,13 @@ pub fn require_caller_writes_group(
     }
 }
 
-/// The reused claims among `planned` whose tenancy is not `('group', group)`,
-/// first occurrence first.
+/// The reused claims among `planned` whose tenancy is not `(visibility,
+/// group)`, the declared one, first occurrence first.
 async fn reused_with_another_tenancy(
     conn: &mut sqlx::PgConnection,
     planned: impl IntoIterator<Item = Uuid>,
     caller: &epigraph_db::visibility::Viewer,
-    group: Uuid,
+    (visibility, group): (&str, Uuid),
 ) -> Result<Vec<ReusedClaim>, IngestExecutorError> {
     let mut ids: Vec<Uuid> = Vec::new();
     for id in planned {
@@ -358,7 +361,7 @@ async fn reused_with_another_tenancy(
     Ok(ids
         .into_iter()
         .filter_map(|claim_id| match readable.get(&claim_id) {
-            Some((v, o)) if v == "group" && *o == group => None,
+            Some((v, o)) if v == visibility && *o == group => None,
             Some((v, o)) => Some(ReusedClaim {
                 claim_id,
                 visibility: Some(v.clone()),
@@ -435,26 +438,30 @@ pub async fn execute_workflow_ingest_plan(
 ///
 /// # Where the rows land (`crate::owner`)
 ///
-/// * `declared_group: Some(g)`: `('group', g)` for every claim the walk
-///   CREATES; the `executes` and plan edges derive the same tenancy from their
-///   endpoints. Before anything is written (and before the idempotency gate,
-///   so a re-ingest is refused the same way) the caller must write `g` NOW,
-///   on this transaction ([`crate::owner::caller_writes_group_now`]: the live
-///   membership definer and the stamp), else
+/// * `declared: Some(('group', g))` or `Some(('public', g))` (the explicit
+///   request to publish): that tenancy for every claim the walk CREATES and
+///   the `workflows` row; the `executes` and plan edges derive theirs from
+///   their endpoints. Before anything is written (and before the idempotency
+///   gate, so a re-ingest is refused the same way) the caller must write `g`
+///   NOW, on this transaction ([`crate::owner::caller_writes_group_now`]: the
+///   live membership definer and the stamp), else
 ///   [`IngestExecutorError::CallerNotGroupWriter`].
-/// * A NEW generation of a group-PRIVATE lineage declares nothing and
-///   inherits its group (ruling R-98 Q6(a)); the caller must write it now,
-///   else [`IngestExecutorError::InheritedGroupNotWritable`].
+/// * A NEW generation of a group-PRIVATE lineage inherits its group when it
+///   declares none (ruling R-98 Q6(a)); the caller must write it now, else
+///   [`IngestExecutorError::InheritedGroupNotWritable`]. Declaring PUBLIC on
+///   it is refused ([`IngestExecutorError::DeclaredPublicOverGroupLineage`]):
+///   it would publish the lineage.
 /// * Otherwise [`crate::owner::resolve_caller_owner`]: a new generation of a
-///   PUBLIC lineage stays in the lineage's owner group when the caller writes
-///   it; else the caller's one team group; else its default declaration. All
-///   three are public. The parent link is kept whatever the group.
+///   PUBLIC lineage stays public, in the lineage's owner group when the caller
+///   writes it, else in the caller's own group; a new lineage is private to
+///   the caller's one team group, else to its default group. The parent link
+///   is kept whatever the group.
 ///
-/// Claims the walk reuses keep their tenancy and are reported in
-/// [`WorkflowIngestExecutionResult::reused_items`] (declared ingests only). A
+/// Claims the walk reuses keep their tenancy; a declared ingest reports those
+/// of another tenancy in [`WorkflowIngestExecutionResult::reused_items`]. A
 /// reused claim private to a group outside the CALLER's writable set (or
-/// unreadable to the stamp) refuses a declared ingest before any edge is
-/// written ([`IngestExecutorError::ReusedClaimOutsideCallerGroups`]).
+/// unreadable to the stamp) refuses the ingest before any edge is written
+/// ([`IngestExecutorError::ReusedClaimOutsideCallerGroups`]).
 ///
 /// # Errors
 /// As [`execute_workflow_ingest_plan`], plus
@@ -467,9 +474,9 @@ pub async fn execute_workflow_ingest_plan_in_group(
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
     caller: &epigraph_db::visibility::Viewer,
-    declared_group: Option<Uuid>,
+    declared: Option<epigraph_core::TenancyDecl>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    execute_plan(conn, plan, extraction, Some(caller), declared_group).await
+    execute_plan(conn, plan, extraction, Some(caller), declared).await
 }
 
 /// What a NEW generation inherits from the lineage it extends: when no row
@@ -528,7 +535,7 @@ async fn execute_plan(
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
     caller: Option<&epigraph_db::visibility::Viewer>,
-    declared_group: Option<Uuid>,
+    declared: Option<epigraph_core::TenancyDecl>,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
     // WHO WRITES: the caller's own agent when there is a caller (every
     // request path), the system agent only for the caller-less entry point.
@@ -557,14 +564,25 @@ async fn execute_plan(
         }
     }
     let inherited = inherited_generation_tenancy(&mut *conn, extraction).await?;
+    // Declaring PUBLIC on a new generation of a group-private lineage would
+    // publish the lineage: refused, before anything is written. (Declaring
+    // another GROUP the caller writes moves the generation, privately.)
+    if let (Some(decl), Some(group)) = (declared, inherited.group) {
+        if decl.visibility_bind() == Some("public") {
+            return Err(IngestExecutorError::DeclaredPublicOverGroupLineage {
+                canonical_name: extraction.source.canonical_name.clone(),
+                group,
+            });
+        }
+    }
     // A NEW generation of a group lineage inherits its predecessor's group
     // when it declares none (ruling R-98 Q6(a), backlog 630af617; 074's
     // successor rule). Before, `improve_workflow_hierarchy` or an undeclared
     // next-generation ingest made a PUBLIC row with public claims under a
     // private lineage. The caller must write the inherited group itself NOW,
     // as for a declared one.
-    let declared_group = match declared_group {
-        Some(group) => Some(group),
+    let declared: Option<epigraph_core::TenancyDecl> = match declared {
+        Some(decl) => Some(decl),
         None => {
             if let Some(group) = inherited.group {
                 let writes = match (caller, caller_agent) {
@@ -582,20 +600,29 @@ async fn execute_plan(
                     });
                 }
             }
-            inherited.group
+            inherited.group.map(epigraph_core::TenancyDecl::group)
         }
     };
-    // A declared group always comes with the caller it is declared for.
-    let declared = match (declared_group, caller) {
-        (Some(group), Some(caller)) => Some((group, caller)),
-        (None, _) => None,
-        (Some(group), None) => {
-            return Err(IngestExecutorError::CallerNotGroupWriter {
-                caller: Uuid::nil(),
-                group,
-            })
-        }
+    // The declared tenancy as (visibility, owner group). A declaration always
+    // names both, and comes with the caller it is declared for.
+    let declared_parts: Option<(&'static str, Uuid)> = match declared {
+        Some(decl) => match (decl.visibility_bind(), decl.owner_group_bind()) {
+            (Some(v), Some(g)) => Some((v, g)),
+            _ => {
+                return Err(IngestExecutorError::CallerNotGroupWriter {
+                    caller: caller_agent.unwrap_or_else(Uuid::nil),
+                    group: Uuid::nil(),
+                })
+            }
+        },
+        None => None,
     };
+    if let (Some((_, group)), None) = (declared_parts, caller) {
+        return Err(IngestExecutorError::CallerNotGroupWriter {
+            caller: Uuid::nil(),
+            group,
+        });
+    }
     let canonical_name = &extraction.source.canonical_name;
     let generation = extraction.source.generation as i32;
     let goal = &extraction.source.goal;
@@ -653,8 +680,9 @@ async fn execute_plan(
     // On this transaction: the live membership definer (a membership revoked
     // since the caller's viewer was resolved is refused here, though the stamp
     // still carries it) and the stamp itself (the question every row's
-    // `WITH CHECK` asks).
-    if let (Some(group), Some(agent)) = (declared_group, caller_agent) {
+    // `WITH CHECK` asks). Public or group alike: the caller owns what it
+    // publishes.
+    if let (Some((_, group)), Some(agent)) = (declared_parts, caller_agent) {
         if !crate::owner::caller_writes_group_now(&mut *conn, agent, group).await? {
             return Err(IngestExecutorError::CallerNotGroupWriter {
                 caller: agent,
@@ -700,17 +728,17 @@ async fn execute_plan(
                 }
                 None => 0,
             };
-            let reused_items = match declared {
-                Some((group, caller)) => {
+            let reused_items = match (declared_parts, caller) {
+                (Some(parts), Some(caller)) => {
                     reused_with_another_tenancy(
                         &mut *conn,
                         plan.claims.iter().map(|c| c.id),
                         caller,
-                        group,
+                        parts,
                     )
                     .await?
                 }
-                None => Vec::new(),
+                _ => Vec::new(),
             };
             return Ok(WorkflowIngestExecutionResult {
                 workflow_id: existing_id,
@@ -726,6 +754,7 @@ async fn execute_plan(
                 inserted_edges: Vec::new(),
                 author_id: None,
                 reused_items,
+                decl: None,
             });
         }
     }
@@ -743,25 +772,20 @@ async fn execute_plan(
     // the plan and the outcome report decide on.
     let (author_id, decl) = match caller_agent {
         Some(agent) => {
-            let decl = match declared_group {
-                Some(group) => epigraph_core::TenancyDecl::group(group),
+            let decl = match declared {
+                Some(decl) => decl,
                 None => {
-                    crate::owner::resolve_caller_owner(
-                        &mut *conn,
-                        agent,
-                        None,
-                        inherited.public_owner,
-                    )
-                    .await?
-                    .decl
+                    crate::owner::resolve_caller_owner(&mut *conn, agent, inherited.public_owner)
+                        .await?
+                        .decl
                 }
             };
             (agent, decl)
         }
         None => {
             let system_agent_id = get_or_create_system_agent(&mut *conn).await?;
-            let decl = match declared_group {
-                Some(group) => epigraph_core::TenancyDecl::group(group),
+            let decl = match declared {
+                Some(decl) => decl,
                 None => {
                     ClaimRepository::default_decl_for_author(&mut *conn, system_agent_id).await?
                 }
@@ -969,19 +993,19 @@ async fn execute_plan(
         id_map.insert(planned.id, planned.id);
     }
 
-    // ── 5b. Declared tenancy: every reused claim must be the caller's to link ──
+    // ── 5b. Every reused claim must be the caller's to link ─────────────
     //
     // A reused claim keeps its tenancy, and the edge trigger derives the
     // `executes` / `decomposes_to` edges' owner from their endpoints: an edge to
-    // a claim private to G is owned by G. Kept from when these edges were
-    // written on the shared system agent's stamp (a writer of every group it
-    // served): row security on the caller's stamp now refuses an edge into a
-    // group the caller does not write, and this check refuses it first, by
-    // name, before any edge is written: every reused claim is read on the
-    // stamp and one the stamp cannot read, or one private to a group outside
-    // the caller's own writable set, is refused. A refusal rolls the whole
-    // ingest back.
-    if let Some((group, caller)) = declared {
+    // a claim private to G is owned by G. Row security on the caller's stamp
+    // refuses an edge into a group the caller does not write; this check
+    // refuses it first, by name, before any edge is written, for EVERY
+    // caller-authored walk (an undeclared one is group-private too): every
+    // reused claim is read on the stamp and one the stamp cannot read, or one
+    // private to a group outside the caller's own writable set, is refused. A
+    // refusal rolls the whole ingest back.
+    let own_group = decl.owner_group_bind();
+    if let Some(caller) = caller {
         let mut ids: Vec<Uuid> = Vec::new();
         for id in &reused_ids {
             if !ids.contains(id) {
@@ -998,7 +1022,7 @@ async fn execute_plan(
         for claim_id in ids {
             let linkable = match on_stamp.get(&claim_id) {
                 Some((v, _)) if v == "public" => true,
-                Some((_, owner)) => *owner == group || writable.contains(owner),
+                Some((_, owner)) => Some(*owner) == own_group || writable.contains(owner),
                 None => false,
             };
             if !linkable {
@@ -1115,11 +1139,11 @@ async fn execute_plan(
         }
     }
 
-    let reused_items = match declared {
-        Some((group, caller)) => {
-            reused_with_another_tenancy(&mut *conn, reused_ids, caller, group).await?
+    let reused_items = match (declared_parts, caller) {
+        (Some(parts), Some(caller)) => {
+            reused_with_another_tenancy(&mut *conn, reused_ids, caller, parts).await?
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     Ok(WorkflowIngestExecutionResult {
@@ -1136,5 +1160,6 @@ async fn execute_plan(
         inserted_edges,
         author_id: Some(author_id),
         reused_items,
+        decl: Some(decl),
     })
 }

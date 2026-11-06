@@ -416,18 +416,17 @@ pub async fn store_workflow(
             viewer,
             &extraction,
             auth,
-            None,
+            params.tenancy.map(|t| t.decl()),
         )
         .await?;
+    let caller = server.write_identity(auth, viewer).await?;
 
     // Embed inline, best-effort. Satisfies the is_current=true → has-embedding
     // invariant (CLAUDE.md "Embedding policy"). Mirrors `do_ingest_workflow` —
     // without this, step claims created via `store_workflow` land without
-    // embeddings and break semantic search.
-    // `embed_and_store` logs tracing::warn on failure internally; no outer handling needed.
-    for (claim_id, content) in &inserted {
-        let _ = server.embedder.embed_and_store(*claim_id, content).await;
-    }
+    // embeddings and break semantic search. Stored through the caller, which
+    // authored them (an undeclared store is private to its owner group).
+    crate::tools::workflow_ingest::embed_created_workflow_claims(server, caller, &inserted).await;
 
     // Also embed the workflow goal into workflows.goal_embedding for
     // embedding-first find_workflow_hierarchical. Omitted from the original
@@ -435,7 +434,6 @@ pub async fn store_workflow(
     if let Some(wf_id) = crate::tools::workflow_ingest::goal_embedding_target(&response) {
         match server.embedder.generate(&params.goal).await {
             Ok(qvec) => {
-                let caller = server.write_identity(auth, viewer).await?;
                 crate::tools::workflow_ingest::store_workflow_goal_embedding(
                     server, caller, wf_id, &qvec,
                 )
