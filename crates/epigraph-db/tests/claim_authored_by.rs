@@ -1,12 +1,17 @@
 //! `AuthoredByRepository::for_claim`: a claim's `authored_by` block, decided
 //! under the caller's viewer on the caller's stamped connection.
 //!
-//! * `human` is the agent's binding RECORD (its operator link in any state,
-//!   else its unrevoked client allowance), shown to every reader of the
-//!   claim. No `OPERATED_BY` edge decides it (anyone with edges:write can
-//!   forge one, so a forged edge changes nothing), and no client or
-//!   registration status moves it. A registered human's own claim names no
-//!   human, exactly as an agent bound to no human.
+//! * `human` is the human the agent was bound to when the claim was filed,
+//!   from its binding RECORD (its operator link until retirement, else the
+//!   client allowance in force then), shown to every reader of the claim. No
+//!   `OPERATED_BY` edge decides it (anyone with edges:write can forge one, so
+//!   a forged edge changes nothing), and no client or registration status
+//!   moves it. A registered human's own claim names no human, exactly as an
+//!   agent bound to no human.
+//! * A document's authors are a claim's primary authors only when the
+//!   ingest's creation record says that document's ingest created it; other
+//!   recorded documents corroborate, every ingester is listed, and pending
+//!   authors are listed apart.
 //! * `prompt_snapshot` follows the audience setting: under
 //!   `OperatorAndAdmins` only the agent's human and admins see it; under
 //!   `ClaimReaders` every caller does.
@@ -20,8 +25,8 @@ mod fixture;
 use chrono::{Duration, Utc};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{
-    AgentRepository, AuthorRef, AuthoredBy, AuthoredByRepository, EdgeRepository,
-    PromptSnapshotAudience, ScopedPool, SessionGucMode,
+    AgentRepository, AuthorRef, AuthoredBy, AuthoredByRepository, ClaimIngestRepository,
+    EdgeRepository, PromptSnapshotAudience, ScopedPool, SessionGucMode,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -546,7 +551,216 @@ async fn the_prompt_snapshot_follows_the_audience_setting(pool: PgPool) {
     );
 }
 
-// ── Literature: a document's authors first, the filer apart ────────────────
+// ── The human bound when the claim was filed ───────────────────────────────
+
+/// The block of a claim filed by `agent` at `at`, as `caller` sees it.
+async fn human_at(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    caller: Uuid,
+    agent: Uuid,
+    at: chrono::DateTime<Utc>,
+) -> Option<Uuid> {
+    let viewer = Viewer::resolve(pool, caller).await.expect("resolve");
+    let mut read = scoped.read_as(&viewer).await.expect("stamped read");
+    let out = AuthoredByRepository::for_claim(
+        &mut read,
+        &viewer,
+        Uuid::new_v4(),
+        agent,
+        at,
+        PromptSnapshotAudience::OperatorAndAdmins,
+    )
+    .await
+    .expect("authored_by");
+    read.commit().await.expect("finish");
+    out.filer().human.as_ref().map(|h| h.id)
+}
+
+async fn linked_at(pool: &PgPool, agent: Uuid) -> chrono::DateTime<Utc> {
+    sqlx::query_scalar("SELECT created_at FROM operator_links WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("link row")
+}
+
+/// `authored_by.human` names the human the agent was BOUND to when the claim
+/// was filed, from the binding record (migration 199's
+/// `epigraph_operator_bound_at`): a link names its operator until it is
+/// retired, and nobody after; a link recorded already retired names its
+/// operator only for what the agent filed before the link was recorded; a
+/// client allowance names its operator while it is in force. Every reader
+/// sees the same.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_human_is_the_one_bound_when_the_claim_was_filed(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let us = Duration::microseconds(1);
+
+    // A live link, later retired.
+    let (op, _) = human(&pool, "Linked Operator").await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "retiring").await;
+    link(&pool, agent, op).await;
+    let linked = linked_at(&pool, agent).await;
+    for caller in [stranger, op] {
+        assert_eq!(
+            human_at(&pool, &scoped, caller, agent, linked - Duration::days(1)).await,
+            Some(op),
+            "before the link, with no allowance: the operator owns the agent's claims"
+        );
+        assert_eq!(
+            human_at(
+                &pool,
+                &scoped,
+                caller,
+                agent,
+                Utc::now() + Duration::days(1)
+            )
+            .await,
+            Some(op),
+            "a live link"
+        );
+    }
+    let outcome: String = sqlx::query_scalar(
+        "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'bound-at test', true)",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("retire");
+    assert_eq!(outcome, "retired", "CALIBRATION");
+    let retired: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM security_events \
+          WHERE agent_id = $1 AND event_type = 'operator.link_retired'",
+    )
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("the retirement's audit row");
+    for caller in [stranger, op] {
+        assert_eq!(
+            human_at(&pool, &scoped, caller, agent, retired - us).await,
+            Some(op),
+            "filed while the link was live"
+        );
+        assert_eq!(
+            human_at(&pool, &scoped, caller, agent, retired).await,
+            None,
+            "filed at or after the retirement"
+        );
+    }
+
+    // A link recorded already retired (107 section 7).
+    let (op2, _) = human(&pool, "Retired-link Operator").await;
+    let (old, _) = fixture::seed_agent_with_group(&pool, "old-identity").await;
+    let out = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = AgentRepository::link_retired_agent(&mut conn, old, op2).await;
+        (conn, r)
+    })
+    .await
+    .expect("record a retired link");
+    assert!(out.link_retired, "CALIBRATION: recorded retired");
+    let recorded = linked_at(&pool, old).await;
+    assert_eq!(
+        human_at(&pool, &scoped, stranger, old, recorded - us).await,
+        Some(op2),
+        "the operator owns what the identity filed before the link was recorded"
+    );
+    assert_eq!(
+        human_at(&pool, &scoped, stranger, old, recorded + us).await,
+        None,
+        "and nothing after"
+    );
+
+    // A client allowance, later revoked.
+    let (op3, _) = human(&pool, "Allowance Operator").await;
+    let (allowed, client) = allowance_bound(&pool, op3).await;
+    let added: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT added_at FROM author_binding_clients WHERE client_id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("added_at");
+    assert_eq!(
+        human_at(&pool, &scoped, stranger, allowed, added - us).await,
+        None,
+        "before the allowance"
+    );
+    assert_eq!(
+        human_at(&pool, &scoped, stranger, allowed, added).await,
+        Some(op3),
+        "while the allowance is in force"
+    );
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, $2)",
+        )
+        .bind(client)
+        .bind("bound-at test")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION");
+    let revoked_at: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM author_binding_clients WHERE client_id = $1")
+            .bind(client)
+            .fetch_one(&pool)
+            .await
+            .expect("revoked_at");
+    for caller in [stranger, op3] {
+        assert_eq!(
+            human_at(&pool, &scoped, caller, allowed, revoked_at - us).await,
+            Some(op3),
+            "filed while the allowance was in force"
+        );
+        assert_eq!(
+            human_at(&pool, &scoped, caller, allowed, revoked_at).await,
+            None,
+            "filed at or after the revocation"
+        );
+    }
+}
+
+/// The retirement instant is read from the audit row only 191's trigger can
+/// write. An application session cannot plant an earlier one: the insert is
+/// refused, so a stranger cannot cut a live agent's claims off its human.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_application_session_cannot_plant_a_retirement(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (op, _) = human(&pool, "Linked Operator").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "agent").await;
+    link(&pool, agent, op).await;
+    let viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped write");
+    let planted = sqlx::query(
+        "INSERT INTO security_events (event_type, agent_id, success, details) \
+         VALUES ('operator.link_retired', $1, true, jsonb_build_object('operator_id', $2::text))",
+    )
+    .bind(agent)
+    .bind(op)
+    .execute(&mut *tx)
+    .await;
+    assert!(planted.is_err(), "the audit row is the trigger's alone");
+    drop(tx);
+    assert_eq!(
+        human_at(
+            &pool,
+            &scoped,
+            stranger,
+            agent,
+            Utc::now() + Duration::days(1)
+        )
+        .await,
+        Some(op)
+    );
+}
+
+// ── Documents: the creating ingest's authors first, the filer apart ────────
 
 /// An author node: a bare agent row named `name` (no group, no human).
 async fn author_node(pool: &PgPool, name: &str) -> Uuid {
@@ -562,18 +776,13 @@ async fn author_node(pool: &PgPool, name: &str) -> Uuid {
     id
 }
 
-/// A document row, created `age_days` days ago (its listing order).
-async fn paper(pool: &PgPool, doi: &str, title: &str, age_days: i64) -> Uuid {
-    sqlx::query_scalar(
-        "INSERT INTO papers (doi, title, created_at) VALUES ($1, $2, now() - make_interval(days => $3::int)) \
-         RETURNING id",
-    )
-    .bind(doi)
-    .bind(title)
-    .bind(i32::try_from(age_days).expect("small"))
-    .fetch_one(pool)
-    .await
-    .expect("seed a paper")
+async fn paper(pool: &PgPool, doi: &str, title: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, $2) RETURNING id")
+        .bind(doi)
+        .bind(title)
+        .fetch_one(pool)
+        .await
+        .expect("seed a paper")
 }
 
 /// An edge whose tenancy the endpoint trigger stamps (public endpoints give a
@@ -600,8 +809,9 @@ async fn edge(
     .expect("seed an edge")
 }
 
-/// Force an edge private to `group` (the trigger fires only on endpoint
-/// changes, so this UPDATE sticks).
+/// Force an edge private to `group`. Administrative only: no application
+/// path makes a public claim's assertion private (the insert trigger takes
+/// the endpoints' meet), so this state arises only from such an UPDATE.
 async fn private_to(pool: &PgPool, edge: Uuid, group: Uuid) {
     let n = sqlx::query(
         "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
@@ -616,15 +826,40 @@ async fn private_to(pool: &PgPool, edge: Uuid, group: Uuid) {
     assert_eq!(n, 1);
 }
 
-async fn asserts(pool: &PgPool, paper: Uuid, claim: Uuid) -> Uuid {
-    edge(
-        pool,
-        (paper, "paper"),
-        (claim, "claim"),
-        "asserts",
-        json!({}),
+/// The ingest's record that `by` ingested `paper` and (per `created`)
+/// whether that ingest created the claim, written with the walk's own
+/// primitive.
+async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) {
+    let mut conn = pool.acquire().await.expect("conn");
+    let wrote = ClaimIngestRepository::record_signed_conn(
+        &mut conn,
+        None,
+        paper,
+        claim,
+        by,
+        created,
+        "ingest_document",
+        "test-pipeline",
     )
     .await
+    .expect("record");
+    assert!(wrote, "CALIBRATION: a new record");
+}
+
+/// The document's `asserts` edge onto the claim, as the walk writes it, AND
+/// the ingest's record of it. Returns the asserts edge.
+async fn ingested(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+    let mut conn = pool.acquire().await.expect("conn");
+    let e = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    )
+    .await
+    .expect("asserts")
+    .0
+    .id;
+    drop(conn);
+    record(pool, paper, claim, by, created).await;
+    e
 }
 
 async fn authored(pool: &PgPool, author: Uuid, paper: Uuid, properties: Value) -> Uuid {
@@ -662,35 +897,46 @@ async fn claim_block(
     out
 }
 
-fn papers_of(block: &AuthoredBy) -> &[epigraph_db::PaperAuthorship] {
+fn literature(block: &AuthoredBy) -> &epigraph_db::LiteratureAuthorship {
     match block {
-        AuthoredBy::Literature { papers, .. } => papers,
+        AuthoredBy::Literature(l) => l,
         AuthoredBy::Agent(_) => panic!("expected a literature block: {block:?}"),
     }
 }
 
-/// A claim a document asserts names the document's authors, ordered by the
-/// `authored` edge's position (a shared position by agent id, a missing one
-/// last) with role and affiliations, and the agent that filed the claim
-/// apart as `ingested_by`, with its human. Agent-to-claim `asserts` edges are
-/// not authors.
+fn ids(list: &[epigraph_db::PaperAuthor]) -> Vec<Uuid> {
+    list.iter().map(|a| a.id).collect()
+}
+
+/// A claim a document's ingest CREATED names that document's authors first,
+/// in position order with role and affiliations, keeps an ingester's
+/// uncountersigned naming apart as pending (with who named them), shows the
+/// filer apart as `ingested_by`, lists a converging document as
+/// corroborating, and lists every ingester with its human. Agent-to-claim
+/// `asserts` edges are not authors.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_literature_claim_names_the_document_authors_first_and_the_ingester_apart(pool: PgPool) {
+async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(pool: PgPool) {
     let scoped = app_scoped(&pool).await;
     let (operator, _) = human(&pool, "Operator Fixture").await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
     let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
     named(&pool, ingester, "ingest-fixture").await;
     link(&pool, ingester, operator).await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "second-ingester").await;
     let claim = fixture::seed_public_claim(&pool, ingester, "a literature fixture claim").await;
-    let doc = paper(&pool, "10.0000/fixture.one", "Fixture Paper One", 1).await;
-    asserts(&pool, doc, claim).await;
+    let doc = paper(&pool, "10.0000/fixture.one", "Fixture Paper One").await;
+    ingested(&pool, doc, claim, ingester, true).await;
+    let other = paper(&pool, "10.0000/fixture.two", "Fixture Paper Two").await;
+    ingested(&pool, other, claim, second, false).await;
+    let other_author = author_node(&pool, "Other Author").await;
+    authored(&pool, other_author, other, json!({"position": 0})).await;
 
     let third = author_node(&pool, "Third Author").await;
     let first_a = author_node(&pool, "First Author").await;
     let first_b = author_node(&pool, "Also First").await;
-    let second = author_node(&pool, "Second Author").await;
+    let second_author = author_node(&pool, "Second Author").await;
     let unplaced = author_node(&pool, "Unplaced Author").await;
+    let named_person = author_node(&pool, "Named Person").await;
     authored(
         &pool,
         third,
@@ -705,15 +951,22 @@ async fn a_literature_claim_names_the_document_authors_first_and_the_ingester_ap
         json!({"position": 0, "role": "author"}),
     )
     .await;
-    authored(&pool, first_b, doc, json!({"position": 0, "role": 7})).await;
+    authored(&pool, first_b, doc, json!({"position": 0})).await;
     authored(
         &pool,
-        second,
+        second_author,
         doc,
         json!({"position": 1, "affiliations": "Lab C"}),
     )
     .await;
     authored(&pool, unplaced, doc, json!({"position": "x"})).await;
+    authored(
+        &pool,
+        named_person,
+        doc,
+        json!({"position": 3, "pending_countersign": true, "ingested_by": second.to_string()}),
+    )
+    .await;
     let claim_asserter = author_node(&pool, "Claim Asserter").await;
     edge(
         &pool,
@@ -725,65 +978,76 @@ async fn a_literature_claim_names_the_document_authors_first_and_the_ingester_ap
     .await;
 
     let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
-    let AuthoredBy::Literature {
-        papers,
-        papers_truncated,
-        ingested_by,
-    } = &block
-    else {
-        panic!("a claim a readable document asserts is literature: {block:?}");
-    };
-    assert!(!papers_truncated);
-    assert_eq!(papers.len(), 1, "{block:?}");
-    let p = &papers[0];
+    let lit = literature(&block);
+    let p = &lit.paper;
     assert_eq!(p.paper.id, doc);
     assert_eq!(p.paper.doi, "10.0000/fixture.one");
     assert_eq!(p.paper.title.as_deref(), Some("Fixture Paper One"));
     assert!(!p.authors_truncated);
-    let (lo, hi) = if first_a < first_b {
-        (first_a, first_b)
-    } else {
-        (first_b, first_a)
-    };
-    let order: Vec<Uuid> = p.authors.iter().map(|a| a.id).collect();
     assert_eq!(
-        order,
-        vec![lo, hi, second, third, unplaced],
-        "by position, a shared position by id, a missing one last; never the claim asserter"
+        ids(&p.authors),
+        vec![first_a, first_b, second_author, third, unplaced],
+        "by position (a shared one in recording order), a missing one last; never the \
+         claim asserter, never the pending person"
     );
     let by_id = |id: Uuid| p.authors.iter().find(|a| a.id == id).expect("listed");
     let t = by_id(third);
     assert_eq!(t.display_name.as_deref(), Some("Third Author"));
     assert_eq!(t.position, Some(2));
-    assert_eq!(t.role.as_deref(), Some("corresponding"));
+    assert_eq!(t.role, "corresponding");
     assert_eq!(
         t.affiliations,
         vec!["Lab A".to_string(), "Lab B".to_string()]
     );
-    assert_eq!(by_id(first_a).role.as_deref(), Some("author"));
-    assert_eq!(by_id(first_b).role, None, "a non-string role is not shown");
-    assert!(by_id(second).affiliations.is_empty(), "a non-array is none");
+    assert_eq!(by_id(first_b).role, "author", "a missing role reads author");
+    assert!(
+        by_id(second_author).affiliations.is_empty(),
+        "a non-array is none"
+    );
     assert_eq!(by_id(unplaced).position, None);
+    assert!(p
+        .authors
+        .iter()
+        .all(|a| !a.pending_countersign && a.named_by.is_none()));
 
-    assert_eq!(ingested_by.agent.id, ingester);
+    assert_eq!(ids(&p.pending_authors), vec![named_person], "pending apart");
+    assert!(p.pending_authors[0].pending_countersign);
     assert_eq!(
-        ingested_by.human.as_ref().map(|h| h.id),
+        p.pending_authors[0].named_by.as_ref().map(|n| n.id),
+        Some(second),
+        "the ingester whose word it is"
+    );
+
+    assert_eq!(lit.ingested_by.agent.id, ingester);
+    assert_eq!(
+        lit.ingested_by.human.as_ref().map(|h| h.id),
         Some(operator),
         "the ingesting human is shown apart, to every reader"
     );
+    let c = &lit.corroboration;
     assert_eq!(
-        ingested_by,
-        authored_by(
-            &pool,
-            &scoped,
-            stranger,
-            ingester,
-            PromptSnapshotAudience::OperatorAndAdmins
-        )
-        .await
-        .filer(),
-        "ingested_by is the same filer block the agent shape carries"
+        c.corroborated_by
+            .iter()
+            .map(|p| p.paper.id)
+            .collect::<Vec<_>>(),
+        vec![other],
+        "the converging document corroborates"
     );
+    assert_eq!(ids(&c.corroborated_by[0].authors), vec![other_author]);
+    assert_eq!(
+        c.ingesters
+            .iter()
+            .map(|i| (i.agent.id, i.paper_id, i.created_claim))
+            .collect::<Vec<_>>(),
+        vec![(ingester, doc, true), (second, other, false)],
+        "every ingester, oldest first"
+    );
+    assert_eq!(
+        c.ingesters[0].human.as_ref().map(|h| h.id),
+        Some(operator),
+        "each ingester's human, bound when it ingested"
+    );
+    assert_eq!(c.ingesters[1].human, None, "an unbound ingester has none");
 
     let wire = serde_json::to_value(&block).expect("serialize");
     assert_eq!(wire["source"], json!("literature"));
@@ -792,24 +1056,99 @@ async fn a_literature_claim_names_the_document_authors_first_and_the_ingester_ap
         "the filer is not primary: {wire}"
     );
     assert_eq!(
-        serde_json::to_value(
-            authored_by(
-                &pool,
-                &scoped,
-                stranger,
-                ingester,
-                PromptSnapshotAudience::OperatorAndAdmins
-            )
-            .await
-        )
-        .expect("serialize")["source"],
-        json!("agent")
+        wire["paper"]["pending_authors"][0]["pending_countersign"],
+        json!(true)
+    );
+    assert_eq!(
+        wire["ingesters"].as_array().map(Vec::len),
+        Some(2),
+        "{wire}"
     );
 }
 
-/// A document whose `asserts` edge the caller cannot read, or whose edge is
+/// Only the CREATING ingest makes a document primary. A claim no record
+/// says a document created (filed directly, then repeated by a document),
+/// or whose creation record names someone other than its filer, is the
+/// filer's: the document is corroborating. A bare `asserts` edge with no
+/// record is not read at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn only_the_creating_ingest_makes_a_document_primary(pool: PgPool) {
+    let scoped = app_scoped(&pool).await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "filer").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "other-ingester").await;
+    let plain = fixture::seed_public_claim(&pool, filer, "no document recorded this").await;
+    let none = serde_json::to_value(claim_block(&pool, &scoped, stranger, plain, filer).await)
+        .expect("serialize");
+    assert_eq!(none["source"], json!("agent"), "CALIBRATION: {none}");
+
+    // A bare asserts edge: no record.
+    let bare_claim = fixture::seed_public_claim(&pool, filer, "barely asserted").await;
+    let bare = paper(&pool, "10.0000/fixture.bare", "Bare Paper").await;
+    edge(
+        &pool,
+        (bare, "paper"),
+        (bare_claim, "claim"),
+        "asserts",
+        json!({}),
+    )
+    .await;
+    authored(
+        &pool,
+        author_node(&pool, "Bare Author").await,
+        bare,
+        json!({"position": 0}),
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_value(claim_block(&pool, &scoped, stranger, bare_claim, filer).await)
+            .expect("serialize"),
+        none,
+        "a bare asserts edge reads exactly as no document"
+    );
+
+    // Repeated by a document whose ingest did not create the claim.
+    let repeated = fixture::seed_public_claim(&pool, filer, "stated, then repeated").await;
+    let doc = paper(&pool, "10.0000/fixture.repeat", "Repeating Paper").await;
+    ingested(&pool, doc, repeated, other, false).await;
+    let block = claim_block(&pool, &scoped, stranger, repeated, filer).await;
+    let AuthoredBy::Agent(a) = &block else {
+        panic!("a repeated claim stays its filer's: {block:?}");
+    };
+    assert_eq!(a.filer.agent.id, filer);
+    assert_eq!(
+        a.corroboration
+            .corroborated_by
+            .iter()
+            .map(|p| p.paper.id)
+            .collect::<Vec<_>>(),
+        vec![doc]
+    );
+    assert_eq!(
+        a.corroboration
+            .ingesters
+            .iter()
+            .map(|i| (i.agent.id, i.created_claim))
+            .collect::<Vec<_>>(),
+        vec![(other, false)]
+    );
+
+    // A record that says "created" but names someone other than the filer.
+    let misnamed = fixture::seed_public_claim(&pool, filer, "creation misattributed").await;
+    let doc2 = paper(&pool, "10.0000/fixture.misnamed", "Misnamed Paper").await;
+    ingested(&pool, doc2, misnamed, other, true).await;
+    assert!(
+        matches!(
+            claim_block(&pool, &scoped, stranger, misnamed, filer).await,
+            AuthoredBy::Agent(_)
+        ),
+        "a creation record is the creator's only when it names the filer"
+    );
+}
+
+/// A document whose assertion the caller cannot read, or whose assertion is
 /// retracted, is no document: the caller gets the agent block, byte for byte
-/// the block of a claim no document asserts. An `authored` edge the caller
+/// the block of a claim no document recorded. An `authored` edge the caller
 /// cannot read is no author.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
@@ -819,20 +1158,25 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
     let plain = fixture::seed_public_claim(&pool, ingester, "no document asserts this").await;
 
-    // A document whose asserts edge is private to the member's group.
     let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
-    let hidden_doc = paper(&pool, "10.0000/fixture.hidden", "Hidden Paper", 1).await;
-    let e = asserts(&pool, hidden_doc, hidden_claim).await;
+    let hidden_doc = paper(&pool, "10.0000/fixture.hidden", "Hidden Paper").await;
+    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true).await;
     private_to(&pool, e, group).await;
-    let writer = author_node(&pool, "Hidden Author").await;
-    authored(&pool, writer, hidden_doc, json!({"position": 0})).await;
+    authored(
+        &pool,
+        author_node(&pool, "Hidden Author").await,
+        hidden_doc,
+        json!({"position": 0}),
+    )
+    .await;
 
     assert_eq!(
-        papers_of(&claim_block(&pool, &scoped, member, hidden_claim, ingester).await)[0]
+        literature(&claim_block(&pool, &scoped, member, hidden_claim, ingester).await)
+            .paper
             .paper
             .id,
         hidden_doc,
-        "CONTROL: a member of the edge's group sees the document"
+        "CONTROL: a member of the assertion's group sees the document"
     );
     let as_json = |b: AuthoredBy| serde_json::to_value(b).expect("serialize");
     let none = as_json(claim_block(&pool, &scoped, stranger, plain, ingester).await);
@@ -840,12 +1184,12 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     assert_eq!(
         as_json(claim_block(&pool, &scoped, stranger, hidden_claim, ingester).await),
         none,
-        "a hidden asserts edge reads exactly as no document"
+        "a hidden assertion reads exactly as no document"
     );
 
-    // A retracted asserts edge.
+    // A retracted assertion.
     let retracted_claim = fixture::seed_public_claim(&pool, ingester, "once asserted").await;
-    let old_doc = paper(&pool, "10.0000/fixture.retracted", "Retracted Paper", 1).await;
+    let old_doc = paper(&pool, "10.0000/fixture.retracted", "Retracted Paper").await;
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                             valid_from, valid_to) \
@@ -857,99 +1201,90 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("a retracted asserts edge");
+    record(&pool, old_doc, retracted_claim, ingester, true).await;
     assert_eq!(
         as_json(claim_block(&pool, &scoped, member, retracted_claim, ingester).await),
         as_json(claim_block(&pool, &scoped, member, plain, ingester).await),
-        "a retracted asserts edge is no document"
+        "a retracted assertion is no document"
     );
 
     // A public document with one public and one group-private author edge.
     let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
-    let open_doc = paper(&pool, "10.0000/fixture.open", "Open Paper", 1).await;
-    asserts(&pool, open_doc, open_claim).await;
+    let open_doc = paper(&pool, "10.0000/fixture.open", "Open Paper").await;
+    ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
     authored(&pool, shown, open_doc, json!({"position": 1})).await;
     let k = authored(&pool, kept, open_doc, json!({"position": 0})).await;
     private_to(&pool, k, group).await;
-    let ids =
-        |b: &AuthoredBy| -> Vec<Uuid> { papers_of(b)[0].authors.iter().map(|a| a.id).collect() };
+    let authors_of = |b: &AuthoredBy| ids(&literature(b).paper.authors);
     assert_eq!(
-        ids(&claim_block(&pool, &scoped, member, open_claim, ingester).await),
+        authors_of(&claim_block(&pool, &scoped, member, open_claim, ingester).await),
         vec![kept, shown],
         "CONTROL: the member reads both author edges"
     );
     assert_eq!(
-        ids(&claim_block(&pool, &scoped, stranger, open_claim, ingester).await),
+        authors_of(&claim_block(&pool, &scoped, stranger, open_claim, ingester).await),
         vec![shown],
         "a hidden authored edge is no author"
     );
 }
 
-/// Converged claims collect documents: every readable one is listed, oldest
-/// document row first, at most `MAX_PAPERS`, and each lists at most
-/// `MAX_PAPER_AUTHORS` authors; both caps say when they cut.
+/// Corroborating documents are listed in record order, at most
+/// `MAX_PAPERS`, and each lists at most `MAX_PAPER_AUTHORS` authors; both
+/// caps say when they cut. Every ingester is listed, past the paper cap.
 #[sqlx::test(migrations = "../../migrations")]
-async fn several_documents_are_listed_oldest_first_and_capped(pool: PgPool) {
+async fn corroborating_documents_are_capped_and_every_ingester_is_listed(pool: PgPool) {
     use epigraph_db::authored_by::{MAX_PAPERS, MAX_PAPER_AUTHORS};
     let scoped = app_scoped(&pool).await;
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "stranger").await;
-    let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
-    let claim = fixture::seed_public_claim(&pool, ingester, "a converged claim").await;
+    let (filer, _) = fixture::seed_agent_with_group(&pool, "filer").await;
+    let claim = fixture::seed_public_claim(&pool, filer, "a converged claim").await;
 
     let mut docs = Vec::new();
     for i in 0..=MAX_PAPERS {
-        // Oldest first: i = 0 is the oldest.
         let d = paper(
             &pool,
             &format!("10.0000/fixture.many.{i}"),
             &format!("Paper {i}"),
-            100 - i,
         )
         .await;
-        asserts(&pool, d, claim).await;
+        let (by, _) = fixture::seed_agent_with_group(&pool, "many-ingester").await;
+        ingested(&pool, d, claim, by, false).await;
         docs.push(d);
     }
     for i in 0..=MAX_PAPER_AUTHORS {
         let a = author_node(&pool, &format!("Author {i}")).await;
         authored(&pool, a, docs[0], json!({"position": i})).await;
     }
-    let solo = author_node(&pool, "Solo Author").await;
-    authored(&pool, solo, docs[1], json!({"position": 0})).await;
 
-    let block = claim_block(&pool, &scoped, stranger, claim, ingester).await;
-    let AuthoredBy::Literature {
-        papers,
-        papers_truncated,
-        ..
-    } = &block
-    else {
+    let block = claim_block(&pool, &scoped, stranger, claim, filer).await;
+    let AuthoredBy::Agent(a) = &block else {
         panic!("{block:?}");
     };
-    assert!(papers_truncated, "one more document than the cap");
-    let listed: Vec<Uuid> = papers.iter().map(|p| p.paper.id).collect();
-    assert_eq!(
-        listed,
-        docs[..usize::try_from(MAX_PAPERS).expect("small")].to_vec(),
-        "the oldest documents, oldest first"
+    let c = &a.corroboration;
+    assert!(
+        c.corroborated_by_truncated,
+        "one more document than the cap"
     );
     assert_eq!(
-        papers[0].authors.len(),
-        usize::try_from(MAX_PAPER_AUTHORS).expect("small")
+        c.corroborated_by
+            .iter()
+            .map(|p| p.paper.id)
+            .collect::<Vec<_>>(),
+        docs[..MAX_PAPERS].to_vec(),
+        "in record order"
     );
-    assert!(papers[0].authors_truncated);
-    assert_eq!(papers[0].authors[0].position, Some(0));
-    assert_eq!(
-        papers[1].authors.iter().map(|a| a.id).collect::<Vec<_>>(),
-        vec![solo]
-    );
-    assert!(!papers[1].authors_truncated);
-    assert!(papers[2].authors.is_empty());
+    assert_eq!(c.corroborated_by[0].authors.len(), MAX_PAPER_AUTHORS);
+    assert!(c.corroborated_by[0].authors_truncated);
+    assert!(c.corroborated_by[1].authors.is_empty());
+    assert_eq!(c.ingesters.len(), MAX_PAPERS + 1, "every ingester");
+    assert!(!c.ingesters_truncated);
 }
 
-/// The same two hidden edges, read on a SUPERUSER scoped connection, where
-/// row security filters nothing: only the in-query viewer predicates decide.
-/// On the application role the `edges` policy re-filters, so the test above
+/// The same hidden edges, read on a SUPERUSER scoped connection, where row
+/// security filters nothing: only the in-query viewer predicates decide. On
+/// the application role the `edges` policy re-filters, so the test above
 /// stays green without them; this one does not.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: PgPool) {
@@ -959,13 +1294,13 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
     let (ingester, _) = fixture::seed_agent_with_group(&pool, "ingester").await;
 
     let hidden_claim = fixture::seed_public_claim(&pool, ingester, "privately asserted").await;
-    let hidden_doc = paper(&pool, "10.0000/fixture.su.hidden", "Hidden Paper", 1).await;
-    let e = asserts(&pool, hidden_doc, hidden_claim).await;
+    let hidden_doc = paper(&pool, "10.0000/fixture.su.hidden", "Hidden Paper").await;
+    let e = ingested(&pool, hidden_doc, hidden_claim, ingester, true).await;
     private_to(&pool, e, group).await;
 
     let open_claim = fixture::seed_public_claim(&pool, ingester, "openly asserted").await;
-    let open_doc = paper(&pool, "10.0000/fixture.su.open", "Open Paper", 1).await;
-    asserts(&pool, open_doc, open_claim).await;
+    let open_doc = paper(&pool, "10.0000/fixture.su.open", "Open Paper").await;
+    ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
     authored(&pool, shown, open_doc, json!({"position": 1})).await;
@@ -975,24 +1310,20 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
     assert!(
         matches!(
             claim_block(&pool, &superuser, member, hidden_claim, ingester).await,
-            AuthoredBy::Literature { .. }
+            AuthoredBy::Literature(_)
         ),
-        "CONTROL: the member's viewer admits the edge"
+        "CONTROL: the member's viewer admits the assertion"
     );
     assert!(
         matches!(
             claim_block(&pool, &superuser, stranger, hidden_claim, ingester).await,
             AuthoredBy::Agent(_)
         ),
-        "the asserts-edge predicate is in the query"
+        "the assertion predicate is in the query"
     );
     let block = claim_block(&pool, &superuser, stranger, open_claim, ingester).await;
     assert_eq!(
-        papers_of(&block)[0]
-            .authors
-            .iter()
-            .map(|a| a.id)
-            .collect::<Vec<_>>(),
+        ids(&literature(&block).paper.authors),
         vec![shown],
         "the authored-edge predicate is in the query"
     );

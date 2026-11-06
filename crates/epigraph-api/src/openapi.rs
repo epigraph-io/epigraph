@@ -17,8 +17,9 @@ use crate::routes::admin::{
 };
 use crate::routes::challenge::{ChallengeResponse, SubmitChallengeRequest};
 use crate::routes::claims::{
-    AuthorRefView, AuthoredByView, ClaimResponse, FilerView, PaperAuthorView, PaperAuthorshipView,
-    PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest, UpdateLabelsResponse,
+    AuthorRefView, AuthoredByView, ClaimResponse, FilerView, IngesterView, PaperAuthorView,
+    PaperAuthorshipView, PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest,
+    UpdateLabelsResponse,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -140,6 +141,7 @@ use workflow_schema_stubs::{
             AuthorRefView,
             PromptSnapshotView,
             FilerView,
+            IngesterView,
             PaperAuthorshipView,
             PaperRefView,
             PaperAuthorView,
@@ -407,15 +409,21 @@ async fn unmark_duplicate_doc() {}
 /// Read one claim (doc stub)
 ///
 /// A claim the caller may not read is 404, exactly as an id with no claim.
-/// The response carries `authored_by`, tagged by `source`. `agent`: `agent`
-/// (the filer) and `human` (the human operator it is bound to, never
-/// inferred from an `OPERATED_BY` edge) for every reader, and
-/// `prompt_snapshot` only for the agent's linked human and admins (the
-/// prompt-history gate). `literature`, when the caller can read a document's
-/// `asserts` edge to the claim: `papers` (each document and its authors, the
-/// claim's primary authors) and `ingested_by` (the filer, with the same three
-/// parts). A part the caller may not see is `null`, exactly as a part that
-/// does not exist.
+/// The response carries `authored_by`, tagged by `source`. `agent` (no
+/// readable creation record names a document): `agent` (the filer, the
+/// author), `human` (the human the agent was bound to when it filed the
+/// claim, read from the binding record, never from an `OPERATED_BY` edge)
+/// for every reader, and `prompt_snapshot` only for the agent's linked human
+/// and admins (the prompt-history gate). `literature` (the document ingest
+/// recorded at creation that a document's ingest created the claim):
+/// `paper` (that document and its authors, the claim's primary authors;
+/// authors an ingester named without their countersignature are listed
+/// apart under `pending_authors`, never primary) and `ingested_by` (the
+/// filer, with the same three parts). Both carry `corroborated_by` (every
+/// other readable document whose ingest recorded the claim) and `ingesters`
+/// (every readable ingest, each with the human its agent was bound to then).
+/// A bare `asserts` edge no ingest recorded is not read. A part the caller
+/// may not see is `null`, exactly as a part that does not exist.
 #[utoipa::path(
     get,
     path = "/api/v1/claims/{id}",

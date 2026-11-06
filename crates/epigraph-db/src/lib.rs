@@ -94,9 +94,10 @@ pub use repos::{
     PromptSnapshotIndex,
 };
 pub use repos::{
-    agent_lookup, authored_by, AgentCard, AgentKind, AgentLookupRepository, AgentNameMatch,
-    AgentRef, AgentSearchHit, AuthorNode, AuthorRef, AuthoredBy, AuthoredByRepository, CardCounts,
-    CardRole, Filer, FindAgentQuery, FindAgentResult, MatchTier, PaperAuthor, PaperAuthorship,
+    agent_lookup, authored_by, AgentAuthorship, AgentCard, AgentKind, AgentLookupRepository,
+    AgentNameMatch, AgentRef, AgentSearchHit, AuthorNode, AuthorRef, AuthoredBy,
+    AuthoredByRepository, CardCounts, CardRole, Corroboration, Filer, FindAgentQuery,
+    FindAgentResult, Ingester, LiteratureAuthorship, MatchTier, PaperAuthor, PaperAuthorship,
     PaperRef, PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use repos::{

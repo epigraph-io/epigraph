@@ -203,10 +203,27 @@ async fn a_claim_read_names_the_agent_the_human_and_the_snapshot_by_audience(poo
         ),
     }
     assert_eq!(theirs["source"], json!("agent"), "{theirs}");
-    assert!(
-        theirs.as_object().is_some_and(|o| o.len() == 4),
-        "exactly source, agent, human, prompt_snapshot: {theirs}"
+    let mut keys: Vec<&str> = theirs
+        .as_object()
+        .map(|o| o.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "agent",
+            "corroborated_by",
+            "corroborated_by_truncated",
+            "human",
+            "ingesters",
+            "ingesters_truncated",
+            "prompt_snapshot",
+            "source"
+        ],
+        "{theirs}"
     );
+    assert_eq!(theirs["corroborated_by"], json!([]), "{theirs}");
+    assert_eq!(theirs["ingesters"], json!([]), "{theirs}");
 }
 
 /// `caller` writes an `OPERATED_BY` edge `agent -> target` through
@@ -315,11 +332,11 @@ async fn a_forged_edge_changes_nothing_and_a_hidden_claim_leaks_nothing(pool: Pg
     );
 }
 
-/// A claim a document asserts, on the wire: `source: "literature"`, the
-/// document and its authors first (by position, with role and affiliations),
-/// and the agent that filed the claim, with its human, apart as
-/// `ingested_by`. A reader who cannot see the document's `asserts` edge gets
-/// the agent block instead.
+/// A claim a document's ingest created, on the wire: `source:
+/// "literature"`, the document and its authors first (by position, with role
+/// and affiliations, a pending author apart), the filer, with its human,
+/// apart as `ingested_by`, and every ingester. A reader who cannot see the
+/// document's assertion gets the agent block instead.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -336,58 +353,39 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
     .fetch_one(&pool)
     .await
     .expect("paper");
-    let edge = |src: Uuid,
-                st: &'static str,
-                tgt: Uuid,
-                tt: &'static str,
-                rel: &'static str,
-                props: Value| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
-                                    properties) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-            )
-            .bind(src)
-            .bind(st)
-            .bind(tgt)
-            .bind(tt)
-            .bind(rel)
-            .bind(props)
-            .fetch_one(&pool)
-            .await
-            .expect("edge")
-        }
-    };
-    let asserts = edge(doc, "paper", claim, "claim", "asserts", json!({})).await;
+    let asserts = ingest_record(&pool, doc, claim, ingester, true).await;
     let (second, _) = viewer_fixture::seed_agent_with_group(&pool, "second").await;
     named(&pool, second, "Second Author").await;
     let (first, _) = viewer_fixture::seed_agent_with_group(&pool, "first").await;
     named(&pool, first, "First Author").await;
-    edge(
+    let (person, _) = viewer_fixture::seed_agent_with_group(&pool, "person").await;
+    named(&pool, person, "Named Person").await;
+    authored_edge(
+        &pool,
         second,
-        "agent",
         doc,
-        "paper",
-        "authored",
         json!({"position": 1, "role": "author", "affiliations": []}),
     )
     .await;
-    edge(
+    authored_edge(
+        &pool,
         first,
-        "agent",
         doc,
-        "paper",
-        "authored",
         json!({"position": 0, "role": "corresponding", "affiliations": ["Fixture Institute"]}),
+    )
+    .await;
+    authored_edge(
+        &pool,
+        person,
+        doc,
+        json!({"position": 2, "pending_countersign": true, "ingested_by": ingester.to_string()}),
     )
     .await;
 
     let block = authored_by(&state, stranger, claim).await;
     assert_eq!(block["source"], json!("literature"), "{block}");
     assert!(block.get("agent").is_none(), "{block}");
-    assert_eq!(block["papers_truncated"], json!(false));
-    let p = &block["papers"][0];
+    let p = &block["paper"];
     assert_eq!(
         p["paper"],
         json!({"id": doc, "doi": "10.0000/fixture.wire", "title": "Wire Paper"})
@@ -396,11 +394,23 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         p["authors"],
         json!([
             {"id": first, "display_name": "First Author", "position": 0,
-             "role": "corresponding", "affiliations": ["Fixture Institute"]},
+             "role": "corresponding", "affiliations": ["Fixture Institute"],
+             "pending_countersign": false, "named_by": null},
             {"id": second, "display_name": "Second Author", "position": 1,
-             "role": "author", "affiliations": []},
+             "role": "author", "affiliations": [],
+             "pending_countersign": false, "named_by": null},
         ]),
         "{block}"
+    );
+    assert_eq!(
+        p["pending_authors"],
+        json!([
+            {"id": person, "display_name": "Named Person", "position": 2,
+             "role": "author", "affiliations": [],
+             "pending_countersign": true,
+             "named_by": {"id": ingester, "display_name": "ingest-fixture"}},
+        ]),
+        "a pending author is apart, never primary: {block}"
     );
     assert_eq!(p["authors_truncated"], json!(false));
     assert_eq!(
@@ -412,8 +422,14 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         json!({"id": operator, "display_name": "Operator Fixture"})
     );
     assert_eq!(block["ingested_by"]["prompt_snapshot"], Value::Null);
+    assert_eq!(block["corroborated_by"], json!([]));
+    assert_eq!(block["ingesters"][0]["agent"]["id"], json!(ingester));
+    assert_eq!(block["ingesters"][0]["human"]["id"], json!(operator));
+    assert_eq!(block["ingesters"][0]["paper_id"], json!(doc));
+    assert_eq!(block["ingesters"][0]["created_claim"], json!(true));
 
-    // The document's asserts edge private to the member's group: the member
+    // The document's assertion private to the member's group (an
+    // administrative state: no application path writes it): the member
     // still sees the literature block, a stranger the plain agent block.
     sqlx::query(
         "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
@@ -432,4 +448,140 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
     assert_eq!(plain["source"], json!("agent"), "{plain}");
     assert_eq!(plain["agent"]["id"], json!(ingester));
     assert_eq!(plain["human"]["id"], json!(operator));
+    assert_eq!(plain["ingesters"], json!([]), "{plain}");
+}
+
+/// The ingest's `asserts` edge and its creation record, written with the
+/// walk's own primitives. Returns the asserts edge.
+async fn ingest_record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+    let mut conn = pool.acquire().await.expect("conn");
+    let e = epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    )
+    .await
+    .expect("asserts")
+    .0
+    .id;
+    epigraph_db::ClaimIngestRepository::record_signed_conn(
+        &mut conn,
+        None,
+        paper,
+        claim,
+        by,
+        created,
+        "ingest_document",
+        "test-pipeline",
+    )
+    .await
+    .expect("record");
+    e
+}
+
+async fn authored_edge(pool: &PgPool, author: Uuid, paper: Uuid, props: Value) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) VALUES ($1, 'agent', $2, 'paper', 'authored', $3)",
+    )
+    .bind(author)
+    .bind(paper)
+    .bind(props)
+    .execute(pool)
+    .await
+    .expect("authored edge");
+}
+
+/// `caller` POSTs an edge to `/api/v1/edges`: the status.
+async fn post_edge(state: &AppState, caller: Uuid, body: Value) -> StatusCode {
+    let token = common::mint_token_with_agent(&["edges:write"], caller);
+    create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/edges")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response")
+        .status()
+}
+
+/// A stranger cannot make a document the author of someone's claim, or make
+/// an agent assert it, over `POST /api/v1/edges`: a `paper -asserts-> claim`
+/// edge, an ingest record and an `authored` edge into a paper are refused
+/// (400) for every caller, an agent-sourced `asserts` from an agent the
+/// caller neither is nor operates is refused (403), and the claim's block is
+/// byte for byte as it was, for a third party and for the filer's human.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_document_assertion_is_refused_and_changes_nothing(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let operator = human(&pool, "Operator Fixture").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "stranger").await;
+    let (bystander, _) = viewer_fixture::seed_agent_with_group(&pool, "bystander").await;
+    let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "agent").await;
+    link(&pool, agent, operator).await;
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "an agent's own claim").await;
+    let doc: Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (doi, title) VALUES ('10.0000/fixture.forged', 'Forged') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("paper");
+    let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "unwitting").await;
+    authored_edge(&pool, author, doc, json!({"position": 0})).await;
+
+    let before_third = authored_by(&state, bystander, claim).await;
+    let before_human = authored_by(&state, operator, claim).await;
+    assert_eq!(before_third["source"], json!("agent"), "CALIBRATION");
+
+    let forged_asserts = json!({
+        "source_id": doc, "source_type": "paper",
+        "target_id": claim, "target_type": "claim", "relationship": "asserts",
+    });
+    assert_eq!(
+        post_edge(&state, stranger, forged_asserts).await,
+        StatusCode::BAD_REQUEST,
+        "a paper's assertion is the ingest's alone"
+    );
+    let forged_record = json!({
+        "source_id": doc, "source_type": "paper",
+        "target_id": claim, "target_type": "claim", "relationship": "ingested_claim",
+        "properties": {"ingested_by": agent.to_string(), "created_claim": true},
+    });
+    assert_eq!(
+        post_edge(&state, stranger, forged_record).await,
+        StatusCode::BAD_REQUEST,
+        "the ingest record is the ingest's alone"
+    );
+    let forged_authorship = json!({
+        "source_id": stranger, "source_type": "agent",
+        "target_id": doc, "target_type": "paper", "relationship": "authored",
+    });
+    assert_eq!(
+        post_edge(&state, stranger, forged_authorship).await,
+        StatusCode::BAD_REQUEST,
+        "an authorship of a paper is the ingest's alone"
+    );
+    let forged_agent_asserts = json!({
+        "source_id": operator, "source_type": "agent",
+        "target_id": claim, "target_type": "claim", "relationship": "asserts",
+    });
+    assert_eq!(
+        post_edge(&state, stranger, forged_agent_asserts).await,
+        StatusCode::FORBIDDEN,
+        "an agent's assertion is that agent's, or its operator's, alone"
+    );
+    let landed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship IN \
+           ('asserts', 'ingested_claim')",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(landed, 0, "nothing was written");
+    assert_eq!(authored_by(&state, bystander, claim).await, before_third);
+    assert_eq!(authored_by(&state, operator, claim).await, before_human);
 }

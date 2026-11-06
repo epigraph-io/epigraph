@@ -128,8 +128,9 @@ pub use atlas_layout::{
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
 };
 pub use authored_by::{
-    AuthorRef, AuthoredBy, AuthoredByRepository, Filer, PaperAuthor, PaperAuthorship, PaperRef,
-    PromptSnapshotAt, PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
+    AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
