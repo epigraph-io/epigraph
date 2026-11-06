@@ -26,7 +26,11 @@
 //! siblings, which is the half-state that re-breaks them.
 //!
 //! `#[sqlx::test]` supplies the empty database the DELETEs were faking, so
-//! every assertion below is unchanged and no test name is lost. `spawn_app`
+//! that conversion changed no assertion and lost no test name. (Backlog
+//! 57917c13 later replaced `themes_overview_returns_seeded_themes` with
+//! `themes_overview_reports_live_member_counts` and the tenancy arms below:
+//! the route now counts live, viewer-readable members, so a theme seeded with
+//! a stored count and no members is absent.) `spawn_app`
 //! builds its own pool from a URL, so each arm hands it
 //! `fixture::database_url_for(&pool)` — the per-test database — rather than the
 //! ambient `DATABASE_URL`, which would seed one database and assert against
@@ -39,98 +43,349 @@
 
 use serde_json::Value;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 mod common;
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn themes_overview_returns_seeded_themes(pool: PgPool) {
-    let url = fixture::database_url_for(&pool).await;
-    // FOUR themes, not two, and the counts INTERLEAVE the labels on purpose.
-    //
-    // Before the #[sqlx::test] conversion this arm ran on the shared database and
-    // deleted only labels 'A' and 'B', so `assert_eq!(order, sorted)` ranged over
-    // the whole accumulated theme corpus. On a per-test database the response is
-    // exactly what this fixture seeds, and two rows make that assertion nearly
-    // vacuous: with A(12), B(7) the only permutation it can reject is a full
-    // reversal, so a broken secondary key or a partial mis-ordering passes.
-    //
-    // `routes/graph.rs::themes_overview` runs `ORDER BY claim_count DESC,
-    // label ASC` with no LIMIT. C(9) sits BETWEEN A and B by count while sorting
-    // after both by label, so count and label disagree about the answer; and
-    // B/D tie at 7, so `label ASC` is the only thing that separates them. The
-    // one correct sequence is therefore A, C, B, D — asserted by label below
-    // rather than by "the list happens to be descending".
-    let theme_a = uuid::Uuid::new_v4();
-    let theme_b = uuid::Uuid::new_v4();
-    let theme_c = uuid::Uuid::new_v4();
-    let theme_d = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO claim_themes (id, label, description, claim_count) \
-         VALUES ($1, 'A', '', 12), ($2, 'B', '', 7), ($3, 'C', '', 9), ($4, 'D', '', 7)",
+// ---- GET /api/v1/graph/themes/overview (backlog 57917c13) ---------------------
+//
+// The route reports, per theme, the live count of CURRENT members the CALLER
+// can read; a theme with no readable member is absent; the stored
+// `claim_themes.claim_count` is never returned. Every theme below is seeded
+// with a deliberately WRONG stored count so a route that read the column
+// fails.
+
+/// A theme with an explicit, deliberately wrong stored `claim_count`.
+async fn seed_theme(pool: &PgPool, label: &str, stored_count: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO claim_themes (label, description, claim_count) \
+         VALUES ($1, '', $2) RETURNING id",
     )
-    .bind(theme_a)
-    .bind(theme_b)
-    .bind(theme_c)
-    .bind(theme_d)
-    .execute(&pool)
+    .bind(label)
+    .bind(stored_count)
+    .fetch_one(pool)
     .await
-    .unwrap();
+    .expect("insert theme")
+}
+
+/// A public, current claim by `agent`, assigned to `theme`.
+async fn seed_member(pool: &PgPool, theme: Uuid, agent: Uuid, content: &str) -> Uuid {
+    let claim = common::seed_claim_with_agent(pool, content, agent).await;
+    sqlx::query("UPDATE claims SET theme_id = $2 WHERE id = $1")
+        .bind(claim)
+        .bind(theme)
+        .execute(pool)
+        .await
+        .expect("assign claim to theme");
+    claim
+}
+
+/// `GET path` with an optional bearer; `(status, body text)`.
+async fn get(addr: std::net::SocketAddr, path: &str, token: Option<&str>) -> (u16, String) {
+    let mut req = reqwest::Client::new().get(format!("http://{addr}{path}"));
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await.expect("request");
+    let status = resp.status().as_u16();
+    (status, resp.text().await.expect("body"))
+}
+
+fn json(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("not JSON ({e}): {body}"))
+}
+
+/// `(id, claim_count)` of every theme in a parsed body, in body order.
+fn id_counts(body: &Value) -> Vec<(Uuid, i64)> {
+    body["themes"]
+        .as_array()
+        .expect("themes array")
+        .iter()
+        .map(|t| {
+            (
+                t["id"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .expect("id"),
+                t["claim_count"]
+                    .as_i64()
+                    .expect("claim_count is an integer"),
+            )
+        })
+        .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_overview_reports_live_member_counts(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    // Live members A(3), C(2), B(1), D(1); stored counts 12, 9, 7, 7, the
+    // numbers this arm used to assert. A route that read the stored column
+    // returns the old numbers; one that dropped the `id ASC` tiebreak makes the
+    // B/D order nondeterministic.
+    let agent = Uuid::new_v4();
+    let a = seed_theme(&pool, "A", 12).await;
+    let b = seed_theme(&pool, "B", 7).await;
+    let c = seed_theme(&pool, "C", 9).await;
+    let d = seed_theme(&pool, "D", 7).await;
+    for (theme, n) in [(a, 3), (c, 2), (b, 1), (d, 1)] {
+        for i in 0..n {
+            seed_member(&pool, theme, agent, &format!("live member {theme} {i}")).await;
+        }
+    }
+    // A retired member is not counted.
+    let retired = seed_member(&pool, a, agent, "retired member of A").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired)
+        .execute(&pool)
+        .await
+        .expect("retire");
 
     let (addr, _shutdown) = common::spawn_app(&url).await;
-    let resp = reqwest::Client::new()
-        .get(format!("http://{addr}/api/v1/graph/themes/overview"))
-        .header(
-            "Authorization",
-            format!("Bearer {}", common::test_bearer_token()),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: Value = resp.json().await.unwrap();
-    let themes = body["themes"].as_array().unwrap();
-    let by_label: std::collections::HashMap<String, &Value> = themes
+    let (status, text) = get(
+        addr,
+        "/api/v1/graph/themes/overview",
+        Some(&common::test_bearer_token()),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+
+    let (first_tie, second_tie) = if b < d { (b, d) } else { (d, b) };
+    assert_eq!(
+        id_counts(&body),
+        vec![(a, 3), (c, 2), (first_tie, 1), (second_tie, 1)],
+        "claim_count DESC then id ASC, with LIVE counts; got {body}"
+    );
+    let labels: Vec<&str> = body["themes"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter_map(|t| t["label"].as_str().map(|l| (l.to_string(), t)))
+        .filter_map(|t| t["label"].as_str())
         .collect();
-    for label in ["A", "B", "C", "D"] {
+    assert_eq!(labels[..2], ["A", "C"], "labels travel with their rows");
+    assert_eq!(body["total"], 4);
+    assert!(body["next_cursor"].is_null(), "{body}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_overview_requires_a_bearer(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (status, text) = get(addr, "/api/v1/graph/themes/overview", None).await;
+    assert_eq!(status, 401, "{text}");
+}
+
+/// THE TENANCY TEST. A stranger in a different group from the owner sees no
+/// count, id, label or existence signal of the owner's private members or of
+/// the theme whose only member is private.
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_overview_hides_a_private_theme_and_its_count_from_a_non_member(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let owner = Uuid::new_v4();
+    let stranger = Uuid::new_v4();
+
+    // P: one member, private to the owner. Its label is a unique marker, so a
+    // leak of it anywhere in the body is detectable by substring.
+    let marker = format!("U1-PRIVATE-THEME-{}", Uuid::new_v4().simple());
+    let p = seed_theme(&pool, &marker, 50).await;
+    let p_claim = seed_member(&pool, p, owner, "owner's private member of P").await;
+    common::seed_private_ownership(&pool, p_claim, owner).await;
+
+    // Q: one public member and one owner-private member.
+    let q = seed_theme(&pool, "U1 public theme", 50).await;
+    seed_member(&pool, q, owner, "public member of Q").await;
+    let q_private = seed_member(&pool, q, owner, "owner's private member of Q").await;
+    common::seed_private_ownership(&pool, q_private, owner).await;
+
+    // The stranger has a group of its own, different from the owner's.
+    common::seed_claim_with_agent(&pool, "stranger's own unthemed claim", stranger).await;
+    let stranger_group = common::personal_group_of(&pool, stranger).await;
+    let owner_group = common::personal_group_of(&pool, owner).await;
+    assert_ne!(
+        stranger_group, owner_group,
+        "two viewers in DIFFERENT groups"
+    );
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let stranger_token = common::mint_token_with_agent(&["claims:read"], stranger);
+    let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
+
+    // Owner first: the calibration arm. It proves the stranger assertions do
+    // not pass against an empty handler, and that the marker WOULD be found
+    // had it leaked.
+    let (status, owner_text) = get(addr, "/api/v1/graph/themes/overview", Some(&owner_token)).await;
+    assert_eq!(status, 200, "{owner_text}");
+    let owner_body = json(&owner_text);
+    assert_eq!(id_counts(&owner_body), vec![(q, 2), (p, 1)], "{owner_body}");
+    assert_eq!(owner_body["total"], 2);
+    assert!(
+        owner_text.contains(&marker),
+        "CALIBRATION: the owner's body carries P's marker label"
+    );
+
+    let (status, text) = get(addr, "/api/v1/graph/themes/overview", Some(&stranger_token)).await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+
+    // Parsed body. Counts are JSON numbers, so they are asserted on the parsed
+    // value and never by substring (a bare `50` can occur in a UUID's hex).
+    assert_eq!(
+        id_counts(&body),
+        vec![(q, 1)],
+        "the stranger sees Q with its ONE readable member, and no P; got {body}"
+    );
+    assert_eq!(body["themes"][0]["label"], "U1 public theme");
+    let total = body["total"].as_i64().expect("total");
+    assert_eq!(total, 1, "the stranger's total does not count P");
+    assert!(total != 50 && total != 2);
+    for (_, count) in id_counts(&body) {
+        assert_eq!(count, 1, "no stored (50) or owner-scoped (2) count");
+    }
+    assert!(body["next_cursor"].is_null(), "{body}");
+
+    // Raw text, fixed seeded values only.
+    for needle in [
+        p.to_string(),
+        p.simple().to_string(),
+        marker.clone(),
+        p_claim.to_string(),
+        p_claim.simple().to_string(),
+        q_private.to_string(),
+        q_private.simple().to_string(),
+    ] {
         assert!(
-            by_label.contains_key(label),
-            "expected theme {label} in response"
+            !text.contains(&needle),
+            "the stranger's body leaks {needle}: {text}"
         );
     }
 
-    // Assert the EXACT sequence, not that it is sorted. Every wrong ORDER BY this
-    // arm can distinguish produces a different sequence: dropping `DESC` gives
-    // B, D, C, A; dropping the `label ASC` tie-break makes the B/D pair
-    // nondeterministic; ordering by label alone gives A, B, C, D.
-    let order: Vec<&str> = themes.iter().filter_map(|t| t["label"].as_str()).collect();
-    assert_eq!(
-        order,
-        vec!["A", "C", "B", "D"],
-        "themes must be ordered by claim_count DESC then label ASC. \
-         Seeded A(12), C(9), B(7), D(7); got {order:?}"
-    );
+    // With limit=1 the walk is one page and the cursor does not hint at a
+    // hidden row.
+    let (status, text1) = get(
+        addr,
+        "/api/v1/graph/themes/overview?limit=1",
+        Some(&stranger_token),
+    )
+    .await;
+    assert_eq!(status, 200, "{text1}");
+    let body1 = json(&text1);
+    assert_eq!(id_counts(&body1), vec![(q, 1)]);
+    assert_eq!(body1["total"], 1);
+    assert!(body1["next_cursor"].is_null(), "{body1}");
 
-    // And the counts travel with the labels, so the sequence above is not an
-    // accident of two columns being read from different rows.
-    let counts: Vec<i64> = themes
-        .iter()
-        .filter_map(|t| t["claim_count"].as_i64())
-        .collect();
-    assert_eq!(
-        counts,
-        vec![12, 9, 7, 7],
-        "claim_count must accompany its own label; got {counts:?}"
-    );
+    // A spoofed agent_id in the query string changes nothing: the viewer comes
+    // from the token.
+    let (status, spoofed) = get(
+        addr,
+        &format!("/api/v1/graph/themes/overview?agent_id={owner}"),
+        Some(&stranger_token),
+    )
+    .await;
+    assert_eq!(status, 200, "{spoofed}");
+    assert_eq!(json(&spoofed), body, "agent_id in the query is ignored");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_overview_rejects_a_malformed_cursor(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let theme = seed_theme(&pool, "cursor theme", 0).await;
+    seed_member(&pool, theme, Uuid::new_v4(), "cursor theme member").await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::test_bearer_token();
+
+    for bad in [
+        "garbage".to_string(),
+        format!("k1.1.{}", Uuid::new_v4().simple()),
+        format!("t1.0.{}", Uuid::new_v4().simple()),
+    ] {
+        let (status, text) = get(
+            addr,
+            &format!("/api/v1/graph/themes/overview?after={bad}"),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 400, "after={bad}: {text}");
+        assert!(text.contains("malformed `after` cursor"), "{text}");
+    }
+
+    // Empty `after` is a first page.
+    let (status, text) = get(addr, "/api/v1/graph/themes/overview?after=", Some(&token)).await;
+    assert_eq!(status, 200, "{text}");
+    assert_eq!(id_counts(&json(&text)), vec![(theme, 1)]);
+
+    // A typed `limit`: not a number is the extractor's 400.
+    let (status, _) = get(
+        addr,
+        "/api/v1/graph/themes/overview?limit=abc",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 400);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn themes_overview_clamps_limit(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let agent = Uuid::new_v4();
+    let mut expected = Vec::new();
+    for (i, n) in [3i64, 2, 1].into_iter().enumerate() {
+        let theme = seed_theme(&pool, &format!("clamp {i}"), 0).await;
+        for k in 0..n {
+            seed_member(&pool, theme, agent, &format!("clamp {i} {k}")).await;
+        }
+        expected.push((theme, n));
+    }
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let token = common::test_bearer_token();
+
+    // limit=0 behaves as 1: one row and a cursor.
+    let (status, text) = get(addr, "/api/v1/graph/themes/overview?limit=0", Some(&token)).await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+    assert_eq!(id_counts(&body), expected[..1]);
+    assert_eq!(body["total"], 3);
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("a cut page carries a cursor")
+        .to_string();
+    assert!(cursor.starts_with("t1."), "{cursor}");
+
+    // Following the cursors at limit=1 walks every theme once.
+    let mut walked = id_counts(&body);
+    let mut after = Some(cursor);
+    while let Some(c) = after.take() {
+        let (status, text) = get(
+            addr,
+            &format!("/api/v1/graph/themes/overview?limit=1&after={c}"),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 200, "{text}");
+        let page = json(&text);
+        walked.extend(id_counts(&page));
+        after = page["next_cursor"].as_str().map(str::to_string);
+        assert!(walked.len() <= 3, "the walk must terminate: {walked:?}");
+    }
+    assert_eq!(walked, expected);
+
+    // limit=100000 behaves as 200: everything, no cursor.
+    let (status, text) = get(
+        addr,
+        "/api/v1/graph/themes/overview?limit=100000",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let body = json(&text);
+    assert_eq!(id_counts(&body), expected);
+    assert!(body["next_cursor"].is_null());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn themes_expand_returns_neighborhoods_for_seeded_theme(pool: PgPool) {
-    use uuid::Uuid;
     let url = fixture::database_url_for(&pool).await;
 
     // Inline minimal seed: agent + run + theme + 2 atoms + 1 edge.

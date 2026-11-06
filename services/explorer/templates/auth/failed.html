@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+
+{% block title %}{{ title }} · {{ ctx.product_name() }}{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ ctx.static_url("auth.css") }}">
+<meta name="robots" content="noindex">
+{% endblock %}
+
+{% block content %}
+<section class="auth-page" aria-labelledby="auth-failed-title">
+  <p class="error-page__status">Error {{ status }}</p>
+  <h1 id="auth-failed-title">{{ title }}</h1>
+  <p class="lead">{{ message }}</p>
+  <div class="auth-page__actions">
+    <a class="button" href="{{ retry_url }}">Sign in again</a>
+    <a href="{{ ctx.home_url() }}">Back to the start</a>
+  </div>
+</section>
+{% endblock %}

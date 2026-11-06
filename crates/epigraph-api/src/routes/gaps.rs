@@ -180,13 +180,15 @@ pub async fn gap_analysis(
     let graph_claims = epigraph_db::ClaimRepository::semantic_search_flat(
         &state.db_pool,
         &viewer,
-        &format_embedding(&query_vec),
+        epigraph_db::FlatRanking::Query(&format_embedding(&query_vec)),
         GAP_RELEVANCE_FLOOR,
         None,
         None,
         None,
         None,
         20,
+        None,
+        0,
     )
     .await
     .map_err(|e| ApiError::InternalError {

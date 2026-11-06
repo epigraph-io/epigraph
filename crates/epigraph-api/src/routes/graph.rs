@@ -1,7 +1,7 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
 //!
-//! # Tenancy: 1 of this file's 4 raw-pool sites is converted
+//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
 //!
 //! Conversion shard 7. `expand` is ONE register site whose alias was spent on
 //! FOUR statements, and all four now run on a viewer-stamped connection from
@@ -33,10 +33,17 @@
 //! stays open, and nothing further about it is recorded here — see
 //! `docs/tenancy/progress.json`.
 //!
-//! The other 3 sites — `overview`, `themes_overview`, `themes_expand` — are
-//! routed GETs that hold no `Viewer` at all. Their owner is
-//! `D-PR16-theme-cluster-viewer-scope`, an open entry that explicitly has no
-//! control.
+//! `themes_overview` (backlog 57917c13) runs on a [`AppState::read_as`]
+//! connection too, and is viewer-scoped by the spliced `claims` predicate in
+//! `ClaimThemeRepository::overview_page`: the per-theme count is of the
+//! current members the caller can read, and theme rows narrow to those with
+//! at least one such member. Its LABELS are not viewer-scoped: a stored label
+//! may be derived from members the caller cannot read (the label residual on
+//! `D-PR16-theme-cluster-viewer-scope`).
+//!
+//! The other 2 sites — `overview`, `themes_expand` — are routed GETs that hold
+//! no `Viewer` at all. Their owner is `D-PR16-theme-cluster-viewer-scope`, an
+//! open entry that explicitly has no control.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -310,16 +317,22 @@ pub async fn overview(
     Query(params): Query<OverviewParams>,
 ) -> Result<Json<OverviewResponse>, (axum::http::StatusCode, String)> {
     let pool: &PgPool = &state.db_pool;
-    let latest: Option<(Uuid, chrono::DateTime<chrono::Utc>, bool)> = sqlx::query_as(
-        "SELECT run_id, completed_at, degraded
-         FROM graph_cluster_runs
-         ORDER BY completed_at DESC
-         LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(internal)?;
-    let Some((run_id, generated_at, degraded)) = latest else {
+    // The latest-run lookup lives in `ClusterRunRepository::latest`, not here.
+    // The SQL is byte-identical to the copy that used to be inlined, so no
+    // request can tell them apart today — which is exactly why the copy was
+    // dangerous: the day the shared one changes (migration 028's `algo` filter,
+    // or a tie-break on `run_id`), the first symptom is
+    // `GET /claims/:id/placement` handing out an id this route no longer
+    // recognises, and no behavioural test would have caught the drift.
+    let latest = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal_db)?;
+    let Some(epigraph_db::ClusterRunRow {
+        run_id,
+        completed_at: generated_at,
+        degraded,
+    }) = latest
+    else {
         return Ok(Json(OverviewResponse {
             run_id: None,
             generated_at: None,
@@ -477,12 +490,13 @@ pub async fn expand(
             "failed to acquire a scoped connection".to_string(),
         )
     })?;
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(&mut *read)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    // Shared lookup, fed this handler's viewer-stamped connection so main's
+    // one-connection property survives. `graph_cluster_runs` carries no
+    // tenancy columns, so `latest` takes no viewer; see its doc.
+    let latest_run = epigraph_db::ClusterRunRepository::latest(&mut *read)
+        .await
+        .map_err(internal_db)?;
+    let Some(run_id) = latest_run.map(|r| r.run_id) else {
         return Err((StatusCode::NOT_FOUND, "no completed run".into()));
     };
     let cluster_exists: Option<(i64,)> =
@@ -626,29 +640,102 @@ async fn fetch_subgraph_edges(
     Ok((edges, filtered))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct ThemeOut {
     pub id: Uuid,
+    /// The stored theme label, cut to 200 characters. NOT viewer-scoped: for
+    /// a theme with members the caller cannot read, it may be derived from
+    /// their text (`scripts/label_themes_llm.py` samples members with no
+    /// visibility predicate). Residual recorded on
+    /// `D-PR16-theme-cluster-viewer-scope`.
     pub label: String,
-    pub claim_count: i32,
+    /// Current claims assigned to this theme that the CALLER can read. Live,
+    /// never the stored `claim_themes.claim_count` (backlog 57917c13).
+    pub claim_count: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ThemesOverviewResponse {
     pub themes: Vec<ThemeOut>,
+    /// Themes with at least one member the caller can read.
+    pub total: i64,
+    /// Pass back as `after`; `null` at the end.
+    pub next_cursor: Option<String>,
 }
 
+/// Query params of `GET /api/v1/graph/themes/overview`. Typed, so a
+/// malformed `limit` is the query extractor's 400.
+#[derive(Debug, Deserialize)]
+pub struct ThemesOverviewParams {
+    /// Page size, clamped to `1..=THEME_OVERVIEW_PAGE_MAX` (200, the default).
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// The previous page's `next_cursor`, unchanged. Empty = first page.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// `GET /api/v1/graph/themes/overview` — viewer-scoped, cursor-paged.
+///
+/// Which themes appear and their `claim_count` are per viewer (owner ruling
+/// A1): a theme is listed only when the caller can read at least one current
+/// member, and the count is of those members, ordered `claim_count DESC, id
+/// ASC`. These guarantees are THIS route's only; `themes_expand` and
+/// `/api/v1/themes/split-candidates` do not yet hold them. Labels are
+/// corpus-derived for mixed themes (see [`ThemeOut::label`]).
 pub async fn themes_overview(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
+    Query(params): Query<ThemesOverviewParams>,
 ) -> Result<Json<ThemesOverviewResponse>, (axum::http::StatusCode, String)> {
-    let pool: &PgPool = &state.db_pool;
-    let themes: Vec<ThemeOut> = sqlx::query_as::<_, ThemeOut>(
-        "SELECT id, label, claim_count FROM claim_themes ORDER BY claim_count DESC, label ASC",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
-    Ok(Json(ThemesOverviewResponse { themes }))
+    use axum::http::StatusCode;
+    use epigraph_db::repos::claim_theme::{ThemeOverviewCursor, THEME_OVERVIEW_PAGE_MAX};
+
+    let limit = params
+        .limit
+        .unwrap_or(THEME_OVERVIEW_PAGE_MAX)
+        .clamp(1, THEME_OVERVIEW_PAGE_MAX);
+    let after = match params.after.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(token) => Some(ThemeOverviewCursor::decode(token).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "malformed `after` cursor; pass back `next_cursor` of the previous page \
+                 unchanged"
+                    .to_string(),
+            )
+        })?),
+    };
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "themes_overview",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to acquire a scoped connection".to_string(),
+        )
+    })?;
+    let page = epigraph_db::ClaimThemeRepository::overview_page(&mut *read, &viewer, after, limit)
+        .await
+        .map_err(internal_db)?;
+
+    Ok(Json(ThemesOverviewResponse {
+        themes: page
+            .themes
+            .into_iter()
+            .map(|t| ThemeOut {
+                id: t.id,
+                label: t.label,
+                claim_count: t.member_count,
+            })
+            .collect(),
+        total: page.total,
+        next_cursor: page.next.map(|c| c.encode()),
+    }))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -692,12 +779,10 @@ pub async fn themes_expand(
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
     }
 
-    let latest_run: Option<(Uuid,)> =
-        sqlx::query_as("SELECT run_id FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .map_err(internal)?;
-    let Some((run_id,)) = latest_run else {
+    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+        .await
+        .map_err(internal_db)?;
+    let Some(run_id) = latest_run.map(|r| r.run_id) else {
         return Ok(Json(synthesize_pre_run_response(theme_id)));
     };
 
