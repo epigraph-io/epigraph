@@ -9,7 +9,16 @@
 //!
 //! Pinned here:
 //! * an explicit `agent_id` (found with `find_agent`) receives the `authored`
-//!   edge and every `asserts` edge, and no name-derived node is created;
+//!   edge and no name-derived node is created; it receives the `asserts`
+//!   edges only when the ingester IS that agent or is the human operating
+//!   it. Anyone else's naming is `pending_countersign`: `authored` only,
+//!   marked with the ingester, and not counted on the agent's card;
+//! * a re-ingest with `agent_id` REPLACES the entry's name-derived author
+//!   (on the operator CLI's privileged pool), never adds the agent beside it;
+//!   an MCP server, which cannot retract those administrative edges, refuses
+//!   it and writes nothing; and a later name-only re-ingest keeps the
+//!   explicit author;
+//! * an explicit id equal to another entry's name-derived node is refused;
 //! * an absent `agent_id` whose name equals an existing human's is
 //!   `ambiguous`: the human gets NO edge, the name-derived node gets them, and
 //!   the human is listed as a candidate with public fields only;
@@ -37,8 +46,8 @@ use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
 use epigraph_mcp::types::{
-    FindAgentParams, IngestDocumentInlineParams, IngestDocumentParams, IngestDocumentSpineParams,
-    IngestWorkflowParams,
+    FindAgentParams, GetAgentParams, IngestDocumentInlineParams, IngestDocumentParams,
+    IngestDocumentSpineParams, IngestWorkflowParams,
 };
 use rmcp::model::CallToolResult;
 use serde_json::{json, Value};
@@ -55,6 +64,16 @@ async fn app_role_server(pool: &PgPool) -> EpiGraphMcpFull {
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
     let embedder = McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
     EpiGraphMcpFull::new(plain, AgentSigner::generate(), embedder, false).with_scoped_pool(scoped)
+}
+
+/// The operator `ingest-document` CLI's shape: no `ScopedPool`, a DECLARED
+/// privileged pool (here the superuser harness pool stands in for
+/// `MaintenancePool`), so the walk is a plain transaction row security does
+/// not scope.
+fn privileged_server(pool: &PgPool) -> EpiGraphMcpFull {
+    let embedder = McpEmbedder::new(pool.clone(), None).on_a_privileged_pool("test: operator CLI");
+    EpiGraphMcpFull::new(pool.clone(), AgentSigner::generate(), embedder, false)
+        .on_a_privileged_pool("test: operator CLI")
 }
 
 /// A server on the harness (superuser) pools, for workflow ingest, whose
@@ -111,6 +130,78 @@ async fn asserts_edges(pool: &PgPool, agent: Uuid) -> i64 {
     .expect("count asserts")
 }
 
+/// In-force `authored` edges from `agent` into the paper keyed `doi`.
+async fn authored_in_force(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2 \
+            AND (e.valid_to IS NULL OR e.valid_to > now())",
+    )
+    .bind(agent)
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count in-force authored")
+}
+
+/// In-force `asserts` edges from `agent` onto the claims the paper keyed
+/// `doi` asserts.
+async fn asserts_on_doc(pool: &PgPool, agent: Uuid, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges a \
+          WHERE a.source_id = $1 AND a.source_type = 'agent' AND a.relationship = 'asserts' \
+            AND (a.valid_to IS NULL OR a.valid_to > now()) \
+            AND EXISTS (SELECT 1 FROM edges pc JOIN papers p ON p.id = pc.source_id \
+                         WHERE p.doi = $2 AND pc.relationship = 'asserts' \
+                           AND pc.target_id = a.target_id)",
+    )
+    .bind(agent)
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count asserts on the document")
+}
+
+/// Claims the paper keyed `doi` asserts.
+async fn paper_claims(pool: &PgPool, doi: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM edges pc JOIN papers p ON p.id = pc.source_id \
+          WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim'",
+    )
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("count the paper's claims")
+}
+
+/// The properties of `agent`'s `authored` edge into the paper keyed `doi`.
+async fn authored_props(pool: &PgPool, agent: Uuid, doi: &str) -> Value {
+    sqlx::query_scalar(
+        "SELECT e.properties FROM edges e JOIN papers p ON p.id = e.target_id \
+          WHERE e.source_id = $1 AND e.relationship = 'authored' AND p.doi = $2",
+    )
+    .bind(agent)
+    .bind(doi)
+    .fetch_one(pool)
+    .await
+    .expect("authored edge properties")
+}
+
+/// `get_agent`'s card counts for `id`, as a third party who wrote nothing.
+async fn card_counts(server: &EpiGraphMcpFull, pool: &PgPool, id: Uuid) -> Value {
+    let viewer = fixture::public_viewer(pool).await;
+    let r = tools::agent_lookup::get_agent(
+        server,
+        &viewer,
+        GetAgentParams {
+            agent_id: id.to_string(),
+        },
+    )
+    .await
+    .expect("get_agent");
+    text(&r)["counts"].clone()
+}
+
 async fn papers_with_doi(pool: &PgPool, doi: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM papers WHERE doi = $1")
         .bind(doi)
@@ -125,6 +216,24 @@ async fn claims_labelled(pool: &PgPool, doi: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count claims")
+}
+
+/// A one-section, one-paragraph paper by `authors` with these atoms.
+fn doc_with_atoms(doi: &str, authors: Value, atoms: &[&str]) -> DocumentExtraction {
+    let generality: Vec<u8> = atoms.iter().map(|_| 3).collect();
+    serde_json::from_value(json!({
+        "source": {"title": format!("Author resolution {doi}"), "doi": doi,
+                   "source_type": "Paper", "authors": authors},
+        "thesis": format!("Thesis of {doi}"),
+        "thesis_derivation": "TopDown",
+        "sections": [{"title": "S", "paragraphs": [{
+            "text": format!("Paragraph of {doi}."),
+            "atoms": atoms,
+            "generality": generality, "confidence": 0.8
+        }]}],
+        "relationships": []
+    }))
+    .expect("extraction parses")
 }
 
 /// A one-section, one-paragraph, one-atom paper by `authors`.
@@ -178,8 +287,16 @@ async fn ingest_wait(
 /// DONE line of 94cc12db: find the person by name, then ingest a document
 /// authored by THAT node. The extraction spells the name differently on
 /// purpose: the id, not the name, chooses the node.
+///
+/// The ingester here (this stdio server's own agent) is neither the person
+/// nor operates them, so the explicit-author rule applies: the person is the
+/// paper's author (`authored`, marked `pending_countersign` with the
+/// ingester as `ingested_by`), asserts NONE of its claims, and a third
+/// party's card for them counts nothing until they countersign.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_explicit_agent_id_found_by_find_agent_receives_every_author_edge(pool: PgPool) {
+async fn an_explicit_agent_id_found_by_find_agent_is_the_author_and_a_stranger_cannot_make_it_assert(
+    pool: PgPool,
+) {
     let server = app_role_server(&pool).await;
     let human = human_named(&pool, "Lyra Okonkwo-Brandt").await;
 
@@ -220,13 +337,42 @@ async fn an_explicit_agent_id_found_by_find_agent_receives_every_author_edge(poo
     assert_eq!(report["action"], "attached_given", "{json}");
     assert_eq!(report["display_name"], "Lyra Okonkwo-Brandt", "{json}");
     assert_eq!(report["name"], "L. Okonkwo-Brandt", "{json}");
-    assert_eq!(authored_edges(&pool, human, doi).await, 1);
+    assert_eq!(report["attribution"], "pending_countersign", "{json}");
+    assert_eq!(report["asserts_claims"], false, "{json}");
+    let ingester = server.server_agent_id().await.expect("server agent");
+    assert_eq!(json["ingested_by"], ingester.to_string(), "{json}");
+    assert_ne!(
+        ingester, human,
+        "CALIBRATION: the ingester is not the person"
+    );
+
+    assert_eq!(
+        authored_edges(&pool, human, doi).await,
+        1,
+        "the person is an author"
+    );
+    let props = authored_props(&pool, human, doi).await;
+    assert_eq!(props["pending_countersign"], true, "{props}");
+    assert_eq!(props["ingested_by"], ingester.to_string(), "{props}");
+    assert_eq!(props["explicit_agent_id"], true, "{props}");
+    assert_eq!(props["author_name"], "L. Okonkwo-Brandt", "{props}");
     let claims = json["claims_ingested"].as_i64().expect("claims_ingested");
     assert!(claims > 0, "{json}");
     assert_eq!(
-        asserts_edges(&pool, human).await,
+        paper_claims(&pool, doi).await,
         claims,
-        "the given agent asserts every claim of the document"
+        "CALIBRATION: the paper asserts every claim"
+    );
+    assert_eq!(
+        asserts_edges(&pool, human).await,
+        0,
+        "a stranger's naming makes the person assert nothing"
+    );
+    let counts = card_counts(&server, &pool, human).await;
+    assert_eq!(
+        (&counts["authored_papers"], &counts["asserted_claims"]),
+        (&json!(0), &json!(0)),
+        "a pending authorship is not on the person's card: {counts}"
     );
     for spelling in ["L. Okonkwo-Brandt", "Lyra Okonkwo-Brandt"] {
         assert_eq!(
@@ -294,10 +440,12 @@ async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_nev
     let server = app_role_server(&pool).await;
     let name = "Wren Halvorsen";
     let mut humans = Vec::new();
-    for _ in 0..11 {
+    for _ in 0..10 {
         humans.push(human_named(&pool, name).await);
     }
-    let folded = human_named(&pool, "WREN HÄLVORSEN").await; // the 12th other
+    // The 11th other, youngest, so never listed: `candidates_truncated` below
+    // is true ONLY if its folded name is counted as a match.
+    let folded = human_named(&pool, "WREN HÄLVORSEN").await;
     let (system, _) = fixture::seed_agent_with_group(&pool, "author-system-same-name").await;
     assert!(fixture::register_system_agent(&pool, system).await);
     let role: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE agent_type = 'role' LIMIT 1")
@@ -323,7 +471,7 @@ async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_nev
     assert_eq!(report["status"], "ambiguous", "{json}");
     assert_eq!(
         report["candidates_truncated"], true,
-        "12 others, 10 listed: {json}"
+        "11 others (10 plain + the case- and accent-folded one), 10 listed: {json}"
     );
     let listed: Vec<Uuid> = report["candidates"]
         .as_array()
@@ -337,7 +485,8 @@ async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_nev
         })
         .collect();
     assert_eq!(listed.len(), 10, "{json}");
-    assert_eq!(listed, humans[..10].to_vec(), "oldest first: {json}");
+    assert_eq!(listed, humans, "oldest first: {json}");
+    assert!(!listed.contains(&folded), "the youngest is cut: {json}");
     for never in [system, role] {
         assert!(!listed.contains(&never), "{never} listed: {json}");
     }
@@ -366,6 +515,27 @@ async fn same_named_agents_are_listed_to_the_limit_and_system_and_role_nodes_nev
     );
     assert!(report.get("candidates_truncated").is_none(), "{json}");
     assert_eq!(asserts_edges(&pool, accented).await, 0, "never picked");
+
+    // And the other way round: the EXTRACTION is accented, the stored name is
+    // not. Folding the query side is what finds it.
+    let plain = human_named(&pool, "zoe angstrom").await;
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            "10.9999/author-folded-query",
+            json!([{"name": "Zoë Ångström"}]),
+        ),
+    )
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["status"], "ambiguous", "{json}");
+    assert_eq!(
+        report["candidates"][0]["agent_id"],
+        plain.to_string(),
+        "{json}"
+    );
+    assert_eq!(asserts_edges(&pool, plain).await, 0, "never picked");
 }
 
 /// The default path is the old one: the same id `did_key_for_author` always
@@ -571,6 +741,347 @@ async fn the_spine_honours_an_explicit_agent_id(pool: PgPool) {
     assert_eq!(json["authors"][0]["status"], "explicit", "{json}");
     assert_eq!(authored_edges(&pool, human, doi).await, 1);
     assert_eq!(name_key_node(&pool, "O. Vasquez").await, None);
+}
+
+/// The two arms of the explicit-author rule that DO write `asserts`: the
+/// ingester names itself, or names an agent it is the human operator of.
+/// CONTROL: an agent somebody else operates is `pending_countersign`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ingester_itself_and_the_human_operating_an_agent_make_it_assert(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let me = server.server_agent_id().await.expect("server agent");
+
+    let doi = "10.9999/author-self";
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "The Ingester", "agent_id": me.to_string()}]),
+        ),
+    )
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["attribution"], "caller", "{json}");
+    assert_eq!(report["asserts_claims"], true, "{json}");
+    let claims = paper_claims(&pool, doi).await;
+    assert!(claims > 0);
+    assert_eq!(
+        asserts_on_doc(&pool, me, doi).await,
+        claims,
+        "self: asserts every claim"
+    );
+    let props = authored_props(&pool, me, doi).await;
+    assert_eq!(props["explicit_agent_id"], true, "{props}");
+    assert!(props.get("pending_countersign").is_none(), "{props}");
+    assert_eq!(
+        card_counts(&server, &pool, me).await["authored_papers"],
+        1,
+        "a self-attributed paper is on the card"
+    );
+
+    // The ingester becomes a registered human and operates a bot.
+    fixture::make_human_operator(&pool, me).await;
+    let (bot, _) = fixture::seed_agent_with_group(&pool, "author-operated-bot").await;
+    let (other_human, _) = fixture::seed_human_operator(&pool, "author-other-human").await;
+    let (other_bot, _) = fixture::seed_agent_with_group(&pool, "author-other-bot").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_operator(&mut conn, bot, me)
+            .await
+            .expect("link the bot");
+        epigraph_db::AgentRepository::link_operator(&mut conn, other_bot, other_human)
+            .await
+            .expect("link the other bot");
+        assert_eq!(
+            epigraph_db::AgentRepository::human_of(&mut conn, bot, true)
+                .await
+                .expect("human_of"),
+            Some(me),
+            "CALIBRATION: the ingester is the bot's human"
+        );
+    }
+
+    let doi = "10.9999/author-operated";
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "The Bot", "agent_id": bot.to_string()}]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        json["authors"][0]["attribution"], "operated_by_caller",
+        "{json}"
+    );
+    assert_eq!(json["authors"][0]["asserts_claims"], true, "{json}");
+    assert_eq!(
+        asserts_on_doc(&pool, bot, doi).await,
+        paper_claims(&pool, doi).await,
+        "operated: the bot asserts every claim"
+    );
+
+    let doi = "10.9999/author-operated-control";
+    let json = ingest_wait(
+        &server,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "Their Bot", "agent_id": other_bot.to_string()}]),
+        ),
+    )
+    .await;
+    assert_eq!(
+        json["authors"][0]["attribution"], "pending_countersign",
+        "{json}"
+    );
+    assert_eq!(
+        authored_edges(&pool, other_bot, doi).await,
+        1,
+        "CONTROL: authored"
+    );
+    assert_eq!(
+        asserts_edges(&pool, other_bot).await,
+        0,
+        "CONTROL: no asserts"
+    );
+}
+
+/// An MCP server cannot retract a name-derived author's edges (agent edges
+/// are administrative), so a re-ingest with `agent_id` that would REPLACE it
+/// is refused, on the queued path, in wait mode and in the core, and nothing
+/// moves: in particular the agent is never added BESIDE the old author.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_mcp_server_refuses_to_replace_a_name_derived_author_and_writes_nothing(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Corvin Thale";
+    let human = human_named(&pool, name).await;
+    let doi = "10.9999/author-replace-refused";
+
+    let first = ingest_wait(&server, &pool, doc(doi, json!([{"name": name}]))).await;
+    assert_eq!(first["authors"][0]["status"], "ambiguous", "{first}");
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let before = asserts_on_doc(&pool, key, doi).await;
+    assert!(
+        before > 0,
+        "CALIBRATION: the name-derived node asserts the claims"
+    );
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let again = || doc(doi, json!([{"name": name, "agent_id": human.to_string()}]));
+    for wait in [None, Some(true)] {
+        let err = tools::ingestion::ingest_document_inline(
+            &server,
+            &viewer,
+            IngestDocumentInlineParams {
+                extraction: again(),
+                wait,
+            },
+            None,
+        )
+        .await
+        .expect_err("a replacement this server cannot make is refused");
+        for needle in ["source.authors[0].agent_id", "REPLACE", "ingest-document"] {
+            assert!(
+                err.message.contains(needle),
+                "wait={wait:?}: {needle:?}: {}",
+                err.message
+            );
+        }
+    }
+    let err = tools::ingestion::do_ingest_document(&server, &viewer, &again(), None)
+        .await
+        .expect_err("the walk refuses it too");
+    assert!(err.message.contains("REPLACE"), "{}", err.message);
+
+    assert_eq!(
+        authored_in_force(&pool, key, doi).await,
+        1,
+        "the old author stays"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi).await,
+        before,
+        "its asserts stay"
+    );
+    assert_eq!(
+        authored_edges(&pool, human, doi).await,
+        0,
+        "never added beside it"
+    );
+}
+
+/// The operator CLI (a privileged pool) performs the replacement: the
+/// name-derived node's `authored` edge and its `asserts` edges on THIS paper
+/// are retracted, except on a claim another of its papers also asserts, and
+/// its other paper is untouched. A later name-only re-ingest keeps the
+/// explicit author instead of bringing the name-derived node back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operator_cli_replaces_the_name_derived_author_and_a_name_only_reingest_keeps_it(
+    pool: PgPool,
+) {
+    let server = privileged_server(&pool);
+    let reader = app_role_server(&pool).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let name = "Ysolde Marchetti";
+    let human = human_named(&pool, name).await;
+    let (doi1, doi2) = ("10.9999/author-replace-1", "10.9999/author-replace-2");
+    let shared = "Shared atom of the replacement pair.";
+    let core = |extraction: DocumentExtraction| {
+        let (server, viewer) = (&server, &viewer);
+        async move {
+            text(
+                &tools::ingestion::do_ingest_document(server, viewer, &extraction, None)
+                    .await
+                    .expect("the core ingests"),
+            )
+        }
+    };
+
+    core(doc_with_atoms(
+        doi1,
+        json!([{"name": name}]),
+        &["Only in the first.", shared],
+    ))
+    .await;
+    core(doc_with_atoms(
+        doi2,
+        json!([{"name": name}]),
+        &["Only in the second.", shared],
+    ))
+    .await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+    let k1 = asserts_on_doc(&pool, key, doi1).await;
+    let k2 = asserts_on_doc(&pool, key, doi2).await;
+    let both: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges a JOIN papers p ON p.id = a.source_id AND p.doi = $1 \
+           JOIN edges b ON b.target_id = a.target_id AND b.relationship = 'asserts' \
+           JOIN papers q ON q.id = b.source_id AND q.doi = $2 \
+          WHERE a.relationship = 'asserts'",
+    )
+    .bind(doi1)
+    .bind(doi2)
+    .fetch_one(&pool)
+    .await
+    .expect("shared claims");
+    assert!(both >= 1, "CALIBRATION: the two papers share a claim");
+    assert_eq!(
+        card_counts(&reader, &pool, key).await["authored_papers"],
+        2,
+        "CALIBRATION"
+    );
+
+    let json = core(doc_with_atoms(
+        doi1,
+        json!([{"name": name, "agent_id": human.to_string()}]),
+        &["Only in the first.", shared],
+    ))
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], human.to_string(), "{json}");
+    assert_eq!(report["replaced"]["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["replaced"]["authored_edges_retracted"], 1, "{json}");
+    assert_eq!(
+        report["replaced"]["asserts_edges_retracted"],
+        k1 - both,
+        "{json}"
+    );
+    assert!(report.get("also_at_position").is_none(), "{json}");
+
+    assert_eq!(
+        authored_in_force(&pool, key, doi1).await,
+        0,
+        "replaced on this paper"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi1).await,
+        both,
+        "only the claim its other paper asserts keeps its edge"
+    );
+    assert_eq!(
+        authored_in_force(&pool, key, doi2).await,
+        1,
+        "its other paper is untouched"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi2).await,
+        k2,
+        "its other paper is untouched"
+    );
+    assert_eq!(
+        authored_in_force(&pool, human, doi1).await,
+        1,
+        "one author at the position"
+    );
+    assert_eq!(
+        card_counts(&reader, &pool, key).await["authored_papers"],
+        1,
+        "a retracted authorship leaves the card"
+    );
+
+    // A name-only re-ingest (a pipeline re-run) keeps the explicit author.
+    let json = core(doc_with_atoms(
+        doi1,
+        json!([{"name": name}]),
+        &["Only in the first.", shared],
+    ))
+    .await;
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], human.to_string(), "{json}");
+    assert_eq!(report["status"], "explicit", "{json}");
+    assert_eq!(report["action"], "kept_attached", "{json}");
+    assert_eq!(
+        authored_in_force(&pool, key, doi1).await,
+        0,
+        "not brought back"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, doi1).await,
+        both,
+        "not brought back"
+    );
+    assert_eq!(authored_in_force(&pool, human, doi1).await, 1);
+}
+
+/// An explicit id that IS another entry's name-derived node would make two
+/// entries one agent with one `authored` edge: refused before the paper row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_id_equal_to_another_entrys_name_derived_node_is_refused(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let name = "Brannoc Ilse";
+    ingest_wait(
+        &server,
+        &pool,
+        doc("10.9999/author-dup-seed", json!([{"name": name}])),
+    )
+    .await;
+    let key = name_key_node(&pool, name).await.expect("name-key node");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let doi = "10.9999/author-dup";
+    let err = tools::ingestion::ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction: doc(
+                doi,
+                json!([{"name": "Someone Else", "agent_id": key.to_string()}, {"name": name}]),
+            ),
+            wait: None,
+        },
+        None,
+    )
+    .await
+    .expect_err("refused");
+    assert!(
+        err.message.contains("source.authors[0].agent_id"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("source.authors[1]"), "{}", err.message);
+    assert_eq!(papers_with_doi(&pool, doi).await, 0, "no papers row");
 }
 
 fn token(agent: Uuid) -> AuthContext {
