@@ -242,9 +242,11 @@ q "SELECT '   doc_claims='||(SELECT count(*) FROM claims WHERE 'doi:$DOI' = ANY(
 
 echo "--- CONVERGED ATOM owned by ANOTHER group (the workflow ingest's operation atom) ---"
 # Atoms are content-addressed: this document's first atom has the same text as
-# an operation atom the ingest_workflow arm above wrote, owned by the
-# workflow-ingest-system agent's group. The ingest resolves to that row and must
-# still land the rest of the document.
+# an operation atom the ingest_workflow arm above wrote, owned by the group the
+# workflow ingest landed in (the caller's own team or default group, private to
+# it since workflow writes are made as the caller; it was the
+# workflow-ingest-system agent's group before). The ingest resolves to that row
+# and must still land the rest of the document.
 DOI3="10.9999/unit-e-conv-$LABEL"
 DOC3='{"source":{"title":"Unit E convergence paper","doi":"'"$DOI3"'","source_type":"Paper","authors":[]},"thesis":"Unit E convergence thesis","thesis_derivation":"TopDown","sections":[{"title":"Convergence section","paragraphs":[{"text":"The convergence paragraph","atoms":["Write the operation atom claims","A fresh unit E atom beside a converged one"],"generality":[3,3],"confidence":0.8}]}],"relationships":[]}'
 q "SELECT '   converged atom before: owner='||COALESCE((SELECT owner_group_id::text FROM claims WHERE content='Write the operation atom claims'),'absent')"
@@ -310,16 +312,17 @@ else
 fi
 
 echo
-echo "=== E1 REVOKED: hard constraint #3 — a revoked ingest-system membership must NOT be revived ==="
-# The executor authors every row as the workflow-ingest-system agent. Revoke
-# that agent's membership(s) as the superuser, call store_workflow, and re-read
-# revoked_at. PASS = the call refuses loudly, writes nothing, and the membership
-# is STILL revoked. The first E1 revision revived it (live 0 -> 1) and committed.
-# The agent is identified off a claim the ingest above wrote, never by
-# display_name (not unique — see README trap 1).
+echo "=== E1 REVOKED: hard constraint #3 — a revoked workflow-writer membership must NOT be revived ==="
+# The executor authors every row as the CALLER (here this MCP process's own
+# agent; it was the workflow-ingest-system agent before workflow writes moved to
+# the caller). Revoke that agent's membership(s) as the superuser, call
+# store_workflow, and re-read revoked_at. PASS = the call refuses loudly, writes
+# nothing, and the membership is STILL revoked. The first E1 revision revived it
+# (live 0 -> 1) and committed. The agent is identified off a claim the ingest
+# above wrote, never by display_name (not unique — see README trap 1).
 SYS=$(q "SELECT agent_id FROM claims WHERE 'workflow_step' = ANY(labels) LIMIT 1")
 if [ -z "$SYS" ]; then
-  echo "   SKIP: no executor-authored claim to identify the system agent by"
+  echo "   SKIP: no executor-authored claim to identify the writing agent by"
 else
   q "UPDATE group_memberships SET revoked_at = now() WHERE agent_id = '$SYS' AND revoked_at IS NULL" >/dev/null
   mstate() { q "SELECT 'live='||count(*) FILTER (WHERE revoked_at IS NULL)||' revoked='||count(*) FILTER (WHERE revoked_at IS NOT NULL) FROM group_memberships WHERE agent_id='$SYS'"; }

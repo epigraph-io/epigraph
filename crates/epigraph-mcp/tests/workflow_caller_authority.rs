@@ -149,7 +149,7 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-owned", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -215,9 +215,9 @@ async fn a_stranger_cannot_add_or_delete_steps_on_a_submitted_workflow(pool: PgP
     assert_eq!(steps(&pool, "h3-owned").await, before + 2);
 }
 
-/// Ingest `canonical` as `owner`, then strip the recorded submitter: the shape
-/// of every workflow written before batch H-b (nothing recorded who created
-/// them). Returns the lineage of its one step.
+/// Ingest `canonical` as `owner`, public in its own group, then strip the
+/// recorded submitter: the shape of every workflow written before batch H-b
+/// (nothing recorded who created them). Returns the lineage of its one step.
 async fn legacy_workflow(
     pool: &PgPool,
     server: &epigraph_mcp::EpiGraphMcpFull,
@@ -230,7 +230,7 @@ async fn legacy_workflow(
         owner_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(owner_viewer)),
             embed: None,
         },
         Some(owner_token),
@@ -266,14 +266,15 @@ async fn lineage_truths(pool: &PgPool, lineage: Uuid) -> Vec<f64> {
         .expect("lineage truths")
 }
 
-/// U005 (backlog 84b2a98d), default decision A: a workflow with no recorded
-/// submitter is PLATFORM corpus. Over the authenticated transport a
-/// `claims:write` caller may not mutate it — not a stranger, and not the agent
-/// that happened to ingest it, since nothing records that it did. Before this
-/// change every arm below was admitted with a WARN (`delete_step` drove the
-/// step's truth to 0.05).
+/// U005 (backlog 84b2a98d): a workflow with no recorded submitter has no
+/// submitter arm. Over the authenticated transport a `claims:write` caller
+/// that does not write its owner group may not mutate it. Before batch H-b
+/// every arm below was admitted with a WARN (`delete_step` drove the step's
+/// truth to 0.05). A writer of the row's owner group (here the agent that
+/// ingested it, whose own group owns it) IS admitted: the owner-group writer
+/// arm, recorded as such.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(pool: PgPool) {
+async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_writer_http_caller(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let (_owner, owner_token, owner_viewer) = seed_caller(&pool, &["claims:write"]).await;
     let (_stranger, stranger_token, stranger_viewer) = seed_caller(&pool, &["claims:write"]).await;
@@ -297,22 +298,6 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
     assert!(
         err.message.contains("audited claims:admin path"),
         "the refusal names the one arm that admits: {}",
-        err.message
-    );
-    assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
-
-    // The ORIGINAL ingester is refused too: no record says it submitted it.
-    let err = tools::step_ops::add_step(
-        &server,
-        &owner_viewer,
-        add("h3-legacy", "the ingester's step"),
-        Some(&owner_token),
-    )
-    .await
-    .expect_err("no record means no submitter arm");
-    assert!(
-        err.message.contains("no recorded submitter"),
-        "{}",
         err.message
     );
     assert_eq!(steps(&pool, "h3-legacy").await, before, "nothing written");
@@ -387,6 +372,28 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_admin_http_caller(
         after.iter().any(|t| (t - 0.05).abs() < 1e-9),
         "its head is driven to 0.05: {after:?}"
     );
+
+    // The ORIGINAL ingester writes the row's owner group: admitted through
+    // the owner-group writer arm (no record says it submitted it).
+    let before = steps(&pool, "h3-legacy").await;
+    tools::step_ops::add_step(
+        &server,
+        &owner_viewer,
+        add("h3-legacy", "the ingester's step"),
+        Some(&owner_token),
+    )
+    .await
+    .expect("a writer of the owner group is admitted on a legacy row");
+    assert_eq!(steps(&pool, "h3-legacy").await, before + 1);
+    let arm: Option<String> = sqlx::query_scalar(
+        "SELECT details->>'arm' FROM security_events \
+          WHERE event_type = 'workflows.caller_write' AND details->>'action' = 'add_step' \
+            AND details->>'transport' = 'http'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the ingester's provenance row");
+    assert_eq!(arm.as_deref(), Some("owner_group_writer"));
 }
 
 /// The arm that DOES admit a legacy workflow over the authenticated transport:
@@ -681,7 +688,7 @@ async fn stdio_is_checked_and_a_stdio_ingest_is_still_owned(pool: PgPool) {
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-http-owned-stdio", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -783,7 +790,7 @@ async fn a_new_generation_cannot_take_a_lineage_over_without_naming_a_parent(poo
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-lineage", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),
@@ -923,7 +930,7 @@ async fn a_workflow_admin_write_is_audited_and_a_grantless_admin_is_refused(pool
         &owner_viewer,
         IngestWorkflowParams {
             extraction: extraction("h3-admin", serde_json::json!({})),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&owner_viewer)),
             embed: None,
         },
         Some(&owner_token),

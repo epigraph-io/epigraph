@@ -2054,12 +2054,38 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// Whether some `workflows` row named `canonical_name` is one `conn`'s
+    /// session cannot read (migration 202's
+    /// `epigraph_workflow_name_has_hidden_rows`, a maintenance-owned definer:
+    /// the session's own view cannot answer this, because row security hides
+    /// exactly the rows asked about). One boolean, no row.
+    ///
+    /// Workflow writes run on the CALLER's stamp, so a lineage whose head is
+    /// private to a group the caller is not in looks absent to it; without this
+    /// check a non-member could mint the next generation of that lineage (a
+    /// public row every member would then resolve as the head). Callers refuse
+    /// a write to a name with hidden rows before anything is written.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails (`42883` before migration 202).
+    pub async fn name_has_hidden_rows_conn(
+        conn: &mut sqlx::PgConnection,
+        canonical_name: &str,
+    ) -> Result<bool, DbError> {
+        Ok(
+            sqlx::query_scalar("SELECT public.epigraph_workflow_name_has_hidden_rows($1)")
+                .bind(canonical_name)
+                .fetch_one(&mut *conn)
+                .await?,
+        )
+    }
+
     /// The tenancy `(visibility, owner_group_id)` of the `workflows` row `id`,
     /// or `None` when the connection's stamp does not read it. The write paths
-    /// that EXTEND a plan run it on the system-agent-stamped transaction that
-    /// writes the extension, so the extension takes the row's tenancy (ruling
-    /// R-98: a step added to a group plan, a new generation of a group
-    /// lineage); a reader's view goes through [`Self::tenancy_as_viewer`].
+    /// that EXTEND a plan run it on the caller-stamped transaction that writes
+    /// the extension, so the extension takes the row's tenancy (ruling R-98: a
+    /// step added to a group plan, a new generation of a group lineage); a
+    /// reader's view goes through [`Self::tenancy_as_viewer`].
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -2133,6 +2159,27 @@ impl WorkflowRepository {
               GROUP BY id ORDER BY min(depth), id",
         )
         .bind(id)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// The distinct `canonical_name`s of the `workflows` rows `ids` that the
+    /// connection's stamp reads, sorted. A cascade deprecation asks
+    /// [`Self::name_has_hidden_rows_conn`] of each, so a generation of the
+    /// lineage the caller cannot read refuses the cascade instead of being
+    /// skipped by [`Self::lineage_descendants`].
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn canonical_names_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        ids: &[Uuid],
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT DISTINCT canonical_name FROM workflows WHERE id = ANY($1) \
+              ORDER BY canonical_name",
+        )
+        .bind(ids)
         .fetch_all(executor)
         .await
     }

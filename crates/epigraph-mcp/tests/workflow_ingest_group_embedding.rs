@@ -62,8 +62,16 @@ async fn ingest_step(
         .await
         .expect("the stdio viewer");
     let mut params = json!({ "extraction": extraction(name) });
-    if let Some(g) = group {
-        params["tenancy"] = json!({"visibility": "group", "owner_group_id": g});
+    match group {
+        Some(g) => params["tenancy"] = json!({"visibility": "group", "owner_group_id": g}),
+        // The explicit public tenancy, in the stdio agent's one group: an
+        // undeclared ingest would be private to it.
+        None => {
+            let [own] = viewer.writable_groups() else {
+                panic!("fixture: the stdio agent writes one group");
+            };
+            params["tenancy"] = json!({"visibility": "public", "owner_group_id": own});
+        }
     }
     let params: epigraph_mcp::types::IngestWorkflowParams =
         serde_json::from_value(params).expect("params");
