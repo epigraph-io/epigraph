@@ -56,20 +56,26 @@
 //!   HELD: its manifest would record only the FROM part, and the reversal,
 //!   which refuses a lineage row it did not see, could then never restore it.
 //!
-//!   `--catch-up` (with `--visibility group`) is the remedy for a lineage
-//!   re-ingested between runs. A STRAY generation is one in the source's
-//!   private state (the owner-group-only default for new workflow writes puts
-//!   a re-ingest there: in a move it is neither FROM nor TO), or a FROM one
-//!   beside generations already in TO. A catch-up run takes only the
-//!   lineages that have one, and changes only their non-TO generations and
-//!   their plan rows (the source's private plan claims too, into exactly the
-//!   TO state); the TO generations and claims are recorded as SEEN, so the
-//!   reversal's growth check accepts them, and are never written. A lineage
-//!   with no stray generation is SKIPPED (it is the main act's), and one that
-//!   is wholly private stays held. It is audited, manifested and reversed
-//!   exactly like the main act; reversing the catch-up puts the lineage back
-//!   in the state it found it in, and the original manifest then refuses (a
-//!   generation joined after it).
+//!   `--catch-up` (with `--visibility group`) is the remedy for a generation
+//!   that joined a lineage AFTER its act: it takes only a lineage that has a
+//!   generation in the TO state, and its other generations are STRAY (FROM,
+//!   or, in a move, the source's private state, which is neither FROM nor
+//!   TO). A lineage with no generation in TO is the main act's, never a
+//!   catch-up's: SKIPPED when it is all FROM, HELD otherwise. A catch-up
+//!   changes the stray generations and their plan rows under the main act's
+//!   rules, with ONE exemption from the hand-off rule, for the stray
+//!   generations' OWN rows ([`StrayScope`]): their `workflows` rows, the
+//!   source's private plan claims only they reach, and those claims' plan
+//!   edges among themselves, the lineage's TO rows and their author agent.
+//!   These go into exactly the TO state. Every other row keeps the hand-off
+//!   rule, so a catch-up never widens anything else: a private derived row
+//!   (evidence on a new step), a private edge to a row outside the plans, or
+//!   a private step the main act left holds the lineage, and an `--apply`
+//!   exits 3. The TO generations and claims are recorded as SEEN, so the
+//!   reversal's growth check accepts them, and are never written. It is
+//!   audited, manifested and reversed exactly like the main act; reversing
+//!   the catch-up puts the lineage back in the state it found it in, and the
+//!   original manifest then refuses (a generation joined after it).
 //! * `claims`: the plan claims, i.e. the target of every `executes` edge from
 //!   any of those rows (thesis, phases, steps, operation atoms; retracted
 //!   edges count too, as migration 183's backfill counts them), plus every
@@ -81,7 +87,8 @@
 //!     atoms are content-addressed in the namespace documents share), or in a
 //!     step lineage with such a member. A shared claim is never moved;
 //!   - owned by a group other than the source, or not public (under
-//!     `--catch-up`, the source's private state counts as source-owned);
+//!     `--catch-up`, a stray generation's own private claim is taken; see
+//!     [`StrayScope`]);
 //!   - `keep` only: carrying a row the cascade would move that is not
 //!     `('public', source)` (a third group's derived row, pinned evidence), or
 //!     an edge with a non-public endpoint, or sharing a cascaded row (a
@@ -104,8 +111,8 @@
 //!   an `--apply` exits 3. Holding a move on a source-private edge is a
 //!   choice: the target would get owner and delete rights over a row the
 //!   source kept private, which a ruling to narrow public plans does not
-//!   cover. The remedy is a separate act on that row (or, for the source's
-//!   own private plan rows of a listed lineage, `--catch-up`).
+//!   cover. The remedy is a separate act on that row (or, for the rows a
+//!   generation that joined after the act wrote itself, `--catch-up`).
 //!
 //!   A claim shared with a source-owned PUBLIC lineage the list omits is
 //!   named on a `SHARED-SPLIT` line: no run of either list narrows it alone,
@@ -298,9 +305,9 @@ pub struct Act {
     pub source: Uuid,
     pub target: Uuid,
     pub visibility: Visibility,
-    /// `--catch-up`: also take the source's PRIVATE rows of a listed lineage,
-    /// and lineages already partly in the TO state (only their other
-    /// generations change).
+    /// `--catch-up`: take only lineages with a generation in the TO state, and
+    /// change only their other (stray) generations; the stray generations' own
+    /// private rows may go into the TO state ([`StrayScope`]).
     pub catch_up: bool,
 }
 
@@ -610,8 +617,8 @@ pub enum LineageHold {
     NotPublic {
         generation: i32,
         visibility: String,
-        /// A source-private generation of a lineage with others in the FROM
-        /// or TO state (a re-ingest): `--catch-up` takes it.
+        /// A source-private generation of a lineage with a generation in the
+        /// TO state: `--catch-up` takes it.
         catch_up: bool,
     },
     /// Some generations are in the TO state already and some in the FROM
@@ -753,7 +760,7 @@ impl fmt::Display for Left {
 pub struct Component {
     /// Sorted.
     pub lineages: Vec<String>,
-    /// Generations that change (the FROM state, or under `--catch-up` the
+    /// Generations that change (the FROM state, or under `--catch-up` a stray
     /// source's private state).
     pub workflows: Vec<WfRow>,
     /// Generations already in the TO state (`--catch-up`): recorded as seen,
@@ -910,8 +917,11 @@ fn tuple_text(t: &Tenancy) -> String {
 /// * `prior == post`: nothing changes (an edge to a row already private to the
 ///   target, or in place to the same group; a cascaded row already in the TO
 ///   state). Never blocks.
-/// * `--catch-up` re-owning the source's private plan row into exactly the TO
-///   state: the operator's own row of a lineage this act covers.
+/// * `own` (`--catch-up` only): one of the stray generations' OWN rows (see
+///   [`StrayScope`]) going into exactly the TO state from a private tuple only
+///   the source and the target read. The operator's ruling to move the lineage
+///   covers the generation that joined it late; every other row, derived rows
+///   included, keeps the rules below.
 /// * `post` readable by a group that cannot read `prior`: a widening.
 /// * a non-public `prior` whose owner changes: the target would become the
 ///   OWNER (delete and re-tenant rights) of a row its owner keeps private,
@@ -927,11 +937,19 @@ fn hand_off(
     prior: &Tenancy,
     post: &Tenancy,
     public_taken: bool,
+    own: bool,
 ) -> Option<&'static str> {
     if prior == post {
         return None;
     }
-    if act.catch_up && *prior == act.source_private() && *post == act.to_state() {
+    let ours = |g: Uuid| g == act.source || g == act.target;
+    if own
+        && act.catch_up
+        && *post == act.to_state()
+        && prior.visibility != PUBLIC
+        && ours(prior.owner)
+        && prior.co_owner.is_none_or(ours)
+    {
         return None;
     }
     if !narrows(prior, post) {
@@ -950,6 +968,56 @@ fn hand_off(
             "it is another group's public row, which only that group's own narrowing may take \
              (not writer-owned, so the database does not hand it over)",
         )
+    }
+}
+
+/// `--catch-up`: the stray generations' OWN rows, the only rows its hand-off
+/// exemption covers ([`hand_off`]'s `own`).
+///
+/// * `workflows`: the generations it changes (the non-TO generations of a
+///   lineage that has a generation in the TO state);
+/// * `claims`: the source's private plan claims ONLY those generations reach:
+///   executed by one of them, by no other generation (retracted edges count),
+///   in no step lineage with a member another generation executes (the moved
+///   plan reaches an evolved step through its lineage, so a private step the
+///   main act left is never one of these), and not SHARED;
+/// * edges: an edge touching one of those rows whose every endpoint is one of
+///   them, a row of the same lineages already in the TO state, or (an
+///   `AUTHORED` edge) the author agent the ingest records.
+///
+/// Derived rows (evidence, BBAs, fragments, ...) are never own rows: a private
+/// one holds the lineage as in the main act.
+#[derive(Default)]
+struct StrayScope {
+    workflows: BTreeSet<Uuid>,
+    claims: BTreeSet<Uuid>,
+    to_workflows: BTreeSet<Uuid>,
+    to_claims: BTreeSet<Uuid>,
+}
+
+impl StrayScope {
+    fn own(&self, (id, ty): &(Uuid, String)) -> bool {
+        match ty.as_str() {
+            "workflow" => self.workflows.contains(id),
+            "claim" => self.claims.contains(id),
+            _ => false,
+        }
+    }
+
+    fn in_to(&self, (id, ty): &(Uuid, String)) -> bool {
+        match ty.as_str() {
+            "workflow" => self.to_workflows.contains(id),
+            "claim" => self.to_claims.contains(id),
+            _ => false,
+        }
+    }
+
+    fn owns_edge(&self, e: &EdgeRow) -> bool {
+        let ends = [&e.source, &e.target];
+        ends.iter().any(|n| self.own(n))
+            && ends.iter().all(|n| {
+                self.own(n) || self.in_to(n) || (n.1 == "agent" && e.relationship == "AUTHORED")
+            })
     }
 }
 
@@ -986,6 +1054,7 @@ async fn classify_narrowing(
     edge_rows: &[EdgeRow],
     moving_wf: &BTreeSet<Uuid>,
     inside_node: &dyn Fn(&(Uuid, String)) -> bool,
+    stray: &StrayScope,
 ) -> anyhow::Result<Narrowed> {
     let to = act.to_state();
     let to_node: NodeState = (to.owner, to.visibility.clone());
@@ -1096,7 +1165,8 @@ async fn classify_narrowing(
             out.kept_rows.insert(k.clone(), a.clone());
             continue;
         }
-        if let Some(why) = hand_off(act, &a.tenancy, &post.tenancy, writer_owned) {
+        // A derived row is never one of a stray generation's own rows.
+        if let Some(why) = hand_off(act, &a.tenancy, &post.tenancy, writer_owned, false) {
             out.hand_offs.push((
                 anchors,
                 LineageHold::HandOff {
@@ -1195,7 +1265,7 @@ async fn classify_narrowing(
             out.kept.push((e, "already as narrow as its plan"));
             continue;
         }
-        if let Some(why) = hand_off(act, &e.tenancy, &post, true) {
+        if let Some(why) = hand_off(act, &e.tenancy, &post, true, stray.owns_edge(&e)) {
             let anchors = vec![e.source.0, e.target.0];
             out.hand_offs.push((
                 anchors,
@@ -1265,8 +1335,8 @@ pub async fn plan(
     // A generation is FROM ('public', source), TO, or (a move) the source's
     // private state; anything else holds the lineage. Without --catch-up a
     // lineage moves only from the FROM state whole; with it, a lineage moves
-    // when it has a STRAY generation (the source's private one, or a FROM one
-    // beside generations already in TO), and its TO generations are seen.
+    // only when it has a generation in TO (its other generations are STRAY:
+    // FROM, or the source's private state), and its TO generations are seen.
     let mut eligible: BTreeMap<String, Vec<WfRow>> = BTreeMap::new();
     let mut moving_wf: BTreeSet<Uuid> = BTreeSet::new();
     for name in names {
@@ -1310,7 +1380,9 @@ pub async fn plan(
             out.already.push(name.clone());
             continue;
         }
-        let stray = !to_g.is_empty() || (!from_g.is_empty() && !priv_g.is_empty());
+        // Stray: a generation beside generations already in TO. A lineage
+        // with none in TO is the main act's (which holds or moves it whole).
+        let stray = !to_g.is_empty();
         if !act.catch_up {
             if let Some(w) = priv_g.first() {
                 out.held.push((name.clone(), not_public(w, stray)));
@@ -1488,6 +1560,38 @@ pub async fn plan(
     let mut left: BTreeMap<Uuid, Left> = BTreeMap::new();
     let mut already: BTreeSet<Uuid> = BTreeSet::new();
     let mut candidates: BTreeSet<Uuid> = BTreeSet::new();
+    let mut stray = StrayScope::default();
+    if act.catch_up {
+        stray.workflows.clone_from(&moving_wf);
+        stray.to_workflows = wf_lineage
+            .keys()
+            .filter(|w| !moving_wf.contains(w))
+            .copied()
+            .collect();
+        let mut executors: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
+        for (w, c) in &exec {
+            executors.entry(*c).or_default().insert(*w);
+        }
+        let by_other = |c: &Uuid| {
+            executors
+                .get(c)
+                .is_some_and(|ws| ws.iter().any(|w| !moving_wf.contains(w)))
+        };
+        for c in executors.keys() {
+            let reached_otherwise = by_other(c)
+                || step_of
+                    .get(c)
+                    .is_some_and(|l| step_members[l].iter().any(&by_other));
+            if !reached_otherwise
+                && !shared.contains_key(c)
+                && by_id
+                    .get(c)
+                    .is_some_and(|r| claim_tenancy(r) == source_private)
+            {
+                stray.claims.insert(*c);
+            }
+        }
+    }
     for id in &all_claims {
         let Some(c) = by_id.get(id) else {
             left.insert(*id, Left::NotFound);
@@ -1500,7 +1604,7 @@ pub async fn plan(
             left.insert(*id, Left::Shared(by.iter().cloned().collect()));
         } else if c.owner != source {
             left.insert(*id, Left::NotSourceOwned { owner: c.owner });
-        } else if c.visibility != PUBLIC && !(act.catch_up && state == source_private) {
+        } else if c.visibility != PUBLIC && !stray.claims.contains(id) {
             left.insert(
                 *id,
                 Left::NotPublic {
@@ -1512,6 +1616,7 @@ pub async fn plan(
         }
     }
 
+    stray.to_claims.clone_from(&already);
     let cand: Vec<Uuid> = candidates.iter().copied().collect();
     let attached = fetch_attached(conn, specs, &cand).await?;
     let edge_rows = fetch_edges(conn, &all_claims, &wall).await?;
@@ -1552,6 +1657,7 @@ pub async fn plan(
             &edge_rows,
             &moving_wf,
             &inside_node,
+            &stray,
         )
         .await?;
         rows_out = n.rows;
@@ -2587,8 +2693,9 @@ pub async fn run_batch(
             )),
         }
     }
-    // A row that was public and ends non-public; a source-private row a
-    // catch-up re-owns was never readable to an unstamped session.
+    // A row that was public and ends non-public; a stray generation's own
+    // private row a catch-up re-owns was never readable to an unstamped
+    // session.
     let public_claims: Vec<Uuid> = comps
         .iter()
         .flat_map(|c| c.claims.iter())
@@ -2940,9 +3047,9 @@ pub async fn run(
         writeln!(
             out,
             "RULE: only ('public', source) generations and plan claims change (with --catch-up \
-             also the source's private ones), and each ends ('group', target); the claims \
-             narrow through the tenancy cascade (derived rows, fragments, every edge with a \
-             claim endpoint; another writer's public row joins the claim's group and loses its \
+             also a stray generation's own private ones), and each ends ('group', target); the \
+             claims narrow through the tenancy cascade (derived rows, fragments, every edge with \
+             a claim endpoint; another writer's public row joins the claim's group and loses its \
              writer_owned flag, which the manifest records; pinned evidence keeps its owner); \
              an edge with no narrowing claim endpoint (a workflow's, or one on a narrowing \
              step's evidence) is narrowed by this tool to the meet of its endpoints; a plan \
@@ -4222,28 +4329,39 @@ mod tests {
             visibility: Visibility::Group,
             catch_up: false,
         };
+        let held = |prior: Tenancy, post: Tenancy, taken: bool| {
+            hand_off(&act, &prior, &post, taken, false).is_some()
+        };
         // Nothing changes: never a hand-off (in place, or already the target's).
-        assert!(hand_off(&act, &t(2, "group", None), &t(2, "group", None), false).is_none());
+        assert!(!held(t(2, "group", None), t(2, "group", None), false));
         // The source's and world public rows, and any public edge: taken.
-        assert!(hand_off(&act, &t(1, "public", None), &t(2, "group", None), false).is_none());
-        assert!(hand_off(&act, &t(0, "public", None), &t(2, "group", None), false).is_none());
-        assert!(hand_off(&act, &t(3, "public", None), &t(2, "group", None), true).is_none());
+        assert!(!held(t(1, "public", None), t(2, "group", None), false));
+        assert!(!held(t(0, "public", None), t(2, "group", None), false));
+        assert!(!held(t(3, "public", None), t(2, "group", None), true));
         // A third group's public row the database does not hand over: held.
-        assert!(hand_off(&act, &t(3, "public", None), &t(2, "group", None), false).is_some());
+        assert!(held(t(3, "public", None), t(2, "group", None), false));
         // A private row whose owner would become the target: held.
-        assert!(hand_off(&act, &t(1, "group", None), &t(2, "group", Some(1)), true).is_some());
+        assert!(held(t(1, "group", None), t(2, "group", Some(1)), true));
+        assert!(held(t(1, "group", None), t(2, "group", None), true));
         // A widening: held.
-        assert!(hand_off(&act, &t(3, "group", None), &t(2, "group", None), true).is_some());
+        assert!(held(t(3, "group", None), t(2, "group", None), true));
         // Same owner, a co-owner added: narrower, held by no one.
-        assert!(hand_off(&act, &t(2, "group", None), &t(2, "group", Some(3)), true).is_none());
-        // --catch-up takes the source's private row into exactly the TO state.
+        assert!(!held(t(2, "group", None), t(2, "group", Some(3)), true));
+        // --catch-up exempts only a stray generation's OWN row (`own`), going
+        // into exactly the TO state from a tuple only source and target read.
         let cu = Act {
             catch_up: true,
             ..act
         };
-        assert!(hand_off(&act, &t(1, "group", None), &t(2, "group", None), false).is_some());
-        assert!(hand_off(&cu, &t(1, "group", None), &t(2, "group", None), false).is_none());
-        assert!(hand_off(&cu, &t(1, "group", None), &t(2, "group", Some(1)), true).is_some());
+        let held_own =
+            |prior: Tenancy, post: Tenancy| hand_off(&cu, &prior, &post, true, true).is_some();
+        assert!(hand_off(&act, &t(1, "group", None), &t(2, "group", None), true, true).is_some());
+        assert!(hand_off(&cu, &t(1, "group", None), &t(2, "group", None), true, false).is_some());
+        assert!(!held_own(t(1, "group", None), t(2, "group", None)));
+        assert!(!held_own(t(2, "group", Some(1)), t(2, "group", None)));
+        assert!(held_own(t(1, "group", None), t(2, "group", Some(1))));
+        assert!(held_own(t(3, "group", None), t(2, "group", None)));
+        assert!(held_own(t(1, "group", Some(3)), t(2, "group", None)));
     }
 
     #[test]
