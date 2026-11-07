@@ -696,8 +696,8 @@ pub async fn stdio_agent(server: &epigraph_mcp::server::EpiGraphMcpFull) -> Uuid
 pub fn public_tenancy_for(
     viewer: &epigraph_db::visibility::Viewer,
 ) -> epigraph_ingest::workflow::WorkflowTenancy {
-    let groups: Vec<Uuid> = viewer.writable_groups().iter().copied().collect();
-    let [group] = groups.as_slice() else {
+    let groups = viewer.writable_groups();
+    let [group] = groups else {
         panic!("fixture: the caller writes exactly one group, not {groups:?}");
     };
     public_tenancy(*group)
