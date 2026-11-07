@@ -18,6 +18,13 @@
 //! ahead of OQ-7's rule into the one posture watch, because the deploy order
 //! starts request units before arming).
 //!
+//! `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` is NOT this flag and is
+//! served on an armed database: it admits an unattested passkey only as a
+//! person's LATER one, anchored by a confirmed `passkey.register` act whose
+//! confirming passkey is hardware-attested, so it never lets a
+//! maintenance-DSN holder plant a first key (`allows_software_attestation`
+//! is false for it, and it does not combine with this flag).
+//!
 //! Only the API `server` is concerned: `epigraph-passkey` is never a
 //! dependency of `epigraph-mcp`.
 
