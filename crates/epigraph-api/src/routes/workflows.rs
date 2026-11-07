@@ -4130,10 +4130,14 @@ mod tests {
     /// personal group: an undeclared ingest is private to its owner group,
     /// and these fixtures are read by other callers.
     async fn public_payload(pool: &PgPool, agent: Uuid, canonical_name: &str) -> serde_json::Value {
-        let mut conn = pool.acquire().await.unwrap();
-        let group = epigraph_db::AgentRepository::ensure_personal_group(&mut conn, agent)
-            .await
-            .expect("the fixture agent's personal group");
+        provision_personal_group(pool, agent).await;
+        let group: Uuid = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("the fixture agent's personal group");
         let mut body = ingest_payload(canonical_name);
         body["tenancy"] = serde_json::json!({"visibility": "public", "owner_group_id": group});
         body

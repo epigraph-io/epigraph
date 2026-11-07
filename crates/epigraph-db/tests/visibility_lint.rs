@@ -3562,9 +3562,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of `workflows` only: the rows descended from one through `parent_id` (the cascade \
          set of `deprecate_workflow`). Since migration 183 (ruling R-74) `workflows` carries \
          its plan's tenancy and row security, so the stamp of the connection it runs on bounds \
-         what it sees: on the system-agent stamp (MCP) every group it ingests into, on the \
-         caller's stamp (REST) the rows the caller reads; a descendant outside that set is not \
-         deprecated by this call.",
+         what it sees: on the caller's stamp the rows the caller reads. A cascade whose \
+         lineage has a row outside that set is refused (`canonical_names_of` + migration 202's \
+         hidden-rows check), never deprecated in part.",
+    ),
+    (
+        "workflow.rs",
+        "canonical_names_of",
+        "READ of `workflows` only: the distinct `canonical_name`s of a cascade's target rows, \
+         which `deprecate_workflow` hands to migration 202's hidden-rows check. Since migration \
+         183 (ruling R-74) `workflows` carries its plan's tenancy and row security, so the \
+         stamp of the connection it runs on (the caller's) bounds what it sees; the targets \
+         were themselves read on that stamp, and there is no read for a viewer to filter.",
     ),
     (
         "workflow.rs",

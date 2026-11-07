@@ -224,6 +224,14 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          `MaintenancePool`). The Stamped arm is a pure read that never reaches the mint.",
     ),
     (
+        "epigraph-api/src/routes/workflows.rs",
+        "ensure_personal_group",
+        1,
+        "`#[cfg(test)]` fixture only (`provision_personal_group`): provisions a fixture agent's \
+         own personal group on the superuser harness, so the caller-authored workflow routes \
+         have a group to write into. No request path in the file mints.",
+    ),
+    (
         "epigraph-mcp/src/tools/recall.rs",
         "ensure_personal_group",
         2,
