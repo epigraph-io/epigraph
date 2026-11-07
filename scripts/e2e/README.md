@@ -102,8 +102,11 @@ because on a clean series `store_workflow` was *itself* refused (`new row
 violates row-level security policy for table "claims"`, from the pool-bound
 ingest executor), leaving nothing to deprecate and every downstream arm vacuous
 by absence. **That is fixed**: the ingest executor now takes a connection stamped
-from the `workflow-ingest-system` agent's viewer, so mode `a` seeds successfully
-and is the primary mode. The old refusal is what mode `a` now regression-tests —
+from the CALLER's own viewer (workflow writes are made as the caller, into a
+group it writes, private to that group unless the call declares
+`{"visibility":"public","owner_group_id":G}`; they were written as the
+`workflow-ingest-system` agent before), so mode `a` seeds successfully and is
+the primary mode. The old refusal is what mode `a` now regression-tests —
 run it against a binary built before the conversion and it reproduces verbatim,
 which is how the fixed and unfixed binaries are distinguished.
 
@@ -521,9 +524,11 @@ decision or conversion before the operator drops `claims_privacy`,
    not a cosmetic warning.
 4. **MCP tools still on the unstamped pool** (`residual_unstamped_writes.rs` is
    the register):
-   - `evolve_step`: 42501 on A. Its population is step claims authored by
-     `workflow-ingest-system`, and stamping from that system agent is H3
-     (84b2a98d).
+   - `evolve_step`: 42501 on A. Its population was step claims authored by
+     `workflow-ingest-system`; since workflow writes moved to the caller, new
+     steps are authored by their caller, and `evolve_step` writes as its caller
+     under the lineage authority gate (submitter, its operator, a writer of the
+     workflow's owner group, or the audited admin path).
    - `refresh_workflow_promotion`'s `merge_properties`: same population, same H3
      question. Its A behaviour is inferred, not measured.
    - `mark_duplicate`: CONVERTED in batch H-b (gate read, dedup and cascade on
