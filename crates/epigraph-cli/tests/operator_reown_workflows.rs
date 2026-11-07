@@ -2176,3 +2176,328 @@ async fn a_dry_run_names_a_step_split_with_an_unlisted_source_lineage(pool: PgPo
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Catch-up never widens anything but the stray generation's own rows
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An edge's full tenancy: `(owner, visibility, co-owner)`.
+async fn edge_tenancy(pool: &PgPool, id: Uuid) -> (Uuid, String, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT owner_group_id, visibility::text, co_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("tenancy of edge {id}: {e}"))
+}
+
+/// A private re-ingest of `alpha` after its move: generation 2 and its new
+/// step NS in the SOURCE's private state, with the edges a real ingest writes
+/// (`executes` to NS and to the moved thesis T, `variant_of` to generation 1,
+/// phase P `decomposes_to` NS, the author's `AUTHORED` on NS).
+struct Stray {
+    w_a2: Uuid,
+    ns: Uuid,
+    edges: Vec<Uuid>,
+}
+
+async fn private_reingest(pool: &PgPool, fx: &Fx) -> Stray {
+    let mut m = pool.acquire().await.expect("acquire");
+    let w_a2 = workflow(&mut m, "alpha", 2, Some(fx.w_a1), fx.src, "group").await;
+    let ns = claim(
+        &mut m,
+        fx.operator,
+        fx.src,
+        "group",
+        2,
+        "alpha step nine (a private re-ingest)",
+    )
+    .await;
+    let edges = vec![
+        edge(&mut m, (w_a2, "workflow"), (ns, "claim"), "executes").await,
+        edge(&mut m, (w_a2, "workflow"), (fx.t, "claim"), "executes").await,
+        edge(
+            &mut m,
+            (w_a2, "workflow"),
+            (fx.w_a1, "workflow"),
+            "variant_of",
+        )
+        .await,
+        edge(&mut m, (fx.p, "claim"), (ns, "claim"), "decomposes_to").await,
+        edge(&mut m, (fx.operator, "agent"), (ns, "claim"), "AUTHORED").await,
+    ];
+    Stray { w_a2, ns, edges }
+}
+
+/// The main move of the LISTED lineages into the target, `alpha` included
+/// (the private note is the target's, so nothing holds it).
+async fn main_move(pool: &PgPool, fx: &Fx, dir: &Path) {
+    let r = reown_run(
+        pool,
+        fx,
+        dir,
+        &dir.join("main.jsonl"),
+        fx.target,
+        Some("3"),
+        GROUP,
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(
+        tenancy(pool, "claims", fx.p).await,
+        (fx.target, "group".to_string()),
+        "PREMISE: the main act moved alpha"
+    );
+}
+
+/// A real private re-ingest after a move: every row of the stray generation
+/// (its workflow row, the step only it executes, and that step's plan edges,
+/// including the phase's `decomposes_to` met with the source and the author's
+/// `AUTHORED`) lands exactly in the target state.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_moves_every_own_row_of_a_private_re_ingest(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let s = private_reingest(&pool, &fx).await;
+    let src_private = (fx.src, "group".to_string(), None);
+    assert_eq!(
+        edge_tenancy(&pool, s.edges[0]).await,
+        src_private,
+        "PREMISE"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, s.edges[4]).await,
+        src_private,
+        "PREMISE"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, s.edges[3]).await,
+        (fx.target, "group".to_string(), Some(fx.src)),
+        "PREMISE: the phase's edge to the private step is co-owned by the source"
+    );
+
+    let m = dir.join("c.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, Some("1"), CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let to = (fx.target, "group".to_string());
+    assert_eq!(tenancy(&pool, "workflows", s.w_a2).await, to);
+    assert_eq!(tenancy(&pool, "claims", s.ns).await, to);
+    for e in &s.edges {
+        assert_eq!(
+            edge_tenancy(&pool, *e).await,
+            (fx.target, "group".to_string(), None),
+            "edge {e}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The round-3 probe: `alpha` is held by the main act (the source's private
+/// evidence on S2), then gets a private generation 2 with NO generation in the
+/// target state. That is the main act's lineage, not a stray one: `--catch-up`
+/// takes none of it, and the private evidence stays the source's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_takes_nothing_of_a_lineage_with_no_generation_in_the_target(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let ev: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, 'document', $2, 'a private note on step two') RETURNING id",
+    )
+    .bind(fx.s2)
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("evidence");
+    sqlx::query("UPDATE evidence SET visibility = 'group' WHERE id = $1")
+        .bind(ev)
+        .execute(&pool)
+        .await
+        .expect("private evidence");
+    let src_private = (fx.src, "group".to_string());
+    assert_eq!(tenancy(&pool, "evidence", ev).await, src_private, "PREMISE");
+    let dir = scratch_dir();
+    let m = dir.join("m.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &[&ev.to_string()]),
+        "PREMISE: the main act holds alpha on the evidence: {}",
+        r.show()
+    );
+    let w_a2 = {
+        let mut c = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut c, "alpha", 2, Some(fx.w_a1), fx.src, "group").await;
+        edge(&mut c, (w, "workflow"), (fx.t, "claim"), "executes").await;
+        w
+    };
+    let before = snapshot_sans_epoch(&pool).await;
+
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, GROUP).await;
+    assert!(
+        !line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &["--catch-up"]),
+        "a lineage with nothing in the target state is not a catch-up's: {}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &[]),
+        "{}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, Some("3"), CATCH_UP).await;
+    assert_eq!(r.code, 1, "the old count must be refused: {}", r.show());
+    assert_eq!(tenancy(&pool, "evidence", ev).await, src_private);
+    assert_eq!(tenancy(&pool, "workflows", w_a2).await, src_private);
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "nothing is written"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Run a catch-up of a stray generation that carries one more source-private
+/// row (`extra`) outside its own rows: the dry run holds `alpha` naming it, the
+/// apply exits 3, and nothing is written.
+async fn catch_up_holds_on(pool: &PgPool, fx: &Fx, dir: &Path, s: &Stray, extra: Uuid) {
+    let before = snapshot_sans_epoch(pool).await;
+    let m = dir.join("c.jsonl");
+    let r = reown_run(pool, fx, dir, &m, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &[&extra.to_string()]),
+        "the catch-up must hold alpha on {extra}: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(pool, fx, dir, &m, fx.target, Some("0"), CATCH_UP).await;
+    assert_eq!(r.code, 3, "a held hand-off exits 3: {}", r.show());
+    let src_private = (fx.src, "group".to_string());
+    assert_eq!(tenancy(pool, "workflows", s.w_a2).await, src_private);
+    assert_eq!(tenancy(pool, "claims", s.ns).await, src_private);
+    assert_eq!(
+        snapshot_sans_epoch(pool).await,
+        before,
+        "nothing is written"
+    );
+}
+
+/// The source's private evidence on the stray step is not one of the stray
+/// generation's own rows (a derived row): the catch-up must not hand it to the
+/// target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_holds_a_stray_step_whose_private_evidence_would_go_to_the_target(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let s = private_reingest(&pool, &fx).await;
+    let ev: Uuid = sqlx::query_scalar(
+        "INSERT INTO evidence (claim_id, evidence_type, content_hash, raw_content) \
+         VALUES ($1, 'document', $2, 'a private note on the new step') RETURNING id",
+    )
+    .bind(s.ns)
+    .bind(h32(Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("evidence");
+    assert_eq!(
+        tenancy(&pool, "evidence", ev).await,
+        (fx.src, "group".to_string()),
+        "PREMISE: the evidence follows its private claim"
+    );
+    catch_up_holds_on(&pool, &fx, &dir, &s, ev).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A source-private edge from the stray step to a row OUTSIDE the plans (Y, an
+/// unrelated public claim of the operator): its narrowing meets to exactly the
+/// target state, the shape the round-3 exemption let through, but it is not
+/// the stray generation's own. The catch-up must hold it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_holds_a_stray_steps_private_edge_to_a_row_outside_the_plans(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let s = private_reingest(&pool, &fx).await;
+    let e = {
+        let mut m = pool.acquire().await.expect("acquire");
+        edge(&mut m, (s.ns, "claim"), (fx.y, "claim"), "supports").await
+    };
+    assert_eq!(
+        tenancy(&pool, "claims", fx.y).await,
+        (fx.src, "public".to_string()),
+        "PREMISE"
+    );
+    assert_eq!(
+        edge_tenancy(&pool, e).await,
+        (fx.src, "group".to_string(), None),
+        "PREMISE: the edge is the source's private row"
+    );
+    catch_up_holds_on(&pool, &fx, &dir, &s, e).await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A private step the main act LEFT (an evolved member of S1's step lineage,
+/// which the moved plan reaches through that lineage) and the stray
+/// generation then executes is not the stray generation's alone: it stays the
+/// source's, and nothing hands it to the target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_never_moves_a_private_step_the_main_act_left(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let lineage: Uuid = sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+        .bind(fx.s1)
+        .fetch_one(&pool)
+        .await
+        .expect("S1's step lineage");
+    let q = {
+        let mut m = pool.acquire().await.expect("acquire");
+        claim_in_lineage(
+            &mut m,
+            fx.operator,
+            fx.src,
+            "group",
+            2,
+            "alpha step one, evolved privately",
+            Some(lineage),
+        )
+        .await
+    };
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let src_private = (fx.src, "group".to_string());
+    assert_eq!(
+        tenancy(&pool, "claims", q).await,
+        src_private,
+        "PREMISE: the main act left the private step"
+    );
+    let s = private_reingest(&pool, &fx).await;
+    let e_q = {
+        let mut m = pool.acquire().await.expect("acquire");
+        edge(&mut m, (s.w_a2, "workflow"), (q, "claim"), "executes").await
+    };
+    // Q is the stray generation's only through this edge; the moved plan
+    // reaches it through S1's lineage. Left, its private `executes` edge from
+    // the moving generation would become the target's: the lineage holds.
+    catch_up_holds_on(&pool, &fx, &dir, &s, e_q).await;
+    assert_eq!(tenancy(&pool, "claims", q).await, src_private);
+    std::fs::remove_dir_all(&dir).ok();
+}
