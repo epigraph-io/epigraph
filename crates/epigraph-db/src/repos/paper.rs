@@ -317,29 +317,73 @@ impl PaperRepository {
     ) -> Result<Vec<PaperAuthorListing>, DbError> {
         let sql = viewer.splice(
             &format!(
-                "SELECT a.id, a.display_name, \
-                        CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
-                             THEN (e.properties ->> 'position')::bigint END, \
-                        COALESCE(e.properties ->> 'role', 'author'), \
-                        CASE WHEN jsonb_typeof(e.properties -> 'affiliations') = 'array' \
-                             THEN e.properties -> 'affiliations' ELSE '[]'::jsonb END, \
-                        {pending}, \
-                        CASE WHEN {pending} \
-                             THEN e.properties ->> '{ingested_by}' END \
+                "SELECT {columns} \
                    FROM edges e \
                    JOIN agents a ON a.id = e.source_id \
-                  WHERE e.target_id = $1 AND e.target_type = 'paper' \
-                    AND e.source_type = 'agent' AND e.relationship = 'authored' \
-                    AND {in_force} \
+                  WHERE e.target_id = $1 AND {authored} \
                     /* {{EDGE_VISIBILITY:e}} */ \
-                  ORDER BY 3 NULLS LAST, e.created_at, e.id",
-                pending = crate::agent_lookup::authorship_pending_sql("e"),
-                ingested_by = AUTHORED_INGESTED_BY_KEY,
-                in_force = crate::repos::edge::EDGE_IN_FORCE,
+                  ORDER BY {order}",
+                columns = author_listing_columns(),
+                authored = authored_in_force_readable(),
+                order = AUTHOR_LISTING_ORDER,
             ),
             2,
         );
+        let mut q = sqlx::query_as::<_, AuthorListingRow>(&sql).bind(paper_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor)
+            .await?
+            .into_iter()
+            .map(author_listing)
+            .collect())
+    }
+
+    /// [`Self::list_authors`] for several papers in ONE read, bounded in SQL:
+    /// at most `per_paper` authors of each (in the same order, under the same
+    /// predicate), plus whether more exist. Papers with no readable author
+    /// are absent from the map. For a reader that lists several documents'
+    /// authors at once (a claim's provenance block), so neither the number of
+    /// papers nor the length of an author list turns one read into an
+    /// unbounded one.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn list_authors_bounded<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        paper_ids: &[Uuid],
+        per_paper: i64,
+    ) -> Result<std::collections::HashMap<Uuid, (Vec<PaperAuthorListing>, bool)>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, (Vec<PaperAuthorListing>, bool)> =
+            std::collections::HashMap::new();
+        if paper_ids.is_empty() || per_paper <= 0 {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            &format!(
+                "SELECT p.id, x.* \
+                   FROM unnest($1::uuid[]) AS p(id) \
+                  CROSS JOIN LATERAL ( \
+                        SELECT {columns}, \
+                               row_number() OVER (ORDER BY {order}) AS listing_rank \
+                          FROM edges e \
+                          JOIN agents a ON a.id = e.source_id \
+                         WHERE e.target_id = p.id AND {authored} \
+                           /* {{EDGE_VISIBILITY:e}} */ \
+                         ORDER BY {order} \
+                         LIMIT $2) x \
+                  ORDER BY p.id, x.listing_rank",
+                columns = author_listing_columns(),
+                authored = authored_in_force_readable(),
+                order = AUTHOR_LISTING_ORDER,
+            ),
+            3,
+        );
         type Row = (
+            Uuid,
             Uuid,
             Option<String>,
             Option<i64>,
@@ -347,35 +391,26 @@ impl PaperRepository {
             serde_json::Value,
             bool,
             Option<String>,
+            i64,
         );
-        let mut q = sqlx::query_as::<_, Row>(&sql).bind(paper_id);
+        let mut q = sqlx::query_as::<_, Row>(&sql)
+            .bind(paper_ids)
+            .bind(per_paper.saturating_add(1));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor)
-            .await?
-            .into_iter()
-            .map(
-                |(agent_id, display_name, position, role, affiliations, pending, by)| {
-                    PaperAuthorListing {
-                        agent_id,
-                        display_name,
-                        position,
-                        role,
-                        affiliations: affiliations
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        pending_countersign: pending,
-                        ingested_by: by.and_then(|s| s.parse().ok()),
-                    }
-                },
-            )
-            .collect())
+        let limit = usize::try_from(per_paper).unwrap_or(usize::MAX);
+        for (paper, a, name, pos, role, aff, pending, by, _rank) in q.fetch_all(executor).await? {
+            let entry = out.entry(paper).or_default();
+            if entry.0.len() < limit {
+                entry
+                    .0
+                    .push(author_listing((a, name, pos, role, aff, pending, by)));
+            } else {
+                entry.1 = true;
+            }
+        }
+        Ok(out)
     }
 
     /// List claim summaries asserted by this paper — one page of `limit` rows
@@ -708,6 +743,70 @@ pub struct PaperAuthorEdge {
     /// On a pending edge, the ingester that asserted the authorship
     /// ([`AUTHORED_INGESTED_BY_KEY`]).
     pub ingested_by: Option<Uuid>,
+}
+
+/// The columns [`PaperRepository::list_authors`] and
+/// [`PaperRepository::list_authors_bounded`] read for one `authored` edge
+/// `e` from agent `a`, in [`AuthorListingRow`] order.
+fn author_listing_columns() -> String {
+    format!(
+        "a.id, a.display_name, \
+         CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
+              THEN (e.properties ->> 'position')::bigint END, \
+         COALESCE(e.properties ->> 'role', 'author'), \
+         CASE WHEN jsonb_typeof(e.properties -> 'affiliations') = 'array' \
+              THEN e.properties -> 'affiliations' ELSE '[]'::jsonb END, \
+         {pending}, \
+         CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END",
+        pending = crate::agent_lookup::authorship_pending_sql("e"),
+        ingested_by = AUTHORED_INGESTED_BY_KEY,
+    )
+}
+
+/// The predicate both author listings read edge `e` under: an in-force
+/// `agent -authored-> paper` edge (each listing adds the viewer's edge
+/// visibility marker in its own statement).
+fn authored_in_force_readable() -> String {
+    format!(
+        "e.target_type = 'paper' AND e.source_type = 'agent' AND e.relationship = 'authored' \
+         AND {in_force}",
+        in_force = crate::repos::edge::EDGE_IN_FORCE,
+    )
+}
+
+/// The listing order: the extraction's position (missing last), then age.
+const AUTHOR_LISTING_ORDER: &str = "CASE WHEN e.properties ->> 'position' ~ '^[0-9]{1,9}$' \
+     THEN (e.properties ->> 'position')::bigint END NULLS LAST, e.created_at, e.id";
+
+type AuthorListingRow = (
+    Uuid,
+    Option<String>,
+    Option<i64>,
+    String,
+    serde_json::Value,
+    bool,
+    Option<String>,
+);
+
+fn author_listing(
+    (agent_id, display_name, position, role, affiliations, pending, by): AuthorListingRow,
+) -> PaperAuthorListing {
+    PaperAuthorListing {
+        agent_id,
+        display_name,
+        position,
+        role,
+        affiliations: affiliations
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        pending_countersign: pending,
+        ingested_by: by.and_then(|s| s.parse().ok()),
+    }
 }
 
 /// One author of a paper as [`PaperRepository::list_authors`] lists it.

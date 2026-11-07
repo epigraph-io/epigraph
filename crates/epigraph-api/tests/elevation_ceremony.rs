@@ -2251,8 +2251,8 @@ async fn log_seen_by(pool: &PgPool, who: Uuid) -> i64 {
 
 /// An elevated read of B's private claim through the real router is recorded
 /// as exactly ONE log row before the response leaves: the matched route as the
-/// surface, the concrete path and the token's jti in the args, one row in the
-/// response, and B's group (and only B's) as the subject. B (the admin of its
+/// surface, the concrete path and the token's jti in the args, the claim and
+/// its author as the response's rows, and B's group (and only B's) as the subject. B (the admin of its
 /// personal group) reads that row; an unrelated A does not, nor does P.
 ///
 /// Verified to fail with the recorder layer removed from the router (the
@@ -2285,7 +2285,10 @@ async fn an_elevated_read_through_the_router_is_recorded_for_its_subject(pool: P
     assert_eq!(log.len(), 1, "exactly one row: {log:?}");
     let (surface, rows, groups, args) = &log[0];
     assert_eq!(surface, "GET /api/v1/claims/:id");
-    assert_eq!(*rows, 1, "one row in the response");
+    // Two id-bearing objects: the claim, and its `authored_by.agent` (B, the
+    // agent that filed it; B is bound to no human, so `authored_by.human` is
+    // null and not counted). `rows_in` counts every nested row object.
+    assert_eq!(*rows, 2, "the claim and its author in the response");
     assert_eq!(groups, &vec![b_group], "B's group, and only B's");
     assert_eq!(args["path"], json!(format!("/api/v1/claims/{claim}")));
     assert_eq!(args["jti"], json!(jti.to_string()));

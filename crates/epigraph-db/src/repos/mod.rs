@@ -16,6 +16,7 @@ pub mod alternative_set;
 pub mod analysis;
 pub mod atlas_layout;
 pub mod atom_axiom;
+pub mod authored_by;
 pub mod authorization_code;
 pub mod authorize_session;
 pub mod behavioral_execution;
@@ -125,6 +126,11 @@ pub use atlas_layout::{
     PublicThemeCentroid, PublicThemeLinkCount, RegionDetail, ThemePageCursor, ThemePlacement,
     UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
+};
+pub use authored_by::{
+    AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
+    LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperRef, PromptSnapshotAt,
+    PromptSnapshotAudience, PROMPT_SNAPSHOT_AUDIENCE,
 };
 pub use challenge::{ChallengeRepository, ChallengeRow, GapChallengeRow};
 pub use claim::{
