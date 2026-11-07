@@ -3204,7 +3204,7 @@ async fn over_mcp_the_hierarchical_embedding_path_finds_a_declared_generation_on
 #[sqlx::test(migrations = "../../migrations")]
 async fn evolving_a_step_a_hidden_generation_executes_needs_authority_over_it(pool: PgPool) {
     let w = world(&pool).await;
-    // W1 (undeclared) is written as `h` into its one team group `g`, so W2 is
+    // W1 (declared public in `g`) is written as `h` into its team group `g`, so W2 is
     // declared into `og` to keep the shared step outside W2's group.
     let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve", w.og).await;
     let step = shared_step(&pool, w1, w2).await;
@@ -3270,7 +3270,7 @@ async fn over_mcp_evolving_a_step_a_hidden_generation_executes_needs_authority_o
     pool: PgPool,
 ) {
     let w = world(&pool).await;
-    // W1 (undeclared) is written as `h` into its one team group `g`, so W2 is
+    // W1 (declared public in `g`) is written as `h` into its team group `g`, so W2 is
     // declared into `og` to keep the shared step outside W2's group.
     let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-evolve-mcp", w.og).await;
     let step = shared_step(&pool, w1, w2).await;
