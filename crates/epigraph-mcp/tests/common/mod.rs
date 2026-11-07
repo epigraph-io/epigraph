@@ -660,3 +660,55 @@ pub async fn seed_caller(
         viewer,
     )
 }
+
+/// The explicit PUBLIC workflow tenancy, owned by `group`: an undeclared
+/// workflow write is private to its owner group, so a fixture that needs a
+/// public workflow (one a public viewer, a stranger or another caller reads)
+/// declares it.
+pub fn public_tenancy(group: Uuid) -> epigraph_ingest::workflow::WorkflowTenancy {
+    serde_json::from_value(serde_json::json!({"visibility": "public", "owner_group_id": group}))
+        .expect("the explicit public tenancy")
+}
+
+/// The owner group of `agent`'s default declaration (its personal group, or
+/// its operator's for an operated agent): the group an undeclared write of
+/// `agent` with no team group lands in.
+pub async fn default_owner_group(pool: &PgPool, agent: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::ClaimRepository::default_decl_for_author(&mut conn, agent)
+        .await
+        .expect("the agent's default declaration")
+        .owner_group_bind()
+        .expect("a declared owner group")
+}
+
+/// The stdio server's own agent (the write identity of a call with no token).
+pub async fn stdio_agent(server: &epigraph_mcp::server::EpiGraphMcpFull) -> Uuid {
+    epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("the stdio viewer")
+        .principal()
+        .expect("the stdio agent")
+}
+
+/// [`public_tenancy`] in the ONE group `viewer` writes (a fixture caller's
+/// personal group).
+pub fn public_tenancy_for(
+    viewer: &epigraph_db::visibility::Viewer,
+) -> epigraph_ingest::workflow::WorkflowTenancy {
+    let groups: Vec<Uuid> = viewer.writable_groups().iter().copied().collect();
+    let [group] = groups.as_slice() else {
+        panic!("fixture: the caller writes exactly one group, not {groups:?}");
+    };
+    public_tenancy(*group)
+}
+
+/// [`public_tenancy_for`] the stdio server's own agent.
+pub async fn stdio_public_tenancy(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+) -> epigraph_ingest::workflow::WorkflowTenancy {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, None)
+        .await
+        .expect("the stdio viewer");
+    public_tenancy_for(&viewer)
+}

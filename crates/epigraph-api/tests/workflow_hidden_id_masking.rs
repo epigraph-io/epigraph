@@ -547,6 +547,24 @@ async fn evolve_of_a_step_a_hidden_workflow_executes_answers_as_a_missing_parent
         .execute(&pool)
         .await
         .expect("drop the submitter record");
+    // A WRITER of the row's owner group is admitted on it (the owner-group
+    // writer arm), recorded or not.
+    let admitted = mcp_evolve(&w, w.member, step, "a member writer's MCP revision").await;
+    assert!(
+        admitted.is_ok(),
+        "a writer of the owner group: {admitted:?}"
+    );
+    // A member that only READS the group is refused, and told why.
+    sqlx::query(
+        "UPDATE group_memberships SET role = 'reader' \
+          WHERE agent_id = $1 \
+            AND group_id = (SELECT owner_group_id FROM workflows WHERE id = $2)",
+    )
+    .bind(w.member)
+    .bind(w.workflow)
+    .execute(&pool)
+    .await
+    .expect("make the member a reader");
     let (s, out) = w
         .api
         .post(

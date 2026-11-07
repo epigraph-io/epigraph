@@ -73,6 +73,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<(), String> {
         server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: format!("operator binding goal {}", Uuid::new_v4()),
             steps: vec![step.to_string()],
             prerequisites: None,

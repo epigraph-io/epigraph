@@ -117,6 +117,26 @@ async fn ingest(
         .expect("the stdio ingest");
 }
 
+/// [`ingest`] with the explicit PUBLIC tenancy, owned by the caller's own
+/// default group (an undeclared ingest would be private to it).
+async fn ingest_public(
+    pool: &PgPool,
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    name: &str,
+) {
+    let group =
+        common::default_owner_group(pool, viewer.principal().expect("the stdio agent")).await;
+    let params = json!({
+        "extraction": extraction(name, &format!("{name} step")),
+        "tenancy": {"visibility": "public", "owner_group_id": group},
+    });
+    let params: IngestWorkflowParams = serde_json::from_value(params).expect("params");
+    tools::workflow_ingest::ingest_workflow(server, viewer, params, None)
+        .await
+        .expect("the stdio ingest");
+}
+
 /// A team group whose writers are the workflow-ingest system agent and
 /// `member`; `outsider` holds nothing in it.
 async fn team_group(pool: &PgPool, member: Uuid) -> Uuid {
@@ -477,7 +497,7 @@ async fn a_stdio_non_submitter_cannot_mutate_a_public_lineage(pool: PgPool) {
     let (member_viewer, member) = stdio(&pool, &member_server, MEMBER_SEED).await;
     let (outsider_viewer, _outsider) = stdio(&pool, &outsider_server, OUTSIDER_SEED).await;
     let name = "stdio-auth-public";
-    ingest(&member_server, &member_viewer, name, None).await;
+    ingest_public(&pool, &member_server, &member_viewer, name).await;
     let submitter: Option<String> = sqlx::query_scalar(
         "SELECT metadata->>'epigraph_submitted_by' FROM workflows WHERE canonical_name = $1",
     )
@@ -709,7 +729,7 @@ async fn an_undeclared_signer_stdio_outsider_cannot_mutate_a_group_private_linea
     // The residual, pinned: a PUBLIC lineage the member submitted.
     let (member_viewer, _) = stdio(&pool, &member_server, MEMBER_SEED).await;
     let public = "stdio-auth-undeclared-public";
-    ingest(&member_server, &member_viewer, public, None).await;
+    ingest_public(&pool, &member_server, &member_viewer, public).await;
     tools::step_ops::add_step(
         &outsider_server,
         &outsider_viewer,

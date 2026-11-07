@@ -182,9 +182,10 @@ async fn direct_viewer(pool: &PgPool, agent: Uuid) -> epigraph_db::visibility::V
         .expect("viewer")
 }
 
-/// Ingest `canonical` (generation 0) through an unrelated HTTP caller, then
-/// record `submitter` as its submitter, as the audited backfill of legacy
-/// workflows did. Returns the workflow id.
+/// Ingest `canonical` (generation 0) through an unrelated HTTP caller, public
+/// in that caller's own group (the explicit public tenancy: an undeclared
+/// ingest would be private to it), then record `submitter` as its submitter,
+/// as the audited backfill of legacy workflows did. Returns the workflow id.
 async fn workflow_submitted_by(
     pool: &PgPool,
     server: &EpiGraphMcpFull,
@@ -197,7 +198,7 @@ async fn workflow_submitted_by(
         &ingester_viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, 0, "gen0"),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&ingester_viewer)),
             embed: None,
         },
         Some(&ingester_token),

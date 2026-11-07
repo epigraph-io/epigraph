@@ -225,6 +225,13 @@ fn declared(mut body: Value, group: Uuid, embed: Option<bool>) -> Value {
     body
 }
 
+/// `extraction` with the explicit public tenancy, owned by `group` (an
+/// undeclared ingest is private to the caller's owner group).
+fn public_decl(mut body: Value, group: Uuid) -> Value {
+    body["tenancy"] = json!({"visibility": "public", "owner_group_id": group});
+    body
+}
+
 /// The MCP tool's parameters: the extraction under `extraction`, the tenancy
 /// beside it. Built from JSON, as a client sends them.
 fn mcp_params(extraction: Value, group: Option<Uuid>) -> epigraph_mcp::types::IngestWorkflowParams {
@@ -1061,22 +1068,42 @@ async fn the_ingest_system_agent_need_not_write_the_declared_group(pool: PgPool)
     }
 }
 
-/// Only `visibility: "group"` is a declaration; anything else is refused and
-/// writes nothing.
+/// `visibility: "group"` and the explicit `visibility: "public"` are the
+/// declarations; anything else is refused and writes nothing.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_tenancy_other_than_group_is_refused(pool: PgPool) {
+async fn a_tenancy_other_than_group_or_public_is_refused(pool: PgPool) {
     let w = world(&pool).await;
-    let name = "acme-tenancy-public-declared";
-    let mut body = extraction(name, 0, &[&[]]);
-    body["tenancy"] = json!({"visibility": "public", "owner_group_id": w.og});
-    let before = row_counts(&pool).await;
-    let (s, b) = w.api.ingest(&token(w.h, WRITE_SCOPES), &body).await;
+    let name = "acme-tenancy-other-declared";
+    for tenancy in [
+        json!({"visibility": "world", "owner_group_id": w.og}),
+        json!({"visibility": "Public", "owner_group_id": w.og}),
+        json!({"visibility": "public"}),
+        json!({"owner_group_id": w.og}),
+    ] {
+        let mut body = extraction(name, 0, &[&[]]);
+        body["tenancy"] = tenancy.clone();
+        let before = row_counts(&pool).await;
+        let (s, b) = w.api.ingest(&token(w.h, WRITE_SCOPES), &body).await;
+        assert!(
+            s.is_client_error(),
+            "{tenancy} refused as the caller's error: {s} {b}"
+        );
+        assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
+        assert_eq!(row_counts(&pool).await, before, "nothing written");
+    }
+    // CALIBRATION: the explicit public form is a declaration.
+    let out = w
+        .api
+        .ingest_ok(
+            &token(w.h, WRITE_SCOPES),
+            &public_decl(extraction(name, 0, &[&[]]), w.og),
+        )
+        .await;
+    let plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
     assert!(
-        s.is_client_error(),
-        "refused as the caller's error: {s} {b}"
+        plan.iter().all(|(_, v, o)| v == "public" && *o == w.og),
+        "{plan:?}"
     );
-    assert_eq!(workflows_named(&pool, name).await, 0, "no workflow row");
-    assert_eq!(row_counts(&pool).await, before, "nothing written");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1088,9 +1115,7 @@ async fn a_tenancy_other_than_group_is_refused(pool: PgPool) {
 /// wrote, still public. Each is listed in `reused_items` with its tenancy, and
 /// none is re-tenanted; every claim generation 1 created is `('group', og)`.
 ///
-/// Generation 0 declares nothing, so it is written as the caller `h` into its
-/// ONE team group `g` (public): `h` writes `og` (personal) and `g` (team), and
-/// the undeclared order picks the single non-personal group.
+/// Generation 0 is declared public in `h`'s team group `g`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPool) {
     let w = world(&pool).await;
@@ -1098,12 +1123,11 @@ async fn reused_items_lists_every_reused_claim_whose_tenancy_differs(pool: PgPoo
     let h = token(w.h, WRITE_SCOPES);
     let gen0 = w
         .api
-        .ingest_ok(&h, &extraction(name, 0, &[&["acme shared operation"], &[]]))
+        .ingest_ok(
+            &h,
+            &public_decl(extraction(name, 0, &[&["acme shared operation"], &[]]), w.g),
+        )
         .await;
-    assert!(
-        gen0.get("reused_items").is_none(),
-        "no tenancy, no reused_items: {gen0}"
-    );
     let gen0_plan = plan_ids(&pool, uuid_of(&gen0["workflow_id"])).await;
 
     let mut gen1_body = extraction(
@@ -1291,7 +1315,7 @@ async fn a_declared_re_ingest_lists_every_claim_and_re_tenants_nothing(pool: PgP
     let name = "acme-tenancy-reingest";
     let h = token(w.h, WRITE_SCOPES);
     let body = extraction(name, 0, &[&["acme reingest operation"], &[]]);
-    let first = w.api.ingest_ok(&h, &body).await;
+    let first = w.api.ingest_ok(&h, &public_decl(body.clone(), w.g)).await;
     let wf = uuid_of(&first["workflow_id"]);
     let before = plan_tenancy(&pool, wf).await;
 
@@ -1314,14 +1338,17 @@ async fn a_declared_re_ingest_lists_every_claim_and_re_tenants_nothing(pool: PgP
 // Unchanged behaviour, and embed
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Without `tenancy` an ingest is public and the response has no
-/// `reused_items` key, on both transports. Written as the caller, it is owned
-/// by the caller's ONE team group: `h` (REST) writes its personal group `og`
-/// and the team group `g`; the curator `c` (stdio) writes `og` (its acting
-/// row), its own personal group and `g`. Both land in `g`. (It used to be the
-/// system agent's default group, `og`, whoever called.)
+/// Without `tenancy` an ingest is PRIVATE to its owner group and the
+/// response has no `reused_items` key, on both transports. Written as the
+/// caller, it is owned by the caller's ONE team group: `h` (REST) writes its
+/// personal group `og` and the team group `g`; the curator `c` (stdio) writes
+/// `og` (its acting row), its own personal group and `g`. Both land in `g`,
+/// group-visible. (It used to be public, in the system agent's default group
+/// `og`, whoever called.)
 #[sqlx::test(migrations = "../../migrations")]
-async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: PgPool) {
+async fn without_tenancy_the_ingest_is_private_to_the_team_and_reports_no_reused_items(
+    pool: PgPool,
+) {
     let w = world(&pool).await;
     let out = w
         .api
@@ -1333,7 +1360,7 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
     assert!(out.get("reused_items").is_none(), "{out}");
     let plan = plan_tenancy(&pool, uuid_of(&out["workflow_id"])).await;
     assert!(
-        plan.iter().all(|(_, v, o)| v == "public" && *o == w.g),
+        plan.iter().all(|(_, v, o)| v == "group" && *o == w.g),
         "{plan:?}"
     );
     let out = stdio_ingest(
@@ -1346,7 +1373,7 @@ async fn without_tenancy_the_ingest_is_public_and_reports_no_reused_items(pool: 
     assert!(plan_tenancy(&pool, uuid_of(&out["workflow_id"]))
         .await
         .iter()
-        .all(|(_, v, o)| v == "public" && *o == w.g));
+        .all(|(_, v, o)| v == "group" && *o == w.g));
 }
 
 /// `embed: false` makes no embedding call and writes no claim or goal
@@ -1714,7 +1741,10 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
 
     // Calibration: a public plan's size is everyone's, f's included.
     let public = extraction("acme-plan-size-public", 0, &[&[], &[], &[]]);
-    let seeded = w.api.ingest_ok(&token(w.h, WRITE_SCOPES), &public).await;
+    let seeded = w
+        .api
+        .ingest_ok(&token(w.h, WRITE_SCOPES), &public_decl(public.clone(), w.g))
+        .await;
     let public_size = executes_count(&pool, uuid_of(&seeded["workflow_id"])).await;
     let before_public = row_counts(&pool).await;
     let out = stdio_ingest(&w.f_server, mcp_params(public, None))
@@ -1774,7 +1804,10 @@ async fn reused_step_generations_into(
     let h = token(w.h, WRITE_SCOPES);
     let gen0 = w
         .api
-        .ingest_ok(&h, &extraction(name, 0, &[&["acme reused-step op"]]))
+        .ingest_ok(
+            &h,
+            &public_decl(extraction(name, 0, &[&["acme reused-step op"]]), w.g),
+        )
         .await;
     let w1 = uuid_of(&gen0["workflow_id"]);
     let mut gen1_body = extraction(name, 1, &[&["acme reused-step op"], &["acme private op"]]);
@@ -1906,7 +1939,10 @@ async fn restricting_a_plans_claims_re_tenants_its_workflows_row(pool: PgPool) {
     let name = "acme-restrict-plan";
     let out = w
         .api
-        .ingest_ok(&h, &extraction(name, 0, &[&["acme restrict op"]]))
+        .ingest_ok(
+            &h,
+            &public_decl(extraction(name, 0, &[&["acme restrict op"]]), w.g),
+        )
         .await;
     let wf = uuid_of(&out["workflow_id"]);
     let row = || async {

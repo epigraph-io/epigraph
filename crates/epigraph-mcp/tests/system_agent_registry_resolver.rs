@@ -142,6 +142,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<String, String> {
         server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: goal.clone(),
             steps: vec![step.to_string()],
             prerequisites: None,

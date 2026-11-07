@@ -46,7 +46,7 @@ async fn ingest_vectors(
         viewer,
         IngestWorkflowParams {
             extraction,
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(viewer)),
             embed: None,
         },
         Some(token),

@@ -61,6 +61,7 @@ async fn store(
         server,
         &viewer,
         StoreWorkflowParams {
+            tenancy: None,
             goal: goal.to_string(),
             steps: steps.iter().map(|s| (*s).to_string()).collect(),
             prerequisites: None,

@@ -65,6 +65,14 @@ fn vector_plan() -> Vec<Value> {
     vectors()["ingest"]["plan"].as_array().unwrap().clone()
 }
 
+/// The extraction with the explicit public tenancy, owned by `group` (an
+/// undeclared ingest is private to the caller's owner group).
+fn public_in(extraction: Value, group: Uuid) -> Value {
+    let mut body = extraction;
+    body["tenancy"] = json!({"visibility": "public", "owner_group_id": group});
+    body
+}
+
 fn uuid_of(v: &Value) -> Uuid {
     v.as_str()
         .unwrap_or_else(|| panic!("expected a uuid string, got {v}"))
@@ -279,7 +287,8 @@ struct Private {
 }
 
 async fn private_workflow(pool: &PgPool) -> Private {
-    let (curator, _) = fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(pool, "workflow-plan-curator").await;
     let (writer, _) = fixture::seed_agent_with_group(pool, "workflow-plan-writer").await;
     let (reader, _) = fixture::seed_agent_with_group(pool, "workflow-plan-reader").await;
     let (stranger, _) = fixture::seed_agent_with_group(pool, "workflow-plan-stranger").await;
@@ -287,7 +296,10 @@ async fn private_workflow(pool: &PgPool) -> Private {
     add_member(pool, g, reader, "reader").await;
     let api = Api::prod_shaped(pool).await;
     let workflow_id = api
-        .ingest(&token(curator, WRITE_SCOPES), &extraction())
+        .ingest(
+            &token(curator, WRITE_SCOPES),
+            &public_in(extraction(), curator_own),
+        )
         .await;
     let claims: Vec<Uuid> = vector_plan()
         .iter()
@@ -394,11 +406,15 @@ async fn a_reader_reads_the_frozen_plan_and_its_digest_equals_the_vectors(pool: 
 /// ingest system agent's, not G), and the same digest.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_public_plan_reports_public_items_and_their_stored_owner(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
     let api = Api::prod_shaped(&pool).await;
     let wf = api
-        .ingest(&token(curator, WRITE_SCOPES), &extraction())
+        .ingest(
+            &token(curator, WRITE_SCOPES),
+            &public_in(extraction(), curator_own),
+        )
         .await;
     let p = api.plan(&token(other, READ_SCOPES), wf).await;
     assert_items_are_the_vectors(&p);
@@ -460,10 +476,10 @@ async fn a_non_member_gets_404_and_nothing_of_the_plan(pool: PgPool) {
 /// route that answers it: the same caller reads an existing plan.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unknown_workflow_is_404(pool: PgPool) {
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-reader").await;
+    let (agent, agent_own) = fixture::seed_agent_with_group(&pool, "workflow-plan-reader").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(agent, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), agent_own)).await;
     let (status, body) = api.plan_status(&t, Uuid::new_v4()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(item_ids(&api.plan(&t, wf).await).len(), vector_plan().len());
@@ -678,10 +694,11 @@ fn assert_vectors_with_one_insert(p: &Value, at: u64, added: Uuid) {
 /// and the echo is the digest of the new plan, not the published one.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_appended_step_is_indexed_after_the_last_item(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let body = add_step(&api, &t, "ACME-123456 appended step", None).await;
     let added = uuid_of(&body["step_claim_id"]);
 
@@ -797,10 +814,11 @@ async fn a_step_added_to_a_group_plan_carries_no_index_a_non_member_could_read(p
 /// read with no gap and no duplicate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_append_after_a_retracted_last_item_leaves_no_gap(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let edges = executes_edges(&pool, wf).await;
     let (last_edge, last_target, last_index) = *edges.last().expect("edges");
     assert_eq!(last_index, 8, "calibration: the vectors' last item");
@@ -841,10 +859,11 @@ async fn claims_with_content(pool: &PgPool, content: &str) -> i64 {
 /// the lock is released the same call goes through.
 #[sqlx::test(migrations = "../../migrations")]
 async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let text = "ACME-123456 concurrent step";
 
     let mut holder = pool.begin().await.expect("holder");
@@ -907,10 +926,11 @@ async fn add_step_waits_for_the_workflow_row_lock(pool: PgPool) {
 /// writing an index that collides with the step it precedes.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_middle_insert_into_a_public_plan_is_left_unindexed_and_says_so(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let body = add_step(&api, &t, "ACME-123456 inserted step", Some(1)).await;
     let mid = uuid_of(&body["step_claim_id"]);
     assert_eq!(
@@ -1222,10 +1242,11 @@ async fn reverse_step_follows(pool: &PgPool, from: Uuid, to: Uuid) {
 /// `chain_order` falls back to stored order, as the readers do.
 #[sqlx::test(migrations = "../../migrations")]
 async fn chain_order_follows_step_follows_and_leaves_the_items_and_digest_alone(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let [s11, s12, s21] = vector_steps();
     let v = vectors();
 
@@ -1275,10 +1296,11 @@ async fn chain_order_follows_step_follows_and_leaves_the_items_and_digest_alone(
 /// is the slot every plan-order reader gives it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn chain_order_lists_an_unindexed_insert_at_its_slot(pool: PgPool) {
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let body = add_step(&api, &t, "ACME-123456 inserted step", Some(1)).await;
     let mid = uuid_of(&body["step_claim_id"]);
     let [s11, s12, s21] = vector_steps();
@@ -1302,10 +1324,11 @@ async fn chain_order_lists_an_unindexed_insert_at_its_slot(pool: PgPool) {
 async fn a_resolver_recomputes_the_digest_from_items_whatever_chain_order_says(pool: PgPool) {
     use epigraph_ingest::workflow::frozen_plan::{wfd1, DigestItem};
 
-    let (curator, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
+    let (curator, curator_own) =
+        fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let api = Api::prod_shaped(&pool).await;
     let t = token(curator, WRITE_SCOPES);
-    let wf = api.ingest(&t, &extraction()).await;
+    let wf = api.ingest(&t, &public_in(extraction(), curator_own)).await;
     let [s11, s12, _] = vector_steps();
     reverse_step_follows(&pool, s11, s12).await;
     let p = api.plan(&t, wf).await;

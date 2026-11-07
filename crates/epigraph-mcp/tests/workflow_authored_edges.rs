@@ -159,14 +159,16 @@ fn step_id(res: &rmcp::model::CallToolResult) -> Uuid {
 }
 
 /// Ingest `canonical` as `submitter` over HTTP (a brand-new lineage records
-/// the caller as its submitter).
+/// the caller as its submitter), public in the caller's own group (the
+/// explicit public tenancy: an undeclared ingest would be private to it).
 async fn ingest_as(server: &EpiGraphMcpFull, auth: &AuthContext, canonical: &str, ops: &[&str]) {
+    let viewer = http_viewer(server, auth).await;
     tools::workflow_ingest::ingest_workflow(
         server,
-        &http_viewer(server, auth).await,
+        &viewer,
         IngestWorkflowParams {
             extraction: extraction(canonical, "gen0", ops),
-            tenancy: None,
+            tenancy: Some(common::public_tenancy_for(&viewer)),
             embed: None,
         },
         Some(auth),

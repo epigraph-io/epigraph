@@ -331,6 +331,7 @@ async fn store_workflow_resubmit_is_idempotent_at_workflow_row() {
     // each test run from colliding with leftover rows in the shared test DB.
     let goal = format!("resubmit idempotent {}", Uuid::new_v4());
     let make_params = || StoreWorkflowParams {
+        tenancy: None,
         goal: goal.clone(),
         steps: vec!["step1".to_string(), "step2".to_string()],
         prerequisites: Some(vec!["prereq1".to_string()]),
