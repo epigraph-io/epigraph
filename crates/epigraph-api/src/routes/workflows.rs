@@ -4126,6 +4126,19 @@ mod tests {
             .with_state(state)
     }
 
+    /// [`ingest_payload`] with the explicit PUBLIC tenancy, owned by `agent`'s
+    /// personal group: an undeclared ingest is private to its owner group,
+    /// and these fixtures are read by other callers.
+    async fn public_payload(pool: &PgPool, agent: Uuid, canonical_name: &str) -> serde_json::Value {
+        let mut conn = pool.acquire().await.unwrap();
+        let group = epigraph_db::AgentRepository::ensure_personal_group(&mut conn, agent)
+            .await
+            .expect("the fixture agent's personal group");
+        let mut body = ingest_payload(canonical_name);
+        body["tenancy"] = serde_json::json!({"visibility": "public", "owner_group_id": group});
+        body
+    }
+
     fn ingest_payload(canonical_name: &str) -> serde_json::Value {
         serde_json::json!({
             "source": {
@@ -5060,7 +5073,7 @@ mod tests {
         let resp = router_as(owner.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-lineage"),
+                public_payload(&pool, owner.agent_id.unwrap(), "h3-http-lineage").await,
             ))
             .await
             .unwrap();
@@ -5158,14 +5171,16 @@ mod tests {
         assert_eq!(audits, 1, "and the admin write is audited");
     }
 
-    /// U005 (backlog 84b2a98d), default decision A, the HTTP twin of
+    /// U005 (backlog 84b2a98d), the HTTP twin of
     /// `epigraph-mcp/tests/workflow_caller_authority.rs`: a workflow with no
-    /// recorded submitter (every workflow written before batch H-b) is
-    /// platform corpus. A `claims:write` stranger — and the agent that happened
-    /// to ingest it, since nothing records that — is refused on the step route
-    /// and on a new generation (403, nothing written); a live `claims:admin`
-    /// grant is admitted and audited with `"submitter": null`. Before U005 the
-    /// stranger's step and generation landed behind a WARN.
+    /// recorded submitter (every workflow written before batch H-b) has no
+    /// submitter arm. A `claims:write` stranger, which does not write the
+    /// row's owner group, is refused on the step routes and on a new
+    /// generation (403, nothing written); a live `claims:admin` grant is
+    /// admitted and audited with `"submitter": null`; the agent that ingested
+    /// it, which writes the row's owner group, is admitted through the
+    /// owner-group writer arm. Before U005 the stranger's step and generation
+    /// landed behind a WARN.
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_legacy_workflow_is_refused_to_a_stranger_over_http(pool: PgPool) {
         use axum::routing::post;
@@ -5194,7 +5209,7 @@ mod tests {
         let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-legacy"),
+                public_payload(&pool, ingester.agent_id.unwrap(), "h3-http-legacy").await,
             ))
             .await
             .unwrap();
@@ -5214,7 +5229,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        for (who, auth) in [("a stranger", stranger.clone()), ("the ingester", ingester)] {
+        for (who, auth) in [("a stranger", stranger.clone())] {
             let resp = router_as(auth)
                 .oneshot(post_json(
                     "/api/v1/workflows/steps",
@@ -5398,6 +5413,25 @@ mod tests {
             vec![Some("null".to_string())],
             "one audit row, \"submitter\": null"
         );
+
+        // The ingester writes the row's owner group: admitted through the
+        // owner-group writer arm, recorded as such.
+        let resp = router_as(ingester)
+            .oneshot(post_json(
+                "/api/v1/workflows/steps",
+                serde_json::json!({"canonical_name": "h3-http-legacy", "step_text": "the ingester's step"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a writer of the owner group");
+        let arm: Option<String> = sqlx::query_scalar(
+            "SELECT details->>'arm' FROM security_events \
+              WHERE event_type = 'workflows.caller_write' AND details->>'action' = 'add_step'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(arm.as_deref(), Some("owner_group_writer"));
     }
 
     /// An agent row, and (when `client_type` is given) an ACTIVE OAuth client
@@ -5512,7 +5546,7 @@ mod tests {
         let resp = router_as(ingester.clone())
             .oneshot(post_json(
                 "/api/v1/workflows/ingest",
-                ingest_payload("h3-http-linked"),
+                public_payload(&pool, ingester.agent_id.unwrap(), "h3-http-linked").await,
             ))
             .await
             .unwrap();
