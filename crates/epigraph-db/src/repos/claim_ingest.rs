@@ -38,9 +38,20 @@
 //!
 //! # The read contract ([`ClaimIngestRepository::for_claims`])
 //!
-//! A record counts only while the SAME paper's `asserts` edge onto the claim
-//! is in force and readable by the caller: a record without its assertion
-//! (the assertion retracted, or hidden from this caller) is not listed.
+//! A record counts only while it carries the ingest-written marker
+//! ([`crate::INGEST_WRITTEN_PROPERTY`], naming the same ingester as
+//! [`INGESTED_BY_PROPERTY`]) and the SAME paper's `asserts` edge onto the
+//! claim is in force, ingest-written and readable by the caller: a record
+//! without its assertion (the assertion retracted, or hidden from this
+//! caller) is not listed. A record or assertion that a supersede, dedup or
+//! merge cascade re-pointed onto another claim lost its marker in the move
+//! (migration 198), so it is not listed on the claim it now points at: the
+//! record is about the row that ingest created or found, never its
+//! successor. The paper's assertion is deduplicated on (paper, claim), so a
+//! second ingester's record rests on the first ingester's assertion; the
+//! read requires the assertion to be ingest-written, not to name the same
+//! ingester. A re-ingest of a document whose assertion predates the marker
+//! (an unmarked, legacy row) therefore records nothing readable.
 //! `creator` is the record with `created_claim: true` whose `ingested_by` is
 //! the claim's filer (`claims.agent_id`; the walk files every claim it
 //! creates), when there is one. A
@@ -155,6 +166,11 @@ impl ClaimIngestRepository {
             tx.commit().await?;
             return Ok(false);
         }
+        // Marked as the ingest's (migration 198's guard admits the key only
+        // under the declaration, for this INSERT alone), so a record that a
+        // cascade later re-points onto another claim loses the mark and stops
+        // counting (the read contract).
+        crate::repos::ingest_written::declare_ingest_written(&mut tx, true).await?;
         EdgeRepository::create_signed_conn(
             &mut tx,
             key,
@@ -168,11 +184,14 @@ impl ClaimIngestRepository {
                 CREATED_CLAIM_PROPERTY: created_claim,
                 "tool": tool,
                 "pipeline": pipeline,
+                (crate::repos::ingest_written::INGEST_WRITTEN_PROPERTY):
+                    crate::repos::ingest_written::ingest_written_marker(tool, ingested_by),
             })),
             None,
             None,
         )
         .await?;
+        crate::repos::ingest_written::declare_ingest_written(&mut tx, false).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -218,12 +237,15 @@ impl ClaimIngestRepository {
                             AND r.relationship = '{rel}' \
                             AND r.properties ->> '{by}' ~ \
                                 '^[0-9a-fA-F]{{8}}-([0-9a-fA-F]{{4}}-){{3}}[0-9a-fA-F]{{12}}$' \
+                            AND {marked_r} \
+                            AND {marker_by_r} = r.properties ->> '{by}' \
                             AND {in_force_r} \
                             AND EXISTS ( \
                                 SELECT 1 FROM edges a \
                                  WHERE a.source_id = r.source_id AND a.source_type = 'paper' \
                                    AND a.target_id = r.target_id AND a.target_type = 'claim' \
                                    AND a.relationship = 'asserts' AND {in_force_a} \
+                                   AND {marked_a} \
                                    /* {{EDGE_VISIBILITY:a}} */) \
                             /* {{EDGE_VISIBILITY:r}} */ \
                             /* {{VISIBILITY:c}} */) k \
@@ -234,6 +256,9 @@ impl ClaimIngestRepository {
                 rel = INGEST_RECORD_RELATIONSHIP,
                 in_force_r = in_force("r"),
                 in_force_a = in_force("a"),
+                marked_r = crate::repos::ingest_written::ingest_written_edge_sql("r"),
+                marker_by_r = crate::repos::ingest_written::ingest_written_by_sql("r"),
+                marked_a = crate::repos::ingest_written::ingest_written_edge_sql("a"),
             ),
             3,
         );

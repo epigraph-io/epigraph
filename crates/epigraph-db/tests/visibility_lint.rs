@@ -2495,6 +2495,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          nothing a viewer could filter; the walk spends its viewer on the stamp.",
     ),
     (
+        "ingest_written.rs",
+        "declare_ingest_written",
+        "SESSION SETTING. Sets or clears migration 198's transaction-local declaration \
+         (set_config(..., true)) on the caller's connection; touches no table, so there is \
+         nothing a viewer could filter. Called only around the document ingest record's own \
+         INSERT.",
+    ),
+    (
         "edge.rs",
         "create_if_not_exists_signed_conn",
         "WRITE. The INSERT-time signed twin (ruling R-50) of the unsigned edge primitive of the same name without `_signed`: identical dedup probe (the VISIBILITY-EXEMPT write-path read) and INSERT, plus the attestation columns; the INSERT is authorised by edges_tenancy's WITH CHECK on the caller's connection.",
