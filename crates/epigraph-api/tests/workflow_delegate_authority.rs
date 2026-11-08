@@ -763,15 +763,26 @@ impl World {
     }
 }
 
-/// Refused with nothing written.
-async fn assert_refused(pool: &PgPool, via: &Via<'_>, name: &str, what: &str) {
+/// The lineage gate's own refusal over a row the caller reads (every
+/// transport names the submitter there, before and after R-183). A guard
+/// asserts it so a refusal from another layer (the transport, or the armed
+/// database refusing a write the gate wrongly admitted) cannot pass for the
+/// gate's.
+const GATE_REFUSAL: &str = "was submitted by agent";
+
+/// Refused with nothing written, with a refusal containing `expect`.
+async fn assert_refused(pool: &PgPool, via: &Via<'_>, name: &str, what: &str, expect: &str) {
     let before = row_counts(pool).await;
     let out = via
         .add_step(name, &format!("acme {what} step via {}", via.label()))
         .await;
+    let err = out.expect_err(&format!(
+        "{what} ({}): must be refused on {name}",
+        via.label()
+    ));
     assert!(
-        out.is_err(),
-        "{what} ({}): must be refused on {name}: {out:?}",
+        err.contains(expect),
+        "{what} ({}): refused by the expected layer ({expect:?}): {err}",
         via.label()
     );
     assert_eq!(
@@ -901,9 +912,40 @@ async fn a_retired_link_grants_nothing(pool: PgPool) {
             ),
         ),
     ] {
-        assert_refused(&pool, &via, PUB, "a retired link").await;
+        // On HTTP a retired link holds no live delegation, so the transport
+        // refuses before the gate; on stdio the gate itself refuses.
+        let expect = match &via {
+            Via::McpStdio(_) => GATE_REFUSAL,
+            _ => "not live",
+        };
+        assert_refused(&pool, &via, PUB, "a retired link", expect).await;
     }
     assert!(caller_writes(&pool, w.pub_wf, w.r).await.is_empty());
+}
+
+/// A link record that is not retired but whose writer membership of the
+/// submitter's group was revoked is not ACTING (migration 107: the operator
+/// ends an agent's authority with an ordinary revoke), so it grants nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_whose_membership_was_revoked_grants_nothing(pool: PgPool) {
+    let w = world(&pool).await;
+    let v_server = mcp_server(&pool, 0xD8).await;
+    let v = stdio_agent(&pool, &v_server, 0xD8).await;
+    link(&pool, v, w.p).await;
+    delegation::revoke_membership(&pool, v, w.p_g).await;
+    assert_eq!(
+        acting_operator(&pool, v).await,
+        None,
+        "PREMISE: v's link is not acting"
+    );
+    assert_refused(
+        &pool,
+        &Via::McpStdio(&v_server),
+        PUB,
+        "a revoked link membership",
+        GATE_REFUSAL,
+    )
+    .await;
 }
 
 /// A live link to a DIFFERENT operator grants nothing over the submitter's
@@ -937,8 +979,7 @@ async fn a_link_to_another_operator_grants_nothing(pool: PgPool) {
                 .await
                 .expect("CALIBRATION: e's delegation is live");
         }
-        assert_refused(&pool, &via, PUB, "a link to another operator").await;
-        assert_refused(&pool, &via, OWN, "a link to another operator").await;
+        assert_refused(&pool, &via, PUB, "a link to another operator", GATE_REFUSAL).await;
     }
 }
 
@@ -946,9 +987,16 @@ async fn a_link_to_another_operator_grants_nothing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_link_grants_nothing(pool: PgPool) {
     let w = world(&pool).await;
-    assert_refused(&pool, &Via::McpStdio(&w.n_server), PUB, "no link").await;
+    assert_refused(
+        &pool,
+        &Via::McpStdio(&w.n_server),
+        PUB,
+        "no link",
+        GATE_REFUSAL,
+    )
+    .await;
     for via in w.plain_vias(w.n, WRITE_SCOPES, Uuid::new_v4()) {
-        assert_refused(&pool, &via, PUB, "no link").await;
+        assert_refused(&pool, &via, PUB, "no link", GATE_REFUSAL).await;
     }
 }
 
@@ -1003,7 +1051,14 @@ async fn a_two_hop_chain_grants_nothing(pool: PgPool) {
         "PREMISE: b acts for p"
     );
     assert!(!writes(&pool, a, w.t).await, "PREMISE: a does not write t");
-    assert_refused(&pool, &Via::McpStdio(&a_server), PUB, "a two-hop chain").await;
+    assert_refused(
+        &pool,
+        &Via::McpStdio(&a_server),
+        PUB,
+        "a two-hop chain",
+        GATE_REFUSAL,
+    )
+    .await;
 }
 
 /// The upward arm (#503) is unchanged: the OPERATOR of a workflow's submitter
@@ -1097,7 +1152,7 @@ async fn the_admin_arm_is_unchanged(pool: PgPool) {
     let (z, _) = fixture::seed_human_operator(&pool, "acme-admin").await;
     let ungranted = Uuid::new_v4();
     for via in w.plain_vias(z, ADMIN_SCOPES, ungranted) {
-        assert_refused(&pool, &via, PUB, "an ungranted admin token").await;
+        assert_refused(&pool, &via, PUB, "an ungranted admin token", "ADM02").await;
     }
     let client = Uuid::new_v4();
     sqlx::query(
