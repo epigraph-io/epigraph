@@ -407,7 +407,10 @@ async fn unmark_duplicate_doc() {}
 /// once the link is retired) is shown to every reader; every other field is
 /// computed under the caller's viewer. `counts` holds `authored_papers`,
 /// `pending_authored_papers` (named by an ingester, not countersigned) and
-/// `asserted_claims`, over in-force edges the document ingest wrote.
+/// `asserted_claims`. They count only in-force edges that carry the document
+/// ingest's ingest-written marker, which no other writer can set (an edge
+/// written over `POST /api/v1/edges` never counts, whatever its shape), and
+/// an attribution only when one of the agent's counted authorships backs it.
 /// Same code as MCP `find_agent`. Scope `claims:read`.
 #[utoipa::path(
     get,
