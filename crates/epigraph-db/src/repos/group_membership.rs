@@ -700,10 +700,10 @@ impl GroupMembershipRepository {
     /// Whether `agent_id` holds a live `writer` or `admin` membership of
     /// `group_id`, on `conn` (any stamp): the same live-membership definer
     /// [`Self::list_live_for_agent`] (and so `Viewer::resolve`) reads, asked
-    /// for one group. For a write made on ANOTHER principal's stamp (the
-    /// workflow-ingest system agent's) that must still be bounded by the
-    /// CALLER's own write authority over the group the row lands in (ruling
-    /// R-98: a step added to a group plan).
+    /// for one group: the CALLER's own write authority over the group a row
+    /// lands in, checked live on the write's transaction (a step added to a
+    /// group plan, an owner group chosen for a workflow write, the lineage
+    /// gate's owner-group writer arm).
     ///
     /// # Errors
     /// Returns `DbError` if the query fails.

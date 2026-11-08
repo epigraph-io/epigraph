@@ -782,12 +782,12 @@ pub struct ImproveWorkflowHierarchyResponse {
     pub already_ingested: bool,
 }
 
-/// The highest generation of `canonical_name`, read on the ingest system
-/// agent's stamp: the identity whose plan walk the new generation goes
-/// through, and which reads every group it ingests into. Since migration 183 a
-/// `workflows` row carries its plan's tenancy, so the plain pool would see
-/// public generations only and number a new generation at or below a
-/// group-private head; the walk would then find that row and write nothing.
+/// The highest generation of `canonical_name` the CALLER can see, read on its
+/// own stamp: the identity whose plan walk the new generation goes through.
+/// Since migration 183 a `workflows` row carries its plan's tenancy, so the
+/// plain pool would see public generations only and number a new generation at
+/// or below a group-private head. A generation hidden from the caller makes the
+/// walk's hidden-rows guard (migration 202) refuse it, with nothing written.
 /// Without a [`ScopedPool`](epigraph_db::ScopedPool) (a development
 /// superuser) the plain pool is read, as before.
 async fn lineage_max_generation(

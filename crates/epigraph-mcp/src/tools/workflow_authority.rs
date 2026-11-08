@@ -63,11 +63,13 @@
 //!   holds a membership row of their owner group itself. Recorded as
 //!   `"arm": "owner_group_writer"` with the `owner_group`.
 //! * STDIO (backlog 222289f3, reversing the batch H-b bar that left stdio
-//!   unchecked). The writes run on the system agent's stamp, which writes
-//!   every group the system agent is a writer of, so an unchecked stdio caller
-//!   could add a step to, soft-delete the steps of, mint the next generation
-//!   of, or deprecate a GROUP-PRIVATE lineage it could not even read, while the
-//!   REST twins refused the same outsider. The stdio caller (this server's own
+//!   unchecked). The writes used to run on the system agent's stamp, which
+//!   wrote every group the system agent was a writer of, so an unchecked stdio
+//!   caller could add a step to, soft-delete the steps of, mint the next
+//!   generation of, or deprecate a GROUP-PRIVATE lineage it could not even
+//!   read, while the REST twins refused the same outsider. They now run on the
+//!   caller's own stamp; the check below stays, so a refusal is decided before
+//!   any write and worded for the row. The stdio caller (this server's own
 //!   agent, the write identity) is now checked against the TARGET row
 //!   ([`stdio_workflow_authority`]): it must READ the row on its OWN stamp
 //!   (a row it cannot read is refused without naming it) and, for a group row,
@@ -136,10 +138,9 @@
 //! * A refusal names the WORKFLOW and its submitter. It used to reuse the claim
 //!   gate's text ("claim is owned by agent X ... cannot retire it"), which named
 //!   the wrong object and the wrong verb. It names them only to a caller that
-//!   can READ the row (backlog c831df4a, ruling R-100): the act's transaction is
-//!   often the ingest system agent's, which reads groups the caller does not,
-//!   so a REFUSAL to a caller that cannot read the row is the call site's
-//!   not-found answer, with no id, no submitter and no arm. Only the answer
+//!   can READ the row (backlog c831df4a, ruling R-100): a REFUSAL to a caller
+//!   that cannot read the row is the call site's not-found answer, with no id,
+//!   no submitter and no arm. Only the answer
 //!   changes: the arms admit exactly whom they admitted before.
 //!
 //! Writing as the caller adds the database's own check on top of these arms
@@ -199,12 +200,10 @@ impl WorkflowGrant {
 /// authenticated transport every REFUSAL to a caller that cannot READ the row
 /// is exactly that answer, never text naming the row or its submitter
 /// (backlog c831df4a, ruling R-100: ids stay deterministic, so the answer
-/// must not confirm one). The act's transaction may be stamped with the
-/// ingest system agent, which reads groups the caller does not; the caller's
-/// own view decides what it is told. It does not decide who is admitted: the
-/// ruling masks answers and changes no authority, so the submitter, operator
-/// and admin arms run exactly as before, whether or not the caller reads the
-/// row.
+/// must not confirm one). The caller's own view decides what it is told. It
+/// also bounds the owner-group writer arm, which admits only a caller that
+/// reads the row; the submitter, operator and admin arms run whether or not
+/// the caller reads it (the ruling masks answers and changes no authority).
 ///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
@@ -371,9 +370,8 @@ async fn owner_group_arm(
 /// own agent; the `viewer` a tool was handed is NOT consulted, so the check is
 /// on the principal that writes.
 ///
-/// 1. The caller must READ the row on its OWN stamp (the system-ingest stamp
-///    the write runs on reads every group the system agent writes). A row it
-///    cannot read is refused without its id or submitter. That text is NOT a
+/// 1. The caller must READ the row on its OWN stamp (the stamp the write runs
+///    on). A row it cannot read is refused without its id or submitter. That text is NOT a
 ///    tool's own not-found text (an unknown `canonical_name` reaches the
 ///    executor's "workflow not found"), so a stdio caller can still tell that
 ///    a hidden name exists: the reveal residual ruling R-100 accepted, as the
