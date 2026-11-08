@@ -15,8 +15,9 @@
 //!   naming its arm;
 //! * an agent bound to the submitting human gains nothing through the binding
 //!   (the operator ruling of 2026-10-13: the shared host credential gains no
-//!   edit rights over a human's workflows); only a membership of its own
-//!   would admit it;
+//!   edit rights over a human's workflows through it); only a membership of
+//!   its own, or a live operator link with a live delegated run token (the
+//!   delegate arm, operator ruling R-183), would admit it;
 //! * an already-evolved head that no workflow executes directly (the
 //!   `executes` edge stays on the frozen step) is still gated, because the
 //!   gate reads the whole lineage, not the parent's own edges;

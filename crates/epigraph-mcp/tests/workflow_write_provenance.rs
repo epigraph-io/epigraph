@@ -5,13 +5,17 @@
 //! # The rule is NOT widened
 //!
 //! Over HTTP a workflow with a recorded submitter stays mutable only by the
-//! submitter, the submitter's operator, or the audited `claims:admin` arm. An
-//! agent bound to the submitting human — an allowlisted service client (the
-//! shape a host's shared credential takes) or a live-linked agent — is refused,
-//! with nothing written: the operator ruled that the shared host credential
-//! must not gain edit rights over the human's workflows. (A live-linked agent
-//! is refused its HTTP viewer before any tool runs; it is driven at the gate
-//! directly here so the gate's own answer is pinned too.)
+//! submitter, the submitter's operator, a delegate of either (operator ruling
+//! R-183: a live-linked agent holding a LIVE delegated run token; pinned in
+//! `epigraph-api/tests/workflow_delegate_authority.rs`), a writer of its owner
+//! group, or the audited `claims:admin` arm. An agent bound to the submitting
+//! human — an allowlisted service client (the shape a host's shared credential
+//! takes) with its own token, or a live-linked agent WITHOUT a delegated run
+//! token — is refused, with nothing written: the operator ruled that the
+//! shared host credential must not gain edit rights over the human's
+//! workflows through the binding. (A live-linked agent is refused its HTTP
+//! viewer before any tool runs; it is driven at the gate directly here, with
+//! a plain context, so the gate's own answer is pinned too.)
 //!
 //! # Provenance
 //!
@@ -348,7 +352,9 @@ async fn assert_refused(
 
 /// The operator ruling: on a workflow whose recorded submitter is the human
 /// H, agents bound to H are refused (allowlisted, through the real HTTP viewer;
-/// live-linked, at the gate), with nothing written, while H itself is admitted.
+/// live-linked with a plain, undelegated context, at the gate), with nothing
+/// written, while H itself is admitted. (With a live delegated run token the
+/// live-linked agent is H's delegate, R-183.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn agents_bound_to_the_submitting_human_are_refused(pool: PgPool) {
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
