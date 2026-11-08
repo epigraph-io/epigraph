@@ -76,6 +76,14 @@
 //!   audited, manifested and reversed exactly like the main act; reversing
 //!   the catch-up puts the lineage back in the state it found it in, and the
 //!   original manifest then refuses (a generation joined after it).
+//!
+//!   A stray generation is the exception, not the rule: an undeclared new
+//!   generation of a group lineage inherits its head's group
+//!   (`inherited_generation_group` in epigraph-ingest-executor), so after the
+//!   act a re-ingest lands in TO, or is refused to a caller that does not
+//!   write TO. A stray one comes from an ingest that DECLARED the source
+//!   group, or from a server built before that inheritance (which wrote a new
+//!   generation public).
 //! * `claims`: the plan claims, i.e. the target of every `executes` edge from
 //!   any of those rows (thesis, phases, steps, operation atoms; retracted
 //!   edges count too, as migration 183's backfill counts them), plus every
@@ -340,8 +348,11 @@ impl Act {
     }
 
     /// `('group', source)`: the source's private state. In place it IS the TO
-    /// state; in a move, `--catch-up` takes it too (a re-ingest under the
-    /// owner-group-only default lands there).
+    /// state. In a move, `--catch-up` takes a generation in it beside
+    /// generations already in TO. An undeclared new generation of a group
+    /// lineage inherits its head's group (`inherited_generation_group` in
+    /// epigraph-ingest-executor), so after a move a re-ingest lands in TO; a
+    /// generation lands here only when its ingest declares the source group.
     #[must_use]
     pub fn source_private(&self) -> Tenancy {
         Tenancy {
@@ -666,8 +677,8 @@ impl fmt::Display for LineageHold {
                 "generation {generation} has visibility {visibility}, not public, and is not in \
                  this run's target state; the whole lineage stays{}",
                 if *catch_up {
-                    " (the source's private generation of a lineage this run otherwise covers, \
-                     e.g. a re-ingest: run again with --catch-up to take it)"
+                    " (the source's private generation of a lineage with generations already in \
+                     this run's target state: run again with --catch-up to take it)"
                 } else {
                     ""
                 }

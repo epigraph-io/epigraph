@@ -815,11 +815,16 @@ enum Command {
         #[arg(long, default_value = "keep")]
         visibility: String,
         /// With `--visibility group`: catch a lineage up to a narrowing that
-        /// already ran. Takes only its STRAY generations (the source's private
-        /// state, e.g. a re-ingest, or the FROM state beside generations
-        /// already in the target state, which are recorded as seen and never
-        /// written) and their plan rows; a lineage with none is skipped.
-        /// Audited and reversed like the main act.
+        /// already ran. Takes only a lineage with a generation already in the
+        /// target state (recorded as seen, never written); its other
+        /// generations are STRAY (the source's public state, or in a move the
+        /// source's private state). A lineage with none in the target state is
+        /// the main act's: skipped, or held. Only the stray generations' own
+        /// rows (their workflow rows, the private plan claims only they
+        /// execute, and those claims' plan edges) may pass into the target
+        /// state; every other row keeps the hand-off rule, so a private
+        /// derived row or an edge to a row outside the plans holds the lineage
+        /// (exit 3 under `--apply`). Audited and reversed like the main act.
         #[arg(long)]
         catch_up: bool,
         /// The operator (a person's agent id) the act is attributed to.
