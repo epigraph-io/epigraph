@@ -21,6 +21,8 @@ pub mod matching_client;
 #[cfg(feature = "db")]
 pub mod operator;
 #[cfg(feature = "db")]
+pub mod r131_factor_mint;
+#[cfg(feature = "db")]
 pub mod recompute_betp;
 #[cfg(feature = "db")]
 pub mod recompute_claim_belief;
