@@ -5,12 +5,13 @@
 //! The gate (`routes/workflows.rs::workflow_authority`, and its MCP twin
 //! `tools/workflow_authority.rs`, authenticated and stdio arms) admits, in
 //! order: the submitter; the submitter's operator (#503, upward); a DELEGATE
-//! of the submitter (the caller's acting link names the submitter: one hop,
-//! a not-retired record and a live writer membership of the submitter's own
+//! (the caller's acting link names a principal admitted here by identity: the
+//! submitter, or the submitter's operator. One hop on the caller's side, a
+//! not-retired record and a live writer membership of the principal's own
 //! group, `AgentRepository::operator_actor`); a writer of the row's owner
 //! group; the audited `claims:admin` arm. A delegate's write is recorded in
 //! its `workflows.caller_write` row as `"arm": "delegate"` with `operator` =
-//! the submitter it acted for, so an audit tells it from the submitter's own.
+//! the principal it acted for, so an audit tells it from the submitter's own.
 //!
 //! Tenancy is unchanged: a delegate writes only into groups it writes itself
 //! (the rows a step creates on a public plan land in its own default group,
@@ -1059,6 +1060,17 @@ async fn a_two_hop_chain_grants_nothing(pool: PgPool) {
         GATE_REFUSAL,
     )
     .await;
+    // Nor over a workflow of p's other agent: a's link names b, and b is not
+    // the sibling's operator (p is).
+    let (_, _) = sibling_workflow(&pool, &w, 0xC4, "acme-delegate-chain-sibling", false).await;
+    assert_refused(
+        &pool,
+        &Via::McpStdio(&a_server),
+        "acme-delegate-chain-sibling",
+        "a two-hop chain over a sibling's workflow",
+        GATE_REFUSAL,
+    )
+    .await;
 }
 
 /// The upward arm (#503) is unchanged: the OPERATOR of a workflow's submitter
@@ -1252,4 +1264,140 @@ async fn a_delegate_is_answered_as_unknown_on_a_row_it_cannot_read(pool: PgPool)
         caller_writes(&pool, wf, w.d).await.is_empty(),
         "no provenance row for a refused write"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The sibling shape: the submitter is the principal's OTHER agent
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Another agent `s` of `p` (live-linked, then optionally RETIRED), a writer
+/// of `t` through a roster row of its own, submits workflow `name` PUBLIC in
+/// `t`. `p` itself is admitted over it by identity (the upward arm, #503,
+/// retired links included); `d` writes neither `t` nor anything of `s`'s.
+/// Returns `(s, workflow)`.
+async fn sibling_workflow(
+    pool: &PgPool,
+    w: &World,
+    seed: u8,
+    name: &str,
+    retire: bool,
+) -> (Uuid, Uuid) {
+    let s_server = mcp_server(pool, seed).await;
+    let s = stdio_agent(pool, &s_server, seed).await;
+    link(pool, s, w.p).await;
+    add_roster_row(pool, w.t, s, "writer").await;
+    Via::McpStdio(&s_server)
+        .ingest(&extraction(name, 2), public_in(w.t))
+        .await
+        .unwrap_or_else(|e| panic!("the sibling ingests {name}: {e}"));
+    let wf = workflow_named(pool, name).await;
+    if retire {
+        delegation::retire_link(pool, s).await;
+    }
+    assert_eq!(
+        workflow_row(pool, wf).await,
+        ("public".to_string(), w.t, Some(s.to_string())),
+        "PREMISE: {name} is the sibling's, public, in t"
+    );
+    let mut conn = pool.acquire().await.expect("acquire");
+    let op = epigraph_db::AgentRepository::operator_of_author(&mut conn, s)
+        .await
+        .expect("operator_of_author")
+        .expect("PREMISE: the sibling has a link record");
+    assert_eq!(
+        (op.operator_id, op.retired),
+        (w.p, retire),
+        "PREMISE: p operates the sibling"
+    );
+    assert!(!writes(pool, w.d, w.t).await, "PREMISE: d does not write t");
+    (s, wf)
+}
+
+/// R-183: a delegate is admitted wherever its principal is admitted BY
+/// IDENTITY, and `p` is admitted over its other agents' workflows by the
+/// upward arm (#503), retired agents included. So `d` (live-linked to `p`)
+/// adds a step to a public workflow its sibling submitted, in a group `d` does
+/// not write, on every transport, recorded as `delegate` naming `p` (the
+/// principal it acted for), not the sibling. One hop holds on the caller's
+/// side: `d`'s own link is the only delegation followed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_of_the_submitters_operator_writes_its_sibling_agents_workflow(pool: PgPool) {
+    let w = world(&pool).await;
+    let (live_sib, sib_wf) =
+        sibling_workflow(&pool, &w, 0xC1, "acme-delegate-sibling", false).await;
+    let (retired_sib, rsib_wf) =
+        sibling_workflow(&pool, &w, 0xC2, "acme-delegate-retired-sibling", true).await;
+    let p = w.p.to_string();
+    for (name, wf, submitter) in [
+        ("acme-delegate-sibling", sib_wf, live_sib),
+        ("acme-delegate-retired-sibling", rsib_wf, retired_sib),
+    ] {
+        let mut outcomes = Vec::new();
+        for via in w.d_vias() {
+            let label = via.label();
+            let added = via
+                .add_step(name, &format!("acme sibling step via {label}"))
+                .await;
+            outcomes.push((label, added));
+        }
+        let admitted: Vec<(&str, bool)> = outcomes.iter().map(|(l, r)| (*l, r.is_ok())).collect();
+        assert_eq!(
+            admitted,
+            vec![("mcp-stdio", true), ("mcp-http", true), ("rest", true)],
+            "{name}: a live delegate of the submitter's operator is admitted: {outcomes:?}"
+        );
+        for (label, added) in outcomes {
+            assert_eq!(
+                claim_row(&pool, added.expect("admitted")).await,
+                (w.d, "public".to_string(), w.p_g),
+                "{name} ({label}): the step is the delegate's, in its own default group"
+            );
+        }
+        let rows = caller_writes(&pool, wf, w.d).await;
+        let arms: Vec<(&str, &str, Option<&str>, Option<&str>)> = rows
+            .iter()
+            .map(|(a, arm, op, sub, _)| (a.as_str(), arm.as_str(), op.as_deref(), sub.as_deref()))
+            .collect();
+        let sub = submitter.to_string();
+        assert_eq!(
+            arms,
+            vec![("add_step", "delegate", Some(p.as_str()), Some(sub.as_str())); 3],
+            "{name}: recorded as delegate, naming p as the principal and the sibling as submitter"
+        );
+    }
+    // GUARD: a live delegate of ANOTHER principal is refused by the gate.
+    let ql = &w.q_delegator;
+    for via in [
+        Via::McpStdio(&w.e_server),
+        Via::McpHttp(
+            &w.mcp,
+            mcp_auth(ql.delegator_client, w.e, Some(ql.delegator), WRITE_SCOPES),
+        ),
+        Via::Rest(
+            &w.router,
+            rest_token(
+                &w.state,
+                ql.delegator_client,
+                w.e,
+                Some(ql.delegator),
+                WRITE_SCOPES,
+            ),
+        ),
+    ] {
+        assert_refused(
+            &pool,
+            &via,
+            "acme-delegate-sibling",
+            "another principal's delegate on a sibling workflow",
+            GATE_REFUSAL,
+        )
+        .await;
+    }
+    // GUARD: an unlinked agent, and the retired agent `r` on stdio.
+    for (via, what) in [
+        (Via::McpStdio(&w.n_server), "no link"),
+        (Via::McpStdio(&w.r_server), "a retired link"),
+    ] {
+        assert_refused(&pool, &via, "acme-delegate-sibling", what, GATE_REFUSAL).await;
+    }
 }
