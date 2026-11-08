@@ -982,10 +982,11 @@ async fn a_roster_row_team_writer_works_through_rest(pool: PgPool) {
     team_writer_cycle(&pool, &w, Via::Rest(&w.router, w.dr), w.dr, "dr-rest").await;
 }
 
-/// A team writer cannot touch the operator's workflows: the lineage gate
-/// keeps its arms (submitter, its operator, the audited admin arm), so a
-/// writer who is none of those is refused on every write tool, and a legacy
-/// (unrecorded) workflow stays admin-only over the authenticated transport.
+/// A team writer cannot touch the operator's workflows: the lineage gate's
+/// arms are the submitter, its operator, a writer of the workflow's OWNER
+/// GROUP and the audited admin arm, and a writer of another group (its team)
+/// is none of those, so it is refused on every write tool, the legacy
+/// (unrecorded) workflow in the operator's group included.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_workflow(pool: PgPool) {
     let w = world(&pool).await;
@@ -999,6 +1000,11 @@ async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_work
     let wf = workflow_named(&pool, name, 0)
         .await
         .expect("the operator's workflow");
+    assert!(
+        !writes(&pool, w.rb, workflow_row(&pool, wf).await.1).await
+            && !writes(&pool, w.rb, w.op_g).await,
+        "PREMISE: rb writes neither the workflow's owner group nor the legacy row's"
+    );
     let steps: Vec<Uuid> = plan(&pool, wf)
         .await
         .into_iter()
