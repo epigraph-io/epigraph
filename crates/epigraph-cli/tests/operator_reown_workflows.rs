@@ -1756,6 +1756,13 @@ fn line_with(stdout: &str, prefix: &str, needles: &[&str]) -> bool {
 const GROUP: &[&str] = &["--visibility", "group"];
 const CATCH_UP: &[&str] = &["--visibility", "group", "--catch-up"];
 
+/// `--catch-up` following the act whose manifest is `after`.
+fn catch_up_after(after: &Path) -> Vec<&str> {
+    let mut v = CATCH_UP.to_vec();
+    v.extend(["--after-manifest", after.to_str().unwrap()]);
+    v
+}
+
 /// In place, every unshared step of a plan narrows. S6's edge to a note that
 /// is already private to the SAME group meets into exactly the tuple it has,
 /// and S3's pinned evidence is already in the group's private state: neither
@@ -2013,7 +2020,7 @@ async fn catch_up_moves_only_a_re_ingested_generation_and_reverses(pool: PgPool)
         r.show()
     );
 
-    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, None, CATCH_UP).await;
+    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, None, &catch_up_after(&m1)).await;
     assert_eq!(r.code, 0, "{}", r.show());
     assert!(
         r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
@@ -2028,7 +2035,16 @@ async fn catch_up_moves_only_a_re_ingested_generation_and_reverses(pool: PgPool)
         r.show()
     );
     let audits = security_events(&pool, "operator.workflows_reowned").await;
-    let r = reown_run(&pool, &fx, &dir, &m2, fx.target, Some("1"), CATCH_UP).await;
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m2,
+        fx.target,
+        Some("1"),
+        &catch_up_after(&m1),
+    )
+    .await;
     assert_eq!(r.code, 0, "{}", r.show());
     assert_eq!(
         security_events(&pool, "operator.workflows_reowned").await,
@@ -2095,7 +2111,16 @@ async fn catch_up_narrows_a_public_generation_ingested_after_an_in_place_narrowi
         "{}",
         r.show()
     );
-    let r = reown_run(&pool, &fx, &dir, &m2, fx.src, Some("1"), CATCH_UP).await;
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m2,
+        fx.src,
+        Some("1"),
+        &catch_up_after(&m1),
+    )
+    .await;
     assert_eq!(r.code, 0, "{}", r.show());
     let in_place = (fx.src, "group".to_string());
     assert_eq!(tenancy(&pool, "workflows", w_a2).await, in_place);
@@ -2279,14 +2304,33 @@ async fn catch_up_moves_every_own_row_of_a_private_re_ingest(pool: PgPool) {
     );
 
     let m = dir.join("c.jsonl");
-    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, CATCH_UP).await;
+    let main = dir.join("main.jsonl");
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        None,
+        &catch_up_after(&main),
+    )
+    .await;
     assert_eq!(r.code, 0, "{}", r.show());
     assert!(
         r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
         "{}",
         r.show()
     );
-    let r = reown_run(&pool, &fx, &dir, &m, fx.target, Some("1"), CATCH_UP).await;
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        Some("1"),
+        &catch_up_after(&main),
+    )
+    .await;
     assert_eq!(r.code, 0, "{}", r.show());
     let to = (fx.target, "group".to_string());
     assert_eq!(tenancy(&pool, "workflows", s.w_a2).await, to);
@@ -2380,7 +2424,8 @@ async fn catch_up_takes_nothing_of_a_lineage_with_no_generation_in_the_target(po
 async fn catch_up_holds_on(pool: &PgPool, fx: &Fx, dir: &Path, s: &Stray, extra: Uuid) {
     let before = snapshot_sans_epoch(pool).await;
     let m = dir.join("c.jsonl");
-    let r = reown_run(pool, fx, dir, &m, fx.target, None, CATCH_UP).await;
+    let main = dir.join("main.jsonl");
+    let r = reown_run(pool, fx, dir, &m, fx.target, None, &catch_up_after(&main)).await;
     assert_eq!(r.code, 0, "{}", r.show());
     assert!(
         line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &[&extra.to_string()]),
@@ -2392,7 +2437,16 @@ async fn catch_up_holds_on(pool: &PgPool, fx: &Fx, dir: &Path, s: &Stray, extra:
         "{}",
         r.show()
     );
-    let r = reown_run(pool, fx, dir, &m, fx.target, Some("0"), CATCH_UP).await;
+    let r = reown_run(
+        pool,
+        fx,
+        dir,
+        &m,
+        fx.target,
+        Some("0"),
+        &catch_up_after(&main),
+    )
+    .await;
     assert_eq!(r.code, 3, "a held hand-off exits 3: {}", r.show());
     let src_private = (fx.src, "group".to_string());
     assert_eq!(tenancy(pool, "workflows", s.w_a2).await, src_private);
@@ -2610,5 +2664,130 @@ async fn catch_up_never_takes_a_lineage_with_a_private_generation_and_none_in_th
         before,
         "nothing is written"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A catch-up takes a stray lineage only when an act on record moved it. After
+/// the main move, `alpha` gets a private re-ingest (a stray generation beside
+/// generations the main manifest moved), and `missing` appears with generation
+/// 0 owned NATIVELY by the target, in exactly the target state, and generation
+/// 1 in the source's private state executing a private step only it executes.
+/// Neither carries another reason to hold it. With the main manifest passed,
+/// the catch-up takes `alpha` and holds `missing`: the source's private rows
+/// never go to a group because it owns a same-named generation. A manifest of
+/// another act is refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_holds_a_lineage_the_target_owns_natively(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let main = dir.join("main.jsonl");
+    let s = private_reingest(&pool, &fx).await;
+    let (n0, n1, nc, e) = {
+        let mut c = pool.acquire().await.expect("acquire");
+        let n0 = workflow(&mut c, "missing", 0, None, fx.target, "group").await;
+        let n1 = workflow(&mut c, "missing", 1, Some(n0), fx.src, "group").await;
+        let nc = claim(
+            &mut c,
+            fx.operator,
+            fx.src,
+            "group",
+            2,
+            "a private step of the source's generation",
+        )
+        .await;
+        let e = edge(&mut c, (n1, "workflow"), (nc, "claim"), "executes").await;
+        (n0, n1, nc, e)
+    };
+    let to = (fx.target, "group".to_string());
+    let src_private = (fx.src, "group".to_string());
+    assert_eq!(tenancy(&pool, "workflows", n0).await, to, "PREMISE");
+    assert_eq!(
+        edge_tenancy(&pool, e).await,
+        (fx.src, "group".to_string(), None),
+        "PREMISE: the edge is the source's private row, like a stray step's"
+    );
+
+    // Another act's manifest (another target) is refused.
+    let other = dir.join("other.jsonl");
+    let text = std::fs::read_to_string(&main).expect("read the main manifest");
+    std::fs::write(
+        &other,
+        text.replacen(&fx.target.to_string(), &fx.other_team.to_string(), 1),
+    )
+    .expect("write");
+    let m = dir.join("c.jsonl");
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        None,
+        &catch_up_after(&other),
+    )
+    .await;
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(r.stderr.contains("not this run's"), "{}", r.show());
+
+    let before = snapshot_sans_epoch(&pool).await;
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        None,
+        &catch_up_after(&main),
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(
+            &r.stdout,
+            "HELD-LINEAGE\tmissing\t",
+            &["not moved there by any --after-manifest"]
+        ),
+        "the target's own lineage is no catch-up's: {}",
+        r.show()
+    );
+    assert!(
+        line_with(&r.stdout, "WORKFLOW\t", &[&s.w_a2.to_string()]),
+        "the act's lineage is: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t1"),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        Some("1"),
+        &catch_up_after(&main),
+    )
+    .await;
+    assert_eq!(r.code, 0, "a held lineage is not a hand-off: {}", r.show());
+    assert_eq!(tenancy(&pool, "workflows", s.w_a2).await, to);
+    assert_eq!(tenancy(&pool, "workflows", n1).await, src_private);
+    assert_eq!(tenancy(&pool, "claims", nc).await, src_private);
+    assert_eq!(
+        edge_tenancy(&pool, e).await,
+        (fx.src, "group".to_string(), None)
+    );
+    let mut after = snapshot_sans_epoch(&pool).await;
+    let mut want = before;
+    let mut moved: Vec<Uuid> = vec![s.w_a2, s.ns];
+    moved.extend(&s.edges);
+    for snap in [&mut after, &mut want] {
+        for rows in snap.values_mut() {
+            rows.retain(|row| !moved.iter().any(|id| row.contains(&id.to_string())));
+        }
+    }
+    assert_eq!(after, want, "the catch-up changed the target's lineage");
     std::fs::remove_dir_all(&dir).ok();
 }

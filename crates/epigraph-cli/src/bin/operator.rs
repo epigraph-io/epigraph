@@ -825,8 +825,19 @@ enum Command {
         /// state; every other row keeps the hand-off rule, so a private
         /// derived row or an edge to a row outside the plans holds the lineage
         /// (exit 3 under `--apply`). Audited and reversed like the main act.
+        /// The act must be on record: see `--after-manifest`.
         #[arg(long)]
         catch_up: bool,
+        /// With `--catch-up`, repeatable: the manifest of the act the catch-up
+        /// follows (and of any earlier catch-up of it), from the same source
+        /// and target. A catch-up takes a lineage only when one of its
+        /// target-state generations is a row such a manifest moved into the
+        /// target state; any other lineage with a target-state generation (one
+        /// the target may own natively) is held and reported. Without it,
+        /// every such lineage is held. A held lineage is not a hand-off: an
+        /// `--apply` that holds only such lineages exits 0.
+        #[arg(long = "after-manifest")]
+        after_manifest: Vec<PathBuf>,
         /// The operator (a person's agent id) the act is attributed to.
         #[arg(long)]
         operator: Uuid,
@@ -1097,6 +1108,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         target_group,
         visibility,
         catch_up,
+        after_manifest,
         operator: op,
         from_group,
         manifest_out,
@@ -1120,6 +1132,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             reason: reason.clone(),
             visibility: reown_workflows::Visibility::parse(visibility)?,
             catch_up: *catch_up,
+            after_manifests: after_manifest.clone(),
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
         };

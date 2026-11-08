@@ -61,7 +61,18 @@
 //!   generation in the TO state, and its other generations are STRAY (FROM,
 //!   or, in a move, the source's private state, which is neither FROM nor
 //!   TO). A lineage with no generation in TO is the main act's, never a
-//!   catch-up's: SKIPPED when it is all FROM, HELD otherwise. A catch-up
+//!   catch-up's: SKIPPED when it is all FROM, HELD otherwise. And the act
+//!   must be on record: at least one of the lineage's TO generations must be
+//!   one an `--after-manifest` (the manifest of the act it catches up to, or
+//!   of an earlier catch-up of it) moved into exactly this run's TO state. A
+//!   lineage whose TO generations no such manifest moved is HELD
+//!   (`NotActed`): the target may own it natively, and a catch-up must never
+//!   hand the source's private rows to a group just because that group owns
+//!   a generation of the same name. One recorded generation is enough: an
+//!   act takes a lineage only whole, so a TO generation it did not record
+//!   joined after it (an undeclared re-ingest lands in TO, see below).
+//!   Without `--after-manifest` every lineage with a TO generation is held.
+//!   The rule is the same in place. A catch-up
 //!   changes the stray generations and their plan rows under the main act's
 //!   rules, with ONE exemption from the hand-off rule, for the stray
 //!   generations' OWN rows ([`StrayScope`]): their `workflows` rows, the
@@ -398,6 +409,10 @@ pub struct Options {
     pub visibility: Visibility,
     /// `--catch-up` (see [`Act::catch_up`]); needs `--visibility group`.
     pub catch_up: bool,
+    /// `--after-manifest` (`--catch-up` only): the manifests of the acts a
+    /// catch-up follows. A catch-up takes a lineage only when one of its TO
+    /// generations is a row one of them moved into the TO state.
+    pub after_manifests: Vec<PathBuf>,
     /// Lineages per transaction (a component is never split).
     pub batch_size: usize,
     pub lock_timeout: String,
@@ -417,6 +432,9 @@ pub fn validate(opts: &Options) -> anyhow::Result<()> {
             "--catch-up needs --visibility group: it catches a lineage up to a narrowing that \
              already ran"
         );
+    }
+    if !opts.after_manifests.is_empty() && !opts.catch_up {
+        bail!("--after-manifest is for --catch-up only: it names the act a catch-up follows");
     }
     if opts.apply {
         if opts.ruling.trim().is_empty() {
@@ -632,6 +650,12 @@ pub enum LineageHold {
         /// TO state: `--catch-up` takes it.
         catch_up: bool,
     },
+    /// `--catch-up`: the lineage has generations in the TO state, but no
+    /// `--after-manifest` moved any of them there (the target may own it
+    /// natively), so it is not a catch-up's.
+    NotActed {
+        target_gens: Vec<i32>,
+    },
     /// Some generations are in the TO state already and some in the FROM
     /// state.
     PartlyMoved {
@@ -678,7 +702,8 @@ impl fmt::Display for LineageHold {
                  this run's target state; the whole lineage stays{}",
                 if *catch_up {
                     " (the source's private generation of a lineage with generations already in \
-                     this run's target state: run again with --catch-up to take it)"
+                     this run's target state: run again with --catch-up --after-manifest <the \
+                     manifest of the act that moved them> to take it)"
                 } else {
                     ""
                 }
@@ -690,8 +715,16 @@ impl fmt::Display for LineageHold {
                 f,
                 "partly the target's already (generations {target_gens:?}) and partly the \
                  source's ({source_gens:?}); a run that moved only part of it could not be \
-                 reversed exactly, so it stays (run again with --catch-up to take only the \
-                 other generations, recording the target's as seen)"
+                 reversed exactly, so it stays (run again with --catch-up --after-manifest <the \
+                 manifest of the act that moved them> to take only the other generations, \
+                 recording the target's as seen)"
+            ),
+            Self::NotActed { target_gens } => write!(
+                f,
+                "its generations in this run's target state ({target_gens:?}) were not moved there \
+                 by any --after-manifest: the target may own this lineage natively, and a \
+                 catch-up takes only the stray generations of a lineage an act moved; the whole \
+                 lineage stays (pass the manifest of the act that moved it, or rule on it)"
             ),
             Self::HandOff {
                 table,
@@ -1304,7 +1337,8 @@ async fn classify_narrowing(
 }
 
 /// Plan the listed lineages: which hold, which are done, and per component
-/// what moves.
+/// what moves. `acted` (`--catch-up`): the `workflows` rows the
+/// `--after-manifest`s moved into the TO state ([`acted_generations`]).
 ///
 /// # Errors
 /// A read fails.
@@ -1314,6 +1348,7 @@ pub async fn plan(
     specs: &[TableSpec],
     names: &[String],
     act: &Act,
+    acted: &BTreeSet<Uuid>,
 ) -> anyhow::Result<Plan> {
     let (source, target) = (act.source, act.target);
     let (from, to) = (act.from_state(), act.to_state());
@@ -1414,6 +1449,18 @@ pub async fn plan(
                 None => out.skipped.push(name.clone()),
                 Some(w) => out.held.push((name.clone(), not_public(w, false))),
             }
+            continue;
+        } else if !to_g.is_empty() && !to_g.iter().any(|w| acted.contains(&w.id)) {
+            // A stray lineage, but no act on record moved its TO generations:
+            // the target may own it natively, so its source rows are no
+            // catch-up's. Vacuous without a TO generation: whether such a
+            // lineage is a catch-up's at all is the stray rule's alone.
+            out.held.push((
+                name.clone(),
+                LineageHold::NotActed {
+                    target_gens: to_g.iter().map(|w| w.generation).collect(),
+                },
+            ));
             continue;
         }
         moving_wf.extend(from_g.iter().chain(priv_g.iter()).map(|w| w.id));
@@ -2406,6 +2453,8 @@ pub struct Ctx<'a> {
     /// Tables whose row security does not enforce a `group` row (restrict's
     /// `unenforced_reasons`); the readability check is a subset check there.
     pub unenforced: &'a BTreeMap<String, Vec<String>>,
+    /// `--catch-up`: the rows the `--after-manifest`s moved into TO.
+    pub acted: &'a BTreeSet<Uuid>,
 }
 
 /// What one batch did.
@@ -2468,7 +2517,7 @@ pub async fn run_batch(
         .await?;
 
     // ---- re-plan under the locks; hold every component that changed ----
-    let now = plan(conn, ctx.specs, &names, &act).await?;
+    let now = plan(conn, ctx.specs, &names, &act, ctx.acted).await?;
     let mut comps: Vec<Component> = Vec::new();
     for p in planned {
         match now.components.iter().find(|c| c.lineages == p.lineages) {
@@ -2868,7 +2917,9 @@ pub struct RunReport {
 /// `--apply` held a component under lock, moved a different number of
 /// workflow rows than the operator confirmed, held a lineage on a hand-off, or
 /// left a plan row of a narrowed lineage public (a shortfall must not pass as
-/// success); else 0.
+/// success); else 0. A lineage the plan holds for its state (`NotPublic`,
+/// `OwnedElsewhere`, `PartlyMoved`, `NotActed`) is reported and exits 0: the
+/// dry run excluded it from the confirmed count, and it is not this act's.
 #[must_use]
 pub fn exit_code(report: &RunReport, opts: &Options) -> i32 {
     if !report.batch_failures.is_empty() {
@@ -3004,7 +3055,18 @@ pub async fn run(
         BTreeMap::new()
     };
 
-    let p = plan(conn, &specs, names, &act).await?;
+    let mut acted = BTreeSet::new();
+    let mut after_lines = Vec::new();
+    for path in &opts.after_manifests {
+        let ids = acted_generations(path, &act)?;
+        after_lines.push(format!(
+            "AFTER-MANIFEST\t{}\t{} workflow row(s) it moved into this run's target state",
+            path.display(),
+            ids.len()
+        ));
+        acted.extend(ids);
+    }
+    let p = plan(conn, &specs, names, &act, &acted).await?;
     writeln!(
         out,
         "reown-workflows: operator={} source_group={source} target_group={target} act={} \
@@ -3014,6 +3076,9 @@ pub async fn run(
         act.visibility.as_str(),
         if opts.apply { "APPLY" } else { "DRY-RUN" }
     )?;
+    for l in &after_lines {
+        writeln!(out, "{l}")?;
+    }
     writeln!(
         out,
         "PLAN: {} lineage(s) listed, {} held, {} already in the target state, {} component(s) \
@@ -3202,6 +3267,7 @@ pub async fn run(
         act,
         lock_timeout: &opts.lock_timeout,
         unenforced: &unenforced,
+        acted: &acted,
     };
     let total = batches.len();
     let mut committed: Vec<&Component> = Vec::new();
@@ -3373,6 +3439,73 @@ fn header_uuid(m: &manifest::Manifest, key: &str, path: &Path) -> anyhow::Result
         .and_then(|s| Uuid::parse_str(s).with_context(|| format!("{}: {key}", path.display())))
 }
 
+fn check_format(m: &manifest::Manifest, path: &Path) -> anyhow::Result<()> {
+    if !is_reown_workflows_manifest(m) {
+        bail!(
+            "{}: not a reown-workflows manifest; refusing",
+            path.display()
+        );
+    }
+    if m.header.get("version").and_then(Value::as_i64) != Some(manifest::VERSION) {
+        bail!(
+            "{}: manifest version is not {}; refusing",
+            path.display(),
+            manifest::VERSION
+        );
+    }
+    if m.header.get("record_format").and_then(Value::as_str) != Some(RECORD_FORMAT) {
+        bail!(
+            "{}: record_format is not {RECORD_FORMAT} (a manifest from an older build records \
+             neither the rows it saw nor its edges' endpoints, so its plan's growth cannot be \
+             checked); refusing",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `--after-manifest`: the `workflows` rows a manifest of an act on the same
+/// source and target moved into exactly `act`'s TO state (a post record in
+/// that state). The plan intersects them with the rows in the TO state NOW,
+/// so a recorded batch that rolled back counts for nothing.
+///
+/// # Errors
+/// The manifest cannot be read, is not a current reown-workflows manifest, or
+/// records an act on another source or target.
+pub fn acted_generations(path: &Path, act: &Act) -> anyhow::Result<BTreeSet<Uuid>> {
+    let m = manifest::read(path)?;
+    check_format(&m, path)?;
+    for (key, want) in [
+        ("source_group_id", act.source),
+        ("target_group_id", act.target),
+    ] {
+        let got = header_uuid(&m, key, path)?;
+        if got != want {
+            bail!(
+                "{}: --after-manifest records an act with {key} {got}, not this run's {want}; \
+                 refusing",
+                path.display()
+            );
+        }
+    }
+    let to = act.to_state();
+    let mut out = BTreeSet::new();
+    for r in &m.records {
+        if r.table == "workflows"
+            && r.after
+            && r.owner_group_id == to.owner
+            && r.visibility == to.visibility
+        {
+            let id =
+                r.id.as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .ok_or_else(|| anyhow!("{}: a workflows id is not a uuid", path.display()))?;
+            out.insert(id);
+        }
+    }
+    Ok(out)
+}
+
 /// A manifest read back, keyed.
 #[derive(Default)]
 struct Recorded {
@@ -3456,21 +3589,7 @@ pub async fn reverse_manifest(
     report: &mut super::reverse::Report,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
-    if m.header.get("version").and_then(Value::as_i64) != Some(manifest::VERSION) {
-        bail!(
-            "{}: manifest version is not {}; refusing",
-            path.display(),
-            manifest::VERSION
-        );
-    }
-    if m.header.get("record_format").and_then(Value::as_str) != Some(RECORD_FORMAT) {
-        bail!(
-            "{}: record_format is not {RECORD_FORMAT} (a manifest from an older build records \
-             neither the rows it saw nor its edges' endpoints, so its plan's growth cannot be \
-             checked); refusing",
-            path.display()
-        );
-    }
+    check_format(m, path)?;
     let specs: Vec<TableSpec> = all_specs
         .iter()
         .filter(|s| s.kind != Kind::Edges)
@@ -4172,6 +4291,7 @@ mod tests {
             reason: "why".into(),
             visibility: Visibility::Keep,
             catch_up: false,
+            after_manifests: Vec::new(),
             batch_size: 25,
             lock_timeout: "5s".into(),
         }
@@ -4222,9 +4342,19 @@ mod tests {
             .is_err(),
             "--catch-up needs --visibility group"
         );
+        assert!(
+            validate(&Options {
+                after_manifests: vec![PathBuf::from("a")],
+                visibility: Visibility::Group,
+                ..o.clone()
+            })
+            .is_err(),
+            "--after-manifest is for --catch-up only"
+        );
         assert!(validate(&Options {
             catch_up: true,
             visibility: Visibility::Group,
+            after_manifests: vec![PathBuf::from("a")],
             ..o
         })
         .is_ok());
