@@ -528,7 +528,8 @@ decision or conversion before the operator drops `claims_privacy`,
      `workflow-ingest-system`; since workflow writes moved to the caller, new
      steps are authored by their caller, and `evolve_step` writes as its caller
      under the lineage authority gate (submitter, its operator, an agent acting
-     for the submitter through a live operator link, a writer of the
+     for the submitter or for the submitter's operator through a live operator
+     link, a writer of the
      workflow's owner group, or the audited admin path).
    - `refresh_workflow_promotion`'s `merge_properties`: same population, same H3
      question. Its A behaviour is inferred, not measured.

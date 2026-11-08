@@ -2968,8 +2968,9 @@ enum ApiWorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
-    /// The caller acts for the submitter `0` through its live operator link
-    /// (operator ruling R-183, one hop).
+    /// The caller acts for principal `0` through its live operator link
+    /// (operator ruling R-183, one hop): `0` is the submitter itself, or the
+    /// submitter's operator (the principal the upward arm would admit).
     Delegate(Uuid),
     /// The caller writes the workflow's owner group `0`, live.
     OwnerGroupWriter(Uuid),
@@ -3011,22 +3012,28 @@ impl ApiWorkflowGrant {
 /// writer or admin membership of its owner group NOW (direct or through a
 /// role binding), checked on `conn`, the write's own caller-stamped
 /// transaction (`epigraph_ingest_executor::caller_writes_group_now`, which
-/// also asks the stamp). An author binding is not a membership: an agent
-/// bound to a human through the allowlist gains nothing over the human's
-/// workflows through it (operator ruling 2026-10-13).
+/// also asks the stamp). An author binding is not a membership: the
+/// allowlisted agent's OWN token gains nothing over the human's workflows
+/// through the binding (operator ruling 2026-10-13). A delegated run token
+/// for one of the human's live-linked agents is different: it carries that
+/// agent's delegate authority (below, operator ruling R-183).
 ///
 /// The delegate arm (operator ruling R-183: agents acting for a principal
-/// inherit its authority): the caller's ACTING operator link names the
-/// submitter (`AgentRepository::operator_actor` on `conn`: a not-retired link
-/// record AND a live writer membership of the submitter's own personal
-/// group). One hop: the read returns the caller's direct operator only, and a
-/// retired link is never acting. An operated caller holds a REST viewer only
-/// through a delegated run token whose delegation the bearer middleware found
-/// live for this request, so a token-carrying route admits the arm only for a
-/// token that carries `dlg`. Recorded as `"arm": "delegate"` with `operator` =
-/// the submitter. It runs before the owner-group arm, so a delegate that also
-/// writes the owner group (the submitter's own group, which the link makes it
-/// a writer of) is recorded as the delegation it is.
+/// inherit its authority, wherever the principal itself is admitted by
+/// identity): the caller's ACTING operator link names a principal `P`
+/// (`AgentRepository::operator_actor` on `conn`: a not-retired link record
+/// AND a live writer membership of `P`'s own personal group), and `P` is the
+/// submitter, or the submitter's operator (the upward arm's own read,
+/// retired links of the submitter included, as for `P` itself). One hop on
+/// the caller's side: the read returns the caller's direct operator only, and
+/// a retired link is never acting. An operated caller holds a REST viewer
+/// only through a delegated run token whose delegation the bearer middleware
+/// found live for this request, so a token-carrying route admits the arm only
+/// for a token that carries `dlg`. Recorded as `"arm": "delegate"` with
+/// `operator` = `P`, the principal it acted for. It runs before the
+/// owner-group arm, so a delegate that also writes the owner group (`P`'s own
+/// group, which the link makes it a writer of) is recorded as the delegation
+/// it is.
 ///
 /// Every REFUSAL to a caller whose `viewer` cannot READ the row is
 /// `not_found()`, the call site's answer for a workflow that does not exist,
@@ -3115,22 +3122,28 @@ async fn workflow_authority(
             .map_err(|e| ApiError::InternalError {
                 message: format!("could not read the submitter's operator: {e}"),
             })?;
-        if op.is_some_and(|l| l.operator_id == caller) {
+        if op.as_ref().is_some_and(|l| l.operator_id == caller) {
             return Ok(allowed(ApiWorkflowArm::Operator));
         }
-        // The delegate arm (R-183), after the upward arm. A route that names
-        // its caller through the viewer alone (no token) reached it through
-        // the viewer extractor, which admits an operated caller only through
-        // a live delegation.
+        // The delegate arm (R-183), after the upward arm: the caller's ACTING
+        // link names the principal `P` it acts for, and `P` is admitted here
+        // by identity, as the submitter itself or as the submitter's operator
+        // (#503, the `op` read above). A route that names its caller through
+        // the viewer alone (no token) reached it through the viewer
+        // extractor, which admits an operated caller only through a live
+        // delegation.
         let actor = epigraph_db::AgentRepository::operator_actor(&mut *conn, caller)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("could not read the caller's operator link: {e}"),
             })?;
-        if actor.is_some_and(|l| l.operator_id == owner)
-            && auth.is_none_or(|a| a.delegated_by.is_some())
+        if let Some(principal) = actor
+            .map(|l| l.operator_id)
+            .filter(|p| *p == owner || op.as_ref().is_some_and(|l| l.operator_id == *p))
         {
-            return Ok(allowed(ApiWorkflowArm::Delegate(owner)));
+            if auth.is_none_or(|a| a.delegated_by.is_some()) {
+                return Ok(allowed(ApiWorkflowArm::Delegate(principal)));
+            }
         }
     }
     if let Some(group) = api_owner_group_arm(conn, caller, view.as_ref()).await? {
