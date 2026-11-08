@@ -88,13 +88,15 @@
 //!   the catch-up puts the lineage back in the state it found it in, and the
 //!   original manifest then refuses (a generation joined after it).
 //!
-//!   A stray generation is the exception, not the rule: an undeclared new
-//!   generation of a group lineage inherits its head's group
-//!   (`inherited_generation_group` in epigraph-ingest-executor), so after the
-//!   act a re-ingest lands in TO, or is refused to a caller that does not
-//!   write TO. A stray one comes from an ingest that DECLARED the source
-//!   group, or from a server built before that inheritance (which wrote a new
-//!   generation public).
+//!   A stray generation is the exception, not the rule: the workflow ingest
+//!   gives an undeclared new generation of a group lineage its head's group
+//!   (the generation-inheritance rule in epigraph-ingest-executor's
+//!   `workflow.rs`: `inherited_generation_group`, or
+//!   `inherited_generation_tenancy` once renamed), so after the act a
+//!   re-ingest lands in TO, or is refused to a caller that does not write TO.
+//!   A stray one comes from an ingest that DECLARED the source group, or from
+//!   a server built before that inheritance (which wrote a new generation
+//!   public).
 //! * `claims`: the plan claims, i.e. the target of every `executes` edge from
 //!   any of those rows (thesis, phases, steps, operation atoms; retracted
 //!   edges count too, as migration 183's backfill counts them), plus every
@@ -360,10 +362,10 @@ impl Act {
 
     /// `('group', source)`: the source's private state. In place it IS the TO
     /// state. In a move, `--catch-up` takes a generation in it beside
-    /// generations already in TO. An undeclared new generation of a group
-    /// lineage inherits its head's group (`inherited_generation_group` in
-    /// epigraph-ingest-executor), so after a move a re-ingest lands in TO; a
-    /// generation lands here only when its ingest declares the source group.
+    /// generations already in TO. The workflow ingest gives an undeclared new
+    /// generation of a group lineage its head's group (the ingest executor's
+    /// generation-inheritance rule), so after a move a re-ingest lands in TO;
+    /// a generation lands here only when its ingest declares the source group.
     #[must_use]
     pub fn source_private(&self) -> Tenancy {
         Tenancy {
