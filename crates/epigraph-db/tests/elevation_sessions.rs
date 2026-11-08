@@ -184,6 +184,14 @@ async fn human(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
 /// `passkey.register` act since migration 130
 /// ([`fixture::passkey_register_act`]).
 async fn passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
+    passkey_of_format(pool, person, n, "none").await
+}
+
+/// [`passkey`], recorded with attestation format `format`. A person's later
+/// passkey rides an act its earlier one confirmed, and migration 200 revokes
+/// a `none` one with that earlier passkey (it is what an anchored, unattested
+/// passkey is recorded as); an attested format stands on its own.
+async fn passkey_of_format(pool: &PgPool, person: Uuid, n: u8, format: &'static str) -> Uuid {
     let act = fixture::passkey_register_act(pool, person, "elevation test", "key").await;
     let e: Uuid = fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
         let e = match act {
@@ -215,10 +223,11 @@ async fn passkey(pool: &PgPool, person: Uuid, n: u8) -> Uuid {
         let key: Uuid = sqlx::query_scalar(
             "SELECT public.epigraph_complete_passkey_enrollment($1, $2, \
                     '{\"cred\": 1}'::jsonb, '00000000-0000-0000-0000-000000000000'::uuid, \
-                    'none', true, false)",
+                    $3, true, false)",
         )
         .bind(e)
         .bind(credential(n))
+        .bind(format)
         .fetch_one(&mut *conn)
         .await
         .expect("complete the enrollment");
@@ -1818,7 +1827,10 @@ async fn is_elevated_is_false_once_its_passkey_is_revoked(pool: PgPool) {
 /// THE END, passkey half, through 124's maintenance definer (the
 /// `epigraph-operator revoke-passkey` path): the session that passkey
 /// confirmed ends `passkey_revoked`, audited; a session of the SAME person
-/// confirmed by ANOTHER live passkey (on another family) is untouched.
+/// confirmed by ANOTHER live passkey (on another family) is untouched. The
+/// other passkey is recorded attested (`packed`): a `none` one, enrolled on
+/// an act the first confirmed, is revoked WITH the first (migration 200's
+/// anchored-revoke cascade), and its session would end too.
 ///
 /// Verified to fail: the passkey end trigger dropped -> the first session
 /// stays un-ended; the trigger widened to every session of the person -> the
@@ -1826,7 +1838,7 @@ async fn is_elevated_is_false_once_its_passkey_is_revoked(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn revoking_a_passkey_ends_the_sessions_it_confirmed(pool: PgPool) {
     let h = holder(&pool, "holder", 1).await;
-    let other_key = passkey(&pool, h.person, 2).await;
+    let other_key = passkey_of_format(&pool, h.person, 2, "packed").await;
     let (other_family, other_hash) = family(&pool, h.client).await;
     let h2 = Holder {
         passkey: other_key,
