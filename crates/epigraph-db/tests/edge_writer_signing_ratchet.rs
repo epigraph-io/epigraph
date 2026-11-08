@@ -575,6 +575,16 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // The document ingest's writer of the edges a provenance read trusts
+    // (`authored`, paper and agent `asserts`): the walks call it with their
+    // `edge_signing_key()`, so their counts above are the edges they write
+    // directly.
+    site(
+        "crates/epigraph-db/src/repos/ingest_written.rs",
+        "create_ingest_written_edge_if_absent_conn",
+        1,
+        Signed,
+    ),
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
         "promote_if_pending",

@@ -5,7 +5,8 @@
 -- ===================================================================
 -- 1. WHAT THIS ADDS
 --
--- One SECURITY DEFINER reader and nothing else:
+-- One SECURITY DEFINER reader (sections 1-3) and, for the same card's
+-- counts, one SECURITY INVOKER trigger on `edges` (section 4):
 --
 --   public.epigraph_disclosed_role_assignments(p_agents uuid[])
 --     RETURNS TABLE (agent_id uuid, role text, valid_from timestamptz,
@@ -80,7 +81,49 @@
 --
 -- Callers: `epigraph_db::repos::agent_lookup` (the find_agent / get_agent card).
 --
+-- ===================================================================
+-- 4. THE INGEST-WRITTEN EDGE MARKER (`edges_ingest_written_guard`)
+--
+-- The card counts an agent's papers and claims from three edge shapes:
+-- `agent -authored-> paper`, `paper -asserts-> claim` and
+-- `agent -asserts-> claim`. Their shape proves nothing about their writer:
+-- `POST /api/v1/edges` accepted both `asserts` shapes from any edges:write
+-- caller, so a stranger could write `paper -asserts-> X` onto a paper an
+-- agent really authored, then `agent -asserts-> X`, and the agent read as
+-- having asserted X. The edge signature does not separate the paths either
+-- (the HTTP route and the MCP link tools sign with the same server keys the
+-- ingest uses), and a writer group can be shared.
+--
+-- So the document ingest writes these shapes with a reserved property,
+-- `properties.ingest_written` (the writing tool's name), and this trigger
+-- makes that property the walk's alone:
+--
+--   * INSERT carrying the key (any value, JSON null included): refused,
+--     IWE01 (SQLSTATE 42501), unless the transaction-local setting
+--     `epigraph.ingest_written_edge` is 'on'. Only the walk's writer
+--     (`epigraph_db::create_ingest_written_edge_if_absent_conn`) sets it,
+--     with set_config(..., true) around its own INSERT, then clears it;
+--   * UPDATE that adds the key or changes its value: refused the same way.
+--     An UPDATE that keeps or drops it is not;
+--   * UPDATE that moves an endpoint or changes the relationship of a marked
+--     edge: the key is DROPPED (unless declared), privileged sessions
+--     included. 117 lets an owner re-point its edge and the supersede and
+--     dedup cascades re-point others; either way the moved edge is not what
+--     the walk wrote, so it no longer reads as ingest-written.
+--
+-- No privileged arm: the superuser and maintenance roles are refused like
+-- the application role. A database login can set the setting itself, as it
+-- can write any row; the guarantee is against application callers (HTTP,
+-- MCP, the staged promote, the workflow executor, any later writer). The
+-- application layer also refuses the key (RESERVED_EDGE_PROPERTIES) so such
+-- a caller reads a 400 rather than this error.
+--
+-- Existing rows are untouched: edges written before this carry no marker
+-- and read as unproven until an operator backfills them.
+--
 -- UNDO:
+--   DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
+--   DROP FUNCTION IF EXISTS public.epigraph_edges_ingest_written_guard();
 --   DROP FUNCTION IF EXISTS public.epigraph_disclosed_role_assignments(uuid[]);
 -- No rows, tables or policies change here.
 -- **Applied to throwaway databases only, NOT to any deployed database.**
@@ -124,3 +167,42 @@ BEGIN
                 'TO epigraph_app';
     END IF;
 END $$;
+
+-- ===================================================================
+-- 4. THE INGEST-WRITTEN EDGE MARKER (see the header, section 4)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_edges_ingest_written_guard()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    -- COALESCE: an unset setting reads NULL on a session that never set it
+    -- (and '' on one that did), and a NULL here would admit the write.
+    v_declared boolean := COALESCE(
+        pg_catalog.current_setting('epigraph.ingest_written_edge', true) = 'on', false);
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.properties ? 'ingest_written'
+       AND (NEW.source_id, NEW.source_type, NEW.target_id, NEW.target_type, NEW.relationship)
+           IS DISTINCT FROM
+           (OLD.source_id, OLD.source_type, OLD.target_id, OLD.target_type, OLD.relationship)
+       AND NOT v_declared THEN
+        NEW.properties := NEW.properties - 'ingest_written';
+    END IF;
+    IF NEW.properties ? 'ingest_written'
+       AND NOT v_declared
+       AND (TG_OP = 'INSERT'
+            OR NOT (OLD.properties ? 'ingest_written')
+            OR (NEW.properties -> 'ingest_written')
+               IS DISTINCT FROM (OLD.properties -> 'ingest_written')) THEN
+        RAISE EXCEPTION 'IWE01: properties.ingest_written is reserved for the edges the '
+                        'document ingest writes; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
+CREATE TRIGGER edges_ingest_written_guard
+    BEFORE INSERT OR UPDATE ON public.edges
+    FOR EACH ROW EXECUTE FUNCTION public.epigraph_edges_ingest_written_guard();

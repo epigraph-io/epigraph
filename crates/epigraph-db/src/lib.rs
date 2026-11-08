@@ -144,6 +144,11 @@ pub use repos::{
     RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
     SUPERSEDE_ACT_TOOLS,
 };
+pub use repos::{
+    create_ingest_written_edge_if_absent_conn, ingest_written, ingest_written_edge_sql,
+    without_ingest_marker, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
+    INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES,
+};
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{
     AdminScopeArmingCache, AdminScopeChange, AdminScopeEnforcement, AdminScopeState,
