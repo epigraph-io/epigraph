@@ -223,8 +223,9 @@ impl WorkflowGrant {
 /// (backlog c831df4a, ruling R-100: ids stay deterministic, so the answer
 /// must not confirm one). The caller's own view decides what it is told. It
 /// also bounds the owner-group writer arm, which admits only a caller that
-/// reads the row; the submitter, operator and admin arms run whether or not
-/// the caller reads it (the ruling masks answers and changes no authority).
+/// reads the row; the submitter, operator, delegate and admin arms run
+/// whether or not the caller reads it (the ruling masks answers and changes
+/// no authority).
 ///
 /// # Errors
 /// A workflow-specific refusal naming the submitter (never the claim gate's
