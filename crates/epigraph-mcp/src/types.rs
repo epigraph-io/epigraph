@@ -2540,9 +2540,16 @@ pub struct PaperResponse {
     pub doi: String,
     pub title: String,
     pub authors: Vec<AuthorResponse>,
-    /// Total asserted claims for the paper, independent of paging. Compare
+    /// How many claims the paper has in the graph, independent of paging:
+    /// the larger of `asserted_claim_count` and the claims labelled
+    /// `doi:<doi>` (a node-presence signal for a partially ingested paper,
+    /// which a claim's own writer can also set, so not provenance). Compare
     /// against `offset + returned` to decide whether another page exists.
     pub claim_count: i64,
+    /// The claims the document ingest recorded this paper asserting (its
+    /// ingest-written `asserts` edges): the provenance count, and the set
+    /// `claims` pages over.
+    pub asserted_claim_count: i64,
     /// `claims.len()` — the size of THIS page, not the total.
     pub returned: usize,
     /// Echo of the applied `offset` (after clamping).

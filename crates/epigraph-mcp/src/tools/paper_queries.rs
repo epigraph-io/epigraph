@@ -88,7 +88,10 @@ const MAX_PAPER_CLAIM_LIMIT: i64 = 200;
 ///
 /// The real shape: papers are first-class nodes joined to claims by
 /// `paper -asserts-> claim` edges and to authors by
-/// `agent -authored-> paper` edges.
+/// `agent -authored-> paper` edges. Both are read only as the document ingest
+/// wrote them (ingest-written, `epigraph_db::ingest_written_edge_sql`): an
+/// edge of either shape written any other way is not this paper's
+/// provenance, so it is neither listed nor counted.
 ///
 /// Returns a zero-shaped response (claim_count=0, empty title/authors) when
 /// the DOI isn't in the graph. Callers (the monitor) use this as a dedup
@@ -132,6 +135,7 @@ pub async fn query_paper(
             title: String::new(),
             authors: vec![],
             claim_count: 0,
+            asserted_claim_count: 0,
             returned: 0,
             offset,
             limit,
@@ -220,6 +224,7 @@ pub async fn query_paper(
         title: paper.title.unwrap_or_default(),
         authors,
         claim_count,
+        asserted_claim_count: asserted_count,
         returned,
         offset,
         limit,

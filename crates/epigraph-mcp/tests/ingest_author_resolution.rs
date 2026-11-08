@@ -1842,3 +1842,60 @@ async fn an_explicit_attachment_is_kept_only_for_the_ingester_that_made_it(pool:
     assert_eq!(report["agent_id"], squatter_id.to_string(), "{json}");
     assert_eq!(report["action"], "kept_attached", "{json}");
 }
+
+/// `query_paper` reads a paper's provenance only as the document ingest
+/// wrote it: an `agent -authored-> paper` and a `paper -asserts-> claim`
+/// written any other way (here by the harness, as a forger with a database
+/// write or a pre-guard HTTP write would have left them) are neither listed
+/// nor counted. CONTROL: everything the real ingest wrote is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn query_paper_reads_only_what_the_ingest_wrote(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let d = "10.9999/query-paper-ingest-written";
+    ingest_wait(&server, &pool, doc(d, json!([{"name": "Wendeline Okafor"}]))).await;
+    let before = query_paper(&server, &pool, d).await;
+    let ingested = paper_claims(&pool, d).await;
+    assert!(ingested > 0, "CALIBRATION {before}");
+    assert_eq!(before["asserted_claim_count"], ingested, "{before}");
+    assert_eq!(before["authors"].as_array().map(Vec::len), Some(1), "{before}");
+
+    let (forger, _) = fixture::seed_agent_with_group(&pool, "query-paper-forger").await;
+    let foreign = fixture::seed_public_claim(&pool, forger, "a claim no ingest of d made").await;
+    let paper: Uuid = sqlx::query_scalar("SELECT id FROM papers WHERE doi = $1")
+        .bind(d)
+        .fetch_one(&pool)
+        .await
+        .expect("paper");
+    for (source, source_type, target, target_type, relationship) in [
+        (forger, "agent", paper, "paper", "authored"),
+        (paper, "paper", foreign, "claim", "asserts"),
+    ] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(source)
+        .bind(source_type)
+        .bind(target)
+        .bind(target_type)
+        .bind(relationship)
+        .execute(&pool)
+        .await
+        .expect("a hand-written edge");
+    }
+
+    let after = query_paper(&server, &pool, d).await;
+    assert_eq!(after["authors"], before["authors"], "no forged author: {after}");
+    assert_eq!(after["asserted_claim_count"], ingested, "no forged assertion: {after}");
+    let listed: Vec<String> = after["claims"]
+        .as_array()
+        .expect("claims")
+        .iter()
+        .map(|c| c["id"].as_str().expect("id").to_string())
+        .collect();
+    assert!(
+        !listed.contains(&foreign.to_string()),
+        "the forged assertion's claim is not on the page: {after}"
+    );
+    assert_eq!(listed.len() as i64, ingested.min(25), "{after}");
+}
