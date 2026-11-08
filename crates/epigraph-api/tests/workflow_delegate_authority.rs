@@ -1183,3 +1183,73 @@ async fn the_admin_arm_is_unchanged(pool: PgPool) {
         "an admin write records no caller-write row"
     );
 }
+
+/// R-100 masking holds for a delegate too: over the authenticated transports,
+/// a delegate asking about its operator's workflow in a group it cannot read
+/// gets exactly the answer an unknown name / unknown step gets, and nothing is
+/// written or recorded. (The delegate arm, like the operator arm, does not
+/// consult the caller's view; the step routes' own hidden-row answers and row
+/// security keep the row unnamed and unwritten.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_is_answered_as_unknown_on_a_row_it_cannot_read(pool: PgPool) {
+    let w = world(&pool).await;
+    let hidden = "acme-delegate-hidden-in-team";
+    Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    )
+    .ingest(&extraction(hidden, 1), group_in(w.t))
+    .await
+    .expect("p ingests a workflow private to t");
+    let wf = workflow_named(&pool, hidden).await;
+    assert_eq!(
+        workflow_row(&pool, wf).await,
+        ("group".to_string(), w.t, Some(w.p.to_string())),
+        "PREMISE: p's, private to t, which d does not read"
+    );
+    let step = steps_of(&pool, wf).await[0];
+    let unknown_name = "acme-delegate-hidden-in-tean";
+    let unknown_step = Uuid::new_v4();
+    let [_, http, rest] = w.d_vias();
+    for via in [http, rest] {
+        let label = via.label();
+        let before = row_counts(&pool).await;
+        let refused = via
+            .add_step(hidden, "acme hidden step")
+            .await
+            .expect_err("add_step on a row the delegate cannot read is refused")
+            .replace(hidden, "<name>");
+        let unknown = via
+            .add_step(unknown_name, "acme hidden step")
+            .await
+            .expect_err("add_step on an unknown name is refused")
+            .replace(unknown_name, "<name>");
+        assert_eq!(
+            refused, unknown,
+            "{label}: add_step answers as for an unknown name"
+        );
+        let refused = via
+            .evolve(step, "acme hidden revision")
+            .await
+            .expect_err("evolve on a step the delegate cannot read is refused")
+            .replace(&step.to_string(), "<id>");
+        let unknown = via
+            .evolve(unknown_step, "acme hidden revision")
+            .await
+            .expect_err("evolve on an unknown step is refused")
+            .replace(&unknown_step.to_string(), "<id>");
+        assert_eq!(
+            refused, unknown,
+            "{label}: evolve answers as for an unknown step"
+        );
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "{label}: nothing was written"
+        );
+    }
+    assert!(
+        caller_writes(&pool, wf, w.d).await.is_empty(),
+        "no provenance row for a refused write"
+    );
+}
