@@ -92,8 +92,15 @@ async fn app_scoped(pool: &PgPool) -> ScopedPool {
         .expect("app-role ScopedPool")
 }
 
+/// The REST router on the app role, with an embedder as production has one,
+/// so every REST write here runs its post-commit embeds (the goal embedding a
+/// re-ingest must never store included).
 async fn router(pool: &PgPool) -> axum::Router {
-    let state = AppState::with_scoped_pool(app_scoped(pool).await, ApiConfig::default());
+    let embedder: std::sync::Arc<dyn epigraph_embeddings::EmbeddingService> = std::sync::Arc::new(
+        epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536)),
+    );
+    let state = AppState::with_scoped_pool(app_scoped(pool).await, ApiConfig::default())
+        .with_embedding_service(embedder);
     state
         .load_entity_type_cache()
         .await
@@ -478,6 +485,15 @@ async fn row_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
     .fetch_one(pool)
     .await
     .expect("row counts")
+}
+
+/// Every `events` row: the table has no row security, so an event is seen
+/// by every reader of the stream.
+async fn event_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events")
+        .fetch_one(pool)
+        .await
+        .expect("event count")
 }
 
 async fn workflow_named(pool: &PgPool, name: &str, generation: i32) -> Option<Uuid> {
@@ -966,10 +982,11 @@ async fn a_roster_row_team_writer_works_through_rest(pool: PgPool) {
     team_writer_cycle(&pool, &w, Via::Rest(&w.router, w.dr), w.dr, "dr-rest").await;
 }
 
-/// A team writer cannot touch the operator's workflows: the lineage gate
-/// keeps its arms (submitter, its operator, the audited admin arm), so a
-/// writer who is none of those is refused on every write tool, and a legacy
-/// (unrecorded) workflow stays admin-only over the authenticated transport.
+/// A team writer cannot touch the operator's workflows: the lineage gate's
+/// arms are the submitter, its operator, a writer of the workflow's OWNER
+/// GROUP and the audited admin arm, and a writer of another group (its team)
+/// is none of those, so it is refused on every write tool, the legacy
+/// (unrecorded) workflow in the operator's group included.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_workflow(pool: PgPool) {
     let w = world(&pool).await;
@@ -983,6 +1000,11 @@ async fn the_lineage_gate_still_refuses_a_team_writer_on_another_submitters_work
     let wf = workflow_named(&pool, name, 0)
         .await
         .expect("the operator's workflow");
+    assert!(
+        !writes(&pool, w.rb, workflow_row(&pool, wf).await.1).await
+            && !writes(&pool, w.rb, w.op_g).await,
+        "PREMISE: rb writes neither the workflow's owner group nor the legacy row's"
+    );
     let steps: Vec<Uuid> = plan(&pool, wf)
         .await
         .into_iter()
@@ -1369,6 +1391,7 @@ async fn a_non_writers_exact_re_ingest_changes_nothing(pool: PgPool) {
     );
     let row_before = row_text(&pool, legacy).await;
     let counts_before = row_counts(&pool).await;
+    let events_before = event_count(&pool).await;
 
     let mut poisoned = extraction(LEGACY, 0, 2);
     poisoned["source"]["goal"] = json!("acme poisoned goal text");
@@ -1391,6 +1414,11 @@ async fn a_non_writers_exact_re_ingest_changes_nothing(pool: PgPool) {
         row_counts(&pool).await,
         counts_before,
         "nothing else was written"
+    );
+    assert_eq!(
+        event_count(&pool).await,
+        events_before,
+        "no `workflow.created` event announces the caller's goal for a row it did not create"
     );
 }
 
@@ -1517,6 +1545,62 @@ async fn a_writer_of_the_owner_group_edits_a_workflow_it_did_not_submit(pool: Pg
         );
     }
 
+    // A READER of alpha reads both rows, so its refusal is the gate's own
+    // (the arm declined: it does not write the owner group), not a not-found.
+    let (rd, _) = fixture::seed_human_operator(&pool, "acme-alpha-reader").await;
+    add_roster_row(&pool, w.alpha, rd, "reader").await;
+    assert!(
+        !writes(&pool, rd, w.alpha).await,
+        "PREMISE: rd reads alpha, does not write it"
+    );
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, rd), "mcp"),
+        (Via::Rest(&w.router, rd), "rest"),
+    ] {
+        let by_the_gate = |what: &str, r: Result<String, String>| {
+            let e = r.expect_err(&format!("{tag}: a reader is refused {what}"));
+            let gate = if tag == "mcp" {
+                e.contains("does not write the workflow's owner group")
+            } else {
+                e.starts_with("403") && e.contains("a writer of its owner group")
+            };
+            assert!(gate, "{tag}: {what} refused by the gate's arms: {e}");
+        };
+        let before = row_counts(&pool).await;
+        by_the_gate(
+            "add_step",
+            via.add_step(shared, "acme reader step")
+                .await
+                .map(|_| String::new()),
+        );
+        by_the_gate(
+            "add_step on the unrecorded row",
+            via.add_step(unrecorded, "acme reader step")
+                .await
+                .map(|_| String::new()),
+        );
+        let lineage = step_lineage(&pool, steps[0]).await;
+        by_the_gate(
+            "delete_step",
+            via.delete_step(shared, lineage)
+                .await
+                .map(|_| String::new()),
+        );
+        by_the_gate(
+            "the next generation",
+            via.ingest(&extraction(shared, 1, 1), None)
+                .await
+                .map(|_| String::new()),
+        );
+        let evolved = via.evolve(steps[0], "acme reader revision").await;
+        assert!(evolved.is_err(), "{tag}: a reader is refused evolve_step");
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "{tag}: the reader's refusals wrote nothing"
+        );
+    }
+
     // rb writes alpha (role binding) and submitted neither: admitted on both
     // transports, on the submitted row and on the unrecorded one.
     for (via, tag) in [
@@ -1579,14 +1663,55 @@ async fn a_writer_of_the_owner_group_edits_a_workflow_it_did_not_submit(pool: Pg
         Some(w.dr.to_string()),
         "the lineage keeps its submitter"
     );
+    // ... and over MCP too, from the generation REST just published.
+    let g2 = uuid_of(
+        &via_ok(
+            Via::McpHttp(&w.mcp, w.rb)
+                .ingest(&extraction(shared, 2, 1), None)
+                .await,
+        )["workflow_id"],
+    );
+    let (v2, owner2, submitter2, parent2) = workflow_row(&pool, g2).await;
+    assert_eq!(
+        (v2.as_str(), owner2, parent2),
+        ("group", w.alpha, Some(g1)),
+        "the MCP generation stays in the lineage, private to alpha"
+    );
+    assert_eq!(submitter2, Some(w.dr.to_string()));
 
-    // stdio: the linked agent joins alpha and edits dr's workflow as a writer.
+    // stdio: the linked agent joins alpha and edits dr's workflow as a writer:
+    // add, delete, evolve and the next generation.
     add_roster_row(&pool, w.alpha, w.c, "writer").await;
-    let (added, _) = Via::McpStdio(&w.c_server)
+    let stdio = Via::McpStdio(&w.c_server);
+    let (added, added_lineage) = stdio
         .add_step(shared, "acme stdio co-writer step")
         .await
         .expect("a stdio co-writer adds a step");
     assert_eq!(claim_row(&pool, added).await.0, w.c);
+    stdio
+        .delete_step(shared, added_lineage)
+        .await
+        .expect("a stdio co-writer deletes a step");
+    let revised = stdio
+        .evolve(steps[0], "acme stdio co-writer revision")
+        .await
+        .expect("a stdio co-writer evolves a step");
+    assert_eq!(claim_row(&pool, revised).await.0, w.c);
+    let g3 = uuid_of(&via_ok(stdio.ingest(&extraction(shared, 3, 1), None).await)["workflow_id"]);
+    let (_, owner3, _, parent3) = workflow_row(&pool, g3).await;
+    assert_eq!((owner3, parent3), (w.alpha, Some(g2)));
+    // The step tools act on the lineage's head, so the rows may name any
+    // generation of it.
+    let mut stdio_arms = Vec::new();
+    for wf in [shared_wf, g1, g2] {
+        stdio_arms.extend(caller_write_arms(&pool, wf).await);
+    }
+    assert!(
+        stdio_arms
+            .iter()
+            .any(|(arm, acting, _)| arm == "owner_group_writer" && *acting == w.c.to_string()),
+        "the stdio co-writer's arm is recorded: {stdio_arms:?}"
+    );
 }
 
 /// An agent bound to a human through an allowlisted client (the shape a
@@ -1642,11 +1767,40 @@ async fn an_allowlisted_agent_of_a_human_gains_no_edit_over_its_workflows(pool: 
         .execute(&pool)
         .await
         .expect("make the row public");
+    // The token is shaped as `oauth/token.rs` mints it for the allowlisted
+    // client: its id, the client row's (unset) owner, the client's agent. The
+    // binding to `h` is found from that agent, so the call below is the bound
+    // agent's own, and the refusal must be the gate's final one, after every
+    // arm (submitter, operator, owner-group writer, admin) declined.
+    let mut auth = http_auth(agent);
+    auth.client_id = client;
+    auth.owner_id = None;
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.mcp, Some(&auth))
+        .await
+        .expect("an allowlisted agent resolves an HTTP viewer");
     let before = row_counts(&pool).await;
-    let refused = Via::McpHttp(&w.mcp, agent)
-        .add_step(name, "acme bound agent step")
-        .await;
-    assert!(refused.is_err(), "{refused:?}");
+    let refused = epigraph_mcp::tools::step_ops::add_step(
+        &w.mcp,
+        &viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: name.to_string(),
+            step_text: "acme bound agent step".to_string(),
+            position: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect_err("the binding to h admits nothing");
+    assert!(
+        refused
+            .message
+            .contains(&format!("was submitted by agent {h}"))
+            && refused
+                .message
+                .contains("does not write the workflow's owner group"),
+        "refused by the gate itself, after every arm: {}",
+        refused.message
+    );
     assert_eq!(row_counts(&pool).await, before);
 }
 
@@ -1805,66 +1959,123 @@ async fn an_explicitly_public_workflow_write_is_public(pool: PgPool) {
 
 /// A new generation keeps its lineage's visibility: public stays public (in
 /// the lineage's group when the caller writes it, else the caller's own),
-/// group stays group. Declaring public on a group-private lineage would
-/// publish it, and is refused with nothing written.
+/// group stays group, on MCP and on REST. A step added to a plan takes the
+/// plan's tenancy. Declaring a GROUP the caller writes on a public lineage's
+/// next generation makes that generation private (the lineage's earlier rows
+/// are untouched); declaring PUBLIC on a group-private lineage would publish
+/// it, and is refused with nothing written.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_new_generation_keeps_its_lineages_visibility(pool: PgPool) {
     let w = world(&pool).await;
-    let via = Via::McpHttp(&w.mcp, w.rb);
-    let public_name = "acme-keep-public";
-    let group_name = "acme-keep-group";
-    via_ok(
-        via.ingest_with(
-            &extraction(public_name, 0, 1),
-            Some(json!({"visibility": "public", "owner_group_id": w.alpha})),
-        )
-        .await,
-    );
-    via_ok(via.ingest(&extraction(group_name, 0, 1), None).await);
-    let g1 =
-        uuid_of(&via_ok(via.ingest(&extraction(public_name, 1, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g1).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("public", w.alpha),
-        "public lineage, same group"
-    );
-    let (added, _) = via
-        .add_step(public_name, "acme keep public step")
-        .await
-        .expect("add");
-    assert_eq!(
-        claim_row(&pool, added).await,
-        (w.rb, "public".into(), w.alpha)
-    );
-    let g1 = uuid_of(&via_ok(via.ingest(&extraction(group_name, 1, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g1).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("group", w.alpha),
-        "group lineage stays group"
-    );
+    let public_alpha = json!({"visibility": "public", "owner_group_id": w.alpha});
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, w.rb), "mcp"),
+        (Via::Rest(&w.router, w.rb), "rest"),
+    ] {
+        let public_name = format!("acme-keep-public-{tag}");
+        let group_name = format!("acme-keep-group-{tag}");
+        let (public_name, group_name) = (public_name.as_str(), group_name.as_str());
+        via_ok(
+            via.ingest_with(&extraction(public_name, 0, 1), Some(public_alpha.clone()))
+                .await,
+        );
+        via_ok(via.ingest(&extraction(group_name, 0, 1), None).await);
+        // rb's own public lineage, extended once rb has left alpha (below).
+        via_ok(
+            via.ingest_with(
+                &extraction(&format!("acme-keep-public-outside-{tag}"), 0, 1),
+                Some(public_alpha.clone()),
+            )
+            .await,
+        );
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(public_name, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("public", w.alpha),
+            "{tag}: public lineage, same group"
+        );
+        let (added, _) = via
+            .add_step(public_name, "acme keep public step")
+            .await
+            .expect("add to the public plan");
+        assert_eq!(
+            claim_row(&pool, added).await,
+            (w.rb, "public".into(), w.alpha),
+            "{tag}: a step on a public plan is public"
+        );
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(group_name, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("group", w.alpha),
+            "{tag}: group lineage stays group"
+        );
+        let (added, _) = via
+            .add_step(group_name, "acme keep group step")
+            .await
+            .expect("add to the group plan");
+        assert_eq!(
+            claim_row(&pool, added).await,
+            (w.rb, "group".into(), w.alpha),
+            "{tag}: a step on a group plan is private to the group"
+        );
 
-    let before = row_counts(&pool).await;
-    let refused = via
-        .ingest_with(
-            &extraction(group_name, 2, 1),
-            Some(json!({"visibility": "public", "owner_group_id": w.alpha})),
-        )
-        .await;
-    assert!(refused.is_err(), "publishing a group lineage: {refused:?}");
-    assert_eq!(row_counts(&pool).await, before, "nothing written");
-    assert_eq!(workflow_named(&pool, group_name, 2).await, None);
+        let before = row_counts(&pool).await;
+        let refused = via
+            .ingest_with(&extraction(group_name, 2, 1), Some(public_alpha.clone()))
+            .await;
+        assert!(
+            refused.is_err(),
+            "{tag}: publishing a group lineage: {refused:?}"
+        );
+        assert_eq!(row_counts(&pool).await, before, "{tag}: nothing written");
+        assert_eq!(workflow_named(&pool, group_name, 2).await, None);
 
+        // Declared GROUP on a public lineage: the new generation is private,
+        // in the lineage, and the public generations stay public.
+        let g2 = uuid_of(
+            &via_ok(
+                via.ingest(&extraction(public_name, 2, 1), Some(w.alpha))
+                    .await,
+            )["workflow_id"],
+        );
+        let (v, owner, _, parent) = workflow_row(&pool, g2).await;
+        assert_eq!(
+            (v.as_str(), owner, parent),
+            ("group", w.alpha, Some(g1_of(&pool, public_name).await)),
+            "{tag}: a declared group narrows only the new generation"
+        );
+        for gen in [0, 1] {
+            let row = workflow_named(&pool, public_name, gen).await.expect("row");
+            assert_eq!(workflow_row(&pool, row).await.0, "public");
+        }
+    }
+
+    // rb leaves alpha. Its own public lineage (submitted above, never
+    // narrowed) gets its next generation in rb's own group, still public.
     end_role(&pool, w.rb_role).await;
-    let g2 =
-        uuid_of(&via_ok(via.ingest(&extraction(public_name, 2, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g2).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("public", w.rb_g),
-        "a public lineage outside the caller's groups stays public, in its own group"
-    );
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, w.rb), "mcp"),
+        (Via::Rest(&w.router, w.rb), "rest"),
+    ] {
+        let outside = format!("acme-keep-public-outside-{tag}");
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(&outside, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("public", w.rb_g),
+            "{tag}: a public lineage outside the caller's groups stays public, in its own group"
+        );
+    }
+}
+
+/// The generation-1 row of `name`.
+async fn g1_of(pool: &PgPool, name: &str) -> Uuid {
+    workflow_named(pool, name, 1).await.expect("generation 1")
 }
 
 /// `deprecate_workflow` with `cascade` reads the lineage on the caller's own

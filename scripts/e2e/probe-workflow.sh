@@ -183,7 +183,7 @@ q "SELECT a.display_name||' x'||count(*) FROM claims c JOIN agents a ON a.id=c.a
 
 echo
 echo "=== REACHABILITY: can any DISCOVERY tool hand deprecate_workflow a"
-echo "=== system-agent-owned CLAIM id? (Since U017 deprecate_workflow forks on"
+echo "=== CLAIM id owned by another agent? (Since U017 deprecate_workflow forks on"
 echo "=== the id: a claim the caller can read takes the flat author-stamped path,"
 echo "=== a workflows row the hierarchical path, anything else is an error. So"
 echo "=== only a readable CLAIM id reaches the flat path's foreign-owner case.)"

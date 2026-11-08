@@ -290,9 +290,9 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. It runs on `add_step`'s system-agent-stamped
-    /// transaction, which `workflows`' row security (migration 183) bounds to
-    /// the rows that stamp reads.
+    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction,
+    /// which `workflows`' row security (migration 183) bounds to the rows that
+    /// stamp reads.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -401,7 +401,7 @@ impl WorkflowRepository {
     ///    `workflow_ingest::a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2`.
     ///
     /// Since migration 183 `workflows` has row security keyed on the plan's
-    /// tenancy; both callers run this on the plan walk's system-agent-stamped
+    /// tenancy; both callers run this on the plan walk's caller-stamped
     /// transaction, so it reads what that stamp reads.
     ///
     /// # Errors
@@ -2243,10 +2243,10 @@ impl WorkflowRepository {
     /// Level-3 operation atoms are excluded outright: their ids are content-only
     /// and global, so a document may share one.
     ///
-    /// The read rides the deprecation's own system-stamped transaction and is
-    /// not filtered by a caller viewer on purpose: workflow claims belong to
-    /// the ingest system agent, and the authority decision is the workflow
-    /// authority rule over the `workflows` row, not read visibility.
+    /// The read rides the deprecation's own caller-stamped transaction and is
+    /// not filtered by a viewer on purpose: that stamp's row security already
+    /// bounds it, and the authority decision is the workflow authority rule
+    /// over the `workflows` row, not read visibility.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -2256,7 +2256,7 @@ impl WorkflowRepository {
         deprecating: &[Uuid],
     ) -> Result<Vec<ExecutedClaim>, sqlx::Error> {
         let rows: Vec<(Uuid, bool)> = sqlx::query_as(
-            "-- VISIBILITY-EXEMPT: WRITE path. The deprecation this read plans is gated by the workflow authority rule over the workflows row; the claims are the ingest system agent's and the read rides that agent's stamped transaction.
+            "-- VISIBILITY-EXEMPT: WRITE path. The deprecation this read plans is gated by the workflow authority rule over the workflows row; the read rides the deprecation's caller-stamped transaction, which row security bounds.
              SELECT DISTINCT c.id, \
                     EXISTS (SELECT 1 FROM edges e2 JOIN workflows w2 ON w2.id = e2.source_id \
                              WHERE e2.target_id = c.id AND e2.relationship = 'executes' \
