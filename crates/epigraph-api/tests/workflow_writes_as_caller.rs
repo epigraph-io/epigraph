@@ -1642,11 +1642,40 @@ async fn an_allowlisted_agent_of_a_human_gains_no_edit_over_its_workflows(pool: 
         .execute(&pool)
         .await
         .expect("make the row public");
+    // The token is shaped as `oauth/token.rs` mints it for the allowlisted
+    // client: its id, the client row's (unset) owner, the client's agent. The
+    // binding to `h` is found from that agent, so the call below is the bound
+    // agent's own, and the refusal must be the gate's final one, after every
+    // arm (submitter, operator, owner-group writer, admin) declined.
+    let mut auth = http_auth(agent);
+    auth.client_id = client;
+    auth.owner_id = None;
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.mcp, Some(&auth))
+        .await
+        .expect("an allowlisted agent resolves an HTTP viewer");
     let before = row_counts(&pool).await;
-    let refused = Via::McpHttp(&w.mcp, agent)
-        .add_step(name, "acme bound agent step")
-        .await;
-    assert!(refused.is_err(), "{refused:?}");
+    let refused = epigraph_mcp::tools::step_ops::add_step(
+        &w.mcp,
+        &viewer,
+        epigraph_mcp::tools::step_ops::AddStepParams {
+            canonical_name: name.to_string(),
+            step_text: "acme bound agent step".to_string(),
+            position: None,
+        },
+        Some(&auth),
+    )
+    .await
+    .expect_err("the binding to h admits nothing");
+    assert!(
+        refused
+            .message
+            .contains(&format!("was submitted by agent {h}"))
+            && refused
+                .message
+                .contains("does not write the workflow's owner group"),
+        "refused by the gate itself, after every arm: {}",
+        refused.message
+    );
     assert_eq!(row_counts(&pool).await, before);
 }
 
