@@ -146,7 +146,9 @@ pub use repos::{
     SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
-    create_ingest_written_edge_if_absent_conn, ingest_only_edge_refusal, ingest_written,
+    create_ingest_written_edge_if_absent_conn, credited_agent_end, ingest_only_edge_refusal,
+    ingest_written, staged_provenance_refusal_sql, CreditedEnd, AGENT_SOURCE_AUTHORSHIP,
+    AGENT_TARGET_AUTHORSHIP, OPERATED_BY_REFUSAL, OPERATED_BY_RELATIONSHIP,
     ingest_written_by_sql, ingest_written_edge_sql, is_agent_attribution, same_ingest_sql,
     without_ingest_marker, ClaimIngestRecord, ClaimIngestRepository, ClaimIngests,
     AGENT_ATTRIBUTION_REFUSAL, CREATED_CLAIM_PROPERTY, INGESTED_BY_PROPERTY, INGEST_ONLY_REFUSAL,

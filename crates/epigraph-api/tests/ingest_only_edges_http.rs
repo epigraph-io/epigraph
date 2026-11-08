@@ -9,9 +9,15 @@
 //!   live binding. Anyone else's would put words in that agent's mouth: the
 //!   edge lands world-owned, so neither the agent nor the writer could take
 //!   it back.
-//! * `paper -asserts-> claim`, any `authored` edge into a paper, and the
-//!   ingest's own `ingested_claim` record are written only by the document
-//!   ingest. Refused for every caller, the paper's own authors included.
+//! * The same authorship written the other way round (`claim
+//!   -attributed_to-> agent` and every other relationship that credits the
+//!   TARGET agent with the source's content), and an agent's `generated`,
+//!   likewise. The operator link's own `OPERATED_BY` is refused for every
+//!   caller.
+//! * `paper -asserts-> claim`, a paper's `AUTHORED`, any `authored` edge into
+//!   a paper, and the ingest's own `ingested_claim` record are written only
+//!   by the document ingest. Refused for every caller, the paper's own
+//!   authors included.
 //!
 //! Every refusal writes nothing (the edge count is measured), and every
 //! refusal has an accepted positive control. All names are invented.
@@ -229,15 +235,25 @@ async fn the_ingest_only_relationships_are_refused_for_every_caller(pool: PgPool
         for (source, target, relationship) in [
             ((doc, "paper"), (claim, "claim"), "asserts"),
             ((doc, "paper"), (claim, "claim"), "ASSERTS"),
+            ((doc, "paper"), (claim, "claim"), "AUTHORED"),
             ((doc, "paper"), (claim, "claim"), "ingested_claim"),
             ((caller, "agent"), (doc, "paper"), "AUTHORED"),
             ((caller, "agent"), (doc, "paper"), "authored"),
         ] {
             let before = edge_count(&pool).await;
             let (status, body) = post_edge(&state, caller, source, target, relationship).await;
+            // The gate's own refusal, not the relationship list's: several of
+            // these spellings are not in that list, which would refuse them
+            // with a 400 of its own.
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{caller}: {relationship} {source:?} -> {target:?}: {body}"
+            );
             assert!(
-                status.is_client_error(),
-                "{caller}: {relationship} {source:?} -> {target:?}: {status} {body}"
+                body.to_string().contains("document ingest"),
+                "{caller}: {relationship} {source:?} -> {target:?}: the refusal names the \
+                 only writer: {body}"
             );
             assert_eq!(
                 edge_count(&pool).await,
@@ -245,18 +261,6 @@ async fn the_ingest_only_relationships_are_refused_for_every_caller(pool: PgPool
                 "{relationship} {source:?} -> {target:?}: nothing written"
             );
         }
-        let (status, body) = post_edge(
-            &state,
-            stranger,
-            (doc, "paper"),
-            (claim, "claim"),
-            "asserts",
-        )
-        .await;
-        assert!(
-            body.to_string().contains("document ingest"),
-            "the refusal names the only writer: {status} {body}"
-        );
     }
 
     let (status, body) = post_edge(
@@ -375,3 +379,131 @@ async fn a_group_writer_cannot_rewrite_its_claims_ingest_record(pool: PgPool) {
     assert_eq!(after["created_claim"], false, "{after}");
     assert_eq!(after["ingested_by"], other.to_string(), "{after}");
 }
+
+/// `GET /api/v1/agents/:id/claims` as `caller` with `claims:read`: the total.
+async fn attributed_total(state: &AppState, caller: Uuid, agent: Uuid) -> i64 {
+    let token = common::mint_token_with_agent(&["claims:read"], caller);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/v1/agents/{agent}/claims"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let resp = create_router(state.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK, "attributed claims");
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("json");
+    body["total"].as_i64().expect("total")
+}
+
+/// The same authorship written the other way round: an edge ONTO an agent
+/// that credits it with the source's content (`claim -attributed_to-> agent`
+/// and every other spelling the relationship list accepts), and an agent's
+/// `generated`. A stranger is refused for a registered human and for an
+/// agent that human operates (403, nothing written), and a third party's
+/// `GET /api/v1/agents/:id/claims` lists none of it. The operator link's own
+/// `OPERATED_BY` is refused for every caller (400). CONTROLS: the human
+/// attributes its own claim to itself, and a claim to the agent it operates.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reverse_attribution_is_accepted_only_for_the_caller_or_its_live_agent(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "rev-stranger").await;
+    let (reader, _) = viewer_fixture::seed_agent_with_group(&pool, "rev-reader").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "rev-human").await;
+    let (bot, _) = viewer_fixture::seed_agent_with_group(&pool, "rev-bot").await;
+    link(&pool, bot, human).await;
+    let forged = viewer_fixture::seed_public_claim(&pool, stranger, "a stranger's claim").await;
+    let own = viewer_fixture::seed_public_claim(&pool, human, "the human's own claim").await;
+    let human_before = attributed_total(&state, reader, human).await;
+
+    for target in [human, bot] {
+        for relationship in [
+            "attributed_to",
+            "ATTRIBUTED_TO",
+            "authored_by",
+            "ORIGINATED_BY",
+            "AMPLIFIED_BY",
+            "GENERATED_BY",
+            "interpreted_by",
+        ] {
+            let before = edge_count(&pool).await;
+            let (status, body) = post_edge(
+                &state,
+                stranger,
+                (forged, "claim"),
+                (target, "agent"),
+                relationship,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "a stranger's claim -{relationship}-> {target}: {body}"
+            );
+            assert!(
+                body.to_string().contains("operates"),
+                "the refusal says whose edge it may write: {body}"
+            );
+            assert_eq!(edge_count(&pool).await, before, "nothing written");
+        }
+        let before = edge_count(&pool).await;
+        let (status, body) = post_edge(
+            &state,
+            stranger,
+            (target, "agent"),
+            (forged, "claim"),
+            "generated",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{target} -generated->: {body}");
+        assert_eq!(edge_count(&pool).await, before, "nothing written");
+    }
+    assert_eq!(
+        attributed_total(&state, reader, human).await,
+        human_before,
+        "a third party sees no forged attribution"
+    );
+
+    for caller in [stranger, human] {
+        for relationship in ["OPERATED_BY", "operated_by"] {
+            let before = edge_count(&pool).await;
+            let (status, body) =
+                post_edge(&state, caller, (bot, "agent"), (caller, "agent"), relationship).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{relationship}: {body}");
+            assert!(
+                body.to_string().contains("operator link"),
+                "the refusal names the only writer: {body}"
+            );
+            assert_eq!(edge_count(&pool).await, before, "nothing written");
+        }
+    }
+
+    // CONTROLS: the human itself, and the agent it operates.
+    let (status, body) = post_edge(
+        &state,
+        human,
+        (own, "claim"),
+        (human, "agent"),
+        "attributed_to",
+    )
+    .await;
+    assert!(status.is_success(), "CONTROL self: {status} {body}");
+    let (status, body) = post_edge(
+        &state,
+        human,
+        (own, "claim"),
+        (bot, "agent"),
+        "ORIGINATED_BY",
+    )
+    .await;
+    assert!(status.is_success(), "CONTROL operated: {status} {body}");
+    assert_eq!(
+        attributed_total(&state, reader, human).await,
+        human_before + 1,
+        "CONTROL: the human's own attribution is listed"
+    );
+}
+
