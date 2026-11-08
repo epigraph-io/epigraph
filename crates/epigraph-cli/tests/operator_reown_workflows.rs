@@ -2501,3 +2501,51 @@ async fn catch_up_never_moves_a_private_step_the_main_act_left(pool: PgPool) {
     assert_eq!(tenancy(&pool, "claims", q).await, src_private);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A private step the moved plan executes DIRECTLY (one with no step lineage,
+/// added to generation 1 after the move and kept in the source's private
+/// state) that the stray generation then executes too is not the stray
+/// generation's alone: it stays the source's, and nothing hands it to the
+/// target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_never_moves_a_private_step_the_moved_plan_executes(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let s = private_reingest(&pool, &fx).await;
+    let (k, e_k) = {
+        let mut m = pool.acquire().await.expect("acquire");
+        let k = claim(
+            &mut m,
+            fx.operator,
+            fx.src,
+            "group",
+            2,
+            "alpha step ten, kept private in the moved plan",
+        )
+        .await;
+        edge(&mut m, (fx.w_a1, "workflow"), (k, "claim"), "executes").await;
+        let e_k = edge(&mut m, (s.w_a2, "workflow"), (k, "claim"), "executes").await;
+        (k, e_k)
+    };
+    let src_private = (fx.src, "group".to_string());
+    assert_eq!(tenancy(&pool, "claims", k).await, src_private, "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "workflows", fx.w_a1).await,
+        (fx.target, "group".to_string()),
+        "PREMISE: generation 1 is in the target state"
+    );
+    let step_lineage: Option<Uuid> =
+        sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+            .bind(k)
+            .fetch_one(&pool)
+            .await
+            .expect("step lineage");
+    assert_eq!(step_lineage, None, "PREMISE: reached only directly");
+    // K is executed by the target-state generation 1 as well, so it is not
+    // the stray generation's own; its private `executes` edge from the moving
+    // generation would become the target's: the lineage holds.
+    catch_up_holds_on(&pool, &fx, &dir, &s, e_k).await;
+    assert_eq!(tenancy(&pool, "claims", k).await, src_private);
+    std::fs::remove_dir_all(&dir).ok();
+}
