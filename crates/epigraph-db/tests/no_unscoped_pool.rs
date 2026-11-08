@@ -340,7 +340,6 @@
 //!   recompute_claim_belief}`, `routes/events.rs::retain_visible_events`,
 //!   `routes/graph_query_utils.rs::load_subgraph`,
 //!   `routes/independence.rs::analyze_independence`,
-//!   `routes/provenance.rs::{find_or_create_author_agent, find_or_create_org_agent}`,
 //!   `routes/webhooks.rs::{retain_visible_subscriptions, agent_principal_exists,
 //!   agent_is_not_operated, agent_may_receive, deliver_event}`,
 //!   `routes/workflows.rs::{get_or_create_system_agent,
@@ -743,7 +742,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// the caller's stamped read (`routes/graph.rs` 3 -> 2), confirmed by
 /// `the_scanner_is_not_vacuous` passing on the converted tree. No file reached
 /// zero.
-const HIGH_WATER: usize = 221;
+///
+/// 221 -> 220: `set_provenance` holds a `Viewer` and runs every read and
+/// write on the caller's stamped transaction, its organization helper on that
+/// connection; `routes/provenance.rs` reached zero and its key was DELETED
+/// (`HIGH_WATER_FILES` falls by one with it).
+const HIGH_WATER: usize = 220;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -808,7 +812,7 @@ const HIGH_WATER: usize = 221;
 /// 43 -> 42 when `routes/entities.rs` reached zero (backlog 850dcc61).
 /// 42 -> 41 when `routes/challenge.rs` reached zero (backlog 2f2eeaea).
 /// 41 -> 40 when `routes/groups.rs` reached zero (backlog 323773fe).
-const HIGH_WATER_FILES: usize = 40;
+const HIGH_WATER_FILES: usize = 39;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -1033,7 +1037,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
     ("routes/political.rs", 5),
-    ("routes/provenance.rs", 1),
     ("routes/rag.rs", 2),
     // `routes/reasoning.rs` was 1 and is GONE, not zeroed: `analyze`'s edge
     // loader moved onto `AppState::read_as` and

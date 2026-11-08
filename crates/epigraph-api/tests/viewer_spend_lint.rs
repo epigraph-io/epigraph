@@ -1030,6 +1030,27 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "require_plan_authority",
         ],
     ),
+    // write on a transaction stamped with the caller's viewer: the claim is
+    // read through the viewer; the rest is identity data every session reads
+    // (the agent a name or ORCID derives, the system-agent registry) and the
+    // authority check `AgentRepository::speaks_for` (is the caller the claim's
+    // filer, each author and the ingestion agent, or its human through a live
+    // binding), then the four edge writes and the organization agent, which
+    // the edge trigger and WITH CHECK decide.
+    (
+        "provenance.rs",
+        "set_provenance",
+        &[
+            "AgentRepository::get_by_public_key",
+            "AgentRepository::speaks_for",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "EdgeRepository::create_signed_conn",
+            "SystemAgentRepository::registered_agent_ids",
+            "find_or_create_org_agent",
+        ],
+    ),
     // no SQL: the query embedding.
     ("rag.rs", "rag_context", &["generate_query_embedding"]),
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),

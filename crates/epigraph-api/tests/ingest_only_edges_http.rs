@@ -18,6 +18,9 @@
 //!   a paper, and the ingest's own `ingested_claim` record are written only
 //!   by the document ingest. Refused for every caller, the paper's own
 //!   authors included.
+//! * `POST /api/v1/claims/:id/provenance` (claim -ATTRIBUTED_TO-> author,
+//!   author -AUTHORED-> claim) only by the claim's filer or its operator, and
+//!   only for authors the caller is or operates.
 //!
 //! Every refusal writes nothing (the edge count is measured), and every
 //! refusal has an accepted positive control. All names are invented.
@@ -507,3 +510,120 @@ async fn a_reverse_attribution_is_accepted_only_for_the_caller_or_its_live_agent
     );
 }
 
+/// `POST /api/v1/claims/:id/provenance` as `caller` holding `scopes`.
+async fn post_provenance(
+    state: &AppState,
+    caller: Uuid,
+    scopes: &[&str],
+    claim: Uuid,
+    body: Value,
+) -> (StatusCode, Value) {
+    let token = common::mint_token_with_agent(scopes, caller);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/claims/{claim}/provenance"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = create_router(state.clone())
+        .oneshot(req)
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn agent_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM agents")
+        .fetch_one(pool)
+        .await
+        .expect("count agents")
+}
+
+/// The provenance route writes `claim -ATTRIBUTED_TO-> author` and
+/// `author -AUTHORED-> claim`, world-owned. A stranger (with or without write
+/// scopes) cannot attach authors to someone else's claim; the claim's own
+/// filer cannot attach a third party it does not operate (there is no
+/// document to record that person's authorship on), nor name another agent as
+/// the ingestion agent. Every refusal writes no edge and creates no agent.
+/// CONTROL: a human attaches, to its own claim, an author node it operates
+/// and itself as the ingestion agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provenance_is_attached_only_by_the_filer_for_authors_it_speaks_for(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "prov-stranger").await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "prov-human").await;
+    let victim = viewer_fixture::seed_public_claim(&pool, human, "the human's claim").await;
+    let write = ["claims:write", "edges:write"];
+    let third_party = json!({"authors": [{"name": "Orsolya Quennell"}]});
+
+    for (caller, scopes, claim, body, want, says) in [
+        (stranger, &["claims:read"][..], victim, third_party.clone(), StatusCode::FORBIDDEN, ""),
+        (stranger, &write[..], victim, third_party.clone(), StatusCode::FORBIDDEN, "filer"),
+        (human, &write[..], victim, third_party.clone(), StatusCode::FORBIDDEN, "countersignature"),
+        (
+            human,
+            &write[..],
+            victim,
+            json!({"authors": [], "ingestion_agent_id": stranger}),
+            StatusCode::FORBIDDEN,
+            "ingestion agent",
+        ),
+    ] {
+        let (edges, agents) = (edge_count(&pool).await, agent_count(&pool).await);
+        let (status, got) = post_provenance(&state, caller, scopes, claim, body.clone()).await;
+        assert_eq!(status, want, "{caller} {scopes:?} {body}: {got}");
+        assert!(got.to_string().contains(says), "{body}: {got}");
+        assert_eq!(edge_count(&pool).await, edges, "{body}: no edge written");
+        assert_eq!(agent_count(&pool).await, agents, "{body}: no agent created");
+    }
+
+    // CONTROL: the author node a name derives, operated by the human.
+    let name = "Tamsin Ferrow";
+    let node: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(
+        epigraph_crypto::did_key::did_key_for_author(None, name)
+            .1
+            .as_slice(),
+    )
+    .bind(name)
+    .fetch_one(&pool)
+    .await
+    .expect("author node");
+    link(&pool, node, human).await;
+    let (status, got) = post_provenance(
+        &state,
+        human,
+        &write,
+        victim,
+        json!({"authors": [{"name": name, "position": 0}], "ingestion_agent_id": human}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "CONTROL: {got}");
+    assert_eq!(got["edges_created"], 3, "{got}");
+    let written: Vec<(String, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT relationship, source_id, target_id FROM edges \
+          WHERE (source_id = $1 OR target_id = $1) \
+            AND relationship IN ('ATTRIBUTED_TO', 'AUTHORED', 'WAS_ASSOCIATED_WITH') \
+          ORDER BY relationship",
+    )
+    .bind(victim)
+    .fetch_all(&pool)
+    .await
+    .expect("written edges");
+    assert_eq!(
+        written,
+        vec![
+            ("ATTRIBUTED_TO".to_string(), victim, node),
+            ("AUTHORED".to_string(), node, victim),
+            ("WAS_ASSOCIATED_WITH".to_string(), victim, human),
+        ]
+    );
+}
