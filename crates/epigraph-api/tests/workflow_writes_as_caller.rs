@@ -480,6 +480,15 @@ async fn row_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
     .expect("row counts")
 }
 
+/// Every `events` row: the table has no row security, so an event is seen
+/// by every reader of the stream.
+async fn event_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events")
+        .fetch_one(pool)
+        .await
+        .expect("event count")
+}
+
 async fn workflow_named(pool: &PgPool, name: &str, generation: i32) -> Option<Uuid> {
     sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = $1 AND generation = $2")
         .bind(name)
@@ -1369,6 +1378,7 @@ async fn a_non_writers_exact_re_ingest_changes_nothing(pool: PgPool) {
     );
     let row_before = row_text(&pool, legacy).await;
     let counts_before = row_counts(&pool).await;
+    let events_before = event_count(&pool).await;
 
     let mut poisoned = extraction(LEGACY, 0, 2);
     poisoned["source"]["goal"] = json!("acme poisoned goal text");
@@ -1391,6 +1401,11 @@ async fn a_non_writers_exact_re_ingest_changes_nothing(pool: PgPool) {
         row_counts(&pool).await,
         counts_before,
         "nothing else was written"
+    );
+    assert_eq!(
+        event_count(&pool).await,
+        events_before,
+        "no `workflow.created` event announces the caller's goal for a row it did not create"
     );
 }
 
@@ -1517,6 +1532,62 @@ async fn a_writer_of_the_owner_group_edits_a_workflow_it_did_not_submit(pool: Pg
         );
     }
 
+    // A READER of alpha reads both rows, so its refusal is the gate's own
+    // (the arm declined: it does not write the owner group), not a not-found.
+    let (rd, _) = fixture::seed_human_operator(&pool, "acme-alpha-reader").await;
+    add_roster_row(&pool, w.alpha, rd, "reader").await;
+    assert!(
+        !writes(&pool, rd, w.alpha).await,
+        "PREMISE: rd reads alpha, does not write it"
+    );
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, rd), "mcp"),
+        (Via::Rest(&w.router, rd), "rest"),
+    ] {
+        let by_the_gate = |what: &str, r: Result<String, String>| {
+            let e = r.expect_err(&format!("{tag}: a reader is refused {what}"));
+            let gate = if tag == "mcp" {
+                e.contains("does not write the workflow's owner group")
+            } else {
+                e.starts_with("403") && e.contains("a writer of its owner group")
+            };
+            assert!(gate, "{tag}: {what} refused by the gate's arms: {e}");
+        };
+        let before = row_counts(&pool).await;
+        by_the_gate(
+            "add_step",
+            via.add_step(shared, "acme reader step")
+                .await
+                .map(|_| String::new()),
+        );
+        by_the_gate(
+            "add_step on the unrecorded row",
+            via.add_step(unrecorded, "acme reader step")
+                .await
+                .map(|_| String::new()),
+        );
+        let lineage = step_lineage(&pool, steps[0]).await;
+        by_the_gate(
+            "delete_step",
+            via.delete_step(shared, lineage)
+                .await
+                .map(|_| String::new()),
+        );
+        by_the_gate(
+            "the next generation",
+            via.ingest(&extraction(shared, 1, 1), None)
+                .await
+                .map(|_| String::new()),
+        );
+        let evolved = via.evolve(steps[0], "acme reader revision").await;
+        assert!(evolved.is_err(), "{tag}: a reader is refused evolve_step");
+        assert_eq!(
+            row_counts(&pool).await,
+            before,
+            "{tag}: the reader's refusals wrote nothing"
+        );
+    }
+
     // rb writes alpha (role binding) and submitted neither: admitted on both
     // transports, on the submitted row and on the unrecorded one.
     for (via, tag) in [
@@ -1579,14 +1650,55 @@ async fn a_writer_of_the_owner_group_edits_a_workflow_it_did_not_submit(pool: Pg
         Some(w.dr.to_string()),
         "the lineage keeps its submitter"
     );
+    // ... and over MCP too, from the generation REST just published.
+    let g2 = uuid_of(
+        &via_ok(
+            Via::McpHttp(&w.mcp, w.rb)
+                .ingest(&extraction(shared, 2, 1), None)
+                .await,
+        )["workflow_id"],
+    );
+    let (v2, owner2, submitter2, parent2) = workflow_row(&pool, g2).await;
+    assert_eq!(
+        (v2.as_str(), owner2, parent2),
+        ("group", w.alpha, Some(g1)),
+        "the MCP generation stays in the lineage, private to alpha"
+    );
+    assert_eq!(submitter2, Some(w.dr.to_string()));
 
-    // stdio: the linked agent joins alpha and edits dr's workflow as a writer.
+    // stdio: the linked agent joins alpha and edits dr's workflow as a writer:
+    // add, delete, evolve and the next generation.
     add_roster_row(&pool, w.alpha, w.c, "writer").await;
-    let (added, _) = Via::McpStdio(&w.c_server)
+    let stdio = Via::McpStdio(&w.c_server);
+    let (added, added_lineage) = stdio
         .add_step(shared, "acme stdio co-writer step")
         .await
         .expect("a stdio co-writer adds a step");
     assert_eq!(claim_row(&pool, added).await.0, w.c);
+    stdio
+        .delete_step(shared, added_lineage)
+        .await
+        .expect("a stdio co-writer deletes a step");
+    let revised = stdio
+        .evolve(steps[0], "acme stdio co-writer revision")
+        .await
+        .expect("a stdio co-writer evolves a step");
+    assert_eq!(claim_row(&pool, revised).await.0, w.c);
+    let g3 = uuid_of(&via_ok(stdio.ingest(&extraction(shared, 3, 1), None).await)["workflow_id"]);
+    let (_, owner3, _, parent3) = workflow_row(&pool, g3).await;
+    assert_eq!((owner3, parent3), (w.alpha, Some(g2)));
+    // The step tools act on the lineage's head, so the rows may name any
+    // generation of it.
+    let mut stdio_arms = Vec::new();
+    for wf in [shared_wf, g1, g2] {
+        stdio_arms.extend(caller_write_arms(&pool, wf).await);
+    }
+    assert!(
+        stdio_arms
+            .iter()
+            .any(|(arm, acting, _)| arm == "owner_group_writer" && *acting == w.c.to_string()),
+        "the stdio co-writer's arm is recorded: {stdio_arms:?}"
+    );
 }
 
 /// An agent bound to a human through an allowlisted client (the shape a
