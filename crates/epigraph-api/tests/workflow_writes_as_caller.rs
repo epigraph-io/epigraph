@@ -92,8 +92,15 @@ async fn app_scoped(pool: &PgPool) -> ScopedPool {
         .expect("app-role ScopedPool")
 }
 
+/// The REST router on the app role, with an embedder as production has one,
+/// so every REST write here runs its post-commit embeds (the goal embedding a
+/// re-ingest must never store included).
 async fn router(pool: &PgPool) -> axum::Router {
-    let state = AppState::with_scoped_pool(app_scoped(pool).await, ApiConfig::default());
+    let embedder: std::sync::Arc<dyn epigraph_embeddings::EmbeddingService> = std::sync::Arc::new(
+        epigraph_embeddings::MockProvider::new(epigraph_embeddings::EmbeddingConfig::openai(1536)),
+    );
+    let state = AppState::with_scoped_pool(app_scoped(pool).await, ApiConfig::default())
+        .with_embedding_service(embedder);
     state
         .load_entity_type_cache()
         .await
