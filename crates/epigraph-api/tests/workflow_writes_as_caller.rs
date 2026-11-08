@@ -1953,66 +1953,123 @@ async fn an_explicitly_public_workflow_write_is_public(pool: PgPool) {
 
 /// A new generation keeps its lineage's visibility: public stays public (in
 /// the lineage's group when the caller writes it, else the caller's own),
-/// group stays group. Declaring public on a group-private lineage would
-/// publish it, and is refused with nothing written.
+/// group stays group, on MCP and on REST. A step added to a plan takes the
+/// plan's tenancy. Declaring a GROUP the caller writes on a public lineage's
+/// next generation makes that generation private (the lineage's earlier rows
+/// are untouched); declaring PUBLIC on a group-private lineage would publish
+/// it, and is refused with nothing written.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_new_generation_keeps_its_lineages_visibility(pool: PgPool) {
     let w = world(&pool).await;
-    let via = Via::McpHttp(&w.mcp, w.rb);
-    let public_name = "acme-keep-public";
-    let group_name = "acme-keep-group";
-    via_ok(
-        via.ingest_with(
-            &extraction(public_name, 0, 1),
-            Some(json!({"visibility": "public", "owner_group_id": w.alpha})),
-        )
-        .await,
-    );
-    via_ok(via.ingest(&extraction(group_name, 0, 1), None).await);
-    let g1 =
-        uuid_of(&via_ok(via.ingest(&extraction(public_name, 1, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g1).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("public", w.alpha),
-        "public lineage, same group"
-    );
-    let (added, _) = via
-        .add_step(public_name, "acme keep public step")
-        .await
-        .expect("add");
-    assert_eq!(
-        claim_row(&pool, added).await,
-        (w.rb, "public".into(), w.alpha)
-    );
-    let g1 = uuid_of(&via_ok(via.ingest(&extraction(group_name, 1, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g1).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("group", w.alpha),
-        "group lineage stays group"
-    );
+    let public_alpha = json!({"visibility": "public", "owner_group_id": w.alpha});
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, w.rb), "mcp"),
+        (Via::Rest(&w.router, w.rb), "rest"),
+    ] {
+        let public_name = format!("acme-keep-public-{tag}");
+        let group_name = format!("acme-keep-group-{tag}");
+        let (public_name, group_name) = (public_name.as_str(), group_name.as_str());
+        via_ok(
+            via.ingest_with(&extraction(public_name, 0, 1), Some(public_alpha.clone()))
+                .await,
+        );
+        via_ok(via.ingest(&extraction(group_name, 0, 1), None).await);
+        // rb's own public lineage, extended once rb has left alpha (below).
+        via_ok(
+            via.ingest_with(
+                &extraction(&format!("acme-keep-public-outside-{tag}"), 0, 1),
+                Some(public_alpha.clone()),
+            )
+            .await,
+        );
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(public_name, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("public", w.alpha),
+            "{tag}: public lineage, same group"
+        );
+        let (added, _) = via
+            .add_step(public_name, "acme keep public step")
+            .await
+            .expect("add to the public plan");
+        assert_eq!(
+            claim_row(&pool, added).await,
+            (w.rb, "public".into(), w.alpha),
+            "{tag}: a step on a public plan is public"
+        );
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(group_name, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("group", w.alpha),
+            "{tag}: group lineage stays group"
+        );
+        let (added, _) = via
+            .add_step(group_name, "acme keep group step")
+            .await
+            .expect("add to the group plan");
+        assert_eq!(
+            claim_row(&pool, added).await,
+            (w.rb, "group".into(), w.alpha),
+            "{tag}: a step on a group plan is private to the group"
+        );
 
-    let before = row_counts(&pool).await;
-    let refused = via
-        .ingest_with(
-            &extraction(group_name, 2, 1),
-            Some(json!({"visibility": "public", "owner_group_id": w.alpha})),
-        )
-        .await;
-    assert!(refused.is_err(), "publishing a group lineage: {refused:?}");
-    assert_eq!(row_counts(&pool).await, before, "nothing written");
-    assert_eq!(workflow_named(&pool, group_name, 2).await, None);
+        let before = row_counts(&pool).await;
+        let refused = via
+            .ingest_with(&extraction(group_name, 2, 1), Some(public_alpha.clone()))
+            .await;
+        assert!(
+            refused.is_err(),
+            "{tag}: publishing a group lineage: {refused:?}"
+        );
+        assert_eq!(row_counts(&pool).await, before, "{tag}: nothing written");
+        assert_eq!(workflow_named(&pool, group_name, 2).await, None);
 
+        // Declared GROUP on a public lineage: the new generation is private,
+        // in the lineage, and the public generations stay public.
+        let g2 = uuid_of(
+            &via_ok(
+                via.ingest(&extraction(public_name, 2, 1), Some(w.alpha))
+                    .await,
+            )["workflow_id"],
+        );
+        let (v, owner, _, parent) = workflow_row(&pool, g2).await;
+        assert_eq!(
+            (v.as_str(), owner, parent),
+            ("group", w.alpha, Some(g1_of(&pool, public_name).await)),
+            "{tag}: a declared group narrows only the new generation"
+        );
+        for gen in [0, 1] {
+            let row = workflow_named(&pool, public_name, gen).await.expect("row");
+            assert_eq!(workflow_row(&pool, row).await.0, "public");
+        }
+    }
+
+    // rb leaves alpha. Its own public lineage (submitted above, never
+    // narrowed) gets its next generation in rb's own group, still public.
     end_role(&pool, w.rb_role).await;
-    let g2 =
-        uuid_of(&via_ok(via.ingest(&extraction(public_name, 2, 1), None).await)["workflow_id"]);
-    let (v, owner, ..) = workflow_row(&pool, g2).await;
-    assert_eq!(
-        (v.as_str(), owner),
-        ("public", w.rb_g),
-        "a public lineage outside the caller's groups stays public, in its own group"
-    );
+    for (via, tag) in [
+        (Via::McpHttp(&w.mcp, w.rb), "mcp"),
+        (Via::Rest(&w.router, w.rb), "rest"),
+    ] {
+        let outside = format!("acme-keep-public-outside-{tag}");
+        let g1 =
+            uuid_of(&via_ok(via.ingest(&extraction(&outside, 1, 1), None).await)["workflow_id"]);
+        let (v, owner, ..) = workflow_row(&pool, g1).await;
+        assert_eq!(
+            (v.as_str(), owner),
+            ("public", w.rb_g),
+            "{tag}: a public lineage outside the caller's groups stays public, in its own group"
+        );
+    }
+}
+
+/// The generation-1 row of `name`.
+async fn g1_of(pool: &PgPool, name: &str) -> Uuid {
+    workflow_named(pool, name, 1).await.expect("generation 1")
 }
 
 /// `deprecate_workflow` with `cascade` reads the lineage on the caller's own
