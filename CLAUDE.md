@@ -64,7 +64,10 @@ semantics, so `update_labels`, `patch_claim` and `update_with_evidence`'s
 transport (the stdio half closed in batch H-b). Ownership is the claim's
 author, or an agent linked to the same operator as the author (stdio;
 migration 107's operator arms, which is what makes a model-bumped fleet agent
-able to retire its predecessor's items), or the author's operator (HTTP).
+able to retire its predecessor's items), an agent live-linked to the author
+itself (its delegate, operator ruling R-183: one hop, a retired link grants
+nothing; stdio, or over HTTP a live delegated run token), or the author's
+operator (HTTP).
 Over HTTP a `claims:admin` token also passes; its write into a group the admin
 cannot write goes through the audited admin path (batch H-b, D2) on
 `update_labels` / `patch_claim`; `update_with_evidence` has no admin path and
@@ -72,7 +75,7 @@ refuses such a label merge instead. Over HTTP the
 WHOLE label mutation needs that ownership, whatever the labels (as
 `patch_claim` and `PATCH /api/v1/claims/:id/labels` do); on stdio every other
 label stays ungated. A stdio agent that shares no operator with the claim's
-author is now refused, including through `release/epiclaw/CLAUDE.md`'s
+author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
 `update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
 server with no declared signer (`--agent-key` / `--agent-model`) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
