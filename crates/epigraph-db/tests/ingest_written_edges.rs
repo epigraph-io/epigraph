@@ -517,3 +517,65 @@ async fn the_walks_writer_declares_only_its_own_insert(pool: PgPool) {
     .await;
     assert!(r.is_err(), "a shape no read trusts was marked: {r:?}");
 }
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Before the guard, the key was an ordinary property any edges:write caller
+/// could set, so a row carrying it when 198 runs is a hand-written copy. 198
+/// drops the key from such a row (and only the key) before the guard exists.
+#[sqlx::test(migrations = false)]
+async fn migration_198_drops_a_marker_written_before_the_guard(pool: PgPool) {
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < 198)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    let mut conn = pool.acquire().await.expect("acquire");
+    before.run(&mut *conn).await.expect("migrate 001 -> 197");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let p = paper(&pool, "10.9999/marker.legacy.1").await;
+    let x = fixture::seed_public_claim(&pool, author, "a finding").await;
+    let forged: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) VALUES ($1, 'paper', $2, 'claim', 'asserts', $3) \
+         RETURNING id",
+    )
+    .bind(p)
+    .bind(x)
+    .bind(
+        serde_json::json!({ KEY: {"tool": "ingest_document", "by": author.to_string()},
+                              "section": "kept" }),
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("CALIBRATION: before 198 the key is an ordinary property");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    MIGRATOR.run(&mut *conn).await.expect("migrate 197 -> head");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    drop(conn);
+
+    let after = props_of(&pool, forged).await;
+    assert!(
+        after.get(KEY).is_none(),
+        "a pre-guard marker survived 198: {after}"
+    );
+    assert_eq!(after["section"], "kept", "only the key is dropped");
+}

@@ -118,8 +118,17 @@
 -- application layer also refuses the key (RESERVED_EDGE_PROPERTIES) so such
 -- a caller reads a 400 rather than this error.
 --
--- Existing rows are untouched: edges written before this carry no marker
--- and read as unproven until an operator backfills them.
+-- The marker records the ingesting principal: `{"tool": ..., "by": <the
+-- walk's write identity>}`. It proves which principal's ingest wrote the
+-- edge, not that the document is genuine; a read that combines edges into
+-- one fact requires them to name the same principal (`same_ingest_sql`).
+--
+-- EXISTING ROWS: before this guard any edges:write caller could set the key
+-- (it was an ordinary property), so every row that already carries it is a
+-- hand-written copy, never the walk's. This migration DROPS the key from
+-- each such row before the guard exists (a NOTICE reports how many); the
+-- rest of each row is untouched. Edges the ingest wrote before this carry no
+-- marker either, and read as unproven until an operator backfills them.
 --
 -- UNDO:
 --   DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
@@ -200,6 +209,22 @@ BEGIN
             USING ERRCODE = '42501';
     END IF;
     RETURN NEW;
+END $$;
+
+-- Drop every pre-existing copy of the key (see the header), BEFORE the
+-- guard exists, so the strip itself is not refused.
+DO $$
+DECLARE
+    v_stripped bigint;
+BEGIN
+    -- Fail closed: on a migrating role that row security would filter, the
+    -- UPDATE errors instead of silently missing the rows it cannot see.
+    PERFORM pg_catalog.set_config('row_security', 'off', true);
+    UPDATE public.edges SET properties = properties - 'ingest_written'
+     WHERE properties ? 'ingest_written';
+    GET DIAGNOSTICS v_stripped = ROW_COUNT;
+    RAISE NOTICE '198: dropped properties.ingest_written from % pre-existing edge row(s)',
+                 v_stripped;
 END $$;
 
 DROP TRIGGER IF EXISTS edges_ingest_written_guard ON public.edges;
