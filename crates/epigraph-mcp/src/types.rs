@@ -1978,8 +1978,9 @@ pub struct IngestAuthorReport {
     /// attached the name-derived node, never one of them).
     pub status: &'static str,
     /// What the walk did: `attached_given` (this call's `agent_id`),
-    /// `kept_attached` (no `agent_id` now, but an earlier ingest attached one
-    /// for this spelling, and it stays the author), `reused_name_key` or
+    /// `kept_attached` (no `agent_id` now, but this ingester attached one for
+    /// this spelling on an earlier run, and it stays the author),
+    /// `reused_name_key` or
     /// `created_name_key`.
     pub action: &'static str,
     /// Who vouches for the STORED attribution: `name_derived` (the name
@@ -2016,9 +2017,9 @@ pub struct IngestAuthorReport {
     /// `position`, left in place: an earlier ingest with a different spelling
     /// or order (replacement follows this entry's own spelling: an
     /// `agent_id` given with a different spelling than the name-derived
-    /// author's is ADDED here, beside it), or an earlier ingester's pending
-    /// naming that a name-only entry does not keep. This call did not change
-    /// them.
+    /// author's is ADDED here, beside it), or another ingester's explicit
+    /// attachment by this spelling (pending or not, at any position) that a
+    /// name-only entry does not keep. This call did not change them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub also_at_position: Vec<String>,
     /// Other agents whose case- and accent-folded name equals this author's

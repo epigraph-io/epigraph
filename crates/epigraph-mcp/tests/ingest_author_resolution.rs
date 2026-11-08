@@ -1776,3 +1776,69 @@ async fn the_spine_records_its_creations_and_every_later_ingester(pool: PgPool) 
     }
 }
 
+/// A stranger who attaches ITSELF by `agent_id` under a person's name is
+/// that stranger's word (non-pending, since the ingester is the agent), and
+/// is not kept for anyone else: a later ingester's name-only re-ingest
+/// attaches the name-derived author, reports the stranger in
+/// `also_at_position`, and its name-derived author asserts the document.
+/// The stranger's own name-only re-run keeps its attachment.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_attachment_is_kept_only_for_the_ingester_that_made_it(pool: PgPool) {
+    let squatter = app_role_server(&pool).await;
+    let honest = app_role_server(&pool).await;
+    let squatter_id = squatter.server_agent_id().await.expect("squatter");
+    let name = "Alaric Thornquist";
+    let d = "10.9999/author-self-squat";
+    let viewer = fixture::public_viewer(&pool).await;
+
+    let json = ingest_wait(
+        &squatter,
+        &pool,
+        doc(d, json!([{"name": name, "agent_id": squatter_id.to_string()}])),
+    )
+    .await;
+    assert_eq!(json["authors"][0]["attribution"], "caller", "CALIBRATION {json}");
+
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &honest,
+            &viewer,
+            &doc(d, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the honest re-ingest"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["action"], "created_name_key", "{json}");
+    let key = name_key_node(&pool, name)
+        .await
+        .expect("the name path ran: a name-derived node exists");
+    assert_eq!(report["agent_id"], key.to_string(), "{json}");
+    assert_eq!(report["attribution"], "name_derived", "{json}");
+    assert_eq!(
+        report["also_at_position"],
+        json!([squatter_id.to_string()]),
+        "{json}"
+    );
+    assert_eq!(
+        asserts_on_doc(&pool, key, d).await,
+        paper_claims(&pool, d).await,
+        "the name-derived author asserts the document"
+    );
+
+    // The squatter's own name-only re-run keeps its own attachment.
+    let json = text(
+        &tools::ingestion::do_ingest_document(
+            &squatter,
+            &viewer,
+            &doc(d, json!([{"name": name}])),
+            None,
+        )
+        .await
+        .expect("the squatter re-runs"),
+    );
+    let report = &json["authors"][0];
+    assert_eq!(report["agent_id"], squatter_id.to_string(), "{json}");
+    assert_eq!(report["action"], "kept_attached", "{json}");
+}

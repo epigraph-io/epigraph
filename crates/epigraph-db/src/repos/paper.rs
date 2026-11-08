@@ -514,7 +514,8 @@ impl PaperRepository {
                         COALESCE(e.properties ->> '{explicit}' = 'true', false), \
                         e.properties ->> '{name}', \
                         {pending}, \
-                        CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END \
+                        CASE WHEN {pending} THEN e.properties ->> '{ingested_by}' END, \
+                        {written_by} \
                    FROM edges e \
                   WHERE e.target_id = $1 AND e.target_type = 'paper' \
                     AND e.source_type = 'agent' AND e.relationship = 'authored' \
@@ -525,6 +526,7 @@ impl PaperRepository {
                 name = AUTHORED_NAME_KEY,
                 pending = crate::agent_lookup::authorship_pending_sql("e"),
                 ingested_by = AUTHORED_INGESTED_BY_KEY,
+                written_by = crate::repos::ingest_written::ingest_written_by_sql("e"),
                 in_force = crate::repos::edge::EDGE_IN_FORCE,
             ),
             2,
@@ -537,6 +539,7 @@ impl PaperRepository {
             Option<String>,
             bool,
             Option<String>,
+            Option<String>,
         );
         let mut q = sqlx::query_as::<_, Row>(&sql).bind(paper_id);
         if let Some(g) = viewer.group_bind() {
@@ -546,7 +549,7 @@ impl PaperRepository {
             .await?
             .into_iter()
             .map(
-                |(edge_id, agent_id, position, explicit, author_name, pending, by)| {
+                |(edge_id, agent_id, position, explicit, author_name, pending, by, written)| {
                     PaperAuthorEdge {
                         edge_id,
                         agent_id,
@@ -555,6 +558,7 @@ impl PaperRepository {
                         author_name,
                         pending,
                         ingested_by: by.and_then(|s| s.parse().ok()),
+                        written_by: written.and_then(|s| s.parse().ok()),
                     }
                 },
             )
@@ -708,6 +712,10 @@ pub struct PaperAuthorEdge {
     /// On a pending edge, the ingester that asserted the authorship
     /// ([`AUTHORED_INGESTED_BY_KEY`]).
     pub ingested_by: Option<Uuid>,
+    /// The principal whose document ingest wrote the edge, from its
+    /// ingest-written marker (`crate::ingest_written_by_sql`); `None` for an
+    /// edge the walk did not mark (written before the marker existed).
+    pub written_by: Option<Uuid>,
 }
 
 /// One author of a paper as [`PaperRepository::list_authors`] lists it.
