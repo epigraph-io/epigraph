@@ -700,19 +700,33 @@ async fn counts_are_computed_under_the_callers_viewer(pool: PgPool) {
         .await
         .expect("paper");
     for (target, ttype, rel) in [(paper, "paper", "authored"), (claim, "claim", "asserts")] {
-        // Inserted, then its tenancy FORCED (migration 070's trigger stamps an
-        // INSERT from its endpoints; see `fixture::seed_edge_owned_by`).
+        // Inserted as the ingest writes it (declared and marked), then its
+        // tenancy FORCED (migration 070's trigger stamps an INSERT from its
+        // endpoints; see `fixture::seed_edge_owned_by`).
+        let mut tx = pool.begin().await.expect("tx");
+        sqlx::query("SELECT pg_catalog.set_config($1, 'on', true)")
+            .bind(epigraph_db::INGEST_WRITTEN_SETTING)
+            .execute(&mut *tx)
+            .await
+            .expect("declare the walk");
         let edge: Uuid = sqlx::query_scalar(
-            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
-             VALUES ($1, 'agent', $2, $3, $4) RETURNING id",
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                                properties) \
+             VALUES ($1, 'agent', $2, $3, $4, \
+                     jsonb_build_object($5::text, \
+                                        jsonb_build_object('tool', 'ingest_document', \
+                                                           'by', $1::text))) \
+             RETURNING id",
         )
         .bind(with_private)
         .bind(target)
         .bind(ttype)
         .bind(rel)
-        .fetch_one(&pool)
+        .bind(epigraph_db::INGEST_WRITTEN_PROPERTY)
+        .fetch_one(&mut *tx)
         .await
         .expect("edge");
+        tx.commit().await.expect("commit");
         sqlx::query(
             "UPDATE edges SET visibility = 'group', owner_group_id = $2, \
                               co_owner_group_id = NULL WHERE id = $1",
@@ -1316,8 +1330,9 @@ async fn paper(pool: &PgPool, doi: &str) -> Uuid {
 }
 
 /// An edge written by `writer` on an `epigraph_app` transaction stamped with
-/// `writer`'s viewer: the repository call both the document ingest's walk and
-/// `POST /api/v1/edges` make. Agent and paper endpoints land
+/// `writer`'s viewer: the repository call `POST /api/v1/edges` makes (the
+/// ingest walk writes these shapes through [`ingest_edge_as`]'s marked
+/// writer instead). Agent and paper endpoints land
 /// `('public', world)` (migration 120), readable by everyone.
 async fn edge_as(
     pool: &PgPool,
@@ -1346,9 +1361,43 @@ async fn edge_as(
     id
 }
 
+/// One edge as the document ingest walk writes it: through
+/// `create_ingest_written_edge_if_absent_conn` (the walk's only writer of
+/// these shapes, which declares the walk and marks the edge) on an
+/// `epigraph_app` transaction stamped as `writer`.
+async fn ingest_edge_as(
+    pool: &PgPool,
+    writer: Uuid,
+    src: (Uuid, &str),
+    tgt: (Uuid, &str),
+    rel: &str,
+    props: Option<serde_json::Value>,
+) -> Uuid {
+    let scoped = app_pool(pool).await;
+    let v = viewer(pool, writer).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let (row, created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut tx,
+        None,
+        "ingest_document",
+        writer,
+        src.0,
+        src.1,
+        tgt.0,
+        tgt.1,
+        rel,
+        props,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("ingest {rel} edge as {writer}: {e}"));
+    tx.commit().await.expect("commit");
+    assert!(created, "CALIBRATION: the ingest wrote a new {rel} edge");
+    row.id
+}
+
 /// What one document ingest writes for one author and one claim: the
 /// author's `authored -> paper`, the paper's `asserts -> claim`, and the
-/// author's `asserts -> claim`.
+/// author's `asserts -> claim`, each marked ingest-written.
 async fn ingest_attribution(
     pool: &PgPool,
     ingester: Uuid,
@@ -1357,7 +1406,7 @@ async fn ingest_attribution(
     claim: Uuid,
     authored_props: serde_json::Value,
 ) {
-    edge_as(
+    ingest_edge_as(
         pool,
         ingester,
         (author, "agent"),
@@ -1366,7 +1415,7 @@ async fn ingest_attribution(
         Some(authored_props),
     )
     .await;
-    edge_as(
+    ingest_edge_as(
         pool,
         ingester,
         (paper_id, "paper"),
@@ -1375,7 +1424,7 @@ async fn ingest_attribution(
         None,
     )
     .await;
-    edge_as(
+    ingest_edge_as(
         pool,
         ingester,
         (author, "agent"),
@@ -1465,6 +1514,154 @@ async fn a_strangers_asserts_edge_moves_no_count(pool: PgPool) {
             "a stranger's asserts edge moved {who}'s count of the human"
         );
         assert_eq!(out[0].counts.asserted_claims, 0, "{:?}", out[0]);
+    }
+}
+
+/// The whole backing chain forged, not just the agent's own edge. A stranger
+/// writes BOTH `paper -asserts-> X`, onto a paper the agent really authored,
+/// and `agent -asserts-> X`: the two shapes an edges:write caller could post.
+/// The agent's in-force, countersigned `authored` edge is real, so a read that
+/// trusted edges by their shape would credit the agent with X. Neither the
+/// name-derived author nor a registered human that ingested its own paper may
+/// move, for any reader.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_paper_assertion_backs_no_attribution(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (author, _) = named(&pool, "Leocadia Brennt").await;
+    let (human, _) = named_human(&pool, "Ferdinand Holloway").await;
+
+    let p = paper(&pool, "10.9999/lookup.forged-paper.1").await;
+    let c = fixture::seed_public_claim(&pool, ingester, "a real finding").await;
+    ingest_attribution(
+        &pool,
+        ingester,
+        author,
+        p,
+        c,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    // A registered human's own ingest of its own paper: not pending.
+    let ph = paper(&pool, "10.9999/lookup.forged-paper.2").await;
+    let ch = fixture::seed_public_claim(&pool, human, "the human's own finding").await;
+    ingest_attribution(
+        &pool,
+        human,
+        human,
+        ph,
+        ch,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    for who in [author, human] {
+        let k = card_as(&pool, outsider, who).await.counts;
+        assert_eq!(
+            (k.authored_papers, k.asserted_claims),
+            (1, 1),
+            "CALIBRATION: the real ingest counts for {who}"
+        );
+    }
+
+    // The forgery, onto three of the stranger's own public claims. Written
+    // through the application repository call, as POST /api/v1/edges would.
+    for i in 0..3 {
+        let x = fixture::seed_public_claim(&pool, stranger, &format!("stranger text {i}")).await;
+        for (who, pp) in [(author, p), (human, ph)] {
+            edge_as(
+                &pool,
+                stranger,
+                (pp, "paper"),
+                (x, "claim"),
+                "asserts",
+                None,
+            )
+            .await;
+            edge_as(
+                &pool,
+                stranger,
+                (who, "agent"),
+                (x, "claim"),
+                "asserts",
+                Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+            )
+            .await;
+        }
+    }
+
+    for reader in [outsider, author, human, stranger] {
+        for who in [author, human] {
+            let k = card_as(&pool, reader, who).await.counts;
+            assert_eq!(
+                (k.authored_papers, k.asserted_claims),
+                (1, 1),
+                "a forged paper assertion moved {reader}'s count of {who}: {k:?}"
+            );
+        }
+    }
+}
+
+/// A second ingest under the same DOI cannot borrow the first one's
+/// authorship. A stranger running its OWN (marked) ingest of the paper an
+/// author really authored, asserting a claim of its own and attributing it to
+/// that author, writes edges that each carry the marker, but they name the
+/// stranger, not the ingest that wrote the authorship: the chain does not
+/// hold and no reader's count moves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_ingest_of_the_same_paper_cannot_borrow_its_authorship(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (author, _) = named(&pool, "Leopold Fairweather").await;
+    let p = paper(&pool, "10.9999/lookup.second-ingest.1").await;
+    let c = fixture::seed_public_claim(&pool, ingester, "the paper's finding").await;
+    ingest_attribution(
+        &pool,
+        ingester,
+        author,
+        p,
+        c,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    let k = card_as(&pool, outsider, author).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.asserted_claims),
+        (1, 1),
+        "CALIBRATION"
+    );
+
+    let x = fixture::seed_public_claim(&pool, stranger, "the stranger's finding").await;
+    ingest_edge_as(&pool, stranger, (p, "paper"), (x, "claim"), "asserts", None).await;
+    ingest_edge_as(
+        &pool,
+        stranger,
+        (author, "agent"),
+        (x, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND properties ? 'ingest_written'",
+    )
+    .bind(x)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        marked, 2,
+        "CALIBRATION: both of the stranger's edges are marked"
+    );
+
+    for reader in [outsider, author, stranger] {
+        let k = card_as(&pool, reader, author).await.counts;
+        assert_eq!(
+            (k.authored_papers, k.asserted_claims),
+            (1, 1),
+            "a second ingest borrowed the first one's authorship for {reader}: {k:?}"
+        );
     }
 }
 

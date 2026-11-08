@@ -1003,6 +1003,18 @@ struct PlanEdgeForDs {
     relationship: String,
 }
 
+/// A plan edge the planner emitted as an author's attribution of one of the
+/// document's claims (`author_placeholder -asserts-> claim`, resolved by the
+/// walk to the author's agent). The walk writes it with the ingest-written
+/// marker (`epigraph_db::ingest_written`), naming its write identity, and
+/// only when its target is a claim THIS walk persisted (in `id_map`); no
+/// other plan edge carries one.
+fn is_author_attribution(edge: &epigraph_ingest::common::plan::PlannedEdge) -> bool {
+    edge.source_type == "author_placeholder"
+        && edge.relationship == "asserts"
+        && edge.target_type == "claim"
+}
+
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1179,23 +1191,22 @@ pub async fn do_ingest_document(
     .await?;
     for r in resolved {
         let author = &authors[r.idx];
-        let (_row, _was_created) =
-            EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                &mut tx,
-                edge_key,
-                r.agent_id,
-                "agent",
-                paper_id,
-                "paper",
-                "authored",
-                Some(crate::tools::ingest_authors::authored_edge_properties(
-                    &r, author, agent_id,
-                )),
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
+        let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut tx,
+            edge_key,
+            "ingest_document",
+            agent_id,
+            r.agent_id,
+            "agent",
+            paper_id,
+            "paper",
+            "authored",
+            Some(crate::tools::ingest_authors::authored_edge_properties(
+                &r, author, agent_id,
+            )),
+        )
+        .await
+        .map_err(internal_error)?;
         // The plan's per-claim `asserts` edges come from this map: an author
         // the ingester does not speak for is not in it, so it gets `authored`
         // only (`tools::ingest_authors`, the explicit-author rule).
@@ -1289,21 +1300,20 @@ pub async fn do_ingest_document(
                 .map_err(internal_error)?;
         }
         if resolved_to_existing {
-            let (_row, _was_created) =
-                EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                    &mut tx,
-                    edge_key,
-                    paper_id,
-                    "paper",
-                    persisted_id,
-                    "claim",
-                    "asserts",
-                    Some(planned.properties.clone()),
-                    None,
-                    None,
-                )
-                .await
-                .map_err(internal_error)?;
+            let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut tx,
+                edge_key,
+                "ingest_document",
+                agent_id,
+                paper_id,
+                "paper",
+                persisted_id,
+                "claim",
+                "asserts",
+                Some(planned.properties.clone()),
+            )
+            .await
+            .map_err(internal_error)?;
             // The ingest record: this walk converged on an existing claim.
             epigraph_db::ClaimIngestRepository::record_signed_conn(
                 &mut tx,
@@ -1382,21 +1392,20 @@ pub async fn do_ingest_document(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _was_created) =
-            EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                &mut tx,
-                edge_key,
-                paper_id,
-                "paper",
-                persisted_id,
-                "claim",
-                "asserts",
-                Some(planned.properties.clone()),
-                None,
-                None,
-            )
-            .await
-            .map_err(internal_error)?;
+        let (_row, _was_created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut tx,
+            edge_key,
+            "ingest_document",
+            agent_id,
+            paper_id,
+            "paper",
+            persisted_id,
+            "claim",
+            "asserts",
+            Some(planned.properties.clone()),
+        )
+        .await
+        .map_err(internal_error)?;
 
         // The ingest record: this walk CREATED the claim.
         epigraph_db::ClaimIngestRepository::record_signed_conn(
@@ -1467,20 +1476,40 @@ pub async fn do_ingest_document(
             continue;
         }
 
-        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
-            &mut tx,
-            edge_key,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
+        // An author's attribution is an ingest-written edge (the card and
+        // the provenance reads trust it by its marker); every other plan edge
+        // is written without the marker, a smuggled one dropped.
+        let (row, was_created) =
+            if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
+                epigraph_db::create_ingest_written_edge_if_absent_conn(
+                    &mut tx,
+                    edge_key,
+                    "ingest_document",
+                    agent_id,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(edge.properties.clone()),
+                )
+                .await
+            } else {
+                EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                    &mut tx,
+                    edge_key,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
+                    None,
+                    None,
+                )
+                .await
+            }
+            .map_err(internal_error)?;
         relationships_created += usize::from(was_created);
 
         // The edge's DS factor is wired AFTER the walk commits (step 6), on its
@@ -2177,9 +2206,11 @@ pub async fn do_ingest_document_spine(
     .await?;
     for r in resolved {
         let author = &authors[r.idx];
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
+            "ingest_document_spine",
+            agent_id,
             r.agent_id,
             "agent",
             paper_id,
@@ -2188,8 +2219,6 @@ pub async fn do_ingest_document_spine(
             Some(crate::tools::ingest_authors::authored_edge_properties(
                 &r, author, agent_id,
             )),
-            None,
-            None,
         )
         .await
         .map_err(internal_error)?;
@@ -2278,17 +2307,17 @@ pub async fn do_ingest_document_spine(
         }
 
         if resolved_to_existing {
-            let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+            let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
                 &mut tx,
                 edge_key,
+                "ingest_document_spine",
+                agent_id,
                 paper_id,
                 "paper",
                 persisted_id,
                 "claim",
                 "asserts",
                 Some(planned.properties.clone()),
-                None,
-                None,
             )
             .await
             .map_err(internal_error)?;
@@ -2368,17 +2397,17 @@ pub async fn do_ingest_document_spine(
             .await
             .map_err(internal_error)?;
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+        let (_row, _) = epigraph_db::create_ingest_written_edge_if_absent_conn(
             &mut tx,
             edge_key,
+            "ingest_document_spine",
+            agent_id,
             paper_id,
             "paper",
             persisted_id,
             "claim",
             "asserts",
             Some(planned.properties.clone()),
-            None,
-            None,
         )
         .await
         .map_err(internal_error)?;
@@ -2439,19 +2468,36 @@ pub async fn do_ingest_document_spine(
             continue;
         }
 
-        let (_row, _) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
-            &mut tx,
-            edge_key,
-            src,
-            &src_type,
-            tgt,
-            &edge.target_type,
-            &edge.relationship,
-            Some(edge.properties.clone()),
-            None,
-            None,
-        )
-        .await
+        // As the document walk: only an author's attribution is marked.
+        let (_row, _) = if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
+            epigraph_db::create_ingest_written_edge_if_absent_conn(
+                &mut tx,
+                edge_key,
+                "ingest_document_spine",
+                agent_id,
+                src,
+                &src_type,
+                tgt,
+                &edge.target_type,
+                &edge.relationship,
+                Some(edge.properties.clone()),
+            )
+            .await
+        } else {
+            EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                &mut tx,
+                edge_key,
+                src,
+                &src_type,
+                tgt,
+                &edge.target_type,
+                &edge.relationship,
+                Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
+                None,
+                None,
+            )
+            .await
+        }
         .map_err(internal_error)?;
     }
 

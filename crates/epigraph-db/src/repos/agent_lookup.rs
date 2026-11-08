@@ -46,9 +46,10 @@
 //!   status never moves it), plus the caller's own assignments of any role.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
-//!   number. Only in-force edges the document ingest wrote count, and an
-//!   authorship awaiting its author's countersignature is reported apart
-//!   (see [`CardCounts`]). Capped at [`COUNT_CAP`] so a fleet agent with
+//!   number. Only in-force edges carrying the ingest-written marker count
+//!   (proved by the marker, never by an edge's shape), and an authorship
+//!   awaiting its author's countersignature is reported apart (see
+//!   [`CardCounts`]). Capped at [`COUNT_CAP`] so a fleet agent with
 //!   10^5 claims cannot stall a request.
 //!
 //! # Matching
@@ -76,6 +77,7 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::repos::edge::EDGE_IN_FORCE;
+use crate::repos::ingest_written::{ingest_written_edge_sql, same_ingest_sql};
 use crate::visibility::Viewer;
 
 /// Shortest accepted query, in characters after trimming.
@@ -347,16 +349,31 @@ pub struct CardRole {
 /// Counts computed under the caller's viewer.
 ///
 /// An authorship or attribution counts only when the document ingest wrote
-/// it and it is in force. `authored` edges have no other application
-/// writer: `POST /api/v1/edges` does not accept the relationship and the MCP
-/// edge tools write claim-to-claim edges only (the `claims:admin` staged-edge
-/// promote copies a staged row verbatim, an administrative path). An
-/// `agent -asserts-> claim` edge has another writer: `POST /api/v1/edges`
-/// accepts one from any agent. So an attribution
-/// counts only when the paper authorship it comes from also exists: an
-/// in-force, countersigned `authored` edge from the agent to a paper that
-/// itself asserts the claim (in force). A lone `asserts` edge from an agent,
-/// whoever wrote it, is not the agent's.
+/// it and it is in force. "The ingest wrote it" is never read from an edge's
+/// shape or existence: every edge counted carries the ingest-written marker
+/// ([`crate::ingest_written_edge_sql`]), which only the ingest walk can
+/// write (migration 198's `edges_ingest_written_guard` refuses it to every
+/// other writer, and drops it from an edge that is re-pointed). The marker
+/// names the ingesting principal, not the document's truth: a principal that
+/// ingests a fabricated document under a new name is counted for that name,
+/// and the card says nothing more than that an ingest wrote it.
+///
+/// * `authored_papers`: the agent's marked, in-force `authored -> paper`
+///   edges that are not pending its countersignature.
+/// * `pending_authored_papers`: the marked, in-force ones that are.
+/// * `asserted_claims`: the agent's own claims, plus every claim it is
+///   attributed by a marked, in-force `agent -asserts-> claim` edge BACKED by
+///   one of its counted authorships: a marked, in-force, countersigned
+///   `authored` edge to a paper whose marked, in-force `asserts` edge names
+///   the same claim, all three written by ingests of ONE principal
+///   ([`crate::same_ingest_sql`]). A pending authorship backs nothing, and a
+///   second ingester of the same DOI cannot borrow the first one's
+///   authorship to credit the author with claims of its own.
+///
+/// Not counted, by design: edges written before the marker existed (until an
+/// operator backfills them), any edge written over `POST /api/v1/edges` or
+/// the staged promote, and the workflow executor's `agent -asserts-> claim`
+/// attributions (no document, no countersign state behind them).
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CardCounts {
     /// Visible in-force `authored` edges from the agent to a paper, except
@@ -1042,14 +1059,14 @@ impl AgentLookupRepository {
                         SELECT 1 FROM edges e
                          WHERE e.source_id = u.id AND e.source_type = 'agent'
                            AND e.relationship = 'authored' AND e.target_type = 'paper'
-                           AND {in_force_e} AND NOT {pending_e}
+                           AND {in_force_e} AND NOT {pending_e} AND {ingest_e}
                            /* {{EDGE_VISIBILITY:e}} */
                          LIMIT $2) p) AS papers,
                    (SELECT count(*) FROM (
                         SELECT 1 FROM edges ep
                          WHERE ep.source_id = u.id AND ep.source_type = 'agent'
                            AND ep.relationship = 'authored' AND ep.target_type = 'paper'
-                           AND {in_force_ep} AND {pending_ep}
+                           AND {in_force_ep} AND {pending_ep} AND {ingest_ep}
                            /* {{EDGE_VISIBILITY:ep}} */
                          LIMIT $2) pp) AS pending_papers,
                    (SELECT count(*) FROM (
@@ -1062,16 +1079,17 @@ impl AgentLookupRepository {
                            JOIN claims c2 ON c2.id = e2.target_id
                           WHERE e2.source_id = u.id AND e2.source_type = 'agent'
                             AND e2.relationship = 'asserts' AND e2.target_type = 'claim'
-                            AND {in_force_e2}
+                            AND {in_force_e2} AND {ingest_e2}
                             AND EXISTS (
                                 SELECT 1 FROM edges ea
                                   JOIN edges pa ON pa.source_id = ea.target_id
                                  WHERE ea.source_id = u.id AND ea.source_type = 'agent'
                                    AND ea.relationship = 'authored' AND ea.target_type = 'paper'
-                                   AND {in_force_ea} AND NOT {pending_ea}
+                                   AND {in_force_ea} AND NOT {pending_ea} AND {ingest_ea}
                                    AND pa.source_type = 'paper' AND pa.relationship = 'asserts'
                                    AND pa.target_type = 'claim' AND pa.target_id = c2.id
-                                   AND {in_force_pa}
+                                   AND {in_force_pa} AND {ingest_pa}
+                                   AND {same_e2_ea} AND {same_pa_ea}
                                    /* {{EDGE_VISIBILITY:ea}} */
                                    /* {{EDGE_VISIBILITY:pa}} */)
                             /* {{EDGE_VISIBILITY:e2}} */
@@ -1087,6 +1105,13 @@ impl AgentLookupRepository {
                 in_force_ea = in_force("ea"),
                 pending_ea = authorship_pending_sql("ea"),
                 in_force_pa = in_force("pa"),
+                ingest_e = ingest_written_edge_sql("e"),
+                ingest_ep = ingest_written_edge_sql("ep"),
+                ingest_e2 = ingest_written_edge_sql("e2"),
+                ingest_ea = ingest_written_edge_sql("ea"),
+                ingest_pa = ingest_written_edge_sql("pa"),
+                same_e2_ea = same_ingest_sql("e2", "ea"),
+                same_pa_ea = same_ingest_sql("pa", "ea"),
             ),
             3,
         );

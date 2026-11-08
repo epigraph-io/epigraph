@@ -590,6 +590,16 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
+    // The document ingest's writer of the edges a provenance read trusts
+    // (`authored`, paper and agent `asserts`): the walks call it with their
+    // `edge_signing_key()`, so their counts above are the edges they write
+    // directly.
+    site(
+        "crates/epigraph-db/src/repos/ingest_written.rs",
+        "create_ingest_written_edge_if_absent_conn",
+        1,
+        Signed,
+    ),
     site(
         "crates/epigraph-db/src/repos/match_candidate.rs",
         "promote_if_pending",
@@ -644,18 +654,20 @@ const REGISTER: &[Site] = &[
         1,
         Signed,
     ),
-    // 7 each: the five edge writes, plus the ingest record after the paper's
-    // asserts edge on the created and on the converged branch.
+    // 4 each: the walk's two unmarked edge writes (an unmapped plan edge and
+    // the processed_by stamp), plus the ingest record after the paper's
+    // asserts edge on the created and on the converged branch. The marked
+    // edges go through `create_ingest_written_edge_if_absent_conn`.
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document",
-        7,
+        4,
         Signed,
     ),
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
         "do_ingest_document_spine",
-        7,
+        4,
         Signed,
     ),
     site(
