@@ -142,6 +142,7 @@ fn the_strings_here_are_the_crates() {
         epigraph_db::ingest_written_edge_sql("pa"),
         "((pa.properties ->> 'ingest_written') IS NOT NULL)"
     );
+    assert_eq!(epigraph_db::INGEST_WRITTEN_BY_FIELD, "by");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -469,6 +470,7 @@ async fn the_walks_writer_declares_only_its_own_insert(pool: PgPool) {
         &mut tx,
         None,
         "ingest_document",
+        ingester,
         p,
         "paper",
         x,
@@ -479,7 +481,10 @@ async fn the_walks_writer_declares_only_its_own_insert(pool: PgPool) {
     .await
     .expect("the walk's write");
     assert!(created);
-    assert_eq!(row.properties[KEY], "ingest_document");
+    assert_eq!(
+        row.properties[KEY],
+        serde_json::json!({"tool": "ingest_document", "by": ingester.to_string()})
+    );
     assert_eq!(row.properties["section"], "results");
     let r = sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
@@ -501,6 +506,7 @@ async fn the_walks_writer_declares_only_its_own_insert(pool: PgPool) {
         &mut tx,
         None,
         "ingest_document",
+        ingester,
         x,
         "claim",
         p,

@@ -960,7 +960,9 @@ struct PlanEdgeForDs {
 /// A plan edge the planner emitted as an author's attribution of one of the
 /// document's claims (`author_placeholder -asserts-> claim`, resolved by the
 /// walk to the author's agent). The walk writes it with the ingest-written
-/// marker (`epigraph_db::ingest_written`); no other plan edge carries one.
+/// marker (`epigraph_db::ingest_written`), naming its write identity, and
+/// only when its target is a claim THIS walk persisted (in `id_map`); no
+/// other plan edge carries one.
 fn is_author_attribution(edge: &epigraph_ingest::common::plan::PlannedEdge) -> bool {
     edge.source_type == "author_placeholder"
         && edge.relationship == "asserts"
@@ -1190,6 +1192,7 @@ pub async fn do_ingest_document(
             &mut tx,
             edge_key,
             "ingest_document",
+            agent_id,
             agent_uuid,
             "agent",
             paper_id,
@@ -1301,6 +1304,7 @@ pub async fn do_ingest_document(
                 &mut tx,
                 edge_key,
                 "ingest_document",
+                agent_id,
                 paper_id,
                 "paper",
                 persisted_id,
@@ -1379,6 +1383,7 @@ pub async fn do_ingest_document(
             &mut tx,
             edge_key,
             "ingest_document",
+            agent_id,
             paper_id,
             "paper",
             persisted_id,
@@ -1447,35 +1452,37 @@ pub async fn do_ingest_document(
         // An author's attribution is an ingest-written edge (the card and
         // the provenance reads trust it by its marker); every other plan edge
         // is written without the marker, a smuggled one dropped.
-        let (row, was_created) = if is_author_attribution(edge) {
-            epigraph_db::create_ingest_written_edge_if_absent_conn(
-                &mut tx,
-                edge_key,
-                "ingest_document",
-                src,
-                &src_type,
-                tgt,
-                &edge.target_type,
-                &edge.relationship,
-                Some(edge.properties.clone()),
-            )
-            .await
-        } else {
-            EdgeRepository::create_if_absent_including_retracted_signed_conn(
-                &mut tx,
-                edge_key,
-                src,
-                &src_type,
-                tgt,
-                &edge.target_type,
-                &edge.relationship,
-                Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
-                None,
-                None,
-            )
-            .await
-        }
-        .map_err(internal_error)?;
+        let (row, was_created) =
+            if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
+                epigraph_db::create_ingest_written_edge_if_absent_conn(
+                    &mut tx,
+                    edge_key,
+                    "ingest_document",
+                    agent_id,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(edge.properties.clone()),
+                )
+                .await
+            } else {
+                EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                    &mut tx,
+                    edge_key,
+                    src,
+                    &src_type,
+                    tgt,
+                    &edge.target_type,
+                    &edge.relationship,
+                    Some(epigraph_db::without_ingest_marker(edge.properties.clone())),
+                    None,
+                    None,
+                )
+                .await
+            }
+            .map_err(internal_error)?;
         relationships_created += usize::from(was_created);
 
         // The edge's DS factor is wired AFTER the walk commits (step 6), on its
@@ -2221,6 +2228,7 @@ pub async fn do_ingest_document_spine(
             &mut tx,
             edge_key,
             "ingest_document_spine",
+            agent_id,
             agent_uuid,
             "agent",
             paper_id,
@@ -2325,6 +2333,7 @@ pub async fn do_ingest_document_spine(
                 &mut tx,
                 edge_key,
                 "ingest_document_spine",
+                agent_id,
                 paper_id,
                 "paper",
                 persisted_id,
@@ -2401,6 +2410,7 @@ pub async fn do_ingest_document_spine(
             &mut tx,
             edge_key,
             "ingest_document_spine",
+            agent_id,
             paper_id,
             "paper",
             persisted_id,
@@ -2454,11 +2464,12 @@ pub async fn do_ingest_document_spine(
         }
 
         // As the document walk: only an author's attribution is marked.
-        let (_row, _) = if is_author_attribution(edge) {
+        let (_row, _) = if is_author_attribution(edge) && id_map.contains_key(&edge.target_id) {
             epigraph_db::create_ingest_written_edge_if_absent_conn(
                 &mut tx,
                 edge_key,
                 "ingest_document_spine",
+                agent_id,
                 src,
                 &src_type,
                 tgt,

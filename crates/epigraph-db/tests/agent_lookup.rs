@@ -712,7 +712,10 @@ async fn counts_are_computed_under_the_callers_viewer(pool: PgPool) {
         let edge: Uuid = sqlx::query_scalar(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                                 properties) \
-             VALUES ($1, 'agent', $2, $3, $4, jsonb_build_object($5::text, 'ingest_document')) \
+             VALUES ($1, 'agent', $2, $3, $4, \
+                     jsonb_build_object($5::text, \
+                                        jsonb_build_object('tool', 'ingest_document', \
+                                                           'by', $1::text))) \
              RETURNING id",
         )
         .bind(with_private)
@@ -1377,6 +1380,7 @@ async fn ingest_edge_as(
         &mut tx,
         None,
         "ingest_document",
+        writer,
         src.0,
         src.1,
         tgt.0,
@@ -1595,6 +1599,69 @@ async fn a_forged_paper_assertion_backs_no_attribution(pool: PgPool) {
                 "a forged paper assertion moved {reader}'s count of {who}: {k:?}"
             );
         }
+    }
+}
+
+/// A second ingest under the same DOI cannot borrow the first one's
+/// authorship. A stranger running its OWN (marked) ingest of the paper an
+/// author really authored, asserting a claim of its own and attributing it to
+/// that author, writes edges that each carry the marker, but they name the
+/// stranger, not the ingest that wrote the authorship: the chain does not
+/// hold and no reader's count moves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_second_ingest_of_the_same_paper_cannot_borrow_its_authorship(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (ingester, _) = named(&pool, "ingest-runner").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (author, _) = named(&pool, "Leopold Fairweather").await;
+    let p = paper(&pool, "10.9999/lookup.second-ingest.1").await;
+    let c = fixture::seed_public_claim(&pool, ingester, "the paper's finding").await;
+    ingest_attribution(
+        &pool,
+        ingester,
+        author,
+        p,
+        c,
+        serde_json::json!({"position": 0, "role": "author"}),
+    )
+    .await;
+    let k = card_as(&pool, outsider, author).await.counts;
+    assert_eq!(
+        (k.authored_papers, k.asserted_claims),
+        (1, 1),
+        "CALIBRATION"
+    );
+
+    let x = fixture::seed_public_claim(&pool, stranger, "the stranger's finding").await;
+    ingest_edge_as(&pool, stranger, (p, "paper"), (x, "claim"), "asserts", None).await;
+    ingest_edge_as(
+        &pool,
+        stranger,
+        (author, "agent"),
+        (x, "claim"),
+        "asserts",
+        Some(serde_json::json!({"role": "author", "source": "document_attribution"})),
+    )
+    .await;
+    let marked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND properties ? 'ingest_written'",
+    )
+    .bind(x)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        marked, 2,
+        "CALIBRATION: both of the stranger's edges are marked"
+    );
+
+    for reader in [outsider, author, stranger] {
+        let k = card_as(&pool, reader, author).await.counts;
+        assert_eq!(
+            (k.authored_papers, k.asserted_claims),
+            (1, 1),
+            "a second ingest borrowed the first one's authorship for {reader}: {k:?}"
+        );
     }
 }
 

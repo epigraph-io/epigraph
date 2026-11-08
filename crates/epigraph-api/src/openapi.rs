@@ -410,7 +410,8 @@ async fn unmark_duplicate_doc() {}
 /// `asserted_claims`. They count only in-force edges that carry the document
 /// ingest's ingest-written marker, which no other writer can set (an edge
 /// written over `POST /api/v1/edges` never counts, whatever its shape), and
-/// an attribution only when one of the agent's counted authorships backs it.
+/// an attribution only when one of the agent's counted authorships, written
+/// by an ingest of the same principal, backs it.
 /// Same code as MCP `find_agent`. Scope `claims:read`.
 #[utoipa::path(
     get,

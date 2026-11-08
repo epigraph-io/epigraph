@@ -145,9 +145,10 @@ pub use repos::{
     SUPERSEDE_ACT_TOOLS,
 };
 pub use repos::{
-    create_ingest_written_edge_if_absent_conn, ingest_written, ingest_written_edge_sql,
-    without_ingest_marker, INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY,
-    INGEST_WRITTEN_SETTING, INGEST_WRITTEN_SHAPES,
+    create_ingest_written_edge_if_absent_conn, ingest_written, ingest_written_by_sql,
+    ingest_written_edge_sql, same_ingest_sql, without_ingest_marker, INGEST_WRITTEN_BY_FIELD,
+    INGEST_WRITTEN_KEY_RESERVED, INGEST_WRITTEN_PROPERTY, INGEST_WRITTEN_SETTING,
+    INGEST_WRITTEN_SHAPES,
 };
 pub use repos::{ActConfirmation, AdminActCeremony, CeremonyAct, ProposedAct};
 pub use repos::{

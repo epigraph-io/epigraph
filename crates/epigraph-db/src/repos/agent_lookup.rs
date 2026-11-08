@@ -77,7 +77,7 @@ use uuid::Uuid;
 
 use crate::errors::DbError;
 use crate::repos::edge::EDGE_IN_FORCE;
-use crate::repos::ingest_written::ingest_written_edge_sql;
+use crate::repos::ingest_written::{ingest_written_edge_sql, same_ingest_sql};
 use crate::visibility::Viewer;
 
 /// Shortest accepted query, in characters after trimming.
@@ -353,7 +353,10 @@ pub struct CardRole {
 /// shape or existence: every edge counted carries the ingest-written marker
 /// ([`crate::ingest_written_edge_sql`]), which only the ingest walk can
 /// write (migration 198's `edges_ingest_written_guard` refuses it to every
-/// other writer, and drops it from an edge that is re-pointed).
+/// other writer, and drops it from an edge that is re-pointed). The marker
+/// names the ingesting principal, not the document's truth: a principal that
+/// ingests a fabricated document under a new name is counted for that name,
+/// and the card says nothing more than that an ingest wrote it.
 ///
 /// * `authored_papers`: the agent's marked, in-force `authored -> paper`
 ///   edges that are not pending its countersignature.
@@ -362,7 +365,10 @@ pub struct CardRole {
 ///   attributed by a marked, in-force `agent -asserts-> claim` edge BACKED by
 ///   one of its counted authorships: a marked, in-force, countersigned
 ///   `authored` edge to a paper whose marked, in-force `asserts` edge names
-///   the same claim. A pending authorship backs nothing.
+///   the same claim, all three written by ingests of ONE principal
+///   ([`crate::same_ingest_sql`]). A pending authorship backs nothing, and a
+///   second ingester of the same DOI cannot borrow the first one's
+///   authorship to credit the author with claims of its own.
 ///
 /// Not counted, by design: edges written before the marker existed (until an
 /// operator backfills them), any edge written over `POST /api/v1/edges` or
@@ -912,6 +918,7 @@ impl AgentLookupRepository {
                                    AND pa.source_type = 'paper' AND pa.relationship = 'asserts'
                                    AND pa.target_type = 'claim' AND pa.target_id = c2.id
                                    AND {in_force_pa} AND {ingest_pa}
+                                   AND {same_e2_ea} AND {same_pa_ea}
                                    /* {{EDGE_VISIBILITY:ea}} */
                                    /* {{EDGE_VISIBILITY:pa}} */)
                             /* {{EDGE_VISIBILITY:e2}} */
@@ -932,6 +939,8 @@ impl AgentLookupRepository {
                 ingest_e2 = ingest_written_edge_sql("e2"),
                 ingest_ea = ingest_written_edge_sql("ea"),
                 ingest_pa = ingest_written_edge_sql("pa"),
+                same_e2_ea = same_ingest_sql("e2", "ea"),
+                same_pa_ea = same_ingest_sql("pa", "ea"),
             ),
             3,
         );
