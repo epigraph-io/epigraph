@@ -3515,7 +3515,8 @@ async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool
             .await
             .expect_err("W2 is a descendant the delegate cannot read");
     assert!(
-        err.message.contains("has generations this caller cannot read"),
+        err.message
+            .contains("has generations this caller cannot read"),
         "the delegate passes W1's gate and the hidden-lineage guard refuses: {}",
         err.message
     );
