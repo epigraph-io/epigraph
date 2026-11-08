@@ -13,6 +13,10 @@
 //! its `workflows.caller_write` row as `"arm": "delegate"` with `operator` =
 //! the principal it acted for, so an audit tells it from the submitter's own.
 //!
+//! Tenancy is unchanged, and pinned: where the gate admits a delegate over a
+//! row whose group it does not write, row security still refuses the write
+//! (steps, deprecation, and the claim ownership gate's widened arm alike).
+//!
 //! Tenancy is unchanged: a delegate writes only into groups it writes itself
 //! (the rows a step creates on a public plan land in its own default group,
 //! its operator's).
@@ -350,9 +354,100 @@ impl Via<'_> {
     }
 }
 
+impl Via<'_> {
+    /// `delete_step` of `lineage`; returns the soft-deleted claim id.
+    async fn delete_step(&self, name: &str, lineage: Uuid) -> Result<Uuid, String> {
+        let out = match self {
+            Via::McpHttp(server, _) | Via::McpStdio(server) => {
+                let viewer = Self::mcp_viewer(server, self.auth()).await?;
+                let params = epigraph_mcp::tools::step_ops::DeleteStepParams {
+                    canonical_name: name.to_string(),
+                    step_lineage_id: lineage.to_string(),
+                };
+                let out = epigraph_mcp::tools::step_ops::delete_step(
+                    server,
+                    &viewer,
+                    params,
+                    self.auth(),
+                )
+                .await
+                .map_err(|e| e.message.to_string())?;
+                tool_json(&out)
+            }
+            Via::Rest(router, token) => {
+                let (s, b) = post(
+                    router,
+                    "/api/v1/workflows/steps/delete",
+                    token,
+                    &json!({"canonical_name": name, "step_lineage_id": lineage}),
+                )
+                .await;
+                if s != StatusCode::OK {
+                    return Err(format!("{s}: {b}"));
+                }
+                b
+            }
+        };
+        Ok(uuid_of(&out["step_claim_id"]))
+    }
+
+    /// MCP `deprecate_workflow` of a hierarchical workflow (no cascade). REST
+    /// has no hierarchical deprecation (its `DELETE /workflows/:id` retires a
+    /// flat workflow claim and does not run the lineage gate).
+    async fn deprecate(&self, workflow: Uuid) -> Result<Value, String> {
+        match self {
+            Via::McpHttp(server, _) | Via::McpStdio(server) => {
+                let viewer = Self::mcp_viewer(server, self.auth()).await?;
+                let params = serde_json::from_value(json!({
+                    "workflow_id": workflow.to_string(),
+                    "reason": "acme delegate deprecation",
+                }))
+                .expect("deprecate params");
+                epigraph_mcp::tools::workflows::deprecate_workflow(
+                    server,
+                    &viewer,
+                    params,
+                    self.auth(),
+                )
+                .await
+                .map(|out| tool_json(&out))
+                .map_err(|e| e.message.to_string())
+            }
+            Via::Rest(..) => panic!("hierarchical deprecation is an MCP tool"),
+        }
+    }
+}
+
+/// MCP `add_step` as `auth` with an explicitly given `viewer`, bypassing the
+/// transport's own viewer resolution, so the lineage GATE is what decides.
+async fn mcp_add_step_at_the_gate(
+    server: &epigraph_mcp::server::EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: &epigraph_auth::AuthContext,
+    name: &str,
+    text: &str,
+) -> Result<Uuid, String> {
+    let params = epigraph_mcp::tools::step_ops::AddStepParams {
+        canonical_name: name.to_string(),
+        step_text: text.to_string(),
+        position: None,
+    };
+    let out = epigraph_mcp::tools::step_ops::add_step(server, viewer, params, Some(auth))
+        .await
+        .map_err(|e| e.message.to_string())?;
+    Ok(uuid_of(&tool_json(&out)["step_claim_id"]))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Payloads and harness reads
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// `extraction(name, steps)` as generation `generation` of `name`.
+fn extraction_gen(name: &str, generation: u32, steps: usize) -> Value {
+    let mut x = extraction(name, steps);
+    x["source"]["generation"] = json!(generation);
+    x
+}
 
 fn extraction(name: &str, steps: usize) -> Value {
     let steps: Vec<Value> = (0..steps)
@@ -424,6 +519,32 @@ async fn steps_of(pool: &PgPool, wf: Uuid) -> Vec<Uuid> {
     .fetch_all(pool)
     .await
     .expect("plan steps")
+}
+
+/// The row id of generation `generation` of `name`, if any.
+async fn workflow_gen(pool: &PgPool, name: &str, generation: i32) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT id FROM workflows WHERE canonical_name = $1 AND generation = $2")
+        .bind(name)
+        .bind(generation)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|e| panic!("workflow {name} gen {generation}: {e}"))
+}
+
+async fn truth(pool: &PgPool, id: Uuid) -> f64 {
+    sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("truth value")
+}
+
+async fn step_lineage(pool: &PgPool, id: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("step lineage")
 }
 
 /// One claim's `(author, visibility, owner)`.
@@ -807,16 +928,24 @@ async fn assert_refused(pool: &PgPool, via: &Via<'_>, name: &str, what: &str, ex
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_live_delegate_of_the_submitter_writes_its_public_workflow(pool: PgPool) {
     let w = world(&pool).await;
+    // Every transport's outcome first, so a red run shows all three.
+    let mut outcomes = Vec::new();
     for via in w.d_vias() {
         let label = via.label();
         let added = via
             .add_step(PUB, &format!("acme delegate step via {label}"))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("{label}: a live delegate of the submitter adds a step: {e}")
-            });
+            .await;
+        outcomes.push((label, added));
+    }
+    let admitted: Vec<(&str, bool)> = outcomes.iter().map(|(l, r)| (*l, r.is_ok())).collect();
+    assert_eq!(
+        admitted,
+        vec![("mcp-stdio", true), ("mcp-http", true), ("rest", true)],
+        "a live delegate of the submitter adds a step on every transport: {outcomes:?}"
+    );
+    for (label, added) in outcomes {
         assert_eq!(
-            claim_row(&pool, added).await,
+            claim_row(&pool, added.expect("admitted")).await,
             (w.d, "public".to_string(), w.p_g),
             "{label}: the step is the delegate's, public, in its own default group"
         );
@@ -851,8 +980,8 @@ async fn a_delegate_write_is_recorded_as_delegate_not_as_an_owner_group_write(po
     let w = world(&pool).await;
     let steps = steps_of(&pool, w.own_wf).await;
     assert_eq!(steps.len(), 2, "PREMISE: two steps");
-    let [stdio, http, rest] = w.d_vias();
-    let evolved = stdio
+    let vias = w.d_vias();
+    let evolved = vias[0]
         .evolve(steps[0], "acme own step 0, revised by the delegate")
         .await
         .expect("the delegate evolves a step of the submitter's workflow over stdio");
@@ -861,26 +990,46 @@ async fn a_delegate_write_is_recorded_as_delegate_not_as_an_owner_group_write(po
         (w.d, "group".to_string(), w.p_g),
         "the revision is the delegate's, in the workflow's group"
     );
-    http.add_step(OWN, "acme own step via mcp-http")
-        .await
-        .expect("mcp-http add_step");
-    rest.add_step(OWN, "acme own step via rest")
-        .await
-        .expect("rest add_step");
+    // add, evolve and delete a step on every transport (evolve is its own
+    // call site over REST: `require_api_lineage_authority`).
+    for via in &vias {
+        let label = via.label();
+        let added = via
+            .add_step(OWN, &format!("acme own step via {label}"))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: add_step: {e}"));
+        let revised = via
+            .evolve(added, &format!("acme own step via {label}, revised"))
+            .await
+            .unwrap_or_else(|e| panic!("{label}: evolve_step: {e}"));
+        assert_eq!(claim_row(&pool, revised).await.0, w.d, "{label}");
+        let lineage = step_lineage(&pool, added).await;
+        let deleted = via
+            .delete_step(OWN, lineage)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: delete_step: {e}"));
+        assert!(
+            truth(&pool, deleted).await < 0.5,
+            "{label}: the step was soft-deleted"
+        );
+    }
     let rows = caller_writes(&pool, w.own_wf, w.d).await;
-    assert_eq!(rows.len(), 3, "{rows:?}");
     let arms: Vec<(&str, &str, Option<&str>)> = rows
         .iter()
         .map(|(a, arm, op, ..)| (a.as_str(), arm.as_str(), op.as_deref()))
         .collect();
-    let p = w.p.to_string();
+    let p = Some(w.p.to_string());
+    let p = p.as_deref();
+    let mut expected = vec![("evolve_step", "delegate", p)];
+    for _ in 0..3 {
+        expected.extend([
+            ("add_step", "delegate", p),
+            ("evolve_step", "delegate", p),
+            ("delete_step", "delegate", p),
+        ]);
+    }
     assert_eq!(
-        arms,
-        vec![
-            ("evolve_step", "delegate", Some(p.as_str())),
-            ("add_step", "delegate", Some(p.as_str())),
-            ("add_step", "delegate", Some(p.as_str())),
-        ],
+        arms, expected,
         "every write is recorded as the delegate's, naming the submitter"
     );
 }
@@ -1399,5 +1548,473 @@ async fn a_delegate_of_the_submitters_operator_writes_its_sibling_agents_workflo
         (Via::McpStdio(&w.r_server), "a retired link"),
     ] {
         assert_refused(&pool, &via, "acme-delegate-sibling", what, GATE_REFUSAL).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The HTTP gate's live-delegation conjunct, reached directly
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Over HTTP the delegate arm admits only a context that carries a LIVE
+/// delegation (`dlg`). The transport's viewer refuses an operated principal
+/// without one first, so this test hands the tool a viewer resolved on the
+/// harness pool, and the lineage GATE is what decides: `d` without `dlg` is
+/// refused on `PUB` (where only the delegate arm could admit it) and on the
+/// sibling's workflow; the same call with `dlg` is admitted (calibration).
+/// On `OWN`, where `d` writes the owner group, a no-`dlg` call is admitted by
+/// the owner-group arm and recorded as such, never as `delegate`. The retired
+/// agent `r` with a delegator context is refused by the gate too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_delegate_needs_a_live_delegated_token_at_the_gate(pool: PgPool) {
+    let w = world(&pool).await;
+    let (_, sib_wf) = sibling_workflow(&pool, &w, 0xC3, "acme-delegate-gate-sibling", false).await;
+    let dl = &w.p_delegator;
+    let viewer = epigraph_db::Viewer::resolve(&pool, w.d)
+        .await
+        .expect("d's viewer");
+    let plain = mcp_auth(dl.delegator_client, w.d, None, WRITE_SCOPES);
+    for (name, wf) in [(PUB, w.pub_wf), ("acme-delegate-gate-sibling", sib_wf)] {
+        let before = row_counts(&pool).await;
+        let err = mcp_add_step_at_the_gate(&w.mcp, &viewer, &plain, name, "acme no-dlg step")
+            .await
+            .expect_err("no dlg: the delegate arm does not admit");
+        assert!(
+            err.contains(GATE_REFUSAL),
+            "{name}: refused by the lineage gate: {err}"
+        );
+        assert_eq!(row_counts(&pool).await, before, "{name}: nothing written");
+        assert!(caller_writes(&pool, wf, w.d).await.is_empty());
+        // CALIBRATION: the same call with a live delegation is admitted.
+        let delegated = mcp_auth(dl.delegator_client, w.d, Some(dl.delegator), WRITE_SCOPES);
+        mcp_add_step_at_the_gate(&w.mcp, &viewer, &delegated, name, "acme dlg step")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("CALIBRATION {name}: with dlg the delegate is admitted: {e}")
+            });
+        let arms: Vec<String> = caller_writes(&pool, wf, w.d)
+            .await
+            .into_iter()
+            .map(|r| r.1)
+            .collect();
+        assert_eq!(arms, vec!["delegate"], "{name}");
+    }
+    // OWN: no dlg, so the delegate arm is skipped and the owner-group arm
+    // admits (d writes p_g through its link membership).
+    mcp_add_step_at_the_gate(&w.mcp, &viewer, &plain, OWN, "acme no-dlg own step")
+        .await
+        .expect("the owner-group arm admits a writer of p_g");
+    let arms: Vec<String> = caller_writes(&pool, w.own_wf, w.d)
+        .await
+        .into_iter()
+        .map(|r| r.1)
+        .collect();
+    assert_eq!(
+        arms,
+        vec!["owner_group_writer"],
+        "without dlg the write is not labelled a delegation"
+    );
+    // The retired agent with a delegator context, at the gate.
+    let r_viewer = epigraph_db::Viewer::resolve(&pool, w.r)
+        .await
+        .expect("r's viewer");
+    let r_ctx = mcp_auth(dl.delegator_client, w.r, Some(dl.delegator), WRITE_SCOPES);
+    let before = row_counts(&pool).await;
+    let err = mcp_add_step_at_the_gate(&w.mcp, &r_viewer, &r_ctx, PUB, "acme retired step")
+        .await
+        .expect_err("a retired link is no delegate at the gate");
+    assert!(err.contains(GATE_REFUSAL), "refused by the gate: {err}");
+    assert_eq!(row_counts(&pool).await, before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tenancy is unchanged: the gate admits, row security still decides
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The delegate passes the lineage gate on `PUB` (public, owned by team group
+/// `t`, which `d` reads but does not write), but the writes that would touch
+/// `t`'s own claims are refused by ROW SECURITY, not by the gate, and nothing
+/// is written or recorded: evolving a `PUB` step (the revision would land in
+/// the step's group) and soft-deleting a `PUB` step (an update of a `t`-owned
+/// claim). R-183 leaves tenancy unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_passes_the_gate_but_not_tenancy_on_a_group_it_does_not_write(pool: PgPool) {
+    let w = world(&pool).await;
+    let steps = steps_of(&pool, w.pub_wf).await;
+    let target = steps[0];
+    let lineage = step_lineage(&pool, target).await;
+    let truth_before = truth(&pool, target).await;
+    for via in w.d_vias() {
+        let label = via.label();
+        let before = row_counts(&pool).await;
+        let evolved = via.evolve(target, "acme pub step, revised by d").await;
+        let deleted = via.delete_step(PUB, lineage).await;
+        let (Err(evolve_err), Err(delete_err)) = (&evolved, &deleted) else {
+            panic!("{label}: tenancy refuses both: evolve {evolved:?}, delete {deleted:?}");
+        };
+        for (verb, err) in [("evolve", evolve_err), ("delete_step", delete_err)] {
+            assert!(
+                !err.contains(GATE_REFUSAL),
+                "{label} {verb}: refused by tenancy, not by the gate: {err}"
+            );
+        }
+        assert_eq!(row_counts(&pool).await, before, "{label}: nothing written");
+        assert_eq!(
+            truth(&pool, target).await,
+            truth_before,
+            "{label}: the step is unchanged"
+        );
+    }
+    assert!(
+        caller_writes(&pool, w.pub_wf, w.d).await.is_empty(),
+        "no provenance row survives a refused write"
+    );
+}
+
+/// A new generation of `p`'s public lineage published by `d` (the delegate
+/// arm admits it over the lineage head, on every transport) INHERITS the
+/// lineage's submitter `p`, not `d`, and lands public in `d`'s own default
+/// group (`d` does not write the lineage's group `t`). Each anchor check is
+/// recorded as `delegate`. Another principal's delegate is refused by the
+/// gate with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_publishes_the_next_generation_and_the_submitter_is_inherited(pool: PgPool) {
+    let w = world(&pool).await;
+    let ql = &w.q_delegator;
+    let before = row_counts(&pool).await;
+    let err = Via::McpHttp(
+        &w.mcp,
+        mcp_auth(ql.delegator_client, w.e, Some(ql.delegator), WRITE_SCOPES),
+    )
+    .ingest(&extraction_gen(PUB, 1, 1), None)
+    .await
+    .expect_err("another principal's delegate cannot extend p's lineage");
+    assert!(err.contains(GATE_REFUSAL), "refused by the gate: {err}");
+    assert_eq!(row_counts(&pool).await, before, "nothing written");
+    assert_eq!(workflow_gen(&pool, PUB, 1).await, None);
+
+    let p = w.p.to_string();
+    let mut generation = 0;
+    for via in w.d_vias() {
+        let label = via.label();
+        generation += 1;
+        let head = workflow_gen(&pool, PUB, generation - 1)
+            .await
+            .expect("the lineage head");
+        via.ingest(&extraction_gen(PUB, generation as u32, 1), None)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the delegate publishes gen {generation}: {e}"));
+        let created = workflow_gen(&pool, PUB, generation)
+            .await
+            .expect("the new generation");
+        assert_eq!(
+            workflow_row(&pool, created).await,
+            ("public".to_string(), w.p_g, Some(p.clone())),
+            "{label}: public, in d's own default group, submitter INHERITED from the lineage"
+        );
+        let rows = caller_writes(&pool, head, w.d).await;
+        assert!(!rows.is_empty(), "{label}: the anchor check is recorded");
+        for (action, arm, operator, submitter, _) in &rows {
+            assert_eq!(
+                (
+                    action.as_str(),
+                    arm.as_str(),
+                    operator.as_deref(),
+                    submitter.as_deref()
+                ),
+                (
+                    "workflow_ingest",
+                    "delegate",
+                    Some(p.as_str()),
+                    Some(p.as_str())
+                ),
+                "{label}: {rows:?}"
+            );
+        }
+    }
+}
+
+async fn workflow_truth(pool: &PgPool, wf: Uuid) -> f64 {
+    sqlx::query_scalar("SELECT truth_value FROM workflows WHERE id = $1")
+        .bind(wf)
+        .fetch_one(pool)
+        .await
+        .expect("workflow truth")
+}
+
+/// `deprecate_workflow` (MCP; REST has no hierarchical deprecation) by `p`'s
+/// delegate. Over `p`'s workflow private to `p_g` (which `d` writes through
+/// its link) it is admitted on stdio and MCP-HTTP and recorded as `delegate`
+/// naming `p`. Over `p`'s public workflow in team group `t` (which `d` does
+/// not write) the gate admits it but row security refuses the deprecation of
+/// `t`'s claims, so nothing is written or recorded (tenancy unchanged; the
+/// refusal surfaces as the tool's opaque internal error, the write path's
+/// existing answer to a row-security refusal there). Another principal's
+/// delegate is refused by the gate itself.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
+    let w = world(&pool).await;
+    let p_rest = Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    );
+    let in_t = "acme-delegate-deprecated-in-team";
+    p_rest
+        .ingest(&extraction(in_t, 1), public_in(w.t))
+        .await
+        .expect("p ingests a public workflow in t");
+    let in_t = workflow_named(&pool, in_t).await;
+
+    let ql = &w.q_delegator;
+    let before = row_counts(&pool).await;
+    let err = Via::McpHttp(
+        &w.mcp,
+        mcp_auth(ql.delegator_client, w.e, Some(ql.delegator), WRITE_SCOPES),
+    )
+    .deprecate(in_t)
+    .await
+    .expect_err("another principal's delegate cannot deprecate it");
+    assert!(err.contains(GATE_REFUSAL), "refused by the gate: {err}");
+    assert_eq!(row_counts(&pool).await, before);
+
+    let [stdio, http, _] = w.d_vias();
+    let truth_before = workflow_truth(&pool, in_t).await;
+    let step = steps_of(&pool, in_t).await[0];
+    let step_truth = truth(&pool, step).await;
+    let err = http
+        .deprecate(in_t)
+        .await
+        .expect_err("tenancy refuses the delegate's deprecation of t's claims");
+    assert!(
+        !err.contains(GATE_REFUSAL),
+        "admitted by the gate, refused by row security: {err}"
+    );
+    assert_eq!(row_counts(&pool).await, before, "nothing written");
+    assert_eq!(workflow_truth(&pool, in_t).await, truth_before);
+    assert_eq!(truth(&pool, step).await, step_truth);
+    assert!(caller_writes(&pool, in_t, w.d).await.is_empty());
+
+    for (i, via) in [stdio, http].into_iter().enumerate() {
+        let label = via.label();
+        let name = format!("acme-delegate-deprecated-own-{i}");
+        p_rest
+            .ingest(&extraction(&name, 1), group_in(w.p_g))
+            .await
+            .expect("p ingests a workflow private to p_g");
+        let wf = workflow_named(&pool, &name).await;
+        let out = via
+            .deprecate(wf)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the delegate deprecates it: {e}"));
+        assert!(
+            workflow_truth(&pool, wf).await < 0.5,
+            "{label}: deprecated: {out}"
+        );
+        let arms: Vec<(String, String, Option<String>)> = caller_writes(&pool, wf, w.d)
+            .await
+            .into_iter()
+            .map(|r| (r.0, r.1, r.2))
+            .collect();
+        assert_eq!(
+            arms,
+            vec![(
+                "deprecate_workflow".to_string(),
+                "delegate".to_string(),
+                Some(w.p.to_string())
+            )],
+            "{label}: recorded as delegate"
+        );
+    }
+}
+
+/// stdio half of the R-100 masking guard: a stdio delegate asking about its
+/// operator's workflow in a group it cannot read is refused by the stdio
+/// read pre-check (which runs before every arm) without the row's id or
+/// submitter, and nothing is written or recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stdio_delegate_is_refused_unnamed_on_a_row_it_cannot_read(pool: PgPool) {
+    let w = world(&pool).await;
+    let hidden = "acme-delegate-hidden-stdio";
+    Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    )
+    .ingest(&extraction(hidden, 1), group_in(w.t))
+    .await
+    .expect("p ingests a workflow private to t");
+    let wf = workflow_named(&pool, hidden).await;
+    let before = row_counts(&pool).await;
+    let err = Via::McpStdio(&w.d_server)
+        .add_step(hidden, "acme hidden step")
+        .await
+        .expect_err("refused");
+    assert!(
+        !err.contains(&wf.to_string()) && !err.contains(&w.p.to_string()),
+        "the refusal names neither the row nor its submitter: {err}"
+    );
+    assert!(!err.contains(GATE_REFUSAL), "{err}");
+    assert_eq!(row_counts(&pool).await, before);
+    assert!(caller_writes(&pool, wf, w.d).await.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The claim ownership gate's delegate arm: tenancy is unchanged
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The ownership gate's refusals (stdio, HTTP), before and after R-183.
+const CLAIM_GATE_STDIO: &str = "cannot retire it";
+const CLAIM_GATE_HTTP: &str = "requires claims:admin scope or ownership";
+
+/// `(is_current, labels)` of a claim.
+async fn claim_state(pool: &PgPool, id: Uuid) -> (bool, Vec<String>) {
+    sqlx::query_as("SELECT is_current, labels FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("claim state")
+}
+
+/// The claim verbs a delegate now owns, by name.
+const CLAIM_VERBS: [&str; 4] = [
+    "supersede (stdio)",
+    "resolve (stdio)",
+    "resolve (mcp-http)",
+    "update_labels resolved (stdio)",
+];
+
+/// One claim verb `verb` (of [`CLAIM_VERBS`]) as `d` on `target`:
+/// `supersede_claim` (stdio), `resolve_backlog_item` (stdio, and HTTP with
+/// `d`'s live delegated context) or `update_labels` adding the retirement
+/// label (stdio).
+async fn d_claim_verb(w: &World, target: Uuid, verb: &str) -> Result<(), String> {
+    let dl = &w.p_delegator;
+    let ctx = mcp_auth(dl.delegator_client, w.d, Some(dl.delegator), WRITE_SCOPES);
+    let (server, auth) = if verb.contains("mcp-http") {
+        (&w.mcp, Some(&ctx))
+    } else {
+        (&w.d_server, None)
+    };
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, auth)
+        .await
+        .map_err(|e| format!("viewer: {}", e.message))?;
+    let out = if verb.starts_with("supersede") {
+        epigraph_mcp::tools::supersede::supersede_claim(
+            server,
+            &viewer,
+            epigraph_mcp::types::SupersedeClaimParams {
+                claim_id: target.to_string(),
+                content: format!("acme replacement for {target}"),
+                truth_value: 0.7,
+                reason: "delegate tenancy test".to_string(),
+            },
+            auth,
+        )
+        .await
+    } else if verb.starts_with("resolve") {
+        epigraph_mcp::tools::claims::resolve_backlog_item(
+            server,
+            &viewer,
+            epigraph_mcp::types::ResolveBacklogItemParams {
+                original_id: target.to_string(),
+                resolution_content: format!("acme resolved {target} via {verb}"),
+                methodology: None,
+                basis_claim_ids: Vec::new(),
+            },
+            auth,
+        )
+        .await
+    } else {
+        epigraph_mcp::tools::claims::update_labels(
+            server,
+            &viewer,
+            epigraph_mcp::types::UpdateLabelsParams {
+                claim_id: target.to_string(),
+                add: vec!["resolved".to_string()],
+                remove: Vec::new(),
+            },
+            auth,
+        )
+        .await
+    };
+    match out {
+        Ok(r) if r.is_error == Some(true) => Err(format!("tool error: {r:?}")),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.message.to_string()),
+    }
+}
+
+/// R-183 widened the claim ownership gate: `d` now OWNS `p`'s own claims by
+/// authorship, wherever they live. Tenancy is the only barrier left for a
+/// `p`-authored claim owned by a group `d` does not write, and it must hold:
+/// on `PUB`'s step (public, authored by `p`, owned by `t`) every verb is
+/// refused by ROW SECURITY, not by the ownership gate, and nothing changes.
+/// CALIBRATION on the same app-role servers: the same verbs on `p`-authored
+/// claims owned by `p_g` (which `d` writes through its link) succeed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegate_owns_but_cannot_write_its_operators_claim_in_a_group_it_does_not_write(
+    pool: PgPool,
+) {
+    let w = world(&pool).await;
+    let foreign = steps_of(&pool, w.pub_wf).await[0];
+    assert_eq!(
+        claim_row(&pool, foreign).await,
+        (w.p, "public".to_string(), w.t),
+        "PREMISE: p's claim, owned by t"
+    );
+    assert!(
+        !writes(&pool, w.d, w.t).await,
+        "PREMISE: d does not write t"
+    );
+    let state_before = claim_state(&pool, foreign).await;
+    let counts_before = row_counts(&pool).await;
+    let mut outcomes = Vec::new();
+    for verb in CLAIM_VERBS {
+        outcomes.push((verb, d_claim_verb(&w, foreign, verb).await));
+    }
+    for (verb, out) in &outcomes {
+        let err = out
+            .as_ref()
+            .expect_err(&format!("{verb}: refused on a t-owned claim: {outcomes:?}"));
+        assert!(
+            !err.contains(CLAIM_GATE_STDIO) && !err.contains(CLAIM_GATE_HTTP),
+            "{verb}: refused by tenancy, not by the ownership gate: {err}"
+        );
+    }
+    assert_eq!(
+        claim_state(&pool, foreign).await,
+        state_before,
+        "the claim is unchanged"
+    );
+    assert_eq!(row_counts(&pool).await, counts_before, "nothing written");
+
+    // CALIBRATION: p-authored claims in p_g, one per verb.
+    let p_rest = Via::Rest(
+        &w.router,
+        rest_token(&w.state, Uuid::new_v4(), w.p, None, WRITE_SCOPES),
+    );
+    let mut own = steps_of(&pool, w.own_wf).await;
+    for i in 0..2 {
+        own.push(
+            p_rest
+                .add_step(OWN, &format!("acme p's own step {i}"))
+                .await
+                .expect("p adds a step to its own workflow"),
+        );
+    }
+    for (i, verb) in CLAIM_VERBS.into_iter().enumerate() {
+        let target = own[i];
+        assert_eq!(
+            claim_row(&pool, target).await,
+            (w.p, "group".to_string(), w.p_g),
+            "PREMISE: p's claim in p_g"
+        );
+        let state = claim_state(&pool, target).await;
+        d_claim_verb(&w, target, verb)
+            .await
+            .unwrap_or_else(|e| panic!("CALIBRATION {verb}: admitted and written in p_g: {e}"));
+        assert_ne!(
+            claim_state(&pool, target).await,
+            state,
+            "CALIBRATION {verb}: the claim changed"
+        );
     }
 }
