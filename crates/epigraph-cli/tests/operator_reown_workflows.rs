@@ -2301,10 +2301,13 @@ async fn catch_up_moves_every_own_row_of_a_private_re_ingest(pool: PgPool) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The round-3 probe: `alpha` is held by the main act (the source's private
-/// evidence on S2), then gets a private generation 2 with NO generation in the
-/// target state. That is the main act's lineage, not a stray one: `--catch-up`
-/// takes none of it, and the private evidence stays the source's.
+/// `alpha` is held by the main act (the source's private evidence on S2), then
+/// gets a private generation 2 with NO generation in the target state. That is
+/// the main act's lineage, not a stray one: `--catch-up` takes none of it, and
+/// the private evidence stays the source's. The evidence alone also holds
+/// `alpha`, so this test pins the main act's hint; the stray rule's own red
+/// line is
+/// [`catch_up_never_takes_a_lineage_with_a_private_generation_and_none_in_the_target`].
 #[sqlx::test(migrations = "../../migrations")]
 async fn catch_up_takes_nothing_of_a_lineage_with_no_generation_in_the_target(pool: PgPool) {
     let fx = seed_with(&pool, Neighbour::Target).await;
@@ -2547,5 +2550,65 @@ async fn catch_up_never_moves_a_private_step_the_moved_plan_executes(pool: PgPoo
     // generation would become the target's: the lineage holds.
     catch_up_holds_on(&pool, &fx, &dir, &s, e_k).await;
     assert_eq!(tenancy(&pool, "claims", k).await, src_private);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A lineage with source generations and NONE in the target state is the main
+/// act's, never a catch-up's, even when one of its generations is in the
+/// source's private state: `--catch-up` takes nothing of it. The fixture has
+/// no other reason to hold `alpha` (no private derived row, no edge to a row
+/// outside the plans, the private note is the target's: the PREMISE shows the
+/// main act would take it whole), so the stray rule alone decides.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_never_takes_a_lineage_with_a_private_generation_and_none_in_the_target(
+    pool: PgPool,
+) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    let m = dir.join("c.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        !r.stdout.contains("HELD-LINEAGE\talpha\t")
+            && line_with(&r.stdout, "WORKFLOW\t", &[&fx.w_a1.to_string()]),
+        "PREMISE: nothing else holds alpha, the main act would take it: {}",
+        r.show()
+    );
+    let w_a2 = {
+        let mut c = pool.acquire().await.expect("acquire");
+        let w = workflow(&mut c, "alpha", 2, Some(fx.w_a1), fx.src, "group").await;
+        edge(&mut c, (w, "workflow"), (fx.t, "claim"), "executes").await;
+        w
+    };
+    let before = snapshot_sans_epoch(&pool).await;
+
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(&r.stdout, "HELD-LINEAGE\talpha\t", &["visibility group"]),
+        "the source's private generation holds the main act's lineage: {}",
+        r.show()
+    );
+    assert!(
+        r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "{}",
+        r.show()
+    );
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, Some("3"), CATCH_UP).await;
+    assert_eq!(r.code, 1, "the main act's count is refused: {}", r.show());
+    // A lineage held for its state is reported, not a hand-off: the apply of
+    // the dry run's count exits 0 and writes nothing.
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, Some("0"), CATCH_UP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let src_private = (fx.src, "group".to_string());
+    let src_public = (fx.src, "public".to_string());
+    assert_eq!(tenancy(&pool, "workflows", w_a2).await, src_private);
+    assert_eq!(tenancy(&pool, "workflows", fx.w_a1).await, src_public);
+    assert_eq!(tenancy(&pool, "claims", fx.p).await, src_public);
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "nothing is written"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
