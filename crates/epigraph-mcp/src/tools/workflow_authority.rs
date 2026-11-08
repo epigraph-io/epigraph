@@ -45,22 +45,37 @@
 //! * `add_step`, `delete_step`, `deprecate_workflow`, `evolve_step` and every
 //!   new generation require, over the AUTHENTICATED transport and when a
 //!   submitter is recorded, in this order: the submitter; its operator (#503,
-//!   the operator itself as on every HTTP gate); a WRITER OF THE WORKFLOW'S
-//!   OWNER GROUP; or the AUDITED admin arm. Agents bound to the submitter's
-//!   human are not admitted as such over HTTP (operator ruling, 2026-10-13: the
-//!   shared host credential must not gain edit rights over a human's
-//!   workflows); their authority traces to the human through `OPERATED_BY` /
-//!   the author binding, and their authorship through the `AUTHORED` edges
-//!   below.
+//!   the operator itself as on every HTTP gate); a DELEGATE of the submitter;
+//!   a WRITER OF THE WORKFLOW'S OWNER GROUP; or the AUDITED admin arm. Agents
+//!   bound to the submitter's human through the author-binding allowlist are
+//!   not admitted as such over HTTP (operator ruling, 2026-10-13: the shared
+//!   host credential must not gain edit rights over a human's workflows);
+//!   their authorship traces through the `AUTHORED` edges below.
+//! * THE DELEGATE ARM (operator ruling R-183: agents acting for a principal
+//!   inherit its authority). The caller's ACTING operator link names the
+//!   submitter (`AgentRepository::operator_actor`, on the write's own
+//!   transaction: a not-retired link record AND a live writer membership of
+//!   the submitter's own personal group). One hop only: an agent operated by
+//!   an agent operated by the submitter is not admitted (the read returns the
+//!   caller's direct operator, and migration 107 refuses to record a chain).
+//!   A retired link grants nothing. Over the authenticated transport an
+//!   operated caller holds a viewer only through a delegated run token whose
+//!   delegation is live ([`crate::tools::viewer::live_delegation`]), and the
+//!   arm re-asks that, as the claim gate's actor arm does. Recorded as
+//!   `"arm": "delegate"` with `operator` = the submitter it acted for.
+//!   Tenancy is unchanged: the rows the write creates land in a group the
+//!   delegate writes itself, and row security still refuses any other.
 //! * THE OWNER-GROUP WRITER ARM. A team's workflows are the team's: a caller
 //!   that holds a live writer or admin membership of the row's owner group
 //!   (direct or through a role binding, checked live on the write's own
 //!   transaction by `epigraph_ingest_executor::caller_writes_group_now`, which
 //!   also asks the session stamp) may edit it and publish its next generation,
 //!   whoever submitted it, and on a row with no recorded submitter too. An
-//!   operator link or an author binding confers no membership, so an agent
-//!   bound to a human is admitted over the human's workflows only where it
-//!   holds a membership row of their owner group itself. Recorded as
+//!   author binding confers no membership, so an agent bound to a human
+//!   through the allowlist is admitted over the human's workflows only where
+//!   it holds a membership row of their owner group itself. An agent
+//!   live-linked to the submitter is admitted first, as its DELEGATE (above),
+//!   so its write is recorded as the delegation it is. Recorded as
 //!   `"arm": "owner_group_writer"` with the `owner_group`.
 //! * STDIO (backlog 222289f3, reversing the batch H-b bar that left stdio
 //!   unchecked). The writes run on the system agent's stamp, which writes
@@ -72,7 +87,8 @@
 //!   ([`stdio_workflow_authority`]): it must READ the row on its OWN stamp
 //!   (a row it cannot read is refused without naming it) and, for a group row,
 //!   WRITE the row's owner group; then a recorded submitter admits the
-//!   submitter, its operator (the operator itself, as over HTTP), or a live
+//!   submitter, its operator (the operator itself, as over HTTP), a delegate
+//!   of the submitter (this server's agent live-linked to it), or a live
 //!   writer of the row's owner group (there is no admin arm without a token). Two stdio-only arms remain, both recorded:
 //!   a LEGACY row (no recorded submitter) that passes the read (and group
 //!   write) check is admitted (stdio has no audited admin path to send it to; an operator
@@ -81,14 +97,16 @@
 //!   admitted on a submitted row that passes the same check, with a WARN, because
 //!   ownership is undecidable for it, exactly as
 //!   `tools::claims::require_owner_or_admin`'s stdio arm decides for claims.
-//!   The submitter is still INHERITED by a new generation: only the submitter
-//!   or its operator can add one now, so the inheritance names the truth.
+//!   The submitter is still INHERITED by a new generation: only the submitter,
+//!   its operator, its delegate or a writer of its owner group can add one, so
+//!   the inheritance names the lineage's submitter, not the agent that acted.
 //! * PROVENANCE. Every write admitted over the authenticated transport is
 //!   recorded on its own transaction ([`record_workflow_write`]): the admin
-//!   arm's `workflows.admin_write` row, and for the submitter and operator arms
+//!   arm's `workflows.admin_write` row, and for every other arm
 //!   one `workflows.caller_write` `security_events` row
 //!   ([`record_caller_workflow_write`]) naming the `arm`, the `acting_agent`,
-//!   the human it acted for (`operator`, on the operator arm), the
+//!   the human it acted for (`operator`: the caller itself on the operator
+//!   arm, the submitter on the delegate arm), the
 //!   `submitter`, the tool (`action`), the `workflow_id`, the token
 //!   (`client_id`, `token_jti`) and the tool's own facts (`write`). The row is
 //!   attributed to the session principal (077's `security_events_append`
@@ -161,6 +179,9 @@ pub(crate) enum WorkflowArm {
     Submitter,
     /// The caller is the operator of the submitter (#503).
     Operator,
+    /// The caller acts for the submitter `operator`: its live operator link
+    /// names it (operator ruling R-183, one hop).
+    Delegate { operator: uuid::Uuid },
     /// The caller writes the workflow's owner group `group`, live.
     OwnerGroupWriter { group: uuid::Uuid },
     /// The AUDITED admin arm.
@@ -308,14 +329,25 @@ pub(crate) async fn require_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
-    // 3. A writer of the workflow's owner group.
+    // 3. A delegate of the submitter (R-183): the caller's acting link names
+    //    it. Over HTTP only with a live delegated run token, the one way an
+    //    operated agent holds an HTTP viewer.
+    if delegate_arm(conn, caller_agent, owner, tool_name).await?
+        && crate::tools::viewer::live_delegation(server, Some(auth), caller_agent)
+            .await?
+            .is_some()
+    {
+        return Ok(grant(WorkflowArm::Delegate { operator: owner }));
+    }
+    // 4. A writer of the workflow's owner group.
     if let Some(group) = owner_group_arm(conn, caller_agent, view.as_ref(), tool_name).await? {
         return Ok(grant(WorkflowArm::OwnerGroupWriter { group }));
     }
-    // 4. The AUDITED admin arm.
+    // 5. The AUDITED admin arm.
     let subject = format!("workflow {workflow_id} was submitted by agent {owner}");
-    let needs = "the workflow's submitter, the submitter's operator, a writer of its owner \
-                 group, or a live claims:admin grant";
+    let needs = "the workflow's submitter, the submitter's operator, an agent acting for the \
+                 submitter through a live operator link, a writer of its owner group, or a live \
+                 claims:admin grant";
     if admin_arm(
         conn,
         auth,
@@ -332,10 +364,11 @@ pub(crate) async fn require_workflow_authority(
     }
     Err(refuse(format!(
         "workflow {workflow_id} was submitted by agent {owner}; caller agent {caller_agent} is \
-         neither that submitter nor its operator, does not write the workflow's owner group, and \
-         holds no claims:admin. {tool_name} requires the workflow's submitter, the submitter's \
-         operator, a writer of its owner group, or the audited claims:admin path. Nothing was \
-         written."
+         neither that submitter, its operator, nor an agent acting for it through a live operator \
+         link, does not write the workflow's owner group, and holds no claims:admin. {tool_name} \
+         requires the workflow's submitter, the submitter's operator, an agent acting for the \
+         submitter through a live operator link, a writer of its owner group, or the audited \
+         claims:admin path. Nothing was written."
     )))
 }
 
@@ -344,8 +377,9 @@ pub(crate) async fn require_workflow_authority(
 /// of the row's owner group NOW, on `conn` (the write's own transaction,
 /// stamped from the caller): the live-membership definer and the session
 /// stamp both (`epigraph_ingest_executor::caller_writes_group_now`). An
-/// operator link or an author binding is not a membership, so it admits no
-/// agent bound to a human through them alone.
+/// author binding is not a membership, so it admits no agent bound to a human
+/// through the allowlist alone; a live operator link admits its agent over the
+/// operator's own workflows through [`delegate_arm`], which runs first.
 async fn owner_group_arm(
     conn: &mut sqlx::PgConnection,
     caller_agent: uuid::Uuid,
@@ -366,6 +400,30 @@ async fn owner_group_arm(
     Ok(writes.then_some(*group))
 }
 
+/// The delegate arm (operator ruling R-183): `true` when the caller's ACTING
+/// operator link names `submitter`, read on `conn` (the write's own
+/// transaction) through migration 107's `epigraph_operator_actor` definer: a
+/// not-retired link record AND a live writer membership of the submitter's
+/// own personal group. It returns the caller's DIRECT operator only, so the
+/// arm is one hop. Never the author read (`operator_of_author`), which
+/// includes retired links: a retired identity's key may be exposed.
+async fn delegate_arm(
+    conn: &mut sqlx::PgConnection,
+    caller_agent: uuid::Uuid,
+    submitter: uuid::Uuid,
+    tool_name: &'static str,
+) -> Result<bool, McpError> {
+    let link = epigraph_db::AgentRepository::operator_actor(conn, caller_agent)
+        .await
+        .map_err(|e| {
+            internal_error_logged(
+                format!("{tool_name}: could not read the caller's operator link"),
+                e,
+            )
+        })?;
+    Ok(link.is_some_and(|l| l.operator_id == submitter))
+}
+
 /// The stdio arms of [`require_workflow_authority`] (backlog 222289f3; see the
 /// module doc's STDIO bullet). `caller` is the write identity, this server's
 /// own agent; the `viewer` a tool was handed is NOT consulted, so the check is
@@ -381,7 +439,8 @@ async fn owner_group_arm(
 /// 2. A GROUP row: the caller must hold a live writer/admin membership of the
 ///    row's owner group, the group the write lands in.
 /// 3. A recorded submitter: the submitter, its operator (the operator
-///    itself, as over HTTP), or a live writer of the row's owner group; a
+///    itself, as over HTTP), a delegate of the submitter ([`delegate_arm`]),
+///    or a live writer of the row's owner group; a
 ///    server with no declared signer identity is admitted with a WARN
 ///    (undecidable, as for claims). No submitter: the legacy stdio arm.
 ///
@@ -464,6 +523,9 @@ async fn stdio_workflow_authority(
     if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
         return Ok(WorkflowArm::Operator);
     }
+    if delegate_arm(conn, caller_agent, owner, tool_name).await? {
+        return Ok(WorkflowArm::Delegate { operator: owner });
+    }
     let view = (visibility, owner_group);
     if let Some(group) = owner_group_arm(conn, caller_agent, Some(&view), tool_name).await? {
         return Ok(WorkflowArm::OwnerGroupWriter { group });
@@ -482,10 +544,12 @@ async fn stdio_workflow_authority(
     }
     Err(crate::errors::invalid_params(format!(
         "workflow {workflow_id} was submitted by agent {owner}; stdio caller agent \
-         {caller_agent} is neither that submitter nor its operator and does not write the \
-         workflow's owner group. {tool_name} over stdio requires the workflow's submitter, the \
-         submitter's operator, or a writer of its owner group (the audited claims:admin path \
-         needs an authenticated transport). Nothing was written."
+         {caller_agent} is neither that submitter, its operator, nor an agent acting for it \
+         through a live operator link, and does not write the workflow's owner group. \
+         {tool_name} over stdio requires the workflow's submitter, the submitter's operator, an \
+         agent acting for the submitter through a live operator link, or a writer of its owner \
+         group (the audited claims:admin path needs an authenticated transport). Nothing was \
+         written."
     )))
 }
 
@@ -617,7 +681,7 @@ pub(crate) async fn audit_admin_workflow_write(
 
 /// Record the write a [`WorkflowGrant`] admitted, on the SAME transaction as
 /// the write: the admin arm's `workflows.admin_write` row
-/// ([`audit_admin_workflow_write`]); for the submitter and operator arms,
+/// ([`audit_admin_workflow_write`]); for every other arm,
 /// [`record_caller_workflow_write`], on either transport. `details` carries
 /// the tool's own facts.
 ///
@@ -653,7 +717,8 @@ pub(crate) async fn record_workflow_write(
 /// `security_events` row on the write's own transaction
 /// (`SecurityEventRepository::workflow_caller_write`), recording the arm, the
 /// acting agent, the human it acted for (`operator`: the caller itself on the
-/// operator arm, null on the submitter arm), the submitter, the tool, the
+/// operator arm, the submitter on the delegate arm, null on the submitter
+/// arm), the submitter, the tool, the
 /// workflow and the token. The rows the write makes are authored and stamped
 /// by the caller; this row records under which arm it acted, and the
 /// `AUTHORED` edges which claims it created. `transport` says which transport carried
@@ -677,6 +742,7 @@ pub(crate) async fn record_caller_workflow_write(
         WorkflowArm::Admin => return Ok(()),
         WorkflowArm::Submitter => ("submitter", None, None),
         WorkflowArm::Operator => ("operator", Some(acting), None),
+        WorkflowArm::Delegate { operator } => ("delegate", Some(operator), None),
         WorkflowArm::OwnerGroupWriter { group } => ("owner_group_writer", None, Some(group)),
         WorkflowArm::StdioLegacy => ("legacy", None, None),
         WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None, None),
