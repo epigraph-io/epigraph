@@ -750,11 +750,19 @@ async fn a_superseded_claims_ingest_record_names_no_ingest_on_its_successor(pool
     let (author, group) = fixture::seed_agent_with_group(&pool, "moved-record").await;
     let old = claim_of(&pool, author, group, "ingest-created, superseded").await;
     let (p, record) = ingest_created(&pool, author, old).await;
-    assert_eq!(ingests_of(&pool, author, old).await, (vec![p], Some(p)), "CALIBRATION");
+    assert_eq!(
+        ingests_of(&pool, author, old).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
     let new = supersede_act(&pool, author, group, old).await;
     replay_supersede(&pool, old, new).await;
     replay_supersede(&pool, old, new).await;
-    assert_eq!(filer_of(&pool, new).await, author, "CALIBRATION: the same filer");
+    assert_eq!(
+        filer_of(&pool, new).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
     assert_eq!(
         ingests_of(&pool, author, new).await,
         (vec![], None),
@@ -771,7 +779,11 @@ async fn a_duplicates_ingest_record_names_no_ingest_on_its_canonical(pool: PgPoo
     let dup = claim_of(&pool, author, group, "ingest-created duplicate").await;
     let canonical = claim_of(&pool, author, group, "filed directly").await;
     let (p, record) = ingest_created(&pool, author, dup).await;
-    assert_eq!(ingests_of(&pool, author, dup).await, (vec![p], Some(p)), "CALIBRATION");
+    assert_eq!(
+        ingests_of(&pool, author, dup).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
     dedup_act(&pool, author, group, dup, canonical).await;
     replay_dedup(&pool, dup, canonical).await;
     replay_dedup(&pool, dup, canonical).await;
@@ -790,11 +802,19 @@ async fn a_merge_sources_ingest_record_names_no_ingest_on_the_merge(pool: PgPool
     let a = claim_of(&pool, author, group, "ingest-created merge source").await;
     let b = claim_of(&pool, author, group, "another merge source").await;
     let (p, record) = ingest_created(&pool, author, a).await;
-    assert_eq!(ingests_of(&pool, author, a).await, (vec![p], Some(p)), "CALIBRATION");
+    assert_eq!(
+        ingests_of(&pool, author, a).await,
+        (vec![p], Some(p)),
+        "CALIBRATION"
+    );
     let merged = consolidate_act(&pool, author, group, vec![a, b]).await;
     replay_consolidate(&pool, merged, vec![a, b]).await;
     replay_consolidate(&pool, merged, vec![a, b]).await;
-    assert_eq!(filer_of(&pool, merged).await, author, "CALIBRATION: the same filer");
+    assert_eq!(
+        filer_of(&pool, merged).await,
+        author,
+        "CALIBRATION: the same filer"
+    );
     assert_eq!(
         ingests_of(&pool, author, merged).await,
         (vec![], None),

@@ -391,7 +391,8 @@ pub fn credited_agent_end(
 /// callers that ask only about the source.
 #[must_use]
 pub fn is_agent_attribution(source_type: &str, relationship: &str) -> bool {
-    source_type == "agent" && AGENT_SOURCE_AUTHORSHIP.contains(&relationship.to_ascii_lowercase().as_str())
+    source_type == "agent"
+        && AGENT_SOURCE_AUTHORSHIP.contains(&relationship.to_ascii_lowercase().as_str())
 }
 
 /// The refusal for an authorship-bearing edge ([`credited_agent_end`]) whose
@@ -492,7 +493,11 @@ mod tests {
             ("agent", "claim", "AUTHORED"),
             ("agent", "claim", "generated"),
         ] {
-            assert_eq!(credited_agent_end(s, t, r), Some(CreditedEnd::Source), "{s} {r} {t}");
+            assert_eq!(
+                credited_agent_end(s, t, r),
+                Some(CreditedEnd::Source),
+                "{s} {r} {t}"
+            );
         }
         for r in [
             "attributed_to",
@@ -503,7 +508,11 @@ mod tests {
             "GENERATED_BY",
             "interpreted_by",
         ] {
-            assert_eq!(credited_agent_end("claim", "agent", r), Some(CreditedEnd::Target), "{r}");
+            assert_eq!(
+                credited_agent_end("claim", "agent", r),
+                Some(CreditedEnd::Target),
+                "{r}"
+            );
         }
         for (s, t, r) in [
             ("claim", "agent", "asserts"),
@@ -516,7 +525,12 @@ mod tests {
             assert_eq!(credited_agent_end(s, t, r), None, "{s} {r} {t}");
         }
         let sql = staged_provenance_refusal_sql();
-        for needle in ["'ingested_claim'", "'operated_by'", "'generated'", "'amplified_by'"] {
+        for needle in [
+            "'ingested_claim'",
+            "'operated_by'",
+            "'generated'",
+            "'amplified_by'",
+        ] {
             assert!(sql.contains(needle), "{needle} in {sql}");
         }
     }

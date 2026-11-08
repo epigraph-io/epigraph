@@ -461,7 +461,11 @@ async fn a_reverse_attribution_is_accepted_only_for_the_caller_or_its_live_agent
             "generated",
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{target} -generated->: {body}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{target} -generated->: {body}"
+        );
         assert_eq!(edge_count(&pool).await, before, "nothing written");
     }
     assert_eq!(
@@ -473,8 +477,14 @@ async fn a_reverse_attribution_is_accepted_only_for_the_caller_or_its_live_agent
     for caller in [stranger, human] {
         for relationship in ["OPERATED_BY", "operated_by"] {
             let before = edge_count(&pool).await;
-            let (status, body) =
-                post_edge(&state, caller, (bot, "agent"), (caller, "agent"), relationship).await;
+            let (status, body) = post_edge(
+                &state,
+                caller,
+                (bot, "agent"),
+                (caller, "agent"),
+                relationship,
+            )
+            .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{relationship}: {body}");
             assert!(
                 body.to_string().contains("operator link"),
@@ -563,9 +573,30 @@ async fn provenance_is_attached_only_by_the_filer_for_authors_it_speaks_for(pool
     let third_party = json!({"authors": [{"name": "Orsolya Quennell"}]});
 
     for (caller, scopes, claim, body, want, says) in [
-        (stranger, &["claims:read"][..], victim, third_party.clone(), StatusCode::FORBIDDEN, ""),
-        (stranger, &write[..], victim, third_party.clone(), StatusCode::FORBIDDEN, "filer"),
-        (human, &write[..], victim, third_party.clone(), StatusCode::FORBIDDEN, "countersignature"),
+        (
+            stranger,
+            &["claims:read"][..],
+            victim,
+            third_party.clone(),
+            StatusCode::FORBIDDEN,
+            "",
+        ),
+        (
+            stranger,
+            &write[..],
+            victim,
+            third_party.clone(),
+            StatusCode::FORBIDDEN,
+            "filer",
+        ),
+        (
+            human,
+            &write[..],
+            victim,
+            third_party.clone(),
+            StatusCode::FORBIDDEN,
+            "countersignature",
+        ),
         (
             human,
             &write[..],

@@ -475,7 +475,11 @@ async fn promote_staged_edges_refuses_the_ingests_provenance_and_agent_attributi
             );
         }
         assert_eq!(into_claim().await, 0, "{body}: nothing written");
-        assert_eq!(agent_edges().await, agent_edges_before, "{body}: nothing written");
+        assert_eq!(
+            agent_edges().await,
+            agent_edges_before,
+            "{body}: nothing written"
+        );
         assert_eq!(edges_between(&pool, c_src, c_tgt).await, 0, "{body}");
         for id in &named {
             assert_eq!(staging_status(&pool, *id).await, "approved", "{body}");
