@@ -1651,11 +1651,27 @@ async fn a_delegate_passes_the_gate_but_not_tenancy_on_a_group_it_does_not_write
         let (Err(evolve_err), Err(delete_err)) = (&evolved, &deleted) else {
             panic!("{label}: tenancy refuses both: evolve {evolved:?}, delete {deleted:?}");
         };
-        for (verb, err) in [("evolve", evolve_err), ("delete_step", delete_err)] {
+        // The write paths' own tenancy refusals (measured on every transport;
+        // REST answers 403 with the same text).
+        for (verb, err, tenancy) in [
+            (
+                "evolve",
+                evolve_err,
+                "no write authority over the group that owns this step",
+            ),
+            (
+                "delete_step",
+                delete_err,
+                "this session cannot write its claim, so it was not soft-deleted",
+            ),
+        ] {
             assert!(
-                !err.contains(GATE_REFUSAL),
-                "{label} {verb}: refused by tenancy, not by the gate: {err}"
+                !err.contains(GATE_REFUSAL) && err.contains(tenancy),
+                "{label} {verb}: refused by tenancy ({tenancy:?}), not by the gate: {err}"
             );
+            if matches!(via, Via::Rest(..)) {
+                assert!(err.starts_with("403"), "{label} {verb}: 403: {err}");
+            }
         }
         assert_eq!(row_counts(&pool).await, before, "{label}: nothing written");
         assert_eq!(
@@ -1784,9 +1800,9 @@ async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
         .deprecate(in_t)
         .await
         .expect_err("tenancy refuses the delegate's deprecation of t's claims");
-    assert!(
-        !err.contains(GATE_REFUSAL),
-        "admitted by the gate, refused by row security: {err}"
+    assert_eq!(
+        err, "internal error; the detail is in the server log",
+        "admitted by the gate (not its refusal), refused below it: {err}"
     );
     assert_eq!(row_counts(&pool).await, before, "nothing written");
     assert_eq!(workflow_truth(&pool, in_t).await, truth_before);
@@ -1974,9 +1990,19 @@ async fn a_delegate_owns_but_cannot_write_its_operators_claim_in_a_group_it_does
         let err = out
             .as_ref()
             .expect_err(&format!("{verb}: refused on a t-owned claim: {outcomes:?}"));
+        // Each verb's own write-time refusal (measured): the database refused
+        // the write on the caller's stamp; the ownership gate had admitted it.
+        let tenancy = match *verb {
+            "supersede (stdio)" => "no write authority over the group that owns this claim",
+            "update_labels resolved (stdio)" => "holds no live writer or admin membership",
+            _ => "could not label",
+        };
         assert!(
-            !err.contains(CLAIM_GATE_STDIO) && !err.contains(CLAIM_GATE_HTTP),
-            "{verb}: refused by tenancy, not by the ownership gate: {err}"
+            !err.contains(CLAIM_GATE_STDIO)
+                && !err.contains(CLAIM_GATE_HTTP)
+                && err.contains(tenancy)
+                && (err.contains("Nothing was written") || err.contains("nothing was written")),
+            "{verb}: refused by tenancy ({tenancy:?}), not by the ownership gate: {err}"
         );
     }
     assert_eq!(
