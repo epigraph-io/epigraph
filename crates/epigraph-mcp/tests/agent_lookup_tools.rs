@@ -260,9 +260,15 @@ async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) 
     );
     let v = fixture::public_viewer(&pool).await;
 
+    // Each walk runs twice: a first document that creates its claims, then a
+    // second document (another DOI, another author) with the same text, whose
+    // claims all CONVERGE on the first one's. Both write paths (a created claim
+    // and a converged one) must leave counted, ingest-written edges.
     for (walk, doi, author) in [
         ("document", "10.9999/card-count.doc", "Thaddeus Wrenfield"),
         ("spine", "10.9999/card-count.spine", "Philippa Ashcombe"),
+        ("document", "10.9999/card-count.doc.2", "Octavia Merrow"),
+        ("spine", "10.9999/card-count.spine.2", "Benedikt Ostrander"),
     ] {
         let x = one_author_extraction(doi, author, walk);
         if walk == "document" {
@@ -293,6 +299,54 @@ async fn the_card_counts_every_attribution_the_real_ingest_writes(pool: PgPool) 
             attributions > 0,
             "CALIBRATION ({walk}): the ingest attributed claims to its author"
         );
+        // Every authorship, paper assertion and attribution this walk wrote
+        // carries the ingest-written marker, naming the walk's tool.
+        let tool = if walk == "document" {
+            "ingest_document"
+        } else {
+            "ingest_document_spine"
+        };
+        let marks: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT e.source_type::text, e.relationship::text, e.properties ->> $2 \
+               FROM edges e \
+              WHERE (e.source_id = $1 \
+                     OR e.source_id IN (SELECT a.target_id FROM edges a \
+                                         WHERE a.source_id = $1 AND a.relationship = 'authored')) \
+                AND e.relationship IN ('authored', 'asserts')",
+        )
+        .bind(node)
+        .bind(epigraph_db::INGEST_WRITTEN_PROPERTY)
+        .fetch_all(&pool)
+        .await
+        .expect("the walk's edges");
+        assert!(
+            marks.iter().any(|m| m.0 == "paper") && marks.iter().any(|m| m.1 == "authored"),
+            "CALIBRATION ({walk}): authorship and paper assertions read: {marks:?}"
+        );
+        if doi.ends_with(".2") {
+            let converged: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM edges e \
+                  WHERE e.source_id = $1 AND e.relationship = 'asserts' \
+                    AND (SELECT count(DISTINCT p.source_id) FROM edges p \
+                          WHERE p.target_id = e.target_id AND p.source_type = 'paper' \
+                            AND p.relationship = 'asserts') = 2",
+            )
+            .bind(node)
+            .fetch_one(&pool)
+            .await
+            .expect("converged claims");
+            assert_eq!(
+                converged, attributions,
+                "CALIBRATION ({walk}): the second document converged on every claim"
+            );
+        }
+        for m in &marks {
+            assert_eq!(
+                m.2.as_deref(),
+                Some(tool),
+                "{walk} ({doi}): an edge the walk wrote is not marked: {marks:?}"
+            );
+        }
 
         let card = get(&reader, &pool, outsider, node).await;
         assert_eq!(card["counts"]["authored_papers"], 1, "{walk}: {card}");
