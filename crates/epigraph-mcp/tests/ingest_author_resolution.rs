@@ -1711,3 +1711,68 @@ async fn a_respelled_explicit_author_is_added_beside_and_reported(pool: PgPool) 
     );
     assert_eq!(authored_in_force(&pool, key, doi).await, 1, "left in place");
 }
+
+/// The claims the paper keyed `doi` asserts (in force).
+async fn claims_of_doc(pool: &PgPool, doi: &str) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT pc.target_id FROM edges pc JOIN papers p ON p.id = pc.source_id \
+          WHERE p.doi = $1 AND pc.relationship = 'asserts' AND pc.target_type = 'claim' \
+            AND pc.valid_to IS NULL ORDER BY 1",
+    )
+    .bind(doi)
+    .fetch_all(pool)
+    .await
+    .expect("the document's claims")
+}
+
+/// The spine walk records creation the same way: ingester A's spine of a
+/// document records `(doc, A, created)` on every thesis, section and
+/// paragraph claim it creates; ingester B's spine of the same document adds
+/// `(doc, B, not created)` to each and never a second creator; A's re-run
+/// adds nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_spine_records_its_creations_and_every_later_ingester(pool: PgPool) {
+    let a = app_role_server(&pool).await;
+    let b = app_role_server(&pool).await;
+    let (a_id, b_id) = (
+        a.server_agent_id().await.expect("a"),
+        b.server_agent_id().await.expect("b"),
+    );
+    assert_ne!(a_id, b_id, "CALIBRATION: two ingesters");
+    let d = "10.9999/spine-record";
+    let extraction = || doc(d, json!([{"name": "Spine Recorder"}]));
+
+    spine(&a, &pool, extraction()).await;
+    let claims = claims_of_doc(&pool, d).await;
+    assert!(
+        claims.len() >= 3,
+        "CALIBRATION: thesis, section and paragraph claims: {claims:?}"
+    );
+    for c in &claims {
+        assert_eq!(
+            ingest_records(&pool, *c).await,
+            vec![(d.to_string(), a_id, true)],
+            "the spine records its creation of {c}"
+        );
+    }
+
+    spine(&b, &pool, extraction()).await;
+    assert_eq!(
+        claims_of_doc(&pool, d).await,
+        claims,
+        "CALIBRATION: b converged on every claim"
+    );
+    for c in &claims {
+        assert_eq!(
+            ingest_records(&pool, *c).await,
+            sorted(vec![(d.to_string(), a_id, true), (d.to_string(), b_id, false)]),
+            "a later spine ingester of {c} is recorded, never as its creator"
+        );
+    }
+
+    spine(&a, &pool, extraction()).await;
+    for c in &claims {
+        assert_eq!(ingest_records(&pool, *c).await.len(), 2, "no duplicate on {c}");
+    }
+}
+
