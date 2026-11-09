@@ -413,9 +413,9 @@ impl PaperRepository {
         {
             let entry = out.entry(paper).or_default();
             if entry.0.len() < limit {
-                entry
-                    .0
-                    .push(author_listing((a, name, pos, role, aff, pending, by, written)));
+                entry.0.push(author_listing((
+                    a, name, pos, role, aff, pending, by, written,
+                )));
             } else {
                 entry.1 = true;
             }

@@ -905,25 +905,56 @@ async fn record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool
     assert!(wrote, "CALIBRATION: a new record");
 }
 
-/// The document's `asserts` edge onto the claim, as the walk writes it, AND
-/// the ingest's record of it. Returns the asserts edge.
-async fn ingested(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+/// An edge as `by`'s document ingest writes it: ingest-written (marked), with
+/// the walk's own writer. Returns the edge.
+async fn ingest_edge(
+    pool: &PgPool,
+    by: Uuid,
+    (source, source_type): (Uuid, &str),
+    (target, target_type): (Uuid, &str),
+    relationship: &str,
+    properties: Value,
+) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
-    let e = EdgeRepository::create_if_absent_including_retracted_signed_conn(
-        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        by,
+        source,
+        source_type,
+        target,
+        target_type,
+        relationship,
+        Some(properties),
     )
     .await
-    .expect("asserts")
+    .expect("an ingest-written edge")
     .0
-    .id;
-    drop(conn);
+    .id
+}
+
+/// The document's `asserts` edge onto the claim, as `by`'s walk writes it,
+/// AND the ingest's record of it. Returns the asserts edge.
+async fn ingested(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
+    let e = ingest_edge(
+        pool,
+        by,
+        (paper, "paper"),
+        (claim, "claim"),
+        "asserts",
+        json!({}),
+    )
+    .await;
     record(pool, paper, claim, by, created).await;
     e
 }
 
-async fn authored(pool: &PgPool, author: Uuid, paper: Uuid, properties: Value) -> Uuid {
-    edge(
+/// `author`'s authorship of `paper`, as `by`'s document ingest writes it.
+async fn authored(pool: &PgPool, author: Uuid, paper: Uuid, by: Uuid, properties: Value) -> Uuid {
+    ingest_edge(
         pool,
+        by,
         (author, "agent"),
         (paper, "paper"),
         "authored",
@@ -988,7 +1019,7 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
     let other = paper(&pool, "10.0000/fixture.two", "Fixture Paper Two").await;
     ingested(&pool, other, claim, second, false).await;
     let other_author = author_node(&pool, "Other Author").await;
-    authored(&pool, other_author, other, json!({"position": 0})).await;
+    authored(&pool, other_author, other, second, json!({"position": 0})).await;
 
     let third = author_node(&pool, "Third Author").await;
     let first_a = author_node(&pool, "First Author").await;
@@ -1000,6 +1031,7 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         &pool,
         third,
         doc,
+        ingester,
         json!({"position": 2, "role": "corresponding", "affiliations": ["Lab A", null, "Lab B"]}),
     )
     .await;
@@ -1007,23 +1039,37 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         &pool,
         first_a,
         doc,
+        ingester,
         json!({"position": 0, "role": "author"}),
     )
     .await;
-    authored(&pool, first_b, doc, json!({"position": 0})).await;
+    authored(&pool, first_b, doc, ingester, json!({"position": 0})).await;
     authored(
         &pool,
         second_author,
         doc,
+        ingester,
         json!({"position": 1, "affiliations": "Lab C"}),
     )
     .await;
-    authored(&pool, unplaced, doc, json!({"position": "x"})).await;
+    authored(&pool, unplaced, doc, ingester, json!({"position": "x"})).await;
     authored(
         &pool,
         named_person,
         doc,
+        second,
         json!({"position": 3, "pending_countersign": true, "ingested_by": second.to_string()}),
+    )
+    .await;
+    // An authorship no ingest wrote (a row from before the ingest marked its
+    // edges, or a hand-written one): never an author.
+    let unmarked = author_node(&pool, "Unmarked Author").await;
+    edge(
+        &pool,
+        (unmarked, "agent"),
+        (doc, "paper"),
+        "authored",
+        json!({"position": 0}),
     )
     .await;
     let claim_asserter = author_node(&pool, "Claim Asserter").await;
@@ -1047,7 +1093,7 @@ async fn a_created_claim_names_its_documents_authors_first_and_the_filer_apart(p
         ids(&p.authors),
         vec![first_a, first_b, second_author, third, unplaced],
         "by position (a shared one in recording order), a missing one last; never the \
-         claim asserter, never the pending person"
+         claim asserter, never the pending person, never an authorship no ingest wrote"
     );
     let by_id = |id: Uuid| p.authors.iter().find(|a| a.id == id).expect("listed");
     let t = by_id(third);
@@ -1152,10 +1198,11 @@ async fn only_the_creating_ingest_makes_a_document_primary(pool: PgPool) {
         json!({}),
     )
     .await;
-    authored(
+    edge(
         &pool,
-        author_node(&pool, "Bare Author").await,
-        bare,
+        (author_node(&pool, "Bare Author").await, "agent"),
+        (bare, "paper"),
+        "authored",
         json!({"position": 0}),
     )
     .await;
@@ -1225,6 +1272,7 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
         &pool,
         author_node(&pool, "Hidden Author").await,
         hidden_doc,
+        ingester,
         json!({"position": 0}),
     )
     .await;
@@ -1249,17 +1297,28 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     // A retracted assertion.
     let retracted_claim = fixture::seed_public_claim(&pool, ingester, "once asserted").await;
     let old_doc = paper(&pool, "10.0000/fixture.retracted", "Retracted Paper").await;
+    // Written by the ingest (marked), then retracted: only the in-force
+    // condition keeps it out.
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SELECT set_config('epigraph.ingest_written_edge', 'on', true)")
+        .execute(&mut *tx)
+        .await
+        .expect("declare the ingest's write");
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
-                            valid_from, valid_to) \
-         VALUES ($1, 'paper', $2, 'claim', 'asserts', now() - interval '2 hours', \
-                 now() - interval '1 hour')",
+                            properties, valid_from, valid_to) \
+         VALUES ($1, 'paper', $2, 'claim', 'asserts', \
+                 jsonb_build_object('ingest_written', \
+                     jsonb_build_object('tool', 'ingest_document', 'by', $3::text)), \
+                 now() - interval '2 hours', now() - interval '1 hour')",
     )
     .bind(old_doc)
     .bind(retracted_claim)
-    .execute(&pool)
+    .bind(ingester.to_string())
+    .execute(&mut *tx)
     .await
-    .expect("a retracted asserts edge");
+    .expect("a retracted, ingest-written asserts edge");
+    tx.commit().await.expect("commit");
     record(&pool, old_doc, retracted_claim, ingester, true).await;
     assert_eq!(
         as_json(claim_block(&pool, &scoped, member, retracted_claim, ingester).await),
@@ -1273,8 +1332,8 @@ async fn a_document_edge_the_caller_cannot_read_is_no_document(pool: PgPool) {
     ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
-    authored(&pool, shown, open_doc, json!({"position": 1})).await;
-    let k = authored(&pool, kept, open_doc, json!({"position": 0})).await;
+    authored(&pool, shown, open_doc, ingester, json!({"position": 1})).await;
+    let k = authored(&pool, kept, open_doc, ingester, json!({"position": 0})).await;
     private_to(&pool, k, group).await;
     let authors_of = |b: &AuthoredBy| ids(&literature(b).paper.authors);
     assert_eq!(
@@ -1301,6 +1360,7 @@ async fn corroborating_documents_are_capped_and_every_ingester_is_listed(pool: P
     let claim = fixture::seed_public_claim(&pool, filer, "a converged claim").await;
 
     let mut docs = Vec::new();
+    let mut first_ingester = None;
     for i in 0..=MAX_PAPERS {
         let d = paper(
             &pool,
@@ -1310,11 +1370,13 @@ async fn corroborating_documents_are_capped_and_every_ingester_is_listed(pool: P
         .await;
         let (by, _) = fixture::seed_agent_with_group(&pool, "many-ingester").await;
         ingested(&pool, d, claim, by, false).await;
+        first_ingester.get_or_insert(by);
         docs.push(d);
     }
+    let first_ingester = first_ingester.expect("an ingester");
     for i in 0..=MAX_PAPER_AUTHORS {
         let a = author_node(&pool, &format!("Author {i}")).await;
-        authored(&pool, a, docs[0], json!({"position": i})).await;
+        authored(&pool, a, docs[0], first_ingester, json!({"position": i})).await;
     }
 
     let block = claim_block(&pool, &scoped, stranger, claim, filer).await;
@@ -1362,8 +1424,8 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
     ingested(&pool, open_doc, open_claim, ingester, true).await;
     let shown = author_node(&pool, "Shown Author").await;
     let kept = author_node(&pool, "Kept Author").await;
-    authored(&pool, shown, open_doc, json!({"position": 1})).await;
-    let k = authored(&pool, kept, open_doc, json!({"position": 0})).await;
+    authored(&pool, shown, open_doc, ingester, json!({"position": 1})).await;
+    let k = authored(&pool, kept, open_doc, ingester, json!({"position": 0})).await;
     private_to(&pool, k, group).await;
 
     assert!(

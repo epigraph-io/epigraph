@@ -226,9 +226,11 @@ async fn a_claim_read_names_the_agent_the_human_and_the_snapshot_by_audience(poo
     assert_eq!(theirs["ingesters"], json!([]), "{theirs}");
 }
 
-/// `caller` writes an `OPERATED_BY` edge `agent -> target` through
-/// `POST /api/v1/edges`, as any edges:write caller may.
-async fn forge_over_http(state: &AppState, caller: Uuid, agent: Uuid, target: Uuid) {
+/// `caller` tries to write an `OPERATED_BY` edge `agent -> target` through
+/// `POST /api/v1/edges`, which refuses it (only a recorded link writes one);
+/// then the same edge is planted directly, as a row written before that
+/// refusal existed would be.
+async fn forge_over_http(pool: &PgPool, state: &AppState, caller: Uuid, agent: Uuid, target: Uuid) {
     let token = common::mint_token_with_agent(&["edges:write"], caller);
     let body = json!({
         "source_id": agent, "source_type": "agent",
@@ -249,11 +251,21 @@ async fn forge_over_http(state: &AppState, caller: Uuid, agent: Uuid, target: Uu
         .expect("response");
     let status = resp.status();
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-    assert!(
-        status.is_success(),
-        "CALIBRATION: the route writes the forged edge: {status} {}",
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the route refuses a generic OPERATED_BY write: {}",
         String::from_utf8_lossy(&bytes)
     );
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'agent', $2, 'agent', 'OPERATED_BY')",
+    )
+    .bind(agent)
+    .bind(target)
+    .execute(pool)
+    .await
+    .expect("a forged OPERATED_BY row from before the refusal");
 }
 
 /// On the wire the human is the agent's binding, for every reader: a stranger
@@ -298,9 +310,9 @@ async fn a_forged_edge_changes_nothing_and_a_hidden_claim_leaks_nothing(pool: Pg
         json!({"id": operator, "display_name": "Operator Fixture"}),
         "a stranger sees the binding: {before}"
     );
-    forge_over_http(&state, stranger, agent, decoy).await;
-    forge_over_http(&state, stranger, agent, operator).await;
-    assert_eq!(edges().await, 2, "CALIBRATION: both forged edges landed");
+    forge_over_http(&pool, &state, stranger, agent, decoy).await;
+    forge_over_http(&pool, &state, stranger, agent, operator).await;
+    assert_eq!(edges().await, 2, "CALIBRATION: both forged rows are stored");
     assert_eq!(
         authored_by(&state, stranger, claim).await,
         before,
@@ -364,6 +376,7 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         &pool,
         second,
         doc,
+        ingester,
         json!({"position": 1, "role": "author", "affiliations": []}),
     )
     .await;
@@ -371,6 +384,7 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         &pool,
         first,
         doc,
+        ingester,
         json!({"position": 0, "role": "corresponding", "affiliations": ["Fixture Institute"]}),
     )
     .await;
@@ -378,6 +392,7 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
         &pool,
         person,
         doc,
+        ingester,
         json!({"position": 2, "pending_countersign": true, "ingested_by": ingester.to_string()}),
     )
     .await;
@@ -452,11 +467,20 @@ async fn a_literature_claim_names_the_document_authors_and_the_ingester_apart(po
 }
 
 /// The ingest's `asserts` edge and its creation record, written with the
-/// walk's own primitives. Returns the asserts edge.
+/// walk's own primitives (ingest-written, by `by`). Returns the asserts edge.
 async fn ingest_record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, created: bool) -> Uuid {
     let mut conn = pool.acquire().await.expect("conn");
-    let e = epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
-        &mut conn, None, paper, "paper", claim, "claim", "asserts", None, None, None,
+    let e = epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        by,
+        paper,
+        "paper",
+        claim,
+        "claim",
+        "asserts",
+        None,
     )
     .await
     .expect("asserts")
@@ -477,15 +501,21 @@ async fn ingest_record(pool: &PgPool, paper: Uuid, claim: Uuid, by: Uuid, create
     e
 }
 
-async fn authored_edge(pool: &PgPool, author: Uuid, paper: Uuid, props: Value) {
-    sqlx::query(
-        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
-                            properties) VALUES ($1, 'agent', $2, 'paper', 'authored', $3)",
+/// `author`'s authorship of `paper`, as `by`'s document ingest writes it.
+async fn authored_edge(pool: &PgPool, author: Uuid, paper: Uuid, by: Uuid, props: Value) {
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        by,
+        author,
+        "agent",
+        paper,
+        "paper",
+        "authored",
+        Some(props),
     )
-    .bind(author)
-    .bind(paper)
-    .bind(props)
-    .execute(pool)
     .await
     .expect("authored edge");
 }
@@ -530,7 +560,7 @@ async fn a_forged_document_assertion_is_refused_and_changes_nothing(pool: PgPool
     .await
     .expect("paper");
     let (author, _) = viewer_fixture::seed_agent_with_group(&pool, "unwitting").await;
-    authored_edge(&pool, author, doc, json!({"position": 0})).await;
+    authored_edge(&pool, author, doc, author, json!({"position": 0})).await;
 
     let before_third = authored_by(&state, bystander, claim).await;
     let before_human = authored_by(&state, operator, claim).await;
