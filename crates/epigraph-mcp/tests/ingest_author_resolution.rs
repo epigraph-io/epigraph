@@ -2293,7 +2293,8 @@ async fn an_operator_replacement_is_never_undone_by_a_later_ingester(pool: PgPoo
 /// authorship that no replacement recorded (an UPDATE outside the
 /// maintenance replacement, which names no replacing agent) is no
 /// replacement: a later name-only ingest takes the name path as usual
-/// (`reused_name_key`, asserting), whatever the position or spelling. The
+/// (`reused_name_key`, asserting), whatever the position or spelling, and
+/// although the paper has another author in force. The
 /// operator replacement test above is the control: there the replacing
 /// agent's own authorship records which node it replaced.
 #[sqlx::test(migrations = "../../migrations")]
@@ -2306,10 +2307,17 @@ async fn only_the_operator_replacement_withholds_a_name_derived_authors_credit(p
     ingest_wait(
         &first,
         &pool,
-        doc_with_atoms(d, json!([{"name": name}]), &["The first ingest's atom."]),
+        doc_with_atoms(
+            d,
+            json!([{"name": name}, {"name": "Second Author"}]),
+            &["The first ingest's atom."],
+        ),
     )
     .await;
     let key = name_key_node(&pool, name).await.expect("name-key node");
+    let second = name_key_node(&pool, "Second Author")
+        .await
+        .expect("the co-author's node");
     // A retraction no replacement recorded: in force before, retracted now.
     sqlx::query(
         "UPDATE edges e SET valid_to = now() FROM papers p \
@@ -2322,12 +2330,20 @@ async fn only_the_operator_replacement_withholds_a_name_derived_authors_credit(p
     .await
     .expect("an unrecorded retraction");
     assert_eq!(authored_in_force(&pool, key, d).await, 0, "CALIBRATION");
+    // CALIBRATION: another author's authorship of the paper stays in force,
+    // so only the replacement's own record (not "some in-force authorship")
+    // can tell this retraction from a replacement.
+    assert_eq!(authored_in_force(&pool, second, d).await, 1, "CALIBRATION");
 
     let json = text(
         &tools::ingestion::do_ingest_document(
             &later,
             &public,
-            &doc_with_atoms(d, json!([{"name": name}]), &["A later ingest's atom."]),
+            &doc_with_atoms(
+                d,
+                json!([{"name": name}, {"name": "Second Author"}]),
+                &["A later ingest's atom."],
+            ),
             None,
         )
         .await
