@@ -663,6 +663,9 @@ pub enum LineageHold {
     PartlyMoved {
         source_gens: Vec<i32>,
         target_gens: Vec<i32>,
+        /// The act is in place (target = source): a plain `--catch-up` takes
+        /// the FROM generations, no act need be on record.
+        in_place: bool,
     },
     /// Narrowing the plan would hand a row to the target that the target must
     /// not get (see [`hand_off`]). Holds every lineage joined to it, and an
@@ -685,6 +688,17 @@ impl LineageHold {
     }
 }
 
+/// What the operator can do with a MOVE's lineage that has generations in the
+/// target state beside the source's: a catch-up takes it only when an act of
+/// this tool moved those generations there; a generation the target owns
+/// natively is held by design, and no act of this tool takes the lineage.
+const MOVE_CATCH_UP_HINT: &str = "if an act of this tool moved the target's generations there, \
+     run again with --catch-up --after-manifest <exactly that act's manifest> (plus each \
+     catch-up manifest of it) to take only the other generations, recording the target's as \
+     seen; if none did, the target owns them natively, and the lineage is held by design (a \
+     catch-up never hands the source's rows to a group on a shared name alone): no act of \
+     this tool takes it, and it stays as it is until a ruling";
+
 impl fmt::Display for LineageHold {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -703,30 +717,35 @@ impl fmt::Display for LineageHold {
                 "generation {generation} has visibility {visibility}, not public, and is not in \
                  this run's target state; the whole lineage stays{}",
                 if *catch_up {
-                    " (the source's private generation of a lineage with generations already in \
-                     this run's target state: run again with --catch-up --after-manifest <the \
-                     manifest of the act that moved them> to take it)"
+                    // Only a move has a source-private state apart from TO.
+                    format!(
+                        " (the source's private generation of a lineage with generations already \
+                         in this run's target state: {MOVE_CATCH_UP_HINT})"
+                    )
                 } else {
-                    ""
+                    String::new()
                 }
             ),
             Self::PartlyMoved {
                 source_gens,
                 target_gens,
+                in_place,
             } => write!(
                 f,
                 "partly the target's already (generations {target_gens:?}) and partly the \
                  source's ({source_gens:?}); a run that moved only part of it could not be \
-                 reversed exactly, so it stays (run again with --catch-up --after-manifest <the \
-                 manifest of the act that moved them> to take only the other generations, \
-                 recording the target's as seen)"
+                 reversed exactly, so it stays ({})",
+                if *in_place {
+                    "in place, run again with --catch-up to narrow only the public generations, \
+                     recording the others as seen"
+                } else {
+                    MOVE_CATCH_UP_HINT
+                }
             ),
             Self::NotActed { target_gens } => write!(
                 f,
                 "its generations in this run's target state ({target_gens:?}) were not moved there \
-                 by any --after-manifest: the target may own this lineage natively, and a \
-                 catch-up takes only the stray generations of a lineage an act moved; the whole \
-                 lineage stays (pass the manifest of the act that moved it, or rule on it)"
+                 by any --after-manifest; the whole lineage stays ({MOVE_CATCH_UP_HINT})"
             ),
             Self::HandOff {
                 table,
@@ -1442,6 +1461,7 @@ pub async fn plan(
                     LineageHold::PartlyMoved {
                         source_gens: from_g.iter().map(|w| w.generation).collect(),
                         target_gens: to_g.iter().map(|w| w.generation).collect(),
+                        in_place: act.in_place(),
                     },
                 ));
                 continue;

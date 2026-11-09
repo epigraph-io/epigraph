@@ -2791,3 +2791,97 @@ async fn catch_up_holds_a_lineage_the_target_owns_natively(pool: PgPool) {
     assert_eq!(after, want, "the catch-up changed the target's lineage");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `missing` with generation 0 natively in `owner`'s private state (no act
+/// moved it there) and generation 1 in SRC's public state, executing a public
+/// step only it executes: (generation 0, generation 1, the step).
+async fn native_beside_public(pool: &PgPool, fx: &Fx, owner: Uuid) -> (Uuid, Uuid, Uuid) {
+    let mut c = pool.acquire().await.expect("acquire");
+    let n0 = workflow(&mut c, "missing", 0, None, owner, "group").await;
+    let n1 = workflow(&mut c, "missing", 1, Some(n0), fx.src, "public").await;
+    let np = claim(
+        &mut c,
+        fx.operator,
+        fx.src,
+        "public",
+        2,
+        "missing public step",
+    )
+    .await;
+    edge(&mut c, (n1, "workflow"), (np, "claim"), "executes").await;
+    (n0, n1, np)
+}
+
+/// The same shape in a MOVE: generation 0 natively in the TARGET's private
+/// state, generation 1 in SRC's public state. No act moved generation 0, so a
+/// catch-up must never take generation 1 into the target on a shared name: it
+/// is held, by design, even with the main manifest passed, and nothing is
+/// written. The main act's hint says so, and never sends the operator to "the
+/// manifest of the act that moved them" when no act did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn catch_up_in_a_move_holds_a_public_generation_beside_a_native_target_one(pool: PgPool) {
+    let fx = seed_with(&pool, Neighbour::Target).await;
+    let dir = scratch_dir();
+    main_move(&pool, &fx, &dir).await;
+    let main = dir.join("main.jsonl");
+    let (n0, n1, np) = native_beside_public(&pool, &fx, fx.target).await;
+    let src_public = (fx.src, "public".to_string());
+
+    let m = dir.join("c.jsonl");
+    let r = reown_run(&pool, &fx, &dir, &m, fx.target, None, GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(
+            &r.stdout,
+            "HELD-LINEAGE\tmissing\t",
+            &["partly the target's", "held by design"]
+        ) && !r.stdout.contains("the manifest of the act that moved them"),
+        "a move's hint names the held-by-design case: {}",
+        r.show()
+    );
+
+    let before = snapshot_sans_epoch(&pool).await;
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        None,
+        &catch_up_after(&main),
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(
+        line_with(
+            &r.stdout,
+            "HELD-LINEAGE\tmissing\t",
+            &["not moved there by any --after-manifest", "held by design"]
+        ) && r.stdout.contains("ELIGIBLE-WORKFLOW-ROWS\t0"),
+        "the target's own lineage is no catch-up's: {}",
+        r.show()
+    );
+    let r = reown_run(
+        &pool,
+        &fx,
+        &dir,
+        &m,
+        fx.target,
+        Some("0"),
+        &catch_up_after(&main),
+    )
+    .await;
+    assert_eq!(r.code, 0, "a held lineage is not a hand-off: {}", r.show());
+    assert_eq!(
+        tenancy(&pool, "workflows", n0).await,
+        (fx.target, "group".to_string())
+    );
+    assert_eq!(tenancy(&pool, "workflows", n1).await, src_public);
+    assert_eq!(tenancy(&pool, "claims", np).await, src_public);
+    assert_eq!(
+        snapshot_sans_epoch(&pool).await,
+        before,
+        "nothing is written"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
