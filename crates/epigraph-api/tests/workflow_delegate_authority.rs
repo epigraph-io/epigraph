@@ -1100,10 +1100,19 @@ async fn a_link_whose_membership_was_revoked_grants_nothing(pool: PgPool) {
 
 /// A live link to a DIFFERENT operator grants nothing over the submitter's
 /// workflow, on every transport (its delegated token is live: the gate
-/// refuses).
+/// refuses). Even when that other operator `q` WRITES the row's owner group:
+/// `q` is admitted there by membership, not by identity, and membership is
+/// tenancy, which R-183 does not hand to `q`'s delegate.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_link_to_another_operator_grants_nothing(pool: PgPool) {
     let w = world(&pool).await;
+    let q = w.q_delegator.operator;
+    add_roster_row(&pool, w.t, q, "writer").await;
+    assert!(writes(&pool, q, w.t).await, "PREMISE: q writes t");
+    assert!(
+        !writes(&pool, w.e, w.t).await,
+        "PREMISE: e does not write t"
+    );
     let ql = &w.q_delegator;
     for via in [
         Via::McpStdio(&w.e_server),
